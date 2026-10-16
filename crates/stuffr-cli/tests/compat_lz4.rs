@@ -2835,27 +2835,7 @@ mod unix {
         );
     }
 
-    /// The exit codes the reference produced over every row and the fuzz
-    /// below: the set Task 8's fuzz oracle accepts under the lz4 names.
-    /// Probed 2026-10-16 over the rows and over ~3000 corruptions and cuts
-    /// of ten frames (`-t`, `-dc`, `--list`).
-    ///
-    /// Task 3 added 50: `lz4 -c --rm` on standard input is `Error 50 :
-    /// Remove error : stdin: No such file or directory` (probed 2026-10-16).
-    ///
-    /// Task 4 added 69, 72 and 74: `--sparse` decoding into a pipe (`lz4
-    /// --sparse -dc X | cat`: `Error 69 : Final skip error (sparse file)`,
-    /// `Error 72 : Sparse skip error(29): Illegal seek ; try --no-sparse`,
-    /// `Error 74 : Sparse skip error ; try --no-sparse`; probed 2026-10-16,
-    /// pinned by `sparse_output_matches_the_reference`).
-    ///
-    /// Task 5 added 71 (and met 72 again): `--list` of a file that is only a
-    /// frame's magic number is `Error 71 : Error reading NAME`, of one cut
-    /// inside a header that promises a content size `Error 72 : Error
-    /// reading NAME` (probed 2026-10-16, pinned by the `--list` rows).
-    const EXIT_CODES: [i32; 19] = [
-        0, 1, 26, 27, 34, 38, 40, 42, 43, 44, 50, 61, 63, 64, 69, 70, 71, 72, 74,
-    ];
+    use stuffr_cli::compat::lz4::EXIT_CODES;
 
     #[test]
     fn every_recorded_code_is_in_the_exit_set() {

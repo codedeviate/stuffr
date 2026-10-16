@@ -195,11 +195,19 @@ pub const COMPAT_NAMES: &[&str] = &[
 /// The zstd family's three (0.14.0, R5 again) take bits 13-15, which no
 /// 0.13 generator wrote, and fill the second byte: a sixteenth file needs
 /// a third mask byte. `d.dict` is a dictionary for `-D`.
+///
+/// The lz4 family's one (0.15.0, R5) is the sixteenth file, bit 16, so it
+/// opens a **third mask byte**, present only when the argument-count byte
+/// is at least `2 × (COMPAT_MAX_ARGS + 1)` (the count is still `byte % 9`;
+/// no earlier generator wrote such a byte). lz4's `-D` takes `d.dict`:
+/// there is no second dictionary file, because a seventeenth bit would
+/// need a fourth byte for nothing a dictionary's contents add.
 pub const COMPAT_FILES: &[&str] = &[
     "a", "a.bz2", "a.tbz2", "a.out", // 0.11.0
     "a.gz", "a.tgz", "a.z", // 0.12.0: the gzip family
     "a.xz", "a.txz", "a.lzma", "a.tlz", "a.lz", // 0.13.0: the xz family
     "a.zst", "a.tzst", "d.dict", // 0.14.0: the zstd family
+    "a.lz4",  // 0.15.0: the lz4 family (a third mask byte; its dictionary is `d.dict`)
 ];
 
 /// The `compat` target's argument vocabulary: byte `n % len` is one argument.
@@ -364,6 +372,28 @@ pub const COMPAT_TOKENS: &[&str] = &[
     "--show-default-cparams",
     "a.zst",
     "a.tzst",
+    // 0.15.0: the lz4 family (`-l -D -c -d -z -f -k -t -m -q -v -1..-9
+    // --fast=3 --best --list --rm --sparse --no-sparse -T0 -T1 -T2 -B1K
+    // -r --filelist=a d.dict --format=lz4 --stdout ...` are above). `-c0`
+    // and `-hc` are lz4's legacy spellings; `d.lz4dict` names a dictionary
+    // no case creates (`-D` of a missing file); `null` and `stdout` are
+    // the output-name words.
+    "-BD",
+    "-BX",
+    "-B4",
+    "-B32",
+    "-12",
+    "--favor-decSpeed",
+    "--no-frame-crc",
+    "--content-size",
+    "-m",
+    "d.lz4dict",
+    "null",
+    "stdout",
+    "-c0",
+    "-hc",
+    "-y",
+    "a.lz4",
 ];
 
 /// The largest input the `compat` target runs. Here, not in the target, so
@@ -395,12 +425,15 @@ pub const COMPAT_STDIN_BIT: u8 = 1 << 4;
 /// The mask bit of [`COMPAT_FILES`]`[i]`: `i` below 4, `i + 1` from 4 on,
 /// skipping [`COMPAT_STDIN_BIT`] (R6 of 0.12.0, R5 of 0.13.0). Bits 8 and
 /// up are the second mask byte's.
-fn file_bit(i: usize) -> u16 {
+fn file_bit(i: usize) -> u32 {
     1 << if i < 4 { i } else { i + 1 }
 }
 
 /// The first file whose mask bit is in the second mask byte.
 const FIRST_WIDE_FILE: usize = 7;
+
+/// The first file whose mask bit is in the third mask byte (0.15.0).
+const FIRST_WIDER_FILE: usize = 15;
 
 /// One `compat` fuzz case, decoded by [`decode_compat_case`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -422,23 +455,29 @@ pub struct CompatCase<'a> {
 
 /// Decode `[name][argc][token; argc][mask][mask2?] ++ payload`, the
 /// `compat` target's wire format, where `mask2` is there only when the
-/// `argc` byte is past [`COMPAT_MAX_ARGS`] ([`COMPAT_FILES`]). `None` when
-/// `data` ends before the mask (or `mask2`).
+/// `argc` byte is past [`COMPAT_MAX_ARGS`], and a `mask3` after that only
+/// when it is at least twice that ([`COMPAT_FILES`]). `None` when `data`
+/// ends before the mask (or `mask2`, `mask3`).
 pub fn decode_compat_case(data: &[u8]) -> Option<CompatCase<'_>> {
     let (&name, rest) = data.split_first()?;
     let (&argc_byte, rest) = rest.split_first()?;
     let argc = argc_byte as usize % (COMPAT_MAX_ARGS + 1);
     let wide = argc_byte as usize > COMPAT_MAX_ARGS;
+    let wider = argc_byte as usize > 2 * COMPAT_MAX_ARGS + 1;
     if rest.len() < argc + 1 {
         return None;
     }
     let (tokens, rest) = rest.split_at(argc);
     let (&low, rest) = rest.split_first()?;
-    let (mask, payload) = if wide {
+    let (mask, payload) = if wider {
         let (&high, rest) = rest.split_first()?;
-        (u16::from_le_bytes([low, high]), rest)
+        let (&top, rest) = rest.split_first()?;
+        (u32::from_le_bytes([low, high, top, 0]), rest)
+    } else if wide {
+        let (&high, rest) = rest.split_first()?;
+        (u32::from_le_bytes([low, high, 0, 0]), rest)
     } else {
-        (u16::from(low), rest)
+        (u32::from(low), rest)
     };
     Some(CompatCase {
         name: COMPAT_NAMES[name as usize % COMPAT_NAMES.len()],
@@ -453,7 +492,7 @@ pub fn decode_compat_case(data: &[u8]) -> Option<CompatCase<'_>> {
             .filter(|&(i, _)| mask & file_bit(i) != 0)
             .map(|(_, &f)| f)
             .collect(),
-        stdin: mask & u16::from(COMPAT_STDIN_BIT) != 0,
+        stdin: mask & u32::from(COMPAT_STDIN_BIT) != 0,
         payload,
     })
 }
@@ -485,21 +524,32 @@ pub fn encode_compat_case(
     let selector = u8::try_from(selector).expect("a compat name selector fits a byte");
     let files: Vec<usize> = files.iter().map(|f| index(COMPAT_FILES, f)).collect();
     let wide = files.iter().any(|&i| i >= FIRST_WIDE_FILE);
-    let argc = args.len() + if wide { COMPAT_MAX_ARGS + 1 } else { 0 };
+    let wider = files.iter().any(|&i| i >= FIRST_WIDER_FILE);
+    let argc = args.len()
+        + if wider {
+            2 * (COMPAT_MAX_ARGS + 1)
+        } else if wide {
+            COMPAT_MAX_ARGS + 1
+        } else {
+            0
+        };
     let mut v = vec![selector, argc as u8];
     v.extend(args.iter().map(|a| index(COMPAT_TOKENS, a) as u8));
     let mut mask = if stdin {
-        u16::from(COMPAT_STDIN_BIT)
+        u32::from(COMPAT_STDIN_BIT)
     } else {
         0
     };
     for i in files {
         mask |= file_bit(i);
     }
-    let [low, high] = mask.to_le_bytes();
+    let [low, high, top, _] = mask.to_le_bytes();
     v.push(low);
-    if wide {
+    if wide || wider {
         v.push(high);
+    }
+    if wider {
+        v.push(top);
     }
     v.extend_from_slice(payload);
     v
@@ -1870,6 +1920,7 @@ mod tests {
         }
         seeds_of_0_12_0_decode_unchanged();
         seeds_of_0_13_decode_unchanged();
+        seeds_of_0_14_decode_unchanged();
     }
 
     /// A seed written by the 0.12.0 generator decodes as it did then: a
@@ -2008,12 +2059,126 @@ mod tests {
         }
     }
 
+    /// A seed written by the 0.14.0 generator decodes as it did then: a GNU
+    /// name byte below that release's eighteen names, an argument count
+    /// byte up to `2 × COMPAT_MAX_ARGS + 1` (a second mask byte past
+    /// [`COMPAT_MAX_ARGS`], never a third), tokens below its 148, and the
+    /// fifteen files on bits 0-3 and 5-15. The decoder is restated from
+    /// that release's tables; 0.15.0's third byte starts at a count byte
+    /// of `2 × (COMPAT_MAX_ARGS + 1)`, which no earlier generator wrote.
+    fn seeds_of_0_14_decode_unchanged() {
+        const OLD_NAMES: usize = 18;
+        const OLD_TOKENS: usize = COMPAT_TOKENS.len() - 16;
+        const OLD_FILES: usize = 15;
+        assert_eq!(COMPAT_NAMES[OLD_NAMES - 1], "zstdmt");
+        assert_eq!(COMPAT_TOKENS[OLD_TOKENS - 1], "a.tzst");
+        assert_eq!(COMPAT_FILES[OLD_FILES - 1], "d.dict");
+        let old_bit = |i: usize| 1u16 << if i < 4 { i } else { i + 1 };
+        let max = COMPAT_MAX_ARGS as u8;
+        for name in 0..OLD_NAMES as u8 {
+            for argc in [0, 3, max, max + 1, max + 4, 2 * max + 1] {
+                let wide = argc > max;
+                for high in if wide { 0..=255u8 } else { 0..=0 } {
+                    for low in [0u8, 1, 0x10, 0x55, 0xaa, 0xff] {
+                        let n = usize::from(argc % (max + 1));
+                        let token = (u32::from(low) * 7 + u32::from(argc)) as u8 % OLD_TOKENS as u8;
+                        let mut seed = vec![name, argc];
+                        seed.extend(std::iter::repeat_n(token, n));
+                        seed.push(low);
+                        if wide {
+                            seed.push(high);
+                        }
+                        seed.extend([0xA5, 0x5A]);
+                        let case = decode_compat_case(&seed).unwrap();
+                        let mask = u16::from_le_bytes([low, high]);
+                        let old_files: Vec<&str> = (0..OLD_FILES)
+                            .filter(|&i| mask & old_bit(i) != 0)
+                            .map(|i| COMPAT_FILES[i])
+                            .collect();
+                        assert_eq!(case.name, COMPAT_NAMES[usize::from(name)]);
+                        assert_eq!(case.args.len(), n);
+                        assert_eq!(case.files, old_files, "argc {argc} mask {mask:#x}");
+                        assert_eq!(case.stdin, low & 0x10 != 0);
+                        assert_eq!(case.payload, [0xA5, 0x5A], "argc {argc} mask {mask:#x}");
+                        if wide == old_files.iter().any(|f| COMPAT_FILES[7..].contains(f)) {
+                            let again = encode_compat_case(
+                                case.name,
+                                0,
+                                &case.args,
+                                &case.files,
+                                case.stdin,
+                                case.payload,
+                            );
+                            assert_eq!(again, seed, "argc {argc} mask {mask:#x}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// R5 (0.15.0): the lz4 family's `a.lz4` is the sixteenth file, bit 16,
+    /// the first of a third mask byte that follows only when the argument
+    /// count byte is at least `2 × (COMPAT_MAX_ARGS + 1)`.
+    #[test]
+    fn lz4_files_take_new_bits() {
+        assert_eq!(COMPAT_FILES[15], "a.lz4");
+        assert_eq!(COMPAT_FILES.len(), 16);
+        let k = COMPAT_TOKENS.iter().position(|t| *t == "-k").unwrap() as u8;
+        let f = COMPAT_TOKENS.iter().position(|t| *t == "a.lz4").unwrap() as u8;
+        let seed = encode_compat_case("lz4", 0, &["-k", "a.lz4"], &["a.lz4"], false, b"p");
+        let argc = 2 * (COMPAT_MAX_ARGS as u8 + 1) + 2;
+        assert_eq!(seed, [18, argc, k, f, 0, 0, 1, b'p']);
+        let case = decode_compat_case(&seed).unwrap();
+        assert_eq!(case.name, "lz4");
+        assert_eq!(case.args, ["-k", "a.lz4"]);
+        assert_eq!(case.files, ["a.lz4"]);
+        assert!(!case.stdin);
+        assert_eq!(case.payload, b"p");
+        // Old and new files and stdin together round-trip.
+        let all: Vec<&str> = COMPAT_FILES.to_vec();
+        let seed = encode_compat_case("unlz4", 0, &["-d"], &all, true, b"xy");
+        let case = decode_compat_case(&seed).unwrap();
+        assert_eq!(case.files, all);
+        assert!(case.stdin);
+        assert_eq!(case.payload, b"xy");
+        // Every bit of all three bytes.
+        let case = decode_compat_case(&[18, 18, 0xff, 0xff, 0xff]).unwrap();
+        assert_eq!(case.files, COMPAT_FILES);
+        // A third-byte case cut before its third byte: nothing to run.
+        assert!(decode_compat_case(&[18, 18, 0, 0]).is_none());
+        // Every token the lz4 family brought is in the table, and the
+        // tables still fit the wire's byte; every file is a token.
+        for t in [
+            "-BD",
+            "-BX",
+            "-B4",
+            "-B32",
+            "-12",
+            "--favor-decSpeed",
+            "--no-frame-crc",
+            "--content-size",
+            "-m",
+            "d.lz4dict",
+            "null",
+            "stdout",
+            "-c0",
+            "-hc",
+            "-y",
+            "a.lz4",
+        ] {
+            assert!(COMPAT_TOKENS.contains(&t), "{t}");
+        }
+        assert!(COMPAT_FILES.iter().all(|f| COMPAT_TOKENS.contains(f)));
+        assert!(COMPAT_TOKENS.len() <= 256);
+    }
+
     /// R5 (0.14.0): the zstd family's files continue on bits 13-15 of the
     /// second mask byte, which fills it.
     #[test]
     fn zstd_files_take_bits_past_the_stdin_bit() {
-        assert_eq!(&COMPAT_FILES[12..], ["a.zst", "a.tzst", "d.dict"]);
-        for (i, file) in COMPAT_FILES.iter().enumerate().skip(12) {
+        assert_eq!(&COMPAT_FILES[12..15], ["a.zst", "a.tzst", "d.dict"]);
+        for (i, file) in COMPAT_FILES.iter().enumerate().skip(12).take(3) {
             let bit = i + 1;
             assert!((13..=15).contains(&bit));
             let seed = encode_compat_case("zstd", 0, &["-k", file], &[file], false, b"p");
@@ -2042,8 +2207,7 @@ mod tests {
         assert!(case.stdin);
         // Every bit of both bytes: all fifteen files and stdin.
         let case = decode_compat_case(&[14, 9, 0xff, 0xff]).unwrap();
-        assert_eq!(case.files, COMPAT_FILES);
-        assert_eq!(case.files.len(), 15);
+        assert_eq!(case.files, COMPAT_FILES[..15]);
         assert!(case.stdin);
         // Every token the zstd family brought, and every file is a token.
         for t in [

@@ -3,7 +3,8 @@
 //! (0.12.0 Task 11: `gzip`, `gunzip`, `zcat`, `gzcat`, each as GNU and as
 //! Apple/BSD), the xz family (0.13.0 Task 9: `xz`, `unxz`, `xzcat`,
 //! `lzma`, `unlzma`, `lzcat`) and the zstd family (0.14.0 Task 10: `zstd`,
-//! `unzstd`, `zstdcat`, `zstdmt`), through
+//! `unzstd`, `zstdcat`, `zstdmt`) and the lz4 family (0.15.0 Task 8:
+//! `lz4`, `unlz4`, `lz4cat`, `lz4c`), through
 //! `stuffr_cli::compat::run_in_counted` and `bzip2recover::recover`.
 //!
 //! The only fuzz coverage of `stuffr::bzip2_stream::StreamReader`, the
@@ -92,6 +93,18 @@
 //!   output budget. A `--filelist` case whose list holds a `/`, `.` or
 //!   `..` is not run (a name could leave the run's directory, or reach a
 //!   file under `-r` by a path no operand spells).
+//! - the lz4 family exits 0, 1 or one of lz4's own codes
+//!   (`stuffr_cli::compat::lz4::EXIT_CODES`, the set the reference was
+//!   probed to produce, shared with the differential suite). Its read
+//!   bound (`run_lz4`, which says what it was measured at): per operand
+//!   naming a path exactly, at most two opens and `2 × len` bytes (`len`
+//!   under `--list`), plus one open and `len` bytes per `-D` value naming
+//!   it. It leaves no `.stuffr-lz4-*` temporary and no name
+//!   `could_be_written` does not allow (every non-flag token is a base: an
+//!   operand after the input names the output), and keeps the 8 MiB output
+//!   budget. The lz4 family's tokens bring `a.lz4`, the sixteenth
+//!   `COMPAT_FILES` entry, which takes a third mask byte (present when the
+//!   argument-count byte is at least 18); `-D` takes `d.dict`.
 //!
 //! **Memory under the xz names (Ruling P7).** libFuzzer's RSS limit
 //! (2 GiB by default) is the bound, and each verb stays inside it by a
@@ -236,6 +249,7 @@ fn could_be_written_with(name: &str, fold: bool, extra: &[&str]) -> bool {
         || name.starts_with(".stuffr-gzip-")
         || name.starts_with(".stuffr-xz-")
         || name.starts_with(".stuffr-zstd-")
+        || name.starts_with(".stuffr-lz4-")
         || ZSTD_NAMES.iter().any(|n| key(n) == name)
         || bases.iter().any(|b| {
             name == b
@@ -1170,12 +1184,147 @@ fn check_zstd_leftovers(dir: &Path, name: &str, args: &[&str], listed: &[&str]) 
     }
 }
 
-/// The lz4 family (0.15.0): only "no panic" and containment so far; Task 8
-/// adds its oracles (the recorded exit set, the read bounds, leftovers).
+/// Whether an lz4 run's operation is `--list`: the last token that sets a
+/// mode is `--list`, judged conservatively (a later token that could be a
+/// mode, `--decompress`/`--compress`/`--test` or a short cluster holding
+/// `d`, `z` or `t`, makes it "not list", which only loosens the bound).
+fn lz4_lists(args: &[&str]) -> bool {
+    let Some(at) = args.iter().rposition(|a| *a == "--list") else {
+        return false;
+    };
+    !args[at + 1..].iter().any(|a| {
+        matches!(*a, "--decompress" | "--compress" | "--test")
+            || (a.starts_with('-')
+                && !a.starts_with("--")
+                && a.bytes().any(|b| matches!(b, b'd' | b'z' | b't')))
+    })
+}
+
+/// The lz4 family (0.15.0), through `compat::run_in_counted` on this
+/// crate's pure tier. Asserted:
+///
+/// - exit is 0, 1 or one of lz4's own (`lz4::EXIT_CODES`, the codes the
+///   reference was probed to produce; shared with the differential suite,
+///   which checks every recorded row against the same set), or, over
+///   several inputs (`-m`, `-r`, `--list`, `lz4cat`), the count of inputs
+///   that failed, at most the number of inputs; stuffr's 3-7 as codes of
+///   their own never appear, and a panic is a crash;
+/// - read bound per path, with `m` the operands (non-`-D` tokens) that name
+///   it exactly (lz4 retries no suffix) and `len` its largest length at an
+///   open: at most `2m + d` opens and `2 × len × m + len × d` bytes, where
+///   `d` counts the `-D` values naming it (a dictionary is read whole
+///   once); under `--list` as the operation, `len × m + len × d` bytes (a
+///   header walk). A path nothing names is not opened. lz4 reads from
+///   standard input and writes through the budget only, so there is no
+///   other source of reads;
+/// - no `.stuffr-lz4-*` survives, and every name left in the run's
+///   directory is one `could_be_written` allows, with the non-flag tokens
+///   as bases too: an operand after the input names the output file
+///   (`lz4 a crc32` writes `crc32`);
+/// - standard output plus every new or changed file stays within the 8 MiB
+///   budget.
+///
+/// Measured (0.15.0 Task 8, `STUFFR_FUZZ_COMPAT_TRACE=1` over the seeds on
+/// the pure tier): every mode opens an operand once and reads it once,
+/// whole (`len`): compress (4000 of 4000), decompress, test, a concatenated
+/// pair of frames (2214 of 2214), a legacy frame (21 of 21), `-m` over two
+/// inputs (one open each), and `--list`, which walks the frames and reads
+/// the file once (1107 of 1107, plain and `-v`). A dictionary opens once and
+/// is read whole once, for compress and decompress alike. The `2 ×` leaves
+/// room for a re-read without admitting a third pass; `--list` is held to
+/// `len` because it is measured at exactly that.
 fn run_lz4(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
+    let before = contents(dir);
     let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
-    compat::run_in_counted(dir, name, os_args, stdin, Flavour::Gnu)
+    let (code, out, err, reads) = compat::run_in_counted(dir, name, os_args, stdin, Flavour::Gnu)
         .expect("a COMPAT_NAMES entry is a compat name");
+    let why = || String::from_utf8_lossy(&err).into_owned();
+    if std::env::var_os("STUFFR_FUZZ_COMPAT_TRACE").is_some() {
+        eprintln!("compat: {name} {args:?} -> {code}");
+        for (path, r) in &reads {
+            eprintln!("compat:   {path:?} {r:?}");
+        }
+    }
+    // `-D` takes the next token whole (`-D -h` names `-h`).
+    let mut dicts: Vec<&str> = Vec::new();
+    let mut operands: Vec<&str> = Vec::new();
+    let mut inputs = 0;
+    let mut after_dashes = false;
+    let mut it = args.iter();
+    while let Some(&a) = it.next() {
+        if after_dashes {
+            // `--` ends the options: every later token is a name.
+            operands.push(a);
+            inputs += 1;
+        } else if a == "--" {
+            after_dashes = true;
+        } else if a == "-D" {
+            if let Some(&d) = it.next() {
+                dicts.push(d);
+            }
+        } else if a == "-" {
+            inputs += 1;
+        } else if !a.starts_with('-') {
+            operands.push(a);
+            inputs += 1;
+        }
+    }
+    // Over several inputs (`-m`, `-r`, `--list`, or `lz4cat`) the exit is
+    // the number that failed, one for each input at most: `lz4cat - a b c`
+    // over four missing names exits 4 (the differential suite's
+    // `several_files_one_failing`; found by this target at its first
+    // replay, as an over-strict oracle).
+    let several = name == "lz4cat" || args.iter().any(|a| matches!(*a, "-m" | "-r" | "--list"));
+    assert!(
+        code == 0
+            || code == 1
+            || stuffr_cli::compat::lz4::EXIT_CODES.contains(&code)
+            || (several && (1..=inputs).contains(&code)),
+        "{name} {args:?}: exit {code} is not an lz4 exit code\n{}",
+        why()
+    );
+    let list = lz4_lists(args);
+    for (path, r) in &reads {
+        let file = path
+            .strip_prefix(dir)
+            .ok()
+            .and_then(|p| p.to_str())
+            .unwrap_or_else(|| panic!("{name}: opened {path:?}, outside {dir:?}"));
+        let count = |names: &[&str]| names.iter().filter(|n| **n == file).count() as u64;
+        let (m, d) = (count(&operands), count(&dicts));
+        let per_operand = if list { r.len } else { 2 * r.len };
+        assert!(
+            r.opens <= 2 * m + d,
+            "{name} {args:?}: {} opens of {file:?}, which {m} operand(s) and {d} \
+             dictionary value(s) name",
+            r.opens
+        );
+        assert!(
+            r.bytes <= per_operand * m + r.len * d,
+            "{name} {args:?} (list: {list}): read {} bytes of the {}-byte {file:?}, \
+             which {m} operand(s) and {d} dictionary value(s) name",
+            r.bytes,
+            r.len
+        );
+    }
+    // Operands after the input name the output, and `-m` appends `.lz4`
+    // to each: every token is a base for a stray-name check.
+    let bases: Vec<&str> = operands.iter().chain(&dicts).copied().collect();
+    if let Ok(listing) = std::fs::read_dir(dir) {
+        for e in listing.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            assert!(
+                !n.starts_with(".stuffr-lz4-"),
+                "{name} {args:?}: left its temporary {n:?}"
+            );
+            assert!(
+                could_be_written_with(&n, false, &bases)
+                    || (case_insensitive_fs() && could_be_written_with(&n, true, &bases)),
+                "{name} {args:?}: left a stray {n:?}"
+            );
+        }
+    }
+    check_budget(dir, name, args, &out, &before);
 }
 
 fuzz_target!(|data: &[u8]| {

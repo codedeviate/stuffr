@@ -892,6 +892,58 @@ const COMPAT_SHAPES: &[&str] = &[
     "unlz4-bad-flag",
     "lz4cat-version",
     "lz4c-help",
+    // Compressing: a file, standard input, the legacy format, the highest
+    // level with linked and checksummed blocks, the fast levels with the
+    // smaller block sizes, the optional header fields, the output-name
+    // words, `-m`, `--rm` (and on standard input: exit 50), a dictionary
+    // (present, and named but missing), the lz4c legacy spellings.
+    "lz4-compress-file",
+    "lz4-compress-stdin",
+    "lz4-legacy",
+    "lz4-level-12-blocks",
+    "lz4-fast-small-blocks",
+    "lz4-header-fields",
+    "lz4-output-null",
+    "lz4-output-stdout",
+    "lz4-multiple",
+    "lz4-rm",
+    "lz4-rm-stdin",
+    "lz4-dictionary",
+    "lz4-dictionary-missing",
+    "lz4c-legacy-c0",
+    "lz4c-legacy-hc",
+    "lz4c-legacy-y",
+    // Decoding: a file (its output name taken, then not), standard input,
+    // `lz4cat`, `-t`, a dictionary, `--list` (plain, verbose, a file that
+    // is no lz4 frame), `-m` over a failing operand, a sparse output into
+    // a pipe, and concatenated, skippable and legacy frames.
+    "unlz4-file",
+    "unlz4-overwrite",
+    "unlz4-stdin",
+    "lz4cat-file",
+    "lz4-test",
+    "lz4-decompress-dictionary",
+    "lz4-list",
+    "lz4-list-verbose",
+    "lz4-list-no-frame",
+    "lz4-multiple-one-failing",
+    "lz4-multiple-missing",
+    "lz4-sparse-zeros",
+    "lz4-concatenated",
+    "lz4-skippable-between",
+    "lz4-legacy-frame",
+    "lz4-legacy-then-frame",
+    "lz4-trailing-garbage",
+    // Damaged and hostile frames (Task 4's shapes): a flipped byte, a cut
+    // frame, a block-size word of 16 MiB under 4 MiB blocks, a content
+    // size of 2^63, a legacy block past its bound, a bare magic number.
+    "lz4-corrupt",
+    "lz4-truncated",
+    "lz4-hostile-block-size",
+    "lz4-hostile-content-size",
+    "lz4-hostile-legacy-block",
+    "lz4-list-bare-magic",
+    "lz4-list-corrupt",
 ];
 
 /// `plain` as one zstd frame, through this build's encoder (weak on the
@@ -1000,20 +1052,186 @@ fn xxh64(data: &[u8]) -> u64 {
     h ^ (h >> 32)
 }
 
-/// The lz4 family's seeds (0.15.0): the argument surface only, until
-/// Task 8 adds the coder's shapes.
-fn lz4_seed(shape: &str) -> Option<Vec<u8>> {
-    let (tool, case) = shape.split_once('-')?;
-    if !matches!(tool, "lz4" | "unlz4" | "lz4cat" | "lz4c") {
-        return None;
+/// xxHash32 of at most 15 bytes (a frame header's descriptor): the short
+/// path only, which is all a header checksum needs. Published vectors in
+/// `the_hand_built_compat_payloads_decode`.
+fn xxh32_short(data: &[u8]) -> u32 {
+    const P2: u32 = 2_246_822_519;
+    const P3: u32 = 3_266_489_917;
+    const P4: u32 = 668_265_263;
+    const P5: u32 = 374_761_393;
+    const P1: u32 = 2_654_435_761;
+    assert!(data.len() < 16, "the short path only");
+    let mut h = P5.wrapping_add(data.len() as u32);
+    let mut rest = data;
+    while rest.len() >= 4 {
+        let w = u32::from_le_bytes(rest[..4].try_into().unwrap());
+        h = h
+            .wrapping_add(w.wrapping_mul(P3))
+            .rotate_left(17)
+            .wrapping_mul(P4);
+        rest = &rest[4..];
     }
-    let args: &[&str] = match case {
-        "help" => &["-h"],
-        "bad-flag" => &["--bogus"],
-        "version" => &["-V"],
-        other => unreachable!("COMPAT_SHAPES lists an unhandled lz4 shape {other:?}"),
+    for &b in rest {
+        h = h
+            .wrapping_add(u32::from(b).wrapping_mul(P5))
+            .rotate_left(11)
+            .wrapping_mul(P1);
+    }
+    h ^= h >> 15;
+    h = h.wrapping_mul(P2);
+    h ^= h >> 13;
+    h = h.wrapping_mul(P3);
+    h ^ (h >> 16)
+}
+
+/// An lz4 frame header (doc/lz4_Frame_format.md): the magic, the
+/// descriptor `flg`, `bd` and `extra`, and the header checksum, the second
+/// byte of the descriptor's xxHash32.
+fn lz4_header(flg: u8, bd: u8, extra: &[u8]) -> Vec<u8> {
+    let mut d = vec![flg, bd];
+    d.extend_from_slice(extra);
+    let hc = (xxh32_short(&d) >> 8) as u8;
+    let mut v = vec![0x04, 0x22, 0x4d, 0x18];
+    v.extend_from_slice(&d);
+    v.push(hc);
+    v
+}
+
+/// A legacy-format frame (the magic `0x184C2102`) of one block holding
+/// `plain`'s first twelve bytes as literals, and that block alone.
+fn lz4_legacy_frame(plain: &[u8]) -> Vec<u8> {
+    let lits = &plain[..12];
+    let mut v = vec![0x02, 0x21, 0x4c, 0x18];
+    v.extend_from_slice(&(1 + lits.len() as u32).to_le_bytes());
+    v.push((lits.len() as u8) << 4);
+    v.extend_from_slice(lits);
+    v
+}
+
+/// A skippable frame (the magic `0x184D2A5n`).
+fn lz4_skippable(n: u8, body: &[u8]) -> Vec<u8> {
+    let mut v = vec![0x50 + n, 0x2a, 0x4d, 0x18];
+    v.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    v.extend_from_slice(body);
+    v
+}
+
+/// The lz4 family's seeds (0.15.0): the argument surface (Task 3), then the
+/// coder's shapes (Task 8).
+fn lz4_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> {
+    let Some((tool, case)) = shape.split_once('-') else {
+        return Ok(None);
     };
-    Some(encode_compat_case(tool, 0, args, &[], false, b""))
+    if !matches!(tool, "lz4" | "unlz4" | "lz4cat" | "lz4c") {
+        return Ok(None);
+    }
+    let z = |args: &[&str], files: &[&str], stdin: bool, payload: &[u8]| {
+        encode_compat_case(tool, 0, args, files, stdin, payload)
+    };
+    let text = compat_text(4000);
+    let frame = encoded(work, &text, "lz4", None)?;
+    let zeros = encoded(work, &[0u8; 20_000], "lz4", None)?;
+    let cat = |parts: &[&[u8]]| parts.concat();
+    // Header bytes for the hostile frames: version 01, independent blocks,
+    // content checksum (`0x64`), also a content size (`0x6c`); 4 MiB blocks.
+    let hostile_block = cat(&[&lz4_header(0x64, 0x70, &[]), &0x0100_0000u32.to_le_bytes()]);
+    let hostile_size = cat(&[
+        &lz4_header(0x6c, 0x70, &(1u64 << 63).to_le_bytes()),
+        &0u32.to_le_bytes(),
+    ]);
+    let mut legacy_big = vec![0x02, 0x21, 0x4c, 0x18];
+    legacy_big.extend_from_slice(&0x7fff_ffffu32.to_le_bytes());
+    legacy_big.extend_from_slice(&text[..64]);
+    let mut corrupt = frame.clone();
+    let mid = corrupt.len() / 2;
+    corrupt[mid] ^= 0x55;
+    Ok(Some(match case {
+        "help" => z(&["-h"], &[], false, b""),
+        "bad-flag" => z(&["--bogus"], &[], false, b""),
+        "version" => z(&["-V"], &[], false, b""),
+        "compress-file" => z(&["a"], &["a"], false, &text),
+        "compress-stdin" => z(&["-c"], &[], true, &text),
+        "legacy" => z(&["-l", "-c", "a"], &["a"], false, &text),
+        "level-12-blocks" => z(&["-12", "-BD", "-BX", "-c", "a"], &["a"], false, &text),
+        "fast-small-blocks" => z(&["--fast=3", "-B4", "-c", "a"], &["a"], false, &text),
+        "header-fields" => z(
+            &["--content-size", "--no-frame-crc", "-B32", "-c", "a"],
+            &["a"],
+            false,
+            &text,
+        ),
+        "output-null" => z(&["a", "null"], &["a"], false, &text),
+        "output-stdout" => z(&["a", "stdout"], &["a"], false, &text),
+        "multiple" => z(&["-m", "-f", "a", "a.lz4"], &["a", "a.lz4"], false, &text),
+        "rm" => z(&["--rm", "a"], &["a"], false, &text),
+        "rm-stdin" => z(&["-c", "--rm"], &[], true, &text),
+        "dictionary" => z(&["-D", "d.dict", "-c", "a"], &["a", "d.dict"], false, &text),
+        "dictionary-missing" => z(&["-D", "d.lz4dict", "-c", "a"], &["a"], false, &text),
+        "legacy-c0" => z(&["-c0", "a"], &["a"], false, &text),
+        "legacy-hc" => z(&["-hc", "-c", "a"], &["a"], false, &text),
+        "legacy-y" => z(&["-y", "a"], &["a"], false, &text),
+        "file" => z(&["a.lz4"], &["a.lz4"], false, &frame),
+        "overwrite" => z(&["a.lz4"], &["a.lz4", "a"], true, &frame),
+        "stdin" => z(&[], &[], true, &frame),
+        "test" => z(&["-t", "a.lz4"], &["a.lz4"], false, &frame),
+        "decompress-dictionary" => z(
+            &["-dc", "-D", "d.dict", "a.lz4"],
+            &["a.lz4", "d.dict"],
+            false,
+            &frame,
+        ),
+        "list" => z(&["--list", "a.lz4"], &["a.lz4"], false, &frame),
+        "list-verbose" => z(&["--list", "-v", "a.lz4"], &["a.lz4"], false, &frame),
+        "list-no-frame" => z(&["--list", "a"], &["a"], false, &text),
+        "multiple-one-failing" => z(&["-m", "-d", "a.lz4", "a"], &["a.lz4", "a"], false, &frame),
+        // Three inputs that do not exist: exit 3, the count that failed.
+        "multiple-missing" => z(&["-m", "d.lz4dict", "null", "stdout"], &[], false, b""),
+        "sparse-zeros" => z(&["--sparse", "-dc", "a.lz4"], &["a.lz4"], false, &zeros),
+        "concatenated" => z(
+            &["-dc", "a.lz4"],
+            &["a.lz4"],
+            false,
+            &cat(&[&frame, &frame]),
+        ),
+        "skippable-between" => z(
+            &["-dc", "a.lz4"],
+            &["a.lz4"],
+            false,
+            &cat(&[&frame, &lz4_skippable(3, b"skip me"), &frame]),
+        ),
+        "legacy-frame" => z(
+            &["-dc", "a.lz4"],
+            &["a.lz4"],
+            false,
+            &lz4_legacy_frame(&text),
+        ),
+        "legacy-then-frame" => z(
+            &["-dc", "a.lz4"],
+            &["a.lz4"],
+            false,
+            &cat(&[&lz4_legacy_frame(&text), &frame]),
+        ),
+        "trailing-garbage" => z(
+            &["-dc", "a.lz4"],
+            &["a.lz4"],
+            false,
+            &cat(&[&frame, b"\x01\x02\x03"]),
+        ),
+        "corrupt" => z(&["-dc", "a.lz4"], &["a.lz4"], false, &corrupt),
+        "truncated" => z(
+            &["-dc", "a.lz4"],
+            &["a.lz4"],
+            false,
+            &frame[..frame.len() - 9],
+        ),
+        "hostile-block-size" => z(&["-dc", "a.lz4"], &["a.lz4"], false, &hostile_block),
+        "hostile-content-size" => z(&["-t", "a.lz4"], &["a.lz4"], false, &hostile_size),
+        "hostile-legacy-block" => z(&["-dc", "a.lz4"], &["a.lz4"], false, &legacy_big),
+        "list-bare-magic" => z(&["--list", "a.lz4"], &["a.lz4"], false, &frame[..4]),
+        "list-corrupt" => z(&["--list", "a.lz4"], &["a.lz4"], false, &corrupt),
+        other => unreachable!("COMPAT_SHAPES lists an unhandled lz4 shape {other:?}"),
+    }))
 }
 
 /// The zstd family's seeds: the argument surface (Task 4), then the
@@ -1440,7 +1658,7 @@ fn compat_seed(work: &Path, shape: &str) -> stuffr_core::Result<Vec<u8>> {
     if let Some(seed) = zstd_seed(work, shape)? {
         return Ok(seed);
     }
-    if let Some(seed) = lz4_seed(shape) {
+    if let Some(seed) = lz4_seed(work, shape)? {
         return Ok(seed);
     }
     let text = compat_text(4000);
@@ -3586,6 +3804,19 @@ fn the_hand_built_compat_payloads_decode() {
         assert_eq!(read_all(&back).unwrap(), plain, "flags {flags:#x}");
     }
     assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+
+    // The hand-built lz4 headers: XXH32's published vectors, and the header
+    // checksum agreeing with the one this build's encoder writes.
+    assert_eq!(xxh32_short(b""), 0x02CC_5D05);
+    assert_eq!(xxh32_short(b"abc"), 0x32D1_53FF);
+    let frame = encoded(work.path(), &plain, "lz4", None).unwrap();
+    let flg_bd_extra = &frame[4..frame.len().min(14)];
+    let d_len = if frame[4] & 0x08 != 0 { 10 } else { 2 };
+    assert_eq!(
+        lz4_header(frame[4], frame[5], &flg_bd_extra[2..d_len]),
+        frame[..4 + d_len + 1],
+        "the header checksum helper must match a real header"
+    );
 
     // The hand-built zstd frames: XXH64's published vectors, and a frame
     // with its checksum (both sides of the 32-byte stripe loop) decoding
