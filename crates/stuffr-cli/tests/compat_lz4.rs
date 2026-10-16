@@ -2410,6 +2410,17 @@ mod unix {
         }
     }
 
+    /// Whether the case's refresh count depends on 200 ms passing between
+    /// two units of work: `-m`/`-r`, two or more `.lz4` operands (`lz4cat`,
+    /// `unlz4`), or an input of two legacy frames.
+    fn timing_exposed(c: &Case) -> bool {
+        let operands = c.args.iter().filter(|a| a.ends_with(".lz4")).count();
+        c.args.iter().any(|a| {
+            matches!(*a, "-m" | "-r" | "-dm" | "-tm" | "-fm" | "two.lz4")
+                || (a.starts_with('-') && !a.starts_with("--") && a.contains('m'))
+        }) || operands >= 2
+    }
+
     /// One case against the reference and stuffr, with this suite's
     /// normalisations; false when the reference is absent.
     fn compare(c: &Case) -> bool {
@@ -2420,8 +2431,16 @@ mod unix {
         let mut s = stuffr_as(c);
         mask_banners(&mut r, &mut s);
         // Spec deviation 2: refreshes, timing fields, thread count.
-        r.stderr = normalise_lz4_progress(&r.stderr);
-        s.stderr = normalise_lz4_progress(&s.stderr);
+        // A run with a second file or frame to draw for is timing-exposed:
+        // its refreshes are dropped, not collapsed (single-file rows still
+        // catch a missing or extra refresh).
+        let norm = if timing_exposed(c) {
+            normalise_lz4_progress_without_refreshes
+        } else {
+            normalise_lz4_progress
+        };
+        r.stderr = norm(&r.stderr);
+        s.stderr = norm(&s.stderr);
         // The reference's own race over how much a failed decode wrote.
         tolerate_lz4_partial_output(c, &mut r, &mut s);
         // Spec deviation 6: the pure tier's summary counts its own bytes,

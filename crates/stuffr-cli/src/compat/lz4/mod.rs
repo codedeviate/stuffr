@@ -47,7 +47,8 @@
 //!    the `Using N threads` count where two programs count the host's
 //!    cores differently. Refreshes are drawn at most every 200 ms (the
 //!    first one always; at display level 4 every chunk), which `display.rs`
-//!    pins from recordings; under a sandbox the clock is frozen at zero.
+//!    pins from recordings (a decode offers one per MiB where lz4 offers
+//!    one per 4 MiB chunk); under a sandbox the clock is frozen at zero.
 //! 3. An input that is also the output is never lost. Where the output
 //!    named is the input file itself (the same device and inode: `lz4 -f a
 //!    a`, `lz4 -df s.lz4 s.lz4`, a hard link, standard input redirected

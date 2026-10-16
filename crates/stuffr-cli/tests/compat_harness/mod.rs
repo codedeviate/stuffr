@@ -574,7 +574,20 @@ fn lz4_failed(stderr: &str) -> bool {
 /// clearing line and a refresh-looking text of another shape (one not led
 /// by `\r`, or with other numbers' syntax).
 pub fn normalise_lz4_progress(stderr: &str) -> String {
-    let racy = lz4_failed(stderr);
+    normalise_lz4(stderr, false)
+}
+
+/// [`normalise_lz4_progress`] for a run whose refreshes depend on whether
+/// 200 ms passed between two files or frames (the gate's clock spans them): a
+/// loaded machine can draw the second one on one side only, which collapsing
+/// cannot absorb. Every refresh segment is removed, on both sides; nothing
+/// else changes (the cleared line, the summaries and every other byte stay).
+pub fn normalise_lz4_progress_without_refreshes(stderr: &str) -> String {
+    normalise_lz4(stderr, true)
+}
+
+fn normalise_lz4(stderr: &str, drop_refreshes: bool) -> String {
+    let racy = lz4_failed(stderr) || drop_refreshes;
     let mut collapsed = String::with_capacity(stderr.len());
     let mut rest = stderr;
     while !rest.is_empty() {

@@ -88,6 +88,7 @@ pub(super) fn stream(
         let magic = le32(&magic_bytes);
         src.consume(4);
         if is_skippable_magic(magic) {
+            // probe: `lz4 -vv -t sk.lz4` (skippable frame then a frame).
             run.say(4, m::SKIPPABLE_DETECTED, &[]);
             let size = src.fill(4);
             if size.len() < 4 {
@@ -99,6 +100,7 @@ pub(super) fn stream(
                 return Err(run.exm(43, m::E43_SKIP, &[]));
             }
         } else if magic == LEGACY_MAGIC {
+            // probe: `lz4 -vv -t h.leg`, `lz4 -vv -t two.leg` (said per frame).
             run.say(4, m::LEGACY_DETECTED, &[]);
             legacy(run, src, sink, &mut d)?;
         } else if magic == MAGIC {

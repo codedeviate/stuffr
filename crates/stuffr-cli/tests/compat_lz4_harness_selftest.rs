@@ -91,6 +91,51 @@ Done in 0.00 s ==> 20.94 MiB/s  (cpu load : 67%)\n";
         }
     }
 
+    /// The timing-exposed mode removes every refresh segment (present or
+    /// absent on either side normalise equal) and nothing else: any other
+    /// one-byte difference is still reported, and the cleared line stays.
+    #[test]
+    fn dropping_mode_hides_only_refreshes() {
+        let refresh = "\rRead : 0 MiB   ==> 1.25%   ";
+        let a = normalise_lz4_progress_without_refreshes(V_COMPRESS);
+        assert!(!a.contains("Read :") && !a.contains("<progress>"));
+        assert!(
+            a.contains(
+                "\r<79 blanks>"
+                    .replace("<79 blanks>", &" ".repeat(79))
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            a,
+            normalise_lz4_progress_without_refreshes(&V_COMPRESS.replace(refresh, ""))
+        );
+        assert_eq!(
+            a,
+            normalise_lz4_progress_without_refreshes(
+                &V_COMPRESS.replace(refresh, &refresh.repeat(3))
+            )
+        );
+        for (from, to) in [
+            ("8800 bytes into 110", "8800 bytes into 111"),
+            ("==> 1.25%\n", "==> 1.26%\n"),
+            ("Using 3 threads", "Using 3 thread"),
+            ("(cpu load : 67%)", "(cpu load : 67%) "),
+        ] {
+            assert_ne!(
+                a,
+                normalise_lz4_progress_without_refreshes(&V_COMPRESS.replace(from, to)),
+                "{from}"
+            );
+        }
+        let d = normalise_lz4_progress_without_refreshes(V_DECOMPRESS);
+        assert!(!d.contains("Decompressed :"));
+        assert_ne!(
+            d,
+            normalise_lz4_progress_without_refreshes(&V_DECOMPRESS.replace("8800", "8801"))
+        );
+    }
+
     #[test]
     fn normalise_hides_only_timing_and_threads() {
         let a = normalise_lz4_progress(V_COMPRESS);
