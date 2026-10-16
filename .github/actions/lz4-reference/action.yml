@@ -1,0 +1,56 @@
+name: lz4 reference
+description: >-
+  Builds lz4 1.10.0 from the release tarball and exports
+  STUFFR_LZ4_REFERENCE, the oracle of the lz4 compatibility suites
+  (compat_lz4*). Every job that runs those tests needs it; with CI set, the
+  harness panics if the reference is missing or is not exactly 1.10.0.
+
+# The binary is built from the tarball, not taken from a distro: ubuntu and
+# Homebrew ship other releases, and the promise is byte identity with 1.10.0.
+# lz4 links nothing but libc and pthreads (multithreading is the default on
+# POSIX since 1.10), so the cached install needs no runtime libraries.
+#
+# The reference is GPL-2.0-or-later and is only ever RUN here, as a test
+# oracle: nobody reads its programs/ sources (the family is a clean-room
+# implementation), and the built binary is not distributed.
+
+runs:
+  using: composite
+  steps:
+    # Keyed on the version, the OS and the CPU: the install is a native build.
+    - name: cache the lz4 1.10.0 install
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/lz4-1.10.0
+        key: lz4-1.10.0-${{ runner.os }}-${{ runner.arch }}
+
+    # The SHA-256 is the one in the release's own lz4-1.10.0.tar.gz.sha256,
+    # and matches a local `shasum -a 256` of two independent downloads.
+    - name: build lz4 1.10.0
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        url=https://github.com/lz4/lz4/releases/download/v1.10.0/lz4-1.10.0.tar.gz
+        sha256=537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b
+        src="$RUNNER_TEMP/lz4-src"
+        mkdir -p "$src"
+        curl -fsSL --retry 3 -o "$src/lz4-1.10.0.tar.gz" "$url"
+        echo "$sha256  $src/lz4-1.10.0.tar.gz" | shasum -a 256 -c -
+        tar -xzf "$src/lz4-1.10.0.tar.gz" -C "$src"
+        make -C "$src/lz4-1.10.0/programs" lz4 -j"$(getconf _NPROCESSORS_ONLN)"
+        mkdir -p "$RUNNER_TEMP/lz4-1.10.0/bin"
+        cp "$src/lz4-1.10.0/programs/lz4" "$RUNNER_TEMP/lz4-1.10.0/bin/lz4"
+
+    - name: use it as the reference
+      shell: bash
+      run: |
+        set -euo pipefail
+        bin="$RUNNER_TEMP/lz4-1.10.0/bin"
+        for l in unlz4 lz4cat lz4c; do ln -sf lz4 "$bin/$l"; done
+        echo "STUFFR_LZ4_REFERENCE=$bin/lz4" >> "$GITHUB_ENV"
+        if ! "$bin/lz4" -V; then
+          echo "::error::the lz4 reference at $bin/lz4 does not start (cache hit: ${{ steps.cache.outputs.cache-hit }}); the cache is broken. This is not a missing reference." >&2
+          exit 1
+        fi
