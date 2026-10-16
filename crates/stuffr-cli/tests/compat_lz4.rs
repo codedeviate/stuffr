@@ -3590,6 +3590,45 @@ mod unix {
         check("concatenation_and_trailing_data", &cases);
     }
 
+    /// A block word of `0x8000_0000` (stored, length 0) is an empty block,
+    /// not the end mark: liblz4 ends a frame at a word of exactly 0. With
+    /// and without block and content checksums, followed by more blocks, by
+    /// garbage and by nothing (found by review of the zstd family's lz4
+    /// decode, which first spun on it on the pure tier).
+    #[test]
+    fn a_stored_block_of_length_zero() {
+        let empty_crc = le32(0x02CC_5D05);
+        let stored0 = le32(0x8000_0000);
+        let stored2 = le32(0x8000_0002);
+        let end = le32(0);
+        let streams: Vec<Vec<u8>> = vec![
+            cat(&[&header(0x60, 0x40, &[]), &stored0, &end, b"xxxx"]),
+            cat(&[&header(0x64, 0x40, &[]), &stored0, &end, &empty_crc]),
+            cat(&[&header(0x64, 0x40, &[]), &stored0, &end]),
+            cat(&[
+                &header(0x60, 0x40, &[]),
+                &stored0,
+                &stored2,
+                b"ab",
+                &stored0,
+                &end,
+            ]),
+            cat(&[&header(0x70, 0x40, &[]), &stored0, &empty_crc, &end]),
+            cat(&[&header(0x70, 0x40, &[]), &stored0, &end]),
+            cat(&[&header(0x60, 0x40, &[]), &stored0]),
+            cat(&[&header(0x60, 0x70, &[]), &stored0, &end]),
+        ];
+        let mut cases = Vec::new();
+        for (i, s) in streams.into_iter().enumerate() {
+            let name = leak(format!("z{i}.lz4"));
+            cases.push(lz4_case("lz4", &["-d", name, "o"], vec![(name, s.clone())]));
+            cases.push(lz4_case("lz4", &["-t", name], vec![(name, s.clone())]));
+            cases.push(lz4_case("lz4cat", &[name], vec![(name, s.clone())]));
+            cases.push(piped("lz4", &["-d", "-", "o"], vec![], s.clone()));
+        }
+        check("a_stored_block_of_length_zero", &cases);
+    }
+
     /// Review Focus 4: a 4 MiB frame whose block word claims 16 MiB, a
     /// 64 KiB frame claiming 128 KiB, a legacy block claiming more than
     /// `LZ4_compressBound(8 MiB)` and one just under it, a content size of

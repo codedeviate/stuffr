@@ -101,9 +101,9 @@ mod unix {
     /// zstd frames on the C tier (`zstd-c`), `--format=gzip` with C zlib
     /// (`zlib-c`; spike S2 measured zlib's bytes identical to the
     /// reference's), `--format=xz|lzma` with liblzma (`xz-c`, 5.8.4 on both
-    /// sides), `--format=lz4` with liblz4 (`lz4-c`, 1.10.0 through `lz4_opts`,
-    /// 0.15.0 Task 7; the pure tier is `lz4_flex`'s). The last
-    /// `--format=` counts.
+    /// sides), `--format=lz4` with liblz4 (`lz4-c`, 1.10.0 through
+    /// `lz4_opts`; the pure tier is `lz4_flex`'s). The last `--format=`
+    /// counts.
     fn exact_for(args: &[&str]) -> bool {
         let format = args
             .iter()
@@ -2466,6 +2466,43 @@ mod unix {
                 flipped(foreign_packed("lz4", &[], &t), 4, 7),
             ),
             ("lz4bd.lz4", flipped(foreign_packed("lz4", &[], &t), 5, 4)),
+            // A block word of `0x8000_0000` is an empty stored block, not the
+            // end mark (liblz4 ends the frame at a word of exactly 0).
+            (
+                "zeroblock.lz4",
+                [
+                    &[0x04, 0x22, 0x4d, 0x18, 0x60, 0x40, 0x82][..],
+                    &[0, 0, 0, 0x80, 0, 0, 0, 0],
+                    b"xxxx",
+                ]
+                .concat(),
+            ),
+            (
+                "zeroblockck.lz4",
+                [
+                    &[0x04, 0x22, 0x4d, 0x18, 0x64, 0x40, 0xa7][..],
+                    &[0, 0, 0, 0x80, 0, 0, 0, 0, 0x05, 0x5d, 0xcc, 0x02],
+                ]
+                .concat(),
+            ),
+            (
+                "zeroblockdata.lz4",
+                [
+                    &[0x04, 0x22, 0x4d, 0x18, 0x60, 0x40, 0x82][..],
+                    &[0, 0, 0, 0x80, 2, 0, 0, 0x80],
+                    b"ab",
+                    &[0, 0, 0, 0x80, 0, 0, 0, 0],
+                ]
+                .concat(),
+            ),
+            (
+                "zeroblockbck.lz4",
+                [
+                    &[0x04, 0x22, 0x4d, 0x18, 0x70, 0x40, 0xad][..],
+                    &[0, 0, 0, 0x80, 0x05, 0x5d, 0xcc, 0x02, 0, 0, 0, 0],
+                ]
+                .concat(),
+            ),
             ("lz4hc.lz4", {
                 let v = foreign_packed("lz4", &[], &t);
                 if v.is_empty() {

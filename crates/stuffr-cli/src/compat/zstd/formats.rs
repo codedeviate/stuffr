@@ -1145,7 +1145,10 @@ impl Lz4Member {
         match self.unit {
             Unit::Header => {
                 self.gathered.extend_from_slice(piece);
-                // A header that does not parse is the decoder's to refuse.
+                // A header that does not parse is the decoder's to refuse:
+                // it errors at the same byte, since `parse_frame_header`
+                // follows `LZ4F_decodeHeader`'s checks in its order, and
+                // this tracker then never advances.
                 if let Ok(Some(h)) = lz4_opts::parse_frame_header(&self.gathered)
                     && h.header_len == self.gathered.len()
                 {
@@ -1167,12 +1170,19 @@ impl Lz4Member {
                     ]);
                     self.gathered.clear();
                     let size = (word & 0x7FFF_FFFF) as usize;
-                    self.unit = if size == 0 {
+                    // `LZ4F_decompress` ends the frame only at a word that
+                    // is exactly 0: `0x8000_0000` is an empty stored block.
+                    let total = size.min(self.max_block) + 4 * usize::from(self.block_checksum);
+                    self.unit = if word == 0 {
                         Unit::Trailer(if self.content_checksum { 4 } else { 0 })
+                    } else if total == 0 {
+                        // An empty block: the next word's first byte is what
+                        // moves the decoder past it.
+                        Unit::Word
                     } else {
                         // Over the frame's maximum is refused by the decoder
                         // as soon as the word is in.
-                        Unit::Block(size.min(self.max_block) + 4 * usize::from(self.block_checksum))
+                        Unit::Block(total)
                     };
                 }
             }
@@ -1203,9 +1213,15 @@ impl Coder for Lz4Member {
             if used == input.len() {
                 return call(used, made, Ok(false));
             }
-            let n = self.take(input.len() - used);
+            let n = self.take(input.len() - used).max(1);
             let piece = &input[used..used + n];
+            let before = self.pending.len();
             match self.dec.decompress(piece, &mut self.pending) {
+                Ok((0, hint)) if hint != 0 && self.pending.len() == before => {
+                    // No progress on a non-empty piece: never spin (a
+                    // tracker and decoder that disagree on a hostile frame).
+                    return call(used, made, Err(Fail::Lz4(m::LZ4F_GENERIC)));
+                }
                 Ok((taken, hint)) => {
                     used += taken;
                     self.ended = hint == 0;

@@ -1472,3 +1472,41 @@ mod pure_tier {
         }
     }
 }
+
+/// A stored block whose size word is `0x80000000` (stored flag, length 0)
+/// is an empty block, not the end mark: `LZ4F_decompress` ends the frame
+/// only at a word that is exactly 0. Both tiers decode the frame below to
+/// `b"ab"`, with and without a content checksum (the tracker in zstd's
+/// lz4 decode path relies on it).
+#[test]
+fn a_stored_block_of_length_zero_is_not_the_end_mark() {
+    for content_checksum in [false, true] {
+        let h = FrameHeader {
+            content_checksum,
+            ..plain_header(BlockSizeId::Max64Kb)
+        };
+        let mut f = header(&h);
+        f.extend_from_slice(&0x8000_0000u32.to_le_bytes());
+        f.extend_from_slice(&0x8000_0002u32.to_le_bytes());
+        f.extend_from_slice(b"ab");
+        f.extend_from_slice(&0x8000_0000u32.to_le_bytes());
+        f.extend_from_slice(&0u32.to_le_bytes());
+        if content_checksum {
+            f.extend_from_slice(&xxh32(b"ab").to_le_bytes());
+        }
+        for chunk in [1, 3, 64 << 10] {
+            let mut d = Decoder::new(&DecodeOptions::default()).unwrap();
+            let out = decode_with(&mut d, &f, chunk).unwrap();
+            assert_eq!(out, b"ab", "checksum {content_checksum}, chunk {chunk}");
+        }
+        // An empty frame: only empty blocks.
+        let mut e = header(&h);
+        e.extend_from_slice(&0x8000_0000u32.to_le_bytes());
+        e.extend_from_slice(&0u32.to_le_bytes());
+        if content_checksum {
+            e.extend_from_slice(&xxh32(b"").to_le_bytes());
+        }
+        let out = decode(&DecodeOptions::default(), &e).unwrap();
+        assert!(out.is_empty(), "checksum {content_checksum}");
+    }
+}
