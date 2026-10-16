@@ -36,7 +36,7 @@ mod unix {
     }
 
     const STUFFR: &str = env!("CARGO_BIN_EXE_stuffr");
-    const ALL: [&str; 18] = [
+    const ALL: [&str; 22] = [
         "bzip2",
         "bunzip2",
         "bzcat",
@@ -55,6 +55,10 @@ mod unix {
         "unzstd",
         "zstdcat",
         "zstdmt",
+        "lz4",
+        "unlz4",
+        "lz4cat",
+        "lz4c",
     ];
 
     /// A scratch directory removed on drop.
@@ -139,9 +143,10 @@ mod unix {
         assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
         assert!(s.0.join("bzcat").symlink_metadata().is_ok());
         assert!(s.0.join("bzip2").symlink_metadata().is_err());
-        let o = il(&s.0, &["--names", "lz4"]);
+        // lz4 became a compatibility name in 0.15.0; brotli is none.
+        let o = il(&s.0, &["--names", "brotli"]);
         assert_eq!(o.status.code(), Some(2));
-        assert!(stderr(&o).contains("lz4"));
+        assert!(stderr(&o).contains("brotli"));
     }
 
     #[test]
@@ -526,6 +531,51 @@ mod unix {
         }
         let one = Scratch::new("zstdmt");
         let o = il(&one.0, &["--names", "zstdmt,unzstd"]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert_eq!(std::fs::read_dir(&one.0).unwrap().count(), 2);
+    }
+
+    /// The four lz4 names are links like the rest (twenty-two in all), and
+    /// a link runs as its name: `-h` prints its own name in the usage line
+    /// (to standard error, as lz4 does), `lz4c`'s lists the legacy
+    /// arguments, and `-V` prints stuffr's banner (spec deviation 1).
+    #[test]
+    fn install_links_creates_the_lz4_names() {
+        let s = Scratch::new("lz4");
+        let o = il(&s.0, &[]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert_eq!(std::fs::read_dir(&s.0).unwrap().count(), 22);
+        let dir = s.0.canonicalize().unwrap();
+        let banner = format!(
+            "*** lz4 v1.10.0 64-bit multithread (stuffr {}), by Yann Collet ***\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        for n in ["lz4", "unlz4", "lz4cat", "lz4c"] {
+            let link = dir.join(n);
+            assert_eq!(std::fs::read_link(&link).unwrap(), canon_stuffr(), "{n}");
+            let o = Command::new(&link).arg("-h").output().unwrap();
+            assert_eq!(o.status.code(), Some(0), "{n}: {}", stderr(&o));
+            assert_eq!(stdout(&o), "", "{n}");
+            let usage = format!("Usage : \n      {n} [arg] [input] [output] \n");
+            assert!(
+                stderr(&o).starts_with(&format!("{banner}{usage}")),
+                "{n}: {}",
+                stderr(&o)
+            );
+            assert_eq!(
+                stderr(&o).contains("Legacy arguments : \n"),
+                n == "lz4c",
+                "{n}"
+            );
+            let o = Command::new(&link).arg("-V").output().unwrap();
+            assert_eq!(
+                (o.status.code(), stdout(&o)),
+                (Some(0), banner.clone()),
+                "{n}"
+            );
+        }
+        let one = Scratch::new("lz4c");
+        let o = il(&one.0, &["--names", "lz4c,unlz4"]);
         assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
         assert_eq!(std::fs::read_dir(&one.0).unwrap().count(), 2);
     }

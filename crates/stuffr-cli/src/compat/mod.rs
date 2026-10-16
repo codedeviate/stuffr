@@ -13,6 +13,7 @@ pub mod bzip2recover;
 pub mod gzip;
 mod host;
 pub mod links;
+pub mod lz4;
 pub mod xz;
 pub mod zstd;
 
@@ -37,6 +38,8 @@ pub enum Family {
     Xz,
     /// `zstd`, `unzstd`, `zstdcat`, `zstdmt`.
     Zstd,
+    /// `lz4`, `unlz4`, `lz4cat`, `lz4c`.
+    Lz4,
 }
 
 /// Invoked name to family. The name is matched exactly, after the directory
@@ -60,6 +63,10 @@ const NAMES: &[(&str, Family)] = &[
     ("unzstd", Family::Zstd),
     ("zstdcat", Family::Zstd),
     ("zstdmt", Family::Zstd),
+    ("lz4", Family::Lz4),
+    ("unlz4", Family::Lz4),
+    ("lz4cat", Family::Lz4),
+    ("lz4c", Family::Lz4),
 ];
 
 /// Every compatibility name, from the one table `family_for` also reads.
@@ -104,6 +111,7 @@ pub fn dispatch(args: Vec<OsString>) -> Option<ExitCode> {
         Family::Gzip => gzip::run(name, rest),
         Family::Xz => xz::run(name, &argv0, rest),
         Family::Zstd => zstd::run(name, &argv0, rest),
+        Family::Lz4 => lz4::run(name, &argv0, rest),
     })
 }
 
@@ -131,7 +139,8 @@ pub fn run_in(
 /// from each, by path. Only the gzip family counts its inputs; the map is
 /// empty for the others. The xz family runs with a fixed machine and a
 /// capped decoder memory limit ([`xz::run_in_counted`]), the zstd family
-/// with a fixed machine and R9's bounds ([`zstd::run_in_counted`]).
+/// with a fixed machine and R9's bounds ([`zstd::run_in_counted`]), and
+/// the lz4 family with a fixed machine ([`lz4::run_in_counted`]).
 #[doc(hidden)]
 pub fn run_in_counted(
     dir: &Path,
@@ -153,6 +162,7 @@ pub fn run_in_counted(
         Family::Gzip => gzip::run_in_counted(gzip_flavour, dir, canonical, &args, stdin, &|_| None),
         Family::Xz => xz::run_in_counted(dir, canonical, &args, stdin, &|_| None),
         Family::Zstd => zstd::run_in_counted(dir, canonical, &args, stdin, &|_| None),
+        Family::Lz4 => lz4::run_in_counted(dir, canonical, &args, stdin, &|_| None),
     })
 }
 
@@ -442,7 +452,11 @@ mod tests {
                 "zstd",
                 "unzstd",
                 "zstdcat",
-                "zstdmt"
+                "zstdmt",
+                "lz4",
+                "unlz4",
+                "lz4cat",
+                "lz4c"
             ]
         );
     }

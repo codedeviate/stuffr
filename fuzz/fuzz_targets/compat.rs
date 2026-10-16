@@ -1170,6 +1170,14 @@ fn check_zstd_leftovers(dir: &Path, name: &str, args: &[&str], listed: &[&str]) 
     }
 }
 
+/// The lz4 family (0.15.0): only "no panic" and containment so far; Task 8
+/// adds its oracles (the recorded exit set, the read bounds, leftovers).
+fn run_lz4(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
+    let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
+    compat::run_in_counted(dir, name, os_args, stdin, Flavour::Gnu)
+        .expect("a COMPAT_NAMES entry is a compat name");
+}
+
 fuzz_target!(|data: &[u8]| {
     if data.len() > COMPAT_FUZZ_MAX_INPUT {
         return;
@@ -1203,6 +1211,7 @@ fuzz_target!(|data: &[u8]| {
         }
         "bzip2" | "bunzip2" | "bzcat" => run_bzip2(&dir, case.name, &case.args, stdin),
         "zstd" | "unzstd" | "zstdcat" | "zstdmt" => run_zstd(&dir, case.name, &case.args, stdin),
+        "lz4" | "unlz4" | "lz4cat" | "lz4c" => run_lz4(&dir, case.name, &case.args, stdin),
         other => unreachable!("{other} is in COMPAT_NAMES but has no arm here"),
     }
 

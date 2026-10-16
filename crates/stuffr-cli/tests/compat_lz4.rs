@@ -163,6 +163,7 @@ mod unix {
             "bc.lz4" => blocks(),
             "leg.lz4" => legacy(),
             "dict" => text()[..880].to_vec(),
+            ".lz4" => text(),
             "dict2" => b"completely different dictionary content 0123456789\n".repeat(20),
             "dict_b.lz4" => {
                 // The reference reads a dictionary only from a file.
@@ -441,6 +442,1135 @@ mod unix {
                 1,
                 "Cannot determine an output filename \nIncorrect parameters\nUsage : \n",
             ),
+            // ---- Task 3 (2026-10-16): the grammar, probed for cli.rs ----
+            row(
+                T3,
+                "-B1x: B1 is no size",
+                "lz4",
+                &["-B1x", "a"],
+                &["a"],
+                1,
+                usage,
+            ),
+            row(
+                T3,
+                "a dash inside -B4-",
+                "lz4",
+                &["-B4-", "a"],
+                &["a"],
+                1,
+                "using blocks of size 64 KB \nIncorrect parameters\n",
+            ),
+            row(
+                T3,
+                "-BK: B needs a digit",
+                "lz4",
+                &["-BK", "a"],
+                &["a"],
+                1,
+                usage,
+            ),
+            row(
+                T3,
+                "-B wraps to 31",
+                "lz4",
+                &["-B4294967327", "a"],
+                &["a"],
+                1,
+                usage,
+            ),
+            row(
+                T3,
+                "-B wraps to 0",
+                "lz4",
+                &["-B42949672960", "a"],
+                &["a"],
+                1,
+                usage,
+            ),
+            row(
+                T3,
+                "-B4096M wraps to 0",
+                "lz4",
+                &["-B4096M", "a"],
+                &["a"],
+                1,
+                usage,
+            ),
+            row(
+                T3,
+                "-B4 then -V",
+                "lz4",
+                &["-B4", "-V"],
+                &[],
+                0,
+                "using blocks of size 64 KB \n",
+            ),
+            row(
+                T3,
+                "-B7BD then -V",
+                "lz4",
+                &["-B7BD", "-V"],
+                &[],
+                0,
+                "using blocks of size 4096 KB \n",
+            ),
+            row(
+                T3,
+                "-B4B5 prints both",
+                "lz4",
+                &["-B4B5", "-V"],
+                &[],
+                0,
+                "using blocks of size 64 KB \nusing blocks of size 256 KB \n",
+            ),
+            row(
+                T3,
+                "-B33 is bytes",
+                "lz4",
+                &["-B33", "-V"],
+                &[],
+                0,
+                "using blocks of size 33 bytes \n",
+            ),
+            row(
+                T3,
+                "-B1023 is bytes",
+                "lz4",
+                &["-B1023", "-V"],
+                &[],
+                0,
+                "using blocks of size 1023 bytes \n",
+            ),
+            row(
+                T3,
+                "-B1024 is 1 KB",
+                "lz4",
+                &["-B1024", "-V"],
+                &[],
+                0,
+                "using blocks of size 1 KB \n",
+            ),
+            row(
+                T3,
+                "-B65537 is 64 KB",
+                "lz4",
+                &["-B65537", "-V"],
+                &[],
+                0,
+                "using blocks of size 64 KB \n",
+            ),
+            row(
+                T3,
+                "-B is capped at 4 MiB",
+                "lz4",
+                &["-B99999999999", "-V"],
+                &[],
+                0,
+                "using blocks of size 4096 KB \n",
+            ),
+            row(
+                T3,
+                "-B4194305K wraps to 1 KB",
+                "lz4",
+                &["-B4194305K", "-V"],
+                &[],
+                0,
+                "using blocks of size 1 KB \n",
+            ),
+            row(
+                T3,
+                "-B64KiB",
+                "lz4",
+                &["-B64KiB", "-V"],
+                &[],
+                0,
+                "using blocks of size 64 KB \n",
+            ),
+            row(
+                T3,
+                "-B64k is bytes",
+                "lz4",
+                &["-B64k", "-V"],
+                &[],
+                0,
+                "using blocks of size 64 bytes \n",
+            ),
+            row(
+                T3,
+                "-q before -B silences it",
+                "lz4",
+                &["-q", "-B4", "-V"],
+                &[],
+                0,
+                "",
+            ),
+            row(
+                T3,
+                "-q after -B does not",
+                "lz4",
+                &["-B4", "-q", "-V"],
+                &[],
+                0,
+                "using blocks of size 64 KB \n",
+            ),
+            row(
+                T3,
+                "-B4v",
+                "lz4",
+                &["-B4v", "-V"],
+                &[],
+                0,
+                "using blocks of size 64 KB \n",
+            ),
+            row(T3, "-T4x", "lz4", &["-T4x", "a"], &["a"], 1, usage),
+            row(T3, "-TK then -V", "lz4", &["-TK", "-V"], &[], 0, ""),
+            row(
+                T3,
+                "--threads=x",
+                "lz4",
+                &["--threads=x", "a"],
+                &["a"],
+                1,
+                "error: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB are allowed \n",
+            ),
+            row(
+                T3,
+                "--threads=4x",
+                "lz4",
+                &["--threads=4x", "a"],
+                &["a"],
+                1,
+                "error: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB are allowed \n",
+            ),
+            row(
+                T3,
+                "--threads4 reads the next argument",
+                "lz4",
+                &["--threads4", "a"],
+                &["a"],
+                1,
+                "error: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB are allowed \n",
+            ),
+            row(
+                T3,
+                "--threads last",
+                "lz4",
+                &["a", "--threads"],
+                &["a"],
+                1,
+                "error: missing command argument \n",
+            ),
+            row(
+                T3,
+                "--threads then an option",
+                "lz4",
+                &["--threads", "-c", "a"],
+                &["a"],
+                1,
+                "error: command cannot be separated from its argument by another command \n",
+            ),
+            row(
+                T3,
+                "--threads then -",
+                "lz4",
+                &["--threads", "-", "a"],
+                &["a"],
+                1,
+                "error: command cannot be separated from its argument by another command \n",
+            ),
+            row(
+                T3,
+                "--threads 4 then -V",
+                "lz4",
+                &["--threads", "4", "-V"],
+                &[],
+                0,
+                "",
+            ),
+            row(
+                T3,
+                "--threadsx 4 then -V",
+                "lz4",
+                &["--threadsx", "4", "-V"],
+                &[],
+                0,
+                "",
+            ),
+            row(
+                T3,
+                "--threads= then -V",
+                "lz4",
+                &["--threads=", "-V"],
+                &[],
+                0,
+                "",
+            ),
+            row(
+                T3,
+                "-qq --threads=x is silent",
+                "lz4",
+                &["-qq", "--threads=x"],
+                &[],
+                1,
+                "",
+            ),
+            row(T3, "--fast=", "lz4", &["--fast=", "a"], &["a"], 1, usage),
+            row(
+                T3,
+                "--fast=+1",
+                "lz4",
+                &["--fast=+1", "a"],
+                &["a"],
+                1,
+                usage,
+            ),
+            row(T3, "--fast3", "lz4", &["--fast3", "a"], &["a"], 1, usage),
+            row(T3, "--fastx", "lz4", &["--fastx", "a"], &["a"], 1, usage),
+            row(
+                T3,
+                "--fast wraps to 0",
+                "lz4",
+                &["--fast=4294967296", "a"],
+                &["a"],
+                1,
+                usage,
+            ),
+            row(
+                T3,
+                "--fast=0K",
+                "lz4",
+                &["--fast=0K", "a"],
+                &["a"],
+                1,
+                usage,
+            ),
+            row(
+                T3,
+                "--fast=1x then -V",
+                "lz4",
+                &["--fast=1x", "-V"],
+                &[],
+                0,
+                "",
+            ),
+            row(T3, "--best=1", "lz4", &["--best=1", "a"], &["a"], 1, usage),
+            row(
+                T3,
+                "--decomp is no prefix",
+                "lz4",
+                &["--decomp", "a"],
+                &["a"],
+                1,
+                usage,
+            ),
+            row(
+                T3,
+                "--favor-decspeed",
+                "lz4",
+                &["--favor-decspeed", "a"],
+                &["a"],
+                1,
+                usage,
+            ),
+            row(
+                T3,
+                "--no-keep",
+                "lz4",
+                &["--no-keep", "a"],
+                &["a"],
+                1,
+                usage,
+            ),
+            row(T3, "--legacy", "lz4", &["--legacy", "a"], &["a"], 1, usage),
+            row(
+                T3,
+                "--recursive",
+                "lz4",
+                &["--recursive", "a"],
+                &["a"],
+                1,
+                usage,
+            ),
+            row(T3, "--long-help", "lz4", &["--long-help"], &[], 1, usage),
+            row(T3, "-d-c", "lz4", &["-d-c", "a"], &["a"], 1, usage),
+            row(
+                T3,
+                "a space inside an aggregate",
+                "lz4",
+                &["-d -c", "a"],
+                &["a"],
+                1,
+                usage,
+            ),
+            row(
+                T3,
+                "-qq silences a usage error",
+                "lz4",
+                &["-qq", "--bogus"],
+                &[],
+                1,
+                "",
+            ),
+            row(
+                T3,
+                "-qq after the error does not",
+                "lz4",
+                &["--bogus", "-qq"],
+                &[],
+                1,
+                usage,
+            ),
+            row(T3, "-qq -B3", "lz4", &["-qq", "-B3"], &[], 1, ""),
+            row(T3, "-y is lz4c's", "lz4", &["-y", "a"], &["a"], 1, usage),
+            row(T3, "-cy is lz4c's", "lz4", &["-cy", "a"], &["a"], 1, usage),
+            row(T3, "-bK", "lz4", &["-bK", "a"], &["a"], 1, usage),
+            row(T3, "-bx", "lz4", &["-bx", "a"], &["a"], 1, usage),
+            row(T3, "-e3x", "lz4", &["-e3x", "a"], &["a"], 1, usage),
+            row(T3, "-i3x", "lz4", &["-i3x", "a"], &["a"], 1, usage),
+            row(T3, "-e1Kx", "lz4", &["-e1Kx", "a"], &["a"], 1, usage),
+            row(
+                T3,
+                "-dD with nothing after",
+                "lz4",
+                &["a", "-dD"],
+                &["a"],
+                1,
+                usage,
+            ),
+            row(T3, "-S then -V", "lz4", &["-S", "-V"], &[], 0, ""),
+            // Help and version: printed as soon as read, whatever the level.
+            row(
+                T3,
+                "-h",
+                "lz4",
+                &["-h"],
+                &[],
+                0,
+                "Usage : \n      lz4 [arg] [input] [output] \n",
+            ),
+            row(
+                T3,
+                "-H",
+                "lz4",
+                &["-H"],
+                &[],
+                0,
+                "***** Advanced comment *****",
+            ),
+            row(
+                T3,
+                "--help is -h",
+                "lz4",
+                &["--help"],
+                &[],
+                0,
+                "--best  : same as -12\n",
+            ),
+            row(T3, "--version", "lz4", &["--version"], &[], 0, ""),
+            row(
+                T3,
+                "-h before an unknown option",
+                "lz4",
+                &["-h", "--bogus"],
+                &[],
+                0,
+                "Usage : \n",
+            ),
+            row(
+                T3,
+                "an unknown option before -h",
+                "lz4",
+                &["--bogus", "-h"],
+                &[],
+                1,
+                usage,
+            ),
+            row(T3, "-hV", "lz4", &["-hV"], &[], 0, "Usage : \n"),
+            row(T3, "-Vh", "lz4", &["-Vh"], &[], 0, ""),
+            row(
+                T3,
+                "-V before an unknown option",
+                "lz4",
+                &["-V", "--bogus"],
+                &[],
+                0,
+                "",
+            ),
+            row(T3, "-B3 before -V", "lz4", &["-B3", "-V"], &[], 1, usage),
+            row(
+                T3,
+                "-qq -h still prints",
+                "lz4",
+                &["-qq", "-h"],
+                &[],
+                0,
+                "Usage : \n",
+            ),
+            row(T3, "-qq -V still prints", "lz4", &["-qq", "-V"], &[], 0, ""),
+            row(T3, "-dh", "lz4", &["-dh"], &[], 0, "Usage : \n"),
+            row(
+                T3,
+                "-b before -h",
+                "lz4",
+                &["-b", "-h"],
+                &[],
+                0,
+                "Usage : \n",
+            ),
+            row(T3, "-e before -V", "lz4", &["-e", "-V"], &[], 0, ""),
+            row(
+                T3,
+                "unlz4 -h",
+                "unlz4",
+                &["-h"],
+                &[],
+                0,
+                "      unlz4 [arg] [input] [output] \n",
+            ),
+            row(
+                T3,
+                "unlz4 -H",
+                "unlz4",
+                &["-H"],
+                &[],
+                0,
+                "unlz4 will refuse to read from console",
+            ),
+            row(
+                T3,
+                "lz4cat -h",
+                "lz4cat",
+                &["-h"],
+                &[],
+                0,
+                "      lz4cat [arg] [input] [output] \n",
+            ),
+            row(
+                T3,
+                "lz4cat -H",
+                "lz4cat",
+                &["-H"],
+                &[],
+                0,
+                "generator | lz4cat | consumer",
+            ),
+            row(T3, "lz4cat -V", "lz4cat", &["-V"], &[], 0, ""),
+            row(
+                T3,
+                "unlz4 usage error",
+                "unlz4",
+                &["--bogus"],
+                &[],
+                1,
+                "      unlz4 [arg] [input] [output] \n",
+            ),
+            row(
+                T3,
+                "lz4c -h lists the legacy arguments",
+                "lz4c",
+                &["-h"],
+                &[],
+                0,
+                "Legacy arguments : \n -c0    : fast compression \n",
+            ),
+            row(
+                T3,
+                "lz4c -H warns",
+                "lz4c",
+                &["-H"],
+                &[],
+                0,
+                "***** Warning  ***** \n",
+            ),
+            row(
+                T3,
+                "lz4c usage error has no legacy block",
+                "lz4c",
+                &["--bogus"],
+                &[],
+                1,
+                "      lz4c [arg] [input] [output] \n",
+            ),
+            row(
+                T3,
+                "lz4c -hc9 is -h",
+                "lz4c",
+                &["-hc9", "a"],
+                &["a"],
+                0,
+                "Legacy arguments : \n",
+            ),
+            row(
+                T3,
+                "lz4c -hcd is -h",
+                "lz4c",
+                &["-hcd", "a"],
+                &["a"],
+                0,
+                "Legacy arguments : \n",
+            ),
+            row(T3, "lz4c -yf", "lz4c", &["-yf", "a"], &["a"], 1, usage),
+            row(
+                T3,
+                "lz4c -yd",
+                "lz4c",
+                &["-yd", "b.lz4"],
+                &["b.lz4"],
+                1,
+                usage,
+            ),
+            row(T3, "lz4c -c0 then -V", "lz4c", &["-c0", "-V"], &[], 0, ""),
+            // Operands.
+            row(
+                T3,
+                "a fourth operand",
+                "lz4",
+                &["a", "b", "c", "d"],
+                &["a"],
+                1,
+                "Error : c won't be used ! Do you want multiple input files (-m) ? \n",
+            ),
+            row(
+                T3,
+                "a third operand before -m",
+                "lz4",
+                &["a", "b", "c", "-m"],
+                &["a"],
+                1,
+                "Error : c won't be used ! Do you want multiple input files (-m) ? \n",
+            ),
+            row(
+                T3,
+                "a third operand before -h",
+                "lz4",
+                &["a", "b", "c", "-h"],
+                &["a"],
+                1,
+                "Error : c won't be used ! Do you want multiple input files (-m) ? \n",
+            ),
+            row(
+                T3,
+                "a third operand before --bogus",
+                "lz4",
+                &["a", "b", "c", "--bogus"],
+                &["a"],
+                1,
+                "Error : c won't be used ! Do you want multiple input files (-m) ? \n",
+            ),
+            row(
+                T3,
+                "-B4 before a third operand",
+                "lz4",
+                &["-B4", "a", "b", "c"],
+                &["a"],
+                1,
+                "using blocks of size 64 KB \nError : c won't be used ! Do you want multiple input files (-m) ? \n",
+            ),
+            row(
+                T3,
+                "stdout after -c",
+                "lz4",
+                &["-c", "a", "stdout"],
+                &["a"],
+                1,
+                "Error : stdout won't be used ! Do you want multiple input files (-m) ? \n",
+            ),
+            row(
+                T3,
+                "a name after -",
+                "lz4",
+                &["a", "-", "b"],
+                &["a"],
+                1,
+                "Error : b won't be used ! Do you want multiple input files (-m) ? \n",
+            ),
+            row(
+                T3,
+                "--stdout then two names",
+                "lz4",
+                &["--stdout", "a", "b"],
+                &["a"],
+                1,
+                "Error : b won't be used ! Do you want multiple input files (-m) ? \n",
+            ),
+            row(
+                T3,
+                "-qq silences a surplus operand",
+                "lz4",
+                &["-qq", "-c", "a", "b", "c"],
+                &["a"],
+                1,
+                "",
+            ),
+            row(
+                T3,
+                "-q does not",
+                "lz4",
+                &["-q", "-c", "a", "b", "c"],
+                &["a"],
+                1,
+                "Error : b won't be used ! Do you want multiple input files (-m) ? \n",
+            ),
+            row(
+                T3,
+                "lz4 .lz4",
+                "lz4",
+                &[".lz4"],
+                &[".lz4"],
+                1,
+                "Cannot determine an output filename \nIncorrect parameters\n",
+            ),
+            row(
+                T3,
+                "-qq -d a is silent",
+                "lz4",
+                &["-qq", "-d", "a"],
+                &["a"],
+                1,
+                "",
+            ),
+            row(
+                T3,
+                "-p -V pauses",
+                "lz4",
+                &["-p", "-V"],
+                &[],
+                0,
+                "Press enter to continue...\n",
+            ),
+            row(
+                T3,
+                "-p -h pauses",
+                "lz4",
+                &["-p", "-h"],
+                &[],
+                0,
+                "(default : 3s) \nPress enter to continue...\n",
+            ),
+            row(
+                T3,
+                "-p --bogus does not",
+                "lz4",
+                &["-p", "--bogus"],
+                &[],
+                1,
+                usage,
+            ),
+            row(
+                T3,
+                "-p and a surplus operand",
+                "lz4",
+                &["-p", "a", "b", "c"],
+                &["a"],
+                1,
+                "Error : c won't be used ! Do you want multiple input files (-m) ? \n",
+            ),
+            row(
+                T3,
+                "-p -d a does not pause",
+                "lz4",
+                &["-p", "-d", "a"],
+                &["a"],
+                1,
+                "Cannot determine an output filename \n",
+            ),
+            row(
+                T3,
+                "stdin a terminal",
+                "lz4",
+                &[],
+                &[],
+                1,
+                "refusing to read from a console\n",
+            )
+            .tty(true, false),
+            row(
+                T3,
+                "stdin a terminal, -c",
+                "lz4",
+                &["-c"],
+                &[],
+                1,
+                "refusing to read from a console\n",
+            )
+            .tty(true, false),
+            row(
+                T3,
+                "stdin a terminal, --list",
+                "lz4",
+                &["--list"],
+                &[],
+                1,
+                "refusing to read from a console\n",
+            )
+            .tty(true, false),
+            row(
+                T3,
+                "stdin a terminal, -m",
+                "lz4",
+                &["-m"],
+                &[],
+                1,
+                "refusing to read from a console\n",
+            )
+            .tty(true, false),
+            row(
+                T3,
+                "stdin a terminal, -m stdin",
+                "lz4",
+                &["-m", "stdin"],
+                &[],
+                1,
+                "refusing to read from a console\n",
+            )
+            .tty(true, false),
+            row(
+                T3,
+                "stdin a terminal, lz4cat",
+                "lz4cat",
+                &[],
+                &[],
+                1,
+                "refusing to read from a console\n",
+            )
+            .tty(true, false),
+            row(
+                T3,
+                "stdin a terminal, -p",
+                "lz4",
+                &["-p"],
+                &[],
+                1,
+                "refusing to read from a console\n",
+            )
+            .tty(true, false),
+            row(
+                T3,
+                "stdout a terminal, a -",
+                "lz4",
+                &["a", "-"],
+                &["a"],
+                1,
+                "refusing to write to console without -c \n",
+            )
+            .tty(false, true),
+            row(
+                T3,
+                "stdout a terminal, a stdout",
+                "lz4",
+                &["a", "stdout"],
+                &["a"],
+                1,
+                "refusing to write to console without -c \n",
+            )
+            .tty(false, true),
+            row(
+                T3,
+                "stdout a terminal, -m",
+                "lz4",
+                &["-m"],
+                &[],
+                1,
+                "refusing to write to console without -c \n",
+            )
+            .tty(false, true)
+            .stdin(b"x"),
+            row(
+                T3,
+                "stdout a terminal, unlz4",
+                "unlz4",
+                &[],
+                &[],
+                1,
+                "refusing to write to console without -c \n",
+            )
+            .tty(false, true)
+            .stdin(b"x"),
+            // ---- Task 4: Task 3's parse and decision table reaching I/O ----
+            row(T4, "lz4 on stdin", "lz4", &[], &[], 0, "").stdin_fx("a"),
+            row(T4, "unlz4 on stdin", "unlz4", &[], &[], 0, "").stdin_fx("b.lz4"),
+            row(T4, "lz4cat on stdin", "lz4cat", &[], &[], 0, "").stdin_fx("b.lz4"),
+            row(T4, "lz4c on stdin", "lz4c", &[], &[], 0, "").stdin_fx("a"),
+            row(
+                T4,
+                "lz4c -c0 names a.lz4",
+                "lz4c",
+                &["-c0", "a"],
+                &["a"],
+                0,
+                "Compressed filename will be : a.lz4 \n",
+            ),
+            row(
+                T4,
+                "lz4c -hc a out",
+                "lz4c",
+                &["-hc", "a", "out"],
+                &["a"],
+                0,
+                "",
+            ),
+            row(
+                T4,
+                "lz4c -fc2 a",
+                "lz4c",
+                &["-fc2", "a"],
+                &["a"],
+                0,
+                "Compressed filename will be : a.lz4 \n",
+            ),
+            row(
+                T4,
+                "lz4c -cy writes stdout",
+                "lz4c",
+                &["-cy", "a"],
+                &["a"],
+                0,
+                "",
+            ),
+            row(
+                T4,
+                "a b -m compresses stdin into b",
+                "lz4",
+                &["a", "b", "-m"],
+                &["a"],
+                0,
+                "",
+            )
+            .stdin_fx("a"),
+            row(
+                T4,
+                "a -m compresses stdin to stdout",
+                "lz4",
+                &["a", "-m"],
+                &["a"],
+                0,
+                "",
+            )
+            .stdin_fx("a"),
+            row(
+                T4,
+                "a -m b reads only b",
+                "lz4",
+                &["a", "-m", "b"],
+                &["a"],
+                1,
+                "b: No such file or directory \n",
+            ),
+            row(
+                T4,
+                "-m -t writes stdout",
+                "lz4",
+                &["-m", "-t", "b.lz4"],
+                &["b.lz4"],
+                0,
+                "",
+            ),
+            row(
+                T4,
+                "null then -m -d writes stdout",
+                "lz4",
+                &["a", "null", "-m", "-d", "b.lz4"],
+                &["a", "b.lz4"],
+                0,
+                "",
+            ),
+            row(
+                T4,
+                "null then -m compresses to notlz4.lz4",
+                "lz4",
+                &["a", "null", "-m", "notlz4"],
+                &["a", "notlz4"],
+                0,
+                "",
+            ),
+            row(
+                T4,
+                "-m -d of a name without .lz4",
+                "lz4",
+                &["-m", "-d", "a"],
+                &["a"],
+                1,
+                "File extension doesn't match expected LZ4_EXTENSION (.lz4); will not process file: a\n",
+            ),
+            row(
+                T4,
+                "-m -d .lz4",
+                "lz4",
+                &["-m", "-d", ".lz4"],
+                &[".lz4"],
+                1,
+                "will not process file: .lz4\n",
+            ),
+            row(
+                T4,
+                "-m a stdin names stdin.lz4",
+                "lz4",
+                &["-m", "a", "stdin"],
+                &["a"],
+                0,
+                "",
+            )
+            .stdin_fx("a"),
+            row(
+                T4,
+                "-m stdin writes stdout",
+                "lz4",
+                &["-m", "stdin"],
+                &[],
+                0,
+                "",
+            )
+            .stdin_fx("a"),
+            row(T4, "- out", "lz4", &["-", "out"], &[], 0, "").stdin_fx("a"),
+            row(
+                T4,
+                "a stdin names a file",
+                "lz4",
+                &["a", "stdin"],
+                &["a"],
+                0,
+                "",
+            ),
+            row(T4, "stdin x", "lz4", &["stdin", "x"], &[], 0, "").stdin_fx("a"),
+            row(
+                T4,
+                "-t b.lz4 out writes nothing",
+                "lz4",
+                &["-t", "b.lz4", "out"],
+                &["b.lz4"],
+                0,
+                "",
+            ),
+            row(
+                T4,
+                "-t -dc writes stdout",
+                "lz4",
+                &["-t", "-dc", "b.lz4"],
+                &["b.lz4"],
+                0,
+                "",
+            ),
+            row(
+                T4,
+                "lz4cat -t writes stdout",
+                "lz4cat",
+                &["-t", "b.lz4"],
+                &["b.lz4"],
+                0,
+                "",
+            ),
+            row(
+                T4,
+                "unlz4 b.lz4 -",
+                "unlz4",
+                &["b.lz4", "-"],
+                &["b.lz4"],
+                0,
+                "",
+            ),
+            row(
+                T4,
+                "a b - writes stdout",
+                "lz4",
+                &["a", "b", "-"],
+                &["a"],
+                0,
+                "",
+            ),
+            row(
+                T4,
+                "a null -c writes stdout",
+                "lz4",
+                &["a", "null", "-c"],
+                &["a"],
+                0,
+                "",
+            ),
+            row(
+                T4,
+                "-- - names a file",
+                "lz4",
+                &["--", "-"],
+                &[],
+                1,
+                "Compressed filename will be : -.lz4 \n-: No such file or directory \n",
+            ),
+            row(
+                T4,
+                "an empty operand",
+                "lz4",
+                &["", "a"],
+                &["a"],
+                1,
+                ": No such file or directory \n",
+            ),
+            row(
+                T4,
+                "x.LZ4 compresses",
+                "lz4",
+                &["x.LZ4"],
+                &[],
+                1,
+                "Compressed filename will be : x.LZ4.lz4 \n",
+            ),
+            row(
+                T4,
+                "-p -c a pauses",
+                "lz4",
+                &["-p", "-c", "a"],
+                &["a"],
+                0,
+                "Press enter to continue...\n",
+            ),
+            row(
+                T4,
+                "--rm -k keeps",
+                "lz4",
+                &["--rm", "-k", "a"],
+                &["a"],
+                0,
+                "",
+            ),
+            row(
+                T4,
+                "-k --rm removes",
+                "lz4",
+                &["-k", "--rm", "a"],
+                &["a"],
+                0,
+                "",
+            ),
+            row(
+                T4,
+                "--rm of standard input",
+                "lz4",
+                &["-c", "--rm"],
+                &[],
+                50,
+                "Error 50 : Remove error : stdin: No such file or directory \n",
+            )
+            .stdin_fx("a"),
+            row(
+                T4,
+                "stdout a terminal, a file named",
+                "lz4",
+                &["a"],
+                &["a"],
+                0,
+                "Compressed filename will be : a.lz4 \n",
+            )
+            .tty(false, true),
+            row(
+                T4,
+                "stdout a terminal, -m -t",
+                "lz4",
+                &["-m", "-t", "b.lz4"],
+                &["b.lz4"],
+                0,
+                "",
+            )
+            .tty(false, true),
             // ---- Task 4: missing, unreadable and unwritable files ----
             row(
                 T4,
@@ -1103,33 +2233,111 @@ mod unix {
         }
     }
 
+    /// One case against the reference and stuffr, with this suite's
+    /// normalisations; false when the reference is absent.
+    fn compare(c: &Case) -> bool {
+        let Some(dir) = lz4_dir() else { return false };
+        let Some(mut r) = reference(dir, c) else {
+            return false;
+        };
+        let mut s = stuffr_as(c);
+        mask_banners(&mut r, &mut s);
+        // Spec deviation 2: refreshes, timing fields, thread count.
+        r.stderr = normalise_lz4_progress(&r.stderr);
+        s.stderr = normalise_lz4_progress(&s.stderr);
+        // The reference's own race over how much a failed decode wrote.
+        tolerate_lz4_partial_output(c, &mut r, &mut s);
+        assert_same(c, &r, &s);
+        true
+    }
+
     /// Every row of `task` against the reference and stuffr.
     fn check_task(task: &str) {
         let rows: Vec<Row> = rows().into_iter().filter(|r| r.task == task).collect();
         assert!(!rows.is_empty(), "no rows for {task}");
         let cases: Vec<Case> = rows.iter().map(case).collect();
-        let one = |c: &Case| -> bool {
-            let Some(dir) = lz4_dir() else { return false };
-            let Some(mut r) = reference(dir, c) else {
-                return false;
-            };
-            let mut s = stuffr_as(c);
-            mask_banners(&mut r, &mut s);
-            // Spec deviation 2: refreshes, timing fields, thread count.
-            r.stderr = normalise_lz4_progress(&r.stderr);
-            s.stderr = normalise_lz4_progress(&s.stderr);
-            // The reference's own race over how much a failed decode wrote.
-            tolerate_lz4_partial_output(c, &mut r, &mut s);
-            assert_same(c, &r, &s);
-            true
-        };
-        run_group(task, &cases, Skipped::none(), &one);
+        run_group(task, &cases, Skipped::none(), &compare);
     }
 
     #[test]
-    #[ignore = "Task 3"]
     fn task3_rows_match_the_reference() {
         check_task("Task 3");
+    }
+
+    /// `LZ4_CLEVEL` and `LZ4_NBWORKERS` (lz4.1, "Environment Variables"),
+    /// probed 2026-10-16: a value not starting with a digit is warned about
+    /// before the arguments are read (so `-qq` cannot silence it), under
+    /// every name, `LZ4_CLEVEL`'s first; anything after the digits is
+    /// ignored. Each case ends at `-V`, `-h` or a usage error, before any
+    /// file is touched.
+    #[test]
+    fn environment_variables_match_the_reference() {
+        let mut cases = Vec::new();
+        for var in ["LZ4_CLEVEL", "LZ4_NBWORKERS"] {
+            for val in ["x", "-1", "", " 4", "3x", "1K", "4294967297", "201"] {
+                for args in [&["-V"][..], &["-qq", "-V"], &["--bogus"]] {
+                    let mut c = case(&row("Task 3", "env", "lz4", args, &[], 0, ""));
+                    c.env.push((var, val));
+                    cases.push(c);
+                }
+            }
+        }
+        for name in ["unlz4", "lz4cat", "lz4c"] {
+            let mut c = case(&row("Task 3", "env", name, &["-h"], &[], 0, ""));
+            c.env.push(("LZ4_CLEVEL", "x"));
+            cases.push(c);
+        }
+        let mut both = case(&row("Task 3", "env", "lz4", &["-V"], &[], 0, ""));
+        both.env
+            .extend([("LZ4_NBWORKERS", "y"), ("LZ4_CLEVEL", "x")]);
+        cases.push(both);
+        run_group("environment", &cases, Skipped::none(), &compare);
+    }
+
+    /// Spec deviation 5: `-b#`, `-e#` and `-i#` are refused once the
+    /// command line has parsed (the reference runs its benchmark, or
+    /// ignores `-e`/`-i` alone). A usage error, `-h` and `-V` answer first,
+    /// as the reference's do (the Task 3 rows compare those).
+    #[test]
+    fn benchmark_options_are_refused() {
+        let dir = ScratchDir::at(
+            std::env::temp_dir().join(format!("stuffr-lz4-bench-{}", std::process::id())),
+        );
+        fs::create_dir_all(&*dir).unwrap();
+        fs::write(dir.join("a"), text()).unwrap();
+        let link = dir.join("lz4");
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
+        for args in [
+            &["-b"][..],
+            &["-b3", "a"],
+            &["-c", "-e3", "a"],
+            &["-i1", "-c", "a"],
+            &["-b", "-d", "a"],
+            &["-T1i"],
+        ] {
+            let o = std::process::Command::new(&link)
+                .args(args)
+                .current_dir(&*dir)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            assert_eq!(
+                (o.status.code(), o.stdout.as_slice(), o.stderr.as_slice()),
+                (
+                    Some(1),
+                    &b""[..],
+                    &b"Benchmark mode is not available in this build (stuffr)\n"[..]
+                ),
+                "{args:?}"
+            );
+        }
+        // `-qq` silences it, as it silences every error.
+        let o = std::process::Command::new(&link)
+            .args(["-qq", "-b"])
+            .current_dir(&*dir)
+            .output()
+            .unwrap();
+        assert_eq!((o.status.code(), o.stderr.len()), (Some(1), 0));
     }
 
     #[test]
@@ -1188,7 +2396,10 @@ mod unix {
     /// below: the set Task 8's fuzz oracle accepts under the lz4 names.
     /// Probed 2026-10-16 over the rows and over ~3000 corruptions and cuts
     /// of ten frames (`-t`, `-dc`, `--list`).
-    const EXIT_CODES: [i32; 14] = [0, 1, 26, 27, 34, 38, 40, 42, 43, 44, 61, 63, 64, 70];
+    ///
+    /// Task 3 added 50: `lz4 -c --rm` on standard input is `Error 50 :
+    /// Remove error : stdin: No such file or directory` (probed 2026-10-16).
+    const EXIT_CODES: [i32; 15] = [0, 1, 26, 27, 34, 38, 40, 42, 43, 44, 50, 61, 63, 64, 70];
 
     #[test]
     fn every_recorded_code_is_in_the_exit_set() {

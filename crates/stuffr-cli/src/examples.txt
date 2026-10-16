@@ -1293,8 +1293,8 @@ COMPATIBILITY LINKS (INSTALL-LINKS)
   stuffr install-links --dir ~/.local/bin
       Creates symlinks named bzip2, bunzip2, bzcat, bzip2recover, gzip,
       gunzip, zcat, gzcat, xz, unxz, xzcat, lzma, unlzma, lzcat, zstd,
-      unzstd, zstdcat and zstdmt in that directory, each pointing at this
-      stuffr binary. Run under one of those
+      unzstd, zstdcat, zstdmt, lz4, unlz4, lz4cat and lz4c in that
+      directory, each pointing at this stuffr binary. Run under one of those
       names, the binary behaves as that tool, with its flags, messages and
       exit codes. This is opt-in: nothing creates these links unless you run
       this verb. The directory must exist (exit 2 if not); one that cannot
@@ -1331,6 +1331,12 @@ COMPATIBILITY LINKS (INSTALL-LINKS)
       banner names stuffr; -qV prints 1.5.7. The benchmark options (-b, -e,
       -i) and --trace are refused, as a zstd built without them refuses
       them.
+
+      The lz4 names behave as the LZ4 command line 1.10.0: unlz4
+      decompresses, lz4cat decompresses to standard output (as lz4 -dcfm),
+      and lz4c also reads the legacy arguments -c0, -c1, -c2, -hc and -y.
+      LZ4_CLEVEL and LZ4_NBWORKERS are read as lz4 reads them. -V's banner
+      names stuffr. The benchmark options (-b, -e, -i) are refused.
 
   stuffr install-links --dir ~/.local/bin --names bzcat,zcat
       Only the named links; --names takes a comma-separated list. A name that

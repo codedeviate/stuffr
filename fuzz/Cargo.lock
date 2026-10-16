@@ -808,6 +808,7 @@ dependencies = [
  "stuffr-core",
  "tar",
  "time",
+ "twox-hash",
  "unarj-rs",
  "zip",
 ]

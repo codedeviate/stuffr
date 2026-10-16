@@ -886,6 +886,12 @@ const COMPAT_SHAPES: &[&str] = &[
     "zstd-list-skippable-max",
     "zstd-list-cut",
     "zstd-list-gzip",
+    // The lz4 family (0.15.0 Task 3): one argument-surface seed per name,
+    // so every name has a seed; Task 8 adds the coder's shapes.
+    "lz4-help",
+    "unlz4-bad-flag",
+    "lz4cat-version",
+    "lz4c-help",
 ];
 
 /// `plain` as one zstd frame, through this build's encoder (weak on the
@@ -992,6 +998,22 @@ fn xxh64(data: &[u8]) -> u64 {
     h ^= h >> 29;
     h = h.wrapping_mul(P3);
     h ^ (h >> 32)
+}
+
+/// The lz4 family's seeds (0.15.0): the argument surface only, until
+/// Task 8 adds the coder's shapes.
+fn lz4_seed(shape: &str) -> Option<Vec<u8>> {
+    let (tool, case) = shape.split_once('-')?;
+    if !matches!(tool, "lz4" | "unlz4" | "lz4cat" | "lz4c") {
+        return None;
+    }
+    let args: &[&str] = match case {
+        "help" => &["-h"],
+        "bad-flag" => &["--bogus"],
+        "version" => &["-V"],
+        other => unreachable!("COMPAT_SHAPES lists an unhandled lz4 shape {other:?}"),
+    };
+    Some(encode_compat_case(tool, 0, args, &[], false, b""))
 }
 
 /// The zstd family's seeds: the argument surface (Task 4), then the
@@ -1416,6 +1438,9 @@ fn compat_seed(work: &Path, shape: &str) -> stuffr_core::Result<Vec<u8>> {
         return Ok(seed);
     }
     if let Some(seed) = zstd_seed(work, shape)? {
+        return Ok(seed);
+    }
+    if let Some(seed) = lz4_seed(shape) {
         return Ok(seed);
     }
     let text = compat_text(4000);
