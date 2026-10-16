@@ -1165,9 +1165,64 @@ const REF_HEADER: &str = "\
 # `regenerate_fixtures` (see its doc and this directory's README).
 ";
 
+/// The levels the CLI can hand over at the edge of `i32` (ruling T3-d):
+/// `--fast=2147483646` (−2147483646), `--fast=2147483647` (`i32::MIN + 1`),
+/// `--fast=2147483648`, `-2147483648` and `LZ4_CLEVEL=2147483648` (all
+/// `i32::MIN`). Neither tier may panic on any of them, frame or legacy.
+const EXTREME_LEVELS: [i32; 5] = [i32::MIN, i32::MIN + 1, -2_147_483_646, -65_537, -65_536];
+
+#[test]
+fn extreme_levels_compress_on_both_tiers() {
+    let data = text(100_000, 0xe7);
+    for legacy in [false, true] {
+        for level in EXTREME_LEVELS {
+            let o = EncodeOptions {
+                level,
+                legacy,
+                ..EncodeOptions::default()
+            };
+            let packed = encode(&o, &data);
+            let back = if legacy {
+                decode_legacy(&packed)
+            } else {
+                decode(&DecodeOptions::default(), &packed)
+            };
+            assert_eq!(back.unwrap(), data, "level {level} legacy {legacy}");
+        }
+    }
+}
+
 #[cfg(feature = "lz4-c")]
 mod c_tier {
     use super::*;
+
+    /// probe (2026-10-16, `lz4 -q -c [-l] LEVEL` over 60000 words): frames
+    /// at `i32::MIN` and `i32::MIN + 1` are level 1's bytes (liblz4 negates
+    /// the level plus one, which overflows there), and every level at or
+    /// below −65535 is −65536's (liblz4 caps the acceleration); legacy
+    /// frames at `i32::MIN` are level 1's (the CLI negates the level) and at
+    /// `i32::MIN + 1` −65536's.
+    #[test]
+    fn extreme_levels_give_the_references_bytes() {
+        let data = text(100_000, 0xe7);
+        let at = |level: i32, legacy: bool| {
+            encode(
+                &EncodeOptions {
+                    level,
+                    legacy,
+                    ..EncodeOptions::default()
+                },
+                &data,
+            )
+        };
+        for legacy in [false, true] {
+            assert_eq!(at(i32::MIN, legacy), at(1, legacy), "legacy {legacy}");
+            assert_eq!(at(-2_147_483_646, legacy), at(-65_536, legacy));
+            assert_eq!(at(-65_537, legacy), at(-65_536, legacy));
+        }
+        assert_eq!(at(i32::MIN + 1, false), at(1, false));
+        assert_eq!(at(i32::MIN + 1, true), at(-65_536, true));
+    }
 
     #[test]
     fn liblz4_is_1_10_0() {

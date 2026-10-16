@@ -149,7 +149,7 @@ fn preferences(o: &Settings, content_size: u64) -> sys::LZ4FPreferences {
                 sys::BlockChecksum::NoBlockChecksum
             },
         },
-        compression_level: o.level as c_uint,
+        compression_level: frame_level(o.level) as c_uint,
         auto_flush: AUTO_FLUSH,
         favor_dec_speed: c_uint::from(o.favor_dec_speed),
         reserved: [0; 3],
@@ -671,10 +671,44 @@ const HISTORY: usize = 64 << 10;
 /// (spike S1).
 const LEGACY_HC_MIN: i32 = 3;
 
+/// The most negative level whose bytes differ from the next one's:
+/// liblz4 caps the acceleration of a negative level at 65537
+/// (`LZ4_ACCELERATION_MAX`), which −65536 already reaches (probe: `lz4
+/// --fast=65535`, `--fast=65536` and `--fast=2147483646` write the same
+/// bytes, frame and legacy).
+const LEVEL_FASTEST: i32 = -65_536;
+
+/// `LZ4_ACCELERATION_MAX` (`lib/lz4.c`): liblz4 caps every acceleration
+/// here.
+const LZ4_ACCELERATION_MAX: c_int = 65_537;
+
+/// The level a frame's preferences carry for the CLI's `level` (ruling
+/// T3-d). liblz4 turns a negative level into the acceleration `-level + 1`,
+/// a signed overflow for `i32::MIN` and `i32::MIN + 1`, upstream undefined
+/// behaviour never reproduced: the reference was observed to write level
+/// 1's bytes for both (probe: `lz4 --fast=2147483647`, `--fast=2147483648`,
+/// `-2147483648`, `LZ4_CLEVEL=2147483648`), so they are level 1 here. Every
+/// other level below [`LEVEL_FASTEST`] is that level, which gives the same
+/// bytes and keeps liblz4's arithmetic in range.
+fn frame_level(level: i32) -> i32 {
+    match level {
+        i32::MIN | -2_147_483_647 => 1,
+        l => l.max(LEVEL_FASTEST),
+    }
+}
+
 /// `LZ4_compress_fast`'s acceleration for a legacy level below
-/// [`LEGACY_HC_MIN`] (spike S1).
+/// [`LEGACY_HC_MIN`] (spike S1): the level negated. Negating `i32::MIN`
+/// overflows (upstream undefined behaviour, ruling T3-d); the reference
+/// was observed to write level 1's bytes there (probe: `lz4 -l
+/// --fast=2147483648`), so it is level 1's acceleration, 1. `i32::MIN + 1`
+/// negates cleanly and is capped like any other level (probe: `lz4 -l
+/// --fast=2147483647` writes `--fast=65536`'s bytes).
 fn legacy_acceleration(level: i32) -> c_int {
-    if level < 0 { -level } else { 1 }
+    match level.checked_neg() {
+        Some(a) if level < 0 => a.min(LZ4_ACCELERATION_MAX),
+        _ => 1,
+    }
 }
 
 /// One legacy block through `LZ4_decompress_safe`: the decoded length, or
