@@ -77,6 +77,15 @@
 //!    output (a file or standard output). lz4 writes on another thread and
 //!    exits from the failing one, so it leaves nothing or all of that, run
 //!    to run (probed: 0 or 8800 bytes of 8800 for the same input).
+//! 8. `--list` of a file that ends inside a block-size word, after a
+//!    frame or skippable frame came before: lz4 completes the word from an
+//!    uninitialised buffer (probed: the same garbage run to run, about 4.4
+//!    million, for a given shape), which only the `-v` size of that last
+//!    frame shows. stuffr completes it from the frame's previous
+//!    block-size word, as lz4 does for a second block (zero for the first).
+//! 9. `--list` of a regular file that cannot be opened (mode 000): lz4
+//!    aborts on an assertion (exit 134); stuffr names the error
+//!    (`NAME: Permission denied`) and exits 1.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -92,6 +101,7 @@ use super::host::{self, Host, SANDBOX_OUTPUT_CAP, Sandbox};
 pub(crate) mod cli;
 mod decode;
 mod io;
+mod list;
 mod messages;
 
 use cli::{Command, Op, Stop};
@@ -181,6 +191,7 @@ fn main(
 
 /// Everything after a successful parse.
 fn execute(cmd: &Command, host: &mut Host, out: &mut dyn Write, err: &mut dyn Write) -> Stop {
+    announce(cmd, err);
     let plan = match cli::plan(cmd, host.stdin_is_tty(), host.stdout_is_tty()) {
         Ok(plan) => plan,
         Err(refusal) => {
@@ -193,12 +204,7 @@ fn execute(cmd: &Command, host: &mut Host, out: &mut dyn Write, err: &mut dyn Wr
     let ended = match plan.op {
         Op::Compress => io::compress_files(cmd, &plan, host, out, err),
         Op::Decompress | Op::Test => io::decompress_files(cmd, &plan, host, out, err),
-        Op::List => {
-            return Stop {
-                code: not_yet(err, "--list", "Task 5"),
-                pause: cmd.pause,
-            };
-        }
+        Op::List => list::list_files(cmd, host, out, err),
     };
     Stop {
         code: ended.code,
@@ -206,17 +212,36 @@ fn execute(cmd: &Command, host: &mut Host, out: &mut dyn Write, err: &mut dyn Wr
     }
 }
 
-/// An operation a later task of 0.15.0 implements: exit 1, with a note in
-/// debug builds only.
-fn not_yet(err: &mut dyn Write, what: &str, task: &str) -> i32 {
-    #[cfg(debug_assertions)]
-    printf(
-        err,
-        m::TODO_NOT_IMPLEMENTED,
-        &[what.as_bytes(), task.as_bytes()],
-    );
-    let _ = (err, what, task);
-    1
+/// What lz4 prints once the command line has parsed, before anything else
+/// (probe: `lz4 -v -d nosuch`, `lz4 -vv -t a`, `lz4 -vv --list b.lz4`; the
+/// same under every operation, and before a refusal or a usage error that
+/// the arguments did not raise): the banner at display level 3 and up,
+/// and at level 4 and up the two `_POSIX_VERSION` lines.
+fn announce(cmd: &Command, err: &mut dyn Write) {
+    if cmd.display_level >= 3 {
+        cli::print_banner(err);
+    }
+    if cmd.display_level >= 4 {
+        let v = posix_version();
+        printf(err, m::POSIX_VERSION, &[v.as_bytes(), v.as_bytes()]);
+    }
+}
+
+/// `_POSIX_VERSION` as the system says it (200112 on macOS, probed with
+/// lz4: `_POSIX_VERSION defined: 200112L`); `sysconf(_SC_VERSION)` is the
+/// run-time spelling of the same fact. Not probed on Linux.
+fn posix_version() -> String {
+    #[cfg(unix)]
+    {
+        // SAFETY: `sysconf` reads no memory of ours and has no
+        // preconditions; `_SC_VERSION` is a valid name on every unix.
+        let v = unsafe { libc::sysconf(libc::_SC_VERSION) };
+        if v > 0 {
+            return v.to_string();
+        }
+    }
+    // Where the system cannot say: the value lz4 prints on macOS.
+    "200112".to_string()
 }
 
 #[cfg(test)]

@@ -236,6 +236,56 @@ mod unix {
             "leg_garbage.lz4" => cat(&[&legacy(), b"AAA"]),
             "leg_garbage100.lz4" => cat(&[&legacy(), &[b'A'; 100]]),
             "leg_zeros.lz4" => cat(&[&legacy(), &[0u8; 8]]),
+            // A file named `stdin` (`--list stdin` lists it).
+            "stdin" => good(),
+            // `--list` (Task 5): the reference's own encoder with a content
+            // size, block checksums, linked blocks, 64 KiB blocks, no
+            // checksums; and hand-made shapes (header-only, a magic number
+            // alone, hostile sizes).
+            "cs.lz4" => made(&["-c", "-q", "--content-size"], &text()),
+            "bx.lz4" => made(&["-c", "-q", "-BX"], &text()),
+            "bd.lz4" => made(&["-c", "-q", "-BD"], &text()),
+            "b4.lz4" => made(&["-c", "-q", "-B4"], &text()),
+            "nocrc.lz4" => made(&["-c", "-q", "--no-crc"], &text()),
+            "big_blocks.lz4" => made(&["-c", "-q", "-B7", "--content-size"], &text()),
+            "dict_cs.lz4" => {
+                let path =
+                    std::env::temp_dir().join(format!("stuffr-lz4-dictcs-{}", std::process::id()));
+                fs::write(&path, fx("dict")).unwrap();
+                let frame = made(
+                    &["-c", "-q", "--content-size", "-D", path.to_str().unwrap()],
+                    &text(),
+                );
+                let _ = fs::remove_file(&path);
+                frame
+            }
+            "cs_twice.lz4" => cat(&[&fx("cs.lz4"), &fx("cs.lz4")]),
+            "cs_then_plain.lz4" => cat(&[&fx("cs.lz4"), &good()]),
+            "bd_then_b4.lz4" => cat(&[&fx("bd.lz4"), &fx("b4.lz4")]),
+            "cs_then_skip.lz4" => cat(&[&fx("cs.lz4"), &fx("skip_ok.lz4")]),
+            "leg_twice.lz4" => cat(&[&legacy(), &legacy()]),
+            "skip_then_leg.lz4" => cat(&[&fx("skip_ok.lz4"), &legacy()]),
+            "magic_only.lz4" => vec![0x04, 0x22, 0x4d, 0x18],
+            "hdr_only.lz4" => header(0x64, 0x70, &[]),
+            "hdr_plus1.lz4" => cat(&[&header(0x64, 0x70, &[]), b"z"]),
+            "hdr_cs_only.lz4" => header(0x6c, 0x40, &5u64.to_le_bytes()),
+            "hdr_cs_cut.lz4" => header(0x6c, 0x40, &5u64.to_le_bytes())[..6].to_vec(),
+            "hdr_cut6.lz4" => header(0x64, 0x70, &[])[..6].to_vec(),
+            "dictid_cs.lz4" => cat(&[
+                &header(0x6d, 0x40, &cat(&[&7u64.to_le_bytes(), &le32(0x1234_5678)])),
+                &le32(0x8000_0003),
+                b"abc",
+                &end,
+                &le32(0),
+            ]),
+            "skip_4g.lz4" => cat(&[&[0x50, 0x2a, 0x4d, 0x18], &le32(0xffff_ffff), b"ab"]),
+            "skip_size_cut.lz4" => cat(&[&[0x50, 0x2a, 0x4d, 0x18], &[1, 0]]),
+            "blk_2g.lz4" => cat(&[&header(0x64, 0x40, &[]), &le32(0x7fff_ffff), b"ab"]),
+            "frame_tail1.lz4" => cat(&[&good(), b"A"]),
+            "frame_zero4.lz4" => cat(&[&good(), &[0u8; 4]]),
+            "leg_magic_only.lz4" => LEGACY.to_vec(),
+            "leg_magics.lz4" => cat(&[&LEGACY, &LEGACY]),
+            "leg_zero_blocks.lz4" => cat(&[&LEGACY, &le32(0), &le32(0), &le32(0)]),
             other => panic!("no fixture named {other}"),
         }
     }
@@ -272,6 +322,18 @@ mod unix {
     /// A previous compression's output next to the input (`a.lz4`).
     fn existing_default_output(w: &Path) {
         fs::write(w.join("a.lz4"), b"").unwrap();
+    }
+
+    fn link_to_b(w: &Path) {
+        std::os::unix::fs::symlink("b.lz4", w.join("ln.lz4")).unwrap();
+    }
+    /// A directory `d` holding two `.lz4` files and a subdirectory with one.
+    fn dir_with_lz4(w: &Path) {
+        mkdir_d(w);
+        fs::write(w.join("d/x.lz4"), fx("b.lz4")).unwrap();
+        fs::write(w.join("d/y.lz4"), fx("cs.lz4")).unwrap();
+        fs::create_dir(w.join("d/sub")).unwrap();
+        fs::write(w.join("d/sub/z.lz4"), fx("leg.lz4")).unwrap();
     }
 
     // ---- the table ----
@@ -2183,6 +2245,121 @@ mod unix {
             row(T5, "--list -v two frames", "lz4", &["--list", "-v", "two_frames.lz4"], &["two_frames.lz4"], 0, ""),
             row(T5, "--list -v skippable then frame", "lz4", &["--list", "-v", "skip_then_good.lz4"], &["skip_then_good.lz4"], 0, ""),
             row(T5, "--list -v legacy then frame", "lz4", &["--list", "-v", "leg_then_good.lz4"], &["leg_then_good.lz4"], 0, ""),
+            // ---- Task 5, part 2: every shape the walker meets, at every
+            // verbosity (the compact table, `-v`, `-vv`) ----
+            row(T5, "--list a content size", "lz4", &["--list", "cs.lz4"], &["cs.lz4"], 0, ""),
+            row(T5, "--list -v a content size", "lz4", &["--list", "-v", "cs.lz4"], &["cs.lz4"], 0, ""),
+            row(T5, "--list -BX", "lz4", &["--list", "bx.lz4"], &["bx.lz4"], 0, ""),
+            row(T5, "--list -v -BX", "lz4", &["--list", "-v", "bx.lz4"], &["bx.lz4"], 0, ""),
+            row(T5, "--list -BD", "lz4", &["--list", "bd.lz4"], &["bd.lz4"], 0, ""),
+            row(T5, "--list -v -BD", "lz4", &["--list", "-v", "bd.lz4"], &["bd.lz4"], 0, ""),
+            row(T5, "--list -v -B4", "lz4", &["--list", "-v", "b4.lz4"], &["b4.lz4"], 0, ""),
+            row(T5, "--list -v --no-crc", "lz4", &["--list", "-v", "nocrc.lz4"], &["nocrc.lz4"], 0, ""),
+            row(T5, "--list -B7 and a content size", "lz4", &["--list", "big_blocks.lz4"], &["big_blocks.lz4"], 0, ""),
+            row(T5, "--list -D and a content size", "lz4", &["--list", "dict_cs.lz4"], &["dict_cs.lz4"], 0, ""),
+            row(T5, "--list -v -D and a content size", "lz4", &["--list", "-v", "dict_cs.lz4"], &["dict_cs.lz4"], 0, ""),
+            row(T5, "--list -D (the CLI writes no dictionary ID)", "lz4", &["--list", "dict_b.lz4"], &["dict_b.lz4"], 0, ""),
+            row(T5, "--list a dictionary ID with a content size", "lz4", &["--list", "-v", "dictid_cs.lz4"], &["dictid_cs.lz4"], 0, ""),
+            row(T5, "--list a dictionary ID, no content size", "lz4", &["--list", "dictid.lz4"], &["dictid.lz4"], 1, "File format not recognized"),
+            row(T5, "--list two frames with sizes", "lz4", &["--list", "cs_twice.lz4"], &["cs_twice.lz4"], 0, ""),
+            row(T5, "--list -v two frames with sizes", "lz4", &["--list", "-v", "cs_twice.lz4"], &["cs_twice.lz4"], 0, ""),
+            row(T5, "--list a size, then none", "lz4", &["--list", "cs_then_plain.lz4"], &["cs_then_plain.lz4"], 0, ""),
+            row(T5, "--list blocks that differ", "lz4", &["--list", "bd_then_b4.lz4"], &["bd_then_b4.lz4"], 0, ""),
+            row(T5, "--list -v blocks that differ", "lz4", &["--list", "-v", "bd_then_b4.lz4"], &["bd_then_b4.lz4"], 0, ""),
+            row(T5, "--list a frame then a skippable", "lz4", &["--list", "-v", "cs_then_skip.lz4"], &["cs_then_skip.lz4"], 0, ""),
+            row(T5, "--list two legacy frames", "lz4", &["--list", "leg_twice.lz4"], &["leg_twice.lz4"], 0, ""),
+            row(T5, "--list -v a skippable then a legacy", "lz4", &["--list", "-v", "skip_then_leg.lz4"], &["skip_then_leg.lz4"], 0, ""),
+            row(T5, "--list a skippable frame", "lz4", &["--list", "skip_ok.lz4"], &["skip_ok.lz4"], 0, ""),
+            row(T5, "--list -v a skippable frame", "lz4", &["--list", "-v", "skip_ok.lz4"], &["skip_ok.lz4"], 0, ""),
+            row(T5, "--list a skippable frame cut short", "lz4", &["--list", "-v", "skip_trunc.lz4"], &["skip_trunc.lz4"], 0, ""),
+            row(T5, "--list a skippable size cut", "lz4", &["--list", "skip_hdr_trunc.lz4"], &["skip_hdr_trunc.lz4"], 42, "skippable size unreadable"),
+            row(T5, "--list a skippable size cut to two bytes", "lz4", &["--list", "-v", "skip_size_cut.lz4"], &["skip_size_cut.lz4"], 42, "skippable size unreadable"),
+            row(T5, "--list a skippable frame of 4 GiB", "lz4", &["--list", "-v", "skip_4g.lz4"], &["skip_4g.lz4"], 0, ""),
+            row(T5, "--list a block of 2 GiB", "lz4", &["--list", "-v", "blk_2g.lz4"], &["blk_2g.lz4"], 0, ""),
+            row(T5, "--list a block of 2 GiB, compact", "lz4", &["--list", "blk_2g.lz4"], &["blk_2g.lz4"], 0, ""),
+            row(T5, "--list a header and nothing", "lz4", &["--list", "hdr_only.lz4"], &["hdr_only.lz4"], 1, "File format not recognized"),
+            row(T5, "--list a header and one byte", "lz4", &["--list", "-v", "hdr_plus1.lz4"], &["hdr_plus1.lz4"], 0, ""),
+            row(T5, "--list a header with a content size and nothing", "lz4", &["--list", "hdr_cs_only.lz4"], &["hdr_cs_only.lz4"], 1, "File format not recognized"),
+            row(T5, "--list a magic number alone", "lz4", &["--list", "magic_only.lz4"], &["magic_only.lz4"], 71, "Error 71 : Error reading magic_only.lz4"),
+            row(T5, "--list a content-size header cut at 9 bytes", "lz4", &["--list", "cs_trunc.lz4"], &["cs_trunc.lz4"], 1, "lz4: cs_trunc.lz4: File format not recognized"),
+            row(T5, "--list a content-size header cut at 6 bytes", "lz4", &["--list", "hdr_cs_cut.lz4"], &["hdr_cs_cut.lz4"], 72, "Error 72 : Error reading hdr_cs_cut.lz4"),
+            row(T5, "--list a header cut at 6 bytes, no content size", "lz4", &["--list", "hdr_cut6.lz4"], &["hdr_cut6.lz4"], 1, "lz4: hdr_cut6.lz4: File format not recognized"),
+            row(T5, "--list a cut frame, -v", "lz4", &["--list", "-v", "t_blk.lz4"], &["t_blk.lz4"], 0, ""),
+            row(T5, "--list a cut checksum, -v", "lz4", &["--list", "-v", "t_crc.lz4"], &["t_crc.lz4"], 0, ""),
+            row(T5, "--list a cut block size, -v", "lz4", &["--list", "-v", "t_bsz.lz4"], &["t_bsz.lz4"], 0, ""),
+            row(T5, "--list a cut header, -v", "lz4", &["--list", "-v", "t_hdr.lz4"], &["t_hdr.lz4"], 1, "File format not recognized"),
+            row(T5, "--list a cut block of block checksums, -v", "lz4", &["--list", "-v", "t_bblk.lz4"], &["t_bblk.lz4"], 0, ""),
+            row(T5, "--list a cut magic number", "lz4", &["--list", "t_magic.lz4"], &["t_magic.lz4"], 40, "Magic Number unreadable"),
+            row(T5, "--list a legacy magic number alone", "lz4", &["--list", "leg_magic_only.lz4"], &["leg_magic_only.lz4"], 1, "File format not recognized"),
+            row(T5, "--list two legacy magic numbers", "lz4", &["--list", "leg_magics.lz4"], &["leg_magics.lz4"], 1, "File format not recognized"),
+            row(T5, "--list zero-size legacy blocks", "lz4", &["--list", "-v", "leg_zero_blocks.lz4"], &["leg_zero_blocks.lz4"], 0, ""),
+            row(T5, "--list a legacy size above 4 GiB - 16", "lz4", &["--list", "leg_huge.lz4"], &["leg_huge.lz4"], 1, "Corrupted legacy frame \nlz4: leg_huge.lz4: File format not recognized"),
+            row(T5, "--list a legacy size just above 8 MiB", "lz4", &["--list", "leg_8m.lz4"], &["leg_8m.lz4"], 1, "Corrupted legacy frame \nlz4: leg_8m.lz4: File format not recognized"),
+            row(T5, "--list a legacy size cut short", "lz4", &["--list", "leg_bsz_trunc.lz4"], &["leg_bsz_trunc.lz4"], 1, "Corrupted legacy frame"),
+            row(T5, "--list a legacy block cut short, -v", "lz4", &["--list", "-v", "leg_blk_trunc.lz4"], &["leg_blk_trunc.lz4"], 0, ""),
+            row(T5, "--list a legacy frame then 3 bytes", "lz4", &["--list", "leg_garbage.lz4"], &["leg_garbage.lz4"], 1, "Corrupted legacy frame"),
+            row(T5, "--list a legacy frame then 8 zeros", "lz4", &["--list", "-v", "leg_zeros.lz4"], &["leg_zeros.lz4"], 0, ""),
+            row(T5, "--list a frame then 1 byte", "lz4", &["--list", "-v", "frame_tail1.lz4"], &["frame_tail1.lz4"], 40, "Magic Number unreadable"),
+            row(T5, "--list a frame then 4 zeros, -v", "lz4", &["--list", "-v", "frame_zero4.lz4"], &["frame_zero4.lz4"], 1, "Stream followed by undecodable data at position 114"),
+            row(T5, "--list a frame then 8 zeros", "lz4", &["--list", "z.lz4"], &["z.lz4"], 1, "File format not recognized"),
+            row(T5, "--list frame + 100 bytes, -v", "lz4", &["--list", "-v", "g100.lz4"], &["g100.lz4"], 1, "Stream followed by undecodable data at position 114"),
+            row(T5, "--list not lz4, -v", "lz4", &["--list", "-v", "notlz4"], &["notlz4"], 1, "Stream followed by undecodable data at position 4"),
+            row(T5, "--list a bad header checksum, -v", "lz4", &["--list", "-v", "bad_hc.lz4"], &["bad_hc.lz4"], 1, "File format not recognized"),
+            row(T5, "--list a reserved flag", "lz4", &["--list", "rsvd_flg.lz4"], &["rsvd_flg.lz4"], 1, "File format not recognized"),
+            row(T5, "--list a reserved BD bit", "lz4", &["--list", "rsvd_bd.lz4"], &["rsvd_bd.lz4"], 1, "File format not recognized"),
+            row(T5, "--list a bad version", "lz4", &["--list", "v0.lz4"], &["v0.lz4"], 1, "File format not recognized"),
+            row(T5, "--list a block size ID of 3", "lz4", &["--list", "bd_size3.lz4"], &["bd_size3.lz4"], 1, "File format not recognized"),
+            row(T5, "--list an empty frame, -v", "lz4", &["--list", "-v", "empty.lz4"], &["empty.lz4"], 0, ""),
+            row(T5, "--list a content size of 2^63, -v", "lz4", &["--list", "-v", "cs_2p63.lz4"], &["cs_2p63.lz4"], 0, ""),
+            row(T5, "--list a content size of 2^63, compact", "lz4", &["--list", "cs_2p63.lz4"], &["cs_2p63.lz4"], 0, ""),
+            row(T5, "--list a content size that disagrees", "lz4", &["--list", "cs_mismatch.lz4"], &["cs_mismatch.lz4"], 0, ""),
+            row(T5, "--list a content size cut", "lz4", &["--list", "hdr_cs_cut.lz4", "b.lz4"], &["hdr_cs_cut.lz4", "b.lz4"], 72, "Error 72"),
+            // Several files, and the first failure ends the run.
+            row(T5, "--list several files", "lz4", &["--list", "b.lz4", "cs.lz4", "leg.lz4"], &["b.lz4", "cs.lz4", "leg.lz4"], 0, ""),
+            row(T5, "--list -v several files", "lz4", &["--list", "-v", "b.lz4", "cs.lz4", "leg.lz4"], &["b.lz4", "cs.lz4", "leg.lz4"], 0, ""),
+            row(T5, "--list a failure ends the run", "lz4", &["--list", "b.lz4", "notlz4", "cs.lz4"], &["b.lz4", "notlz4", "cs.lz4"], 1, "lz4: notlz4: File format not recognized"),
+            row(T5, "--list -v a failure ends the run", "lz4", &["--list", "-v", "b.lz4", "notlz4", "cs.lz4"], &["b.lz4", "notlz4", "cs.lz4"], 1, "lz4: notlz4: File format not recognized"),
+            row(T5, "--list a missing file between two", "lz4", &["--list", "b.lz4", "nosuch", "cs.lz4"], &["b.lz4", "cs.lz4"], 1, "lz4: nosuch is not a regular file"),
+            row(T5, "--list an Error N ends the run", "lz4", &["--list", "t_magic.lz4", "b.lz4"], &["t_magic.lz4", "b.lz4"], 40, "Magic Number unreadable"),
+            row(T5, "--list - between files", "lz4", &["--list", "b.lz4", "-", "cs.lz4"], &["b.lz4", "cs.lz4"], 0, ""),
+            row(T5, "--list - alone", "lz4", &["--list", "-"], &[], 0, "").stdin_fx("b.lz4"),
+            row(T5, "--list -v on stdin", "lz4", &["--list", "-v"], &[], 0, "").stdin_fx("b.lz4"),
+            row(T5, "--list the operand stdin, a pipe (a file of that name is not read)", "lz4", &["--list", "stdin"], &["stdin"], 1, "lz4: stdin is not a regular file"),
+            row(T5, "--list after the operand", "lz4", &["b.lz4", "--list"], &["b.lz4"], 0, ""),
+            row(T5, "--list -d: the last mode wins", "lz4", &["--list", "-d", "b.lz4"], &["b.lz4"], 0, ""),
+            row(T5, "-d --list: the last mode wins", "lz4", &["-d", "--list", "b.lz4"], &["b.lz4"], 0, ""),
+            row(T5, "--list -t: the last mode wins", "lz4", &["--list", "-t", "b.lz4"], &["b.lz4"], 0, ""),
+            row(T5, "--list through a symbolic link", "lz4", &["--list", "ln.lz4"], &["b.lz4"], 0, "").setup(link_to_b),
+            row(T5, "--list a directory path", "lz4", &["--list", "d/"], &[], 1, "lz4: d/ is not a regular file").setup(mkdir_d),
+            row(T5, "--list -r over a directory", "lz4", &["--list", "-r", "d"], &[], 0, "").setup(dir_with_lz4),
+            row(T5, "--list -v -r over a directory", "lz4", &["--list", "-v", "-r", "d"], &[], 0, "").setup(dir_with_lz4),
+            row(T5, "--list -r over an empty directory", "lz4", &["--list", "-r", "d"], &[], 1, "lz4: d is not a regular file").setup(mkdir_d),
+            row(T5, "--list -r with an empty directory and a file", "lz4", &["--list", "-r", "d", "b.lz4"], &["b.lz4"], 0, "").setup(mkdir_d),
+            row(T5, "--list a file in a directory (base name)", "lz4", &["--list", "-v", "d/x.lz4"], &[], 0, "").setup(dir_with_lz4),
+            // Display levels: the tables are standard output at every level;
+            // the errors follow -q and -qq; -v adds the banner and the
+            // per-frame table, -vv the version lines.
+            row(T5, "--list -q", "lz4", &["--list", "-q", "b.lz4"], &["b.lz4"], 0, ""),
+            row(T5, "--list -q failing", "lz4", &["--list", "-q", "notlz4"], &["notlz4"], 1, ""),
+            row(T5, "--list -qq failing", "lz4", &["--list", "-qq", "notlz4"], &["notlz4"], 1, ""),
+            row(T5, "--list -qq missing", "lz4", &["--list", "-qq", "nosuch"], &[], 1, ""),
+            row(T5, "--list -q Error 40", "lz4", &["--list", "-q", "t_magic.lz4"], &["t_magic.lz4"], 40, ""),
+            row(T5, "--list -qq Error 40", "lz4", &["--list", "-qq", "t_magic.lz4"], &["t_magic.lz4"], 40, ""),
+            row(T5, "--list -vv", "lz4", &["--list", "-vv", "b.lz4"], &["b.lz4"], 0, "_POSIX_VERSION defined: "),
+            row(T5, "--list -vvv", "lz4", &["--list", "-vvv", "cs.lz4"], &["cs.lz4"], 0, ""),
+            row(T5, "--list -vv failing", "lz4", &["--list", "-vv", "notlz4"], &["notlz4"], 1, "_POSIX_VERSION defined: "),
+            row(T5, "--list -vq", "lz4", &["--list", "-vq", "b.lz4"], &["b.lz4"], 0, ""),
+            row(T5, "--list -qv", "lz4", &["--list", "-qv", "b.lz4"], &["b.lz4"], 0, ""),
+            row(T5, "--list a legacy frame, -v", "lz4", &["--list", "-v", "leg.lz4"], &["leg.lz4"], 0, ""),
+            row(T5, "--list a legacy frame then a frame, -q", "lz4", &["--list", "-q", "leg_then_good.lz4"], &["leg_then_good.lz4"], 0, ""),
+            row(T5, "--list under unlz4", "unlz4", &["--list", "b.lz4"], &["b.lz4"], 0, ""),
+            row(T5, "--list under lz4cat", "lz4cat", &["--list", "b.lz4"], &["b.lz4"], 0, ""),
+            row(T5, "--list -v under lz4cat", "lz4cat", &["--list", "-v", "b.lz4"], &["b.lz4"], 0, ""),
+            row(T5, "--list under lz4c", "lz4c", &["--list", "cs.lz4"], &["cs.lz4"], 0, ""),
+            row(T5, "--list failing under lz4cat", "lz4cat", &["--list", "notlz4"], &["notlz4"], 1, "lz4: notlz4: File format not recognized"),
+            row(T5, "-p --list", "lz4", &["-p", "--list", "b.lz4"], &["b.lz4"], 0, "Press enter to continue"),
+            row(T5, "-p --list failing", "lz4", &["-p", "--list", "notlz4"], &["notlz4"], 1, "Press enter to continue"),
+            row(T5, "-p --list Error 40", "lz4", &["-p", "--list", "t_magic.lz4"], &["t_magic.lz4"], 40, ""),
             // ---- Task 6: -v and the progress display ----
             row(T6, "-v compress", "lz4", &["-v", "-T3", "a", "x.lz4"], &["a"], 0, "Using 3 threads for compression \n"),
             row(T6, "-v decode", "lz4", &["-v", "-d", "b.lz4", "bo"], &["b.lz4"], 0, "decoded 8800 bytes"),
@@ -2377,13 +2554,86 @@ mod unix {
         assert_eq!((o.status.code(), o.stderr.len()), (Some(1), 0));
     }
 
+    /// `--list stdin` (the operand, not `-`) lists standard input when it is
+    /// redirected from a regular file, named `stdin`, and refuses a pipe or
+    /// `/dev/null` (probed 2026-10-16; the differential harness feeds a
+    /// pipe, so this runs the two binaries by hand). `-` and no operand
+    /// never read it.
+    #[test]
+    fn list_of_standard_input_redirected_from_a_file() {
+        if lz4_dir().is_none() {
+            return;
+        }
+        let dir = ScratchDir::at(
+            std::env::temp_dir().join(format!("stuffr-lz4-liststdin-{}", std::process::id())),
+        );
+        fs::create_dir_all(&*dir).unwrap();
+        for name in [
+            "b.lz4",
+            "cs.lz4",
+            "leg.lz4",
+            "skip_ok.lz4",
+            "notlz4",
+            "t_magic.lz4",
+        ] {
+            fs::write(dir.join(name), fx(name)).unwrap();
+        }
+        let link = dir.join("lz4");
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
+        let run = |exe: &Path, args: &[&str], input: &str| {
+            let stdin = if input.is_empty() {
+                std::process::Stdio::null()
+            } else {
+                std::process::Stdio::from(fs::File::open(dir.join(input)).unwrap())
+            };
+            let o = std::process::Command::new(exe)
+                .args(args)
+                .current_dir(&*dir)
+                .stdin(stdin)
+                .env("LC_ALL", "C")
+                .output()
+                .unwrap();
+            let err = String::from_utf8_lossy(&o.stderr).into_owned();
+            // Deviation 1: the banner names stuffr.
+            let err = err.replacen(
+                &format!("multithread (stuffr {})", env!("CARGO_PKG_VERSION")),
+                "multithread",
+                1,
+            );
+            (o.status.code(), o.stdout, err)
+        };
+        let reference = Path::new(ref_lz4());
+        for args in [
+            &["--list", "stdin"][..],
+            &["--list", "-v", "stdin"],
+            &["--list", "b.lz4", "stdin", "cs.lz4"],
+            &["--list", "-"],
+            &["--list"],
+        ] {
+            for input in [
+                "b.lz4",
+                "cs.lz4",
+                "leg.lz4",
+                "skip_ok.lz4",
+                "notlz4",
+                "t_magic.lz4",
+                "",
+            ] {
+                assert_eq!(
+                    run(&link, args, input),
+                    run(reference, args, input),
+                    "{args:?} < {input:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn task4_rows_match_the_reference() {
         check_task("Task 4");
     }
 
     #[test]
-    #[ignore = "Task 5"]
     fn task5_rows_match_the_reference() {
         check_task("Task 5");
     }
@@ -2441,8 +2691,13 @@ mod unix {
     /// `Error 72 : Sparse skip error(29): Illegal seek ; try --no-sparse`,
     /// `Error 74 : Sparse skip error ; try --no-sparse`; probed 2026-10-16,
     /// pinned by `sparse_output_matches_the_reference`).
-    const EXIT_CODES: [i32; 18] = [
-        0, 1, 26, 27, 34, 38, 40, 42, 43, 44, 50, 61, 63, 64, 69, 70, 72, 74,
+    ///
+    /// Task 5 added 71 (and met 72 again): `--list` of a file that is only a
+    /// frame's magic number is `Error 71 : Error reading NAME`, of one cut
+    /// inside a header that promises a content size `Error 72 : Error
+    /// reading NAME` (probed 2026-10-16, pinned by the `--list` rows).
+    const EXIT_CODES: [i32; 19] = [
+        0, 1, 26, 27, 34, 38, 40, 42, 43, 44, 50, 61, 63, 64, 69, 70, 71, 72, 74,
     ];
 
     #[test]

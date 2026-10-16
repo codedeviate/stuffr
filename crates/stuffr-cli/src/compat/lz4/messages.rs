@@ -360,6 +360,97 @@ pub(super) const E72_SPARSE_SKIP: &str =
 /// the bytes after the last whole word).
 pub(super) const E74_SPARSE_TAIL_SKIP: &str = "Error 74 : Sparse skip error ; try --no-sparse \n";
 
+// ---- `--list` (probed on /opt/homebrew/opt/lz4/bin/lz4, 1.10.0) ----
+
+/// probe: `lz4 --list b.lz4` (standard output, once before the first file
+/// and even when none is read: `lz4 --list` on standard input prints only
+/// this; absent at display level 3).
+pub(super) const LIST_HEADER: &str =
+    "    Frames           Type Block  Compressed  Uncompressed    Ratio   Filename\n";
+
+/// probe: `lz4 --list cs100.lz4` (a file whose frames all say how big their
+/// content is): the cells `%10s %14s %5s %11s %13s %8s` as padded by the
+/// caller, the ratio's `%`, two blanks, the file's base name, a blank.
+pub(super) const LIST_ROW_KNOWN: &str = "%s %s %s %s %s %s%%  %s \n";
+
+/// probe: `lz4 --list b.lz4` (a content size missing from a frame, or any
+/// legacy or skippable frame): the same cells, three blanks, the base name,
+/// no trailing blank.
+pub(super) const LIST_ROW_UNKNOWN: &str = "%s %s %s %s %s %s   %s\n";
+
+/// probe: `lz4 --list -v b.lz4` (display level 3): `name(i/n)` before each
+/// file, the base name.
+pub(super) const LIST_FILE_VERBOSE: &str = "%s(%s/%s)\n";
+
+/// probe: `lz4 --list -v b.lz4`: the columns of the per-frame table.
+pub(super) const LIST_HEADER_VERBOSE: &str = "     Frame           Type Block Checksum           Compressed         Uncompressed     Ratio\n";
+
+/// probe: `lz4 --list -v cs100.lz4` (a modern frame with a content size):
+/// the cells `%10s %14s %5s %8s %20s %20s %9s` as padded by the caller, then
+/// the ratio's `%`.
+pub(super) const LIST_FRAME_KNOWN: &str = "%s %s %s %s %s %s %s%%\n";
+
+/// probe: `lz4 --list -v b.lz4` (a modern frame with no content size): the
+/// same cells and a trailing blank.
+pub(super) const LIST_FRAME_UNKNOWN: &str = "%s %s %s %s %s %s %s \n";
+
+/// probe: `lz4 --list -v leg.lz4`, `skip.lz4` (legacy and skippable frames):
+/// the same cells and nothing after them.
+pub(super) const LIST_FRAME_OTHER: &str = "%s %s %s %s %s %s %s\n";
+
+/// probe: `lz4 --list -v b.lz4`: the blank line after a file's frames (not
+/// printed after a file that failed).
+pub(super) const LIST_FILE_END: &str = "\n";
+
+/// probe: `lz4 --list b.lz4`: a modern frame's type cell.
+pub(super) const TYPE_FRAME: &str = "LZ4Frame";
+/// probe: `lz4 --list leg.lz4`: a legacy frame's type cell.
+pub(super) const TYPE_LEGACY: &str = "LegacyFrame";
+/// probe: `lz4 --list skip.lz4`: a skippable frame's type cell.
+pub(super) const TYPE_SKIPPABLE: &str = "SkippableFrame";
+/// probe: `lz4 --list leg_then_good.lz4`: no cell, or frames that differ
+/// (type, block size, block mode), or a frame with nothing to say.
+pub(super) const CELL_NONE: &str = "-";
+/// probe: `lz4 --list -v b.lz4`: the checksum cell of a frame with a
+/// content checksum (`-` without).
+pub(super) const CHECKSUM_XXH32: &str = "XXH32";
+/// probe: `lz4 --list b.lz4`: the block cell is `B`, the size ID (4 to 7)
+/// and `I` (independent blocks) or `D` (linked: `lz4 -BD`).
+pub(super) const BLOCK_INDEPENDENT: &str = "I";
+/// probe: `lz4 --list linked.lz4` (a frame header with block-independence
+/// off).
+pub(super) const BLOCK_LINKED: &str = "D";
+/// probe: `lz4 --list b.lz4`: the block cell's `B` before the size ID.
+pub(super) const BLOCK_PREFIX: &str = "B";
+
+/// probe: `lz4 --list notlz4`, `lz4 --list badhc.lz4`, `lz4 --list e.lz4`
+/// (display level 1 and up; the run ends with exit 1, without reading the
+/// files after it).
+pub(super) const LIST_NOT_RECOGNIZED: &str = "lz4: %s: File format not recognized \n";
+
+/// probe: `lz4 --list nosuch`, `lz4 --list d`, `lz4 --list /dev/null`,
+/// `lz4 --list stdin` (a file named `stdin`: only the operand `-` is
+/// standard input in a list).
+pub(super) const LIST_NOT_REGULAR: &str = "lz4: %s is not a regular file \n";
+
+/// probe: `lz4 --list leg_huge.lz4` (a legacy block size above 8 MiB, or a
+/// size word cut short): printed before [`LIST_NOT_RECOGNIZED`].
+pub(super) const LIST_CORRUPTED_LEGACY: &str = "Corrupted legacy frame \n";
+
+/// probe: `lz4 --list c04.lz4` (a frame's magic number and nothing after
+/// it): the name as given.
+pub(super) const E71_READING: &str = "Error 71 : Error reading %s \n";
+
+/// probe: `lz4 --list c05.lz4` (magic number, then one to three bytes of a
+/// header that says it carries a content size).
+pub(super) const E72_READING: &str = "Error 72 : Error reading %s \n";
+
+/// probe: `lz4 -vv --list b.lz4` (display level 4, after the banner):
+/// `_POSIX_VERSION` as the system reports it (`sysconf(_SC_VERSION)`: on
+/// macOS 200112L), twice.
+pub(super) const POSIX_VERSION: &str =
+    "_POSIX_VERSION defined: %sL\nPLATFORM_POSIX_VERSION defined: %sL\n";
+
 // ---- the end of a run ----
 
 /// probe: `lz4 -p -V < /dev/null` (hidden `-p`): printed at a clean exit,
@@ -368,8 +459,3 @@ pub(super) const PRESS_ENTER: &str = "Press enter to continue...\n";
 
 /// Spec deviation 5 (stuffr's own text): `-b#`, `-e#` and `-i#`.
 pub(super) const BENCH_REFUSED: &str = "Benchmark mode is not available in this build (stuffr)\n";
-
-/// Not lz4's: what an operation a later task implements answers until then
-/// (debug builds only; the 0.15.0 final review greps that none remains).
-#[cfg(debug_assertions)]
-pub(super) const TODO_NOT_IMPLEMENTED: &str = "stuffr: lz4 %s: todo (0.15.0 %s)\n";

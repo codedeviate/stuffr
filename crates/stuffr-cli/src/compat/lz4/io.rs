@@ -439,6 +439,27 @@ pub(super) struct Run<'a> {
     pub(super) dict: Option<Vec<u8>>,
 }
 
+impl<'a> Run<'a> {
+    /// A run over `cmd`'s inputs at display level `level`.
+    pub(super) fn new(
+        cmd: &'a Command,
+        host: &'a mut Host,
+        out: &'a mut dyn Write,
+        err: &'a mut dyn Write,
+        level: i32,
+    ) -> Run<'a> {
+        Run {
+            cmd,
+            host,
+            out,
+            err,
+            level,
+            stdin: None,
+            dict: None,
+        }
+    }
+}
+
 impl Run<'_> {
     /// `Error N : ...` at display level 1: the run ends with N.
     pub(super) fn exm(&mut self, code: i32, fmt: &str, args: &[&[u8]]) -> Fail {
@@ -693,8 +714,12 @@ impl Run<'_> {
     /// entry in the order the directory lists it, hidden ones too, a
     /// directory's files where it stands, symbolic links followed; the
     /// list is made before anything is written, so new outputs are not
-    /// inputs).
-    fn expand(&self, names: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    /// inputs). Where that finds no file at all, the names stand as they
+    /// were given (probe: `lz4 -m -r e1 e2` over two empty directories says
+    /// `e1 is a directory -- ignored` for each, exit 2; `--list -r e1` says
+    /// `e1 is not a regular file`; with another file named, an empty
+    /// directory vanishes: `--list -r e1 plain.lz4` lists `plain.lz4`).
+    pub(super) fn expand(&self, names: &[Vec<u8>]) -> Vec<Vec<u8>> {
         if !self.cmd.recursive {
             return names.to_vec();
         }
@@ -707,6 +732,9 @@ impl Run<'_> {
             } else {
                 out.push(name.clone());
             }
+        }
+        if out.is_empty() {
+            return names.to_vec();
         }
         out
     }
@@ -944,15 +972,7 @@ fn run_files(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Ended {
-    let mut run = Run {
-        cmd,
-        host,
-        out,
-        err,
-        level: run_level(cmd, plan),
-        stdin: None,
-        dict: None,
-    };
+    let mut run = Run::new(cmd, host, out, err, run_level(cmd, plan));
     match files(&mut run, plan) {
         Ok(failed) => Ended {
             code: i32::try_from(failed).unwrap_or(i32::MAX),
