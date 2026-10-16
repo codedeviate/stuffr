@@ -108,16 +108,6 @@
 //! below for the regression sweep, driven by files the REFERENCE `lz4` CLI
 //! wrote, cut at every offset inside a following frame's header.
 
-/// `lz4_flex`'s frame encoder and block decoder, for the `stuffr` binary's
-/// zstd compatibility family (`--format=lz4`, and the LZ4 frames `zstd -d`
-/// reads by magic, whose frame layer it parses itself to answer as
-/// liblz4's `LZ4F_decompress` does). Not part of the stable API.
-#[doc(hidden)]
-pub mod raw {
-    pub use lz4_flex::block::{DecompressError, decompress_into, decompress_into_with_dict};
-    pub use lz4_flex::frame::{BlockMode, BlockSize, Error, FrameEncoder, FrameInfo};
-}
-
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

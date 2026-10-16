@@ -61,14 +61,6 @@ pub mod zstd_opts {
 pub mod zlib_c {
     pub use stuffr_formats::zlib_c::{Inflate, RawDeflate};
 }
-/// LZ4 frames through `lz4_flex` — what the `stuffr` binary's zstd
-/// compatibility family writes for `--format=lz4` and decodes LZ4 frames
-/// with. Not part of the stable API.
-#[cfg(feature = "lz4")]
-#[doc(hidden)]
-pub mod lz4_frame {
-    pub use stuffr_formats::lz4::raw::*;
-}
 /// The `lz4` tool's options seam — levels, block sizes and modes,
 /// checksums, dictionaries, the legacy format — and the streaming coder over
 /// them, what the `stuffr` binary's lz4 compatibility family runs: liblz4

@@ -1217,10 +1217,10 @@ input through, at display level 1) and `zstdmt` compresses with `-T0`.
 - **Compressed output.** On the `c-backed` tier (`--features c-backed`, which
   builds libzstd 1.5.7) zstd frames and dictionaries are **byte-identical to
   zstd 1.5.7** for every level, `--ultra`, `--long`, `-T`, `--rsyncable`,
-  `--format=gzip|xz|lzma`, dictionaries and `--patch-from`. The exceptions:
-  `--train-cover` (see below), `--adapt` (its level moves by timing, so its
-  frames are compatible, not identical) and `--format=lz4`, which is
-  **compatible only** on every tier. On the default pure tier every option is
+  `--format=gzip|xz|lzma|lz4` (liblz4 1.10.0 through `lz4-c`, in
+  `c-backed`), dictionaries and `--patch-from`. The exceptions:
+  `--train-cover` (see below) and `--adapt` (its level moves by timing, so its
+  frames are compatible, not identical). On the default pure tier every option is
   accepted and the output is **compatible**: zstd 1.5.7 decodes it to the
   input. The pure tier's refusals of dictionary compression and `--train` are
   listed below.
@@ -1260,12 +1260,14 @@ input through, at display level 1) and `zstdmt` compresses with `-T0`.
   layout, in zstd itself too. It is promised valid and usable by zstd, not
   byte for byte. `--train`, `--train-fastcover` and `--train-legacy` write
   zstd's bytes.
-- **`--format=lz4` is compatible only,** on every tier: the frames are
-  `lz4_flex`'s fast compressor at every level, inside liblz4's frame
-  descriptor (64 KiB linked blocks, content size, content checksum, as zstd
-  sets them).
 
 **Known differences, pure tier only** (`zstd-pure` without `zstd-c`):
+
+- **`--format=lz4` is compatible, not identical** (the C tier, `lz4-c`, is
+  liblz4's bytes): the pure tier's frame writer follows the frame format
+  with `lz4_flex`'s block compressor at every level, in liblz4's frame
+  descriptor (64 KiB linked blocks, content size, content checksum, as zstd
+  sets them); lz4 reads it back to the input.
 
 - **Compression is `ruzstd`'s `Fastest` at every level,** so the sizes and
   ratios in the summaries and in `-vvvvvv`'s trace are the tier's own. The

@@ -388,6 +388,27 @@ fn encode_plain(o: &EncodeOptions, data: &[u8], chunk: usize) -> Vec<u8> {
     out
 }
 
+/// A plain frame's header is the first thing `update` returns, even for an
+/// input shorter than a block (`LZ4F_compressBegin` runs before the first
+/// `LZ4F_compressUpdate`; zstd's progress counts it as written).
+#[test]
+fn a_plain_frames_header_comes_with_the_first_update() {
+    let o = EncodeOptions {
+        block_size: BlockSizeId::Max64Kb,
+        block_linked: true,
+        content_size: Some(10),
+        ..EncodeOptions::default()
+    };
+    let mut e = Encoder::new_plain(&o).unwrap();
+    let mut out = Vec::new();
+    e.update(b"0123456789", &mut out).unwrap();
+    // Magic, FLG, BD, an eight-byte content size, the header checksum.
+    assert_eq!(out.len(), 15);
+    assert_eq!(out[..4], MAGIC.to_le_bytes());
+    e.finish(&mut out).unwrap();
+    assert!(out.len() > 15);
+}
+
 /// One row of `ref.txt`: `input|source|flags|sha256`, `source` one of
 /// `file`, `stdin` and `zstd` (whose flags are its level).
 #[cfg(feature = "lz4-c")]

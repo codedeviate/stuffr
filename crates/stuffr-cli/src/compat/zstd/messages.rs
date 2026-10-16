@@ -1115,35 +1115,11 @@ pub(super) const NAN: &str = if cfg!(all(
 /// C's `printf("%.2f")` of an infinity.
 pub(super) const INF: &str = "inf";
 
-// lz4frame.c (liblz4 1.10.0): `LZ4F_getErrorName`'s names for the errors
-// fileio.c prints.
+// lz4frame.c (liblz4 1.10.0): `LZ4F_getErrorName`'s name for an error that
+// is not liblz4's own (the others come from `lz4_opts::Lz4fError::name`).
 
 /// lz4frame.c: `LZ4F_ERROR_GENERIC`.
 pub(super) const LZ4F_GENERIC: &str = "ERROR_GENERIC";
-
-/// lz4frame.c: `LZ4F_ERROR_reservedFlag_set`.
-pub(super) const LZ4F_RESERVED_FLAG_SET: &str = "ERROR_reservedFlag_set";
-
-/// lz4frame.c: `LZ4F_ERROR_headerVersion_wrong`.
-pub(super) const LZ4F_HEADER_VERSION_WRONG: &str = "ERROR_headerVersion_wrong";
-
-/// lz4frame.c: `LZ4F_ERROR_maxBlockSize_invalid`.
-pub(super) const LZ4F_MAX_BLOCK_SIZE_INVALID: &str = "ERROR_maxBlockSize_invalid";
-
-/// lz4frame.c: `LZ4F_ERROR_headerChecksum_invalid`.
-pub(super) const LZ4F_HEADER_CHECKSUM_INVALID: &str = "ERROR_headerChecksum_invalid";
-
-/// lz4frame.c: `LZ4F_ERROR_blockChecksum_invalid`.
-pub(super) const LZ4F_BLOCK_CHECKSUM_INVALID: &str = "ERROR_blockChecksum_invalid";
-
-/// lz4frame.c: `LZ4F_ERROR_decompressionFailed`.
-pub(super) const LZ4F_DECOMPRESSION_FAILED: &str = "ERROR_decompressionFailed";
-
-/// lz4frame.c: `LZ4F_ERROR_frameSize_wrong`.
-pub(super) const LZ4F_FRAME_SIZE_WRONG: &str = "ERROR_frameSize_wrong";
-
-/// lz4frame.c: `LZ4F_ERROR_contentChecksum_invalid`.
-pub(super) const LZ4F_CONTENT_CHECKSUM_INVALID: &str = "ERROR_contentChecksum_invalid";
 
 // ---- dibio.c: training ----
 

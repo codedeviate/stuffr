@@ -24,8 +24,8 @@
 //! 0 and `--fast=1`: gzip is compared byte for byte with C zlib (`zlib-c`;
 //! spike S2 measured zlib's deflate and header identical to the
 //! reference's, the OS byte included), xz and lzma with liblzma (`xz-c`,
-//! 5.8.4 on both sides); elsewhere, and for lz4 always (R11: `lz4_flex`,
-//! not liblz4), the reference decodes stuffr's output to the input.
+//! 5.8.4 on both sides) and lz4 with liblz4 (`lz4-c`, 1.10.0 via
+//! `stuffr::lz4_opts`); elsewhere the reference decodes stuffr's output to the input.
 
 #[cfg(unix)]
 mod compat_harness;
@@ -179,6 +179,7 @@ mod bytes {
     fn foreign_exact(f: &str) -> bool {
         (f == "gzip" && cfg!(feature = "zlib-c"))
             || (matches!(f, "xz" | "lzma") && cfg!(feature = "xz-c"))
+            || (f == "lz4" && cfg!(feature = "lz4-c"))
     }
 
     /// `--format=gzip|xz|lzma|lz4` over every input, file to file and to
@@ -201,6 +202,50 @@ mod bytes {
         }
         check("foreign_formats", &cases);
     }
+
+    /// 0.15.0 Task 7: `--format=lz4` is plain `LZ4F` streaming (64 KiB
+    /// linked blocks, content size and checksum, level capped at 12), which
+    /// `lz4_opts::Encoder::new_plain` reproduces: byte-identical on the C
+    /// tier (compared on the pure tier by decoding), from files, to standard
+    /// output and from standard input (content size unknown), at the levels
+    /// either side of liblz4's HC switch (3) and cap (12), over inputs of
+    /// zero, one and several blocks.
+    #[test]
+    fn zstd_format_lz4_is_byte_identical() {
+        let mut inputs = inputs();
+        inputs.push(("one", b"x".to_vec()));
+        inputs.push(("block", text(65_536, 75)));
+        inputs.push(("big", text(1_500_000, 76)));
+        let mut cases = Vec::new();
+        for level in [
+            "-1", "-2", "-3", "-4", "-9", "-12", "-13", "-19", "--fast=3", "-0",
+        ] {
+            for (name, data) in &inputs {
+                for extra in [&[][..], &["--no-check"], &["--no-content-size"]] {
+                    let mut a = vec!["-c", "--format=lz4", level];
+                    a.extend(extra.iter().copied());
+                    a.push(name);
+                    let mut c = case("zstd", a, vec![(name, data.clone())]);
+                    c.compare_output_bytes = EXACT_LZ4;
+                    cases.push(c);
+                }
+                let mut a = vec!["-q", "-k", "--format=lz4", level];
+                a.push(name);
+                let mut c = case("zstd", a, vec![(name, data.clone())]);
+                c.compare_output_bytes = EXACT_LZ4;
+                cases.push(c);
+                // Standard input: the size is not known.
+                let mut c = case("zstd", vec!["-c", "--format=lz4", level], Vec::new());
+                c.stdin = Some(data.clone());
+                c.compare_output_bytes = EXACT_LZ4;
+                cases.push(c);
+            }
+        }
+        check("zstd_format_lz4_is_byte_identical", &cases);
+    }
+
+    /// Whether `--format=lz4`'s bytes are promised on this build.
+    const EXACT_LZ4: bool = cfg!(feature = "lz4-c");
 
     /// Spec deviation 7: the pure tier's answer to compressing with a
     /// dictionary or a prefix, `EXM_THROW(1, …)`.

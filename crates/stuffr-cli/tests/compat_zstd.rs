@@ -101,7 +101,8 @@ mod unix {
     /// zstd frames on the C tier (`zstd-c`), `--format=gzip` with C zlib
     /// (`zlib-c`; spike S2 measured zlib's bytes identical to the
     /// reference's), `--format=xz|lzma` with liblzma (`xz-c`, 5.8.4 on both
-    /// sides); `--format=lz4` never (R11: `lz4_flex`, not liblz4). The last
+    /// sides), `--format=lz4` with liblz4 (`lz4-c`, 1.10.0 through `lz4_opts`,
+    /// 0.15.0 Task 7; the pure tier is `lz4_flex`'s). The last
     /// `--format=` counts.
     fn exact_for(args: &[&str]) -> bool {
         let format = args
@@ -113,7 +114,7 @@ mod unix {
         match format {
             "gzip" => cfg!(feature = "zlib-c"),
             "xz" | "lzma" => cfg!(feature = "xz-c"),
-            "lz4" => false,
+            "lz4" => cfg!(feature = "lz4-c"),
             _ => EXACT,
         }
     }
@@ -313,8 +314,8 @@ mod unix {
         assert_eq!(drop_later_refreshes(&other), other);
     }
 
-    /// Spec deviation 7 on the pure tier, and `--format=lz4` on either
-    /// (R11): the compressed sizes and ratios in the summaries are those of
+    /// Spec deviation 7 on the pure tier, and `--format=lz4` there too
+    /// (compatible, not identical): the compressed sizes and ratios in the summaries are those of
     /// stuffr's own frames, so on both sides they become `<ratio>` and
     /// `<size>` (the input size, the names and every other byte still
     /// compared). Nothing changes where the bytes are promised.
@@ -2328,8 +2329,8 @@ mod unix {
     }
 
     /// The LZ4 frame descriptor (FLG, BD, the content size and the header
-    /// checksum) is the reference's, byte for byte, though the blocks
-    /// after it are `lz4_flex`'s (R11): 64 KiB linked blocks, the content
+    /// checksum) is the reference's, byte for byte on both tiers (the
+    /// blocks after it too on the C tier, `lz4-c`): 64 KiB linked blocks, the content
     /// size when the input's is known and non-zero, and a content checksum
     /// only for `checksumFlag` 1 (`-C` sets 2, which liblz4 reads as no
     /// checksum).

@@ -20,15 +20,13 @@
 //!   `lzma_alone_encoder` over `lzma_lzma_preset(level)`, the level clamped
 //!   to 0..=9, through `stuffr::xz_opts` (liblzma 5.8.4 on the C tier, as
 //!   the reference links).
-//! - lz4: `lz4_flex`'s frame encoder with liblz4's frame settings as
-//!   fileio.c sets them, so the frame descriptor is the reference's byte for
-//!   byte: 64 KiB linked blocks, the content size when the input's is known
-//!   and non-zero, a content checksum only for `checksumFlag` 1 (`-C` sets
-//!   2, which `LZ4F_compressBegin` masks to no checksum). The blocks are
-//!   `lz4_flex`'s fast compressor's at every level (liblz4 switches to HC
-//!   from level 3): compatible, never identical (R11; R11's "4 MiB,
-//!   block-independent" was read from the `lz4` tool, not from
-//!   `FIO_compressLz4Frame`, whose settings the binary shows).
+//! - lz4: plain `LZ4F` streaming through `stuffr::lz4_opts`
+//!   (`Encoder::new_plain`; liblz4 1.10.0 on the C tier, byte-identical to
+//!   the reference's, spike S4), with fileio.c's preferences: 64 KiB linked
+//!   blocks, the content size when the input's is known and non-zero, a
+//!   content checksum only for `checksumFlag` 1 (`-C` sets 2, which
+//!   `LZ4F_compressBegin` masks to no checksum), the level capped at 12 by
+//!   liblz4. Off the C tier the pure writer is compatible, not identical.
 //!
 //! **Decompressing.** Each frame is read as fileio.c's loops read it: the
 //! decoder is called with whatever the read pool holds and a fresh
@@ -60,10 +58,12 @@
 //!   output buffer waits for the next call, as liblzma, which decodes
 //!   nothing into a full buffer, leaves it: a full buffer is always handed
 //!   over, and a failure loses only the call's partial one.
-//! - lz4: liblz4 1.10.0's `LZ4F_decompress` frame layer is ported here (its
-//!   checks in its order, its `LZ4F_getErrorName` names, a block decoded
-//!   with no room left waiting as its `tmpOut` does), the blocks decoded by
-//!   `lz4_flex`.
+//! - lz4: `stuffr::lz4_opts::Decoder` (liblz4 1.10.0's `LZ4F_decompress` on
+//!   the C tier, the pure tier's reader elsewhere), fed so that a block
+//!   decoded with no room left waits as liblz4's `tmpOut` does: the input
+//!   goes in one unit at a time (header, block word, block, checksum), and a
+//!   call stops at the first block that does not fit the output buffer.
+//!   Messages are `LZ4F_getErrorName`'s.
 //!
 //! **A sandboxed run** (the fuzz target) bounds liblzma's memory whatever
 //! the input or the level says: decoders run under a 256 MiB limit (an
@@ -76,9 +76,7 @@ use std::rc::Rc;
 
 #[cfg(not(feature = "zlib-c"))]
 use flate2::{Crc, Decompress, FlushDecompress, Status};
-use stuffr::lz4_frame::{
-    BlockMode, BlockSize, FrameEncoder, FrameInfo, decompress_into, decompress_into_with_dict,
-};
+use stuffr::lz4_opts::{self, BlockSizeId, EncodeOptions as Lz4EncodeOptions, Lz4Error};
 use stuffr::xz_opts::{self, Check, DecodeOptions, EncodeOptions, Filter, Format, Lzma, XzError};
 
 use super::cli::CType;
@@ -445,51 +443,80 @@ fn compress_lzma(
 /// `FIO_LZ4_GetBlockSize_FromBlockId(LZ4F_max64KB)`.
 const LZ4_BLOCK: usize = 64 << 10;
 
-/// `FIO_compressLz4Frame`. The level is liblz4's choice of compressor,
-/// which `lz4_flex` does not have (module doc).
+/// `FIO_compressLz4Frame`: `LZ4F_compressBegin`, one `LZ4F_compressUpdate`
+/// per 64 KiB read, `LZ4F_compressEnd`, through `lz4_opts::Encoder::new_plain`
+/// (liblz4 1.10.0 on the C tier). fileio.c's preferences: 64 KiB linked
+/// blocks, the content size when the input's is known and non-zero, the
+/// content checksum for `checksumFlag` 1 (`-C` sets 2, which
+/// `LZ4F_compressBegin` masks to none), `compressionLevel` the level
+/// (liblz4 caps it at 12).
 fn compress_lz4(
     io: &mut Io<'_>,
     rp: &mut ReadPool,
     src: &[u8],
     file_size: u64,
-    _level: i32,
+    level: i32,
 ) -> Fio<(u64, u64)> {
     let content_size = (file_size != FILESIZE_UNKNOWN && file_size != 0).then_some(file_size);
-    let info = FrameInfo::new()
-        .block_size(BlockSize::Max64KB)
-        .block_mode(BlockMode::Linked)
-        .content_checksum(io.prefs.checksum == 1)
-        .content_size(content_size);
-    let sink = Shared::default();
-    let mut enc = FrameEncoder::with_frame_info(info, sink.clone());
+    let opts = Lz4EncodeOptions {
+        level: level.min(12),
+        block_size: BlockSizeId::Max64Kb,
+        block_linked: true,
+        block_checksum: false,
+        content_checksum: io.prefs.checksum == 1,
+        content_size,
+        ..Lz4EncodeOptions::default()
+    };
+    // `LZ4F_createCompressionContext` failing is an allocation failure,
+    // unreachable here; it is answered as a failing first update.
+    let mut enc = match lz4_opts::Encoder::new_plain(&opts) {
+        Ok(e) => e,
+        Err(e) => {
+            let name = lz4_error_name(&e);
+            return Err(io.exm(35, m::LZ4_COMPRESS_FAILED, &[src, name.as_bytes()]));
+        }
+    };
+    let mut out = Vec::new();
     let (mut read, mut written) = (0u64, 0u64);
     read += io.fill(rp, LZ4_BLOCK)? as u64;
     while !rp.loaded().is_empty() {
         let n = LZ4_BLOCK.min(rp.loaded().len());
-        if enc.write_all(&rp.loaded()[..n]).is_err() {
-            return Err(io.exm(
-                35,
-                m::LZ4_COMPRESS_FAILED,
-                &[src, m::LZ4F_GENERIC.as_bytes()],
-            ));
+        out.clear();
+        if let Err(e) = enc.update(&rp.loaded()[..n], &mut out) {
+            let name = lz4_error_name(&e);
+            return Err(io.exm(35, m::LZ4_COMPRESS_FAILED, &[src, name.as_bytes()]));
         }
-        written += drain(io, &sink)?;
+        written += write_out(io, &out)?;
         read_progress(io, false, read, file_size, written);
         rp.consume(n);
         read += io.fill(rp, LZ4_BLOCK)? as u64;
     }
-    // liblz4 records the size it was told; `lz4_flex` refuses a frame whose
-    // content does not match it (an input that changed size while read).
-    if enc.finish().is_err() {
-        return Err(io.exm(
-            38,
-            m::LZ4_END_FAILED,
-            &[src, m::LZ4F_FRAME_SIZE_WRONG.as_bytes()],
-        ));
+    // liblz4 records the size it was told and refuses an end that does not
+    // match (an input that changed size while read).
+    out.clear();
+    if let Err(e) = enc.finish(&mut out) {
+        let name = lz4_error_name(&e);
+        return Err(io.exm(38, m::LZ4_END_FAILED, &[src, name.as_bytes()]));
     }
-    written += drain(io, &sink)?;
+    written += write_out(io, &out)?;
     io.sparse_end()?;
     Ok((read, written))
+}
+
+/// `LZ4F_getErrorName` of a failing call (an I/O error is not liblz4's).
+fn lz4_error_name(e: &Lz4Error) -> String {
+    match e {
+        Lz4Error::Lib(l) => l.name().to_string(),
+        Lz4Error::Io(_) => m::LZ4F_GENERIC.to_string(),
+    }
+}
+
+/// Writes `out` to the destination, as `drain` does a sink.
+fn write_out(io: &mut Io<'_>, out: &[u8]) -> Fio<u64> {
+    if !out.is_empty() {
+        io.write_block(out)?;
+    }
+    Ok(out.len() as u64)
 }
 
 // ---- decompressing ----
@@ -1036,87 +1063,60 @@ impl Coder for LzmaMember {
 
 // ---- lz4 frames ----
 
-/// Where an LZ4 frame is (`dStage`).
+/// Where the bytes handed to the decoder are in the frame, so that a piece
+/// never crosses a unit (the header, a block word, a block, the checksum):
+/// the decoder is then asked to stop right after the block that does not
+/// fit the output buffer, which is where liblz4's `LZ4F_decompress` stops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum L4 {
+enum Unit {
+    /// The frame header, gathered a byte at a time until it parses.
     Header,
-    BlockHeader,
-    /// A compressed block of `size` bytes (and its checksum).
-    Block,
-    /// An uncompressed block, `left` bytes still to copy.
-    Copy,
-    BlockCrc,
-    Suffix,
-    Done,
+    /// A block's size word (or the end mark's).
+    Word,
+    /// A block's bytes, and its checksum if the frame has them.
+    Block(usize),
+    /// The content checksum.
+    Trailer(usize),
 }
 
-/// One LZ4 frame, read as liblz4 1.10.0's `LZ4F_decompress` reads it: a
-/// block decoded while the output buffer has no room waits in `pending`
-/// (liblz4's `tmpOut`), and the call stops there.
+/// One LZ4 frame through `lz4_opts::Decoder` (liblz4 1.10.0's
+/// `LZ4F_decompress` on the C tier), driven as fileio.c drives it: a
+/// call's decoded bytes go into the caller's `ZSTD_DStreamOutSize()` buffer
+/// and a block decoded with no room left waits in `pending` (liblz4's
+/// `tmpOut`), the call stopping there. The frame's units are tracked here
+/// only to choose how much input each decoder call gets; every check and
+/// every error is liblz4's (or the pure tier's equivalent). Nothing holds
+/// more than a block's decoded bytes.
 struct Lz4Member {
-    st: L4,
-    /// The bytes of the unit being gathered (header, block header, block,
-    /// checksum).
-    buf: Vec<u8>,
-    /// The frame header's size, once its first seven bytes are in.
-    fhs: usize,
+    dec: lz4_opts::Decoder,
+    unit: Unit,
+    /// The header or size word gathered so far.
+    gathered: Vec<u8>,
     block_checksum: bool,
     content_checksum: bool,
-    linked: bool,
     max_block: usize,
-    content_size: u64,
-    decoded: u64,
-    size: usize,
-    left: usize,
-    content_hash: Xxh32,
-    block_hash: Xxh32,
-    /// The last 64 KiB of output (linked blocks' dictionary).
-    dict: Vec<u8>,
+    /// Decoded, not yet handed to the caller.
     pending: Vec<u8>,
     pend_at: usize,
+    /// The frame ended; `pending` is its last output.
+    ended: bool,
 }
 
 impl Lz4Member {
     fn new() -> Self {
+        // `LZ4F_createDecompressionContext` failing is an allocation
+        // failure, not reachable.
         Lz4Member {
-            st: L4::Header,
-            buf: Vec::new(),
-            fhs: 0,
+            dec: lz4_opts::Decoder::new(&lz4_opts::DecodeOptions::default())
+                .expect("LZ4F_createDecompressionContext"),
+            unit: Unit::Header,
+            gathered: Vec::new(),
             block_checksum: false,
             content_checksum: false,
-            linked: false,
             max_block: 0,
-            content_size: 0,
-            decoded: 0,
-            size: 0,
-            left: 0,
-            content_hash: Xxh32::new(0),
-            block_hash: Xxh32::new(0),
-            dict: Vec::new(),
             pending: Vec::new(),
             pend_at: 0,
-        }
-    }
-
-    /// Gathers `input` into `buf` until it holds `need` bytes.
-    fn gather(&mut self, input: &[u8], i: &mut usize, need: usize) -> bool {
-        let take = need.saturating_sub(self.buf.len()).min(input.len() - *i);
-        self.buf.extend_from_slice(&input[*i..*i + take]);
-        *i += take;
-        self.buf.len() >= need
-    }
-
-    /// Decoded bytes: counted, hashed and kept for the next linked block.
-    fn produced(&mut self, data: &[u8]) {
-        self.decoded += data.len() as u64;
-        if self.content_checksum {
-            self.content_hash.update(data);
-        }
-        if self.linked {
-            self.dict.extend_from_slice(data);
-            if self.dict.len() > 2 * LZ4_BLOCK {
-                self.dict.drain(..self.dict.len() - LZ4_BLOCK);
-            }
+            ended: false,
         }
     }
 
@@ -1132,188 +1132,57 @@ impl Lz4Member {
         }
     }
 
-    /// `LZ4F_decodeHeader`, once `buf` holds `fhs` bytes (or seven, for
-    /// the flag checks).
-    fn header(&mut self) -> Result<(), Fail> {
-        let flg = self.buf[4];
-        if self.fhs == 0 {
-            if (flg >> 1) & 1 != 0 {
-                return Err(Fail::Lz4(m::LZ4F_RESERVED_FLAG_SET));
-            }
-            if (flg >> 6) & 3 != 1 {
-                return Err(Fail::Lz4(m::LZ4F_HEADER_VERSION_WRONG));
-            }
-            self.fhs =
-                7 + if flg & 0x08 != 0 { 8 } else { 0 } + if flg & 0x01 != 0 { 4 } else { 0 };
-            return Ok(());
+    /// How many of `avail` input bytes go to the decoder next.
+    fn take(&self, avail: usize) -> usize {
+        match self.unit {
+            Unit::Header | Unit::Word => 1,
+            Unit::Block(left) | Unit::Trailer(left) => left.min(avail),
         }
-        let bd = self.buf[5];
-        if bd >> 7 != 0 {
-            return Err(Fail::Lz4(m::LZ4F_RESERVED_FLAG_SET));
-        }
-        let id = (bd >> 4) & 7;
-        if id < 4 {
-            return Err(Fail::Lz4(m::LZ4F_MAX_BLOCK_SIZE_INVALID));
-        }
-        if bd & 0x0f != 0 {
-            return Err(Fail::Lz4(m::LZ4F_RESERVED_FLAG_SET));
-        }
-        let hc = (xxh32(&self.buf[4..self.fhs - 1], 0) >> 8) as u8;
-        if hc != self.buf[self.fhs - 1] {
-            return Err(Fail::Lz4(m::LZ4F_HEADER_CHECKSUM_INVALID));
-        }
-        self.linked = (flg >> 5) & 1 == 0;
-        self.block_checksum = (flg >> 4) & 1 != 0;
-        self.content_checksum = (flg >> 2) & 1 != 0;
-        self.content_size = if flg & 0x08 != 0 {
-            u64::from_le_bytes(self.buf[6..14].try_into().expect("eight bytes"))
-        } else {
-            0
-        };
-        self.max_block = 1 << (8 + 2 * usize::from(id));
-        Ok(())
     }
 
-    /// `dstage_getSuffix`'s entry: the decoded size against the header's.
-    fn end_mark(&mut self) -> Result<(), Fail> {
-        if self.content_size != 0 && self.decoded != self.content_size {
-            return Err(Fail::Lz4(m::LZ4F_FRAME_SIZE_WRONG));
-        }
-        self.st = if self.content_checksum {
-            L4::Suffix
-        } else {
-            L4::Done
-        };
-        Ok(())
-    }
-
-    /// `LZ4F_decompress`'s stages until the input runs out, the output is
-    /// full with a block waiting, or the frame ends (`Ok(true)`).
-    fn run(
-        &mut self,
-        input: &[u8],
-        out: &mut [u8],
-        i: &mut usize,
-        made: &mut usize,
-    ) -> Result<bool, Fail> {
-        loop {
-            self.flush(out, made);
-            if self.pend_at < self.pending.len() {
-                return Ok(false);
-            }
-            match self.st {
-                L4::Done => return Ok(true),
-                L4::Header => {
-                    let need = if self.fhs == 0 { 7 } else { self.fhs };
-                    if !self.gather(input, i, need) {
-                        return Ok(false);
-                    }
-                    let had = self.fhs;
-                    self.header()?;
-                    if had != 0 {
-                        self.buf.clear();
-                        self.st = L4::BlockHeader;
-                    }
+    /// The unit after `piece` went to the decoder.
+    fn advance(&mut self, piece: &[u8]) {
+        match self.unit {
+            Unit::Header => {
+                self.gathered.extend_from_slice(piece);
+                // A header that does not parse is the decoder's to refuse.
+                if let Ok(Some(h)) = lz4_opts::parse_frame_header(&self.gathered)
+                    && h.header_len == self.gathered.len()
+                {
+                    self.block_checksum = h.block_checksum;
+                    self.content_checksum = h.content_checksum;
+                    self.max_block = h.block_size.bytes();
+                    self.gathered.clear();
+                    self.unit = Unit::Word;
                 }
-                L4::BlockHeader => {
-                    if !self.gather(input, i, 4) {
-                        return Ok(false);
-                    }
-                    let word = u32::from_le_bytes(self.buf[..4].try_into().expect("four"));
-                    self.buf.clear();
+            }
+            Unit::Word => {
+                self.gathered.extend_from_slice(piece);
+                if self.gathered.len() == 4 {
+                    let word = u32::from_le_bytes([
+                        self.gathered[0],
+                        self.gathered[1],
+                        self.gathered[2],
+                        self.gathered[3],
+                    ]);
+                    self.gathered.clear();
                     let size = (word & 0x7FFF_FFFF) as usize;
-                    if size == 0 {
-                        self.end_mark()?;
-                        continue;
-                    }
-                    if size > self.max_block {
-                        return Err(Fail::Lz4(m::LZ4F_MAX_BLOCK_SIZE_INVALID));
-                    }
-                    self.size = size;
-                    if word & 0x8000_0000 != 0 {
-                        self.left = size;
-                        self.block_hash = Xxh32::new(0);
-                        self.st = L4::Copy;
+                    self.unit = if size == 0 {
+                        Unit::Trailer(if self.content_checksum { 4 } else { 0 })
                     } else {
-                        self.st = L4::Block;
-                    }
-                }
-                L4::Copy => {
-                    // `dstage_copyDirect`: as much as both sides allow.
-                    let take = self.left.min(input.len() - *i).min(out.len() - *made);
-                    if take == 0 {
-                        return Ok(false);
-                    }
-                    let data = &input[*i..*i + take];
-                    if self.block_checksum {
-                        self.block_hash.update(data);
-                    }
-                    out[*made..*made + take].copy_from_slice(data);
-                    self.produced(data);
-                    *i += take;
-                    *made += take;
-                    self.left -= take;
-                    if self.left == 0 {
-                        self.st = if self.block_checksum {
-                            L4::BlockCrc
-                        } else {
-                            L4::BlockHeader
-                        };
-                    }
-                }
-                L4::BlockCrc => {
-                    if !self.gather(input, i, 4) {
-                        return Ok(false);
-                    }
-                    let want = u32::from_le_bytes(self.buf[..4].try_into().expect("four"));
-                    self.buf.clear();
-                    if want != self.block_hash.digest() {
-                        return Err(Fail::Lz4(m::LZ4F_BLOCK_CHECKSUM_INVALID));
-                    }
-                    self.st = L4::BlockHeader;
-                }
-                L4::Block => {
-                    let need = self.size + if self.block_checksum { 4 } else { 0 };
-                    if !self.gather(input, i, need) {
-                        return Ok(false);
-                    }
-                    let data = std::mem::take(&mut self.buf);
-                    let block = &data[..self.size];
-                    if self.block_checksum {
-                        let want = u32::from_le_bytes(data[self.size..].try_into().expect("four"));
-                        if want != xxh32(block, 0) {
-                            return Err(Fail::Lz4(m::LZ4F_BLOCK_CHECKSUM_INVALID));
-                        }
-                    }
-                    let mut dec = std::mem::take(&mut self.pending);
-                    dec.resize(self.max_block, 0);
-                    let r = if self.linked {
-                        let at = self.dict.len().saturating_sub(LZ4_BLOCK);
-                        decompress_into_with_dict(block, &mut dec, &self.dict[at..])
-                    } else {
-                        decompress_into(block, &mut dec)
+                        // Over the frame's maximum is refused by the decoder
+                        // as soon as the word is in.
+                        Unit::Block(size.min(self.max_block) + 4 * usize::from(self.block_checksum))
                     };
-                    let n = r.map_err(|_| Fail::Lz4(m::LZ4F_DECOMPRESSION_FAILED))?;
-                    dec.truncate(n);
-                    self.produced(&dec);
-                    self.pending = dec;
-                    self.pend_at = 0;
-                    self.buf = data;
-                    self.buf.clear();
-                    self.st = L4::BlockHeader;
-                }
-                L4::Suffix => {
-                    if !self.gather(input, i, 4) {
-                        return Ok(false);
-                    }
-                    let want = u32::from_le_bytes(self.buf[..4].try_into().expect("four"));
-                    self.buf.clear();
-                    if want != self.content_hash.digest() {
-                        return Err(Fail::Lz4(m::LZ4F_CONTENT_CHECKSUM_INVALID));
-                    }
-                    self.st = L4::Done;
                 }
             }
+            Unit::Block(left) => {
+                self.unit = match left - piece.len() {
+                    0 => Unit::Word,
+                    rest => Unit::Block(rest),
+                };
+            }
+            Unit::Trailer(left) => self.unit = Unit::Trailer(left - piece.len()),
         }
     }
 }
@@ -1321,152 +1190,45 @@ impl Lz4Member {
 impl Coder for Lz4Member {
     fn call(&mut self, input: &[u8], out: &mut [u8], _finish: bool) -> Call {
         let (mut used, mut made) = (0, 0);
-        let r = self.run(input, out, &mut used, &mut made);
-        Call { used, made, r }
-    }
-}
-
-// ---- XXH32 (the LZ4 frame's checksums) ----
-
-const P1: u32 = 0x9E37_79B1;
-const P2: u32 = 0x85EB_CA77;
-const P3: u32 = 0xC2B2_AE3D;
-const P4: u32 = 0x27D4_EB2F;
-const P5: u32 = 0x1656_67B1;
-
-/// XXH32, streaming.
-#[derive(Clone)]
-struct Xxh32 {
-    acc: [u32; 4],
-    mem: [u8; 16],
-    len: usize,
-    total: u64,
-    seed: u32,
-}
-
-fn xxh_round(acc: u32, lane: u32) -> u32 {
-    acc.wrapping_add(lane.wrapping_mul(P2))
-        .rotate_left(13)
-        .wrapping_mul(P1)
-}
-
-fn lane(b: &[u8]) -> u32 {
-    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-}
-
-impl Xxh32 {
-    fn new(seed: u32) -> Self {
-        Xxh32 {
-            acc: [
-                seed.wrapping_add(P1).wrapping_add(P2),
-                seed.wrapping_add(P2),
-                seed,
-                seed.wrapping_sub(P1),
-            ],
-            mem: [0; 16],
-            len: 0,
-            total: 0,
-            seed,
-        }
-    }
-
-    fn stripe(&mut self, s: &[u8]) {
-        for (k, acc) in self.acc.iter_mut().enumerate() {
-            *acc = xxh_round(*acc, lane(&s[4 * k..]));
-        }
-    }
-
-    fn update(&mut self, mut data: &[u8]) {
-        self.total += data.len() as u64;
-        if self.len > 0 {
-            let take = (16 - self.len).min(data.len());
-            self.mem[self.len..self.len + take].copy_from_slice(&data[..take]);
-            self.len += take;
-            data = &data[take..];
-            if self.len < 16 {
-                return;
+        let call = |used, made, r| Call { used, made, r };
+        loop {
+            self.flush(out, &mut made);
+            if self.pend_at < self.pending.len() {
+                // Output waiting with no room left.
+                return call(used, made, Ok(false));
             }
-            let m = self.mem;
-            self.stripe(&m);
-            self.len = 0;
+            if self.ended {
+                return call(used, made, Ok(true));
+            }
+            if used == input.len() {
+                return call(used, made, Ok(false));
+            }
+            let n = self.take(input.len() - used);
+            let piece = &input[used..used + n];
+            match self.dec.decompress(piece, &mut self.pending) {
+                Ok((taken, hint)) => {
+                    used += taken;
+                    self.ended = hint == 0;
+                    self.advance(&piece[..taken]);
+                }
+                Err(e) => return call(used, made, Err(Fail::Lz4(lz4_error_static(&e)))),
+            }
         }
-        let (chunks, rest) = data.as_chunks::<16>();
-        for c in chunks {
-            self.stripe(c);
-        }
-        self.mem[..rest.len()].copy_from_slice(rest);
-        self.len = rest.len();
-    }
-
-    fn digest(&self) -> u32 {
-        let mut h = if self.total >= 16 {
-            let [a, b, c, d] = self.acc;
-            a.rotate_left(1)
-                .wrapping_add(b.rotate_left(7))
-                .wrapping_add(c.rotate_left(12))
-                .wrapping_add(d.rotate_left(18))
-        } else {
-            self.seed.wrapping_add(P5)
-        };
-        h = h.wrapping_add(self.total as u32);
-        let mut rest = &self.mem[..self.len];
-        while rest.len() >= 4 {
-            h = h
-                .wrapping_add(lane(rest).wrapping_mul(P3))
-                .rotate_left(17)
-                .wrapping_mul(P4);
-            rest = &rest[4..];
-        }
-        for &b in rest {
-            h = h
-                .wrapping_add(u32::from(b).wrapping_mul(P5))
-                .rotate_left(11)
-                .wrapping_mul(P1);
-        }
-        h ^= h >> 15;
-        h = h.wrapping_mul(P2);
-        h ^= h >> 13;
-        h = h.wrapping_mul(P3);
-        h ^ (h >> 16)
     }
 }
 
-/// XXH32 of `data`.
-fn xxh32(data: &[u8], seed: u32) -> u32 {
-    let mut h = Xxh32::new(seed);
-    h.update(data);
-    h.digest()
+/// `LZ4F_getErrorName` of a failing decode, as the `'static` text
+/// [`Fail::Lz4`] holds.
+fn lz4_error_static(e: &Lz4Error) -> &'static str {
+    match e {
+        Lz4Error::Lib(l) => l.name(),
+        Lz4Error::Io(_) => m::LZ4F_GENERIC,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn xxh32_matches_the_reference_vectors() {
-        // xxhash's own sanity values.
-        assert_eq!(xxh32(b"", 0), 0x02CC_5D05);
-        assert_eq!(xxh32(b"a", 0), 0x550D_7456);
-        assert_eq!(xxh32(b"abc", 0), 0x32D1_53FF);
-        assert_eq!(
-            xxh32(b"Nobody inspects the spammish repetition", 0),
-            0xE229_3B2F
-        );
-        // Streaming in uneven pieces gives the one-shot value.
-        let data: Vec<u8> = (0..1000u32).map(|i| (i * 7 + 3) as u8).collect();
-        let mut h = Xxh32::new(0);
-        for piece in data.chunks(13) {
-            h.update(piece);
-        }
-        assert_eq!(h.digest(), xxh32(&data, 0));
-    }
-
-    #[test]
-    fn the_lz4_header_checksum_is_liblz4s() {
-        // `zstd --format=lz4 -c < 5000-byte input`'s descriptor: FLG 0x44,
-        // BD 0x40, HC 0x5e (the reference's bytes).
-        assert_eq!((xxh32(&[0x44, 0x40], 0) >> 8) as u8, 0x5e);
-    }
 
     /// Drives `dec` over `input` handed over `piece` bytes at a time, into
     /// an output buffer of `room` bytes, until the frame ends: (input used,
@@ -1491,23 +1253,24 @@ mod tests {
         }
     }
 
-    /// An lz4 frame of `lz4_flex`'s (linked, checksummed) decodes here
-    /// whole, in any input pieces and output rooms, and stops at its end.
+    /// A plain frame (`new_plain`: linked 64 KiB blocks, checksummed) decodes
+    /// here whole, in any input pieces and output rooms, and stops at its
+    /// end.
     #[test]
     fn lz4_frames_decode_in_any_pieces() {
         let data: Vec<u8> = (0..300_000u32)
             .map(|i| if i % 7 == 0 { (i / 7) as u8 } else { b'q' })
             .collect();
-        let sink = Shared::default();
-        let info = FrameInfo::new()
-            .block_size(BlockSize::Max64KB)
-            .block_mode(BlockMode::Linked)
-            .content_checksum(true)
-            .content_size(Some(data.len() as u64));
-        let mut e = FrameEncoder::with_frame_info(info, sink.clone());
-        e.write_all(&data).unwrap();
-        e.finish().unwrap();
-        let mut frame = sink.take();
+        let opts = Lz4EncodeOptions {
+            block_size: BlockSizeId::Max64Kb,
+            block_linked: true,
+            content_size: Some(data.len() as u64),
+            ..Lz4EncodeOptions::default()
+        };
+        let mut e = lz4_opts::Encoder::new_plain(&opts).unwrap();
+        let mut frame = Vec::new();
+        e.update(&data, &mut frame).unwrap();
+        e.finish(&mut frame).unwrap();
         let len = frame.len();
         frame.extend_from_slice(b"tail");
         for (piece, room) in [(1, 1000), (7, 70_000), (4096, 128 << 10), (1 << 20, 3)] {

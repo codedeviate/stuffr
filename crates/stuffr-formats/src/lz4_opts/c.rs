@@ -317,6 +317,11 @@ impl Encoder {
     /// [`Encoder::finish`] (the module doc of `lz4_opts`). Whatever slices
     /// the caller feeds, the output is the same.
     pub fn update(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(), Lz4Error> {
+        if self.plain && !self.started {
+            // `LZ4F_compressBegin` comes before the first update: zstd
+            // counts the header as written when it reports progress.
+            self.begin(out)?;
+        }
         let chunk = self.chunk_size();
         let mut input = input;
         if !self.pending.is_empty() {

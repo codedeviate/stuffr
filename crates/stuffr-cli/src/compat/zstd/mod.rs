@@ -112,10 +112,12 @@
 //!
 //! The foreign formats on both tiers (`formats.rs`; spec "Promises"):
 //! `--format=gzip` is zlib's bytes with `zlib-c`, `--format=xz|lzma`
-//! liblzma's with `xz-c`; `--format=lz4` is compatible only on every tier:
-//! `lz4_flex`'s fast compressor at every level, inside liblz4's frame
-//! descriptor (64 KiB linked blocks, content size, content checksum as
-//! fileio.c sets them).
+//! liblzma's with `xz-c`, `--format=lz4` liblz4 1.10.0's with `lz4-c`
+//! (`stuffr::lz4_opts`, plain `LZ4F` streaming: 64 KiB linked blocks, content
+//! size when known, content checksum, as fileio.c sets them; byte-identical
+//! from files, to standard output and from standard input). Without `lz4-c`
+//! the pure tier's `--format=lz4` is compatible: `lz4_flex`'s block
+//! compressor at every level, inside the same frame descriptor.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
