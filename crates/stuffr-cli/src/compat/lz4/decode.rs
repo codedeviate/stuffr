@@ -38,7 +38,8 @@ use stuffr::lz4_opts::{
     is_skippable_magic,
 };
 
-use super::io::{Fail, Run, Sink, Src, show_decode_progress};
+use super::display::show_decode_progress;
+use super::io::{Fail, Run, Sink, Src};
 use super::messages as m;
 
 /// Input handed to a decoder per call: small, so that what one call
@@ -87,6 +88,7 @@ pub(super) fn stream(
         let magic = le32(&magic_bytes);
         src.consume(4);
         if is_skippable_magic(magic) {
+            run.say(4, m::SKIPPABLE_DETECTED, &[]);
             let size = src.fill(4);
             if size.len() < 4 {
                 return Err(run.exm(42, m::E42_SKIPPABLE_SIZE, &[]));
@@ -97,7 +99,8 @@ pub(super) fn stream(
                 return Err(run.exm(43, m::E43_SKIP, &[]));
             }
         } else if magic == LEGACY_MAGIC {
-            legacy(run, src, sink, &mut d, &mut shown)?;
+            run.say(4, m::LEGACY_DETECTED, &[]);
+            legacy(run, src, sink, &mut d)?;
         } else if magic == MAGIC {
             modern(run, src, sink, &magic_bytes, &mut d, &mut shown)?;
             break;
@@ -200,13 +203,7 @@ fn failed(run: &mut Run, e: &Lz4Error) -> Fail {
 
 /// A legacy frame, its magic read already. It ends at the end of the input
 /// or before the word that ended it, which is left in `src`.
-fn legacy(
-    run: &mut Run,
-    src: &mut Src,
-    sink: &mut Sink,
-    d: &mut Decoded,
-    shown: &mut Option<u64>,
-) -> Result<(), Fail> {
+fn legacy(run: &mut Run, src: &mut Src, sink: &mut Sink, d: &mut Decoded) -> Result<(), Fail> {
     let mut dec = LegacyDecoder::new();
     let mut out = Vec::new();
     // The magic number, already checked.
@@ -237,7 +234,10 @@ fn legacy(
             sink.write(run, &out)?;
             d.written += out.len() as u64;
             out.clear();
-            show_decode_progress(run, d.written, false, shown);
+            // Every block is a chance (probe: `lz4 -vv -t two_legacy.lz4`
+            // draws a refresh after each frame, `Decompressed : 0 MiB` both
+            // times; the gate keeps the count down at levels 2 and 3).
+            show_decode_progress(run, d.written, false, &mut None);
         }
         if hint == 0 {
             return Ok(());

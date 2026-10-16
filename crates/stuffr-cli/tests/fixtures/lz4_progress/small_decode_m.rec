@@ -1,0 +1,5 @@
+4	b'*** lz4 v1.10.0 64-bit multithread, by Yann Collet ***\r\n'
+5	b'\rDecompressed : 0 MiB  '
+6	b'\r                                                                               \ra.lz4                          : decoded 1760 bytes \r\n'
+6	b'\r                                                                               \rb.lz4                          : decoded 1760 bytes \r\n'
+6	b'Done in 0.00 s ==> 1.78 MiB/s  (cpu load : 32%)\r\n'

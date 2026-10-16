@@ -181,9 +181,9 @@ pub(super) const BLOCKS_KB: &str = "using blocks of size %d KB \n";
 /// probe: `lz4 -B32 -c`, `lz4 -B1023 -c`: a byte count under 1024.
 pub(super) const BLOCKS_BYTES: &str = "using blocks of size %d bytes \n";
 
-/// probe: `lz4 -v -T300 -c a` (display level 3, compression only; Task 6
-/// prints it): the count asked for, then the cap.
-#[allow(dead_code, reason = "0.15.0 Task 6 prints it")]
+/// probe: `lz4 -v -T300 -c a` (display level 3, compression only; printed
+/// instead of [`USING_THREADS`] when the count was capped): the count asked
+/// for, then the cap.
 pub(super) const THREADS_REDUCED: &str =
     "Requested %d threads too large => automatically reduced to %d \n";
 
@@ -459,3 +459,55 @@ pub(super) const PRESS_ENTER: &str = "Press enter to continue...\n";
 
 /// Spec deviation 5 (stuffr's own text): `-b#`, `-e#` and `-i#`.
 pub(super) const BENCH_REFUSED: &str = "Benchmark mode is not available in this build (stuffr)\n";
+
+// ---- display levels 3 and 4 (Task 6) ----
+
+/// probe: `lz4 -v -T3 a` (display level 3, compression only, after
+/// `Compressed filename will be :` and before the first file): the worker
+/// count, when it is above 1 and was not capped (`-T1` prints nothing,
+/// `-T200` prints it, `-T201` prints [`THREADS_REDUCED`] instead).
+pub(super) const USING_THREADS: &str = "Using %d threads for compression \n";
+
+/// probe: `lz4 -v -l a` (display level 3): after the thread line.
+pub(super) const GENERATING_LEGACY: &str = "! Generating LZ4 Legacy format (deprecated) ! \n";
+
+/// probe: `lz4 -v --content-size - o < pipe`, `lz4 -v --content-size
+/// /dev/null o` (display level 3, compression of a frame, once the output
+/// is open; a regular file, standard input redirected from one included,
+/// does not say it).
+pub(super) const CONTENT_SIZE_UNKNOWN: &str = "Warning : cannot determine input content size \n";
+
+/// probe: `lz4 -vv - o` (display level 4): standard input is the input,
+/// printed as it is opened (before the overwrite question when compressing,
+/// after it when decoding).
+pub(super) const USING_STDIN: &str = "Using stdin for input \n";
+
+/// probe: `lz4 -vv -c a` (display level 4): standard output is the output.
+/// Compressing says it for every file written there; decoding says it once
+/// at the start of a run whose output is standard output or which has `-m`
+/// operands (`lz4 -vv -d -m a.lz4` says it though it writes `a`).
+pub(super) const USING_STDOUT: &str = "Using stdout for output \n";
+
+/// probe: `lz4 -vv -c a`, after [`USING_STDOUT`] (display level 4): said
+/// unless `--sparse` or `--no-sparse` was given.
+pub(super) const SPARSE_DISABLED: &str = "Sparse File Support automatically disabled on stdout ; to force-enable it, add --sparse command \n";
+
+/// probe: `lz4 -vv -r d` (display level 4, before everything else of the
+/// run): each input of the list `-r` made, from 0.
+pub(super) const LIST_ENTRY: &str = "%d %s\n";
+
+/// probe: `lz4 -v a`, `lz4 -v -d -m b.lz4` (display level 3): after the
+/// last input of a compression (always), of a decode that has `-m`
+/// operands, or of a single decode where the input failed. The seconds
+/// and the speed are `%.2f`, the load `%.0f` (deviation 2: the harness
+/// normalises all three).
+pub(super) const DONE_IN: &str = "Done in %s s ==> %s MiB/s  (cpu load : %s%%)\n";
+
+/// probe: `lz4 -vv -t leg.lz4` (display level 4, decoding): a legacy frame's
+/// magic number was read; said for each such frame, before its first
+/// refresh (not by `--list`).
+pub(super) const LEGACY_DETECTED: &str = "Detected : Legacy format \n";
+
+/// probe: `lz4 -vv -t skip_then_frame.lz4` (display level 4, decoding):
+/// a skippable frame's magic number was read, before its size is.
+pub(super) const SKIPPABLE_DETECTED: &str = "Skipping detected skippable area \n";

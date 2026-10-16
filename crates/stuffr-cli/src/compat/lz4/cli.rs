@@ -110,7 +110,7 @@ pub(crate) enum Output {
 #[derive(Debug, Clone)]
 #[allow(
     dead_code,
-    reason = "0.15.0 Task 6 reads the thread fields; keep and legacy_cli are parse results the run does not need"
+    reason = "keep and legacy_cli are parse results the run does not need"
 )]
 pub(crate) struct Command {
     /// The program name usage texts print (R12: the last path component of

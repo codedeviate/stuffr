@@ -45,7 +45,9 @@
 //! 2. Timing and host fields vary, as between two runs of lz4: the `Done
 //!    in` line's seconds, speed and cpu load, the progress refreshes, and
 //!    the `Using N threads` count where two programs count the host's
-//!    cores differently.
+//!    cores differently. Refreshes are drawn at most every 200 ms (the
+//!    first one always; at display level 4 every chunk), which `display.rs`
+//!    pins from recordings; under a sandbox the clock is frozen at zero.
 //! 3. An input that is also the output is never lost. Where the output
 //!    named is the input file itself (the same device and inode: `lz4 -f a
 //!    a`, `lz4 -df s.lz4 s.lz4`, a hard link, standard input redirected
@@ -100,6 +102,7 @@ use super::host::{self, Host, SANDBOX_OUTPUT_CAP, Sandbox};
 
 pub(crate) mod cli;
 mod decode;
+mod display;
 mod io;
 mod list;
 mod messages;

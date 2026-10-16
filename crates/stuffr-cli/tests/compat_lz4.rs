@@ -2639,9 +2639,147 @@ mod unix {
     }
 
     #[test]
-    #[ignore = "Task 6"]
     fn task6_rows_match_the_reference() {
         check_task("Task 6");
+    }
+
+    /// Display levels 0 to 5 on a non-terminal standard error (Task 6; the
+    /// refresh gate and the terminal forms are `display.rs`'s unit tests):
+    /// compress, decode, test, `-c`, `-m`, `-r`, standard input and
+    /// output, a missing file, `--content-size` of a pipe, `-l`, and the
+    /// overwrite question's two answers at `-v` (R11, moved here from
+    /// Task 4). Timing, refreshes and the thread count are deviation 2's,
+    /// normalised; every other byte of stderr, stdout and the files is
+    /// the reference's, including `Done in`'s presence and place.
+    #[test]
+    fn display_levels_match_the_reference() {
+        let mut cases = Vec::new();
+        let levels: [&[&'static str]; 8] = [
+            &[],
+            &["-v"],
+            &["-vv"],
+            &["-vvv"],
+            &["-q"],
+            &["-qq"],
+            &["-qqq"],
+            &["-v", "-q"],
+        ];
+        // Only the fixtures a case names: the pure tier judges what it
+        // wrote by decoding it, and finds the original from the files.
+        let files = |tail: &[&str]| {
+            let all = [
+                ("a", fx("a")),
+                ("a2", fx("a2")),
+                ("b.lz4", fx("b.lz4")),
+                ("bc.lz4", fx("bc.lz4")),
+                ("leg.lz4", fx("leg.lz4")),
+                ("empty.lz4", fx("empty.lz4")),
+                // A skippable frame then a frame; two legacy frames.
+                (
+                    "sk.lz4",
+                    [&b"\x50\x2a\x4d\x18\x04\x00\x00\x00abcd"[..], &fx("b.lz4")].concat(),
+                ),
+                ("two.lz4", [fx("leg.lz4"), fx("leg.lz4")].concat()),
+            ];
+            all.into_iter()
+                .filter(|(n, _)| tail.contains(n))
+                .collect::<Vec<_>>()
+        };
+        for lv in levels {
+            let with = |tail: &[&'static str]| -> Vec<&'static str> {
+                lv.iter().chain(tail.iter()).copied().collect()
+            };
+            for tail in [
+                &["-T3", "a", "x.lz4"][..],
+                &["-T1", "a", "x.lz4"],
+                &["-T300", "a", "x.lz4"],
+                &["a"],
+                &["-c", "a"],
+                &["a", "-"],
+                &["-l", "a", "x.lz4"],
+                &["-c", "-l", "a"],
+                &["-m", "a", "a2"],
+                &["-c", "-m", "a", "a2"],
+                &["-m", "a", "nosuch"],
+                &["nosuch"],
+                &["-d", "b.lz4", "bo"],
+                &["-d", "b.lz4"],
+                &["-d", "empty.lz4", "eo"],
+                &["-t", "b.lz4"],
+                &["-t", "leg.lz4"],
+                &["-t", "sk.lz4"],
+                &["-t", "two.lz4"],
+                &["-dc", "b.lz4"],
+                &["-dc", "--sparse", "b.lz4"],
+                &["-dc", "--no-sparse", "b.lz4"],
+                &["-d", "-m", "b.lz4", "bc.lz4"],
+                &["-t", "-m", "b.lz4", "leg.lz4"],
+                &["-dc", "-m", "b.lz4", "bc.lz4"],
+                &["-d", "nosuch.lz4", "o"],
+                &["-d", "-m", "b.lz4", "nosuch.lz4", "bc.lz4"],
+                &["-d", "b.lz4", "a2"],
+                &["a", "a2"],
+                &["-f", "-m", "a", "a2"],
+            ] {
+                cases.push(lz4_case("lz4", &with(tail), files(tail)));
+            }
+            for name in ["unlz4", "lz4cat"] {
+                for tail in [&["b.lz4"][..], &["b.lz4", "bc.lz4"], &["nosuch.lz4"]] {
+                    cases.push(lz4_case(name, &with(tail), files(tail)));
+                }
+            }
+            // Standard input and output.
+            cases.push(piped("lz4", &with(&["-T2"]), vec![], fx("a")));
+            cases.push(piped("lz4", &with(&["-c"]), vec![], fx("a")));
+            cases.push(piped(
+                "lz4",
+                &with(&["--content-size", "-c"]),
+                vec![],
+                fx("a"),
+            ));
+            cases.push(piped(
+                "lz4",
+                &with(&["--content-size", "-"]),
+                vec![("o", fx("a2"))],
+                fx("a"),
+            ));
+            cases.push(piped("lz4", &with(&["-d"]), vec![], fx("b.lz4")));
+            cases.push(piped("lz4", &with(&["-dc"]), vec![], fx("b.lz4")));
+            cases.push(piped("lz4", &with(&["-t", "-m"]), vec![], fx("b.lz4")));
+            cases.push(piped(
+                "lz4",
+                &with(&["-d", "-", "o"]),
+                vec![("o", fx("a2"))],
+                b"n\n".to_vec(),
+            ));
+            // The overwrite question, refused (R11; the answered-`y` form
+            // is Task 4's rows: the pure tier's round trip cannot tell
+            // the answer from the data in standard input).
+            cases.push(piped(
+                "lz4",
+                &with(&["-", "a2"]),
+                vec![("a2", fx("a2"))],
+                [&b"n\n"[..], &fx("a")[..]].concat(),
+            ));
+            // R11, moved from Task 4: two inputs, two answers, the data
+            // after them unused, needs `-v` to show the order of lines.
+            cases.push(piped(
+                "lz4",
+                &with(&["-m", "a", "a2"]),
+                vec![
+                    ("a", fx("a")),
+                    ("a2", fx("a2")),
+                    ("a.lz4", fx("a2")),
+                    ("a2.lz4", fx("a2")),
+                ],
+                b"yxz\ny".to_vec(),
+            ));
+            // -r: the list at level 4.
+            let mut r = lz4_case("lz4", &with(&["-r", "d"]), vec![]);
+            r.setup = Some(tree);
+            cases.push(r);
+        }
+        check("display_levels_match_the_reference", &cases);
     }
 
     /// The table, run on the reference alone (always on): every row's exit

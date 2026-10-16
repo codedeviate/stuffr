@@ -1,0 +1,4 @@
+7	b'*** lz4 v1.10.0 64-bit multithread, by Yann Collet ***\r\nUsing 3 threads for compression \r\n'
+8	b'\rRead : 0 MiB   ==> 4.66%   '
+8	b'\r                                                                               \rCompressed 1760 bytes into 82 bytes ==> 4.66%\r\n'
+8	b'Done in 0.00 s ==> 4.26 MiB/s  (cpu load : 79%)\r\n'

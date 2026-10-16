@@ -40,10 +40,10 @@
 //!   last skip ends with a written zero. lz4 seeks before each piece of data
 //!   it writes, an empty skip included, so a pipe fails at the first one.
 //!
-//! The level-2 lines (ruling P3: the announcement, the `\r`-refreshed
-//! progress, the cleared line and the summaries) are rendered by the
-//! `show_*` functions at the end of this file, which Task 6 moves into
-//! `display.rs` with the levels above 2.
+//! The lines of display levels 2 and up (ruling P3: the announcement, the
+//! `\r`-refreshed progress, the cleared line, the summaries, and levels 3
+//! and 4's thread line, `Done in` and notes) are `display.rs`'s: this file
+//! says when, that one says what and at which pace.
 
 use std::fs::{self, File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -52,11 +52,12 @@ use stuffr::lz4_opts::{EncodeOptions, Encoder, FRAME_CHUNK, LEGACY_BLOCK_SIZE};
 
 use super::cli::{self, Command, Op, Plan, STDINMARK, Target};
 use super::decode;
+use super::display::{Display, Timer};
 use super::messages::{self as m, printf};
 use crate::compat::host::{self, Host, Kind};
 
-/// What one input's processing read and wrote, for the summaries (and for
-/// Task 6's `Done in` line).
+/// What one input's processing read and wrote, for the summaries and for
+/// `Done in`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Stats {
     /// Bytes read from the input.
@@ -437,6 +438,14 @@ pub(super) struct Run<'a> {
     stdin: Option<Src>,
     /// The `-D` dictionary's last 64 KiB (all liblz4 keeps).
     pub(super) dict: Option<Vec<u8>>,
+    /// The progress line's refresh gate (`display.rs`).
+    pub(super) display: Display,
+    /// The run's clocks: the gate's and `Done in`'s.
+    pub(super) timer: Timer,
+    /// Bytes handled so far, for `Done in`'s speed: read when compressing,
+    /// decoded when decoding (probe: `lz4 -v -d -m` over 2000 bytes at
+    /// 0.00 s says several MiB/s, which only the decoded size gives).
+    pub(super) total: u64,
 }
 
 impl<'a> Run<'a> {
@@ -448,6 +457,7 @@ impl<'a> Run<'a> {
         err: &'a mut dyn Write,
         level: i32,
     ) -> Run<'a> {
+        let timer = Timer::start(matches!(host, Host::Real));
         Run {
             cmd,
             host,
@@ -456,6 +466,9 @@ impl<'a> Run<'a> {
             level,
             stdin: None,
             dict: None,
+            display: Display::new(level),
+            timer,
+            total: 0,
         }
     }
 }
@@ -530,6 +543,10 @@ impl Run<'_> {
     /// metadata, if it has any.
     fn open_input(&mut self, name: &[u8]) -> Result<(Option<Src>, Option<Metadata>), Fail> {
         if name == STDINMARK {
+            // probe: `lz4 -vv - o` (display level 4), as the input opens:
+            // before the overwrite question when compressing, after it when
+            // decoding (the output is opened first then).
+            self.say(4, m::USING_STDIN, &[]);
             return Ok((None, self.stdin_meta()));
         }
         let path = self.host.path(name);
@@ -582,6 +599,16 @@ impl Run<'_> {
             .map_err(|e| self.fail(m::OPEN_OUTPUT_FAILED, &[name, &host::strerror(&e)]))
     }
 
+    /// Display level 4: standard output is the output, and sparse writing
+    /// was not asked for either way (probe: `lz4 -vv -c a` says both lines,
+    /// `--sparse -c` and `--no-sparse -c` only the first).
+    pub(super) fn stdout_note(&mut self) {
+        self.say(4, m::USING_STDOUT, &[]);
+        if self.cmd.sparse.is_none() {
+            self.say(4, m::SPARSE_DISABLED, &[]);
+        }
+    }
+
     /// The sink for `target`. `input` is the input's metadata (deviation
     /// 3); `decoding` selects sparse writing and the write error.
     fn open_sink(
@@ -602,6 +629,13 @@ impl Run<'_> {
         let (kind, sparse) = match target {
             Target::Null => (SinkKind::Null, false),
             Target::Stdout => {
+                // probe: `lz4 -vv -c a`, `lz4 -vv -c -m a b` (display level
+                // 4): compressing says it for every file written to standard
+                // output; decoding said it once, at the start of the run
+                // ([`announce_run`]).
+                if !decoding {
+                    self.stdout_note();
+                }
                 let sparse = decoding && self.cmd.sparse == Some(true);
                 let fd = match (&*self.host, sparse) {
                     (Host::Real, true) => {
@@ -781,7 +815,8 @@ impl Run<'_> {
         if !self.cmd.opts.legacy {
             self.copy_metadata(target, meta.as_ref());
         }
-        show_compress_summary(self, &stats);
+        self.total += stats.read;
+        self.show_compress_summary(&stats);
         self.remove_input(name)?;
         Ok(stats)
     }
@@ -804,6 +839,13 @@ impl Run<'_> {
             ..self.cmd.opts.clone()
         };
         let legacy = opts.legacy;
+        // probe: `lz4 -v --content-size - o < pipe`, `... /dev/null o`
+        // (display level 3, once the output is open): a frame that was to
+        // record the size of an input that has none. Not for a legacy frame
+        // (no size field), nor for a regular file.
+        if self.cmd.content_size && !legacy && opts.content_size.is_none() {
+            self.say(3, m::CONTENT_SIZE_UNKNOWN, &[]);
+        }
         let Ok(mut enc) = Encoder::new(&opts) else {
             return Err(self.exm(38, m::E38_WRITE_COMPRESSED, &[]));
         };
@@ -840,7 +882,7 @@ impl Run<'_> {
             sink.write(self, &packed)?;
             stats.written += packed.len() as u64;
             packed.clear();
-            show_read_progress(self, &stats);
+            self.show_read_progress(&stats);
             if n < chunk {
                 break;
             }
@@ -854,7 +896,7 @@ impl Run<'_> {
         // a legacy frame only per block it compressed (`lz4 -l e` shows
         // none).
         if !legacy && stats.read == 0 {
-            show_read_progress(self, &stats);
+            self.show_read_progress(&stats);
         }
         sink.finish(self)?;
         Ok(stats)
@@ -906,7 +948,8 @@ impl Run<'_> {
             written: decoded.written,
         };
         self.copy_metadata(target, meta.as_ref());
-        show_decode_summary(self, name, &stats);
+        self.total += stats.written;
+        self.show_decode_summary(name, &stats);
         self.remove_input(name)?;
         Ok((stats, !decoded.undecodable))
     }
@@ -1006,6 +1049,16 @@ fn files(run: &mut Run, plan: &Plan) -> Result<usize, i32> {
         }
     };
     let mut failed = 0usize;
+    // `Done in` follows every compression and every decode that had `-m`
+    // operands or an input that failed (probe: `lz4 -v -d a.lz4 o` says
+    // none, `lz4 -v -d -m a.lz4`, `lz4 -v -d nosuch.lz4 o` and `lz4cat -v
+    // a.lz4` say it; `-dm -`, which lists no operand, says none); not when
+    // an `Error N` ended the run.
+    let done = |run: &mut Run, failed: usize| {
+        if plan.op == Op::Compress || cmd.from_list || failed > 0 {
+            run.show_done();
+        }
+    };
     if !cmd.from_list {
         let name = cmd.inputs.first().map_or(STDINMARK, Vec::as_slice);
         if plan.derived
@@ -1018,17 +1071,21 @@ fn files(run: &mut Run, plan: &Plan) -> Result<usize, i32> {
             };
             run.say(2, fmt, &[out_name]);
         }
+        run.announce_run(plan, &[]);
         if let Err(Fail::Exit(code)) = run.load_dictionary() {
             return Err(code);
         }
         let r = one(run, name, &plan.target);
         tally(&mut failed, r)?;
+        done(run, failed);
         return Ok(failed);
     }
+    let names = run.expand(&cmd.inputs);
+    run.announce_run(plan, &names);
     if let Err(Fail::Exit(code)) = run.load_dictionary() {
         return Err(code);
     }
-    for name in run.expand(&cmd.inputs) {
+    for name in names {
         // probe: `lz4 -m stdin e` writes both to standard output, `lz4 -m e
         // stdin` writes `e.lz4` and `stdin.lz4`: the plan made from the first
         // input says standard output for all.
@@ -1045,70 +1102,6 @@ fn files(run: &mut Run, plan: &Plan) -> Result<usize, i32> {
         let r = one(run, &name, &target);
         tally(&mut failed, r)?;
     }
+    done(run, failed);
     Ok(failed)
-}
-
-// ---- display level 2 (ruling P3; Task 6 moves these into display.rs) ----
-
-/// `%.2f` of `part` over `whole` as a percentage, `whole` at least 1
-/// (probe: `lz4 e` says `1500.00%` for 15 bytes out of none).
-fn percent(part: u64, whole: u64) -> String {
-    format!("{:.2}", part as f64 / whole.max(1) as f64 * 100.0)
-}
-
-/// A `Read :` refresh while compressing (deviation 2: how many are drawn
-/// is lz4's timing; one per piece compressed here).
-fn show_read_progress(run: &mut Run, s: &Stats) {
-    let mib = (s.read >> 20).to_string();
-    let ratio = percent(s.written, s.read);
-    run.say(2, m::READ_PROGRESS, &[mib.as_bytes(), ratio.as_bytes()]);
-}
-
-/// A `Decompressed :` refresh: drawn whenever the decoded total reaches a
-/// new MiB (deviation 2). `frame` is a modern frame's: it draws one even
-/// before its first byte (probe: `lz4 -t empty.lz4`, a frame of nothing,
-/// draws one; `lz4 -t` of a legacy frame of nothing, of a skippable frame or
-/// of an empty file draws none).
-pub(super) fn show_decode_progress(
-    run: &mut Run,
-    written: u64,
-    frame: bool,
-    shown: &mut Option<u64>,
-) {
-    let mib = written >> 20;
-    if (written == 0 && !frame) || *shown == Some(mib) {
-        return;
-    }
-    *shown = Some(mib);
-    run.say(2, m::DECODE_PROGRESS, &[mib.to_string().as_bytes()]);
-}
-
-/// The cleared line, then `Compressed A bytes into B bytes ==> R%`.
-fn show_compress_summary(run: &mut Run, s: &Stats) {
-    let fmt = if run.cmd.opts.legacy {
-        m::COMPRESSED_LEGACY_SUMMARY
-    } else {
-        m::COMPRESSED_SUMMARY
-    };
-    let (read, written) = (s.read.to_string(), s.written.to_string());
-    let ratio = percent(s.written, s.read);
-    run.say(2, m::CLEAR_LINE, &[]);
-    run.say(
-        2,
-        fmt,
-        &[read.as_bytes(), written.as_bytes(), ratio.as_bytes()],
-    );
-}
-
-/// The cleared line, then `NAME: decoded N bytes`, the name cut or padded
-/// to 30 bytes (`%-30.30s`).
-fn show_decode_summary(run: &mut Run, name: &[u8], s: &Stats) {
-    let mut shown = name[..name.len().min(30)].to_vec();
-    shown.resize(30, b' ');
-    run.say(2, m::CLEAR_LINE, &[]);
-    run.say(
-        2,
-        m::DECODED_SUMMARY,
-        &[&shown, s.written.to_string().as_bytes()],
-    );
 }
