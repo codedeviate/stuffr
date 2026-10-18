@@ -3676,12 +3676,30 @@ mod unix {
             return;
         }
         for (name, data) in &hostile {
-            let (_, _, _, peak) =
-                peak_rss_run("lz4", &["-t", name], name, data, &[("LC_ALL", "C")]);
-            assert!(
-                peak < 32 << 20,
-                "{name}: peak memory {peak} bytes is not under 32 MiB"
-            );
+            // Linux: these runs end too soon for `RssAnon` sampling (CI run
+            // 39166896170 never saw one), so the bound is checked as a cap:
+            // under a 32 MiB data segment stuffr answers exactly as without
+            // one (`data_limited_run`).
+            #[cfg(target_os = "linux")]
+            {
+                let env = [("LC_ALL", "C")];
+                let free = data_limited_run("lz4", &["-t", name], name, data, &env, None);
+                let capped =
+                    data_limited_run("lz4", &["-t", name], name, data, &env, Some(32 << 20));
+                assert_eq!(
+                    capped, free,
+                    "{name}: under a 32 MiB data limit stuffr answers differently"
+                );
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let (_, _, _, peak) =
+                    peak_rss_run("lz4", &["-t", name], name, data, &[("LC_ALL", "C")]);
+                assert!(
+                    peak < 32 << 20,
+                    "{name}: peak memory {peak} bytes is not under 32 MiB"
+                );
+            }
         }
     }
 

@@ -1992,6 +1992,74 @@ pub fn peak_rss_run(
     (st, got, err, peak)
 }
 
+/// Run stuffr as `name ARGS` in a scratch directory holding `file`
+/// (written with `input`), with only `env` in the environment and, when
+/// `limit` is given, its data segment capped at that many bytes
+/// (`RLIMIT_DATA`: the heap and every private writable mapping, so an
+/// allocation is refused even if it is never touched); return the exit
+/// code (`None`: killed by a signal, e.g. the abort of a refused
+/// allocation), standard output and standard error.
+///
+/// For a run too short to be sampled: [`decoder_peak_rss`] samples Linux's
+/// `RssAnon` every 5 ms, and a decoder that refuses a hostile header exits
+/// within a millisecond or two (CI run 39166896170: never sampled), while
+/// `wait4`'s `ru_maxrss` counts the spawning test process (see there).
+/// "Answers the same under a cap of N bytes as without one" bounds the
+/// anonymous memory as the sampled peak would, deterministically.
+#[cfg(target_os = "linux")]
+pub fn data_limited_run(
+    name: &str,
+    args: &[&str],
+    file: &str,
+    input: &[u8],
+    env: &[(&str, &str)],
+    limit: Option<u64>,
+) -> (Option<i32>, Vec<u8>, String) {
+    use std::os::unix::process::CommandExt;
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "stuffr-rlimit-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("bin")).unwrap();
+    let link = dir.join("bin").join(name);
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
+    fs::write(dir.join(file), input).unwrap();
+    let mut cmd = Command::new(&link);
+    cmd.args(args)
+        .current_dir(&dir)
+        .env_clear()
+        .envs(env.iter().copied())
+        .stdin(Stdio::null());
+    if let Some(limit) = limit {
+        let rl = libc::rlimit {
+            rlim_cur: limit as libc::rlim_t,
+            rlim_max: limit as libc::rlim_t,
+        };
+        // SAFETY: the closure runs in the child between fork and exec and
+        // only calls `setrlimit`, which is async-signal-safe, on a value
+        // copied into it; it allocates nothing and takes no lock.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::setrlimit(libc::RLIMIT_DATA, &rl) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+    }
+    let o = output(&mut cmd).unwrap();
+    let _ = fs::remove_dir_all(&dir);
+    (
+        o.status.code(),
+        o.stdout,
+        String::from_utf8_lossy(&o.stderr).into_owned(),
+    )
+}
+
 /// Reap `child` with `wait4`, which reports that child's own resource use:
 /// its exit status and its peak resident set in bytes (`ru_maxrss`, which
 /// Linux counts in KiB). Not `getrusage(RUSAGE_CHILDREN)`, the largest of
