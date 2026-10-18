@@ -260,7 +260,8 @@ These come from the design specification and are the reason Phase 0 shipped as
 | `0.12.0` | Phase 5's second part — the gzip compatibility family (`gzip`, `gunzip`, `zcat`, `gzcat`) in two personalities, GNU gzip 1.15 and Apple's gzip 487.0.1 (a port, `LICENSE-gzip-bsd`), chosen by platform or `STUFFR_GZIP_FLAVOR`; stdout, stderr and exit codes byte-identical to the reference in both, Apple's compressed bytes identical on the `c-backed` tier and compatible elsewhere, GNU's compatible only; `install-links` now makes eight names; `stuffr-cli` licensed `MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause`, `stuffr-formats` `MIT AND BSD-2-Clause`. A MINOR because it is a new user-facing surface. |
 | `0.13.0` | Phase 5's third part — the xz compatibility family (`xz`, `unxz`, `xzcat`, `lzma`, `unlzma`, `lzcat`) behaving as XZ Utils 5.8.4's `xz`, one personality ported from its 0BSD `src/xz/`; stdout, stderr and exit codes byte-identical on both tiers, compressed bytes identical on the `c-backed` tier and compatible on the pure tier; signal cleanup of the partial output (`host.rs`); `install-links` now makes fourteen names; `stuffr-cli` licensed `MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD`, `stuffr-formats` `MIT AND BSD-2-Clause AND 0BSD`. A MINOR because it is a new user-facing surface. |
 | `0.14.0` | Phase 5's fourth part — the zstd compatibility family (`zstd`, `unzstd`, `zstdcat`, `zstdmt`) behaving as zstd 1.5.7's command line tool, one personality ported from its BSD `programs/`; stdout, stderr and exit codes byte-identical on both tiers, frames and dictionaries identical on the `c-backed` tier (`zstd-c`) and compatible on the pure tier, with `--train-cover`, `--adapt` and `--format=lz4` compatible only; SIGINT cleanup answered as zstd answers it; `install-links` now makes eighteen names; `stuffr-formats` licensed `MIT AND BSD-2-Clause AND 0BSD AND BSD-3-Clause` (`LICENSE-zstd`, `LICENSE-zstd-clevels`). A MINOR because it is a new user-facing surface. |
-| `0.15.x`/later | The rest of Phase 5 — the remaining compatibility families, one per release (lz4 next, then `unzip`/`zipinfo`; `tar` excluded), each claiming the next open number; polish (completions, man pages) under a separate spec. |
+| `0.15.0` | Phase 5's fifth part — the lz4 compatibility family (`lz4`, `unlz4`, `lz4cat`, `lz4c`) behaving as lz4 1.10.0's command line tool, a clean-room front end (lz4's GPL-2.0-or-later `programs/` was never read) over a new doc-hidden `stuffr::lz4_opts` seam; stdout, stderr and exit codes identical on both tiers, `.lz4` bytes identical on the `c-backed`/`lz4-c` tier (liblz4 1.10.0) and compatible on the pure tier (`lz4_flex`), which also makes zstd's `--format=lz4` byte-identical on the C tier; an interrupt leaves lz4's partial output (no handler, as lz4); `install-links` now makes twenty-two names; `LICENSE-lz4` (liblz4, BSD-2-Clause; expressions unchanged). A MINOR because it is a new user-facing surface. |
+| `0.16.x`/later | The rest of Phase 5 — the remaining compatibility families, one per release (`unzip`/`zipinfo` next; `tar` excluded), each claiming the next open number; polish (completions, man pages) under a separate spec. |
 | `1.0.0` | Reserved for feature-complete, not for any single phase — no earlier milestone claims it. |
 
 This table was revised after Phase 1: the original plan put legacy read/write
@@ -1029,7 +1030,8 @@ behaves as another tool (README, "Compatibility links"). bzip2 (`bzip2`,
 `bunzip2`, `bzcat`, `bzip2recover`) is the first, in `0.11.0`; gzip (`gzip`,
 `gunzip`, `zcat`, `gzcat`) is the second, in `0.12.0`; xz (`xz`, `unxz`,
 `xzcat`, `lzma`, `unlzma`, `lzcat`) is the third, in `0.13.0`; zstd (`zstd`,
-`unzstd`, `zstdcat`, `zstdmt`) is the fourth, in `0.14.0`. **The family's
+`unzstd`, `zstdcat`, `zstdmt`) is the fourth, in `0.14.0`; lz4 (`lz4`,
+`unlz4`, `lz4cat`, `lz4c`) is the fifth, in `0.15.0`. **The family's
 own spec decides its byte-identity promise** before any code is written:
 which tier, against which tool and version, byte-identical or compatible
 behaviour only. The planned tiers come from the Phase 5 design's Decision 2,
@@ -1186,9 +1188,46 @@ emulates is two programs:
   any other difference still fails.
 - **The tier promise.** Stdout, stderr and exit codes are zstd 1.5.7's on
   both tiers. Frames and dictionaries are identical on the C tier except
-  `--train-cover` (libzstd's cover sort breaks ties by address), `--adapt`
-  (timing) and `--format=lz4` (compatible only); the pure tier is compatible
+  `--train-cover` (libzstd's cover sort breaks ties by address) and `--adapt`
+  (timing); `--format=lz4` is identical on the C tier since `0.15.0` (liblz4
+  through `lz4-c`); the pure tier is compatible
   and refuses dictionary compression and `--train`.
+
+**The lz4 family** (`compat/lz4/`) has one personality and one reference,
+and is the second family, after GNU gzip, written **clean room**:
+
+- **Clean room.** lz4's `programs/` is GPL-2.0-or-later and is never read,
+  opened, grepped or summarised, nor are its `tests/`, `contrib/` or
+  `examples/`. The sources allowed are the man pages, `NEWS`, `README.md`,
+  `lz4 -h`/`-H`, the running 1.10.0 binary, and liblz4's own BSD sources and
+  frame/block format documents. A fact those lack is **probed on the binary**
+  and the probe recorded. Every literal and rule in `compat/lz4/` carries a
+  comment naming its source (`// lz4.1: ...`, `// lz4 -H`, `// NEWS v1.9.3`,
+  `// probe: <command>`); `messages.rs` holds every string. liblz4 itself is
+  BSD-2-Clause (`crates/stuffr-cli/LICENSE-lz4`, which also states the
+  clean-room fact); the expressions did not change.
+- **One version, the tarball.** Only 1.10.0 is promised. The reference is
+  found by `lz4_dir()` in the harness: `$STUFFR_LZ4_REFERENCE`, then
+  Homebrew's keg (`/opt/homebrew/opt/lz4/bin/lz4`), then `PATH`. CI builds
+  the release tarball (SHA-256 pinned) in the composite action
+  `.github/actions/lz4-reference`. Where the man page and the binary disagree,
+  the binary wins.
+- **R3, the interrupt answer is none.** lz4 installs no signal handler: an
+  interrupt kills it by the signal and the partial output stays under its
+  name. So nothing is armed, outputs are written directly to their names and
+  no temporary file exists; `--rm` after an interrupted run removes nothing.
+- **R8, help is verbatim.** `-h` and `-H` print the reference's text byte for
+  byte, benchmark lines included; only *invoking* `-b`/`-e`/`-i` is refused
+  (deviation 5).
+- **R12, the name rule.** The preset applies to the last path component (after
+  `/` or `\`) when it is the name, or the name followed by `.` and anything,
+  case-sensitively. Dispatch still registers only the four exact names; the
+  rule matters when `run` sees an `argv0` with a suffix.
+- **The tier promise.** Stdout, stderr and exit codes are lz4 1.10.0's on both
+  tiers; `.lz4` bytes are identical with `lz4-c` (in `c-backed`) and
+  compatible on the pure tier (`lz4_flex`). The module doc of
+  `compat/lz4/mod.rs` is the source of truth for the nine deviations; the
+  README mirrors it.
 
 **Reference tools.** The bzip2 family is tested against the system
 `/usr/bin/bzip2` and `/usr/bin/bzip2recover`, which are not the same program

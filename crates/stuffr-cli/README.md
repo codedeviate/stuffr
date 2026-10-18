@@ -59,7 +59,8 @@ and `zoo` are two read-only containers. That is what a plain
 the build you actually have.
 
 Invoked as `bzip2`, `bunzip2`, `bzcat`, `bzip2recover`, `gzip`, `gunzip`,
-`zcat` or `gzcat`, the binary behaves as that tool, byte for byte on stdout,
+`zcat`, `gzcat`, `xz`, `unxz`, `xzcat`, `lzma`, `unlzma`, `lzcat`, `zstd`,
+`unzstd`, `zstdcat`, `zstdmt`, `lz4`, `unlz4`, `lz4cat` or `lz4c`, the binary behaves as that tool, byte for byte on stdout,
 stderr and exit codes. `stuffr install-links --dir DIR` makes the links, and
 nothing makes them for you. The gzip names follow the platform (GNU gzip, or
 Apple's on macOS and the BSDs); `STUFFR_GZIP_FLAVOR=gnu|bsd` overrides that.
@@ -71,5 +72,8 @@ the [project README](https://github.com/codedeviate/stuffr#readme).
 
 [MIT](LICENSE), with ported code under other permissive licences: the crate's
 metadata is `MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD`.
-The notices ship as `LICENSE-bzip2`, `LICENSE-gzip-bsd`, `LICENSE-xz` and
-`LICENSE-zstd`.
+The notices ship as `LICENSE-bzip2`, `LICENSE-gzip-bsd`, `LICENSE-xz`,
+`LICENSE-zstd` and `LICENSE-lz4`. The lz4 family ports nothing (lz4's CLI is
+GPL-2.0-or-later and was not read; it is a clean-room implementation from lz4's
+documentation and behaviour); `LICENSE-lz4` is liblz4's BSD-2-Clause notice,
+for the `lz4-c` tier that links it.

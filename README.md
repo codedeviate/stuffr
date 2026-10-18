@@ -929,11 +929,12 @@ behaves as **bzip2 1.0.8**; invoked as `gzip`, `gunzip`, `zcat` or `gzcat`
 (from `0.12.0`), as **gzip**; invoked as `xz`, `unxz`, `xzcat`, `lzma`,
 `unlzma` or `lzcat` (from `0.13.0`), as **xz** (XZ Utils 5.8.4); invoked as
 `zstd`, `unzstd`, `zstdcat` or `zstdmt` (from `0.14.0`), as **zstd** (zstd
-1.5.7). In every case that tool's flags, files, exit codes and messages, not stuffr's. The
-binary reads the name from `argv[0]`, the file name only, before parsing
+1.5.7); invoked as `lz4`, `unlz4`, `lz4cat` or `lz4c` (from `0.15.0`), as
+**lz4** (lz4 1.10.0). In every case that tool's flags, files, exit codes and
+messages, not stuffr's. The binary reads the name from `argv[0]`, the file name only, before parsing
 anything. Any other name, `stuffr` included, runs the stuffr CLI unchanged.
 So does a link you make by hand under a name stuffr does not handle:
-`lz4cat -> stuffr` runs `stuffr`, not lz4cat.
+`unzip -> stuffr` runs `stuffr`, not unzip.
 
 ### Opting in
 
@@ -941,7 +942,7 @@ So does a link you make by hand under a name stuffr does not handle:
 Homebrew. One verb makes them:
 
 ```sh
-stuffr install-links --dir ~/.local/bin                  # all eighteen names
+stuffr install-links --dir ~/.local/bin                  # all twenty-two names
 stuffr install-links --dir ~/.local/bin --names bzcat,zcat   # comma-separated subset
 stuffr install-links --dir ~/.local/bin --dry-run        # "would create ...", changes nothing
 stuffr install-links --dir ~/.local/bin --force          # replace what is already there
@@ -1317,11 +1318,98 @@ The fuzz target's sandboxed entry point caps the decoder's window log at 24,
 `--train*` samples at 256 KiB (4 optimiser steps) and workers at 2; those
 bounds never apply to a real run.
 
+### The lz4 family
+
+`lz4`, `unlz4`, `lz4cat` and `lz4c`, from `0.15.0`. They behave as the
+**lz4 command line tool, version 1.10.0**, and only that version: one
+personality, one reference. The preset comes from the invoked name as lz4
+derives it, probed on the binary: the name itself or the name followed by `.`
+and anything (`unlz4.exe`), case-sensitively; `unlz4-1`, `xunlz4` and `UNLZ4`
+are plain `lz4`. `unlz4` decompresses, `lz4cat` is `-dcfm` at display level 1
+and `lz4c` reads the legacy arguments (`-c0`, `-c1`, `-c2`, `-hc`, `-y`) and
+lists them in its help. `LZ4_CLEVEL` and `LZ4_NBWORKERS` are read as lz4 reads
+them. `-h` and `-H` print the reference's text verbatim, benchmark lines
+included.
+
+**The promise:**
+
+- **Stdout, stderr and exit codes are those of lz4 1.10.0** (under
+  `LC_ALL=C`), on both build tiers: every documented option, `--list` (compact
+  and `-v`), `-v`/`-vv`/`-vvv`, `-m`, `-r`, `--rm`, `-D` dictionaries,
+  legacy frames (`-l`), concatenated and skippable frames, sparse output, the
+  overwrite question and the display level rules. The exit codes are lz4's:
+  0, 1 (usage and file errors) and `Error N` exiting N; stuffr's own 3 to 7
+  never apply under these names. A differential suite runs each case through
+  a real lz4 1.10.0 and a stuffr link and compares those streams, the file
+  tree, modes and mtimes.
+- **Compressed output.** With `--features lz4-c` (also in `c-backed`), which
+  builds liblz4 1.10.0, `.lz4` bytes are **byte-identical to lz4 1.10.0** for
+  every option. On the default pure tier (`lz4_flex`) every option is accepted
+  and the output is **compatible**: lz4 1.10.0 decodes it to the input.
+- **The intended difference:** the banner. `-V`, the first lines of `-h`/`-H`
+  and `-v` print `*** lz4 v1.10.0 64-bit multithread (stuffr X.Y.Z), by Yann
+  Collet ***`; the prefix `*** lz4 v1.10.0 ` is unchanged.
+
+**Known differences, both tiers:**
+
+- **Timing and host fields vary,** as between two runs of lz4: the `Done in`
+  line's seconds, speed and cpu load, the progress refreshes, and the `Using
+  N threads` count where two programs count the host's cores differently.
+  Refreshes are drawn at most every 200 ms; a decode offers one per MiB where
+  lz4 offers one per 4 MiB chunk.
+- **An input that is also the output is never lost.** Where the output named
+  is the input file itself (same device and inode: `lz4 -f a a`, `lz4 -df
+  s.lz4 s.lz4`, a hard link, standard input redirected from it), lz4 truncates
+  it before reading it and the data is gone. stuffr opens nothing, prints
+  `NAME is the input file; not overwritten (stuffr)`, counts that input as
+  failed (exit 1, or one more in `-m`'s count), whatever `-f` says.
+- **Closed standard streams, and a parent that ignores `SIGPIPE`,** as in the
+  other families. A closed pipe kills stuffr by SIGPIPE, as it kills lz4
+  under the default disposition; where the parent ignores SIGPIPE lz4 answers
+  `Error 70` (decoding) or `Error 38` (compressing) and stuffr still dies of
+  the signal. A closed standard input or output is reopened on `/dev/null`
+  by the Rust runtime, so `lz4 -c <&-` (lz4: `Error 40`) compresses an empty
+  input.
+- **Benchmark options are out of scope.** `-b#`, `-e#` and `-i#` print
+  `Benchmark mode is not available in this build (stuffr)` and exit 1, once
+  the whole command line has parsed (a usage error, `-h` or `-V` still
+  answers first); this includes `-e#` and `-i#` where lz4 ignores them for a
+  plain compression. `-h` and `-H` still list them. The hidden `-S` is
+  accepted and has no effect, as in lz4.
+- **A decode that fails keeps everything decoded before the fault** in its
+  output (a file or standard output). lz4 writes on another thread and exits
+  from the failing one, so it leaves nothing or all of that, run to run.
+- **`--list` of a file that ends inside a block-size word,** after a frame or
+  skippable frame came before, completes the word from an uninitialised
+  buffer in lz4 (the same garbage run to run, about 4.4 million); only the
+  `-v` size of that last frame shows it. stuffr completes it from the
+  frame's previous block-size word (zero for the first).
+- **`--list` of a regular file that cannot be opened** (mode 000) aborts lz4
+  on an assertion (exit 134); stuffr prints `NAME: Permission denied` and
+  exits 1.
+
+**Known differences, pure tier only** (without `lz4-c`):
+
+- **Levels 3 to 12, `--best` and `--favor-decSpeed` compress with the one
+  level `lz4_flex` has,** so the sizes and ratios in the summaries are the
+  tier's own; the frame descriptor follows lz4's.
+- **A corrupt frame's `Error N` text may differ,** and the output written
+  before it may be a strict prefix of lz4's.
+
+**Behaviour kept from lz4, on purpose.** `--rm` with standard input as the
+input deletes a file named `stdin` (and fails with `Error 50` when there is
+none), as lz4 does. An interrupt (SIGINT, SIGTERM, SIGHUP) leaves the
+partial output under its name and kills the process by the signal: lz4
+installs no handler and writes the output file directly, and so does stuffr.
+`lz4 -d` of a file without the `.lz4` suffix is `Cannot determine an output
+filename`; with `lz4 -f` and standard output as the target an unrecognised
+input is copied through, as lz4 does.
+
 ### Roadmap
 
 One family per release, each with its own spec stating its byte-identity
-promise: **bzip2 (`0.11.0`), gzip (`0.12.0`), xz/lzma (`0.13.0`) and zstd
-(`0.14.0`) are done; lz4 is next, then `unzip`/`zipinfo`.**
+promise: **bzip2 (`0.11.0`), gzip (`0.12.0`), xz/lzma (`0.13.0`), zstd
+(`0.14.0`) and lz4 (`0.15.0`) are done; `unzip`/`zipinfo` are next.**
 `tar` is excluded (see [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md)). The planned
 tiers:
 
@@ -1329,10 +1417,11 @@ tiers:
   the `c-backed` tier, via zlib (done); xz/lzma on the `c-backed` tier, via
   liblzma, against XZ Utils 5.8.4 (done); zstd on the `c-backed` tier,
   via libzstd, against zstd 1.5.7 (done; `--train-cover` and `--adapt`
-  excepted, as stated above).
+  excepted, as stated above); lz4 on the `lz4-c` tier (in `c-backed`), via
+  liblz4, against lz4 1.10.0 (done), which also makes zstd's `--format=lz4`
+  byte-identical there.
 - **Compatible behaviour only** (the same flags, files, exit codes and
-  messages, and output the real tool reads): lz4 (and zstd's `--format=lz4`);
-  GNU gzip's exact bytes;
+  messages, and output the real tool reads): GNU gzip's exact bytes;
   every family except bzip2 on the pure tier.
 
 ### Attribution
@@ -1357,6 +1446,12 @@ licence is in
 fixture carries verbatim zstd source: `crates/stuffr-cli/tests/fixtures/zstd_progress/gen.c`
 copies `UTIL_makeHumanReadableSize` from `programs/util.c` (BSD, covered by
 `LICENSE-zstd`).
+The lz4 family ports nothing: lz4's command line tool is GPL-2.0-or-later and
+its source was never read, so the front end is a clean-room implementation
+from lz4's documentation (man pages, `NEWS`, `-h`/`-H`) and the behaviour of
+the 1.10.0 binary. On the `lz4-c` tier liblz4 1.10.0 (Yann Collet,
+BSD-2-Clause) is linked; its notice is in
+[`crates/stuffr-cli/LICENSE-lz4`](crates/stuffr-cli/LICENSE-lz4).
 `stuffr-cli`'s licence metadata is therefore
 `MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD`. The GNU
 personality contains no GNU code: GNU gzip is GPLv3 and its source was never
@@ -1654,6 +1749,12 @@ Since `0.14.0` the zstd family is ported from zstd 1.5.7's `programs/`
 test fixture `crates/stuffr-cli/tests/fixtures/zstd_progress/gen.c` contains
 verbatim zstd source (`UTIL_makeHumanReadableSize` from `programs/util.c`),
 also BSD and covered by `LICENSE-zstd`.
+The lz4 family (`0.15.0`) is not a port: lz4's CLI is GPL-2.0-or-later and was
+**not read**, so `crates/stuffr-cli/src/compat/lz4/` is a clean-room
+implementation from lz4's documentation and the behaviour of the 1.10.0
+binary, and is MIT. On the `lz4-c` tier liblz4 1.10.0 is linked, under its
+BSD-2-Clause licence (`crates/stuffr-cli/LICENSE-lz4`), already in the
+expression below.
 `stuffr-cli`'s full expression is therefore
 **`MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD`**: the
 BSD-2-Clause covers `gzip.c` and the decoders, the BSD-3-Clause covers
