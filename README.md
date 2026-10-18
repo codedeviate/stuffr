@@ -1356,7 +1356,10 @@ included.
   line's seconds, speed and cpu load, the progress refreshes, and the `Using
   N threads` count where two programs count the host's cores differently.
   Refreshes are drawn at most every 200 ms; a decode offers one per MiB where
-  lz4 offers one per 4 MiB chunk.
+  lz4 offers one per 4 MiB chunk. The figures in the `\r` refresh line also
+  differ, not only their timing: for a file under 4 MiB lz4 shows `==> 24.69%`
+  (the final ratio) where stuffr shows `==> 0.00%`; `-l` and large inputs
+  differ too.
 - **An input that is also the output is never lost.** Where the output named
   is the input file itself (same device and inode: `lz4 -f a a`, `lz4 -df
   s.lz4 s.lz4`, a hard link, standard input redirected from it), lz4 truncates
@@ -1398,7 +1401,8 @@ included.
 
 **Behaviour kept from lz4, on purpose.** `--rm` with standard input as the
 input deletes a file named `stdin` (and fails with `Error 50` when there is
-none), as lz4 does. An interrupt (SIGINT, SIGTERM, SIGHUP) leaves the
+none), as lz4 does. `lz4 -t --rm f.lz4` deletes the source after a
+successful test, as lz4 does, so it can delete a user's only copy. An interrupt (SIGINT, SIGTERM, SIGHUP) leaves the
 partial output under its name and kills the process by the signal: lz4
 installs no handler and writes the output file directly, and so does stuffr.
 `lz4 -d` of a file without the `.lz4` suffix is `Cannot determine an output

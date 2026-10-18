@@ -89,7 +89,9 @@ pub(crate) struct Ended {
 const READ_SIZE: usize = 64 << 10;
 
 /// probe: `lz4 -r d` with a symlink loop inside is lz4's own business; a
-/// walk deeper than this stops, so stuffr never recurses without end.
+/// walk deeper than this stops. The cap bounds depth only: two symlinks to
+/// `.` still give exponentially many paths, and `lz4 -r` then runs
+/// effectively forever, as the reference does.
 const WALK_DEPTH_MAX: usize = 256;
 
 // ---- inputs ----
