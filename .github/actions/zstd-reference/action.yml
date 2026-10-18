@@ -6,7 +6,12 @@ description: >-
   harness panics if the reference is missing or is not exactly 1.5.7 with
   gzip, lz4, lzma and xz support.
 
-# The built zstd is dynamically linked against zlib, liblzma and liblz4, so
+# liblz4 is the one library NOT taken from the distro: ubuntu's liblz4-dev is
+# 1.9.4, whose level 2 is the "fast" mode, while lz4 1.10.0 added a mid-way
+# level 2, so `--format=lz4 -2` bytes differ. The reference therefore links a
+# liblz4.a built from the lz4 1.10.0 release tarball (lib/ only), statically.
+#
+# The built zstd is dynamically linked against zlib and liblzma, so
 # the cached install is only usable where those libraries are present. The
 # runtime libraries are therefore installed on EVERY run, cache hit or not
 # (cheap: the runners have most of them), and a verification step after the
@@ -21,7 +26,7 @@ runs:
       uses: actions/cache@v4
       with:
         path: ${{ runner.temp }}/zstd-1.5.7
-        key: zstd-1.5.7-${{ runner.os }}-${{ runner.arch }}
+        key: zstd-1.5.7-lz4-1.10.0-${{ runner.os }}-${{ runner.arch }}
 
     # The tarball, not a distro package: ubuntu and Homebrew ship other
     # builds, and the promise is byte identity with 1.5.7. The SHA-256 is the
@@ -32,9 +37,9 @@ runs:
       run: |
         set -euo pipefail
         if [ "$RUNNER_OS" = Linux ]; then
-          sudo apt-get update && sudo apt-get install -y zlib1g-dev liblzma-dev liblz4-dev
+          sudo apt-get update && sudo apt-get install -y zlib1g-dev liblzma-dev
         elif [ "$RUNNER_OS" = macOS ]; then
-          brew list xz lz4 >/dev/null 2>&1 || brew install xz lz4
+          brew list xz >/dev/null 2>&1 || brew install xz
         fi
 
     - name: build zstd 1.5.7
@@ -46,19 +51,32 @@ runs:
         sha256=eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3
         src="$RUNNER_TEMP/zstd-src"
         mkdir -p "$src"
+        # liblz4 1.10.0, static, from the SHA-256-verified release tarball
+        # (the same one as the lz4-reference action); only lib/ is built.
+        lz4url=https://github.com/lz4/lz4/releases/download/v1.10.0/lz4-1.10.0.tar.gz
+        lz4sha=537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b
+        curl -fsSL --retry 3 -o "$src/lz4-1.10.0.tar.gz" "$lz4url"
+        echo "$lz4sha  $src/lz4-1.10.0.tar.gz" | shasum -a 256 -c -
+        tar -xzf "$src/lz4-1.10.0.tar.gz" -C "$src"
+        lz4prefix="$src/lz4-prefix"
+        make -C "$src/lz4-1.10.0/lib" install BUILD_SHARED=no PREFIX="$lz4prefix" -j"$(getconf _NPROCESSORS_ONLN)"
+        ls "$lz4prefix/lib"
         curl -fsSL --retry 3 -o "$src/zstd-1.5.7.tar.gz" "$url"
         echo "$sha256  $src/zstd-1.5.7.tar.gz" | shasum -a 256 -c -
         tar -xzf "$src/zstd-1.5.7.tar.gz" -C "$src"
-        # macOS: xz and lz4 come from Homebrew (usually already on the
-        # runner), whose headers and libraries are not on the default paths.
+        # macOS: xz comes from Homebrew (usually already on the runner), whose
+        # headers and libraries are not on the default paths.
         # These are environment variables, not make arguments: the Makefile
         # appends its own -D flags to CPPFLAGS, and a command-line value
         # would replace them (the build then says "supports: zstd" only).
+        # Our lz4 prefix comes FIRST and holds only liblz4.a, so -llz4 can
+        # only resolve to 1.10.0 whatever else is installed.
+        export CPPFLAGS="-I$lz4prefix/include"
+        export LDFLAGS="-L$lz4prefix/lib"
         if [ "$RUNNER_OS" = macOS ]; then
           xz_prefix="$(brew --prefix xz)"
-          lz4_prefix="$(brew --prefix lz4)"
-          export CPPFLAGS="-I$xz_prefix/include -I$lz4_prefix/include"
-          export LDFLAGS="-L$xz_prefix/lib -L$lz4_prefix/lib"
+          export CPPFLAGS="$CPPFLAGS -I$xz_prefix/include"
+          export LDFLAGS="$LDFLAGS -L$xz_prefix/lib"
         fi
         make -C "$src/zstd-1.5.7/programs" zstd-release HAVE_ZLIB=1 HAVE_LZMA=1 HAVE_LZ4=1 HAVE_THREAD=1 -j"$(getconf _NPROCESSORS_ONLN)"
         mkdir -p "$RUNNER_TEMP/zstd-1.5.7/bin"
@@ -71,6 +89,8 @@ runs:
         bin="$RUNNER_TEMP/zstd-1.5.7/bin"
         for l in unzstd zstdcat zstdmt; do ln -sf zstd "$bin/$l"; done
         echo "STUFFR_ZSTD_REFERENCE=$bin/zstd" >> "$GITHUB_ENV"
+        # liblz4 is linked statically; this line is the proof of which one.
+        echo "zstd reference: liblz4 1.10.0 static (tarball); dynamic lz4 references: $( { ldd "$bin/zstd" || otool -L "$bin/zstd"; } 2>&1 | grep -ci lz4 || true )"
         if ! "$bin/zstd" -vV; then
           echo "::error::the zstd reference at $bin/zstd does not start (cache hit: ${{ steps.cache.outputs.cache-hit }}); its shared libraries are missing or the cache is broken. This is not a missing reference." >&2
           exit 1
