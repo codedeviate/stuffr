@@ -2142,7 +2142,10 @@ mod tests {
         assert_eq!(case.files, all);
         assert!(case.stdin);
         assert_eq!(case.payload, b"xy");
-        // Every bit of all three bytes.
+        // Every bit of all three bytes. The argument-count byte is 18, which
+        // is zero arguments (18 % 9 == 0, as COMPAT_MAX_ARGS + 1 is 9) and
+        // still at least 2 x 9, so the third mask byte is read; the three
+        // 0xff bytes then set every file bit and no token follows.
         let case = decode_compat_case(&[18, 18, 0xff, 0xff, 0xff]).unwrap();
         assert_eq!(case.files, COMPAT_FILES);
         // A third-byte case cut before its third byte: nothing to run.

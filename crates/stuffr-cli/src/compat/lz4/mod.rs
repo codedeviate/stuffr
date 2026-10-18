@@ -130,9 +130,9 @@ pub fn run(name: &'static str, argv0: &OsStr, args: Vec<OsString>) -> ExitCode {
     ExitCode::from(code as u8)
 }
 
-/// The exit codes the reference produced over every row and the fuzz
-/// the harness ran: the set the `compat` fuzz target accepts under the lz4
-/// names (with 0 and 1 always allowed there).
+/// The exit codes the reference produced over every row of the differential
+/// suite and its mutation fuzz: the set the `compat` fuzz target accepts
+/// under the lz4 names (with 0 and 1 always allowed there).
 ///
 /// Probed 2026-10-16 over the rows and over ~3000 corruptions and cuts
 /// of ten frames (`-t`, `-dc`, `--list`).
