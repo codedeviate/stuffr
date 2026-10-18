@@ -250,20 +250,26 @@ fn execute(cmd: &Command, host: &mut Host, out: &mut dyn Write, err: &mut dyn Wr
 /// (probe: `lz4 -v -d nosuch`, `lz4 -vv -t a`, `lz4 -vv --list b.lz4`; the
 /// same under every operation, and before a refusal or a usage error that
 /// the arguments did not raise): the banner at display level 3 and up,
-/// and at level 4 and up the two `_POSIX_VERSION` lines.
+/// and at level 4 and up the two `_POSIX_VERSION` lines, after a
+/// `_POSIX_C_SOURCE` line on Linux.
 fn announce(cmd: &Command, err: &mut dyn Write) {
     if cmd.display_level >= 3 {
         cli::print_banner(err);
     }
     if cmd.display_level >= 4 {
+        // probe: `lz4 -vv -c f` on Linux, glibc and musl (CI run
+        // 39166896170; see `m::POSIX_C_SOURCE`); none on macOS.
+        #[cfg(target_os = "linux")]
+        printf(err, m::POSIX_C_SOURCE, &[]);
         let v = posix_version();
         printf(err, m::POSIX_VERSION, &[v.as_bytes(), v.as_bytes()]);
     }
 }
 
 /// `_POSIX_VERSION` as the system says it (200112 on macOS, probed with
-/// lz4: `_POSIX_VERSION defined: 200112L`); `sysconf(_SC_VERSION)` is the
-/// run-time spelling of the same fact. Not probed on Linux.
+/// lz4: `_POSIX_VERSION defined: 200112L`; 200809 on Linux, probed with the
+/// tarball build on glibc and musl and on CI run 39166896170);
+/// `sysconf(_SC_VERSION)` is the run-time spelling of the same fact.
 fn posix_version() -> String {
     #[cfg(unix)]
     {

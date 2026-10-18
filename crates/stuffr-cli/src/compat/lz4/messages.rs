@@ -451,6 +451,14 @@ pub(super) const E72_READING: &str = "Error 72 : Error reading %s \n";
 pub(super) const POSIX_VERSION: &str =
     "_POSIX_VERSION defined: %sL\nPLATFORM_POSIX_VERSION defined: %sL\n";
 
+/// probe: `lz4 -vv -c f` on Linux (the 1.10.0 tarball built with `make -C
+/// programs lz4` on glibc, Debian `rust:1.95`, and on musl, Alpine 3.20;
+/// CI run 39166896170 on ubuntu): a line before the two above, at display
+/// level 4. The reference built on macOS prints no such line. The value is
+/// the reference build's, 200809L under both C libraries.
+#[cfg(target_os = "linux")]
+pub(super) const POSIX_C_SOURCE: &str = "_POSIX_C_SOURCE defined: 200809L\n";
+
 // ---- the end of a run ----
 
 /// probe: `lz4 -p -V < /dev/null` (hidden `-p`): printed at a clean exit,

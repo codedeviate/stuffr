@@ -795,7 +795,12 @@ fn the_levels() {
     let d = Dir::new(&[("a.lz4", &Shape::new().bytes())]);
     let (_, out, err) = d.run(&["--list", "-vv", "a.lz4"]);
     assert!(out.starts_with("a.lz4(1/1)\n"), "{out:?}");
-    let lines: Vec<_> = err.lines().collect();
+    let mut lines: Vec<_> = err.lines().collect();
+    // probe: the Linux reference adds a line after the banner.
+    if cfg!(target_os = "linux") {
+        assert_eq!(lines.get(1), Some(&"_POSIX_C_SOURCE defined: 200809L"));
+        lines.remove(1);
+    }
     assert_eq!(lines.len(), 3, "{err:?}");
     assert!(lines[1].starts_with("_POSIX_VERSION defined: "), "{err:?}");
     assert!(lines[1].ends_with('L'));
