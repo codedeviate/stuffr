@@ -217,6 +217,7 @@ mod bytes {
         inputs.push(("one", b"x".to_vec()));
         inputs.push(("block", text(65_536, 75)));
         inputs.push(("big", text(1_500_000, 76)));
+        let exact_lz4 = EXACT_LZ4 && zstd_lz4_is_1_10();
         let mut cases = Vec::new();
         for level in [
             "-1", "-2", "-3", "-4", "-9", "-12", "-13", "-19", "--fast=3", "-0",
@@ -227,18 +228,18 @@ mod bytes {
                     a.extend(extra.iter().copied());
                     a.push(name);
                     let mut c = case("zstd", a, vec![(name, data.clone())]);
-                    c.compare_output_bytes = EXACT_LZ4;
+                    c.compare_output_bytes = exact_lz4;
                     cases.push(c);
                 }
                 let mut a = vec!["-q", "-k", "--format=lz4", level];
                 a.push(name);
                 let mut c = case("zstd", a, vec![(name, data.clone())]);
-                c.compare_output_bytes = EXACT_LZ4;
+                c.compare_output_bytes = exact_lz4;
                 cases.push(c);
                 // Standard input: the size is not known.
                 let mut c = case("zstd", vec!["-c", "--format=lz4", level], Vec::new());
                 c.stdin = Some(data.clone());
-                c.compare_output_bytes = EXACT_LZ4;
+                c.compare_output_bytes = exact_lz4;
                 cases.push(c);
             }
         }

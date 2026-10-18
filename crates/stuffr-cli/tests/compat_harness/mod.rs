@@ -369,6 +369,54 @@ pub fn zstd_dir() -> Option<&'static str> {
     }
 }
 
+/// Whether the reference zstd's liblz4 is 1.10.x, so its `--format=lz4` bytes
+/// are the ones stuffr promises. `zstd -vV` does not print liblz4's version,
+/// so this probes the one difference that matters: lz4 1.10.0 added a mid-way
+/// level 2 (1.9.x, ubuntu's `liblz4-dev`, treats 2 as 1), so on compressible
+/// text `--format=lz4 -1` and `-2` are the same bytes only on an old liblz4.
+///
+/// `false` locally is a skip of the `--format=lz4` byte rows with a note;
+/// under `CI` it panics (the rule of [`require_reference`]): the
+/// `zstd-reference` action builds liblz4 1.10.0 statically for this. `false`
+/// without a reference at all (nothing to compare against).
+pub fn zstd_lz4_is_1_10() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| {
+        let Some(dir) = zstd_dir() else { return false };
+        let data = text(300_000, 7);
+        let at = |level: &str| -> Option<Vec<u8>> {
+            let mut child = spawn(
+                Command::new(Path::new(dir).join("zstd"))
+                    .args(["-c", "-q", "--format=lz4", level])
+                    .env_clear()
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null()),
+            )
+            .ok()?;
+            let mut stdin = child.stdin.take()?;
+            let feed = data.clone();
+            let writer = std::thread::spawn(move || stdin.write_all(&feed));
+            let out = child.wait_with_output().ok()?;
+            let _ = writer.join();
+            out.status.success().then_some(out.stdout)
+        };
+        let ok = matches!((at("-1"), at("-2")), (Some(a), Some(b)) if a != b);
+        if !ok {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI is set but the reference zstd's liblz4 is not 1.10.x (`--format=lz4` \
+                 levels 1 and 2 give the same bytes, as liblz4 1.9 does): zstd must be \
+                 linked against liblz4 1.10.0, as the zstd-reference action builds it"
+            );
+            eprintln!(
+                "skipped: the reference zstd's liblz4 is not 1.10.x (--format=lz4 byte rows)"
+            );
+        }
+        ok
+    })
+}
+
 /// Replace the timing fields of zstd's `-vv` completion line, `<name> :
 /// Completed in 0.01 sec  (cpu load : 100%)` (`fileio.c`), with `<elapsed>`
 /// and `<cpu>`, and nothing else: they are the only part of zstd's
