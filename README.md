@@ -1382,11 +1382,13 @@ included.
 - **A decode that fails keeps everything decoded before the fault** in its
   output (a file or standard output). lz4 writes on another thread and exits
   from the failing one, so it leaves nothing or all of that, run to run.
-- **`--list` of a file that ends inside a block-size word,** after a frame or
-  skippable frame came before, completes the word from an uninitialised
-  buffer in lz4 (the same garbage run to run, about 4.4 million); only the
-  `-v` size of that last frame shows it. stuffr completes it from the
-  frame's previous block-size word (zero for the first).
+- **`--list` of a file that ends inside a block-size word** completes the
+  word from an uninitialised buffer in lz4; only the `-v` size of that last
+  frame shows it. On macOS that is garbage once a frame or skippable frame
+  came before (the same run to run, about 4.4 million) and zero before; on
+  Linux it is garbage even in the first frame, different on every run.
+  stuffr completes it from the frame's previous block-size word (zero for
+  the first).
 - **`--list` of a regular file that cannot be opened** (mode 000) aborts lz4
   on an assertion (exit 134); stuffr prints `NAME: Permission denied` and
   exits 1.

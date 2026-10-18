@@ -85,12 +85,16 @@
 //!    output (a file or standard output). lz4 writes on another thread and
 //!    exits from the failing one, so it leaves nothing or all of that, run
 //!    to run (probed: 0 or 8800 bytes of 8800 for the same input).
-//! 8. `--list` of a file that ends inside a block-size word, after a
-//!    frame or skippable frame came before: lz4 completes the word from an
-//!    uninitialised buffer (probed: the same garbage run to run, about 4.4
-//!    million, for a given shape), which only the `-v` size of that last
-//!    frame shows. stuffr completes it from the frame's previous
-//!    block-size word, as lz4 does for a second block (zero for the first).
+//! 8. `--list` of a file that ends inside a block-size word: lz4
+//!    completes the word from an uninitialised buffer, which only the `-v`
+//!    size of that last frame shows. On macOS that is garbage once a frame
+//!    or skippable frame came before (probed: the same run to run, about
+//!    4.4 million, for a given shape) and zero before; on Linux it is
+//!    garbage even in the first frame, different on every run (probed: the
+//!    tarball build, `lz4 --list -v` of a header and one byte gave sizes
+//!    from 1.0 to 2.1 billion; CI run 39166896170). stuffr completes it from
+//!    the frame's previous block-size word, as lz4 does for a second block
+//!    (zero for the first).
 //! 9. `--list` of a regular file that cannot be opened (mode 000): lz4
 //!    aborts on an assertion (exit 134); stuffr names the error
 //!    (`NAME: Permission denied`) and exits 1.

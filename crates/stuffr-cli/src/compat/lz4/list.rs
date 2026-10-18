@@ -54,10 +54,12 @@
 //! - The block-size word is read into a 4-byte buffer the walker keeps: a
 //!   word cut short by the end of the file is completed from what the
 //!   buffer held, which is the frame's previous block-size word (zero at
-//!   the first block). lz4's buffer is the same until a frame has come
-//!   before; then it holds garbage the reference does not even repeat
-//!   (probe: `frame + frame header + 1 byte`), so only the **-v frame size
-//!   of a file cut inside a block-size word** can differ (deviation 8).
+//!   the first block). On macOS lz4's buffer is the same until a frame has
+//!   come before; then it holds garbage (probe: `frame + frame header + 1
+//!   byte`); on Linux it holds garbage from the first frame on, different
+//!   every run (probe: `header + 1 byte` with the tarball build). So only
+//!   the **-v frame size of a file cut inside a block-size word** can
+//!   differ (deviation 8).
 //! - The table: without `-v` one row per file after a header printed once
 //!   (compressed = the file's size, not the frames'); with display level 3
 //!   and up (`-v`) a `name(i/n)` line and one row per frame as it is met,

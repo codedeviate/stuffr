@@ -2430,6 +2430,13 @@ mod unix {
         };
         let mut s = stuffr_as(c);
         mask_banners(&mut r, &mut s);
+        // Spec deviation 8: off macOS the reference completes a block-size
+        // word cut short from uninitialised memory even in the first frame
+        // (probe: the tarball build on Linux, CI run 39166896170).
+        if !cfg!(target_os = "macos") && lists_a_cut_word(c) {
+            r.stdout = mask_frame_sizes(&r.stdout);
+            s.stdout = mask_frame_sizes(&s.stdout);
+        }
         // Spec deviation 2: refreshes, timing fields, thread count.
         // A run with a second file or frame to draw for is timing-exposed:
         // its refreshes are dropped, not collapsed (single-file rows still
@@ -2457,6 +2464,36 @@ mod unix {
         }
         assert_same(c, &r, &s);
         true
+    }
+
+    /// Whether `c` is a `--list -v` of a fixture whose first frame ends
+    /// inside a block-size word (deviation 8).
+    fn lists_a_cut_word(c: &Case) -> bool {
+        c.args.contains(&"--list")
+            && c.args.iter().any(|a| a.starts_with("-v"))
+            && c.files
+                .iter()
+                .any(|(name, _)| matches!(*name, "hdr_plus1.lz4" | "t_bsz.lz4"))
+    }
+
+    /// A `--list -v` table with the frame-size cell of every `LZ4Frame`
+    /// row masked (and each row's blanks collapsed, as the cell's width
+    /// moves them).
+    fn mask_frame_sizes(stdout: &[u8]) -> Vec<u8> {
+        let text = String::from_utf8_lossy(stdout);
+        let mut out = String::with_capacity(text.len());
+        for line in text.split_inclusive('\n') {
+            let cells: Vec<&str> = line.split_whitespace().collect();
+            if cells.get(1) == Some(&"LZ4Frame") && cells.len() >= 5 {
+                let mut cells = cells;
+                cells[4] = "<size>";
+                out.push_str(&cells.join(" "));
+                out.push('\n');
+            } else {
+                out.push_str(line);
+            }
+        }
+        out.into_bytes()
     }
 
     /// `Compressed A bytes into B bytes ==> R%` with B and R masked: the
