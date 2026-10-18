@@ -336,6 +336,20 @@ read list.
 > **2598** tests under `--all-features`, **2487** on the default tier —
 > measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
+> `0.15.0` is a MINOR that adds the lz4 compatibility family: `lz4`,
+> `unlz4`, `lz4cat` and `lz4c`, behaving as lz4 1.10.0, with every `-H`
+> option except the benchmark (`-b`/`-e`/`-i`), including `-l`, `-D`,
+> `--list`, `-m`/`-r` and lz4c's legacy arguments. It is a clean-room front
+> end: lz4's command line tool is GPL-2.0-or-later and was not read. On the
+> C tier (`lz4-c`, liblz4 1.10.0) the `.lz4` output is byte-identical to
+> lz4's, and `zstd --format=lz4` now is too; the pure tier (`lz4_flex`) is
+> compatible. `install-links` now makes twenty-two names. Library API, all
+> `#[doc(hidden)]`: `stuffr::lz4_opts` is added, `stuffr::lz4_frame` (and
+> `stuffr_formats::lz4::raw` behind it) is removed; `stuffr-cli` gains an
+> `lz4-c` feature.
+> **2736** tests under `--all-features`, **2620** on the default tier —
+> measured from this bump's own `make check`, `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
@@ -1404,8 +1418,8 @@ included.
 **Behaviour kept from lz4, on purpose.** `--rm` with standard input as the
 input deletes a file named `stdin` (and fails with `Error 50` when there is
 none), as lz4 does. `lz4 -t --rm f.lz4` deletes the source after a
-successful test, as lz4 does, so it can delete a user's only copy. An interrupt (SIGINT, SIGTERM, SIGHUP) leaves the
-partial output under its name and kills the process by the signal: lz4
+successful test, as lz4 does, so it can delete a user's only copy. An
+interrupt (SIGINT, SIGTERM, SIGHUP) leaves the partial output under its name and kills the process by the signal: lz4
 installs no handler and writes the output file directly, and so does stuffr.
 `lz4 -d` of a file without the `.lz4` suffix is `Cannot determine an output
 filename`; with `lz4 -f` and standard output as the target an unrecognised

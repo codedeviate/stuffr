@@ -60,9 +60,10 @@ the build you actually have.
 
 Invoked as `bzip2`, `bunzip2`, `bzcat`, `bzip2recover`, `gzip`, `gunzip`,
 `zcat`, `gzcat`, `xz`, `unxz`, `xzcat`, `lzma`, `unlzma`, `lzcat`, `zstd`,
-`unzstd`, `zstdcat`, `zstdmt`, `lz4`, `unlz4`, `lz4cat` or `lz4c`, the binary behaves as that tool, byte for
-byte on stdout, stderr and exit codes. `stuffr install-links --dir DIR` makes the links, and
-nothing makes them for you. The gzip names follow the platform (GNU gzip, or
+`unzstd`, `zstdcat`, `zstdmt`, `lz4`, `unlz4`, `lz4cat` or `lz4c`, the binary
+behaves as that tool, byte for byte on stdout, stderr and exit codes.
+`stuffr install-links --dir DIR` makes the links, and nothing makes them for
+you. The gzip names follow the platform (GNU gzip, or
 Apple's on macOS and the BSDs); `STUFFR_GZIP_FLAVOR=gnu|bsd` overrides that.
 
 Full documentation, including the safety defaults and the two build tiers, is in
