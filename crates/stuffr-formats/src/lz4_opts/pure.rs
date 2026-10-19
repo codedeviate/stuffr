@@ -145,9 +145,16 @@ impl Encoder {
         Ok(e)
     }
 
+    /// Test only: the bytes now held back, not yet compressed.
     #[cfg(test)]
     pub(crate) fn pending_len(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Test only: the allocation behind the held-back bytes.
+    #[cfg(test)]
+    pub(crate) fn pending_capacity(&self) -> usize {
+        self.pending.capacity()
     }
 
     /// Writes the frame header (or the legacy magic) on first call, and
@@ -617,6 +624,11 @@ mod tests {
                 whole.pending_len() < 8 << 20,
                 "pending {}",
                 whole.pending_len()
+            );
+            assert!(
+                whole.pending_capacity() < 8 << 20,
+                "pending capacity {}",
+                whole.pending_capacity()
             );
             whole.finish(&mut a).unwrap();
             let mut chunked = Encoder::new(&o).unwrap();
