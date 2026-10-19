@@ -145,27 +145,69 @@ impl Encoder {
         Ok(e)
     }
 
-    /// Writes the frame header (or the legacy magic) on first call.
+    #[cfg(test)]
+    pub(crate) fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Writes the frame header (or the legacy magic) on first call, and
+    /// compresses whole blocks straight from the caller's slice; only the
+    /// tail (under one block) is copied and kept.
     ///
     /// As on the C tier, a frame's header waits until 4 MiB of input have
     /// arrived (an input that ends sooner is laid out as a one-shot frame by
     /// [`Encoder::finish`]); a plain frame's is written at once.
-    pub fn update(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(), Lz4Error> {
-        self.pending.extend_from_slice(input);
+    pub fn update(&mut self, mut input: &[u8], out: &mut Vec<u8>) -> Result<(), Lz4Error> {
         if self.legacy {
             if !self.started {
                 out.extend_from_slice(&LEGACY_MAGIC.to_le_bytes());
                 self.started = true;
             }
-            return self.drain(LEGACY_BLOCK_SIZE, out);
+            return self.feed(LEGACY_BLOCK_SIZE, input, out);
         }
-        if !self.started && (self.plain || self.pending.len() >= FRAME_CHUNK) {
+        if !self.started && !self.plain {
+            // The header waits for 4 MiB (or `finish`): hold only that much.
+            let take = FRAME_CHUNK
+                .saturating_sub(self.pending.len())
+                .min(input.len());
+            self.pending.extend_from_slice(&input[..take]);
+            input = &input[take..];
+            if self.pending.len() < FRAME_CHUNK {
+                return Ok(());
+            }
+        }
+        if !self.started {
             self.begin(self.block_size, self.linked, self.content_size, out);
         }
-        if self.started {
-            self.drain(self.frame_block.bytes(), out)?;
+        self.feed(self.frame_block.bytes(), input, out)
+    }
+
+    /// Compresses the pending units, then whole units straight from
+    /// `input`; only its tail (under one unit) is copied and kept.
+    fn feed(&mut self, unit: usize, mut input: &[u8], out: &mut Vec<u8>) -> Result<(), Lz4Error> {
+        self.drain(unit, out)?;
+        if !self.pending.is_empty() {
+            let take = (unit - self.pending.len()).min(input.len());
+            self.pending.extend_from_slice(&input[..take]);
+            input = &input[take..];
+            self.drain(unit, out)?;
         }
+        while input.len() >= unit {
+            let (piece, rest) = input.split_at(unit);
+            self.block(piece, out)?;
+            input = rest;
+        }
+        self.pending.extend_from_slice(input);
         Ok(())
+    }
+
+    /// One unit of input as a legacy or frame block.
+    fn block(&mut self, piece: &[u8], out: &mut Vec<u8>) -> Result<(), Lz4Error> {
+        if self.legacy {
+            self.legacy_block(piece, out)
+        } else {
+            self.frame_block_out(piece, out)
+        }
     }
 
     /// Ends the frame: the last block, the end mark and the content
@@ -244,11 +286,7 @@ impl Encoder {
         let mut r = Ok(());
         while pending.len() - at >= unit && r.is_ok() {
             let piece = &pending[at..at + unit];
-            r = if self.legacy {
-                self.legacy_block(piece, out)
-            } else {
-                self.frame_block_out(piece, out)
-            };
+            r = self.block(piece, out);
             at += unit;
         }
         self.pending = pending;
@@ -547,5 +585,52 @@ impl Decoder {
         self.header = None;
         self.history.clear();
         self.produced = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A large slice is compressed from the caller's buffer: what stays
+    /// pending is at most a block (or the 4 MiB before a frame's header is
+    /// decided), and the bytes equal a chunked feed's.
+    #[test]
+    fn update_buffers_only_the_tail() {
+        let data: Vec<u8> = (0..(13u32 << 20) + 5).map(|i| (i % 251) as u8).collect();
+        for o in [
+            EncodeOptions::default(),
+            EncodeOptions {
+                legacy: true,
+                ..EncodeOptions::default()
+            },
+            EncodeOptions {
+                block_size: BlockSizeId::Max64Kb,
+                block_linked: true,
+                ..EncodeOptions::default()
+            },
+        ] {
+            let mut whole = Encoder::new(&o).unwrap();
+            let mut a = Vec::new();
+            whole.update(&data, &mut a).unwrap();
+            assert!(
+                whole.pending_len() < 8 << 20,
+                "pending {}",
+                whole.pending_len()
+            );
+            whole.finish(&mut a).unwrap();
+            let mut chunked = Encoder::new(&o).unwrap();
+            let mut b = Vec::new();
+            for c in data.chunks(65_537) {
+                chunked.update(c, &mut b).unwrap();
+            }
+            chunked.finish(&mut b).unwrap();
+            assert!(a == b);
+        }
+        // Under 4 MiB in one slice: still one-shot (nothing written yet).
+        let mut e = Encoder::new(&EncodeOptions::default()).unwrap();
+        let mut out = Vec::new();
+        e.update(&data[..3 << 20], &mut out).unwrap();
+        assert!(out.is_empty());
     }
 }
