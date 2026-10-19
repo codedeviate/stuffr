@@ -2529,14 +2529,59 @@ mod unix {
     }
 
     /// Whether the case's refresh count depends on 200 ms passing between
-    /// two units of work: `-m`/`-r`, two or more `.lz4` operands (`lz4cat`,
-    /// `unlz4`), or an input of two legacy frames.
+    /// two units of work: more than one input (`-m`/`-r` or `lz4cat` over
+    /// two or more operands, `-c` over two), or an input of two frames
+    /// (`two.lz4`). Without `-m` a second operand is the output, not an
+    /// input (`-d b.lz4 b.lz4`). A `-D` value is a dictionary, not an input.
     fn timing_exposed(c: &Case) -> bool {
-        let operands = c.args.iter().filter(|a| a.ends_with(".lz4")).count();
-        c.args.iter().any(|a| {
-            matches!(*a, "-m" | "-r" | "-dm" | "-tm" | "-fm" | "two.lz4")
-                || (a.starts_with('-') && !a.starts_with("--") && a.contains('m'))
-        }) || operands >= 2
+        let mut opts: Vec<&str> = Vec::new();
+        let mut operands = 0;
+        let mut ended = false;
+        let mut it = c.args.iter().copied();
+        while let Some(a) = it.next() {
+            if ended {
+                operands += 1;
+            } else if a == "--" {
+                ended = true;
+            } else if a == "-D" {
+                it.next();
+            } else if a.starts_with('-') && a != "-" {
+                opts.push(a);
+            } else {
+                operands += 1;
+            }
+        }
+        let short = |ch: char| {
+            opts.iter()
+                .any(|a| !a.starts_with("--") && a[1..].contains(ch))
+        };
+        let multi = short('m') || short('r') || c.name == "lz4cat";
+        let inputs = if multi || short('c') {
+            operands
+        } else {
+            operands.min(1)
+        };
+        inputs >= 2 || c.args.contains(&"two.lz4")
+    }
+
+    /// Whether `timing_exposed` tells one input from several: a second
+    /// operand is an input only under `-m`, `-r`, `-c` or `lz4cat`.
+    #[test]
+    fn single_inputs_are_not_timing_exposed() {
+        let one = |args: &[&'static str]| lz4_case("lz4", args, vec![("b.lz4", fx("b.lz4"))]);
+        assert!(!timing_exposed(&one(&["-m", "-t", "b.lz4"])));
+        assert!(!timing_exposed(&one(&["-d", "b.lz4", "b.lz4"])));
+        assert!(timing_exposed(&one(&["-m", "-t", "b.lz4", "b.lz4"])));
+        assert!(timing_exposed(&lz4_case(
+            "lz4cat",
+            &["b.lz4", "b.lz4"],
+            vec![]
+        )));
+        assert!(timing_exposed(&one(&["-d", "two.lz4", "o"])));
+        // A dictionary is read, not decoded; a digit in a cluster is not `m`.
+        assert!(!timing_exposed(&one(&["-m", "-D", "dict", "b.lz4"])));
+        assert!(!timing_exposed(&one(&["-B4", "b.lz4"])));
+        assert!(timing_exposed(&one(&["-B4m", "b.lz4", "b.lz4"])));
     }
 
     /// One case against the reference and stuffr, with this suite's

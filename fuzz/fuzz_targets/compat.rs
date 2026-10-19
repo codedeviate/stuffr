@@ -1200,6 +1200,124 @@ fn lz4_lists(args: &[&str]) -> bool {
     })
 }
 
+/// lz4's display level for these arguments: 2 by default (1 for `lz4cat`),
+/// `-v` and `--verbose` add one, `-q` and `--quiet` take one, `-D` takes the
+/// next token whole, and `--` ends the options.
+fn lz4_display_level(name: &str, args: &[&str]) -> i32 {
+    let mut level = if name == "lz4cat" { 1 } else { 2 };
+    let mut it = args.iter();
+    while let Some(&a) = it.next() {
+        match a {
+            "--" => break,
+            "-D" => {
+                it.next();
+            }
+            "--verbose" => level += 1,
+            "--quiet" => level -= 1,
+            _ if a.starts_with('-') && !a.starts_with("--") => {
+                level += a.bytes().filter(|b| *b == b'v').count() as i32;
+                level -= a.bytes().filter(|b| *b == b'q').count() as i32;
+            }
+            _ => {}
+        }
+    }
+    level
+}
+
+/// The arguments with just enough `-q` taken out to bring the display
+/// level up to 1, where failure lines show. (Removing every `-q` would
+/// raise it to 2 and make `a.lz4` already existing a question read from
+/// standard input, a different run.)
+fn lz4_unquieted(name: &str, args: &[&str]) -> Vec<String> {
+    let mut drop = 1 - lz4_display_level(name, args);
+    let mut out: Vec<String> = Vec::new();
+    let mut it = args.iter();
+    let mut ended = false;
+    while let Some(&a) = it.next() {
+        if ended {
+            out.push(a.to_string());
+        } else if a == "--" {
+            ended = true;
+            out.push(a.to_string());
+        } else if a == "-D" {
+            out.push(a.to_string());
+            if let Some(&d) = it.next() {
+                out.push(d.to_string());
+            }
+        } else if a == "--quiet" && drop > 0 {
+            drop -= 1;
+        } else if a.starts_with('-') && !a.starts_with("--") && a.len() > 1 {
+            let mut kept = String::from("-");
+            for ch in a[1..].chars() {
+                if ch == 'q' && drop > 0 {
+                    drop -= 1;
+                } else {
+                    kept.push(ch);
+                }
+            }
+            if kept.len() > 1 {
+                out.push(kept);
+            }
+        } else {
+            out.push(a.to_string());
+        }
+    }
+    out
+}
+
+/// Whether one stderr line, `\r`-refreshes already stripped, is lz4
+/// reporting an input as failed. The forms (`messages.rs`; each is one
+/// line per failing input under `-m`, `lz4cat` and `--list`):
+///
+/// - `Error N : ...` (every `E##_*`, `--list`'s `E71_READING` and
+///   `E72_READING` among them);
+/// - `NAME: STRERROR ` (`OPEN_INPUT_FAILED`), and the same without the
+///   blank for `OPEN_OUTPUT_FAILED`;
+/// - `lz4: NAME is a directory -- ignored` (`IS_A_DIRECTORY`);
+/// - `lz4: NAME is not a regular file` (`LIST_NOT_REGULAR`) and
+///   `lz4: NAME: File format not recognized` (`LIST_NOT_RECOGNIZED`;
+///   `LIST_CORRUPTED_LEGACY` comes before it and is not a line of its own);
+/// - `Stream followed by undecodable data [at position N]` (`UNDECODABLE`);
+/// - `File extension doesn't match ...; will not process file: NAME`
+///   (`EXTENSION_MISMATCH`);
+/// - `NAME already exists; not overwritten` (`ALREADY_EXISTS`) and
+///   `NAME is the input file; not overwritten (stuffr)` (`SAME_FILE`).
+fn is_lz4_failure_line(l: &str) -> bool {
+    const ERRNO_TEXTS: &[&str] = &[
+        "No such file or directory",
+        "Permission denied",
+        "Is a directory",
+        "Not a directory",
+        "File name too long",
+        "Too many levels of symbolic links",
+        "File exists",
+        "Read-only file system",
+    ];
+    let t = l.trim_end();
+    t.strip_prefix("Error ")
+        .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
+        || ERRNO_TEXTS.iter().any(|e| t.ends_with(&format!(": {e}")))
+        || (t.starts_with("lz4: ")
+            && (t.ends_with(" is a directory -- ignored")
+                || t.ends_with(" is not a regular file")
+                || t.ends_with(": File format not recognized")))
+        || t.starts_with("Stream followed by undecodable data")
+        || t.contains("; will not process file: ")
+        || t.ends_with(" already exists; not overwritten")
+        || t.ends_with(" is the input file; not overwritten (stuffr)")
+}
+
+/// The inputs an lz4 run reports as failed: one stderr line each, in the
+/// forms [`is_lz4_failure_line`] lists (lz4 prints one per failing input
+/// under `-m`, `lz4cat` and `--list`, and the count is its exit code).
+fn lz4_failure_lines(stderr: &[u8]) -> u64 {
+    let text = String::from_utf8_lossy(stderr);
+    text.split('\n')
+        .map(|l| l.rsplit('\r').next().unwrap_or(l))
+        .filter(|l| is_lz4_failure_line(l))
+        .count() as u64
+}
+
 /// The lz4 family (0.15.0), through `compat::run_in_counted` on this
 /// crate's pure tier. Asserted:
 ///
@@ -1207,8 +1325,10 @@ fn lz4_lists(args: &[&str]) -> bool {
 ///   reference was probed to produce; shared with the differential suite,
 ///   which checks every recorded row against the same set), or, over
 ///   several inputs (`-m`, `-r`, `--list`, `lz4cat`), the count of inputs
-///   that failed, at most the number of inputs; stuffr's 3-7 as codes of
-///   their own never appear, and a panic is a crash;
+///   that failed, which must equal the number of failure lines on stderr
+///   (`lz4_failure_lines`; under `-qq` the lines are hidden, so the case is
+///   re-run with enough `-q` removed to show them); stuffr's 3-7 as codes
+///   of their own never appear, and a panic is a crash;
 /// - read bound per path, with `m` the operands (non-`-D` tokens) that name
 ///   it exactly (lz4 retries no suffix) and `len` its largest length at an
 ///   open: at most `2m + d` opens and `2 × len × m + len × d` bytes, where
@@ -1248,41 +1368,67 @@ fn run_lz4(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
     // `-D` takes the next token whole (`-D -h` names `-h`).
     let mut dicts: Vec<&str> = Vec::new();
     let mut operands: Vec<&str> = Vec::new();
-    let mut inputs = 0;
     let mut after_dashes = false;
     let mut it = args.iter();
     while let Some(&a) = it.next() {
         if after_dashes {
             // `--` ends the options: every later token is a name.
             operands.push(a);
-            inputs += 1;
         } else if a == "--" {
             after_dashes = true;
         } else if a == "-D" {
             if let Some(&d) = it.next() {
                 dicts.push(d);
             }
-        } else if a == "-" {
-            inputs += 1;
-        } else if !a.starts_with('-') {
+        } else if !a.starts_with('-') && a != "-" {
             operands.push(a);
-            inputs += 1;
         }
     }
     // Over several inputs (`-m`, `-r`, `--list`, or `lz4cat`) the exit is
-    // the number that failed, one for each input at most: `lz4cat - a b c`
-    // over four missing names exits 4 (the differential suite's
-    // `several_files_one_failing`; found by this target at its first
-    // replay, as an over-strict oracle).
+    // the number that failed, and each failure printed one line: `lz4cat -
+    // a b c` over four missing names exits 4 (the differential suite's
+    // `several_files_one_failing`). A stuffr 3-7 leaking out can no longer
+    // pass as a count (0.15.0 Task 8's minor).
     let several = name == "lz4cat" || args.iter().any(|a| matches!(*a, "-m" | "-r" | "--list"));
-    assert!(
-        code == 0
-            || code == 1
-            || stuffr_cli::compat::lz4::EXIT_CODES.contains(&code)
-            || (several && (1..=inputs).contains(&code)),
-        "{name} {args:?}: exit {code} is not an lz4 exit code\n{}",
-        why()
-    );
+    let lz4_code = code == 0 || code == 1 || stuffr_cli::compat::lz4::EXIT_CODES.contains(&code);
+    if several && !lz4_code {
+        let shown = lz4_display_level(name, args) >= 1;
+        let failed = if shown {
+            lz4_failure_lines(&err)
+        } else {
+            // `-qq` hides the lines: run the same case again, from the
+            // directory as it was, with enough `-q` removed to show them.
+            let again = dir.with_file_name("again");
+            let _ = std::fs::remove_dir_all(&again);
+            std::fs::create_dir(&again).expect("create the re-run directory");
+            for (n, bytes) in &before {
+                std::fs::write(again.join(n), bytes).expect("copy a case file");
+            }
+            let loud = lz4_unquieted(name, args);
+            let os_loud: Vec<OsString> = loud.iter().map(OsString::from).collect();
+            let (code2, _, err2, _) =
+                compat::run_in_counted(&again, name, os_loud, stdin, Flavour::Gnu)
+                    .expect("a COMPAT_NAMES entry is a compat name");
+            assert_eq!(
+                code, code2,
+                "{name} {args:?}: the loud re-run {loud:?} exits differently"
+            );
+            let _ = std::fs::remove_dir_all(&again);
+            lz4_failure_lines(&err2)
+        };
+        assert_eq!(
+            code as u64,
+            failed,
+            "{name} {args:?}: exit {code} but {failed} failure line(s)\n{}",
+            why()
+        );
+    } else {
+        assert!(
+            lz4_code,
+            "{name} {args:?}: exit {code} is not an lz4 exit code\n{}",
+            why()
+        );
+    }
     let list = lz4_lists(args);
     for (path, r) in &reads {
         let file = path
