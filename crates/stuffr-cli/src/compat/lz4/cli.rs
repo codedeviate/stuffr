@@ -645,9 +645,9 @@ fn short_options(
                 }
             }
             b'T' => st.threads = read_u32(a, &mut p),
-            // Spec deviation 5: the benchmark is refused when the parse
-            // ends. probe: `-b` reads a number only after a digit (`-bK` is
-            // a usage error), `-e` and `-i` always (`-eK` is accepted).
+            // Spec deviation 5: `-b` alone starts the benchmark, which is
+            // refused when the parse ends. probe: `-b` reads a number only
+            // after a digit (`-bK` is a usage error).
             b'b' => {
                 st.mode = Mode::Bench;
                 st.bench = true;
@@ -655,8 +655,11 @@ fn short_options(
                     read_u32(a, &mut p);
                 }
             }
+            // probe: `-e#` and `-i#` are the benchmark's own settings and
+            // change nothing else (`lz4 -9e3 -c f` writes `lz4 -9 -c f`'s
+            // bytes, `-e3d` decompresses); the number is optional (`-eK`
+            // is accepted). Only `-b` starts the benchmark (deviation 5).
             b'e' | b'i' => {
-                st.bench = true;
                 read_u32(a, &mut p);
             }
             _ => return Err(bad_usage(err, st.program, st.display_level)),

@@ -1387,12 +1387,12 @@ included.
   the signal. A closed standard input or output is reopened on `/dev/null`
   by the Rust runtime, so `lz4 -c <&-` (lz4: `Error 40`) compresses an empty
   input.
-- **Benchmark options are out of scope.** `-b#`, `-e#` and `-i#` print
-  `Benchmark mode is not available in this build (stuffr)` and exit 1, once
+- **Benchmark mode is out of scope.** `-b#` prints
+  `Benchmark mode is not available in this build (stuffr)` and exits 1, once
   the whole command line has parsed (a usage error, `-h` or `-V` still
-  answers first); this includes `-e#` and `-i#` where lz4 ignores them for a
-  plain compression. `-h` and `-H` still list them. The hidden `-S` is
-  accepted and has no effect, as in lz4.
+  answers first). `-e#` and `-i#`, the benchmark's own settings, are accepted
+  and have no effect without it, as in lz4. `-h` and `-H` still list all
+  three. The hidden `-S` is accepted and has no effect, as in lz4.
 - **A decode that fails keeps everything decoded before the fault** in its
   output (a file or standard output). lz4 writes on another thread and exits
   from the failing one, so it leaves nothing or all of that, run to run.

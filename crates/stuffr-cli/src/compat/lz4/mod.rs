@@ -70,12 +70,13 @@
 //!    A closed standard input or output is reopened on `/dev/null` by the
 //!    runtime before `main`, so `lz4 -c <&-` (lz4: `Error 40`) compresses
 //!    an empty input.
-//! 5. Out of scope and refused: `-b#`, `-e#` and `-i#` print `Benchmark
-//!    mode is not available in this build (stuffr)` and exit 1, once the
-//!    whole command line has parsed (a usage error, `-h` or `-V` still
-//!    answers first). `-h` and `-H` still list them (R8). The hidden `-S`
-//!    (a benchmark switch with no effect elsewhere) is accepted and has no
-//!    effect, as in lz4.
+//! 5. Out of scope and refused: `-b#` prints `Benchmark mode is not
+//!    available in this build (stuffr)` and exits 1, once the whole command
+//!    line has parsed (a usage error, `-h` or `-V` still answers first).
+//!    `-e#` and `-i#`, the benchmark's own settings, are accepted and have
+//!    no effect without it, as in lz4. `-h` and `-H` still list all three
+//!    (R8). The hidden `-S` (a benchmark switch with no effect elsewhere) is
+//!    accepted and has no effect, as in lz4.
 //! 6. The pure tier (`lz4_flex`): levels 3 to 12, `--best` and
 //!    `--favor-decSpeed` compress with its single level; a corrupt frame's
 //!    `Error N` text may differ, and output written before it may be a

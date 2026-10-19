@@ -48,7 +48,7 @@ pub(super) const USAGE: &str = concat!(
     " -h/-H  : display help/long help and exit \n",
 );
 /// lz4 -h: the rest of the short help, after the usage (lines 16-43), the
-/// benchmark lines included (R8: printed though `-b`/`-e`/`-i` are refused).
+/// benchmark lines included (R8: printed though `-b` is refused).
 pub(super) const HELP_REST: &str = concat!(
     "\n",
     "Advanced arguments :\n",

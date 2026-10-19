@@ -651,11 +651,12 @@ fn the_benchmark_is_refused_once_the_line_parses() {
     let refused = (USAGE_ERROR, m::BENCH_REFUSED.to_string());
     assert_eq!(stop(&["-b"]), refused);
     assert_eq!(stop(&["-b3", "a"]), refused);
-    assert_eq!(stop(&["-e3"]), refused);
-    assert_eq!(stop(&["-i1"]), refused);
-    assert_eq!(stop(&["-eK"]), refused);
+    assert_eq!(stop(&["-b1", "-e3", "a"]), refused);
     assert_eq!(stop(&["-b", "-d"]), refused);
-    assert_eq!(stop(&["-T1i"]), refused);
+    // probe: `-e#`/`-i#` without `-b` are ignored (lz4 -e3 -c a compresses).
+    for args in [&["-e3"][..], &["-i1"], &["-eK"], &["-T1i"], &["-9e3", "a"]] {
+        assert!(run("lz4", args, &[]).0.is_ok(), "{args:?}");
+    }
     assert_eq!(stop(&["-qq", "-b"]), (USAGE_ERROR, String::new()));
     // Help and usage errors answer first.
     assert_eq!(run("lz4", &["-b", "-h"], &[]).0.unwrap_err().code, 0);

@@ -891,6 +891,124 @@ mod unix {
             row(T3, "-e3x", "lz4", &["-e3x", "a"], &["a"], 1, usage),
             row(T3, "-i3x", "lz4", &["-i3x", "a"], &["a"], 1, usage),
             row(T3, "-e1Kx", "lz4", &["-e1Kx", "a"], &["a"], 1, usage),
+            // probe: `-e#` and `-i#` change nothing outside `-b` (0.15.1).
+            row(
+                T3,
+                "-e3 alone is ignored",
+                "lz4",
+                &["-e3", "-f", "a", "a.lz4"],
+                &["a"],
+                0,
+                "",
+            ),
+            row(
+                T3,
+                "-i3 alone is ignored",
+                "lz4",
+                &["-i3", "-f", "a", "a.lz4"],
+                &["a"],
+                0,
+                "",
+            ),
+            row(
+                T3,
+                "-e3 -i2 alone are ignored",
+                "lz4",
+                &["-e3", "-i2", "-f", "a", "a.lz4"],
+                &["a"],
+                0,
+                "",
+            ),
+            row(
+                T3,
+                "-e without a number",
+                "lz4",
+                &["-e", "-f", "a", "a.lz4"],
+                &["a"],
+                0,
+                "",
+            ),
+            row(
+                T3,
+                "-i without a number",
+                "lz4",
+                &["-i", "-f", "a", "a.lz4"],
+                &["a"],
+                0,
+                "",
+            ),
+            row(
+                T3,
+                "-e99 is ignored",
+                "lz4",
+                &["-e99", "-f", "a", "a.lz4"],
+                &["a"],
+                0,
+                "",
+            ),
+            row(
+                T3,
+                "-i0 is ignored",
+                "lz4",
+                &["-i0", "-f", "a", "a.lz4"],
+                &["a"],
+                0,
+                "",
+            ),
+            row(
+                T3,
+                "-9e3 keeps -9",
+                "lz4",
+                &["-9e3", "-f", "a", "a.lz4"],
+                &["a"],
+                0,
+                "",
+            ),
+            row(
+                T3,
+                "-e3d decompresses",
+                "lz4",
+                &["-e3d", "-f", "b.lz4", "bo"],
+                &["b.lz4"],
+                0,
+                "",
+            ),
+            row(
+                T3,
+                "-e3 -d decompresses",
+                "lz4",
+                &["-e3", "-d", "-f", "b.lz4", "bo"],
+                &["b.lz4"],
+                0,
+                "",
+            ),
+            row(
+                T3,
+                "-i3 -t tests",
+                "lz4",
+                &["-i3", "-t", "b.lz4"],
+                &["b.lz4"],
+                0,
+                "",
+            ),
+            row(
+                T3,
+                "-e3 --list lists",
+                "lz4",
+                &["-e3", "--list", "b.lz4"],
+                &["b.lz4"],
+                0,
+                "",
+            ),
+            row(
+                T3,
+                "-e3 -c writes stdout",
+                "lz4",
+                &["-e3", "-c", "a"],
+                &["a"],
+                0,
+                "",
+            ),
             row(
                 T3,
                 "-dD with nothing after",
@@ -2564,9 +2682,9 @@ mod unix {
         run_group("environment", &cases, Skipped::none(), &compare);
     }
 
-    /// Spec deviation 5: `-b#`, `-e#` and `-i#` are refused once the
-    /// command line has parsed (the reference runs its benchmark, or
-    /// ignores `-e`/`-i` alone). A usage error, `-h` and `-V` answer first,
+    /// Spec deviation 5: `-b#` is refused once the
+    /// command line has parsed (the reference runs its benchmark;
+    /// `-e`/`-i` alone are ignored, as the Task 3 rows compare). A usage error, `-h` and `-V` answer first,
     /// as the reference's do (the Task 3 rows compare those).
     #[test]
     fn benchmark_options_are_refused() {
@@ -2580,10 +2698,8 @@ mod unix {
         for args in [
             &["-b"][..],
             &["-b3", "a"],
-            &["-c", "-e3", "a"],
-            &["-i1", "-c", "a"],
+            &["-b1", "-e3", "a"],
             &["-b", "-d", "a"],
-            &["-T1i"],
         ] {
             let o = std::process::Command::new(&link)
                 .args(args)
