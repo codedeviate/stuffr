@@ -2533,6 +2533,7 @@ mod unix {
     /// two or more operands, `-c` over two), or an input of two frames
     /// (`two.lz4`). Without `-m` a second operand is the output, not an
     /// input (`-d b.lz4 b.lz4`). A `-D` value is a dictionary, not an input.
+    /// `-r` is always exposed: a directory operand expands to many inputs.
     fn timing_exposed(c: &Case) -> bool {
         let mut opts: Vec<&str> = Vec::new();
         let mut operands = 0;
@@ -2561,7 +2562,7 @@ mod unix {
         } else {
             operands.min(1)
         };
-        inputs >= 2 || c.args.contains(&"two.lz4")
+        short('r') || inputs >= 2 || c.args.contains(&"two.lz4")
     }
 
     /// Whether `timing_exposed` tells one input from several: a second
@@ -2582,6 +2583,8 @@ mod unix {
         assert!(!timing_exposed(&one(&["-m", "-D", "dict", "b.lz4"])));
         assert!(!timing_exposed(&one(&["-B4", "b.lz4"])));
         assert!(timing_exposed(&one(&["-B4m", "b.lz4", "b.lz4"])));
+        assert!(timing_exposed(&one(&["-r", "d"])));
+        assert!(timing_exposed(&one(&["-v", "-r", "d"])));
     }
 
     /// One case against the reference and stuffr, with this suite's

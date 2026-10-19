@@ -944,6 +944,12 @@ const COMPAT_SHAPES: &[&str] = &[
     "lz4-hostile-legacy-block",
     "lz4-list-bare-magic",
     "lz4-list-corrupt",
+    // 0.15.1 Task 4: shapes whose exit is a count the oracle ties to stderr
+    // lines: a declined overwrite prompt under `-v -m`, and undecodable data
+    // after a legacy frame (a line only at display level 2) over two inputs.
+    "lz4-multiple-declined-prompt",
+    "lz4cat-two-undecodable",
+    "lz4-multiple-test-undecodable",
 ];
 
 /// `plain` as one zstd frame, through this build's encoder (weak on the
@@ -1230,6 +1236,19 @@ fn lz4_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> {
         "hostile-legacy-block" => z(&["-dc", "a.lz4"], &["a.lz4"], false, &legacy_big),
         "list-bare-magic" => z(&["--list", "a.lz4"], &["a.lz4"], false, &frame[..4]),
         "list-corrupt" => z(&["--list", "a.lz4"], &["a.lz4"], false, &corrupt),
+        "multiple-declined-prompt" => z(&["-v", "-m", "a", "a"], &["a", "a.lz4"], false, &text),
+        "two-undecodable" => z(
+            &["a.lz4", "a.lz4"],
+            &["a.lz4"],
+            false,
+            &cat(&[&lz4_legacy_frame(&text), b"XYZW1234"]),
+        ),
+        "multiple-test-undecodable" => z(
+            &["-m", "-t", "a.lz4", "a.lz4"],
+            &["a.lz4"],
+            false,
+            &cat(&[&lz4_legacy_frame(&text), b"XYZW1234"]),
+        ),
         other => unreachable!("COMPAT_SHAPES lists an unhandled lz4 shape {other:?}"),
     }))
 }

@@ -1200,6 +1200,43 @@ fn lz4_lists(args: &[&str]) -> bool {
     })
 }
 
+/// Whether an lz4 run takes several inputs (`-m`, `-r`, `--multiple`,
+/// `--list`, `lz4cat`), and whether it decodes or tests (the last of `-d`,
+/// `-t`, `-z`, `--list` and their long forms wins; `unlz4` and `lz4cat`
+/// start as decoders), `--list` not counting as one.
+fn lz4_shape(name: &str, args: &[&str]) -> (bool, bool) {
+    let mut several = name == "lz4cat";
+    let mut decodes = matches!(name, "unlz4" | "lz4cat");
+    let mut it = args.iter();
+    while let Some(&a) = it.next() {
+        match a {
+            "--" => break,
+            "-D" => {
+                it.next();
+            }
+            "--multiple" => several = true,
+            "--list" => {
+                several = true;
+                decodes = false;
+            }
+            "--decompress" | "--uncompress" | "--test" => decodes = true,
+            "--compress" => decodes = false,
+            _ if a.starts_with('-') && !a.starts_with("--") => {
+                for ch in a[1..].chars() {
+                    match ch {
+                        'm' | 'r' => several = true,
+                        'd' | 't' => decodes = true,
+                        'z' => decodes = false,
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (several, decodes)
+}
+
 /// lz4's display level for these arguments: 2 by default (1 for `lz4cat`),
 /// `-v` and `--verbose` add one, `-q` and `--quiet` take one, `-D` takes the
 /// next token whole, and `--` ends the options.
@@ -1276,12 +1313,18 @@ fn lz4_unquieted(name: &str, args: &[&str]) -> Vec<String> {
 /// - `lz4: NAME is a directory -- ignored` (`IS_A_DIRECTORY`);
 /// - `lz4: NAME is not a regular file` (`LIST_NOT_REGULAR`) and
 ///   `lz4: NAME: File format not recognized` (`LIST_NOT_RECOGNIZED`;
-///   `LIST_CORRUPTED_LEGACY` comes before it and is not a line of its own);
-/// - `Stream followed by undecodable data [at position N]` (`UNDECODABLE`);
+///   `LIST_CORRUPTED_LEGACY` is a line of its own, `Corrupted legacy frame`,
+///   but not a separate failure: `LIST_NOT_RECOGNIZED` follows it);
+/// - `Stream followed by undecodable data [at position N]` (`UNDECODABLE`;
+///   at display level 2, so after a `\r` refresh at `-v`; it is a failure
+///   of the input, and lz4 itself prints it only at level 2);
 /// - `File extension doesn't match ...; will not process file: NAME`
 ///   (`EXTENSION_MISMATCH`);
-/// - `NAME already exists; not overwritten` (`ALREADY_EXISTS`) and
-///   `NAME is the input file; not overwritten (stuffr)` (`SAME_FILE`).
+/// - `NAME already exists; not overwritten` (`ALREADY_EXISTS`), the same
+///   after a declined prompt (`NAME already exists; do you want to
+///   overwrite (y/N) ?     not overwritten`, one line, `OVERWRITE_PROMPT`
+///   then `NOT_OVERWRITTEN`), and `NAME is the input file; not
+///   overwritten (stuffr)` (`SAME_FILE`).
 fn is_lz4_failure_line(l: &str) -> bool {
     const ERRNO_TEXTS: &[&str] = &[
         "No such file or directory",
@@ -1301,9 +1344,9 @@ fn is_lz4_failure_line(l: &str) -> bool {
             && (t.ends_with(" is a directory -- ignored")
                 || t.ends_with(" is not a regular file")
                 || t.ends_with(": File format not recognized")))
-        || t.starts_with("Stream followed by undecodable data")
+        || t.contains("Stream followed by undecodable data")
         || t.contains("; will not process file: ")
-        || t.ends_with(" already exists; not overwritten")
+        || t.ends_with("not overwritten")
         || t.ends_with(" is the input file; not overwritten (stuffr)")
 }
 
@@ -1325,10 +1368,17 @@ fn lz4_failure_lines(stderr: &[u8]) -> u64 {
 ///   reference was probed to produce; shared with the differential suite,
 ///   which checks every recorded row against the same set), or, over
 ///   several inputs (`-m`, `-r`, `--list`, `lz4cat`), the count of inputs
-///   that failed, which must equal the number of failure lines on stderr
-///   (`lz4_failure_lines`; under `-qq` the lines are hidden, so the case is
-///   re-run with enough `-q` removed to show them); stuffr's 3-7 as codes
-///   of their own never appear, and a panic is a crash;
+///   that failed, at most the number of inputs named, and never fewer than
+///   the failure lines on stderr (`lz4_failure_lines`); equal to them, but
+///   for a decode or test (`-d`, `-t`, `unlz4`, `lz4cat`; not `--list`) at a
+///   display level of 2 or below (`-m`, `-r` and `lz4cat` bring the default
+///   2 down to 1), where lz4 itself hides `Stream followed by undecodable
+///   data` and only the bound holds. Under `-qq` the other lines are hidden
+///   too, so the case is re-run with enough `-q` removed to show them
+///   (never at `-v`: that turns declined prompts into reads of stdin).
+///   Residual cost: a stuffr 3-7 leaking out of a quiet several-input
+///   decode stays masked as a count. stuffr's 3-7 as codes of their own
+///   never appear otherwise, and a panic is a crash;
 /// - read bound per path, with `m` the operands (non-`-D` tokens) that name
 ///   it exactly (lz4 retries no suffix) and `len` its largest length at an
 ///   open: at most `2m + d` opens and `2 × len × m + len × d` bytes, where
@@ -1368,20 +1418,25 @@ fn run_lz4(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
     // `-D` takes the next token whole (`-D -h` names `-h`).
     let mut dicts: Vec<&str> = Vec::new();
     let mut operands: Vec<&str> = Vec::new();
+    let mut inputs = 0usize;
     let mut after_dashes = false;
     let mut it = args.iter();
     while let Some(&a) = it.next() {
         if after_dashes {
             // `--` ends the options: every later token is a name.
             operands.push(a);
+            inputs += 1;
         } else if a == "--" {
             after_dashes = true;
         } else if a == "-D" {
             if let Some(&d) = it.next() {
                 dicts.push(d);
             }
-        } else if !a.starts_with('-') && a != "-" {
+        } else if a == "-" {
+            inputs += 1;
+        } else if !a.starts_with('-') {
             operands.push(a);
+            inputs += 1;
         }
     }
     // Over several inputs (`-m`, `-r`, `--list`, or `lz4cat`) the exit is
@@ -1389,11 +1444,13 @@ fn run_lz4(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
     // a b c` over four missing names exits 4 (the differential suite's
     // `several_files_one_failing`). A stuffr 3-7 leaking out can no longer
     // pass as a count (0.15.0 Task 8's minor).
-    let several = name == "lz4cat" || args.iter().any(|a| matches!(*a, "-m" | "-r" | "--list"));
+    let (several, decodes) = lz4_shape(name, args);
     let lz4_code = code == 0 || code == 1 || stuffr_cli::compat::lz4::EXIT_CODES.contains(&code);
     if several && !lz4_code {
-        let shown = lz4_display_level(name, args) >= 1;
-        let failed = if shown {
+        // lz4 drops its default level 2 to 1 under several inputs, and
+        // prints `Stream followed by undecodable data` only at 2 or more.
+        let hidden = decodes && lz4_display_level(name, args) <= 2;
+        let failed = if lz4_display_level(name, args) >= 1 {
             lz4_failure_lines(&err)
         } else {
             // `-qq` hides the lines: run the same case again, from the
@@ -1416,10 +1473,21 @@ fn run_lz4(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
             let _ = std::fs::remove_dir_all(&again);
             lz4_failure_lines(&err2)
         };
-        assert_eq!(
-            code as u64,
-            failed,
+        let code = code as u64;
+        assert!(
+            failed <= code,
             "{name} {args:?}: exit {code} but {failed} failure line(s)\n{}",
+            why()
+        );
+        assert!(
+            hidden || failed == code,
+            "{name} {args:?}: exit {code} but {failed} failure line(s)\n{}",
+            why()
+        );
+        // Standard input stands for a missing operand.
+        assert!(
+            code <= inputs.max(1) as u64,
+            "{name} {args:?}: exit {code} over {inputs} input(s)\n{}",
             why()
         );
     } else {
