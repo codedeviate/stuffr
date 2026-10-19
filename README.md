@@ -1370,10 +1370,12 @@ included.
   line's seconds, speed and cpu load, the progress refreshes, and the `Using
   N threads` count where two programs count the host's cores differently.
   Refreshes are drawn at most every 200 ms; a decode offers one per MiB where
-  lz4 offers one per 4 MiB chunk. The figures in the `\r` refresh line also
-  differ, not only their timing: for a file under 4 MiB lz4 shows `==> 24.69%`
-  (the final ratio) where stuffr shows `==> 0.00%`; `-l` and large inputs
-  differ too.
+  lz4 offers one per 4 MiB chunk. While compressing, a refresh that both draw
+  shows the same figures (each job's refresh is over the input read before
+  that job, `inf` for the first, and a one-shot frame's over all of it; the
+  pure tier's ratio is of its own bytes). While decoding, lz4's figures and
+  count depend on its writer thread (probed: the same legacy file drew `14,
+  14` or `8, 14` MiB), so those are timing too.
 - **An input that is also the output is never lost.** Where the output named
   is the input file itself (same device and inode: `lz4 -f a a`, `lz4 -df
   s.lz4 s.lz4`, a hard link, standard input redirected from it), lz4 truncates

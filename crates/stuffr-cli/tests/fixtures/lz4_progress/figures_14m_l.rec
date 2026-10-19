@@ -1,0 +1,5 @@
+3	b'*** lz4 v1.10.0 64-bit multithread, by Yann Collet ***\r\n_POSIX_VERSION defined: 200112L\r\nPLATFORM_POSIX_VERSION defined: 200112L\r\n! Generating LZ4 Legacy format (deprecated) ! \r\n'
+15	b'\rRead : 0 MiB   ==> inf%   '
+24	b'\rRead : 8 MiB   ==> 75.33%   \r                                                                               \r'
+24	b'Compressed 14680064 bytes into 6319101 bytes ==> 43.05% \r\n'
+24	b'Done in 0.02 s ==> 648.25 MiB/s  (cpu load : 99%)\r\n'

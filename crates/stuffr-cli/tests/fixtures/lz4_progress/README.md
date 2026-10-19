@@ -31,3 +31,26 @@ Re-record (macOS or Linux, with `LZ4=/path/to/lz4`):
 ```sh
 python3 record.py compress_t1_12.rec -- $LZ4 -f -v -T1 -12 bins bins.lz4
 ```
+
+## Compression figures (`figures_*.rec`, `figures_*.jobs`, 0.15.1)
+
+`figures.py` makes these; re-record with `python3 figures.py $LZ4`. Each input
+is `text(n, 51)`, a Python port of `compat_harness::text` (byte-identical to
+the Rust generator, so Linux CI and `compat_lz4.rs` use the same bytes), and
+each `.rec` is `record.py figures_<shape>.rec -- $LZ4 -f -T1 -vvvv [OPTS] in
+in.lz4` (`-T1 -vvvv`: every chance drawn). Each `.jobs` line is one refresh,
+`<input before the job> <bytes counted> <one-shot 0|1>`, read from the
+reference's own `in.lz4`: a one-shot frame counts the whole frame; a streamed
+frame its block bytes only (no header, end mark or checksum); a legacy frame
+everything, magic included. `display.rs`' `recorded_figures_are_the_rendered_ones`
+renders each line and compares it with the recording.
+
+| file | input | options |
+|---|---|---|
+| `figures_2m` | 2 MiB | (one-shot) |
+| `figures_4m` | 4 MiB | (one job: `inf` only) |
+| `figures_4m1` | 4 MiB + 1 | |
+| `figures_14m` | 14 MiB | |
+| `figures_14m_l` | 14 MiB | `-l` |
+| `figures_14m_bd` | 14 MiB | `-BD` |
+| `figures_empty` | empty | (`1500.00%`) |

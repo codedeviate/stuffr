@@ -48,7 +48,9 @@
 use std::fs::{self, File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
-use stuffr::lz4_opts::{EncodeOptions, Encoder, FRAME_CHUNK, LEGACY_BLOCK_SIZE};
+use stuffr::lz4_opts::{
+    EncodeOptions, Encoder, FRAME_CHUNK, LEGACY_BLOCK_SIZE, parse_frame_header,
+};
 
 use super::cli::{self, Command, Op, Plan, STDINMARK, Target};
 use super::decode;
@@ -862,6 +864,23 @@ impl Run<'_> {
         let mut packed = Vec::new();
         let mut stats = Stats::default();
         let mut first = true;
+        // The progress figures (probe: `lz4 -T1 -vvvv` over generated text
+        // of 2, 4, 4 MiB + 1, 8, 8 MiB + 1 and 9 MiB, `-l`, `-BD`,
+        // `--content-size` and `--no-frame-crc`, a job's size swept byte by
+        // byte across a rounding boundary of its ratio): a refresh is drawn
+        // once a job's blocks are written, over the input read before that
+        // job (`0 MiB ==> inf%` first). A streamed frame's figure counts its
+        // blocks only, neither its header nor its end mark and checksum; a
+        // legacy frame's counts everything, the magic too; a one-shot frame
+        // (input under 4 MiB) is drawn once complete, over all of it.
+        let mut before = 0u64;
+        // The frame is streamed in jobs (it had a whole job of input).
+        let mut streamed = false;
+        // A streamed frame's header, and its end mark and checksum.
+        let (mut header, mut trailer) = (0u64, 0u64);
+        // A last, partial job of a streamed or legacy frame: the encoder
+        // writes its blocks only in `finish`, so it is drawn after that.
+        let mut last_job = None;
         loop {
             let n = src.read_full(&mut buf);
             // probe: `lz4 -c <&-` (a frame; `lz4 -l -c <&-` writes an empty
@@ -883,8 +902,24 @@ impl Run<'_> {
             }
             sink.write(self, &packed)?;
             stats.written += packed.len() as u64;
+            if !legacy && !streamed && n == chunk {
+                streamed = true;
+                // The first job's output opens with the header.
+                if let Ok(Some(h)) = parse_frame_header(&packed) {
+                    header = h.header_len as u64;
+                    trailer = if h.content_checksum { 8 } else { 4 };
+                }
+            }
             packed.clear();
-            self.show_read_progress(&stats);
+            if legacy || streamed {
+                if n == chunk {
+                    let blocks = stats.written.saturating_sub(header);
+                    self.show_read_progress_at(before, blocks, false);
+                } else {
+                    last_job = Some(before);
+                }
+            }
+            before = stats.read;
             if n < chunk {
                 break;
             }
@@ -894,11 +929,15 @@ impl Run<'_> {
         }
         sink.write(self, &packed)?;
         stats.written += packed.len() as u64;
-        // probe: a frame shows a refresh even for an empty input (`lz4 e`),
-        // a legacy frame only per block it compressed (`lz4 -l e` shows
-        // none).
-        if !legacy && stats.read == 0 {
-            self.show_read_progress(&stats);
+        // probe: a one-shot frame (input under 4 MiB, the empty one too:
+        // `lz4 e` says `1500.00%`) draws one refresh once complete, over the
+        // whole input; a legacy frame only per job it compressed (`lz4 -l e`
+        // shows none).
+        if let Some(before) = last_job {
+            let blocks = stats.written.saturating_sub(header + trailer);
+            self.show_read_progress_at(before, blocks, false);
+        } else if !legacy && !streamed {
+            self.show_read_progress_at(stats.read, stats.written, true);
         }
         sink.finish(self)?;
         Ok(stats)

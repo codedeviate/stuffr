@@ -49,11 +49,12 @@
 //!    first one always; at display level 4 every chunk), which `display.rs`
 //!    pins from recordings (a decode offers one per MiB where lz4 offers
 //!    one per 4 MiB chunk); under a sandbox the clock is frozen at zero.
-//!    The figures in the `\r` refresh line also differ from lz4's, not
-//!    only their timing: for a file under 4 MiB lz4 shows `==> 24.69%`
-//!    (the final ratio) where stuffr shows `==> 0.00%`, because the
-//!    one-shot frame is not written yet when stuffr draws it; `-l` and
-//!    large inputs differ too.
+//!    While compressing, a refresh that both draw shows the same figures
+//!    (each job's refresh is over the input read before that job, `inf` for
+//!    the first, and a one-shot frame's over all of it; the pure tier's
+//!    ratio is of its own bytes, deviation 6). While decoding,
+//!    lz4's figures and count depend on its writer thread (probed: the same
+//!    legacy file drew `14, 14` or `8, 14` MiB), so those are timing too.
 //! 3. An input that is also the output is never lost. Where the output
 //!    named is the input file itself (the same device and inode: `lz4 -f a
 //!    a`, `lz4 -df s.lz4 s.lz4`, a hard link, standard input redirected

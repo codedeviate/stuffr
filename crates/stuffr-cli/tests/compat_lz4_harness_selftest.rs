@@ -91,6 +91,50 @@ Done in 0.00 s ==> 20.94 MiB/s  (cpu load : 67%)\n";
         }
     }
 
+    /// The figure check (deviation 2 covers which refreshes are drawn, not
+    /// their figures): a ratio one hundredth off in a refresh both sides
+    /// drew is reported, with its MiB; a refresh one side did not draw is
+    /// timing and is not. The stderr is `lz4 -T1 -vvvv` over 4 MiB + 1
+    /// (probe 2026-10-19), cleared as in [`V_COMPRESS`].
+    #[test]
+    fn the_figure_check_bites_on_figures_only() {
+        let clear = format!("\r{}\r", " ".repeat(79));
+        let stderr = |second: &str| {
+            format!(
+                "\rRead : 0 MiB   ==> inf%   \rRead : 4 MiB   ==> {second}%   \
+                 {clear}Compressed 4194305 bytes into 2298905 bytes ==> 54.81%\n"
+            )
+        };
+        let c = case("/nonexistent", vec!["-T1", "-vvvv", "-f", "a", "o.lz4"]);
+        let check = |r: &str, s: &str| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_lz4_read_figures(&c, &run(0, r), &run(0, s))
+            }))
+            .err()
+            .map(panic_text)
+        };
+        assert_eq!(check(&stderr("54.81"), &stderr("54.81")), None);
+        let got = check(&stderr("54.81"), &stderr("54.82")).expect("a figure differs");
+        assert!(
+            got.contains("at 4 MiB") && got.contains("54.81") && got.contains("54.82"),
+            "{got}"
+        );
+        // Timing: the 4 MiB refresh missing on either side.
+        let missing = stderr("54.81").replace("\rRead : 4 MiB   ==> 54.81%   ", "");
+        assert_eq!(check(&stderr("54.81"), &missing), None);
+        assert_eq!(check(&missing, &stderr("54.82")), None);
+        // Two runs (`-m`): matched by position, so the second file's
+        // figure is checked against the second file's.
+        let two = |x: &str| format!("{}{}", stderr("54.81"), stderr(x));
+        assert_eq!(check(&two("54.81"), &two("54.81")), None);
+        assert!(check(&two("54.81"), &two("54.80")).is_some());
+        // The parse: one list per run, decode refreshes left out.
+        assert_eq!(
+            lz4_read_refreshes(&format!("{}\rDecompressed : 4 MiB  \n", stderr("54.81"))),
+            vec![vec![(0, "inf".to_owned()), (4, "54.81".to_owned())]]
+        );
+    }
+
     /// The timing-exposed mode removes every refresh segment (present or
     /// absent on either side normalise equal) and nothing else: any other
     /// one-byte difference is still reported, and the cleared line stays.

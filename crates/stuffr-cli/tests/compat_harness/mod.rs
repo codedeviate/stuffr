@@ -687,6 +687,57 @@ fn normalise_lz4_line(line: &str) -> String {
     line.to_owned()
 }
 
+/// The `Read :` refreshes of `stderr`, one list per run of consecutive
+/// refreshes (one file's compression), each as (MiB, ratio text).
+/// Decompression refreshes are not returned: their figures are the
+/// reference's own race (deviation 2).
+pub fn lz4_read_refreshes(stderr: &str) -> Vec<Vec<(u64, String)>> {
+    let mut runs = Vec::new();
+    let mut rest = stderr;
+    let mut cur: Vec<(u64, String)> = Vec::new();
+    while !rest.is_empty() {
+        if let Some(n) = lz4_refresh_len(rest, false) {
+            let seg = &rest[1..n];
+            if let Some(r) = seg.strip_prefix("Read : ")
+                && let Some((mib, tail)) = r.split_once(" MiB   ==> ")
+                && let Some(ratio) = tail.strip_suffix("%   ")
+            {
+                cur.push((mib.parse().unwrap(), ratio.to_owned()));
+            }
+            rest = &rest[n..];
+        } else {
+            if !cur.is_empty() {
+                runs.push(std::mem::take(&mut cur));
+            }
+            let ch = rest.chars().next().unwrap();
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    if !cur.is_empty() {
+        runs.push(cur);
+    }
+    runs
+}
+
+/// Deviation 2 leaves which refreshes are drawn to timing, not their
+/// figures: in each run of refreshes, a `Read : N MiB` both sides drew must
+/// show the same ratio. Runs are matched by position; the normalised stderr
+/// comparison already checks that both sides have the same runs.
+pub fn assert_lz4_read_figures(c: &Case, r: &Run, s: &Run) {
+    let (rr, sr) = (lz4_read_refreshes(&r.stderr), lz4_read_refreshes(&s.stderr));
+    for (i, (a, b)) in rr.iter().zip(&sr).enumerate() {
+        for (mib, ratio) in a {
+            if let Some((_, theirs)) = b.iter().find(|(m, _)| m == mib) {
+                assert_eq!(
+                    ratio, theirs,
+                    "{} {:?}: refresh run {i} at {mib} MiB: reference {ratio}%, stuffr {theirs}%",
+                    c.name, c.args
+                );
+            }
+        }
+    }
+}
+
 /// How much a failed lz4 decode had written is the reference's own race: it
 /// decodes on one thread and writes on another, and the failure exits the
 /// process, so what reached the output (stdout or the named file) is nothing,

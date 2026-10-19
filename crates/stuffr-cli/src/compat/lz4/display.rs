@@ -10,9 +10,11 @@
 //! - **The refresh gate.** Display levels 2 and 3 redraw the progress line
 //!   when at least [`REFRESH_MS`] have passed since the last redraw (the
 //!   first one is always drawn: a run that ends within the interval still
-//!   shows one); level 4 and up redraws at every chance. A "chance" is a
-//!   chunk the run finished: 4 MiB of input compressed, 8 MiB of a legacy
-//!   frame, 4 MiB decoded (here: each new MiB decoded). How many redraws a
+//!   shows one); level 4 and up redraws at every chance. A "chance" is,
+//!   compressing, each job written (4 MiB of a streamed frame's input, 8
+//!   MiB of a legacy frame's), drawn over the input read before that job,
+//!   or a one-shot frame (input under 4 MiB) once complete, drawn over all
+//!   of it; decoding, each new MiB decoded. How many redraws a
 //!   run makes is therefore its timing, which spec deviation 2 leaves out of
 //!   the promise.
 //! - **`Done in`.** Seconds since the run started, megabytes per second of
@@ -140,12 +142,33 @@ pub(crate) fn percent(part: u64, whole: u64) -> String {
     format!("{:.2}", part as f64 / whole.max(1) as f64 * 100.0)
 }
 
-/// A `Read :` refresh while compressing: MiB read and the ratio so far
-/// (deviation 2: how many are drawn is lz4's timing).
-pub(crate) fn read_progress(w: &mut dyn Write, read: u64, written: u64) {
+/// `%.2f` of `part` over `whole` as a percentage where `whole` may be 0:
+/// lz4's `inf` (probe: the first job's refresh, `Read : 0 MiB ==> inf%`).
+/// Nothing over nothing cannot be drawn (every job writes a block) and is
+/// `0.00`, not `NaN`.
+pub(crate) fn ratio(part: u64, whole: u64) -> String {
+    if whole == 0 && part == 0 {
+        return "0.00".to_owned();
+    }
+    format!("{:.2}", part as f64 / whole as f64 * 100.0)
+}
+
+/// A `Read :` refresh while compressing. `read` is the input consumed
+/// before the job just written (all of it for a one-shot frame) and
+/// `written` what lz4 counts of the output so far: a streamed frame's
+/// blocks (no header, end mark or checksum), a legacy frame's every byte,
+/// a one-shot frame's whole frame (probe: `lz4 -T1 -vvvv` over 2, 4, 4+, 8
+/// and 14 MiB inputs, the `figures_*` recordings; deviation 2 keeps only
+/// which ones are drawn). A one-shot frame's ratio divides by at least one
+/// byte ([`percent`]), a streamed job's may be `inf` ([`ratio`]).
+pub(crate) fn read_progress(w: &mut dyn Write, read: u64, written: u64, one_shot: bool) {
     let mib = (read >> 20).to_string();
-    let ratio = percent(written, read);
-    printf(w, m::READ_PROGRESS, &[mib.as_bytes(), ratio.as_bytes()]);
+    let r = if one_shot {
+        percent(written, read)
+    } else {
+        ratio(written, read)
+    };
+    printf(w, m::READ_PROGRESS, &[mib.as_bytes(), r.as_bytes()]);
 }
 
 /// A `Decompressed :` refresh: MiB decoded so far.
@@ -232,12 +255,13 @@ pub(crate) fn done_line(w: &mut dyn Write, secs: f64, cpu: f64, bytes: u64) {
 // ---- the run's lines ----
 
 impl Run<'_> {
-    /// A `Read :` refresh while compressing (the gate decides whether it is
-    /// drawn: one per piece compressed is offered).
-    pub(super) fn show_read_progress(&mut self, s: &Stats) {
+    /// A `Read :` refresh while compressing ([`read_progress`]; the gate
+    /// decides whether it is drawn).
+    pub(super) fn show_read_progress_at(&mut self, read: u64, written: u64, one_shot: bool) {
         let now = self.timer.now_ms();
-        self.display
-            .update(now, &mut *self.err, |w| read_progress(w, s.read, s.written));
+        self.display.update(now, &mut *self.err, |w| {
+            read_progress(w, read, written, one_shot)
+        });
     }
 
     /// The cleared line, then the compression summary (level 2).
@@ -490,7 +514,7 @@ mod tests {
         // The recording: `lz4 -f -v -T3 a a.lz4` over a 1760-byte input.
         let want_threads = text(|w| threads_line(w, 3, None));
         assert!(all.contains(&want_threads), "{all:?}");
-        let progress = text(|w| read_progress(w, 0, 1));
+        let progress = text(|w| read_progress(w, 0, 1, false));
         // The reference's first refresh is drawn before the output exists
         // (`0 MiB ==> inf%` for a large input, the ratio of the one chunk
         // for a small one): the shape is `\rRead : N MiB   ==> R%   `.
@@ -621,6 +645,96 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         assert!(t.now_ms() >= 20);
         assert!(t.elapsed().0 >= 0.02);
+    }
+
+    /// `\rRead : MIB MiB   ==> RATIO%   ` (three blanks each side).
+    fn read_line(mib: u64, ratio: &str) -> String {
+        let blanks = " ".repeat(3);
+        format!("\rRead : {mib} MiB{blanks}==> {ratio}%{blanks}")
+    }
+
+    #[test]
+    fn a_streamed_jobs_ratio_is_over_the_input_before_it() {
+        // probe: `lz4 -T1 -vvvv` over 14,963,310 bytes: after job 0 the
+        // input before it is 0 and the ratio is `inf`.
+        assert_eq!(
+            text(|w| read_progress(w, 0, 2_299_080, false)),
+            read_line(0, "inf")
+        );
+        assert_eq!(
+            text(|w| read_progress(w, 4 << 20, 4_600_260, false)),
+            read_line(4, "109.68")
+        );
+    }
+
+    #[test]
+    fn a_one_shot_ratio_divides_by_at_least_one() {
+        // probe: `lz4 e` (empty): `Read : 0 MiB   ==> 1500.00%`.
+        assert_eq!(percent(15, 0), "1500.00");
+        assert_eq!(ratio(15, 0), "inf");
+        assert_eq!(ratio(0, 0), "0.00");
+        assert_eq!(
+            text(|w| read_progress(w, 0, 15, true)),
+            read_line(0, "1500.00")
+        );
+    }
+
+    /// The figure recordings (`figures.py`): each `.rec` is `lz4 -f -T1
+    /// -vvvv` over generated text, each `.jobs` what the reference counted
+    /// for each refresh, read from its own output file.
+    const FIGURES: [(&str, &str, &str); 7] = {
+        macro_rules! fig {
+            ($n:literal) => {
+                (
+                    $n,
+                    include_str!(concat!(
+                        "../../../tests/fixtures/lz4_progress/figures_",
+                        $n,
+                        ".rec"
+                    )),
+                    include_str!(concat!(
+                        "../../../tests/fixtures/lz4_progress/figures_",
+                        $n,
+                        ".jobs"
+                    )),
+                )
+            };
+        }
+        [
+            fig!("2m"),
+            fig!("4m"),
+            fig!("4m1"),
+            fig!("14m"),
+            fig!("14m_l"),
+            fig!("14m_bd"),
+            fig!("empty"),
+        ]
+    };
+
+    /// Every recorded refresh is what [`read_progress`] draws from the
+    /// figures the reference counted: a one-shot frame over its whole input
+    /// and output, a streamed or legacy job over the input before it (`inf`
+    /// for the first).
+    #[test]
+    fn recorded_figures_are_the_rendered_ones() {
+        for (name, raw, jobs) in FIGURES {
+            let all: Vec<u8> = rec(raw).into_iter().flat_map(|(_, b)| b).collect();
+            let all = String::from_utf8(all).unwrap();
+            let drawn: Vec<String> = all
+                .split('\r')
+                .filter(|seg| seg.starts_with("Read : "))
+                .map(|seg| format!("\r{seg}"))
+                .collect();
+            let want: Vec<String> = jobs
+                .lines()
+                .map(|l| {
+                    let f: Vec<u64> = l.split(' ').map(|x| x.parse().unwrap()).collect();
+                    text(|w| read_progress(w, f[0], f[1], f[2] == 1))
+                })
+                .collect();
+            assert!(!want.is_empty(), "{name}");
+            assert_eq!(drawn, want, "{name}");
+        }
     }
 
     /// The ratio is `%.2f` of at least one byte (probe: `lz4 e` says

@@ -1,0 +1,4 @@
+6	b'*** lz4 v1.10.0 64-bit multithread, by Yann Collet ***\r\n_POSIX_VERSION defined: 200112L\r\nPLATFORM_POSIX_VERSION defined: 200112L\r\n'
+13	b'\rRead : 0 MiB   ==> inf%   \rRead : 4 MiB   ==> 43.05%   '
+13	b'\r                                                                               \rCompressed 4194305 bytes into 1805616 bytes ==> 43.05%\r\n'
+13	b'Done in 0.01 s ==> 541.32 MiB/s  (cpu load : 93%)\r\n'

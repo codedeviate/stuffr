@@ -2548,6 +2548,12 @@ mod unix {
         };
         let mut s = stuffr_as(c);
         mask_banners(&mut r, &mut s);
+        // Deviation 2 covers which refreshes are drawn, not their figures
+        // (read from the raw stderr; the pure tier's bytes, and so its
+        // figures, are its own: deviation 6).
+        if EXACT {
+            assert_lz4_read_figures(c, &r, &s);
+        }
         // Spec deviation 8: off macOS the reference completes a block-size
         // word cut short from uninitialised memory even in the first frame
         // (probe: the tarball build on Linux, CI run 39166896170).
@@ -2950,6 +2956,47 @@ mod unix {
             let mut r = lz4_case("lz4", &with(&["-r", "d"]), vec![]);
             r.setup = Some(tree);
             cases.push(r);
+        }
+        // The compression figures (deviation 2 keeps only which refreshes
+        // are drawn): `-T1 -vvvv` draws every chance on both sides, over
+        // generated text one-shot, one job, a job and a byte, several jobs
+        // (legacy and linked too), two files and nothing.
+        let big = |n: usize| super::compat_harness::text(n, 51);
+        for (args, files) in [
+            (
+                &["-T1", "-vvvv", "-f", "in", "o.lz4"][..],
+                vec![("in", big(2 << 20))],
+            ),
+            (
+                &["-T1", "-vvvv", "-f", "in", "o.lz4"],
+                vec![("in", big(4 << 20))],
+            ),
+            (
+                &["-T1", "-vvvv", "-f", "in", "o.lz4"],
+                vec![("in", big((4 << 20) + 1))],
+            ),
+            (
+                &["-T1", "-vvvv", "-f", "in", "o.lz4"],
+                vec![("in", big(9 << 20))],
+            ),
+            (
+                &["-T1", "-vvvv", "-f", "-l", "in", "o.lz4"],
+                vec![("in", big(9 << 20))],
+            ),
+            (
+                &["-T1", "-vvvv", "-f", "-BD", "in", "o.lz4"],
+                vec![("in", big(9 << 20))],
+            ),
+            (
+                &["-T1", "-vvvv", "-f", "-m", "in", "in2"],
+                vec![("in", big(2 << 20)), ("in2", big((4 << 20) + 1))],
+            ),
+            (
+                &["-T1", "-vvvv", "-f", "in", "o.lz4"],
+                vec![("in", Vec::new())],
+            ),
+        ] {
+            cases.push(lz4_case("lz4", args, files));
         }
         check("display_levels_match_the_reference", &cases);
     }
