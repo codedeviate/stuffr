@@ -350,6 +350,22 @@ read list.
 > **2736** tests under `--all-features`, **2620** on the default tier —
 > measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
+> `0.15.1` is a PATCH that closes 0.15.0's follow-ups. The lz4 link accepts
+> `-e#` and `-i#` without `-b` and ignores them, as lz4 does (only `-b#` is
+> still refused), and its compression progress line now shows lz4's own
+> figures: each job's refresh is over the input read before it (`inf` for the
+> first), a one-shot frame's over all of it. The pure lz4 encoder compresses
+> from the caller's buffer instead of copying all of its input first. On the
+> zstd side, `-l` reads through a buffer (it was 12-15x slower unbuffered), the
+> C tier's `-V` banner reports the libzstd actually linked, and
+> `WINDOWLOG_MAX` is 30 on 32-bit targets, as libzstd's. The C-tier install
+> lines now say `cargo install --locked`. The test suite is stricter: a pty
+> capture race that once lost a terminal's last bytes on macOS is closed, the
+> fuzz oracle ties a several-input lz4 exit to its failure lines, and two
+> large lz4 reference fixtures pin the pure reader.
+> **2745** tests under `--all-features`, **2631** on the default tier —
+> measured from this bump's own `make check`, `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
