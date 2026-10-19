@@ -115,6 +115,14 @@ struct FrameInfo {
     content: u64,
 }
 
+impl FrameInfo {
+    /// Whether the frame recorded its content size (a legacy or skippable
+    /// frame never does, and lz4 treats a recorded 0 as unknown).
+    fn known(&self) -> bool {
+        self.kind == Kind::Frame && self.content != 0
+    }
+}
+
 /// Why a walk stopped before the end of the file (module doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stop {
@@ -145,6 +153,8 @@ struct Window<R> {
 
 impl<R: Read + Seek> Window<R> {
     fn new(mut r: R) -> Window<R> {
+        // Standard input may be a pipe, which has no position: lz4
+        // lists it from where it stands, so 0 is right there.
         let base = r.stream_position().unwrap_or(0);
         Window {
             r,
@@ -186,6 +196,10 @@ impl<R: Read + Seek> Window<R> {
         loop {
             match self.r.read(&mut self.buf) {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                // A read error ends the walk like end of file. lz4's
+                // behaviour on a failing read mid-file cannot be probed
+                // here (no reproducible EIO on a regular file); what it
+                // prints for a cut file is the same either way.
                 Ok(0) | Err(_) => {
                     self.buf.clear();
                     return false;
@@ -411,7 +425,7 @@ impl Totals {
             None => self.block = Some(f.block),
             Some(b) => self.block_same &= b == f.block,
         }
-        self.known &= f.kind == Kind::Frame && f.content != 0;
+        self.known &= f.known();
         self.content = self.content.wrapping_add(f.content);
     }
 }
@@ -488,7 +502,7 @@ fn print_frame_row(run: &mut Run, index: u64, f: &FrameInfo) {
         8,
     );
     let size = pad(&f.size.to_string(), 20);
-    let known = f.kind == Kind::Frame && f.content != 0;
+    let known = f.known();
     let (content, ratio) = if known {
         (f.content.to_string(), ratio_cell(f.size, f.content))
     } else {
@@ -662,6 +676,12 @@ pub(crate) fn list_files(
         printf(run.out, m::LIST_HEADER, &[]);
     }
     let mut result = Ok(());
+    // `from_list` holds only when `--list` came with operands (`-m`'s list,
+    // `-r` or a file list); without them the one input is standard input,
+    // which lists nothing. The names go through `expand` first so that `-r`
+    // lists a directory's files, as the operand path would compress them,
+    // and every file is then listed in turn, numbered `i` of `total`,
+    // stopping at the first failure.
     if cmd.from_list {
         let names = run.expand(&cmd.inputs);
         let total = names.len();

@@ -122,7 +122,9 @@ fn cpu_seconds() -> f64 {
         // writes it.
         let ru = unsafe {
             let mut ru: libc::rusage = std::mem::zeroed();
-            libc::getrusage(libc::RUSAGE_SELF, &mut ru);
+            if libc::getrusage(libc::RUSAGE_SELF, &mut ru) != 0 {
+                return 0.0; // no figure: `cpu load` reads 0%, as from clock() == 0
+            }
             ru
         };
         let t = |tv: libc::timeval| tv.tv_sec as f64 + tv.tv_usec as f64 / 1e6;
