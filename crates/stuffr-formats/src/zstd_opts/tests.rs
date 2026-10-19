@@ -1377,6 +1377,12 @@ mod pure_tier {
     use super::*;
 
     #[test]
+    fn windowlog_max_follows_the_pointer_width() {
+        let want = if usize::BITS == 32 { 30 } else { 31 };
+        assert_eq!(WINDOWLOG_MAX, want);
+    }
+
+    #[test]
     fn libzstd_version_is_pinned() {
         assert_eq!(libzstd_version(), "1.5.7");
     }

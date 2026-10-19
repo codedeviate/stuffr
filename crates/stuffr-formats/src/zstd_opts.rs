@@ -86,8 +86,13 @@ pub const MAGIC_DICTIONARY: u32 = 0xEC30_A437;
 pub const MAGIC_SKIPPABLE_START: u32 = 0x184D_2A50;
 /// `ZSTD_BLOCKSIZE_MAX`: no block regenerates more than 128 KiB.
 pub const BLOCKSIZE_MAX: usize = 128 << 10;
-/// `ZSTD_WINDOWLOG_MAX` on a 64-bit target.
-pub const WINDOWLOG_MAX: u32 = 31;
+/// `ZSTD_WINDOWLOG_MAX`: 31 on a 64-bit target, 30 on a 32-bit one
+/// (`ZSTD_WINDOWLOG_MAX_32`).
+pub const WINDOWLOG_MAX: u32 = if cfg!(target_pointer_width = "32") {
+    30
+} else {
+    31
+};
 /// `ZSTD_WINDOWLOG_ABSOLUTEMIN`.
 pub const WINDOWLOG_ABSOLUTEMIN: u32 = 10;
 /// `ZSTD_minCLevel()`: `-ZSTD_TARGETLENGTH_MAX`.
