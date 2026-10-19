@@ -464,7 +464,17 @@ const BINARY_FIXTURES: &[(&str, &str, &str)] = &[
     ("multi-b4-bx-9-cs.lz4", "multi", "-B4 -BX -9 --content-size"),
     ("rand-b4-bd.lz4", "rand66", "-B4 -BD"),
     ("empty.lz4", "empty", ""),
+    ("rep9-bd.lz4", "rep9", "-BD"),
+    ("rep9-legacy.lz4", "rep9", "-l"),
 ];
+
+/// 9 MiB + 37 of a 50,000-byte text repeated: three 4 MiB frame jobs,
+/// two 8 MiB legacy blocks, matches across every boundary (period < 64 KiB),
+/// and tens of KiB compressed.
+fn rep9() -> Vec<u8> {
+    let unit = text(50_000, 0x9e9);
+    unit.iter().copied().cycle().take((9 << 20) + 37).collect()
+}
 
 /// The binary fixtures' inputs.
 fn fixture_input(name: &str) -> Vec<u8> {
@@ -473,6 +483,7 @@ fn fixture_input(name: &str) -> Vec<u8> {
         "multi" => text(140_000, 0x3b),
         "rand66" => rand(66_000, 0x66),
         "empty" => Vec::new(),
+        "rep9" => rep9(),
         _ => panic!("no input {name}"),
     }
 }
@@ -1103,6 +1114,29 @@ fn reads_the_reference_fixtures() {
             assert!(decode_with(&mut d, &f, 1).unwrap() == want, "{name}");
         }
     }
+}
+
+/// The large fixtures fed one compressed byte at a time: every job, block
+/// and legacy block boundary is crossed with the least input there is.
+#[test]
+fn large_fixtures_decode_one_byte_at_a_time() {
+    let want = rep9();
+    let mut d = Decoder::new(&DecodeOptions::default()).unwrap();
+    assert!(decode_with(&mut d, &fixture("rep9-bd.lz4"), 1).unwrap() == want);
+    let leg = fixture("rep9-legacy.lz4");
+    let mut d = LegacyDecoder::new();
+    let mut out = Vec::new();
+    // A size word is never consumed in part: the window over the unconsumed
+    // bytes grows by one until the decoder takes something.
+    let (mut pos, mut end) = (0, 1);
+    while pos < leg.len() {
+        let (n, _) = d.decompress(&leg[pos..end], &mut out).unwrap();
+        pos += n;
+        end = if n == 0 { end + 1 } else { pos + 1 }.min(leg.len());
+        assert!(end > pos || pos == leg.len(), "stuck at {pos}");
+    }
+    assert!(d.at_block_boundary());
+    assert!(out == want);
 }
 
 /// Regenerates `tests/data/lz4_opts/` from the reference lz4 1.10.0 and

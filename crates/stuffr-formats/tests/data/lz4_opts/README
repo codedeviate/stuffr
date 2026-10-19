@@ -16,9 +16,12 @@ ref.txt      SHA-256 digests of the reference tools' output, one row per
   multi-b4-bx-9-cs.lz4  lz4 -q -c -B4 -BX -9 --content-size multi
   rand-b4-bd.lz4        lz4 -q -c -B4 -BD rand66
   empty.lz4             lz4 -q -c empty
+  rep9-bd.lz4           lz4 -q -c -BD rep9      (57,904 bytes)
+  rep9-legacy.lz4       lz4 -q -c -l rep9       (78,293 bytes)
 
   The inputs and the dictionary are generated, not stored: small, multi,
-  rand66 and empty are tests.rs' fixture_input(), d10 its dictionary().
+  rand66, empty and rep9 (9 MiB + 37 of a 50,000-byte text repeated, so
+  three 4 MiB jobs and two 8 MiB legacy blocks) are tests.rs' fixture_input(), d10 its dictionary().
 
 Reference tools: lz4 1.10.0 (/opt/homebrew/opt/lz4/bin/lz4, or
 $STUFFR_LZ4_REFERENCE) and zstd 1.5.7 (/opt/homebrew/opt/zstd/bin/zstd, or
