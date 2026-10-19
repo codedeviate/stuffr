@@ -1373,13 +1373,13 @@ included.
 - **Timing and host fields vary,** as between two runs of lz4: the `Done in`
   line's seconds, speed and cpu load, the progress refreshes, and the `Using
   N threads` count where two programs count the host's cores differently.
-  Refreshes are drawn at most every 200 ms; a decode offers one per MiB where
-  lz4 offers one per 4 MiB chunk. While compressing, a refresh that both draw
-  shows the same figures (each job's refresh is over the input read before
-  that job, `inf` for the first, and a one-shot frame's over all of it; the
-  pure tier's ratio is of its own bytes). While decoding, lz4's figures and
-  count depend on its writer thread (probed: the same legacy file drew `14,
-  14` or `8, 14` MiB), so those are timing too.
+  Refreshes are drawn at most every 200 ms. While compressing, a refresh that
+  both draw shows the same figures (each job's refresh is over the input read
+  before that job, `inf` for the first, and a one-shot frame's over all of
+  it; the pure tier's ratio is of its own bytes). While decoding, stuffr
+  offers one refresh per MiB decoded, while lz4's count and figures vary from
+  run to run with its writer thread (probed: the same legacy file drew `14,
+  14` or `8, 14` MiB, a `-B4` frame `4, 7, 8`), so those are timing too.
 - **An input that is also the output is never lost.** Where the output named
   is the input file itself (same device and inode: `lz4 -f a a`, `lz4 -df
   s.lz4 s.lz4`, a hard link, standard input redirected from it), lz4 truncates

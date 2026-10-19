@@ -905,7 +905,12 @@ impl Run<'_> {
             if !legacy && !streamed && n == chunk {
                 streamed = true;
                 // The first job's output opens with the header.
-                if let Ok(Some(h)) = parse_frame_header(&packed) {
+                let parsed = parse_frame_header(&packed);
+                debug_assert!(
+                    matches!(parsed, Ok(Some(_))),
+                    "the first job of a streamed frame opens with its header"
+                );
+                if let Ok(Some(h)) = parsed {
                     header = h.header_len as u64;
                     trailer = if h.content_checksum { 8 } else { 4 };
                 }

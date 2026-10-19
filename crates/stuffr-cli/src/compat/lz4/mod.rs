@@ -47,14 +47,15 @@
 //!    the `Using N threads` count where two programs count the host's
 //!    cores differently. Refreshes are drawn at most every 200 ms (the
 //!    first one always; at display level 4 every chunk), which `display.rs`
-//!    pins from recordings (a decode offers one per MiB where lz4 offers
-//!    one per 4 MiB chunk); under a sandbox the clock is frozen at zero.
+//!    pins from recordings; under a sandbox the clock is frozen at zero.
 //!    While compressing, a refresh that both draw shows the same figures
 //!    (each job's refresh is over the input read before that job, `inf` for
 //!    the first, and a one-shot frame's over all of it; the pure tier's
-//!    ratio is of its own bytes, deviation 6). While decoding,
-//!    lz4's figures and count depend on its writer thread (probed: the same
-//!    legacy file drew `14, 14` or `8, 14` MiB), so those are timing too.
+//!    ratio is of its own bytes, deviation 6). While decoding, stuffr
+//!    offers one refresh per MiB decoded, while lz4's count and figures
+//!    vary from run to run with its writer thread (probed: the same legacy
+//!    file drew `14, 14` or `8, 14` MiB, a `-B4` frame `4, 7, 8`), so
+//!    those are timing too.
 //! 3. An input that is also the output is never lost. Where the output
 //!    named is the input file itself (the same device and inode: `lz4 -f a
 //!    a`, `lz4 -df s.lz4 s.lz4`, a hard link, standard input redirected

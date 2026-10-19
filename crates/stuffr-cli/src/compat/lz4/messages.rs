@@ -465,7 +465,7 @@ pub(super) const POSIX_C_SOURCE: &str = "_POSIX_C_SOURCE defined: 200809L\n";
 /// whatever the display level, then a byte of standard input is read.
 pub(super) const PRESS_ENTER: &str = "Press enter to continue...\n";
 
-/// Spec deviation 5 (stuffr's own text): `-b#`, `-e#` and `-i#`.
+/// Spec deviation 5 (stuffr's own text): `-b#` (`-e#` and `-i#` are accepted and ignored).
 pub(super) const BENCH_REFUSED: &str = "Benchmark mode is not available in this build (stuffr)\n";
 
 // ---- display levels 3 and 4 (Task 6) ----

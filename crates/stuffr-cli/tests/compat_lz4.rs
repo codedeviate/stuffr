@@ -2736,9 +2736,9 @@ mod unix {
         run_group("environment", &cases, Skipped::none(), &compare);
     }
 
-    /// Spec deviation 5: `-b#` is refused once the
-    /// command line has parsed (the reference runs its benchmark;
-    /// `-e`/`-i` alone are ignored, as the Task 3 rows compare). A usage error, `-h` and `-V` answer first,
+    /// Spec deviation 5: `-b#` is refused once the command line has parsed
+    /// (the reference runs its benchmark; `-e`/`-i` alone are ignored, as
+    /// the Task 3 rows compare). A usage error, `-h` and `-V` answer first,
     /// as the reference's do (the Task 3 rows compare those).
     #[test]
     fn benchmark_options_are_refused() {

@@ -676,9 +676,9 @@ pub(crate) fn list_files(
         printf(run.out, m::LIST_HEADER, &[]);
     }
     let mut result = Ok(());
-    // `from_list` holds only when `--list` came with operands (`-m`'s list,
-    // `-r` or a file list); without them the one input is standard input,
-    // which lists nothing. The names go through `expand` first so that `-r`
+    // `from_list` holds only when operands followed `--list` (which, like
+    // `-m` and `-r`, makes every later operand a list entry); without them
+    // the one input is standard input, which lists nothing. The names go through `expand` first so that `-r`
     // lists a directory's files, as the operand path would compress them,
     // and every file is then listed in turn, numbered `i` of `total`,
     // stopping at the first failure.
