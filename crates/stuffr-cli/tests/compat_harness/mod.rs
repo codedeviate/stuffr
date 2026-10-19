@@ -1030,7 +1030,6 @@ fn execute(exe: &Path, s: &Scratch, c: &Case) -> Run {
         .envs(c.env.iter().copied());
 
     let mut stdin_master: Option<std::fs::File> = None;
-    let mut stdout_master: Option<std::fs::File> = None;
     if c.tty_stdin {
         let (m, sl) = openpty();
         cmd.stdin(Stdio::from(sl));
@@ -1040,10 +1039,18 @@ fn execute(exe: &Path, s: &Scratch, c: &Case) -> Run {
     } else {
         cmd.stdin(Stdio::null());
     }
+    // The child's terminal: our copy of the slave stays open until the
+    // child has exited, so the master never reads a hang-up (EIO) while
+    // the child's last bytes are still queued (macOS drops them then;
+    // 0.15.0's tag run). Everything the child wrote is queued once its
+    // write returned, so after it exits one read to EAGAIN takes it all.
+    let mut tty_out: Option<(std::fs::File, OwnedFd)> = None;
     if c.tty_stdout {
         let (m, sl) = openpty();
+        let keep = sl.try_clone().expect("dup pty slave");
         cmd.stdout(Stdio::from(sl));
-        stdout_master = Some(std::fs::File::from(m));
+        set_nonblocking(&m);
+        tty_out = Some((std::fs::File::from(m), keep));
     } else {
         cmd.stdout(Stdio::piped());
     }
@@ -1078,14 +1085,15 @@ fn execute(exe: &Path, s: &Scratch, c: &Case) -> Run {
             })
         })
     };
-    let out_t = stdout_master
-        .take()
-        .map(drain)
-        .or_else(|| child.stdout.take().map(drain));
+    let out_t = child.stdout.take().map(drain);
     let err_t = child.stderr.take().map(drain);
 
+    let mut tty_buf = Vec::new();
     let deadline = Instant::now() + TIMEOUT;
     let status = loop {
+        if let Some((m, _)) = &mut tty_out {
+            read_available(m, &mut tty_buf);
+        }
         if let Some(st) = child.try_wait().unwrap() {
             break st;
         }
@@ -1094,15 +1102,29 @@ fn execute(exe: &Path, s: &Scratch, c: &Case) -> Run {
             let _ = child.wait();
             panic!("{exe:?} {:?} timed out after {TIMEOUT:?}", c.args);
         }
-        std::thread::sleep(Duration::from_millis(2));
+        // A pty queues only a few KiB, so a child writing more is blocked
+        // until we read: wait for the master to be readable (at most 2 ms),
+        // not for a fixed sleep.
+        if let Some((m, _)) = &tty_out {
+            wait_readable(m, 2);
+        } else {
+            std::thread::sleep(Duration::from_millis(2));
+        }
     };
     drop(registered);
+    if let Some((mut m, keep)) = tty_out.take() {
+        read_available(&mut m, &mut tty_buf);
+        drop(keep);
+    }
     // Deliberately not joined: a child that never reads the terminal leaves
     // the writer blocked once the pty buffer is full, and joining would hang
     // the test. Dropping the handle detaches it; the thread ends when the
     // master (and its clone) close or the write fails.
     drop(writer);
-    let stdout = out_t.map(|t| t.join().unwrap()).unwrap_or_default();
+    let stdout = match out_t {
+        Some(t) => t.join().unwrap(),
+        None => tty_buf,
+    };
     drop(stdin_master);
     let stderr_raw = err_t.map(|t| t.join().unwrap()).unwrap_or_default();
 
@@ -1162,6 +1184,43 @@ fn drain<R: Read + Send + 'static>(mut r: R) -> std::thread::JoinHandle<Vec<u8>>
         }
         v
     })
+}
+
+/// Reads everything queued on a non-blocking descriptor, up to EAGAIN.
+fn read_available(r: &mut std::fs::File, into: &mut Vec<u8>) {
+    let mut buf = [0u8; 65536];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => into.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+            Err(e) if e.raw_os_error() == Some(libc::EIO) => return,
+            Err(e) => panic!("read failed: {e}"),
+        }
+    }
+}
+
+/// Waits until `fd` is readable, at most `ms` milliseconds.
+fn wait_readable(fd: &impl AsRawFd, ms: i32) {
+    let mut p = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd; a failed or interrupted poll only shortens the wait.
+    unsafe { libc::poll(&mut p, 1, ms) };
+}
+
+/// `O_NONBLOCK` on `fd`.
+fn set_nonblocking(fd: &OwnedFd) {
+    // SAFETY: valid descriptor; F_GETFL/F_SETFL take and return flags.
+    unsafe {
+        let fl = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
+        assert!(fl >= 0, "fcntl: {}", std::io::Error::last_os_error());
+        let rc = libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK);
+        assert_eq!(rc, 0, "fcntl: {}", std::io::Error::last_os_error());
+    }
 }
 
 // glibc declares these `const`, the BSDs and macOS declare them mutable.

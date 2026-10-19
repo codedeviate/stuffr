@@ -377,4 +377,71 @@ no-such-file: No such file or directory \n";
             "{msg}"
         );
     }
+
+    /// stuffr as `lz4` with nothing compared: a hand-built case.
+    fn stuffr_lz4<'a>(args: Vec<&'a str>, files: Vec<(&'a str, Vec<u8>)>, tty: bool) -> Run {
+        stuffr_as(&Case {
+            name: "lz4",
+            args,
+            files,
+            stdin: None,
+            tty_stdin: false,
+            tty_stdout: tty,
+            env: vec![],
+            compare_output_bytes: false,
+            expect_stdout_plain: None,
+            setup: None,
+            roundtrip: Roundtrip::Lz4 {
+                ref_lz4: "/nonexistent/lz4",
+            },
+        })
+    }
+
+    /// The pty capture loses nothing when the child writes and exits at
+    /// once (0.15.0's tag: a `tty_stdout` row lost its binary tail on
+    /// macOS, the master reading EIO once the last slave closed).
+    #[test]
+    fn a_terminal_capture_keeps_every_byte() {
+        let plain: Vec<u8> = (0..256 * 1024u32)
+            .map(|i| {
+                if i % 61 == 60 {
+                    b'\n'
+                } else {
+                    b'a' + (i % 26) as u8
+                }
+            })
+            .collect();
+        let packed = stuffr_lz4(vec!["-q", "-c", "p"], vec![("p", plain.clone())], false).stdout;
+        let mut want = Vec::with_capacity(plain.len() * 2);
+        for &b in &plain {
+            if b == b'\n' {
+                want.push(b'\r');
+            }
+            want.push(b);
+        }
+        for i in 0..200 {
+            let run = stuffr_lz4(
+                vec!["-d", "-c", "p.lz4"],
+                vec![("p.lz4", packed.clone())],
+                true,
+            );
+            assert_eq!(run.code, 0, "iteration {i}: {}", run.stderr);
+            assert!(
+                run.stdout == want,
+                "iteration {i}: captured {} of {} bytes",
+                run.stdout.len(),
+                want.len()
+            );
+        }
+    }
+
+    /// A child that writes nothing to its terminal ends the capture: no
+    /// hang waiting for a hang-up the kept slave would never deliver.
+    #[test]
+    fn a_terminal_capture_of_no_output_finishes() {
+        let packed = stuffr_lz4(vec!["-q", "-c", "e"], vec![("e", Vec::new())], false).stdout;
+        let run = stuffr_lz4(vec!["-d", "-c", "e.lz4"], vec![("e.lz4", packed)], true);
+        assert_eq!(run.code, 0, "{}", run.stderr);
+        assert!(run.stdout.is_empty(), "{:?}", run.stdout);
+    }
 }
