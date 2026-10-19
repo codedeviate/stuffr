@@ -20,8 +20,12 @@ vendored C backends instead — a faster xz/LZMA encoder and a strong zstd
 encoder:
 
 ```sh
-cargo install stuffr-cli --features c-backed    # needs a C compiler, nothing else
+cargo install --locked stuffr-cli --features c-backed    # needs a C compiler, nothing else
 ```
+
+`--locked` keeps the vendored C libraries at the versions the compatibility
+links promise (libzstd 1.5.7, liblz4 1.10.0); without it, cargo may resolve
+newer `-sys` crates.
 
 The five legacy formats (Unix `compress` `.Z`, LHA/LZH, ARJ, ARC/PAK, ZOO)
 are in the default build too, pure Rust like the rest of it — no extra flag

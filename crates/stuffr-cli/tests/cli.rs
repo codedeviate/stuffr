@@ -8842,7 +8842,13 @@ fn documented_install_commands_name_features_this_crate_declares() {
     for doc in docs {
         let text = std::fs::read_to_string(&doc).unwrap();
         for line in text.lines() {
-            let Some(rest) = line.split("cargo install stuffr-cli").nth(1) else {
+            // `cargo install [--locked] stuffr-cli ...`: flags may precede
+            // the package name.
+            let Some(rest) = line
+                .split("cargo install")
+                .nth(1)
+                .and_then(|r| r.split("stuffr-cli").nth(1))
+            else {
                 continue;
             };
             let Some(after) = rest.split("--features").nth(1) else {

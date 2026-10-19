@@ -65,9 +65,11 @@ enum InfoError {
 }
 
 /// A `FILE*` as `FIO_analyzeFrames` uses it: `fread`'s short reads and end
-/// of file flag, `fseek` and `ftell`.
-struct Stream<'a, R> {
-    inner: &'a mut R,
+/// of file flag, `fseek` and `ftell`. Reads go through a buffer, as stdio's
+/// `FILE*` does: an unbuffered walk of a file of many small blocks was
+/// 12-15x slower (0.14.0 review).
+struct Stream<'a, R: Read + Seek> {
+    inner: io::BufReader<&'a mut R>,
     pos: u64,
     eof: bool,
 }
@@ -95,7 +97,13 @@ impl<R: Read + Seek> Stream<'_, R> {
     /// `fseek(f, to, SEEK_SET)`; clears the end of file flag. Seeking past
     /// the end succeeds, as on a regular file.
     fn seek_to(&mut self, to: u64) -> bool {
-        if self.inner.seek(SeekFrom::Start(to)).is_err() {
+        // A relative seek keeps the buffer when the target lies inside it.
+        let by = i128::from(to) - i128::from(self.pos);
+        let ok = match i64::try_from(by) {
+            Ok(by) => self.inner.seek_relative(by).is_ok(),
+            Err(_) => self.inner.seek(SeekFrom::Start(to)).is_ok(),
+        };
+        if !ok {
             return false;
         }
         self.pos = to;
@@ -128,7 +136,7 @@ fn analyze_frames<R: Read + Seek>(
 ) -> InfoError {
     use InfoError::{FrameError, NotZstd, Success, Truncated};
     let mut s = Stream {
-        inner: src,
+        inner: io::BufReader::with_capacity(64 << 10, src),
         pos: 0,
         eof: false,
     };
@@ -584,6 +592,43 @@ mod tests {
         let mut out = Vec::new();
         display_info(name.as_bytes(), &info, level, &mut out, level);
         String::from_utf8(out).unwrap()
+    }
+
+    /// `-l` walks a file of many small blocks with few reads: zstd's `FILE*`
+    /// buffers, and an unbuffered walk was 12-15x slower (0.14.0 review).
+    #[test]
+    fn the_frame_walk_reads_through_a_buffer() {
+        struct Counting<R> {
+            inner: R,
+            reads: usize,
+        }
+        impl<R: Read> Read for Counting<R> {
+            fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                self.inner.read(b)
+            }
+        }
+        impl<R: Seek> Seek for Counting<R> {
+            fn seek(&mut self, p: SeekFrom) -> io::Result<u64> {
+                self.inner.seek(p)
+            }
+        }
+        // 2000 empty frames without a checksum: single segment, one-byte
+        // content size 0, one last raw block of 0 bytes.
+        let frame = hand(0x20, None, &[], &[0], &block(0, true, 0, b""), &[]);
+        let file: Vec<u8> = frame.repeat(2000);
+        let mut info = Info {
+            compressed: file.len() as u64,
+            ..Info::default()
+        };
+        let mut src = Counting {
+            inner: Cursor::new(file),
+            reads: 0,
+        };
+        let st = analyze_frames(&mut info, &mut src, &Display::new(2), &mut Vec::new());
+        assert_eq!(st, InfoError::Success);
+        assert_eq!(info.frames, 2000);
+        assert!(src.reads < 200, "{} reads", src.reads);
     }
 
     #[test]

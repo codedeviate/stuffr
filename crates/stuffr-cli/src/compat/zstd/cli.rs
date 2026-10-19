@@ -1251,7 +1251,14 @@ pub(crate) fn parse(
     }
 
     // The welcome line (`-v`).
-    ctx.display(3, m::WELCOME, &[env!("CARGO_PKG_VERSION").as_bytes()]);
+    ctx.display(
+        3,
+        m::WELCOME,
+        &[
+            env!("CARGO_PKG_VERSION").as_bytes(),
+            zstd_opts::libzstd_version().as_bytes(),
+        ],
+    );
 
     if op == Operation::Decompress && nb_workers > 1 {
         ctx.display(2, m::DECOMPRESS_NO_MT, &[]);
@@ -1728,7 +1735,14 @@ pub(crate) fn usage(f: &mut dyn Write, program: &str) {
 /// zstdcli.c: usageAdvanced (`-H`, `--help`), for a build with
 /// `ZSTD_NOBENCH` and `ZSTD_NOTRACE` (R13).
 pub(crate) fn usage_advanced(out: &mut dyn Write, program: &str) {
-    printf(out, m::WELCOME, &[env!("CARGO_PKG_VERSION").as_bytes()]);
+    printf(
+        out,
+        m::WELCOME,
+        &[
+            env!("CARGO_PKG_VERSION").as_bytes(),
+            zstd_opts::libzstd_version().as_bytes(),
+        ],
+    );
     printf(out, m::ADV_AFTER_BANNER, &[]);
     usage(out, program);
     printf(out, m::ADV_OPTIONS, &[]);
@@ -1825,10 +1839,21 @@ const PLATFORM_POSIX_VERSION: i64 = 0;
 /// zstd's own build and are not printed (spec deviation 1, ruling T4-a).
 pub(crate) fn print_version(out: &mut dyn Write, level: i32) {
     if level < DISPLAY_LEVEL_DEFAULT {
-        printf(out, m::VERSION_ONLY, &[m::VERSION_STRING.as_bytes()]);
+        printf(
+            out,
+            m::VERSION_ONLY,
+            &[zstd_opts::libzstd_version().as_bytes()],
+        );
         return;
     }
-    printf(out, m::WELCOME, &[env!("CARGO_PKG_VERSION").as_bytes()]);
+    printf(
+        out,
+        m::WELCOME,
+        &[
+            env!("CARGO_PKG_VERSION").as_bytes(),
+            zstd_opts::libzstd_version().as_bytes(),
+        ],
+    );
     if level >= 3 {
         printf(out, m::SUPPORTS, &[]);
         if level >= 4 {

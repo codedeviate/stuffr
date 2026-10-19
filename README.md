@@ -913,8 +913,12 @@ vendored, statically built C backends instead — a faster xz/LZMA1 encoder and 
 strong zstd encoder:
 
 ```sh
-cargo install stuffr-cli --features c-backed    # needs a C compiler, nothing else
+cargo install --locked stuffr-cli --features c-backed    # needs a C compiler, nothing else
 ```
+
+`--locked` keeps the vendored C libraries at the versions the compatibility
+links promise (libzstd 1.5.7, liblz4 1.10.0); without it, cargo may resolve
+newer `-sys` crates.
 
 The five legacy formats (Unix `compress` `.Z`, LHA/LZH and ARJ — all three
 read AND write, as of Phase 3c Tasks 5, 6 and 7 — plus the read-only ARC/PAK and ZOO) are in the default

@@ -19,17 +19,17 @@ pub(super) use crate::compat::host::printf;
 
 // ---- zstdcli.c: constants and the banner ----
 
-/// zstdcli.c: `ZSTD_VERSION_STRING`, what `printVersion` prints below the
-/// default display level (`zstd -qV`).
-pub(super) const VERSION_STRING: &str = "1.5.7";
-
 /// zstdcli.c: `WELCOME_MESSAGE`, `"*** %s (%i-bit) %s, by %s ***\n"` with
 /// `COMPRESSOR_NAME`, the pointer width, `ZSTD_VERSION` and `AUTHOR`. Spec
-/// deviation 1: the compressor name carries stuffr's version (the argument).
+/// deviation 1: the compressor name carries stuffr's version (the first
+/// argument); `ZSTD_VERSION` is the linked library's (the second, from
+/// `zstd_opts::libzstd_version`). "zstd 1.5.7 compatible" names the command
+/// line tool's behaviour, not the library, so it stays fixed.
 pub(super) const WELCOME: &str =
-    "*** Zstandard CLI (stuffr %s; zstd 1.5.7 compatible) (64-bit) v1.5.7, by Yann Collet ***\n";
+    "*** Zstandard CLI (stuffr %s; zstd 1.5.7 compatible) (64-bit) v%s, by Yann Collet ***\n";
 
-/// zstdcli.c: printVersion, `"%s\n"` with `ZSTD_VERSION_STRING`.
+/// zstdcli.c: printVersion, `"%s\n"` with `ZSTD_VERSION_STRING` (the linked
+/// library's, `zstd_opts::libzstd_version`).
 pub(super) const VERSION_ONLY: &str = "%s\n";
 
 /// zstdcli.c: printVersion at display level 3: the format support line

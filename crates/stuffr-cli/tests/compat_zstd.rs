@@ -210,10 +210,11 @@ mod unix {
         run_group(group, cases, Skipped::none(), &one);
     }
 
-    /// The compression progress refreshes zstd throttles by wall clock
+    /// The progress refreshes zstd throttles by wall clock
     /// (`READY_FOR_UPDATE`: more than `REFRESH_RATE`, a sixth of a second,
     /// since the last one). A refresh is `"\r"`, 79 spaces and `"\r"` (the clearing) and then
-    /// `Compress: N/M files. Current: ...` or, from `-v`, `(L#) Buffered:
+    /// `Compress: N/M files. Current: ...` (decompression: a bare `"\r"`
+    /// and `Decompress: N/M files. ...`, or lz4's `Decompressed : `) or, from `-v`, `(L#) Buffered:
     /// ...`, up to the next `\r` or newline. Whether one beyond the first
     /// appears depends on how long the run took, in the reference and in
     /// stuffr alike (a loaded machine let the reference draw
@@ -241,35 +242,47 @@ mod unix {
         }
     }
 
-    /// Every compression progress refresh of `t` but the first (see
+    /// Every progress refresh of `t` but the first (see
     /// [`throttled_refreshes`]).
     fn drop_later_refreshes(t: &str) -> String {
         let b = t.as_bytes();
         let mut clear = vec![b'\r'];
         clear.extend([b' '; 79]);
         clear.push(b'\r');
-        let is_refresh = |at: usize| -> bool {
+        // The length of the text before a refresh's body: a clearing, or
+        // for the decompression forms a bare `\r` (`Decompress: N/M files.`,
+        // and the lz4 reader's `Decompressed : ` and `Read : `).
+        let prefix = |at: usize| -> Option<usize> {
             let rest = &b[at..];
-            rest.starts_with(&clear) && {
+            if rest.starts_with(&clear) {
                 let body = &rest[clear.len()..];
-                body.starts_with(b"Compress: ")
+                let is = body.starts_with(b"Compress: ")
+                    || body.starts_with(b"Decompress: ")
                     || (body.starts_with(b"(L")
                         && body[2..].iter().position(|c| *c == b')').is_some_and(|n| {
                             n > 0
                                 && body[2..2 + n].iter().all(u8::is_ascii_digit)
                                 && body[3 + n..].starts_with(b" Buffered:")
-                        }))
+                        }));
+                return is.then_some(clear.len());
             }
+            let body = &rest[1..];
+            [&b"Decompress: "[..], b"Decompressed : ", b"Read : "]
+                .iter()
+                .any(|p| body.starts_with(p))
+                .then_some(1)
         };
         let mut out = Vec::with_capacity(b.len());
         let mut seen = false;
         let mut i = 0;
         while i < b.len() {
-            if b[i] == b'\r' && is_refresh(i) {
-                let end = b[i + clear.len()..]
+            if b[i] == b'\r'
+                && let Some(skip) = prefix(i)
+            {
+                let end = b[i + skip..]
                     .iter()
                     .position(|c| *c == b'\r' || *c == b'\n')
-                    .map_or(b.len(), |n| i + clear.len() + n);
+                    .map_or(b.len(), |n| i + skip + n);
                 if seen {
                     i = end;
                     continue;
@@ -310,8 +323,24 @@ mod unix {
             format!("{}{tail}", r("(L3) Buffered: 0 B"))
         );
         // Not refreshes: the clearing alone, other lines.
-        let other = format!("{tail}{clear}{clear}Decompress: 1/2\nzstd: x\n");
+        let other = format!("{tail}{clear}{clear}Decompress 1/2\nzstd: x\n");
         assert_eq!(drop_later_refreshes(&other), other);
+        // The decompression forms: a bare `\r`, lz4's reader, a clearing.
+        let d = |n: u32| format!("\rDecompress:  {n}/ 3 files. Current: a : 0 B...    ");
+        let dtail = format!("{clear}a: 3893 bytes \n");
+        assert_eq!(
+            drop_later_refreshes(&format!("{}{}{dtail}{}", d(1), d(2), d(3))),
+            format!("{}{dtail}", d(1))
+        );
+        let lz = "\rDecompressed : 3.80 KiB  ";
+        assert_eq!(
+            drop_later_refreshes(&format!("{}{lz}{dtail}", d(1))),
+            format!("{}{dtail}", d(1))
+        );
+        assert_eq!(
+            drop_later_refreshes(&format!("{lz}{dtail}")),
+            format!("{lz}{dtail}")
+        );
     }
 
     /// Spec deviation 7 on the pure tier, and `--format=lz4` there too
@@ -4131,6 +4160,9 @@ mod unix {
                 files.clone(),
             ));
         }
-        check("progress_decompressing", &cases);
+        // Decompress refreshes (`Decompress: N/M files.`, lz4's `Decompressed
+        // :`) sit behind the same `READY_FOR_UPDATE` gate as compression's,
+        // so any beyond the first depends on timing: normalise them alike.
+        check_with("progress_decompressing", &cases, throttled_refreshes);
     }
 }
