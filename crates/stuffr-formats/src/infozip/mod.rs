@@ -5,7 +5,7 @@
 //! surface.
 //!
 //! **Licence.** Everything under this module is ported from Info-ZIP UnZip
-//! 6.0 (`crypt.c` here; `inflate.c`, `explode.c` and `unshrink.c` to follow)
+//! 6.0 (`crypt.c` and `inflate.c` here; `explode.c` and `unshrink.c` to follow)
 //! and stays under the Info-ZIP licence, version 2009-Jan-02, reproduced in
 //! this crate's `LICENSE-infozip`. It is an altered version in that
 //! licence's clause 3 sense: a port to Rust, not Info-ZIP's source, and not
@@ -16,15 +16,25 @@
 //! (unzip's `NEXTBYTE`, already decrypted by [`crypt`] where the entry is
 //! encrypted), writes only through a flush callback, and reports an early
 //! stop as [`Stop`], carrying the C function's own return code unchanged.
+//! [`inflate()`] also takes a `message` callback: `inflate.c` prints
+//! `(incomplete l-tree)  ` or `(incomplete d-tree)  ` through `MESSAGE`
+//! before it stops with code 1, which `unzip -t` shows inside its
+//! `testing:` line (probed on both references), and the flush callback
+//! cannot carry it.
 
 pub mod crypt;
+mod inflate;
+
+pub use inflate::{INCOMPLETE_D_TREE, INCOMPLETE_L_TREE, inflate};
 
 #[cfg(test)]
 mod tests;
 
 /// What a decoder reads: unzip's `NEXTBYTE` over `csize` bytes of the entry
 /// (already decrypted). `None` is unzip's EOF (`csize` exhausted, or a read
-/// error the caller remembers and reports itself).
+/// error the caller remembers and reports itself). Once it has returned
+/// `None` it must keep doing so, as unzip's `readbyte()` does: the decoders'
+/// read-beyond-EOF tolerance relies on it.
 pub trait ByteSource {
     /// The next byte of the entry, or `None` at unzip's EOF.
     fn next_byte(&mut self) -> Option<u8>;
