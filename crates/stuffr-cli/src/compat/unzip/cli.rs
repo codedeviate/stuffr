@@ -1220,7 +1220,6 @@ fn version(uz: &mut Uz) {
 /// What funzip's command line says (funzip.c:main): the password (an
 /// argument starting with `-`, `CRYPT`) and the input file, if given.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct FunzipArgs {
     /// `p`: the first argument's bytes after its `-`.
     pub password: Option<Vec<u8>>,
@@ -1230,8 +1229,8 @@ pub(crate) struct FunzipArgs {
 
 // port: funzip.c:main
 /// funzip's arguments: skip the program name, take a first argument
-/// starting with `-` as the password, then the input file. Task 12 ports
-/// the rest of `main`.
+/// starting with `-` as the password, then the input file (`funzip.rs`
+/// ports the rest of `main`).
 pub(crate) fn parse_funzip(args: &[OsString]) -> FunzipArgs {
     let mut rest = args.iter();
     let mut out = FunzipArgs::default();

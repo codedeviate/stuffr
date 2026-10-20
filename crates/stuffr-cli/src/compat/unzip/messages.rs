@@ -475,6 +475,59 @@ pub(super) const FUNZIP_USAGE: &str = concat!(
     "Extracts to stdout the gzip file or first zip entry of stdin or the given file.\n",
 );
 
+/// funzip.c:err, every error: `Info(slide, 1, ((char *)slide, "funzip
+/// error: %s\n", m))`. `%s` is one of the `FZ_*` texts below.
+pub(super) const FUNZIP_ERROR: &str = "funzip error: %s\n";
+/// funzip.c:main, `err(2, ...)`: the input file cannot be opened.
+pub(super) const FZ_NO_INPUT_FILE: &str = "cannot find input file";
+/// funzip.c:main, `err(2, ...)`: `fdopen(0, FOPR)` failed.
+pub(super) const FZ_NO_STDIN: &str = "cannot find stdin";
+/// funzip.c:main, `err(2, ...)`: `fdopen(1, FOPW)` failed.
+pub(super) const FZ_NO_STDOUT: &str = "cannot write to stdout";
+/// funzip.c:main, `err(3, ...)`: a short local header, or no `PK\3\4`.
+pub(super) const FZ_INVALID_ZIPFILE: &str = "invalid zipfile";
+/// funzip.c:main, `err(3, ...)`: a method other than stored, deflated
+/// and deflate64.
+pub(super) const FZ_NOT_DEFLATED_OR_STORED: &str =
+    "first entry not deflated or stored--cannot unpack";
+/// funzip.c:main, `err(3, ...)`: a gzip header shorter than 8 bytes.
+pub(super) const FZ_INVALID_GZIP: &str = "invalid gzip file";
+/// funzip.c:main, `err(3, ...)`: a gzip method other than 8 and 9.
+pub(super) const FZ_GZIP_NOT_DEFLATED: &str = "gzip file not deflated";
+/// funzip.c:main, `err(3, ...)`: gzip flag bit 1 (`GZPMUL`, today's
+/// FHCRC).
+pub(super) const FZ_MULTI_PART: &str = "cannot handle multi-part gzip files";
+/// funzip.c:main, `err(3, ...)`: neither magic.
+pub(super) const FZ_NOT_ZIP_OR_GZIP: &str = "input not a zip or gzip file";
+/// funzip.c:main, `err(1, ...)`: `malloc()` failed, or inflate's 3.
+pub(super) const FZ_OUT_OF_MEMORY: &str = "out of memory";
+/// funzip.c:main, `err(1, ...)`: `getp()` gave `NULL`.
+pub(super) const FZ_NO_TTY: &str = "no tty to prompt for password";
+/// funzip.c:main: `getp()`'s prompt.
+pub(super) const FZ_ENTER_PASSWORD: &str = "Enter password: ";
+/// funzip.c:main, `err(3, ...)`: the header's check byte differs.
+pub(super) const FZ_INCORRECT_PASSWORD: &str = "incorrect password for first entry";
+/// funzip.c:main, `err(4, ...)`: inflate's 1 or 2.
+pub(super) const FZ_FORMAT_VIOLATED: &str = "invalid compressed data--format violated";
+/// funzip.c:main: a stored entry's sizes disagree, `"len %ld, siz %ld\n"`
+/// (the caller formats both numbers).
+pub(super) const FZ_LEN_SIZ: &str = "len %d, siz %d\n";
+/// funzip.c:main, `err(4, ...)`: after [`FZ_LEN_SIZ`].
+pub(super) const FZ_LENGTH_MISMATCH: &str = "invalid compressed data--length mismatch";
+/// funzip.c:flush and main, `err(9, ...)`: `fwrite()` failed (not `EPIPE`).
+pub(super) const FZ_OUT_OF_SPACE: &str = "out of space on stdout";
+/// funzip.c:main, `err(3, ...)`: the gzip trailer is short.
+pub(super) const FZ_GZIP_ENDED: &str = "gzip file ended prematurely";
+/// funzip.c:main, `err(3, ...)`: the data descriptor is short.
+pub(super) const FZ_ZIP_ENDED: &str = "zipfile ended prematurely";
+/// funzip.c:main, `err(4, ...)`: the CRC differs.
+pub(super) const FZ_CRC_ERROR: &str = "invalid compressed data--crc error";
+/// funzip.c:main, `err(4, ...)`: the length differs.
+pub(super) const FZ_LENGTH_ERROR: &str = "invalid compressed data--length error";
+/// funzip.c:main: another local header follows the first entry.
+pub(super) const FZ_MORE_THAN_ONE: &str =
+    "funzip warning: zipfile has more than one entry--rest ignored\n";
+
 // ---- process.c (Task 8) ----
 
 /// unzip.c's `Zipnfo` (consts.h): the program's name in zipinfo mode.
@@ -1474,7 +1527,3 @@ pub(super) const HANDLER_TEXT: &[u8] = b"";
 /// the program name, then the value.
 pub(super) const FLAVOR_REFUSED: &str =
     "%s: STUFFR_UNZIP_FLAVOR must be apple or ubuntu, not '%s'\n";
-/// stuffr's own, until Task 12 builds funzip's decoder (exit 3, funzip.c's
-/// `err()` code for a bad input).
-pub(super) const FUNZIP_NOT_BUILT_YET: &str =
-    "funzip error: decoding is not implemented in this build yet (stuffr)\n";

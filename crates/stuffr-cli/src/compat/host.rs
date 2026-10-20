@@ -530,9 +530,74 @@ pub(crate) fn arm_interrupt_exit(
     }
 }
 
+/// funzip.c installs no signal handler, so a signal kills funzip by its
+/// default action, at its password prompt too, where the terminal's echo is
+/// off: the C leaves it off.
+#[cfg(unix)]
+pub(crate) const FUNZIP_SIGNALS: Signals =
+    &[libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
+#[cfg(not(unix))]
+pub(crate) const FUNZIP_SIGNALS: Signals = &[];
+
+/// [`on_interrupt_exit_code`] re-raises every signal (funzip's
+/// [`arm_tty_restore`]) rather than exiting with [`EXIT_CODE`].
+#[cfg(unix)]
+static EXIT_RERAISES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Deviation 8 for a program with no handler (funzip): while the guard
+/// lives, each of `signals` puts back the terminal mode a [`TtyMode`]
+/// changed, then is re-raised at its default action, so the process still
+/// dies of it as the C does. A signal the parent left ignored stays
+/// ignored (the C installs nothing to override it). Under `Host::Sandbox`
+/// nothing is installed.
+pub(crate) fn arm_tty_restore(host: &Host, signals: Signals) -> InterruptExitGuard {
+    #[cfg(unix)]
+    {
+        let mut old = Vec::new();
+        if matches!(host, Host::Sandbox(_)) {
+            return InterruptExitGuard { old };
+        }
+        EXIT_RERAISES.store(true, Ordering::SeqCst);
+        let handler = on_interrupt_exit_code
+            as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void)
+            as libc::sighandler_t;
+        // SAFETY: zeroed sigaction structs filled before use; the handler
+        // only makes async-signal-safe calls (`on_interrupt_exit_code`) and
+        // takes the three arguments `SA_SIGINFO` passes. A disposition
+        // found to be `SIG_IGN` is put straight back.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            libc::sigemptyset(&mut action.sa_mask);
+            for &sig in signals {
+                libc::sigaddset(&mut action.sa_mask, sig);
+            }
+            action.sa_flags = libc::SA_RESTART | libc::SA_SIGINFO;
+            action.sa_sigaction = handler;
+            for &sig in signals {
+                let mut prev: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(sig, &action, &mut prev) != 0 {
+                    continue;
+                }
+                if prev.sa_sigaction == libc::SIG_IGN {
+                    libc::sigaction(sig, &prev, std::ptr::null_mut());
+                } else {
+                    old.push((sig, prev));
+                }
+            }
+        }
+        InterruptExitGuard { old }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (host, signals);
+        InterruptExitGuard {}
+    }
+}
+
 /// [`arm_interrupt_exit`]'s handler: unzip's `handler()` (`echon()`, then
 /// `EXIT(IZ_CTRLC)`), except for a signal the process raised itself (P28).
-/// It never allocates or locks.
+/// Under [`arm_tty_restore`] every signal is re-raised. It never allocates
+/// or locks.
 #[cfg(unix)]
 extern "C" fn on_interrupt_exit_code(
     sig: libc::c_int,
@@ -544,8 +609,9 @@ extern "C" fn on_interrupt_exit_code(
     // SAFETY: `SA_SIGINFO` passes a valid siginfo_t (or null); getpid is
     // async-signal-safe.
     let own = !info.is_null() && unsafe { (*info).si_pid() == libc::getpid() };
-    if own {
-        // ruling: P28: our own abort stays a crash.
+    if own || EXIT_RERAISES.load(Ordering::SeqCst) {
+        // ruling: P28: our own abort stays a crash (and funzip, which has
+        // no handler, dies of every signal).
         // SAFETY: signal and raise are async-signal-safe; the re-raised
         // signal is blocked until this handler returns, then delivered at
         // SIG_DFL, which ends the process with it.

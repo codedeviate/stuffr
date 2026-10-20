@@ -5,7 +5,7 @@
 //! its retries, Review Focus 4's password mixes, the overwrite question
 //! and `[r]ename` at a terminal, `-M`'s pager, the `^S` pause in a comment,
 //! and interrupts (exit 80, the partial file kept, the terminal's echo put
-//! back). The rulings only stuffr can show are pinned at the end.
+//! back; funzip, which has no handler, dies of the signal). The rulings only stuffr can show are pinned at the end.
 //!
 //! Each case's archive is built here, so both sides read the same bytes;
 //! the terminal's mode after each run is compared too.
@@ -283,6 +283,29 @@ mod unix {
             }
             ran
         });
+    }
+
+    /// funzip installs no signal handler: SIGINT at its password prompt
+    /// kills it, and the reference leaves the terminal's echo off. stuffr
+    /// dies of the same signal with the terminal put back (deviation 8).
+    #[test]
+    fn an_interrupt_at_funzips_prompt_kills_it_with_echo_back() {
+        let mut c = unzip_case("funzip", vec!["enc.zip"], vec![("enc.zip", enc())]);
+        c.tty_ctl = true;
+        c.stdin = Some(Vec::new());
+        c.tty_signal = Some(libc::SIGINT);
+        let s = stuffr_unzip(&c);
+        assert_eq!(
+            (s.code, s.tty_mode),
+            (-libc::SIGINT, Some((true, true))),
+            "{}",
+            s.stderr
+        );
+        assert_eq!(s.stderr, "Enter password: ");
+        if let Some(r) = unzip_reference(&c) {
+            assert_eq!((r.code, r.tty_mode), (-libc::SIGINT, Some((false, true))));
+            assert_eq!(r.stderr, s.stderr);
+        }
     }
 
     /// ruling: T11-1. A signal while the pager reads a key: both end with

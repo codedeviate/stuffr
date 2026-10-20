@@ -23,7 +23,7 @@
 //! options and the state, so a sandboxed run ([`run_in_counted`]) touches
 //! nothing of the process.
 //!
-//! **Built so far** (0.16.0 Tasks 7 to 10): the names, the flavour, the
+//! **Built so far** (0.16.0 Tasks 7 to 12): the names, the flavour, the
 //! command line (`unzip.c`'s `unzip()` front half and `uz_opts()`,
 //! `zipinfo.c`'s `zi_opts()`, `envargs.c`), the usage screens, `-hh`, the
 //! `-v` screen and funzip's usage (Task 7); opening archives, wildcard
@@ -38,7 +38,7 @@
 //! terminal (`ttyio.rs`: `getp()` on `/dev/tty`, `zgetch()`,
 //! `screensize()`; `fileio.rs`: `UzpPassword()`, `UzpMorePause()`; `-M`'s
 //! line counting in `Uz::print_raw`; crypt.c's retries; the interrupt
-//! handler, exit 80: Task 11).
+//! handler, exit 80: Task 11); funzip (`funzip.rs`: funzip.c, Task 12).
 
 //! Known deviations (the source of truth; the README and the spec mirror
 //! this list):
@@ -69,7 +69,9 @@
 //!    unzip's `echon()` only sets echo again (after an interrupt in the
 //!    `-M` pager it leaves canonical mode off). A SIGABRT stuffr raises
 //!    itself (a crash) kills it by the signal; one sent by another process
-//!    exits 80, as unzip does for both.
+//!    exits 80, as unzip does for both. funzip installs no handler, so a
+//!    signal at its password prompt kills it, echo off; stuffr puts the
+//!    mode back first, then dies of the same signal (`host::arm_tty_restore`).
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -86,6 +88,7 @@ pub(crate) mod cli;
 mod extract;
 mod fileio;
 pub(crate) mod flavour;
+mod funzip;
 mod list;
 mod matching;
 mod messages;
@@ -664,7 +667,8 @@ fn main(
     err: &mut dyn Write,
 ) -> i32 {
     if name == "funzip" {
-        return funzip(flavour, args, &host, err);
+        let mut uz = Uz::new(host, flavour, env, err);
+        return funzip::funzip(&mut uz, args);
     }
     // port: unzip.c:unzip (`SET_SIGHANDLER(SIGINT, handler)` and its
     // siblings): for the whole run, an interrupt puts the terminal's echo
@@ -716,25 +720,6 @@ fn unzip(uz: &mut Uz, argv0: &[u8], args: &[OsString]) -> i32 {
 /// `process.c`'s `process_zipfiles()`.
 fn process_zipfiles(uz: &mut Uz, parsed: &cli::Parsed) -> i32 {
     process::process_zipfiles(uz, parsed)
-}
-
-// port: funzip.c:main
-/// funzip: its usage when there is no input file and standard input is a
-/// terminal (exit 3), else, until Task 12, a placeholder (exit 3).
-fn funzip(flavour: Flavour, args: &[OsString], host: &Host, err: &mut dyn Write) -> i32 {
-    let a = cli::parse_funzip(args);
-    // if no file argument and stdin not redirected, give the user help
-    if a.input.is_none() && host.stdin_is_tty() {
-        printf(
-            err,
-            flavour::funzip_banner(flavour),
-            &[env!("CARGO_PKG_VERSION").as_bytes()],
-        );
-        let _ = err.write_all(m::FUNZIP_USAGE.as_bytes());
-        return 3;
-    }
-    let _ = err.write_all(m::FUNZIP_NOT_BUILT_YET.as_bytes());
-    3
 }
 
 #[cfg(test)]

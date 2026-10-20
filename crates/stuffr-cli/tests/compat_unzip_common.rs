@@ -1880,35 +1880,574 @@ mod unix {
                 "",
             ),
         ]);
-        // funzip on standard input (Task 12).
-        for (label, stdin, code, out, err) in [
+        // funzip (Task 12): the first entry or a gzip member, from standard
+        // input or a file (both references gave every row).
+        let more = "funzip warning: zipfile has more than one entry--rest ignored\n";
+        let fz = |e: &str| -> &'static str {
+            match e {
+                "" => "",
+                _ => Box::leak(format!("funzip error: {e}\n").into_boxed_str()),
+            }
+        };
+        for (label, args, stdin, code, out, err) in [
+            ("funzip a zip", &[][..], a_zip(), 0, "alpha\n", more),
             (
-                "funzip a zip",
-                a_zip(),
+                "funzip stored",
+                &[],
+                fz_zip(0, 0, b"alpha\n"),
                 0,
                 "alpha\n",
-                "funzip warning: zipfile has more than one entry--rest ignored\n",
+                "",
+            ),
+            (
+                "funzip deflated",
+                &[],
+                fz_zip(8, 0, &text()),
+                0,
+                "the quick",
+                "",
+            ),
+            (
+                "funzip deflate64",
+                &[],
+                fz_zip(9, 0, &text()),
+                4,
+                "the quick",
+                fz("invalid compressed data--crc error"),
+            ),
+            ("funzip directory first", &[], fz_dir_zip(), 0, "", more),
+            (
+                "funzip method 12",
+                &[],
+                fz_zip(12, 0, b"BZh9"),
+                3,
+                "",
+                fz("first entry not deflated or stored--cannot unpack"),
+            ),
+            (
+                "funzip method 264",
+                &[],
+                fz_zip(0x108, 0, b"x"),
+                3,
+                "",
+                fz("first entry not deflated or stored--cannot unpack"),
+            ),
+            (
+                "funzip encrypted stored",
+                &["-pw"],
+                fz_enc(0, b"secret\n", 0),
+                0,
+                "secret\n",
+                "",
+            ),
+            (
+                "funzip encrypted deflated",
+                &["-pw"],
+                fz_enc(8, &text(), 0),
+                0,
+                "the quick",
+                "",
+            ),
+            (
+                "funzip encrypted streamed",
+                &["-pw"],
+                fz_enc(8, &text(), 8),
+                0,
+                "the quick",
+                "",
+            ),
+            (
+                "funzip wrong password",
+                &["-px"],
+                fz_enc(8, &text(), 0),
+                3,
+                "",
+                fz("incorrect password for first entry"),
+            ),
+            (
+                "funzip no tty for a password",
+                &[],
+                fz_enc(0, b"secret\n", 0),
+                1,
+                "",
+                fz("no tty to prompt for password"),
+            ),
+            (
+                "funzip encrypted cut short",
+                &["-pw"],
+                fz_cut(fz_enc(8, &text(), 0), 70),
+                4,
+                "",
+                fz("invalid compressed data--format violated"),
+            ),
+            (
+                "funzip encrypted header cut",
+                &["-pw"],
+                fz_cut(fz_enc(8, &text(), 0), 40),
+                3,
+                "",
+                fz("incorrect password for first entry"),
             ),
             (
                 "funzip a gzip",
+                &[],
                 gzm(b"gzip data\n", b"g.txt"),
                 0,
                 "gzip data\n",
                 "",
             ),
             (
+                "funzip gzip extra name comment",
+                &[],
+                fz_gzip_xnc(),
+                0,
+                "gzip data\n",
+                "",
+            ),
+            (
+                "funzip gzip header crc",
+                &[],
+                fz_gzip_hcrc(),
+                3,
+                "",
+                fz("cannot handle multi-part gzip files"),
+            ),
+            (
+                "funzip gzip two members",
+                &[],
+                [gzm(b"one\n", b"1"), gzm(b"two\n", b"2")].concat(),
+                0,
+                "one\n",
+                "",
+            ),
+            (
+                "funzip gzip trailing garbage",
+                &[],
+                [gzm(b"gzip data\n", b"g"), b"garbage".to_vec()].concat(),
+                0,
+                "gzip data\n",
+                "",
+            ),
+            (
+                "funzip gzip method 7",
+                &[],
+                fz_gzip_method(7),
+                3,
+                "",
+                fz("gzip file not deflated"),
+            ),
+            (
+                "funzip gzip method 9",
+                &[],
+                fz_gzip_method(9),
+                4,
+                "the quick",
+                fz("invalid compressed data--crc error"),
+            ),
+            (
+                "funzip gzip cut header",
+                &[],
+                b"\x1f\x8b\x08\x00".to_vec(),
+                3,
+                "",
+                fz("invalid gzip file"),
+            ),
+            (
+                "funzip gzip cut trailer",
+                &[],
+                fz_cut(gzm(b"gzip data\n", b"g"), -4),
+                3,
+                "gzip data\n",
+                fz("gzip file ended prematurely"),
+            ),
+            (
+                "funzip gzip bad crc",
+                &[],
+                fz_gzip_crc(),
+                4,
+                "gzip data\n",
+                fz("invalid compressed data--crc error"),
+            ),
+            (
                 "funzip garbage",
+                &[],
                 b"garbage\n".to_vec(),
+                3,
+                "",
+                fz("input not a zip or gzip file"),
+            ),
+            (
+                "funzip empty",
+                &[],
+                vec![],
+                3,
+                "",
+                fz("input not a zip or gzip file"),
+            ),
+            (
+                "funzip one byte",
+                &[],
+                b"P".to_vec(),
+                3,
+                "",
+                fz("input not a zip or gzip file"),
+            ),
+            (
+                "funzip end record",
+                &[],
+                fz_cut(a_zip(), -22),
+                0,
+                "alpha\n",
+                more,
+            ),
+            (
+                "funzip only PK",
+                &[],
+                b"PK\x05\x06".to_vec(),
+                3,
+                "",
+                fz("invalid zipfile"),
+            ),
+            (
+                "funzip deflate cut short",
+                &[],
+                fz_cut(fz_zip(8, 0, &text()), 60),
+                4,
+                "",
+                fz("invalid compressed data--format violated"),
+            ),
+            (
+                "funzip stored cut short",
+                &[],
+                fz_cut(fz_zip(0, 0, &text()), 100),
+                4,
+                "the quick",
+                fz("invalid compressed data--crc error"),
+            ),
+            (
+                "funzip stored sizes differ",
+                &[],
+                fz_stored_mismatch(),
+                4,
+                "",
+                "len 7, siz 5\nfunzip error: invalid compressed data--length mismatch\n",
+            ),
+            (
+                "funzip stored streamed",
+                &[],
+                fz_zip(0, 8, b"hello"),
+                4,
+                "",
+                fz("invalid compressed data--crc error"),
+            ),
+            (
+                "funzip deflated streamed",
+                &[],
+                fz_zip(8, 8, &text()),
+                0,
+                "the quick",
+                "",
+            ),
+            (
+                "funzip descriptor cut",
+                &[],
+                fz_cut(fz_zip(8, 8, &text()), -27),
+                3,
+                "the quick",
+                fz("zipfile ended prematurely"),
+            ),
+            (
+                "funzip incomplete l-tree",
+                &[],
+                fz_ltree(),
+                4,
+                "",
+                "(incomplete l-tree)  funzip error: invalid compressed data--format violated\n",
+            ),
+            (
+                "funzip -h piped",
+                &["-h"],
+                vec![],
+                3,
+                "",
+                fz("input not a zip or gzip file"),
+            ),
+        ] {
+            v.push(row(Both, 12, label, "funzip", args, vec![], code, out, err).piped(&stdin));
+        }
+        // An encrypted deflate stream cut short: past the end funzip's
+        // NEXTBYTE gives `EOF ^ decrypt_byte()`, a negative `int` but not
+        // `EOF` (`ByteSource::next_bits`), and inflate decodes on.
+        let violated = fz("invalid compressed data--format violated");
+        for (cut, out, err) in [
+            (
+                55,
+                "",
+                "(incomplete l-tree)  funzip error: invalid compressed data--format violated\n",
+            ),
+            (60, "", violated),
+            (65, "", violated),
+            (70, "the iqqqqqqqq", violated),
+            (75, "", violated),
+            (80, "", violated),
+            (90, "the lavqqqqqqqq", violated),
+            (100, "", violated),
+        ] {
+            let label: &'static str =
+                Box::leak(format!("funzip encrypted cut at {cut}").into_boxed_str());
+            v.push(
+                row(Both, 12, label, "funzip", &["-pw"], vec![], 4, out, err)
+                    .piped(&fz_cut(fz_enc(8, &text(), 0), cut)),
+            );
+        }
+        let usage: &'static str = Box::leak(
+            format!("{FUNZIP_BANNER}\n{}", concat!(
+                "usage: ... | funzip [-password] | ...\n",
+                "       ... | funzip [-password] > outfile\n",
+                "       funzip [-password] infile.zip > outfile\n",
+                "       funzip [-password] infile.gz > outfile\n",
+                "Extracts to stdout the gzip file or first zip entry of stdin or the given file.\n",
+            ))
+            .into_boxed_str(),
+        );
+        v.extend([
+            row(
+                Both,
+                12,
+                "funzip a file",
+                "funzip",
+                &["f.zip"],
+                vec![("f.zip", fz_zip(8, 0, &text()))],
+                0,
+                "the quick",
+                "",
+            ),
+            row(
+                Both,
+                12,
+                "funzip a password and a file",
+                "funzip",
+                &["-pw", "e.zip", "x"],
+                vec![("e.zip", fz_enc(0, b"secret\n", 0))],
+                0,
+                "secret\n",
+                "",
+            ),
+            row(
+                Both,
+                12,
+                "funzip no such file",
+                "funzip",
+                &["nosuch"],
+                vec![],
+                2,
+                "",
+                "funzip error: cannot find input file\n",
+            ),
+            row(
+                Both,
+                12,
+                "funzip an empty name",
+                "funzip",
+                &[""],
+                vec![],
+                2,
+                "",
+                "funzip error: cannot find input file\n",
+            ),
+            row(
+                Both,
+                12,
+                "funzip a directory",
+                "funzip",
+                &["."],
+                vec![],
                 3,
                 "",
                 "funzip error: input not a zip or gzip file\n",
             ),
-        ] {
-            let mut r = row(Both, 12, label, "funzip", &[], vec![], code, out, err);
-            r.stdin = Some(stdin);
-            v.push(r);
-        }
+            // standard input a terminal: the usage
+            row(
+                Both,
+                12,
+                "funzip usage",
+                "funzip",
+                &[],
+                vec![],
+                3,
+                "",
+                usage,
+            )
+            .typed(b""),
+            row(
+                Both,
+                12,
+                "funzip -h usage",
+                "funzip",
+                &["-h"],
+                vec![],
+                3,
+                "",
+                usage,
+            )
+            .typed(b""),
+            // the password typed at the terminal
+            row(
+                Both,
+                12,
+                "funzip typed password",
+                "funzip",
+                &["e.zip"],
+                vec![("e.zip", fz_enc(8, &text(), 0))],
+                0,
+                "the quick",
+                "Enter password: \n",
+            )
+            .typed(b"pw\n"),
+            row(
+                Both,
+                12,
+                "funzip typed wrong password",
+                "funzip",
+                &["e.zip"],
+                vec![("e.zip", fz_enc(8, &text(), 0))],
+                3,
+                "",
+                "Enter password: \nfunzip error: incorrect password for first entry\n",
+            )
+            .typed(b"no\n"),
+        ]);
         v
+    }
+
+    // ---- funzip's fixtures (Task 12) ----
+
+    /// A local header for `data` under `method` and `flags` (bit 3: a
+    /// signed data descriptor follows), one name byte, the data (deflated
+    /// for 8 and 9, else as is), and an end record.
+    fn fz_zip(method: u16, flags: u16, data: &[u8]) -> Vec<u8> {
+        let body = if matches!(method, 8 | 9) {
+            deflate_raw(data)
+        } else {
+            data.to_vec()
+        };
+        fz_local(method, flags, &body, data, crc32(data))
+    }
+
+    fn fz_local(method: u16, flags: u16, body: &[u8], data: &[u8], crc: u32) -> Vec<u8> {
+        let dd = flags & 8 != 0;
+        let mut v = b"PK\x03\x04".to_vec();
+        for x in [20u16, flags, method, 0x1883, 0x5022] {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        let sizes = [crc, body.len() as u32, data.len() as u32];
+        for x in if dd { [0; 3] } else { sizes } {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        v.extend_from_slice(&[1, 0, 0, 0, b'a']);
+        v.extend_from_slice(body);
+        if dd {
+            v.extend_from_slice(b"PK\x07\x08");
+            for x in sizes {
+                v.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        v.extend_from_slice(b"PK\x05\x06");
+        v.extend_from_slice(&[0; 18]);
+        v
+    }
+
+    /// `data` under `method`, encrypted with `pw` (check byte: the CRC's
+    /// high byte, or the DOS time's under flag bit 3 in `flags`).
+    fn fz_enc(method: u16, data: &[u8], flags: u16) -> Vec<u8> {
+        let body = if method == 8 {
+            deflate_raw(data)
+        } else {
+            data.to_vec()
+        };
+        let check = if flags & 8 != 0 {
+            0x18
+        } else {
+            (crc32(data) >> 24) as u8
+        };
+        fz_local(
+            method,
+            flags | 1,
+            &zipcrypto(b"pw", check, &body),
+            data,
+            crc32(data),
+        )
+    }
+
+    /// `v` cut to `n` bytes (`n` < 0: that many fewer).
+    fn fz_cut(mut v: Vec<u8>, n: isize) -> Vec<u8> {
+        let n = if n < 0 {
+            v.len() - n.unsigned_abs()
+        } else {
+            n as usize
+        };
+        v.truncate(n);
+        v
+    }
+
+    /// A directory entry, then a file.
+    fn fz_dir_zip() -> Vec<u8> {
+        zip_with(
+            &[
+                ZipEntrySpec::new(b"d/", b""),
+                ZipEntrySpec::new(b"d/a", b"x"),
+            ],
+            b"",
+            b"",
+        )
+    }
+
+    /// A stored entry whose sizes say 5 and 7.
+    fn fz_stored_mismatch() -> Vec<u8> {
+        let mut v = fz_zip(0, 0, b"hello");
+        v[22..26].copy_from_slice(&7u32.to_le_bytes());
+        v
+    }
+
+    /// A gzip member with FEXTRA, FNAME and FCOMMENT.
+    fn fz_gzip_xnc() -> Vec<u8> {
+        member(Member {
+            extra: Some(b"AB\x02\x00hi"),
+            name: Some(b"g.txt"),
+            comment: Some(b"c"),
+            ..plain_member(b"gzip data\n")
+        })
+    }
+
+    /// A gzip member with FHCRC (funzip's "multi-part" bit).
+    fn fz_gzip_hcrc() -> Vec<u8> {
+        member(Member {
+            hcrc: true,
+            ..plain_member(b"gzip data\n")
+        })
+    }
+
+    /// The text as a gzip member whose method byte is `method`.
+    fn fz_gzip_method(method: u8) -> Vec<u8> {
+        let mut v = member(plain_member(&text()));
+        v[2] = method;
+        v
+    }
+
+    /// A gzip member whose trailer has the wrong CRC.
+    fn fz_gzip_crc() -> Vec<u8> {
+        member_with(plain_member(b"gzip data\n"), Some(1), None)
+    }
+
+    /// A dynamic block whose literal/length tree is incomplete
+    /// (`stuffr-formats`' hand stream `l-tree-incomplete`).
+    fn fz_ltree() -> Vec<u8> {
+        let mut body = vec![0x05, 0xc0, 0x01, 0x04, 0x00, 0x00, 0x00, 0x80, 0x20];
+        body.extend_from_slice(&[0; 12]);
+        body.push(0x01);
+        body.extend_from_slice(&[0; 19]);
+        body.push(0x07);
+        fz_local(8, 0, &body, b"x", crc32(b"x"))
     }
 
     // ---- checks ----
@@ -2060,8 +2599,10 @@ mod unix {
         differential(11);
     }
 
+    /// Task 12's rows (funzip): Apple's and the `Both` rows on macOS;
+    /// Ubuntu's side waits for Task 13 (R13), as `Row::task_here` tags it.
     #[test]
-    #[ignore = "Task 12"]
+    #[cfg_attr(not(target_os = "macos"), ignore = "Task 13 (R13: Ubuntu's side)")]
     fn task12_rows_match_stuffr() {
         differential(12);
     }
