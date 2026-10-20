@@ -391,8 +391,8 @@ mod crypt {
 }
 
 mod inflate {
-    use crate::infozip::inflate::{WSIZE, inflate_max_distance};
-    use crate::infozip::{INCOMPLETE_D_TREE, INCOMPLETE_L_TREE, Stop, inflate};
+    use crate::infozip::inflate::inflate_max_distance;
+    use crate::infozip::{INCOMPLETE_D_TREE, INCOMPLETE_L_TREE, Stop, WSIZE, inflate};
 
     /// What one [`inflate`] call did: its result (the C's return code, 0 for
     /// success), every chunk it flushed, and every message it passed on.
@@ -403,13 +403,20 @@ mod inflate {
         messages: Vec<&'static str>,
     }
 
+    /// [`run_in`] over a fresh zeroed window: what the C driver's
+    /// `memset(&G, 0, sizeof G)` gives inflate.c.
     fn run(input: &[u8], deflate64: bool) -> Run {
+        run_in(input, deflate64, &mut vec![0; WSIZE])
+    }
+
+    fn run_in(input: &[u8], deflate64: bool, window: &mut [u8]) -> Run {
         let mut chunks = Vec::new();
         let mut out = Vec::new();
         let mut messages = Vec::new();
         let r = inflate(
             &mut input.iter(),
             deflate64,
+            window,
             &mut |c: &[u8]| -> Result<(), ()> {
                 chunks.push(c.len());
                 out.extend_from_slice(c);
@@ -513,7 +520,7 @@ mod inflate {
     }
 
     /// 64 inputs from the three generators at sizes either side of the
-    /// window, through flate2 levels 0-9: the output is the input.
+    /// window, each through every flate2 level 0-9: the output is the input.
     #[cfg(feature = "deflate")]
     #[test]
     fn inflates_like_flate2() {
@@ -525,11 +532,12 @@ mod inflate {
                 1 => random(n, i + 1),
                 _ => mixed(n, i + 1),
             };
-            let level = (i % 10) as u32;
-            let r = run(&flate2(&data, level), false);
-            assert_eq!(r.code, 0, "input {i} (level {level}, {n} bytes)");
-            assert!(r.out == data, "input {i} (level {level}, {n} bytes)");
-            assert!(r.messages.is_empty());
+            for level in 0..=9 {
+                let r = run(&flate2(&data, level), false);
+                assert_eq!(r.code, 0, "input {i} (level {level}, {n} bytes)");
+                assert!(r.out == data, "input {i} (level {level}, {n} bytes)");
+                assert!(r.messages.is_empty());
+            }
         }
     }
 
@@ -749,7 +757,9 @@ mod inflate {
     /// Every damaged input gives exactly the C's return code, messages and
     /// flushed chunks (lengths and bytes): Info-ZIP's own `inflate.c`,
     /// compiled against a stub `G` (the driver and recipe are in the
-    /// fixtures' README), recorded in `inflate_damage.txt`. The undamaged
+    /// fixtures' README), recorded in `inflate_damage.txt`. The driver
+    /// zeroes `G` before each input, so the table is the oracle for a zeroed
+    /// window, and this test passes one ([`run`]). The undamaged
     /// bases decode cleanly first, so a row of all-zeros is not mistaken
     /// for agreement.
     #[test]
@@ -1121,5 +1131,65 @@ mod inflate {
             );
         }
         std::fs::write(out.join("manifest-hand.txt"), manifest).unwrap();
+    }
+
+    /// The window is the caller's and is not cleared (`inflate.c:1012`
+    /// masks a distance into `slide[]` and never rejects it): a distance
+    /// reaching before the entry's first byte copies what the window held.
+    /// Pre-filled with 0xAA, the before-the-start cases copy 0xAA where a
+    /// zeroed window gives zeros, and over the whole damage table the code,
+    /// the chunk lengths and the total never move; only some outputs do.
+    #[test]
+    fn window_contents_are_what_early_distances_read() {
+        let streams = hand_streams();
+        let stream = |name: &str| {
+            let (_, d64, s) = streams.iter().find(|(n, ..)| *n == name).unwrap();
+            (s.clone(), *d64)
+        };
+        let filled = || vec![0xaa; WSIZE];
+        for (name, want) in [
+            ("before-the-start", vec![b'a', b'b', 0xaa, 0xaa, 0xaa]),
+            ("dist-code-30-64", vec![b'a', 0xaa, 0xaa, 0xaa]),
+        ] {
+            let (s, d64) = stream(name);
+            let r = run_in(&s, d64, &mut filled());
+            assert_eq!(
+                (r.code, &r.chunks, &r.out),
+                (0, &vec![want.len()], &want),
+                "{name}"
+            );
+        }
+        // A window longer than WSIZE is accepted; only WSIZE bytes are used.
+        let (s, d64) = stream("before-the-start");
+        let mut long = vec![0xaa; WSIZE + 10];
+        assert_eq!(
+            run_in(&s, d64, &mut long).out,
+            [b'a', b'b', 0xaa, 0xaa, 0xaa]
+        );
+
+        let Some(inputs) = damaged_inputs() else {
+            return;
+        };
+        let mut moved = 0;
+        for d in &inputs {
+            let zeroed = run(&d.input, d.deflate64);
+            let r = run_in(&d.input, d.deflate64, &mut filled());
+            assert_eq!(
+                (r.code, &r.chunks, &r.messages),
+                (zeroed.code, &zeroed.chunks, &zeroed.messages),
+                "row {:03}",
+                d.i
+            );
+            moved += usize::from(r.out != zeroed.out);
+        }
+        assert!(moved > 0, "no damaged row reads before its start");
+        eprintln!("{moved} of {DAMAGED} damaged rows read before their start");
+    }
+
+    /// A window under `WSIZE` is refused.
+    #[test]
+    #[should_panic(expected = "under WSIZE")]
+    fn short_window_panics() {
+        run_in(&[0b0000_0011, 0], false, &mut [0; 100]);
     }
 }

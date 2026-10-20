@@ -20,12 +20,15 @@
 //! `(incomplete l-tree)  ` or `(incomplete d-tree)  ` through `MESSAGE`
 //! before it stops with code 1, which `unzip -t` shows inside its
 //! `testing:` line (probed on both references), and the flush callback
-//! cannot carry it.
+//! cannot carry it. And it takes the caller's `window` (unzip's `slide[]`,
+//! at least [`WSIZE`] bytes), which persists across entries in unzip: a
+//! corrupt distance reaching before an entry's first byte copies whatever
+//! that window holds, never rejected (`inflate.c:1012`).
 
 pub mod crypt;
 mod inflate;
 
-pub use inflate::{INCOMPLETE_D_TREE, INCOMPLETE_L_TREE, inflate};
+pub use inflate::{INCOMPLETE_D_TREE, INCOMPLETE_L_TREE, WSIZE, inflate};
 
 #[cfg(test)]
 mod tests;

@@ -17,23 +17,24 @@
 //! of output gives `unzip -p` 0 bytes on both references, where a 32 KiB
 //! window would give 32768.
 //!
-//! The C's globals (`G.slide`, `G.wp`, `G.bb`, `G.bk`, `G.fixed_*`,
-//! `G.cplens`/`cplext`/`cpdext`) are one [`Inflate`] per call. Each function
+//! The C's globals (`G.wp`, `G.bb`, `G.bk`, `G.fixed_*`,
+//! `G.cplens`/`cplext`/`cpdext`) are one [`Inflate`] per call, borrowing the
+//! caller's window for `G.slide`. Each function
 //! keeps the C's local copies of the bit buffer (`b`, `k`) and window
 //! position (`w`), restored to the struct where the C restores them.
 //!
-//! **A fresh window.** `slide[]` starts zeroed on every call. In unzip it is
-//! `G.area.Slide`, shared with the previous entry's output and with the
-//! messages unzip formats into it, so a distance reaching back past the
-//! start of this entry's output reads whatever was there. This port reads
-//! zeros there, which is what a never-used `slide[]` (unzip's static `G`)
-//! holds; the damage table's C driver is run the same way.
+//! **The caller's window.** `slide[]` is the caller's: in unzip it is
+//! `G.area.Slide`, one per run, holding the previous entry's output and the
+//! messages unzip formats into it (`Info(slide, ...)`, `fnfilter`). A
+//! distance reaching back past the start of this entry's output is never
+//! rejected (`d &= wsize-1`, inflate.c:1012) and reads whatever is there, so
+//! [`inflate`] takes the window rather than making one.
 
 use super::{ByteSource, Stop};
 
 /// `WSIZE` with `USE_DEFLATE64` (`unzpriv.h:886`): the window and flush
 /// size, for deflate and deflate64 alike.
-pub(crate) const WSIZE: usize = 0x10000;
+pub const WSIZE: usize = 0x10000;
 
 /// `INVALID_CODE`: marks an unused `huft` entry.
 pub(crate) const INVALID_CODE: u8 = 99;
@@ -378,8 +379,8 @@ macro_rules! needbits {
                     return Err(Stop::Code(1));
                 }
                 // The C shifts by a `k` that is never negative here: its
-                // EOF is sticky. `wrapping_shl` keeps a source that is not
-                // from panicking.
+                // EOF is sticky. `wrapping_shl` keeps a source whose EOF is
+                // not sticky from panicking.
                 Some(c) => {
                     $b |= u64::from(c).wrapping_shl($k);
                     $k = $k.wrapping_add(8);
@@ -411,10 +412,10 @@ struct Fixed {
 /// The C's inflate globals for one entry.
 struct Inflate<'a, S, E> {
     src: &'a mut S,
+    /// `redirSlide`: the caller's window, its first `WSIZE` bytes.
+    slide: &'a mut [u8],
     flush: &'a mut dyn FnMut(&[u8]) -> Result<(), E>,
     message: &'a mut dyn FnMut(&'static str),
-    /// `redirSlide`: the window, `WSIZE` bytes.
-    slide: Vec<u8>,
     /// `G.wp`: current position in `slide`.
     wp: u32,
     /// `G.bb`: bit buffer (`ulg`, 64 bits on both references).
@@ -823,12 +824,19 @@ impl<S: ByteSource, E> Inflate<'_, S, E> {
 }
 
 /// Inflates one entry, deflate or (with `deflate64`) deflate64, reading
-/// through `src` and writing through `flush` in exactly the chunks
+/// through `src`, decoding into `window` (unzip's `slide[]`), and writing
+/// through `flush` in exactly the chunks
 /// `inflate()` passes to unzip's `flush()`: every full 64 KiB window, then
 /// the final `G.wp` bytes, which is an empty slice when the output is empty
 /// or a multiple of 64 KiB. Partial output after an error is what was
 /// flushed before it: the window's unflushed tail is dropped, as the C
 /// drops it.
+///
+/// `window` is the caller's and must hold at least [`WSIZE`] bytes (only the
+/// first `WSIZE` are used; a shorter one panics). It is not cleared: a
+/// match distance reaching before this entry's first byte copies what the
+/// window already holds there, as unzip copies from its persistent
+/// `slide[]`. A caller emulating a fresh `G` passes zeros.
 ///
 /// `message` receives the text `inflate_dynamic` passes to `MESSAGE` with
 /// flag 1 (stderr), [`INCOMPLETE_L_TREE`] or [`INCOMPLETE_D_TREE`], just
@@ -842,25 +850,32 @@ impl<S: ByteSource, E> Inflate<'_, S, E> {
 pub fn inflate<S: ByteSource, E>(
     src: &mut S,
     deflate64: bool,
+    window: &mut [u8],
     flush: &mut dyn FnMut(&[u8]) -> Result<(), E>,
     message: &mut dyn FnMut(&'static str),
 ) -> Result<(), Stop<E>> {
-    inflate_state(src, deflate64, flush, message).0
+    inflate_state(src, deflate64, window, flush, message).0
 }
 
 /// [`inflate`], also returning the state for the tests.
 fn inflate_state<'a, S: ByteSource, E>(
     src: &'a mut S,
     deflate64: bool,
+    window: &'a mut [u8],
     flush: &'a mut dyn FnMut(&[u8]) -> Result<(), E>,
     message: &'a mut dyn FnMut(&'static str),
 ) -> (Result<(), Stop<E>>, Inflate<'a, S, E>) {
-    // initialize window, bit buffer
+    assert!(
+        window.len() >= WSIZE,
+        "inflate: window of {} bytes, under WSIZE",
+        window.len()
+    );
+    // initialize window position, bit buffer
     let mut g = Inflate {
         src,
+        slide: &mut window[..WSIZE],
         flush,
         message,
-        slide: vec![0; WSIZE],
         wp: 0,
         bb: 0,
         bk: 0,
@@ -882,7 +897,8 @@ fn inflate_state<'a, S: ByteSource, E>(
     (r, g)
 }
 
-/// Test-only: [`inflate`], returning the longest match distance decoded.
+/// Test-only: [`inflate`] over a zeroed window, returning the longest match
+/// distance decoded.
 #[cfg(test)]
 pub(super) fn inflate_max_distance<S: ByteSource, E>(
     src: &mut S,
@@ -890,6 +906,7 @@ pub(super) fn inflate_max_distance<S: ByteSource, E>(
     flush: &mut dyn FnMut(&[u8]) -> Result<(), E>,
 ) -> (Result<(), Stop<E>>, u32) {
     let mut quiet = |_| {};
-    let (r, g) = inflate_state(src, deflate64, flush, &mut quiet);
+    let mut window = vec![0; WSIZE];
+    let (r, g) = inflate_state(src, deflate64, &mut window, flush, &mut quiet);
     (r, g.max_distance)
 }
