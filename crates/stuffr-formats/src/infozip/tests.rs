@@ -93,6 +93,9 @@ fn sha256(data: &[u8]) -> String {
     h.iter().map(|x| format!("{x:08x}")).collect()
 }
 
+mod explode;
+mod unshrink;
+
 mod crypt {
     use crate::infozip::crypt::{Keys, RAND_HEAD_LEN, test_key};
 
@@ -428,6 +431,7 @@ mod inflate {
             Ok(()) => 0,
             Err(Stop::Code(c)) => c,
             Err(Stop::Flush(())) => unreachable!("this flush never fails"),
+            Err(Stop::Length { .. }) => unreachable!("explode's alone"),
         };
         Run {
             code,
@@ -439,9 +443,9 @@ mod inflate {
 
     // ---- deterministic data: the differential harness's generators ----
 
-    struct XorShift(u64);
+    pub(super) struct XorShift(pub(super) u64);
     impl XorShift {
-        fn next(&mut self) -> u64 {
+        pub(super) fn next(&mut self) -> u64 {
             let mut x = self.0;
             x ^= x << 13;
             x ^= x >> 7;
@@ -451,7 +455,7 @@ mod inflate {
         }
     }
 
-    fn random(n: usize, seed: u64) -> Vec<u8> {
+    pub(super) fn random(n: usize, seed: u64) -> Vec<u8> {
         let mut r = XorShift(seed);
         (0..n).map(|_| (r.next() >> 24) as u8).collect()
     }
@@ -461,7 +465,7 @@ mod inflate {
         "deflate", "header", "and", "of", "a", "to", "in", "file",
     ];
 
-    fn text(n: usize, seed: u64) -> Vec<u8> {
+    pub(super) fn text(n: usize, seed: u64) -> Vec<u8> {
         let mut r = XorShift(seed);
         let mut v = Vec::with_capacity(n + 16);
         while v.len() < n {

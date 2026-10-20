@@ -5,9 +5,9 @@
 //! surface.
 //!
 //! **Licence.** Everything under this module is ported from Info-ZIP UnZip
-//! 6.0 (`crypt.c` and `inflate.c` here; `explode.c` and `unshrink.c` to follow)
-//! and stays under the Info-ZIP licence, version 2009-Jan-02, reproduced in
-//! this crate's `LICENSE-infozip`. It is an altered version in that
+//! 6.0 (`crypt.c`, `inflate.c`, `explode.c` and `unshrink.c`) and stays
+//! under the Info-ZIP licence, version 2009-Jan-02, reproduced in this
+//! crate's `LICENSE-infozip`. It is an altered version in that
 //! licence's clause 3 sense: a port to Rust, not Info-ZIP's source, and not
 //! an Info-ZIP release. Every ported function carries a
 //! `// port: <file>.c:<function>` comment naming its original.
@@ -24,11 +24,25 @@
 //! at least [`WSIZE`] bytes), which persists across entries in unzip: a
 //! corrupt distance reaching before an entry's first byte copies whatever
 //! that window holds, never rejected (`inflate.c:1012`).
+//!
+//! [`explode()`] and [`unshrink()`] take the same window: explode decodes
+//! in it as inflate does (but zero-fills, never reads, what lies before the
+//! entry's first byte), and unshrink keeps its tables in it, where unzip's
+//! `G.area` union puts them over `slide[]`. Neither prints anything, so
+//! neither takes a `message`. Explode stops on the uncompressed size and
+//! then checks the compressed size, which is why [`ByteSource`] reports
+//! [`remaining`](ByteSource::remaining) bytes and [`Stop`] has a
+//! [`Length`](Stop::Length) case; unshrink stops at the end of the data and
+//! takes no size at all.
 
 pub mod crypt;
+mod explode;
 mod inflate;
+mod unshrink;
 
+pub use explode::explode;
 pub use inflate::{INCOMPLETE_D_TREE, INCOMPLETE_L_TREE, WSIZE, inflate};
+pub use unshrink::unshrink;
 
 #[cfg(test)]
 mod tests;
@@ -41,11 +55,25 @@ mod tests;
 pub trait ByteSource {
     /// The next byte of the entry, or `None` at unzip's EOF.
     fn next_byte(&mut self) -> Option<u8>;
+
+    /// unzip's `G.csize + G.incnt` before any EOF: the entry's compressed
+    /// bytes not yet returned. It is 0 once `next_byte` has returned `None`
+    /// at the end of the entry's data; a `None` while it is still positive
+    /// is a read that came up short (a truncated archive: `read()` gave 0),
+    /// which `readbyte()` answers with `EOF` but without touching
+    /// `G.csize`. [`explode()`] reads it at the start (`bd`) and at the end
+    /// (its return 5), and counts the end-of-data EOFs itself, as
+    /// `readbyte()`'s `G.csize--` does.
+    fn remaining(&self) -> u64;
 }
 
 impl ByteSource for std::slice::Iter<'_, u8> {
     fn next_byte(&mut self) -> Option<u8> {
         self.next().copied()
+    }
+
+    fn remaining(&self) -> u64 {
+        self.len() as u64
     }
 }
 
@@ -60,4 +88,14 @@ pub enum Stop<E> {
     Code(i32),
     /// The flush callback's error, unchanged.
     Flush(E),
+    /// `explode.c`'s return 5, which `extract.c` treats apart from the other
+    /// codes ("treat 5 specially"): every byte was flushed, but the stream
+    /// did not end at the compressed size. `unused` is the C's
+    /// `G.csize + G.incnt + (k >> 3)` at that point, the compressed bytes
+    /// left over (negative when it read past the end), so unzip's
+    /// `G.used_csize` is `G.lrec.csize - unused`.
+    Length {
+        /// `G.csize + G.incnt + (k >> 3)`, never 0.
+        unused: i64,
+    },
 }

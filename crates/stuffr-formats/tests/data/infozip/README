@@ -65,7 +65,36 @@ lzma.zip                | 14 LZMA
   libarchive test_read_format_zip_lzma.zipx (renamed), BSD-2-Clause
   a8fd1714eff610dae52e434a759818829bf8040b5016aa771b9a33965d2dbc89
 
-To reproduce all nine hashes: run `shasum -a 256 *.zip` in this directory.
+implode-hand-4k-2trees.zip  | 6 implode, 4K window, 2 trees (flags 0)
+  hand-built by stuffr's test-only implode writer (Task 5, ruling P5)
+  815b41834e5c18dd9fbb3e8a33e55459ac5d64825c879df7c590306acaa36948
+implode-hand-4k-3trees.zip  | 6 implode, 4K window, 3 trees (flags 4)
+  hand-built likewise; no other sample of this variant was found
+  f4f111a786077acbda1dfe036c75137d4e3b8069ca1abc27a90345adba2dad3c
+implode-hand-8k-2trees.zip  | 6 implode, 8K window, 2 trees (flags 2)
+  hand-built likewise; no other sample of this variant was found
+  3b1af90209ea81074f5092520430cc67c7db2a26908fd9fee2da239ae47dcfcb
+implode-hand-8k-3trees.zip  | 6 implode, 8K window, 3 trees (flags 6)
+  hand-built likewise
+  4e4aec7f5057a5b8f217e75fb43537c02f355121da3d4bb43bee9f218774aca9
+
+The four hand-built zips hold one entry, hand.txt, the 9400 bytes of
+`hand_data()` (SHA-256 5079ff3e18949acca7b9a31962b516f5e2ffc93fe58282e45a3a8278e19f52e1),
+imploded by `implode()` in src/infozip/tests/explode.rs over fixed complete
+Shannon-Fano trees (literals 7/8/9 bits, lengths 4/6/8, distances 6), greedy
+matches including distances past 4K and lengths with the extra byte.
+Authored for this repository (MIT). Made with
+  STUFFR_INFOZIP_HAND_OUT=$W/hand cargo test -p stuffr-formats --lib \
+    infozip::tests::explode::write_hand_fixtures -- --ignored
+and accepted only after both references passed them:
+  /usr/bin/unzip -t $W/hand/<zip>                       (exit 0, "OK")
+  docker run --rm -v $W/hand:/w ubuntu:24.04 sh -c 'apt-get update -qq &&
+    apt-get install -qq -y unzip >/dev/null && unzip -t /w/<zip>'
+                                                       (exit 0, "OK")
+Both references' `unzip -p` give the SHA-256 above for all four.
+`explode_all_four_variants` checks the writer still makes them byte for byte.
+
+To reproduce all thirteen hashes: run `shasum -a 256 *.zip` in this directory.
 
 Unsupported by design: exact answers of `unzip -t <file>`
 ----------------------------------------------------------
@@ -90,7 +119,7 @@ refuses on the version-needed field (PK compat.) BEFORE it looks at the method.
 Coverage gaps
 -------------
  * Implode 4K+3 trees and 8K+2 trees: no sample exists in any corpus found;
-   hand-built in Task 5 (plan ruling P5).
+   hand-built in Task 5 (plan ruling P5): implode-hand-*.zip above.
  * deflate64 match distance > 32 KiB in deflate64-lorem.zip: verified in
    Task 4 (P6). The longest distance the stream uses is 65521 (counted by
    the port, `deflate64_fixture`), so it reaches distance codes 30/31 and
@@ -220,6 +249,191 @@ driver.c:
                  msgs[0] ? msgs : "-", total, chunks[0] ? chunks : "-");
           for (i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) printf("%02x", dig[i]);
           printf("\n");
+      }
+      return 0;
+  }
+
+explode and unshrink damage tables (stuffr 0.16.0, Task 5)
+=========================================================
+
+explode_damage.txt and unshrink_damage.txt record what Info-ZIP's own
+explode.c (with inflate.c's huft_build) and unshrink.c (UnZip 6.0; Apple's
+zip-33 copies are byte-identical to upstream's, and Ubuntu's patch series
+touches neither) do with 200 damaged streams each: return code, (explode)
+G.used_csize for a 5, every flushed chunk length and the SHA-256 of the
+flushed bytes. `damage_codes_match_the_c` in src/infozip/tests/explode.rs
+and .../unshrink.rs regenerates each input and requires the port to match
+every row. Authored for this repository (MIT).
+
+Bases: explode cycles through the entries of implode-4k-2trees.zip,
+implode-8k-3trees.zip and the four implode-hand-*.zip; unshrink through
+shrink-commons.zip's two entries and shrink-full-table.zip's one.
+
+  explode_damage.txt
+    f90e3de0d5b0b16292fcbc9e2e7becde14d361a5c65f95602768d1f630a9a547
+  unshrink_damage.txt
+    9ff050a962579a0016ab6d292615c7d408be9db30b8961db86b4d9d517bd20b2
+
+Damage: input i takes base i % (bases) and a XorShift seeded
+(i + 1) * 0x9e3779b97f4a7c15 picks bit flips (1-3), a truncation where the
+entry's data ends, a truncation where the ARCHIVE ends (the cut bytes still
+claimed: G.csize stays positive), inserted bytes (1-2), or (explode only) a
+changed uncompressed size; see `damage()`. The window (G.area) starts as
+zeros for even rows and 0xAA for odd ones. Each row records the input's
+SHA-256, so a generator change shows as a mismatch, not a silent pass.
+
+Recipe (macOS, Apple clang 21.0.0; $W any scratch directory, $UZ a copy of
+Apple's zip-zip-33/unzip/unzip60):
+
+  1. Inputs and manifests:
+       STUFFR_INFOZIP_DAMAGE_OUT=$W/damage cargo test -p stuffr-formats --lib \
+         infozip::tests -- --ignored write_damage_inputs write_hand_inputs
+     (writes $W/damage/{explode,unshrink,explode-hand,unshrink-hand}/)
+  2. The drivers: the three files below, beside the stub quarantine.h of
+     the inflate recipe, compiled with the real sources and Apple's macosx
+     target's defines:
+       cc -O0 -w -DUNIX -DBSD -DLARGE_FILE_SUPPORT -DUNICODE_SUPPORT \
+         -I$W/stubinc -I$UZ -o $W/explode_driver $W/explode_driver.c \
+         $UZ/explode.c $UZ/inflate.c
+       cc -O0 -w -DUNIX -DBSD -DLARGE_FILE_SUPPORT -DUNICODE_SUPPORT \
+         -I$W/stubinc -I$UZ -o $W/unshrink_driver $W/unshrink_driver.c \
+         $UZ/unshrink.c
+     Built again with -DNOMEMCPY (Ubuntu's DEFINES; explode.c reads it), and
+     at -O2, the explode driver prints a byte-identical table. In this build
+     G.area is 65536 bytes with Parent at 0, value at 32768, Stack at 40960,
+     shrint an int, OUTBUFSIZ 65536 (checked with a sizeof probe).
+  3. The tables:
+       { echo '# explode.c (UnZip 6.0, Apple zip-33 = upstream) on 200 damaged implode streams.'
+         echo '# Generated by the C driver in README ("explode and unshrink damage tables"); do not edit by hand.'
+         echo '# NNN|base|kind|input-sha256|rc|used_csize|total|chunks|output-sha256'
+         $W/explode_driver $W/damage/explode/manifest.txt; } > explode_damage.txt
+       { echo '# unshrink.c (UnZip 6.0, Apple zip-33 = upstream) on 200 damaged shrink streams.'
+         echo '# Generated by the C driver in README ("explode and unshrink damage tables"); do not edit by hand.'
+         echo '# NNN|base|kind|input-sha256|rc|total|chunks|output-sha256'
+         $W/unshrink_driver $W/damage/unshrink/manifest.txt; } > unshrink_damage.txt
+
+  The hand-built cases in each file's `hand_built_streams` came from the same
+  drivers over the *-hand/manifest.txt; their answers are written into the
+  tests.
+
+common.h:
+
+  /* Shared by the explode and unshrink damage drivers: Info-ZIP UnZip 6.0's
+   * real explode.c / unshrink.c over a stub G.  Manifest lines:
+   *   NNN|base|flags|ucsize|missing|fill|kind|in_sha256|path
+   * flags = general-purpose bit flag, ucsize = G.lrec.ucsize, missing = bytes
+   * the entry claims beyond the file (G.csize: a truncated archive, read()
+   * gives 0), fill = the byte G.area starts as (hex).                       */
+  #define UNZIP_INTERNAL
+  #include "unzip.h"
+  #include <CommonCrypto/CommonDigest.h>
+
+  Uz_Globs G;
+  ZCONST unsigned near mask_bits[17] = {
+      0x0000, 0x0001, 0x0003, 0x0007, 0x000f, 0x001f, 0x003f, 0x007f, 0x00ff,
+      0x01ff, 0x03ff, 0x07ff, 0x0fff, 0x1fff, 0x3fff, 0x7fff, 0xffff};
+
+  static CC_SHA256_CTX out_sha;
+  static unsigned long total;
+  static char chunks[1 << 16];
+
+  int flush(uch *rawbuf, ulg size, int unshrink) {
+      char n[32];
+      CC_SHA256_Update(&out_sha, rawbuf, (CC_LONG)size);
+      total += size;
+      snprintf(n, sizeof n, "%s%lu", chunks[0] ? "," : "", (unsigned long)size);
+      strlcat(chunks, n, sizeof chunks);
+      return 0;
+  }
+  int memflush(ZCONST uch *rawbuf, ulg size) { abort(); }
+  /* fileio.c readbyte(), less the file: past the data, either the entry is
+   * exhausted (G.csize <= 0: decrement, as unzip does "for tests done after
+   * exploding") or the archive is (read() gives 0: G.csize untouched). */
+  int readbyte(void) {
+      if (G.csize <= 0) { G.csize--; G.incnt = 0; return EOF; }
+      G.incnt = 0;
+      return EOF;
+  }
+  static int message(zvoid *pG, uch *buf, ulg size, int flag) { abort(); }
+
+  static min_info info;
+  static uch in[1 << 20];
+
+  /* One manifest line: sets up G and returns its fields. */
+  static int setup(char *line, char **nnn, char **base, char **kind, char **insha) {
+      char *flags, *ucsize, *missing, *fill, *path;
+      FILE *f;
+      size_t n;
+      *nnn = strtok(line, "|"); *base = strtok(NULL, "|");
+      flags = strtok(NULL, "|"); ucsize = strtok(NULL, "|");
+      missing = strtok(NULL, "|"); fill = strtok(NULL, "|");
+      *kind = strtok(NULL, "|"); *insha = strtok(NULL, "|");
+      path = strtok(NULL, "|\n");
+      f = fopen(path, "rb");
+      n = fread(in, 1, sizeof in, f);
+      fclose(f);
+      memset(&G, 0, sizeof G);
+      memset(&G.area, (int)strtol(fill, NULL, 16), sizeof G.area);
+      G.message = message;
+      memset(&info, 0, sizeof info);
+      G.pInfo = &info;
+      if (!G.outbuf) G.outbuf = malloc(OUTBUFSIZ + 1);
+      G.inptr = in;
+      G.incnt = (int)n;
+      G.csize = atoll(missing);
+      G.lrec.csize = n + atoll(missing);
+      G.lrec.ucsize = strtoull(ucsize, NULL, 10);
+      G.lrec.general_purpose_bit_flag = (ush)atoi(flags);
+      /* extract_or_test_member() */
+      G.bits_left = 0; G.bitbuf = 0L; G.zipeof = 0;
+      total = 0; chunks[0] = 0;
+      CC_SHA256_Init(&out_sha);
+      return 0;
+  }
+
+  static void finish(void) {
+      unsigned char dig[CC_SHA256_DIGEST_LENGTH];
+      int i;
+      CC_SHA256_Final(dig, &out_sha);
+      printf("%lu|%s|", total, chunks[0] ? chunks : "-");
+      for (i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) printf("%02x", dig[i]);
+      printf("\n");
+  }
+
+explode_driver.c:
+
+  /* explode_damage driver: prints NNN|base|kind|in_sha256|rc|used_csize|total|chunks|out_sha256
+   * (used_csize only for rc 5, else "-"). */
+  #include "common.h"
+  int explode(__GPRO);
+  int main(int argc, char **argv) {
+      char line[4096], *nnn, *base, *kind, *insha;
+      FILE *m = fopen(argv[1], "r");
+      while (fgets(line, sizeof line, m)) {
+          int rc;
+          setup(line, &nnn, &base, &kind, &insha);
+          rc = explode();
+          printf("%s|%s|%s|%s|%d|", nnn, base, kind, insha, rc);
+          if (rc == 5) printf("%lld|", (long long)G.used_csize); else printf("-|");
+          finish();
+      }
+      return 0;
+  }
+
+unshrink_driver.c:
+
+  /* unshrink_damage driver: prints NNN|base|kind|in_sha256|rc|total|chunks|out_sha256 */
+  #include "common.h"
+  int unshrink(__GPRO);
+  int main(int argc, char **argv) {
+      char line[4096], *nnn, *base, *kind, *insha;
+      FILE *m = fopen(argv[1], "r");
+      while (fgets(line, sizeof line, m)) {
+          int rc;
+          setup(line, &nnn, &base, &kind, &insha);
+          rc = unshrink();
+          printf("%s|%s|%s|%s|%d|", nnn, base, kind, insha, rc);
+          finish();
       }
       return 0;
   }
