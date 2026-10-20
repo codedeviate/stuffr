@@ -20,7 +20,7 @@ pub(super) use crate::compat::host::printf;
 // ---- banners (R2: deviation 2, Info-ZIP licence clause 3) ----
 
 /// unzip.c:UnzipUsageLine1's first line under Apple's build (`apple:
-/// unzip.c:573`: `UnZip 6.00 of 20 April 2009, by Info-ZIP, with
+/// unzip.c:574`: `UnZip 6.00 of 20 April 2009, by Info-ZIP, with
 /// modifications by Apple Inc.`), as R2 words it. `%s` is stuffr's version.
 pub(super) const APPLE_UNZIP_BANNER: &str = "UnZip 6.00 of 20 April 2009, by stuffr %s \
      (altered; original by Info-ZIP, with modifications by Apple Inc.).\n";

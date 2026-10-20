@@ -603,6 +603,8 @@ mod unix {
                 .env("STUFFR_UNZIP_FLAVOR", flavor)
                 .env_remove("UNZIP")
                 .env_remove("UNZIPOPT")
+                .env_remove("ZIPINFO")
+                .env_remove("ZIPINFOOPT")
                 .stdin(std::process::Stdio::null())
                 .output()
                 .unwrap()

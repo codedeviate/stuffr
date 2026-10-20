@@ -73,7 +73,7 @@ pub(crate) fn iconv_charsets(_f: Flavour) -> bool {
 /// licence clause 3, deviation 2). `%s` is stuffr's version.
 pub(crate) fn unzip_banner(f: Flavour) -> &'static str {
     match f {
-        // apple: unzip.c:573 (`by Info-ZIP, with modifications by Apple Inc.`)
+        // apple: unzip.c:574 (`by Info-ZIP, with modifications by Apple Inc.`)
         Flavour::Apple => super::messages::APPLE_UNZIP_BANNER,
         // ubuntu: 02-this-is-debian-unzip.patch (`by Debian. Original by
         // Info-ZIP.`)

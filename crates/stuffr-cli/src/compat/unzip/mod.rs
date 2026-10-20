@@ -168,11 +168,11 @@ pub(crate) struct Uz<'a> {
     #[allow(dead_code)]
     pub(crate) unicode_escape_all: bool,
     /// `G.rootdir`, Apple's descriptor for the extraction root (`-1`: none;
-    /// apple: globals.c:163, `apple_globals_ctor`). Task 10 opens it.
+    /// apple: globals.c:164, `apple_globals_ctor`). Task 10 opens it.
     #[allow(dead_code)]
     pub(crate) rootdir: Option<std::fs::File>,
     /// `G.qf`, the archive's quarantine information (`NULL`: none; apple:
-    /// globals.c:164, `apple_globals_ctor`). Task 10 reads it (R9).
+    /// globals.c:165, `apple_globals_ctor`). Task 10 reads it (R9).
     #[allow(dead_code)]
     pub(crate) qf: Option<Vec<u8>>,
     /// `G.area.Slide`: the one window every decoder writes into and the
@@ -207,9 +207,9 @@ impl<'a> Uz<'a> {
             process_all_files: false,
             native_is_utf8: false,
             unicode_escape_all: false,
-            // apple: globals.c:163 (`G.rootdir = -1`)
+            // apple: globals.c:164 (`G.rootdir = -1`)
             rootdir: None,
-            // apple: globals.c:164 (`G.qf = NULL`)
+            // apple: globals.c:165 (`G.qf = NULL`)
             qf: None,
             slide: vec![0u8; stuffr::infozip::WSIZE].into_boxed_slice(),
         }
@@ -494,22 +494,24 @@ mod tests {
         );
     }
 
-    /// Without a terminal, funzip never prints its usage; its decoder is
-    /// Task 12's. Neither it nor an archive operand panics.
+    /// A command line that gets past the parser (an archive operand,
+    /// funzip without a terminal) does not panic and exits with one of the
+    /// flavour's codes. What it answers is the archive tasks' to pin.
     #[test]
-    fn placeholders_answer_without_panicking() {
+    fn past_the_parser_a_run_never_panics() {
         for f in [Flavour::Apple, Flavour::Ubuntu] {
-            let (code, out, err) = run(f, "funzip", &[]);
-            assert_eq!((code, out.as_str()), (3, ""));
-            assert!(err.starts_with("funzip error: "), "{err}");
-            let (code, _, err) = run(f, "unzip", &["-l", "a.zip", "x", "-x", "y"]);
-            assert_eq!(code, 3, "{err}");
-            assert!(err.starts_with("unzip:  archive processing"), "{err}");
-            // zipinfo's default listing sets its totals flag, `uO.tflag`,
-            // which sends every message to standard output.
-            let (code, out, err) = run(f, "zipinfo", &["a.zip"]);
-            assert_eq!((code, err.as_str()), (3, ""));
-            assert!(out.starts_with("zipinfo:  archive processing"), "{out}");
+            let codes = match f {
+                Flavour::Apple => EXIT_CODES_APPLE,
+                Flavour::Ubuntu => EXIT_CODES_UBUNTU,
+            };
+            for (name, args) in [
+                ("funzip", &[][..]),
+                ("unzip", &["-l", "a.zip", "x", "-x", "y"]),
+                ("zipinfo", &["a.zip"]),
+            ] {
+                let (code, _, _) = run(f, name, args);
+                assert!(codes.contains(&code), "{f:?} {name} {args:?}: exit {code}");
+            }
         }
     }
 

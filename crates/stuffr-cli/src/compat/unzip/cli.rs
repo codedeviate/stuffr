@@ -403,14 +403,22 @@ fn operands(uz: &mut Uz, argv: &[Vec<u8>]) -> Result<Parsed, i32> {
         uz.unicode_escape_all = true;
     }
 
-    // The counted prefixes; within them C's lists hold no `NULL` (a list is
-    // cut exactly where it is terminated).
+    // The counted prefixes. A counted list can hold a `NULL`: in `a.zip f1
+    // -d dir f2 -x e` the `-d` cuts `G.pfnames` at `f1`, `f2` restarts
+    // `in_files` on the same list, and `-x` recounts it to 4, so C matches
+    // against `[f1, NULL, dir, f2]`.
+    // ruling: P20: that is upstream undefined behaviour (Apple's unzip lists
+    // `f1`, then says `error:  zipfile probably corrupt (segmentation
+    // violation)`, exit 3), so it is not reproduced: a list ends at its
+    // first hole, which is what Apple acts on before it crashes, and what
+    // follows the hole is dropped (`exdir` keeps its value). The `-x` list
+    // cannot hold one (after `-x` only `-d` cuts it, and nothing recounts
+    // it), but the same rule applies to it.
     let list = |start: Option<usize>, n: usize| -> Vec<OsString> {
         start.map_or_else(Vec::new, |s| {
             v[s..(s + n).min(v.len())]
                 .iter()
-                .flatten()
-                .map(|a| os(a))
+                .map_while(|a| a.map(os))
                 .collect()
         })
     };

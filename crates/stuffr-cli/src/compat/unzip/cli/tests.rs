@@ -212,6 +212,15 @@ fn x_lists_and_operands() {
     let p = ok(&r);
     assert_eq!(names(&p.include), ["f1"]);
     assert_eq!(names(&p.exclude), ["e1"]);
+    // ruling: P20: `-d` cuts the include list at `f1`, `f2` restarts it
+    // and `-x` recounts it over the hole (C: `[f1, NULL, dir, f2]`, upstream
+    // undefined behaviour, Apple crashes after `f1`); stuffr ends the list
+    // at the hole, keeps `dir` and the exclude list.
+    let r = unzip(&["a.zip", "f1", "-d", "dir", "f2", "-x", "e"]);
+    let p = ok(&r);
+    assert_eq!(names(&p.include), ["f1"]);
+    assert_eq!(names(&p.exclude), ["e"]);
+    assert_eq!(p.exdir.as_deref(), Some(OsStr::new("dir")));
     // Only the operand `-x` exactly starts the exclude list.
     let r = unzip(&["a.zip", "-xf", "f"]);
     assert_eq!(names(&ok(&r).include), ["-xf", "f"]);

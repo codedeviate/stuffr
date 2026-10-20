@@ -295,10 +295,11 @@ mod tests {
             out.starts_with("ZipInfo 3.00 of 20 April 2009, by stuffr "),
             "{out}"
         );
-        // `-h` is funzip's password; with no terminal it never shows usage.
-        let (code, out, err) = run("funzip", U);
-        assert_eq!((code, out.as_str()), (3, ""));
-        assert!(err.starts_with(b"funzip error: "));
+        // `-h` is funzip's password; with no terminal it never shows usage,
+        // and what it answers then is Task 12's.
+        let (code, out, _) = run("funzip", U);
+        assert!(unzip::EXIT_CODES_APPLE.contains(&code), "exit {code}");
+        assert!(!out.contains("fUnZip"), "{out}");
     }
 
     /// The `compat` fuzz target picks its tool from `COMPAT_NAMES`; a name
