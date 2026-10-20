@@ -1438,6 +1438,36 @@ pub(super) const SYMLINK_FAILED: &str = "warning:  symbolic link (%s) failed\n";
 /// unix.c:close_outfile, the link target after the name.
 pub(super) const SYMLINK_ARROW: &str = "-> %s ";
 
+// ---- the terminal: fileio.c's pager and password prompt, ttyio.c ----
+
+/// fileio.c:MorePrompt (`%lu` there: `%d` is `G.numlines`, formatted by
+/// the caller).
+pub(super) const MORE_PROMPT: &str = "--More--(%d)";
+/// fileio.c:QuitPrompt, the `^S` pause in a comment while extracting.
+pub(super) const QUIT_PROMPT: &str = "--- Press `Q' to quit, or any other key to continue ---";
+/// fileio.c:HidePrompt, which covers a pause's prompt.
+pub(super) const HIDE_PROMPT: &str =
+    "\r                                                         \r";
+/// fileio.c:PasswPrompt (not `MACOS`): the archive's name, then the entry's.
+pub(super) const PASSW_PROMPT: &str = "[%s] %s password: ";
+/// fileio.c:PasswPrompt2, when the names would not fit the prompt.
+pub(super) const PASSW_PROMPT2: &str = "Enter password: ";
+/// fileio.c:PasswRetry.
+pub(super) const PASSW_RETRY: &str = "password incorrect--reenter: ";
+/// ttyio.c:getp's warning before it asks again.
+#[cfg(unix)]
+pub(super) const LINE_TOO_LONG: &str = "(line too long--try again)\n";
+/// ttyio.c:getp's `PUTC('\n', stderr)` after each line read.
+#[cfg(unix)]
+pub(super) const GETP_NEWLINE: &str = "\n";
+/// ttyio.c:getp's `_PATH_TTY`.
+#[cfg(unix)]
+pub(super) const PATH_TTY: &std::ffi::CStr = c"/dev/tty";
+/// fileio.c:handler: nothing. Its leading-newline message is compiled only
+/// where neither SIGBUS nor SIGSEGV exists (`#if !(defined(SIGBUS) ||
+/// defined(SIGSEGV))`), never on unix.
+pub(super) const HANDLER_TEXT: &[u8] = b"";
+
 // ---- stuffr's own ----
 
 /// stuffr's own: the flavour variable holds neither name (exit 1). `%s` is

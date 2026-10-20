@@ -1,7 +1,8 @@
 //! `fileio.c`'s archive input and strings: `open_input_file()`, `readbuf()`,
 //! `seek_zipf()`, `do_string()`, `makeword()`/`makelong()`/`makeint64()`,
 //! `dos_to_unix_time()`; `extract.c`'s `fnfilter()`; the `localtime()` the
-//! listings call.
+//! listings call; the pager's pause (`UzpMorePause()`) and the password
+//! prompt (`UzpPassword()`).
 //!
 //! The archive is read as the C reads it: `read(2)` of `INBUFSIZ` blocks
 //! into `G.inbuf`, `lseek(2)` to block boundaries, with `G.incnt`,
@@ -331,7 +332,9 @@ pub(crate) fn c_str(buf: &[u8]) -> &[u8] {
 /// bytes at the archive's current position, or print them (CRs dropped,
 /// `ESC` shown as `^[`, `^S` dropped, `DISPL_8` after the host's code page
 /// conversion), then a newline if the text did not end one. `pinfo` is
-/// `G.pInfo`, which `DISPL_8` reads.
+/// `G.pInfo`, which `DISPL_8` reads. While extracting, a `^S` (with the
+/// line end after it) flushes the text so far and pauses
+/// ([`more_pause`]'s "Press `Q' to quit").
 ///
 /// The text is formatted into `uz.slide`, as the C formats into `slide[]`.
 /// ruling: the C strips CRs with `while (*p) { while (*p == CR) ++p; *q++ =
@@ -408,9 +411,14 @@ pub(crate) fn do_string(
                         let out = uz.slide[..q].to_vec();
                         uz.info(0, &out);
                         q = 0;
-                        // `if (pause && G.extract_flag)` the C asks
-                        // UzpMorePause (`--- Press `Q' to quit...`) here;
-                        // a listing never does. Task 11 ports it.
+                        if pause && uz.extract_flag {
+                            // don't pause for list/test
+                            more_pause(uz, m::QUIT_PROMPT.as_bytes(), 0);
+                            if uz.abort.is_some() {
+                                // `q` in a sandbox: the C has exited
+                                return PK_COOL;
+                            }
+                        }
                     }
                     i += 1;
                 }
@@ -820,6 +828,119 @@ pub(crate) fn dos_to_unix_time(uz: &Uz, dosdatetime: u32) -> i64 {
         m_time -= tm.gmtoff; // sec. EAST of GMT: subtr.
     }
     saturate(m_time)
+}
+
+// port: fileio.c:UzpMorePause
+/// `UzpMorePause(prompt, flag)`: `prompt` on standard error (after a
+/// newline when the output is not at the start of a line), a key read
+/// (`flag` 1: only Enter, space or `q`), the prompt covered. `q` ends the
+/// run, exit 0; space under `flag` 1 starts a new screen.
+///
+/// ruling: T11-4. At the end of standard input (or a read error) the C's
+/// `c` is uninitialised. With `flag` 0 (the `^S` pause in a comment) both
+/// binaries go on, as for any key that is not `q` (probe: `unzip -o cs.zip
+/// </dev/null`), and so does this. With `flag` 1 (`-M`) they wait for a key
+/// that can never come, spinning for ever (probe: `unzip -M -l many.zip`,
+/// stdout a terminal, stdin `/dev/null`); here the pager stops pausing for
+/// the rest of the run, as if `-M` had not been given.
+pub(crate) fn more_pause(uz: &mut Uz, prompt: &[u8], flag: u32) {
+    if !uz.sol {
+        let _ = uz.err.write_all(b"\n");
+    }
+    // numlines may or may not be used:
+    let _ = uz.err.write_all(prompt);
+    let _ = uz.err.flush();
+    let c = if flag & 1 != 0 {
+        loop {
+            match super::ttyio::zgetch(uz) {
+                Some(c @ (b'\r' | b'\n' | b' ' | b'q' | b'Q')) => break Some(c),
+                Some(_) => {}
+                None => break None,
+            }
+        }
+    } else {
+        super::ttyio::zgetch(uz)
+    };
+
+    // newline was not echoed, so cover up prompt line
+    let _ = uz.err.write_all(m::HIDE_PROMPT.as_bytes());
+    let _ = uz.err.flush();
+
+    if c.is_some_and(|c| c.eq_ignore_ascii_case(&b'q')) {
+        uz.exit_run(PK_COOL);
+        return;
+    }
+    if c.is_none() && flag & 1 != 0 {
+        // ruling: T11-4
+        uz.o.m_flag = false;
+    }
+
+    uz.sol = true;
+
+    // space for another screen, enter for another line.
+    if flag & 1 != 0 && c == Some(b' ') {
+        uz.lines = 0;
+    }
+}
+
+/// crypt.h's `IZ_PW_*`: what a password fetch answered.
+pub(crate) enum Pw {
+    /// `IZ_PW_ENTERED`: a password was typed.
+    Entered(super::ttyio::Password),
+    /// `IZ_PW_CANCELALL`: an empty answer: skip, and ask no more.
+    CancelAll,
+    /// `IZ_PW_ERROR`: no password can be had.
+    Error,
+}
+
+/// `UzpPassword()`'s first prompt: `[zipfile] entry password: ` with both
+/// names filtered, or "Enter password: " when they exceed `2*FILNAMSIZ`
+/// bytes together (ubuntu: 20-cve-2018-1000035; ruling T11-5 for Apple).
+pub(crate) fn passw_prompt(uz: &mut Uz, zfn: &[u8], efn: &[u8]) -> Vec<u8> {
+    let zfnf = fnfilter1(uz, zfn);
+    let efnf = fnfilter2(uz, efn);
+    let room = 2 * flavour::filnamsiz(uz.flavour);
+    if zfnf.len() + efnf.len() <= room {
+        let mut p = Vec::new();
+        m::printf(&mut p, m::PASSW_PROMPT, &[&zfnf, &efnf]);
+        p
+    } else {
+        m::PASSW_PROMPT2.as_bytes().to_vec()
+    }
+}
+
+// port: fileio.c:UzpPassword
+/// `UzpPassword(&G, rcnt, pwbuf, size, zfn, efn)`: the first call for an
+/// entry (`*rcnt == 0`) asks with the archive's and the entry's names and
+/// sets two retries; each later call asks "password incorrect--reenter"
+/// and spends one. The names are `G.zipfn` and `G.filename`.
+///
+/// ubuntu: 20-cve-2018-1000035-unzip-buffer-overflow.patch: when the two
+/// filtered names exceed `2*FILNAMSIZ` bytes the prompt is "Enter
+/// password: ". ruling: T11-5. Apple's build `sprintf()`s them into its
+/// `2*FILNAMSIZ + 15`-byte buffer unchecked, and `__sprintf_chk` kills it
+/// (SIGTRAP, exit 133) one byte past that (probe: `lon3.zip` with an entry
+/// of 1020 `^A` bytes, 2048 filtered bytes, prompts; `lon4.zip` with one
+/// more byte traps); Apple's flavour gives Ubuntu's answer with its own
+/// `FILNAMSIZ`, as the earlier buffer rulings (T8-1, T9) do.
+pub(crate) fn uzp_password(uz: &mut Uz, rcnt: &mut i32) -> Pw {
+    let prompt: Vec<u8> = if *rcnt == 0 {
+        // First call for current entry
+        *rcnt = 2;
+        let zfn = uz.zipfn.clone();
+        let efn = c_str(&uz.filename).to_vec();
+        passw_prompt(uz, &zfn, &efn)
+    } else {
+        // Retry call, previous password was wrong
+        *rcnt -= 1;
+        m::PASSW_RETRY.as_bytes().to_vec()
+    };
+
+    match super::ttyio::getp(uz, &prompt) {
+        Err(_) => Pw::Error,
+        Ok(p) if p.is_empty_answer() => Pw::CancelAll,
+        Ok(p) => Pw::Entered(p),
+    }
 }
 
 #[cfg(test)]

@@ -429,6 +429,207 @@ pub(crate) fn take_interrupt(host: &Host) -> bool {
     }
 }
 
+/// unzip 6.0 (unzip.c: `unzip()`, measured 2026-10-20 on Apple's and
+/// Ubuntu's): SIGINT, SIGTERM and SIGABRT end the run through `handler()`
+/// (echo back on, `EXIT(IZ_CTRLC)`), installed with `signal()`, which
+/// overrides an inherited ignore; SIGHUP and SIGQUIT keep their default.
+/// unzip.c also hooks SIGBUS, SIGILL and SIGSEGV ("zipfile corrupt"), which
+/// only a crash raises; those are left to the Rust runtime.
+#[cfg(unix)]
+pub(crate) const UNZIP_SIGNALS: Signals = &[libc::SIGINT, libc::SIGTERM, libc::SIGABRT];
+#[cfg(not(unix))]
+pub(crate) const UNZIP_SIGNALS: Signals = &[];
+
+/// The code and message [`on_interrupt_exit_code`] ends the process with.
+#[cfg(unix)]
+static EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+#[cfg(unix)]
+static EXIT_MESSAGE: std::sync::atomic::AtomicPtr<u8> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+#[cfg(unix)]
+static EXIT_MESSAGE_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// What a run holds while [`arm_interrupt_exit`]'s handler is installed;
+/// dropping it puts the previous dispositions back.
+#[must_use = "dropping the guard disarms the handler at once"]
+pub(crate) struct InterruptExitGuard {
+    #[cfg(unix)]
+    old: Vec<(libc::c_int, libc::sigaction)>,
+}
+
+impl Drop for InterruptExitGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        for (sig, old) in &self.old {
+            // SAFETY: restoring a disposition sigaction itself returned.
+            unsafe { libc::sigaction(*sig, old, std::ptr::null_mut()) };
+        }
+    }
+}
+
+/// unzip.c's `SET_SIGHANDLER(sig, handler)` for each of `signals`: on
+/// arrival, the terminal mode a [`TtyMode`] changed is put back (`echon()`),
+/// `message` is written to standard error and the process exits with
+/// `code` at once. Nothing is removed: a partial output stays, as unzip
+/// leaves it. As `signal()` does, an inherited `SIG_IGN` is overridden and
+/// `SA_RESTART` is on. Under `Host::Sandbox` nothing is installed.
+///
+/// The handler calls `_exit`, where unzip's calls `exit()` (not
+/// async-signal-safe): every message is flushed as it is written, so at
+/// most the one being written when the signal lands is lost.
+pub(crate) fn arm_interrupt_exit(
+    host: &Host,
+    signals: Signals,
+    code: i32,
+    message: &'static [u8],
+) -> InterruptExitGuard {
+    #[cfg(unix)]
+    {
+        let mut old = Vec::new();
+        if matches!(host, Host::Sandbox(_)) {
+            return InterruptExitGuard { old };
+        }
+        EXIT_CODE.store(code, Ordering::SeqCst);
+        EXIT_MESSAGE_LEN.store(message.len(), Ordering::SeqCst);
+        EXIT_MESSAGE.store(message.as_ptr().cast_mut(), Ordering::SeqCst);
+        let handler = on_interrupt_exit_code as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        // SAFETY: zeroed sigaction structs filled before use; the handler
+        // only makes async-signal-safe calls (`on_interrupt_exit_code`).
+        // Every hooked signal is blocked while it runs, so it runs once.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            libc::sigemptyset(&mut action.sa_mask);
+            for &sig in signals {
+                libc::sigaddset(&mut action.sa_mask, sig);
+            }
+            action.sa_flags = libc::SA_RESTART;
+            action.sa_sigaction = handler;
+            for &sig in signals {
+                let mut prev: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(sig, &action, &mut prev) == 0 {
+                    old.push((sig, prev));
+                }
+            }
+        }
+        InterruptExitGuard { old }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (host, signals, code, message);
+        InterruptExitGuard {}
+    }
+}
+
+/// [`arm_interrupt_exit`]'s handler: unzip's `handler()` (`echon()`, then
+/// `EXIT(IZ_CTRLC)`). It never allocates or locks.
+#[cfg(unix)]
+extern "C" fn on_interrupt_exit_code(_sig: libc::c_int) {
+    restore_saved_tty();
+    let msg = EXIT_MESSAGE.load(Ordering::SeqCst);
+    let len = EXIT_MESSAGE_LEN.load(Ordering::SeqCst);
+    // SAFETY: write and _exit are async-signal-safe; `msg` is null or a
+    // `&'static [u8]` of `len` bytes stored by `arm_interrupt_exit`.
+    unsafe {
+        if !msg.is_null() && len > 0 {
+            libc::write(2, msg.cast(), len);
+        }
+        libc::_exit(EXIT_CODE.load(Ordering::SeqCst));
+    }
+}
+
+/// The terminal whose mode a [`TtyMode`] has changed, for the interrupt
+/// handler to put back: its descriptor (`-1`: none) and saved mode.
+#[cfg(unix)]
+static TTY_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+#[cfg(unix)]
+struct TtySlot(std::cell::UnsafeCell<std::mem::MaybeUninit<libc::termios>>);
+
+// SAFETY: the slot is written only by `TtyMode::set`, with `TTY_FD` at -1
+// and the exit signals blocked on the writing thread, and read only after
+// `TTY_FD` is seen >= 0 (Acquire, pairing with the Release after the
+// write). One `TtyMode` exists at a time.
+#[cfg(unix)]
+unsafe impl Sync for TtySlot {}
+
+#[cfg(unix)]
+static TTY_SAVED: TtySlot = TtySlot(std::cell::UnsafeCell::new(std::mem::MaybeUninit::uninit()));
+
+/// Put back the mode a live [`TtyMode`] saved, if there is one
+/// (`tcsetattr(TCSAFLUSH)`, which is async-signal-safe): the signal path of
+/// the guard's restore.
+#[cfg(unix)]
+pub(crate) fn restore_saved_tty() {
+    let fd = TTY_FD.load(Ordering::Acquire);
+    if fd >= 0 {
+        // SAFETY: `TTY_FD` >= 0 means the slot holds the termios written
+        // before the Release store this load pairs with.
+        unsafe {
+            libc::tcsetattr(fd, libc::TCSAFLUSH, (*TTY_SAVED.0.get()).as_ptr());
+        }
+    }
+}
+
+/// A terminal's mode changed for one read (ttyio.c's `echoff()`/`echon()`
+/// pair, `zgetch()`'s cbreak mode), put back exactly as it was when the
+/// guard drops: on every path, an error's early return and a panic's
+/// unwind included, and by [`arm_interrupt_exit`]'s handler when a signal
+/// ends the run meanwhile. Both changes use `TCSAFLUSH`, as ttyio.c's
+/// `STTY` does, so input typed ahead of the read is discarded.
+#[cfg(unix)]
+pub(crate) struct TtyMode {
+    fd: libc::c_int,
+    saved: libc::termios,
+}
+
+#[cfg(unix)]
+impl TtyMode {
+    /// `GTTY(fd)`, `change` applied to a copy, `STTY(fd)`. `None` when
+    /// `fd` is not a terminal (the C's `GTTY` and `STTY` then fail and
+    /// change nothing).
+    pub(crate) fn set(fd: libc::c_int, change: impl FnOnce(&mut libc::termios)) -> Option<TtyMode> {
+        // SAFETY: termios is plain data, filled by tcgetattr before use.
+        let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: tcgetattr writes into the termios we own.
+        if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
+            return None;
+        }
+        debug_assert!(TTY_FD.load(Ordering::Acquire) < 0, "one TtyMode at a time");
+        // SAFETY: sigset_t is plain data, initialised by sigemptyset. The
+        // exit signals are blocked on this thread while the slot is
+        // written, and `TTY_FD` is -1 meanwhile, so no handler reads it
+        // half-written; the previous mask is restored after.
+        unsafe {
+            let mut block: libc::sigset_t = std::mem::zeroed();
+            let mut old: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut block);
+            for &sig in UNZIP_SIGNALS {
+                libc::sigaddset(&mut block, sig);
+            }
+            libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
+            (*TTY_SAVED.0.get()).write(saved);
+            TTY_FD.store(fd, Ordering::Release);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+        }
+        let mut t = saved;
+        change(&mut t);
+        // SAFETY: tcsetattr reads the termios we own.
+        unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &t) };
+        Some(TtyMode { fd, saved })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TtyMode {
+    fn drop(&mut self) {
+        // Put the mode back first, then clear the slot: a signal between
+        // the two restores the same mode again.
+        // SAFETY: tcsetattr reads the termios we own.
+        unsafe { libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.saved) };
+        TTY_FD.store(-1, Ordering::Release);
+    }
+}
+
 /// The signals that ask for a progress line: xz 5.8.4's message.c
 /// `message_progress_sigs`, SIGALRM, then SIGINFO where the system has it
 /// (Apple and the BSDs), then SIGUSR1.

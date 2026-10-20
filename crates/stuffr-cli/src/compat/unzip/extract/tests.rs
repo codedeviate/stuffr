@@ -384,3 +384,95 @@ fn a_spent_budget_is_a_full_disk() {
         }
     }
 }
+
+/// `args` through `run_in_counted` in `d`'s root with `stdin` piped.
+fn run_piped(d: &Dir, f: Flavour, args: &[&str], stdin: &[u8]) -> (i32, String, String) {
+    let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+    let (code, out, err, _) =
+        run_in_counted(f, &d.0.join("root"), "unzip", &args, stdin, &|_| None);
+    (
+        code,
+        String::from_utf8_lossy(&out).into_owned(),
+        String::from_utf8_lossy(&err).into_owned(),
+    )
+}
+
+/// fileio.c's HidePrompt: `\r`, 57 blanks, `\r`.
+fn hide() -> String {
+    format!("\r{}\r", " ".repeat(57))
+}
+
+const QUIT: &str = "--- Press `Q' to quit, or any other key to continue ---";
+
+/// The `^S` pause in an archive comment reads the sandbox's standard
+/// input: `q` ends the run (exit 0, nothing more printed or extracted);
+/// any other key, or the end of the input (ruling: T11-4, `flag` 0), goes
+/// on. Listing and testing never pause.
+#[test]
+fn a_comment_pause_reads_the_run_input() {
+    let mut z = zip(&[stored(b"c.txt", b"hi", 0o100644 << 16)]);
+    let comment = b"line one\x13\nline two\x13more\nend";
+    let n = z.len();
+    z[n - 2..].copy_from_slice(&(comment.len() as u16).to_le_bytes());
+    z.extend_from_slice(comment);
+    let h = hide();
+    for f in [Flavour::Apple, Flavour::Ubuntu] {
+        let d = Dir::new("pause");
+        std::fs::write(d.0.join("root/cs.zip"), &z).unwrap();
+        let (code, out, err) = run_piped(&d, f, &["-o", "cs.zip"], b"q");
+        assert_eq!(
+            (code, out.as_str(), err.as_str()),
+            (
+                0,
+                "Archive:  cs.zip\nline one\n",
+                format!("{QUIT}{h}").as_str()
+            )
+        );
+        assert!(!d.0.join("root/c.txt").exists());
+        for stdin in [&b"xy"[..], b""] {
+            let (code, out, err) = run_piped(&d, f, &["-o", "cs.zip"], stdin);
+            assert_eq!(code, 0, "{err}");
+            assert_eq!(
+                out,
+                format!(
+                    "Archive:  cs.zip\nline one\nline twomore\nend\n extracting: c.txt{}\n",
+                    " ".repeat(19)
+                )
+            );
+            assert_eq!(err, format!("{QUIT}{h}\n{QUIT}{h}"));
+        }
+        let (code, _, err) = run_piped(&d, f, &["-t", "cs.zip"], b"q");
+        assert_eq!((code, err.as_str()), (0, ""));
+    }
+}
+
+/// `-M` before `-h` pages the usage even to a pipe (the `isatty(1)` reset
+/// comes after the help exit; probe: `printf ' ' | unzip -Mh`), reading
+/// its keys from standard input: space goes on, `q` ends the output with
+/// exit 0, and the end of the input (ruling: T11-4, where the reference
+/// spins for ever) stops the pauses.
+#[test]
+fn the_pager_pages_the_usage_to_a_pipe() {
+    let d = Dir::new("pager");
+    for f in [Flavour::Apple, Flavour::Ubuntu] {
+        let (_, plain, _) = run_piped(&d, f, &["-h"], b"");
+        let lines = plain.lines().count();
+        assert!(lines >= 22, "{lines}");
+        let more = format!("--More--(22){}", hide());
+        for stdin in [&b" "[..], b""] {
+            let (code, out, err) = run_piped(&d, f, &["-Mh"], stdin);
+            assert_eq!(
+                (code, out.as_str(), err.as_str()),
+                (0, plain.as_str(), more.as_str())
+            );
+        }
+        let (code, out, err) = run_piped(&d, f, &["-Mh"], b"q");
+        assert_eq!((code, err.as_str()), (0, more.as_str()));
+        // 22 screen lines: deviation 2's banner is wider than the screen's
+        // 80 columns, so it counts as two (`SCREENLWRAP`; the reference's
+        // own banner fits and it shows 22 text lines).
+        assert!(plain.lines().next().unwrap().len() >= 80);
+        assert_eq!(out.lines().count(), 21, "{out}");
+        assert!(plain.starts_with(&out));
+    }
+}

@@ -10,7 +10,7 @@
 //! write the C's fails.
 
 use std::fs::File;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 
 use stuffr::infozip::ByteSource;
 use stuffr::infozip::crypt::Keys;
@@ -42,10 +42,7 @@ const ANSWERBUF: usize = 10;
 /// `\n` (kept) or `size - 1` bytes, `None` at the end with nothing read.
 /// Standard input is one stdio stream for the whole run, as the C's.
 fn fgets(uz: &mut Uz, size: usize) -> Option<Vec<u8>> {
-    if uz.stdin.is_none() {
-        uz.stdin = Some(uz.host.stdin());
-    }
-    let input = uz.stdin.as_mut()?;
+    let input = uz.stdin();
     let mut line = Vec::new();
     while line.len() + 1 < size {
         let buf = match input.fill_buf() {

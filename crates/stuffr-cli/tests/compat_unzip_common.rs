@@ -55,6 +55,11 @@ mod unix {
         files: Vec<(&'static str, Vec<u8>)>,
         /// Piped standard input; `None` is `/dev/null`.
         stdin: Option<Vec<u8>>,
+        /// `stdin` is typed at the controlling terminal instead (R12,
+        /// `Case::tty_ctl`).
+        tty: bool,
+        /// Standard output is a terminal (`-M`).
+        tty_stdout: bool,
         /// Extra environment (`UNZIP`, `ZIPINFO`, ...), both sides.
         env: Vec<(&'static str, &'static str)>,
         /// The reference's exit code.
@@ -81,7 +86,28 @@ mod unix {
             let mut c = unzip_case(self.name, self.args.clone(), self.files.clone());
             c.stdin = self.stdin.clone();
             c.env = self.env.clone();
+            c.tty_ctl = self.tty;
+            c.tty_stdout = self.tty_stdout;
             c
+        }
+
+        /// The row with `keys` typed at its controlling terminal.
+        fn typed(mut self, keys: &[u8]) -> Row {
+            self.stdin = Some(keys.to_vec());
+            self.tty = true;
+            self
+        }
+
+        /// The row with `data` piped to standard input.
+        fn piped(mut self, data: &[u8]) -> Row {
+            self.stdin = Some(data.to_vec());
+            self
+        }
+
+        /// The row with standard output a terminal.
+        fn stdout_tty(mut self) -> Row {
+            self.tty_stdout = true;
+            self
         }
 
         /// The row run with `env` added to its environment.
@@ -111,6 +137,8 @@ mod unix {
             args: args.to_vec(),
             files,
             stdin: None,
+            tty: false,
+            tty_stdout: false,
             env: Vec::new(),
             code,
             stdout_contains,
@@ -230,6 +258,66 @@ mod unix {
             b"",
             b"",
         )
+    }
+
+    /// Plain `p.txt`, `s.txt` encrypted with `secret`, plain `t.txt`.
+    fn mixed_zip() -> Vec<u8> {
+        let plain = b"secret data\n";
+        let body = zipcrypto(b"secret", (crc32(plain) >> 24) as u8, plain);
+        zip_with(
+            &[
+                ZipEntrySpec::new(b"p.txt", b"plain\n"),
+                ZipEntrySpec {
+                    flags: 1,
+                    stored_data: Some(&body),
+                    ..ZipEntrySpec::new(b"s.txt", plain)
+                },
+                ZipEntrySpec::new(b"t.txt", b"other\n"),
+            ],
+            b"",
+            b"",
+        )
+    }
+
+    /// Sixty small entries: listings longer than a 24-line screen.
+    fn many_zip() -> Vec<u8> {
+        let names: Vec<String> = (0..60).map(|i| format!("f{i:02}.txt")).collect();
+        let data: Vec<Vec<u8>> = (0..60).map(|i| vec![b'x'; i]).collect();
+        let specs: Vec<ZipEntrySpec> = names
+            .iter()
+            .zip(&data)
+            .map(|(n, d)| ZipEntrySpec::new(n.as_bytes(), d))
+            .collect();
+        zip_with(&specs, b"", b"")
+    }
+
+    /// An archive comment with a `^S` pause before a line end and one
+    /// inside a line.
+    fn comment_pauses_zip() -> Vec<u8> {
+        zip_with(
+            &[ZipEntrySpec::new(b"c.txt", b"hi")],
+            b"line one\x13\nline two\x13more\nend",
+            b"",
+        )
+    }
+
+    /// `ow.zip` with `a.txt` and `b.txt`, both already in the directory.
+    fn overwrite_files() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            (
+                "ow.zip",
+                zip_with(
+                    &[
+                        ZipEntrySpec::new(b"a.txt", b"new a\n"),
+                        ZipEntrySpec::new(b"b.txt", b"new b\n"),
+                    ],
+                    b"",
+                    b"",
+                ),
+            ),
+            ("a.txt", b"old\n".to_vec()),
+            ("b.txt", b"old\n".to_vec()),
+        ]
     }
 
     /// The minimal overlapped archive (Fifield's "zip bomb" shape): one local
@@ -1452,6 +1540,185 @@ mod unix {
                 "",
             ),
         ]);
+        // At the terminal (Task 11, R12): the password prompt on the
+        // controlling terminal, the questions typed there, `-M`, `^S`.
+        let enc = || vec![("enc.zip", encrypted_zip())];
+        let hide = "\r                                                         \r";
+        let more =
+            |ns: &[u32]| -> String { ns.iter().map(|n| format!("--More--({n}){hide}")).collect() };
+        let keys = |k: &[u8]| -> Vec<u8> { k.iter().flat_map(|&b| [b, TTY_BREAK]).collect() };
+        let quit = "--- Press `Q' to quit, or any other key to continue ---";
+        let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+        v.extend([
+            row(
+                Both,
+                11,
+                "prompt: right password",
+                "unzip",
+                &["-t", "enc.zip"],
+                enc(),
+                0,
+                "    testing: s.txt                    OK\n",
+                "[enc.zip] s.txt password: \n",
+            )
+            .typed(b"secret\n"),
+            row(
+                Both,
+                11,
+                "prompt: wrong then right",
+                "unzip",
+                &["-t", "enc.zip"],
+                enc(),
+                0,
+                "    testing: s.txt                    OK\n",
+                "[enc.zip] s.txt password: \npassword incorrect--reenter: \n",
+            )
+            .typed(b"wrong\nsecret\n"),
+            row(
+                Both,
+                11,
+                "prompt: wrong three times",
+                "unzip",
+                &["-t", "enc.zip"],
+                enc(),
+                82,
+                "   skipping: s.txt                   incorrect password\n",
+                concat!(
+                    "[enc.zip] s.txt password: \n",
+                    "password incorrect--reenter: \n",
+                    "password incorrect--reenter: \n",
+                ),
+            )
+            .typed(b"wrong\nbad\nworse\n"),
+            row(
+                Both,
+                11,
+                "prompt: empty answer",
+                "unzip",
+                &["-t", "enc.zip"],
+                enc(),
+                82,
+                "1 file skipped because of incorrect password.\n",
+                "[enc.zip] s.txt password: \n",
+            )
+            .typed(b"\n"),
+            row(
+                Both,
+                11,
+                "prompt: mixed archive",
+                "unzip",
+                &["-t", "mix.zip"],
+                vec![("mix.zip", mixed_zip())],
+                0,
+                "No errors detected in compressed data of mix.zip.\n",
+                "[mix.zip] s.txt password: \n",
+            )
+            .typed(b"secret\n"),
+            row(
+                Both,
+                11,
+                "-P ''",
+                "unzip",
+                &["-P", "", "-t", "mix.zip"],
+                vec![("mix.zip", mixed_zip())],
+                1,
+                concat!(
+                    "   skipping: s.txt                   incorrect password\n",
+                    "    testing: t.txt                    OK\n",
+                    "No errors detected in mix.zip for the 2 files tested.\n",
+                    "1 file skipped because of incorrect password.\n",
+                ),
+                "",
+            ),
+            row(
+                Both,
+                11,
+                "no terminal: unable to get password",
+                "unzip",
+                &["-t", "mix.zip"],
+                vec![("mix.zip", mixed_zip())],
+                5,
+                "   skipping: s.txt                   unable to get password\n",
+                "",
+            ),
+            row(
+                Both,
+                11,
+                "[r]ename at a terminal",
+                "unzip",
+                &["ow.zip"],
+                overwrite_files(),
+                0,
+                " extracting: c.txt                   \n",
+                concat!(
+                    "replace a.txt? [y]es, [n]o, [A]ll, [N]one, [r]ename: new name: ",
+                    "replace b.txt? [y]es, [n]o, [A]ll, [N]one, [r]ename: ",
+                ),
+            )
+            .typed(b"r\nc.txt\nn\n"),
+            row(
+                Apple,
+                11,
+                "-M listing",
+                "unzip",
+                &["-M", "-l", "many.zip"],
+                vec![("many.zip", many_zip())],
+                0,
+                "       41  01-02-2020 03:04   f41.txt\r\n",
+                leak(more(&[22, 44, 45])),
+            )
+            .typed(&keys(b" \nq"))
+            .stdout_tty(),
+            row(
+                Both,
+                11,
+                "-M testing",
+                "unzip",
+                &["-M", "-t", "many.zip"],
+                vec![("many.zip", many_zip())],
+                0,
+                "    testing: f43.txt                  OK\r\n",
+                leak(more(&[22, 44, 45])),
+            )
+            .typed(&keys(b" \nq"))
+            .stdout_tty(),
+            row(
+                Apple,
+                11,
+                "-Mh paged to a pipe",
+                "unzip",
+                &["-Mh"],
+                vec![],
+                0,
+                "Usage: unzip ",
+                leak(more(&[22])),
+            )
+            .piped(b" "),
+            row(
+                Both,
+                11,
+                "^S in a comment, then q",
+                "unzip",
+                &["-o", "cs.zip"],
+                vec![("cs.zip", comment_pauses_zip())],
+                0,
+                "Archive:  cs.zip\nline one\n",
+                leak(format!("{quit}{hide}")),
+            )
+            .piped(b"q"),
+            row(
+                Both,
+                11,
+                "^S in a comment at a terminal",
+                "unzip",
+                &["-o", "cs.zip"],
+                vec![("cs.zip", comment_pauses_zip())],
+                0,
+                "line twomore\nend\n extracting: c.txt",
+                leak(format!("{quit}{hide}\n{quit}{hide}")),
+            )
+            .typed(&keys(b"x ")),
+        ]);
         // Extraction (Task 10), as both references extract.
         let up = || {
             vec![(
@@ -1782,8 +2049,13 @@ mod unix {
         differential(10);
     }
 
+    /// Task 11's rows (the password prompt, the questions at a terminal,
+    /// `-M`, the `^S` pause): Apple's and the `Both` rows on macOS;
+    /// Ubuntu's side waits for Task 13 (R13), as `Row::task_here` tags it
+    /// (`compat_unzip_tty` runs the same paths against Ubuntu's reference
+    /// now).
     #[test]
-    #[ignore = "Task 11"]
+    #[cfg_attr(not(target_os = "macos"), ignore = "Task 13 (R13: Ubuntu's side)")]
     fn task11_rows_match_stuffr() {
         differential(11);
     }

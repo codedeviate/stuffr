@@ -421,6 +421,11 @@ fn do_seekable(uz: &mut Uz, lastchance: bool) -> i32 {
         uz.zin.ziplen.min(66000)
     };
     let mut error_in_archive = end::find_ecrec(uz, searchlen);
+    if uz.abort.is_some() {
+        // `q` at the comment's `^S` pause in a sandbox: the C has exited
+        close_infile(uz);
+        return PK_COOL;
+    }
     if error_in_archive > PK_WARN {
         close_infile(uz);
         if maybe_exe {

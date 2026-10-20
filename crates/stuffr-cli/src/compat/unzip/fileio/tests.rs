@@ -193,3 +193,33 @@ fn oem_names_are_code_page_850() {
     ext_ascii_to_native(&mut s, &unix, false);
     assert_eq!(&s, b"\x82");
 }
+
+/// ruling: T11-5. The first password prompt names the archive and the
+/// entry while both, filtered, fit `2*FILNAMSIZ` bytes (Apple 2048, Ubuntu
+/// 8192), else it is "Enter password: " (ubuntu:
+/// 20-cve-2018-1000035-unzip-buffer-overflow.patch; Apple's build dies one
+/// byte past its buffer).
+#[test]
+fn the_password_prompt_fits_its_buffer() {
+    let env = |_: &str| None;
+    for (f, room) in [(Flavour::Apple, 2048), (Flavour::Ubuntu, 8192)] {
+        let mut err: Vec<u8> = Vec::new();
+        let mut uz = Uz::new(sandbox(), f, &env, &mut err);
+        let zfn = b"lon3.zip";
+        // each ^A shows as two bytes
+        let fits = vec![1u8; (room - zfn.len()) / 2];
+        let p = passw_prompt(&mut uz, zfn, &fits);
+        assert_eq!(
+            p.len(),
+            zfn.len() + 2 * fits.len() + b"[] password: ".len() + 1
+        );
+        assert!(p.starts_with(b"[lon3.zip] ^A^A"), "{f:?}");
+        assert!(p.ends_with(b"^A password: "));
+        let over = [fits.clone(), b"A".to_vec()].concat();
+        assert_eq!(passw_prompt(&mut uz, zfn, &over), b"Enter password: ");
+        assert_eq!(
+            passw_prompt(&mut uz, b"a.zip", b"s.txt"),
+            b"[a.zip] s.txt password: "
+        );
+    }
+}

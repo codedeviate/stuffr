@@ -34,7 +34,11 @@
 //! Task 9); testing and extraction (`extract/`: `extract.c`, `fileio.c`'s
 //! output side, crypt.c's `decrypt()`; `unix/mapname.rs`, `unix/attrs.rs`:
 //! `unix.c`'s names, paths, modes, times and symlinks; `unix/beneath.rs`:
-//! the resolve-beneath walk every change goes through; Task 10).
+//! the resolve-beneath walk every change goes through; Task 10); the
+//! terminal (`ttyio.rs`: `getp()` on `/dev/tty`, `zgetch()`,
+//! `screensize()`; `fileio.rs`: `UzpPassword()`, `UzpMorePause()`; `-M`'s
+//! line counting in `Uz::print_raw`; crypt.c's retries; the interrupt
+//! handler, exit 80: Task 11).
 
 //! Known deviations (the source of truth; the README and the spec mirror
 //! this list):
@@ -78,6 +82,7 @@ mod list;
 mod matching;
 mod messages;
 mod process;
+mod ttyio;
 mod unix;
 mod zipinfo;
 
@@ -106,6 +111,8 @@ pub(crate) const PK_PARAM: i32 = 10;
 pub(crate) const PK_FIND: i32 = 11;
 /// unzip.h:PK_EOF, an unexpected end of the archive.
 pub(crate) const PK_EOF: i32 = 51;
+/// unzip.h:IZ_CTRLC, "user hit ^C to terminate": the interrupt's exit code.
+pub(crate) const IZ_CTRLC: i32 = 80;
 /// unzpriv.h:IZ_DIR, the archive operand is a directory (never an exit
 /// code: `process_zipfiles()` counts it).
 pub(crate) const IZ_DIR: i32 = 76;
@@ -207,10 +214,11 @@ pub(crate) struct Uz<'a> {
     /// an answer finds the end of input).
     pub(crate) answerbuf: [u8; 10],
     /// Standard input as one stdio stream for the run (`fgets(...,
-    /// stdin)`), opened at the first question.
-    pub(crate) stdin: Option<host::Input>,
-    /// `G.key`: the password tried on encrypted entries.
-    pub(crate) key: Option<Vec<u8>>,
+    /// stdin)`), opened at the first question ([`Uz::stdin`]).
+    pub(crate) stdin: Option<Box<dyn io::BufRead>>,
+    /// `G.key`: the password tried on encrypted entries (zeroed when
+    /// dropped).
+    pub(crate) key: Option<ttyio::Password>,
     /// `G.nopwd`: no more prompting (`-P`, or "skip all").
     pub(crate) nopwd: bool,
     /// `G.newzip`: no encrypted entry of this archive seen yet.
@@ -260,6 +268,18 @@ pub(crate) struct Uz<'a> {
     /// it (after `getZip64Data()` for a selected entry): `zipinfo()` starts
     /// the next archive's `endprev` at 4 when it is 4.
     pub(crate) crec_relative_offset_local_header: u64,
+    /// `-M`'s pager (globals.h, `MORE`): `G.height`, the lines a screen
+    /// holds less two (`SCREENSIZE()`, read at every message).
+    pub(crate) height: i32,
+    /// `G.width`, the screen's columns (`SCREENLWRAP`: a line that reaches
+    /// it counts as two).
+    pub(crate) width: i32,
+    /// `G.lines`, lines shown since the last full screen.
+    pub(crate) lines: i32,
+    /// `G.numlines`, every line shown, for `--More--(%lu)`.
+    pub(crate) numlines: u64,
+    /// `G.chars`, the columns used on the current line.
+    pub(crate) chars: i32,
 }
 
 impl<'a> Uz<'a> {
@@ -313,7 +333,37 @@ impl<'a> Uz<'a> {
             sig: [0; 4],
             filename: vec![0u8; flavour::filnamsiz(flavour)],
             crec_relative_offset_local_header: 0,
+            height: 0,
+            width: 0,
+            lines: 0,
+            numlines: 0,
+            chars: 0,
         }
+    }
+
+    /// Standard input as stdio's `stdin`: a fill takes what one `read(2)`
+    /// returns (a line from a terminal, what a pipe holds), so a question
+    /// is answered as soon as its line is typed. A sandbox's is its bytes.
+    pub(crate) fn stdin(&mut self) -> &mut dyn io::BufRead {
+        if self.stdin.is_none() {
+            self.stdin = Some(match self.host {
+                Host::Real => Box::new(io::stdin().lock()),
+                Host::Sandbox(_) => Box::new(self.host.stdin()),
+            });
+        }
+        self.stdin.as_deref_mut().expect("just opened")
+    }
+
+    /// unzip's `EXIT(code)` from inside the run (the pager's `q`): the
+    /// process exits with `code` once its output is flushed. A sandbox
+    /// cannot exit: the code is kept in `abort`, and the caller returns.
+    pub(crate) fn exit_run(&mut self, code: i32) {
+        if matches!(self.host, Host::Real) {
+            let _ = self.out.flush();
+            let _ = self.err.flush();
+            std::process::exit(code);
+        }
+        self.abort = Some(code);
     }
 
     /// `Info(slide, flag, ((char *)slide, ...))`: the message formatted into
@@ -372,8 +422,30 @@ impl<'a> Uz<'a> {
     /// when `flag` has [`MSG_STDERR`] and `-t` is not set, else to standard
     /// output, with the leading and trailing newlines `flag` asks for, and
     /// flush. Write errors are ignored, as every `Info()` caller ignores
-    /// them. (`-M`'s pager is Task 11's.)
+    /// them. Under `-M` every line shown is counted (a line reaching the
+    /// screen's width counts too, `SCREENLWRAP`; no tab expansion, no
+    /// `TABSIZE` in either build) and a full screen pauses
+    /// ([`fileio::more_pause`], `--More--(N)`).
     pub(crate) fn print_raw(&mut self, flag: u32, buf: &[u8]) {
+        let _ = self.message(flag, buf, false);
+    }
+
+    /// `(*G.message)(&G, rawbuf, size, 0)` for `-c` and `-p`'s data:
+    /// standard output, flushed (and paged under `-M`); a failed write is
+    /// returned (flush() then gives up on the entry).
+    pub(crate) fn print_data(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.message(0, buf, true)
+    }
+
+    // port: fileio.c:UzpMessagePrnt
+    /// [`Uz::print_raw`] and [`Uz::print_data`]: `strict` returns the first
+    /// failed write, as `WriteTxtErr()`'s error is returned; a message's is
+    /// ignored, as every `Info()` caller ignores it. After the run's
+    /// `EXIT` (`abort`) nothing more is printed: the C has exited.
+    fn message(&mut self, flag: u32, buf: &[u8], strict: bool) -> io::Result<()> {
+        if self.abort.is_some() {
+            return Ok(());
+        }
         let to_stderr = flag & MSG_STDERR != 0 && !self.o.tflag;
         let owned: Vec<u8>;
         let buf = if flag & MSG_TNEWLN != 0
@@ -384,6 +456,12 @@ impl<'a> Uz<'a> {
         } else {
             buf
         };
+        if self.o.m_flag {
+            // room for --More-- and one line of overlap:
+            let (height, width) = ttyio::screensize(&self.host);
+            self.height = height - 2;
+            self.width = width;
+        }
         // error output from testing redirected:  also send to stderr
         let also_stderr = flag & MSG_STDERR != 0
             && self.o.tflag
@@ -391,34 +469,92 @@ impl<'a> Uz<'a> {
             && self.host.stderr_is_tty();
         if flag & MSG_LNEWLN != 0 && !self.sol {
             // not at start of line:  want newline
-            self.write(to_stderr, b"\n");
+            self.emit(to_stderr, b"\n", strict)?;
+            if self.o.m_flag {
+                self.chars = 0;
+                self.numlines += 1;
+                self.lines += 1;
+                if self.lines >= self.height {
+                    self.more();
+                }
+            }
             if also_stderr {
                 let _ = self.err.write_all(b"\n");
                 let _ = self.err.flush();
             }
             self.sol = true;
         }
-        if !buf.is_empty() {
-            self.write(to_stderr, buf);
+
+        // put zipfile name, filename and/or error/warning keywords here
+        let mut q = 0;
+        if self.o.m_flag {
+            for p in 0..buf.len() {
+                let mut islinefeed = false;
+                if buf[p] == b'\n' {
+                    islinefeed = true;
+                } else if buf[p] == b'\r' {
+                    self.chars = 0;
+                } else {
+                    self.chars += 1;
+                    if self.chars >= self.width {
+                        islinefeed = true;
+                    }
+                }
+                if islinefeed && self.o.m_flag {
+                    // (`-M` off again mid-message: ruling T11-4's end of
+                    // input)
+                    self.chars = 0;
+                    self.numlines += 1;
+                    self.lines += 1;
+                    if self.lines >= self.height {
+                        self.emit(to_stderr, &buf[q..=p], strict)?;
+                        self.sol = true;
+                        q = p + 1;
+                        self.more();
+                        if self.abort.is_some() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+        let rest = &buf[q..];
+        if !rest.is_empty() {
+            self.emit(to_stderr, rest, strict)?;
             if also_stderr {
-                let _ = self.err.write_all(buf);
+                let _ = self.err.write_all(rest);
                 let _ = self.err.flush();
             }
             self.sol = buf.last() == Some(&b'\n');
         }
+        Ok(())
     }
 
-    /// `(*G.message)(&G, rawbuf, size, 0)` for `-c` and `-p`'s data:
-    /// standard output, flushed; a failed write is returned (flush() then
-    /// gives up on the entry).
-    pub(crate) fn print_data(&mut self, buf: &[u8]) -> io::Result<()> {
-        if buf.is_empty() {
+    /// `(*G.mpause)(&G, MorePrompt, 1)`.
+    fn more(&mut self) {
+        let mut prompt = Vec::new();
+        printf(
+            &mut prompt,
+            m::MORE_PROMPT,
+            &[self.numlines.to_string().as_bytes()],
+        );
+        fileio::more_pause(self, &prompt, 1);
+    }
+
+    /// `WriteTxtErr(buf, outfp)` + `fflush(outfp)`: the error returned when
+    /// `strict`, else ignored.
+    fn emit(&mut self, to_stderr: bool, buf: &[u8], strict: bool) -> io::Result<()> {
+        if !strict {
+            self.write(to_stderr, buf);
             return Ok(());
         }
-        self.out.write_all(buf)?;
-        self.out.flush()?;
-        self.sol = buf.last() == Some(&b'\n');
-        Ok(())
+        let w: &mut dyn Write = if to_stderr {
+            &mut *self.err
+        } else {
+            &mut self.out
+        };
+        w.write_all(buf)?;
+        w.flush()
     }
 
     /// [`Uz::info`] of `fmt` with its `%s`/`%d` filled from `args`.
@@ -516,6 +652,14 @@ fn main(
     if name == "funzip" {
         return funzip(flavour, args, &host, err);
     }
+    // port: unzip.c:unzip (`SET_SIGHANDLER(SIGINT, handler)` and its
+    // siblings): for the whole run, an interrupt puts the terminal's echo
+    // back and exits with IZ_CTRLC, leaving a partial output in place.
+    // probe: `kill -INT`/`-TERM`/`-ABRT` during `unzip big.zip` (Apple's and
+    // Ubuntu's): exit 80, nothing printed, `big.bin` kept, also under an
+    // inherited `SIG_IGN`; SIGHUP and SIGQUIT kill it.
+    let _interrupt =
+        host::arm_interrupt_exit(&host, host::UNZIP_SIGNALS, IZ_CTRLC, m::HANDLER_TEXT);
     let mut uz = Uz::new(host, flavour, env, err);
     uz.native_is_utf8 = fileio::init_locale(&uz.host);
     let code = unzip(&mut uz, argv0, args);

@@ -2,38 +2,19 @@
 //! encryption header read, the password tried, and the keys left for the
 //! decoder (`stuffr::infozip::crypt`).
 //!
-//! Without `-P` the password comes from [`get_password`], crypt.c's
-//! `G.decr_passwd` (fileio.c's `UzpPassword()`): with no terminal (a
-//! sandbox, R7) that is `IZ_PW_ERROR`, the "unable to get password" path.
-//! Task 11 gives it the terminal prompt.
+//! Without `-P` the password comes from `G.decr_passwd`, fileio.c's
+//! `UzpPassword()` ([`fileio::uzp_password`]): the prompt on the
+//! controlling terminal, or with none (a sandbox, cron: R7) `IZ_PW_ERROR`,
+//! the "unable to get password" path.
 
 use stuffr::infozip::ByteSource;
 use stuffr::infozip::crypt::{self, RAND_HEAD_LEN};
 
+use super::super::fileio::{self, Pw};
+use super::super::ttyio::Password;
 use super::super::{PK_COOL, PK_WARN, Uz, flavour};
 use super::output::{self, EntrySrc};
 use super::{Ex, PK_ERR, PK_MEM2};
-
-/// crypt.h's `IZ_PW_*`: what a password fetch answered.
-#[allow(dead_code)]
-pub(crate) enum Pw {
-    /// `IZ_PW_ENTERED`: a password was typed.
-    Entered(Vec<u8>),
-    /// `IZ_PW_CANCEL`: skip this entry (the empty password is tried).
-    Cancel,
-    /// `IZ_PW_CANCELALL`: skip, and ask no more.
-    CancelAll,
-    /// `IZ_PW_ERROR`: no password can be had.
-    Error,
-}
-
-/// `(*G.decr_passwd)(&G, rcnt, key, IZ_PWLEN+1, zipfn, filename)`:
-/// fileio.c's `UzpPassword()`. `rcnt` is its retry counter.
-/// Until Task 11 there is no terminal prompt: `IZ_PW_ERROR`, as `getp()`
-/// answers when there is no terminal to read.
-pub(crate) fn get_password(_uz: &mut Uz, _rcnt: &mut i32) -> Pw {
-    Pw::Error
-}
 
 // port: crypt.c:testkey
 /// `testkey(h, key)`: the header decrypted with `key` and its last byte
@@ -104,7 +85,7 @@ pub(crate) fn decrypt_entry(uz: &mut Uz, ex: &mut Ex, passwrd: Option<&[u8]>) ->
         if let Some(p) = passwrd {
             // user gave password on command line
             if uz.key.is_none() {
-                uz.key = Some(p.to_vec());
+                uz.key = Some(Password::new(p));
                 uz.nopwd = true; // inhibit password prompting!
             }
         } else if uz.key.is_some() {
@@ -114,8 +95,8 @@ pub(crate) fn decrypt_entry(uz: &mut Uz, ex: &mut Ex, passwrd: Option<&[u8]>) ->
     }
 
     // if have key already, test it; else allocate memory for it
-    if let Some(key) = uz.key.clone() {
-        if testkey(uz, ex, &h, &key) {
+    if uz.key.is_some() {
+        if testp(uz, ex, &h) {
             return PK_COOL; // existing password OK (else prompt for new)
         } else if uz.nopwd {
             return PK_WARN; // user indicated no more prompting
@@ -125,32 +106,44 @@ pub(crate) fn decrypt_entry(uz: &mut Uz, ex: &mut Ex, passwrd: Option<&[u8]>) ->
     // try a few keys
     let mut n = 0;
     loop {
-        let key = match get_password(uz, &mut n) {
+        let r = fileio::uzp_password(uz, &mut n);
+        let cancel_all = matches!(r, Pw::CancelAll);
+        uz.key = match r {
             Pw::Error => {
                 // internal error in fetch of PW
                 uz.key = None;
                 return PK_MEM2;
             }
-            Pw::Entered(k) => k,
-            Pw::Cancel => {
-                // user replied "skip": we try the NIL password, and cancel
-                // fetch for this item
-                n = 0;
-                Vec::new()
-            }
+            Pw::Entered(k) => Some(k),
             Pw::CancelAll => {
+                // user replied "skip all": we try the NIL password, and
+                // cancel fetch for this item
                 n = 0;
-                uz.nopwd = true; // inhibit any further PW prompt!
-                Vec::new()
+                Some(Password::new(b""))
             }
         };
-        uz.key = Some(key.clone());
-        if testkey(uz, ex, &h, &key) {
+        if testp(uz, ex, &h) {
             return PK_COOL;
+        }
+        if cancel_all {
+            // User replied "Skip all"
+            uz.nopwd = true; // inhibit any further PW prompt!
         }
         if n <= 0 {
             break;
         }
     }
     PK_WARN
+}
+
+// port: crypt.c:testp
+/// `testp(h)`: `G.key` tested (neither build translates it: no
+/// `STR_TO_CP1`/`STR_TO_CP2` on unix).
+fn testp(uz: &mut Uz, ex: &mut Ex, h: &[u8; RAND_HEAD_LEN]) -> bool {
+    let Some(key) = uz.key.take() else {
+        return false;
+    };
+    let ok = testkey(uz, ex, h, key.key());
+    uz.key = Some(key);
+    ok
 }
