@@ -1494,8 +1494,11 @@ from lz4's documentation (man pages, `NEWS`, `-h`/`-H`) and the behaviour of
 the 1.10.0 binary. On the `lz4-c` tier liblz4 1.10.0 (Yann Collet,
 BSD-2-Clause) is linked; its notice is in
 [`crates/stuffr-cli/LICENSE-lz4`](crates/stuffr-cli/LICENSE-lz4).
+The unzip family is ported from Info-ZIP UnZip 6.0 (Apple's `zip-33` tree
+and Debian's patches) under the Info-ZIP licence, in
+[`crates/stuffr-cli/LICENSE-infozip`](crates/stuffr-cli/LICENSE-infozip).
 `stuffr-cli`'s licence metadata is therefore
-`MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD`. The GNU
+`MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD AND Info-ZIP`. The GNU
 personality contains no GNU code: GNU gzip is GPLv3 and its source was never
 read, so that behaviour comes from the manual, `--help`, the NEWS file and
 running the binary.
@@ -1797,15 +1800,22 @@ implementation from lz4's documentation and the behaviour of the 1.10.0
 binary, and is MIT. On the `lz4-c` tier liblz4 1.10.0 is linked, under its
 BSD-2-Clause licence (`crates/stuffr-cli/LICENSE-lz4`), already in the
 expression below.
+Since `0.16.0` the unzip family is ported from Info-ZIP UnZip 6.0 (Apple's
+`zip-33` tree, and Debian's patch series for the Ubuntu flavour, both under
+the same licence) and stays under the **Info-ZIP licence**, version
+2009-Jan-02 ([`crates/stuffr-cli/LICENSE-infozip`](crates/stuffr-cli/LICENSE-infozip)).
+Its clause 3 asks that an altered version be plainly marked and never
+presented as an Info-ZIP release, which is why the family's banner lines
+name stuffr and say "altered".
 `stuffr-cli`'s full expression is therefore
-**`MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD`**: the
+**`MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD AND Info-ZIP`**: the
 BSD-2-Clause covers `gzip.c` and the decoders, the BSD-3-Clause covers
 `zuncompress.c`, the University of California's `.Z` reader, and the zstd
-family; the 0BSD covers the xz family. One notice is
+family; the 0BSD covers the xz family; Info-ZIP covers the unzip family. One notice is
 BSD-style but not word for word the SPDX `BSD-2-Clause` text: the Lzd one in
 `unlz.c`. The full notice ships in `LICENSE-gzip-bsd`, and that file, not the
 SPDX name, is what to read. `stuffr-formats` is
-**`MIT AND BSD-2-Clause AND 0BSD AND BSD-3-Clause`**, because its pack
+**`MIT AND BSD-2-Clause AND 0BSD AND BSD-3-Clause AND Info-ZIP`**, because its pack
 decoder (`pack.rs`) is a port of FreeBSD's `unpack.c` (Xin LI), whose notice is
 [`crates/stuffr-formats/LICENSE-unpack-bsd`](crates/stuffr-formats/LICENSE-unpack-bsd),
 and since `0.13.0` its liblzma memory-usage formulas and container coders
@@ -1813,7 +1823,10 @@ and since `0.13.0` its liblzma memory-usage formulas and container coders
 `crates/stuffr-formats/LICENSE-xz-memusage`, and since `0.14.0` zstd
 1.5.7's default compression-parameter table (`clevels.h`, Meta Platforms,
 Inc.) is ported under zstd's BSD licence, notice in
-`crates/stuffr-formats/LICENSE-zstd-clevels`.
+`crates/stuffr-formats/LICENSE-zstd-clevels`, and since `0.16.0` Info-ZIP
+UnZip 6.0's decoders (`crypt.c`, `inflate.c`, `explode.c`, `unshrink.c`,
+in `src/infozip/`) are ported under the Info-ZIP licence, notice in
+[`crates/stuffr-formats/LICENSE-infozip`](crates/stuffr-formats/LICENSE-infozip).
 `stuffr` and `stuffr-core` are MIT. On the `c-backed` tier zlib is built too,
 under the `Zlib` licence (also permissive); the default pure tier does not
 contain it.

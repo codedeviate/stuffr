@@ -52,6 +52,8 @@ trusting the size a file declares about itself.
 formulas and container coders, ported for the pure xz tier
 (`LICENSE-xz-memusage`), and BSD-3-Clause for zstd 1.5.7's default
 compression-parameter table (`clevels.h`, Meta Platforms, Inc.), ported for
-the zstd tool's options (`LICENSE-zstd-clevels`); the crate's metadata is
-`MIT AND BSD-2-Clause AND 0BSD AND BSD-3-Clause`. `lzma-rust2`, behind the
+the zstd tool's options (`LICENSE-zstd-clevels`), and the Info-ZIP licence
+for Info-ZIP UnZip 6.0's decoders, ported for the unzip compatibility family
+(`LICENSE-infozip`); the crate's metadata is
+`MIT AND BSD-2-Clause AND 0BSD AND BSD-3-Clause AND Info-ZIP`. `lzma-rust2`, behind the
 pure xz/LZMA1/LZIP backends, is Apache-2.0.

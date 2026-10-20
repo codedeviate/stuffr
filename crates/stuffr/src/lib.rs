@@ -20,6 +20,14 @@ pub use stuffr_core::*;
 pub mod bzip2_stream {
     pub use stuffr_formats::bzip2::{RawStream, StreamError, StreamReader};
 }
+/// Info-ZIP UnZip 6.0's own decoders — traditional PKWARE decryption so
+/// far, inflate, explode and unshrink to follow — what the `stuffr` binary's
+/// unzip compatibility family decodes entries with, failing where unzip
+/// fails. Ported under the Info-ZIP licence. Not part of the stable API.
+#[doc(hidden)]
+pub mod infozip {
+    pub use stuffr_formats::infozip::*;
+}
 /// The old Unix `pack` (`.z`) decoder — what the `stuffr` binary's gzip
 /// compatibility personalities use for the pack files both references read.
 /// Not part of the stable API.

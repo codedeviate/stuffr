@@ -18,8 +18,10 @@ rust-version.workspace = true
 # zstd's BSD licence (BSD-3-Clause, already in the expression), which ships
 # as LICENSE-zstd. The lz4 family ports nothing (a clean-room front end;
 # lz4's GPL `programs/` was never read) and links liblz4 (BSD-2-Clause,
-# already in the expression) on the `lz4-c` tier: LICENSE-lz4.
-license = "MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD"
+# already in the expression) on the `lz4-c` tier: LICENSE-lz4. The unzip
+# family ports Info-ZIP UnZip 6.0's front end (Apple's zip-33 tree and
+# Debian's patches, all under the Info-ZIP licence): LICENSE-infozip.
+license = "MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD AND Info-ZIP"
 repository.workspace = true
 keywords = ["compression", "archive", "cli", "unzip", "extract"]
 categories = ["command-line-utilities", "compression"]

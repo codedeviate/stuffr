@@ -190,6 +190,12 @@ pub mod cpio_salvage;
 pub mod deflate;
 #[cfg(feature = "gzip")]
 pub mod gzip;
+// Info-ZIP UnZip 6.0's decoders (crypt.c, then inflate.c, explode.c and
+// unshrink.c), ported for the `unzip` compatibility family and reached
+// through `stuffr-cli` only; not part of the public surface. Pure Rust and
+// ungated, as `pack` is.
+#[doc(hidden)]
+pub mod infozip;
 // `zip` joined this gate in Salvage Stage 2 Task 1: `salvage_verify.rs`
 // (below) reaches `legacy::crc::crc16_arc_continued` from its `Verifier::
 // Crc16` arm unconditionally — the match is on a runtime value, not a

@@ -76,9 +76,13 @@ the [project README](https://github.com/codedeviate/stuffr#readme).
 ## License
 
 [MIT](LICENSE), with ported code under other permissive licences: the crate's
-metadata is `MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD`.
+metadata is
+`MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD AND Info-ZIP`.
 The notices ship as `LICENSE-bzip2`, `LICENSE-gzip-bsd`, `LICENSE-xz`,
-`LICENSE-zstd` and `LICENSE-lz4`. The lz4 family ports nothing (lz4's CLI is
+`LICENSE-zstd`, `LICENSE-lz4` and `LICENSE-infozip`. The lz4 family ports nothing (lz4's CLI is
 GPL-2.0-or-later and was not read; it is a clean-room implementation from lz4's
 documentation and behaviour); `LICENSE-lz4` is liblz4's BSD-2-Clause notice,
-for the `lz4-c` tier that links it.
+for the `lz4-c` tier that links it. The unzip family is ported from Info-ZIP
+UnZip 6.0 (Apple's `zip-33` tree, with Debian's patches for the Ubuntu
+flavour) under the Info-ZIP licence, `LICENSE-infozip`; it is an altered
+version, not an Info-ZIP release.
