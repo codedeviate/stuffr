@@ -433,7 +433,7 @@ compat-ubuntu:
 	  -v stuffr-ubuntu-cargo-registry:/home/oracle/.cargo/registry \
 	  -v stuffr-ubuntu-target:/target \
 	  $(COMPAT_UBUNTU_IMAGE) \
-	  cargo test --locked -p stuffr-cli --test compat_unzip_ubuntu --test compat_unzip_common \
+	  cargo test --locked -p stuffr-cli --test compat_unzip_ubuntu --test compat_unzip_common --test compat_unzip_safety \
 	    --test compat_unzip_harness_selftest -- $(COMPAT_UBUNTU_ARGS)
 
 clean:
