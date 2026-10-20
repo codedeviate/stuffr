@@ -6,7 +6,7 @@
 
 CARGO ?= cargo
 
-.PHONY: help check lint-latest deps-guard fmt fmt-check lint doc test test-pure release miri hooks clean fuzz-corpus fuzz
+.PHONY: help check lint-latest deps-guard fmt fmt-check lint doc test test-pure release miri hooks clean fuzz-corpus fuzz compat-ubuntu
 
 help:
 	@echo 'stuffr development targets:'
@@ -23,6 +23,8 @@ help:
 	@echo '  make clean    remove build artefacts'
 	@echo '  make fuzz-corpus  (re)generate fuzz/corpus/{codec,container,chain,roundtrip,salvage,compat}'
 	@echo '  make fuzz     short, seeded smoke pass over the six targets (mirrors CI)'
+	@echo '  make compat-ubuntu  the unzip suites against Ubuntu 24.04 unzip, in Docker'
+	@echo '                (not in check; COMPAT_UBUNTU_ARGS=... is passed to the tests)'
 
 # Ordered so the cheapest gate fails first.
 check: deps-guard fmt-check lint doc test test-pure release
@@ -407,6 +409,32 @@ fuzz-corpus:
 	  fi; \
 	done; \
 	echo "✓ corpus regenerated ($$ran generator test(s) ran; all six target corpora non-empty)"
+
+# The unzip family's Ubuntu oracle (0.16.0, ruling R10): apt's unzip
+# 6.0-28ubuntu4.1 on ubuntu:24.04, which only CI's ubuntu-latest otherwise has.
+# Builds tests/docker/ubuntu-24.04 (the toolchain rust-toolchain.toml names)
+# and runs the Ubuntu and shared unzip suites in it with `CI=1`, so a missing
+# or wrong reference fails instead of skipping. The repository is mounted
+# read-only; cargo's registry and the target directory are named Docker
+# volumes, so runs are incremental and the host's `target/` is never written.
+# Runs as the image's unprivileged user (root ignores modes). Not part of
+# `check`: Docker is not a gate dependency. `COMPAT_UBUNTU_ARGS` goes after
+# `--` (a test name filter, `--nocapture`). `docker volume rm
+# stuffr-ubuntu-target stuffr-ubuntu-cargo-registry` starts clean.
+COMPAT_UBUNTU_IMAGE ?= stuffr-ubuntu-24.04
+COMPAT_UBUNTU_ARGS ?=
+
+compat-ubuntu:
+	docker build --quiet \
+	  --build-arg RUST_TOOLCHAIN=$$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml) \
+	  -t $(COMPAT_UBUNTU_IMAGE) tests/docker/ubuntu-24.04
+	docker run --rm -e CI=1 \
+	  -v "$(CURDIR)":/src:ro \
+	  -v stuffr-ubuntu-cargo-registry:/home/oracle/.cargo/registry \
+	  -v stuffr-ubuntu-target:/target \
+	  $(COMPAT_UBUNTU_IMAGE) \
+	  cargo test --locked -p stuffr-cli --test compat_unzip_ubuntu --test compat_unzip_common \
+	    --test compat_unzip_harness_selftest -- $(COMPAT_UBUNTU_ARGS)
 
 clean:
 	$(CARGO) clean

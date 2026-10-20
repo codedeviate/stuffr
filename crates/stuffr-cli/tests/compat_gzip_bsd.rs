@@ -46,6 +46,8 @@ mod differential {
             tty_stdout: false,
             env: vec![("STUFFR_GZIP_FLAVOR", "bsd")],
             compare_output_bytes: EXACT,
+            tz: None,
+            unzip_flavour: None,
             expect_stdout_plain: None,
             setup: None,
             roundtrip: Roundtrip::Gzip {

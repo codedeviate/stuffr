@@ -2506,6 +2506,8 @@ mod unix {
             tty_stdout: r.tty_stdout,
             env: vec![("LC_ALL", "C")],
             compare_output_bytes: EXACT,
+            tz: None,
+            unzip_flavour: None,
             expect_stdout_plain: None,
             setup: r.setup,
             roundtrip: Roundtrip::Lz4 { ref_lz4: ref_lz4() },
@@ -3116,6 +3118,8 @@ mod unix {
             tty_stdout: false,
             env: vec![],
             compare_output_bytes: true,
+            tz: None,
+            unzip_flavour: None,
             expect_stdout_plain: None,
             setup: None,
             roundtrip: Roundtrip::Lz4 { ref_lz4: ref_lz4() },
@@ -3152,6 +3156,8 @@ mod unix {
             tty_stdout: false,
             env: vec![("LC_ALL", "C")],
             compare_output_bytes: EXACT,
+            tz: None,
+            unzip_flavour: None,
             expect_stdout_plain: None,
             setup: None,
             roundtrip: Roundtrip::Lz4 { ref_lz4: ref_lz4() },
@@ -3926,6 +3932,8 @@ mod unix {
             ]
         };
         let to_stdout = |args: &[&'static str]| Case {
+            tz: None,
+            unzip_flavour: None,
             expect_stdout_plain: Some(text()),
             ..lz4_case("lz4", args, files())
         };

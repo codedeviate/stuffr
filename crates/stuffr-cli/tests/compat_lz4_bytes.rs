@@ -44,6 +44,8 @@ mod bytes {
             tty_stdout: false,
             env: vec![("LC_ALL", "C")],
             compare_output_bytes: EXACT,
+            tz: None,
+            unzip_flavour: None,
             expect_stdout_plain: None,
             setup: None,
             roundtrip: Roundtrip::Lz4 { ref_lz4: ref_lz4() },
@@ -130,6 +132,8 @@ mod bytes {
                 // Standard output holds the input's frame only (not the
                 // dictionary's).
                 cases.push(Case {
+                    tz: None,
+                    unzip_flavour: None,
                     expect_stdout_plain: Some(data.clone()),
                     ..case("lz4", out, files.clone())
                 });
@@ -171,6 +175,8 @@ mod bytes {
                 args.extend(set.iter().copied());
                 args.push(name);
                 cases.push(Case {
+                    tz: None,
+                    unzip_flavour: None,
                     expect_stdout_plain: Some(data.clone()),
                     ..case("lz4", args, files)
                 });

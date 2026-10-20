@@ -62,6 +62,8 @@ mod differential {
             tty_stdout: false,
             env: vec![("STUFFR_GZIP_FLAVOR", "gnu"), ("PATH", gnu_path())],
             compare_output_bytes: false,
+            tz: None,
+            unzip_flavour: None,
             expect_stdout_plain: None,
             setup: None,
             roundtrip: Roundtrip::Gzip {
@@ -110,6 +112,8 @@ mod differential {
             tty_stdout: c.tty_stdout,
             env: c.env.clone(),
             compare_output_bytes: c.compare_output_bytes,
+            tz: None,
+            unzip_flavour: None,
             expect_stdout_plain: c.expect_stdout_plain.clone(),
             setup: c.setup,
             roundtrip: c.roundtrip,

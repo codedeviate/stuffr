@@ -41,6 +41,8 @@ mod bytes {
             tty_stdout: false,
             env: vec![("LC_ALL", "C")],
             compare_output_bytes: EXACT,
+            tz: None,
+            unzip_flavour: None,
             expect_stdout_plain: None,
             setup: None,
             roundtrip: Roundtrip::Xz { ref_xz: ref_xz() },

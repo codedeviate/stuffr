@@ -89,6 +89,8 @@ mod unix {
             tty_stdout: false,
             env: vec![("LC_ALL", "C")],
             compare_output_bytes: exact_for(args),
+            tz: None,
+            unzip_flavour: None,
             expect_stdout_plain: None,
             setup: None,
             roundtrip: Roundtrip::Zstd {
@@ -3501,6 +3503,8 @@ mod unix {
             tty_stdout: c.tty_stdout,
             env: c.env.clone(),
             compare_output_bytes: c.compare_output_bytes,
+            tz: None,
+            unzip_flavour: None,
             expect_stdout_plain: None,
             setup: c.setup,
             roundtrip: c.roundtrip,

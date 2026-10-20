@@ -51,6 +51,8 @@ mod unix {
             tty_stdout: false,
             env: vec![],
             compare_output_bytes: true,
+            tz: None,
+            unzip_flavour: None,
             expect_stdout_plain: None,
             setup: None,
             roundtrip: roundtrip(dir),
