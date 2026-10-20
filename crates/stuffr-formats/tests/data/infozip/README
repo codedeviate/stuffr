@@ -1,0 +1,92 @@
+Info-ZIP method fixtures (stuffr 0.16.0, Task 1)
+================================================
+
+Archives that the Info-ZIP decoder ports (stuffr_formats::infozip) are tested
+against. Every file is at most 64 KiB, is committed byte-for-byte as fetched
+(or generated as stated), and was checked with BOTH references:
+
+  Apple   /usr/bin/unzip  (UnZip 6.00 of 20 April 2009, modified by Apple Inc.)
+  Ubuntu  unzip 6.0-28ubuntu4.1 on ubuntu:24.04 (docker; zip 3.0-13ubuntu0.2)
+
+Both exit 0 on `unzip -t` for every supported fixture. The unsupported ones
+(aes*, lzma, and bzip2 on Apple) are listed at the bottom with each
+reference's exact exit code and message.
+
+Sources and licences
+--------------------
+ libarchive v3.7.7        https://github.com/libarchive/libarchive/tree/v3.7.7
+                          libarchive/test/<name>.uu, decoded with uudecode.
+                          BSD-2-Clause.
+ commons-compress         https://github.com/apache/commons-compress
+                          commit 611cad06b66842692870c6ae98f50de7ce4f25d5,
+                          src/test/resources/<name>. Apache-2.0.
+ zip2 (zip-rs)            https://github.com/zip-rs/zip2
+                          commit 15639ba675933ab79f1aa425f21ebd0cf3ed482f,
+                          tests/data/<name>. MIT.
+
+Fixtures
+--------
+Each line: file | method | origin | SHA-256
+
+shrink-commons.zip      | 1 shrink, 2 entries (76 + 81 bytes)
+  commons-compress SHRUNK.ZIP, Apache-2.0
+  7403088a3219165f6de8d76abd2daf03bdcf72458dfa14713fc2b34d0293fb4e
+shrink-full-table.zip   | 1 shrink, 26001 bytes; fills the 8192-entry code table
+  zip2 tests/data/legacy/shrink_full_table.zip, MIT
+  cab8e3576040ea7bdb7bba5ff4771b8d7a929984ed00256c882dce44382aea39
+implode-4k-2trees.zip   | 6 implode, 4K window, 2 trees (flag bits 1-2 = 0 0)
+  commons-compress imploding-4Kdict-2trees.zip, Apache-2.0
+  cde0fbf261fb6f18339b2159c530462bc91220d9b43cd090b303d5b663b3f0bb
+implode-8k-3trees.zip   | 6 implode, 8K window, 3 trees (flag bits 1-2 = 1 1)
+  commons-compress imploding-8Kdict-3trees.zip, Apache-2.0
+  88d2bf6cf1e2f9604be7639ab67218e9a6ed946d0919b29cfff699c5bbc6c5fa
+deflate64-lorem.zip     | 9 deflate64, 144060 bytes
+  commons-compress lorem-ipsum-deflate64.zip, Apache-2.0
+  aa5542a9408d62f28e9032b98cb4f614b5c29eefe006532d0cd1d6a4e5c62491
+bzip2.zip               | 12 bzip2, 7600 bytes
+  GENERATED. In docker ubuntu:24.04 (zip 3.0-13ubuntu0.2), from a file of 200
+  copies of "bzip2 sample line for stuffr fixtures\n" named sample.txt:
+    TZ=UTC zip -q -X -Z bzip2 bzip2.zip sample.txt
+  Authored for this repository, so it carries the repository licence (MIT).
+  6ffce363b0be63ff1e65ffd65c2e26487f6aad2265bc49e8f2c89c396235762b
+aes128.zip              | 99 WinZip AES-128 (extra field 0x9901)
+  libarchive test_read_format_zip_winzip_aes128.zip, BSD-2-Clause
+  4cb263afa9f999074643978598f4450e7f408f482dd3adb1a00a7aff6f30e0ac
+aes256.zip              | 99 WinZip AES-256
+  libarchive test_read_format_zip_winzip_aes256.zip, BSD-2-Clause
+  447342e5b3b20d05d087e3bc3b89727879fb74734cd84556abc6c5126528dd9e
+lzma.zip                | 14 LZMA
+  libarchive test_read_format_zip_lzma.zipx (renamed), BSD-2-Clause
+  a8fd1714eff610dae52e434a759818829bf8040b5016aa771b9a33965d2dbc89
+
+ reproduces all nine hashes.
+
+Unsupported by design: exact answers of `unzip -t <file>`
+----------------------------------------------------------
+All four print the same shape; only the "can do" version differs. unzip
+refuses on the version-needed field (PK compat.) BEFORE it looks at the method.
+
+  aes128.zip, aes256.zip   (needs v5.1)
+    Apple   exit 81
+      Archive:  aes128.zip
+         skipping: README                  need PK compat. v5.1 (can do v4.5)
+      Caution:  zero files tested in aes128.zip.
+      1 file skipped because of unsupported compression or encoding.
+    Ubuntu  exit 81, identical except "(can do v4.6)"
+  lzma.zip                 (needs v6.3, entry vimrc)
+    Apple   exit 81, "skipping: vimrc  need PK compat. v6.3 (can do v4.5)", same footer
+    Ubuntu  exit 81, same with "(can do v4.6)"
+  bzip2.zip                (needs v4.6, entry sample.txt)
+    Apple   exit 81, "skipping: sample.txt  need PK compat. v4.6 (can do v4.5)", same footer
+    Ubuntu  exit 0: "testing: sample.txt   OK" and
+            "No errors detected in compressed data of bzip2.zip."
+
+Coverage gaps (Task 1 findings)
+-------------------------------
+ * Implode: only 4K+2 trees and 8K+3 trees have samples; 4K+3 and 8K+2
+   exist in no corpus found (libarchive, commons-compress, zip2, sharpcompress,
+   Info-ZIP's own tests). Needs a decision (see the Task 1 report).
+ * deflate64-lorem.zip is real deflate64 output; whether it uses a distance
+   beyond 32 KiB is not verified.
+ * zip2's deflate64_issue_25.zip was rejected: both references reject it
+   (exit 3, "missing 2166816915 bytes in zipfile").
