@@ -10,6 +10,9 @@ rust-version.workspace = true
 # `zstd_opts` ports zstd 1.5.7's `clevels.h` table (BSD-3-Clause, Meta
 # Platforms, Inc.; LICENSE-zstd-clevels).
 license = "MIT AND BSD-2-Clause AND 0BSD AND BSD-3-Clause"
+# Apache-2.0/MIT/BSD-2-Clause fixtures from other projects; see
+# tests/data/infozip/README. Tests read them from CARGO_MANIFEST_DIR.
+exclude = ["tests/data/infozip/"]
 repository.workspace = true
 keywords = ["compression", "archive", "gzip", "zstd", "tar"]
 categories = ["compression", "encoding", "filesystem"]

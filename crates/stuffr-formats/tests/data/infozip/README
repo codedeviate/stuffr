@@ -14,6 +14,12 @@ reference's exact exit code and message.
 
 Sources and licences
 --------------------
+Licence texts are in LICENSES/: Apache-2.0.txt and commons-compress-NOTICE.txt
+(commons-compress, same commit), zip2-MIT.txt (zip2, same commit),
+libarchive-BSD-2-Clause.txt (libarchive COPYING at v3.7.7).
+Excluded from the published crate (`exclude` in Cargo.toml); tests read these
+files at run time from CARGO_MANIFEST_DIR.
+
  libarchive v3.7.7        https://github.com/libarchive/libarchive/tree/v3.7.7
                           libarchive/test/<name>.uu, decoded with uudecode.
                           BSD-2-Clause.
@@ -59,7 +65,7 @@ lzma.zip                | 14 LZMA
   libarchive test_read_format_zip_lzma.zipx (renamed), BSD-2-Clause
   a8fd1714eff610dae52e434a759818829bf8040b5016aa771b9a33965d2dbc89
 
- reproduces all nine hashes.
+To reproduce all nine hashes: run `shasum -a 256 *.zip` in this directory.
 
 Unsupported by design: exact answers of `unzip -t <file>`
 ----------------------------------------------------------
@@ -81,12 +87,11 @@ refuses on the version-needed field (PK compat.) BEFORE it looks at the method.
     Ubuntu  exit 0: "testing: sample.txt   OK" and
             "No errors detected in compressed data of bzip2.zip."
 
-Coverage gaps (Task 1 findings)
--------------------------------
- * Implode: only 4K+2 trees and 8K+3 trees have samples; 4K+3 and 8K+2
-   exist in no corpus found (libarchive, commons-compress, zip2, sharpcompress,
-   Info-ZIP's own tests). Needs a decision (see the Task 1 report).
- * deflate64-lorem.zip is real deflate64 output; whether it uses a distance
-   beyond 32 KiB is not verified.
+Coverage gaps
+-------------
+ * Implode 4K+3 trees and 8K+2 trees: no sample exists in any corpus found;
+   hand-built in Task 5 (plan ruling P5).
+ * deflate64 match distance > 32 KiB in deflate64-lorem.zip: verified in
+   Task 4 (P6).
  * zip2's deflate64_issue_25.zip was rejected: both references reject it
    (exit 3, "missing 2166816915 bytes in zipfile").
