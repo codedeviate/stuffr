@@ -52,7 +52,9 @@
 //!    `UnZip 6.00 of 20 April 2009, by stuffr X.Y.Z (altered; original by
 //!    Info-ZIP, with modifications by Apple Inc.).` (Ubuntu: `(altered;
 //!    Debian's build, original by Info-ZIP).`), and likewise for zipinfo
-//!    and funzip.
+//!    and funzip. That line is wider than the pager's 80 columns, so under
+//!    `-M` it counts as two screen lines and `-Mh` pauses one text line
+//!    earlier than the reference (P26).
 //! 3. Pre-existing symlinks: the Ubuntu flavour also stays beneath the
 //!    extraction root, as Apple's does.
 //! 4. The archive being read is never overwritten.
@@ -62,6 +64,12 @@
 //!    `en_US.UTF-8` only.
 //! 7. On macOS the Ubuntu flavour also propagates the archive's quarantine
 //!    attribute (R9), as Apple's does.
+//! 8. The terminal (T11-1, P28): after a prompt, a pager key or an
+//!    interrupt, the terminal's mode is put back exactly as it was, where
+//!    unzip's `echon()` only sets echo again (after an interrupt in the
+//!    `-M` pager it leaves canonical mode off). A SIGABRT stuffr raises
+//!    itself (a crash) kills it by the signal; one sent by another process
+//!    exits 80, as unzip does for both.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -443,6 +451,7 @@ impl<'a> Uz<'a> {
     /// ignored, as every `Info()` caller ignores it. After the run's
     /// `EXIT` (`abort`) nothing more is printed: the C has exited.
     fn message(&mut self, flag: u32, buf: &[u8], strict: bool) -> io::Result<()> {
+        // ruling: T11-7. Nothing is printed after the run's `EXIT`.
         if self.abort.is_some() {
             return Ok(());
         }
@@ -476,6 +485,10 @@ impl<'a> Uz<'a> {
                 self.lines += 1;
                 if self.lines >= self.height {
                     self.more();
+                    if self.abort.is_some() {
+                        // ruling: T11-7 (`q`: the C has exited)
+                        return Ok(());
+                    }
                 }
             }
             if also_stderr {
@@ -512,6 +525,7 @@ impl<'a> Uz<'a> {
                         q = p + 1;
                         self.more();
                         if self.abort.is_some() {
+                            // ruling: T11-7
                             return Ok(());
                         }
                     }

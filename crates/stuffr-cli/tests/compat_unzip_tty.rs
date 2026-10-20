@@ -312,7 +312,8 @@ mod unix {
         }
     }
 
-    /// The brief's interrupt pin: SIGINT and SIGTERM during an extraction
+    /// The brief's interrupt pin: SIGINT, SIGTERM (and a sent SIGABRT)
+    /// during an extraction
     /// end the run with exit 80 and print nothing; the partial file stays
     /// (unzip writes it in place, with no temporary to remove). As
     /// `signal()` does, an inherited ignore of SIGINT is overridden.
@@ -330,6 +331,8 @@ mod unix {
         for (sig, inherit) in [
             (libc::SIGINT, Inherit::Default),
             (libc::SIGTERM, Inherit::Default),
+            // another process's SIGABRT (P28: our own still crashes)
+            (libc::SIGABRT, Inherit::Default),
             (libc::SIGINT, Inherit::IgnoreInt),
         ] {
             for (exe, env) in [
@@ -365,8 +368,8 @@ mod unix {
             }
         }
         let _ = std::fs::remove_dir_all(&scratch);
-        assert_eq!(ran + hung, 6);
-        assert!(ran >= 3, "only {ran} runs compared");
+        assert_eq!(ran + hung, 8);
+        assert!(ran >= 4, "only {ran} runs compared");
     }
 
     // ---- rulings only stuffr can show ----
@@ -412,5 +415,98 @@ mod unix {
                 assert_eq!(asked, "Enter password: ");
             }
         }
+    }
+
+    /// ruling: T11-3, end to end. The controlling terminal hangs up (its
+    /// master closes) while the password prompt waits, with SIGHUP ignored
+    /// so the read sees it: the reference stores its stale byte for ever,
+    /// stuffr answers as with no terminal, "unable to get password", exit 5.
+    #[test]
+    fn a_terminal_that_hangs_up_at_the_prompt_is_no_terminal() {
+        use std::io::Read;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let dir = std::env::temp_dir().join(format!("stuffr-unzip-hup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("enc.zip"), enc()).unwrap();
+        let guard = spawn_lock();
+        let (mut m, mut s) = (-1, -1);
+        // SAFETY: openpty fills two descriptors we then own; the name, mode
+        // and size may be null.
+        let rc = unsafe {
+            libc::openpty(
+                &mut m,
+                &mut s,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0);
+        // SAFETY: both were just returned by openpty.
+        let (master, slave) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s)) };
+        // SAFETY: fcntl on a descriptor we own; the child must not keep the
+        // master open.
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_stuffr"));
+        cmd.arg0("unzip")
+            .args(["-t", "enc.zip"])
+            .current_dir(&dir)
+            .env_clear()
+            .env("LANG", "C")
+            .env("STUFFR_UNZIP_FLAVOR", platform_unzip_flavour())
+            .stdin(Stdio::from(slave))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // SAFETY: only async-signal-safe calls between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::signal(libc::SIGHUP, libc::SIG_IGN);
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().unwrap();
+        drop(cmd); // our copy of the slave
+        drop(guard);
+        let mut err = child.stderr.take().unwrap();
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 256];
+        while !seen.ends_with(b"password: ") {
+            let n = err.read(&mut buf).unwrap();
+            assert!(n > 0, "no prompt: {:?}", String::from_utf8_lossy(&seen));
+            seen.extend_from_slice(&buf[..n]);
+        }
+        drop(master); // the terminal hangs up
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break st;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("stuffr kept waiting on a hung-up terminal");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let mut out = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut out)
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(status.code(), Some(5), "{status:?}");
+        assert!(
+            out.contains("   skipping: s.txt                   unable to get password\n"),
+            "{out}"
+        );
+        assert_eq!(String::from_utf8_lossy(&seen), "[enc.zip] s.txt password: ");
     }
 }

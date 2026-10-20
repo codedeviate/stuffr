@@ -415,7 +415,8 @@ pub(crate) fn do_string(
                             // don't pause for list/test
                             more_pause(uz, m::QUIT_PROMPT.as_bytes(), 0);
                             if uz.abort.is_some() {
-                                // `q` in a sandbox: the C has exited
+                                // ruling: T11-7. `q` in a sandbox: the C
+                                // has exited
                                 return PK_COOL;
                             }
                         }

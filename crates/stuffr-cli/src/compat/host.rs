@@ -474,9 +474,16 @@ impl Drop for InterruptExitGuard {
 /// leaves it. As `signal()` does, an inherited `SIG_IGN` is overridden and
 /// `SA_RESTART` is on. Under `Host::Sandbox` nothing is installed.
 ///
-/// The handler calls `_exit`, where unzip's calls `exit()` (not
-/// async-signal-safe): every message is flushed as it is written, so at
-/// most the one being written when the signal lands is lost.
+/// ruling: T11-6. The handler calls `_exit`, where unzip's calls `exit()`
+/// (not async-signal-safe): every message is flushed as it is written, so
+/// at most the one being written when the signal lands is lost.
+///
+/// ruling: P28. A signal the process sent itself (`si_pid` is our own:
+/// `abort()` after a double panic, `handle_alloc_error`, the runtime's
+/// stack-overflow handler, the allocator finding corruption) is not an
+/// interrupt: the terminal mode is put back and the signal re-raised at
+/// its default action, so stuffr's own crashes stay crashes. Another
+/// process's `kill -ABRT` keeps the C's exit 80.
 pub(crate) fn arm_interrupt_exit(
     host: &Host,
     signals: Signals,
@@ -492,17 +499,20 @@ pub(crate) fn arm_interrupt_exit(
         EXIT_CODE.store(code, Ordering::SeqCst);
         EXIT_MESSAGE_LEN.store(message.len(), Ordering::SeqCst);
         EXIT_MESSAGE.store(message.as_ptr().cast_mut(), Ordering::SeqCst);
-        let handler = on_interrupt_exit_code as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        let handler = on_interrupt_exit_code
+            as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void)
+            as libc::sighandler_t;
         // SAFETY: zeroed sigaction structs filled before use; the handler
-        // only makes async-signal-safe calls (`on_interrupt_exit_code`).
-        // Every hooked signal is blocked while it runs, so it runs once.
+        // only makes async-signal-safe calls (`on_interrupt_exit_code`),
+        // and takes the three arguments `SA_SIGINFO` passes. Every hooked
+        // signal is blocked while it runs, so it runs once.
         unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
             libc::sigemptyset(&mut action.sa_mask);
             for &sig in signals {
                 libc::sigaddset(&mut action.sa_mask, sig);
             }
-            action.sa_flags = libc::SA_RESTART;
+            action.sa_flags = libc::SA_RESTART | libc::SA_SIGINFO;
             action.sa_sigaction = handler;
             for &sig in signals {
                 let mut prev: libc::sigaction = std::mem::zeroed();
@@ -521,12 +531,33 @@ pub(crate) fn arm_interrupt_exit(
 }
 
 /// [`arm_interrupt_exit`]'s handler: unzip's `handler()` (`echon()`, then
-/// `EXIT(IZ_CTRLC)`). It never allocates or locks.
+/// `EXIT(IZ_CTRLC)`), except for a signal the process raised itself (P28).
+/// It never allocates or locks.
 #[cfg(unix)]
-extern "C" fn on_interrupt_exit_code(_sig: libc::c_int) {
+extern "C" fn on_interrupt_exit_code(
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    _ctx: *mut libc::c_void,
+) {
+    // ruling: T11-1. The whole saved mode, where `echon()` sets ECHO only.
     restore_saved_tty();
+    // SAFETY: `SA_SIGINFO` passes a valid siginfo_t (or null); getpid is
+    // async-signal-safe.
+    let own = !info.is_null() && unsafe { (*info).si_pid() == libc::getpid() };
+    if own {
+        // ruling: P28: our own abort stays a crash.
+        // SAFETY: signal and raise are async-signal-safe; the re-raised
+        // signal is blocked until this handler returns, then delivered at
+        // SIG_DFL, which ends the process with it.
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+        return;
+    }
     let msg = EXIT_MESSAGE.load(Ordering::SeqCst);
     let len = EXIT_MESSAGE_LEN.load(Ordering::SeqCst);
+    // ruling: T11-6. `_exit`, not `exit()`.
     // SAFETY: write and _exit are async-signal-safe; `msg` is null or a
     // `&'static [u8]` of `len` bytes stored by `arm_interrupt_exit`.
     unsafe {
@@ -570,6 +601,9 @@ pub(crate) fn restore_saved_tty() {
     }
 }
 
+/// ruling: T11-1. The mode is put back as saved, where the C's `echon()`
+/// only sets ECHO again (and leaves cbreak after a signal in the pager).
+///
 /// A terminal's mode changed for one read (ttyio.c's `echoff()`/`echon()`
 /// pair, `zgetch()`'s cbreak mode), put back exactly as it was when the
 /// guard drops: on every path, an error's early return and a panic's
@@ -594,7 +628,7 @@ impl TtyMode {
         if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
             return None;
         }
-        debug_assert!(TTY_FD.load(Ordering::Acquire) < 0, "one TtyMode at a time");
+        assert!(TTY_FD.load(Ordering::Acquire) < 0, "one TtyMode at a time");
         // SAFETY: sigset_t is plain data, initialised by sigemptyset. The
         // exit signals are blocked on this thread while the slot is
         // written, and `TTY_FD` is -1 meanwhile, so no handler reads it
@@ -2309,5 +2343,55 @@ mod tests {
             libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
             "an ignored SIGTSTP was hooked (status {status:#x})"
         );
+    }
+
+    /// ruling: P28. Under `arm_interrupt_exit`, a SIGABRT the process
+    /// raises itself (`abort()`) still kills it by the signal, while one
+    /// another process sends ends it with the armed code (unzip's 80). The
+    /// handler would end this test process, so the test runs its own
+    /// binary as the child (`STUFFR_HOST_ABORT_CHILD`).
+    #[cfg(unix)]
+    #[test]
+    fn an_own_abort_crashes_and_a_sent_one_exits_with_the_code() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Command, Stdio};
+        const VAR: &str = "STUFFR_HOST_ABORT_CHILD";
+        const NAME: &str =
+            "compat::host::tests::an_own_abort_crashes_and_a_sent_one_exits_with_the_code";
+        if let Some(mode) = std::env::var_os(VAR) {
+            let _armed = arm_interrupt_exit(&Host::Real, UNZIP_SIGNALS, 80, b"");
+            if mode == "own" {
+                std::process::abort();
+            }
+            println!("armed");
+            let _ = io::stdout().flush();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            std::process::exit(0);
+        }
+        let exe = std::env::current_exe().unwrap();
+        let child = |mode: &str| {
+            let mut c = Command::new(&exe);
+            c.args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+                .env(VAR, mode)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            c
+        };
+        let own = child("own").output().unwrap();
+        assert_eq!(own.status.signal(), Some(libc::SIGABRT), "{:?}", own.status);
+
+        let mut sent = child("sent").spawn().unwrap();
+        let mut out = io::BufReader::new(sent.stdout.take().unwrap());
+        let mut line = String::new();
+        while out.read_line(&mut line).unwrap() > 0 && !line.contains("armed") {
+            line.clear();
+        }
+        assert!(line.contains("armed"), "the child never armed");
+        // SAFETY: kill on a child we spawned and have not reaped.
+        unsafe { libc::kill(sent.id() as libc::pid_t, libc::SIGABRT) };
+        let st = sent.wait().unwrap();
+        assert_eq!(st.code(), Some(80), "{st:?}");
     }
 }

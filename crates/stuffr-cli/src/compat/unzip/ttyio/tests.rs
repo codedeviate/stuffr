@@ -226,3 +226,35 @@ fn a_password_shows_nothing_and_is_zeroed() {
     q.clear();
     assert!(q.is_empty_answer());
 }
+
+/// ruling: T11-3. A terminal whose master has closed returns nothing for
+/// ever (macOS: `read` gives 0 and `poll` reports `POLLHUP`; Linux: `read`
+/// fails with `EIO`), where the C would store the stale byte for ever:
+/// the prompt ends with `HungUp`, and its mode is not left changed.
+#[test]
+fn a_terminal_that_hung_up_ends_the_prompt() {
+    let _l = lock();
+    let (master, slave) = pty();
+    drop(master);
+    let fd = slave.as_raw_fd();
+    let mut b = 0u8;
+    // SAFETY: a one-byte read into a byte we own.
+    let n = unsafe { libc::read(fd, (&mut b as *mut u8).cast(), 1) };
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll on one pollfd we own, without waiting.
+    unsafe { libc::poll(&mut pfd, 1, 0) };
+    if cfg!(target_os = "macos") {
+        assert_eq!(n, 0, "macOS reads 0 from a hung-up terminal");
+        assert_ne!(pfd.revents & libc::POLLHUP, 0, "and reports POLLHUP");
+    } else {
+        assert!(n == 0 || n == -1, "{n}");
+    }
+    let mut err = Vec::new();
+    let r = getp_on(&mut err, fd, b"pw: ", IZ_PWLEN + 1);
+    assert_eq!(r.unwrap_err(), PwError::HungUp);
+    assert_eq!(err, b"pw: ");
+}

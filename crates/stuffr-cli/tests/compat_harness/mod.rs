@@ -1278,6 +1278,24 @@ fn spawn_case(exe: &Path, s: &Scratch, c: &Case, stuffr_side: bool) -> Spawned {
                 Ok(())
             });
         }
+    } else if c.unzip_flavour.is_some() {
+        // The unzip family opens `/dev/tty` for a password (and the
+        // pager's keys read the session's terminal through stdin): a case
+        // without `tty_ctl` gets a session of its own, with no controlling
+        // terminal, so run from a terminal it answers "unable to get
+        // password" (R7) instead of prompting on the developer's terminal
+        // with echo off until the timeout kills it.
+        // SAFETY: setsid is async-signal-safe and touches nothing else.
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    if c.tty_ctl {
+        // standard input is the controlling terminal, set up above
     } else if c.tty_stdin {
         let (m, sl) = openpty();
         cmd.stdin(Stdio::from(sl));

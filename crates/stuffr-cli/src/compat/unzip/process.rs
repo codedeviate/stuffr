@@ -422,7 +422,8 @@ fn do_seekable(uz: &mut Uz, lastchance: bool) -> i32 {
     };
     let mut error_in_archive = end::find_ecrec(uz, searchlen);
     if uz.abort.is_some() {
-        // `q` at the comment's `^S` pause in a sandbox: the C has exited
+        // ruling: T11-7. `q` at the comment's `^S` pause in a sandbox: the
+        // C has exited
         close_infile(uz);
         return PK_COOL;
     }

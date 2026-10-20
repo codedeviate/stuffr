@@ -52,9 +52,15 @@ impl Password {
     }
 
     /// Zero the bytes held, then forget them (`i = 0` before a retry).
+    /// Volatile writes, so the zeroing is not optimised away as dead
+    /// stores before the buffer is freed.
     fn clear(&mut self) {
-        self.0.fill(0);
-        std::hint::black_box(&self.0);
+        for b in self.0.iter_mut() {
+            // SAFETY: `b` is a valid, aligned, exclusive reference to a byte
+            // of the vector.
+            unsafe { std::ptr::write_volatile(b, 0) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
         self.0.clear();
     }
 }

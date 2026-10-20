@@ -351,4 +351,30 @@ mod unix {
         );
         assert_eq!(r.stderr, "one: two: three: ");
     }
+
+    /// An unzip-family case without `tty_ctl` runs in a session of its
+    /// own, with no controlling terminal: `/dev/tty` cannot be opened, so
+    /// a password prompt answers as R7 does even when the tests run from a
+    /// terminal. Other families' cases (no `unzip_flavour`) keep the
+    /// harness's session.
+    #[test]
+    fn an_unzip_case_has_no_controlling_terminal() {
+        let sh = Path::new("/bin/sh");
+        let script = concat!(
+            "if (exec 3</dev/tty) 2>/dev/null; then echo tty; else echo none; fi; ",
+            "[ \"$(ps -o pgid= -p $$ | tr -d ' ')\" = \"$$\" ] && echo leader || echo member",
+        );
+        let mut c = unzip_case("sh", vec!["-c", script], vec![]);
+        let r = run_program(sh, &c, false);
+        assert_eq!(
+            String::from_utf8_lossy(&r.stdout),
+            "none\nleader\n",
+            "{}",
+            r.stderr
+        );
+        c.unzip_flavour = None;
+        let r = run_program(sh, &c, false);
+        let out = String::from_utf8_lossy(&r.stdout).into_owned();
+        assert!(out.ends_with("member\n"), "{out}");
+    }
 }
