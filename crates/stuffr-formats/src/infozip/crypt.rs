@@ -131,3 +131,19 @@ pub fn test_key(password: &[u8], header: &[u8; RAND_HEAD_LEN], check: u8) -> Opt
     keys.decrypt(&mut hh);
     (hh[RAND_HEAD_LEN - 1] == check).then_some(keys)
 }
+
+/// The byte [`test_key`] compares the header's last byte with, from unzip's
+/// mixed sources (ruling P10): when the CENTRAL header has general-purpose
+/// bit 3 (`G.pInfo->ExtLocHdr`, extract.c:895) the high byte of the local
+/// header's DOS time (`G.lrec.last_mod_dos_datetime`'s low 16 bits,
+/// process.c:1852), else the high byte of the local CRC (`G.lrec.crc32`,
+/// which process.c:1859–1861 replaces with the central one when the LOCAL
+/// header has bit 3).
+// port: crypt.c:testkey (ternary)
+pub fn check_byte(central_bit3: bool, lrec_crc32: u32, lrec_dos_datetime: u32) -> u8 {
+    if central_bit3 {
+        ((lrec_dos_datetime & 0xffff) >> 8) as u8
+    } else {
+        (lrec_crc32 >> 24) as u8
+    }
+}

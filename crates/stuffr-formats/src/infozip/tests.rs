@@ -97,7 +97,16 @@ mod explode;
 mod unshrink;
 
 mod crypt {
-    use crate::infozip::crypt::{Keys, RAND_HEAD_LEN, test_key};
+    use crate::infozip::crypt::{Keys, RAND_HEAD_LEN, check_byte, test_key};
+
+    /// P10: the central bit 3 picks the DOS time's high byte (of its low 16
+    /// bits), else the CRC's.
+    #[test]
+    fn the_check_byte_follows_the_central_bit_3() {
+        assert_eq!(check_byte(false, 0x9f60_6eec, 0x5021_1883), 0x9f);
+        assert_eq!(check_byte(true, 0x9f60_6eec, 0x5021_1883), 0x18);
+        assert_eq!(check_byte(true, 0, 0xffff_00ab), 0x00);
+    }
 
     // The expected values below come from crypt.c itself: `update_keys`,
     // `decrypt_byte` and `init_keys` copied from
