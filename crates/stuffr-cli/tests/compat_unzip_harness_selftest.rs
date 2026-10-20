@@ -153,6 +153,32 @@ mod unix {
         assert!(panic_text(p).contains("in 6 way(s)"));
     }
 
+    /// R11: another Apple build's `-v` gives a header naming the lines that
+    /// differ and the drift prefix; the recorded one, or none, gives nothing.
+    #[test]
+    fn apple_drift_note_names_the_differing_identity_lines() {
+        assert!(apple_drift_note(None).is_none());
+        assert!(apple_drift_note(Some(APPLE_UNZIP_IDENTITY)).is_none());
+        let other = APPLE_UNZIP_IDENTITY.replace("on Aug  8 2026.", "on Jan  1 2027.");
+        let (head, prefix) = apple_drift_note(Some(&other)).unwrap();
+        assert_eq!(prefix, "[apple drift?] ");
+        assert!(
+            head.starts_with("[the installed /usr/bin/unzip is not the build"),
+            "{head}"
+        );
+        let recorded = head.find("recorded -v only:").unwrap();
+        let installed = head.find("installed -v only:").unwrap();
+        assert!(
+            head[recorded..installed].contains("on Aug  8 2026."),
+            "{head}"
+        );
+        assert!(head[installed..].contains("on Jan  1 2027."), "{head}");
+        assert!(
+            !head.contains("SET_DIR_ATTRIB"),
+            "only differing lines: {head}"
+        );
+    }
+
     #[test]
     fn banners_are_masked_only_when_each_side_prints_its_own() {
         let apple = "UnZip 6.00 of 20 April 2009, by Info-ZIP, with modifications by Apple Inc.\n";

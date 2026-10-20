@@ -686,10 +686,14 @@ mod unix {
     fn recorded_rows_hold_on_the_reference() {
         let rows: Vec<Row> = rows().into_iter().filter(Row::runs_here).collect();
         let mut bad = Vec::new();
+        let mut ran = 0;
         for r in &rows {
+            // No reference: a skip (a panic under CI); the rows already
+            // judged are still reported.
             let Some(run) = unzip_reference(&r.case()) else {
-                return;
+                continue;
             };
+            ran += 1;
             let stdout = String::from_utf8_lossy(&run.stdout);
             if run.code != r.code || !stdout.contains(r.stdout_contains) || run.stderr != r.stderr {
                 bad.push(format!(
@@ -707,12 +711,20 @@ mod unix {
                 ));
             }
         }
-        println!("{} rows on the {:?} reference", rows.len(), own());
+        println!("{ran} of {} rows on the {:?} reference", rows.len(), own());
+        // R11: on another Apple build, say so before every mismatch.
+        let (head, prefix) = match own() {
+            Which::Apple => apple_drift_note(apple_unzip_identity()).unwrap_or_default(),
+            _ => Default::default(),
+        };
         assert!(
             bad.is_empty(),
-            "{} rows differ:\n{}",
+            "{head}{} rows differ:\n{}",
             bad.len(),
-            bad.join("\n")
+            bad.iter()
+                .map(|b| format!("{prefix}{b}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
 
