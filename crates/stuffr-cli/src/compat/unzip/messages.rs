@@ -475,15 +475,284 @@ pub(super) const FUNZIP_USAGE: &str = concat!(
     "Extracts to stdout the gzip file or first zip entry of stdin or the given file.\n",
 );
 
+// ---- process.c (Task 8) ----
+
+/// unzip.c's `Zipnfo` (consts.h): the program's name in zipinfo mode.
+pub(super) const ZIPNFO: &str = "zipinfo";
+/// process.c's `Unzip`.
+pub(super) const UNZIP: &str = "unzip";
+/// unzpriv.h's `ZSUFX`, tried after a single archive name failed.
+pub(super) const ZSUFX: &str = ".zip";
+/// unzpriv.h's `ALT_ZSUFX` (unix only), tried after `ZSUFX`.
+pub(super) const ALT_ZSUFX: &str = ".ZIP";
+/// process.c:FilesProcessOK. `%d` is the count, `%s` ` was` or `s were`.
+pub(super) const FILES_PROCESS_OK: &str = "%d archive%s successfully processed.\n";
+/// process.c:ArchiveWarning.
+pub(super) const ARCHIVE_WARNING: &str = "%d archive%s had warnings but no fatal errors.\n";
+/// process.c:ArchiveFatalError.
+pub(super) const ARCHIVE_FATAL_ERROR: &str = "%d archive%s had fatal errors.\n";
+/// process.c:FileHadNoZipfileDir.
+pub(super) const FILE_HAD_NO_ZIPFILE_DIR: &str = "%d file%s had no zipfile directory.\n";
+/// process.c:ZipfileWasDir.
+pub(super) const ZIPFILE_WAS_DIR: &str = "1 \"zipfile\" was a directory.\n";
+/// process.c:ManyZipfilesWereDir.
+pub(super) const MANY_ZIPFILES_WERE_DIR: &str = "%d \"zipfiles\" were directories.\n";
+/// process.c:NoZipfileFound.
+pub(super) const NO_ZIPFILE_FOUND: &str = "No zipfiles found.\n";
+/// process.c:CannotFindZipfileDirMsg (unix): program, operand, `"  "` in
+/// zipinfo mode, operand, the last name tried.
+pub(super) const CANNOT_FIND_ZIPFILE_DIR_MSG: &str = "%s:  cannot find zipfile directory in one of %s or\n        %s%s.zip, and cannot find %s, period.\n";
+/// process.c:CannotFindEitherZipfile (unix).
+pub(super) const CANNOT_FIND_EITHER_ZIPFILE: &str = "%s:  cannot find or open %s, %s.zip or %s.\n";
+/// process.c:MaybeExe.
+pub(super) const MAYBE_EXE: &str = "note:  %s may be a plain executable, not an archive\n";
+/// process.c:CentDirNotInZipMsg (zipinfo mode). `%s` the archive, then
+/// the two disk numbers (`%lu`, formatted by the caller).
+pub(super) const CENT_DIR_NOT_IN_ZIP_MSG: &str = "\n   [%s]:\n     Zipfile is disk %s of a multi-disk archive, and this is not the disk on\n     which the central zipfile directory begins (disk %s).\n";
+/// process.c:EndCentDirBogus (zipinfo mode).
+pub(super) const END_CENT_DIR_BOGUS: &str = "\nwarning [%s]:  end-of-central-directory record claims this\n  is disk %s but that the central directory starts on disk %s; this is a\n  contradiction.  Attempting to process anyway.\n";
+/// process.c:MaybePakBug (no `NO_MULTIPART`).
+pub(super) const MAYBE_PAK_BUG: &str = "warning [%s]:  zipfile claims to be last disk of a multi-part archive;\n  attempting to process anyway, assuming all parts have been concatenated\n  together in order.  Expect \"errors\" and warnings...true multi-part support\n  doesn't exist yet (coming soon).\n";
+/// process.c:ExtraBytesAtStart. `%s` the archive, the count, `""`/`"s"`.
+pub(super) const EXTRA_BYTES_AT_START: &str = "warning [%s]:  %s extra byte%s at beginning or within zipfile\n  (attempting to process anyway)\n";
+/// process.c:LogInitline.
+pub(super) const LOG_INITLINE: &str = "Archive:  %s\n";
+/// process.c:MissingBytes. `%s` the archive, the count (`FmZofft`).
+pub(super) const MISSING_BYTES: &str =
+    "error [%s]:  missing %s bytes in zipfile\n  (attempting to process anyway)\n";
+/// process.c:NullCentDirOffset.
+pub(super) const NULL_CENT_DIR_OFFSET: &str =
+    "error [%s]:  NULL central directory offset\n  (attempting to process anyway)\n";
+/// process.c:ZipfileEmpty.
+pub(super) const ZIPFILE_EMPTY: &str = "warning [%s]:  zipfile is empty\n";
+/// process.c:do_seekable's zipinfo-mode empty archive (a literal there).
+/// `%s` is `"\n  "` for zipinfo's verbose listing, else empty.
+pub(super) const EMPTY_ZIPFILE_ZI: &str = "%sEmpty zipfile.\n";
+/// process.c:CentDirStartNotFound. `%s` the archive, then `ReportMsg`.
+pub(super) const CENT_DIR_START_NOT_FOUND: &str =
+    "error [%s]:  start of central directory not found;\n  zipfile corrupt.\n%s";
+/// process.c:Cent64EndSigSearchErr.
+pub(super) const CENT64_END_SIG_SEARCH_ERR: &str = "fatal error: read failure while seeking for End-of-centdir-64 signature.\n  This zipfile is corrupt.\n";
+/// process.c:Cent64EndSigSearchOff.
+pub(super) const CENT64_END_SIG_SEARCH_OFF: &str = "error: End-of-centdir-64 signature not where expected (prepended bytes?)\n  (attempting to process anyway)\n";
+/// process.c:CentDirTooLong. `%s` the archive, the count.
+pub(super) const CENT_DIR_TOO_LONG: &str = "error [%s]:  reported length of central directory is\n  %s bytes too long (Atari STZip zipfile?  J.H.Holm ZIPSPLIT 1.1\n  zipfile?).  Compensating...\n";
+/// process.c:CentDirEndSigNotFound (not `SFX`).
+pub(super) const CENT_DIR_END_SIG_NOT_FOUND: &str = "  End-of-central-directory signature not found.  Either this file is not\n  a zipfile, or it constitutes one disk of a multi-part archive.  In the\n  latter case the central directory and zipfile comment will be found on\n  the last disk(s) of this archive.\n";
+/// process.c's `"[%s]\n"` (find_ecrec(), find_ecrec64()): the archive's
+/// name before an end-record failure under `-q` or in zipinfo mode.
+pub(super) const BRACKETED_NAME: &str = "[%s]\n";
+/// process.c:ZipTimeStampFailed (`TIMESTAMP`).
+pub(super) const ZIP_TIME_STAMP_FAILED: &str = "warning:  cannot set time for %s\n";
+/// process.c:ZipTimeStampSuccess.
+pub(super) const ZIP_TIME_STAMP_SUCCESS: &str = "Updated time stamp for %s.\n";
+/// process.c:ZipfileCommTrunc1.
+pub(super) const ZIPFILE_COMM_TRUNC1: &str = "\ncaution:  zipfile comment truncated\n";
+/// process.c:NoZipfileComment (zipinfo's verbose listing).
+pub(super) const NO_ZIPFILE_COMMENT: &str = "There is no zipfile comment.\n";
+/// process.c:ZipfileCommentDesc. `%u` is the length (formatted by the
+/// caller).
+pub(super) const ZIPFILE_COMMENT_DESC: &str =
+    "The zipfile comment is %s bytes long and contains the following text:\n";
+/// process.c:ZipfileCommBegin.
+pub(super) const ZIPFILE_COMM_BEGIN: &str =
+    "======================== zipfile comment begins ==========================\n";
+/// process.c:ZipfileCommEnd.
+pub(super) const ZIPFILE_COMM_END: &str =
+    "========================= zipfile comment ends ===========================\n";
+/// process.c:ZipfileCommTrunc2.
+pub(super) const ZIPFILE_COMM_TRUNC2: &str = "\n  The zipfile comment is truncated.\n";
+/// consts.h:CentSigMsg. `%lu` is the entry's number (by the caller).
+pub(super) const CENT_SIG_MSG: &str =
+    "error:  expected central file header signature not found (file #%s).\n";
+/// consts.h:EndSigMsg (printed with `"%s"`: apple: list.c:510).
+pub(super) const END_SIG_MSG: &str =
+    "\nnote:  didn't find end-of-central-dir signature at end of central dir.\n";
+/// consts.h:SeekMsg. `%s` the archive, then `ReportMsg`.
+pub(super) const SEEK_MSG: &str = "error [%s]:  attempt to seek before beginning of zipfile\n%s";
+/// consts.h:ReportMsg (not `VMS`).
+pub(super) const REPORT_MSG: &str = "  (please check that you have transferred or created the zipfile in the\n  appropriate BINARY mode and that you have compiled UnZip properly)\n";
+
+// ---- fileio.c (Task 8) ----
+
+/// fileio.c:CannotOpenZipfile. `%s` the archive, then `strerror(errno)`.
+pub(super) const CANNOT_OPEN_ZIPFILE: &str = "error:  cannot open zipfile [ %s ]\n        %s\n";
+/// fileio.c:ReadError.
+pub(super) const READ_ERROR: &str = "error:  zipfile read error\n";
+/// fileio.c:FilenameTooLongTrunc.
+pub(super) const FILENAME_TOO_LONG_TRUNC: &str = "warning:  filename too long--truncating.\n";
+/// fileio.c:do_string's `"[ %s ]\n"`: what is left of a truncated name.
+pub(super) const TRUNCATED_NAME: &str = "[ %s ]\n";
+/// fileio.c:ExtraFieldCorrupt (apple: fileio.c:183). `%04x` is the block
+/// id, always `EF_PKSZ64` ([`EF_PKSZ64_HEX`]).
+pub(super) const EXTRA_FIELD_CORRUPT: &str =
+    "warning:  extra field (type: 0x%s) corrupt.  Continuing...\n";
+/// `EF_PKSZ64` as `%04x` prints it.
+pub(super) const EF_PKSZ64_HEX: &str = "0001";
+/// ebcdic.h's `oem2iso_850[]`: code page 850's bytes 0x80..0xff as ISO
+/// 8859-1 (fileio.c's `_OEM_INTERN` on unix).
+pub(super) const OEM2ISO_850: [u8; 128] = [
+    0xC7, 0xFC, 0xE9, 0xE2, 0xE4, 0xE0, 0xE5, 0xE7, // 80 - 87
+    0xEA, 0xEB, 0xE8, 0xEF, 0xEE, 0xEC, 0xC4, 0xC5, // 88 - 8F
+    0xC9, 0xE6, 0xC6, 0xF4, 0xF6, 0xF2, 0xFB, 0xF9, // 90 - 97
+    0xFF, 0xD6, 0xDC, 0xF8, 0xA3, 0xD8, 0xD7, 0x83, // 98 - 9F
+    0xE1, 0xED, 0xF3, 0xFA, 0xF1, 0xD1, 0xAA, 0xBA, // A0 - A7
+    0xBF, 0xAE, 0xAC, 0xBD, 0xBC, 0xA1, 0xAB, 0xBB, // A8 - AF
+    0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xC1, 0xC2, 0xC0, // B0 - B7
+    0xA9, 0xA6, 0xA6, 0x2B, 0x2B, 0xA2, 0xA5, 0x2B, // B8 - BF
+    0x2B, 0x2D, 0x2D, 0x2B, 0x2D, 0x2B, 0xE3, 0xC3, // C0 - C7
+    0x2B, 0x2B, 0x2D, 0x2D, 0xA6, 0x2D, 0x2B, 0xA4, // C8 - CF
+    0xF0, 0xD0, 0xCA, 0xCB, 0xC8, 0x69, 0xCD, 0xCE, // D0 - D7
+    0xCF, 0x2B, 0x2B, 0xA6, 0x5F, 0xA6, 0xCC, 0xAF, // D8 - DF
+    0xD3, 0xDF, 0xD4, 0xD2, 0xF5, 0xD5, 0xB5, 0xFE, // E0 - E7
+    0xDE, 0xDA, 0xDB, 0xD9, 0xFD, 0xDD, 0xAF, 0xB4, // E8 - EF
+    0xAD, 0xB1, 0x3D, 0xBE, 0xB6, 0xA7, 0xF7, 0xB8, // F0 - F7
+    0xB0, 0xA8, 0xB7, 0xB9, 0xB3, 0xB2, 0xA6, 0xA0, // F8 - FF
+];
+
+// ---- list.c (Task 8) ----
+
+/// list.c:CompFactor100.
+pub(super) const COMP_FACTOR_100: &str = "100%";
+/// list.c:list_files's `method[]`, by `find_compr_idx()`.
+pub(super) const LIST_METHODS: [&str; 18] = [
+    "Stored", "Shrunk", "Reduce1", "Reduce2", "Reduce3", "Reduce4", "Implode", "Token", "Defl:#",
+    "Def64#", "ImplDCL", "BZip2", "LZMA", "Terse", "IBMLZ77", "WavPack", "PPMd", "Unk:###",
+];
+/// list.c:list_files's `dtype[]`: deflate's option letter by flag bits 1-2
+/// (zi_short()'s too).
+pub(super) const DTYPE: [u8; 4] = *b"NXFS";
+/// unzpriv.h's `DATE_SEPCHAR`.
+pub(super) const DATE_SEPCHAR: u8 = b'-';
+/// list.c:HeadersS (no `OS2_EAS`).
+pub(super) const HEADERS_S: &str = "  Length      Date    Time    Name";
+/// list.c:HeadersS1.
+pub(super) const HEADERS_S1: &str = "---------  ---------- -----   ----";
+/// list.c:HeadersL.
+pub(super) const HEADERS_L: &str = " Length   Method    Size  Cmpr    Date    Time   CRC-32   Name";
+/// list.c:HeadersL1.
+pub(super) const HEADERS_L1: &str =
+    "--------  ------  ------- ---- ---------- ----- --------  ----";
+/// list.c:CaseConversion: the heading under `-L`.
+pub(super) const CASE_CONVERSION: &str = "%s (\"^\" ==> case\n%s   conversion)\n";
+/// list.c:list_files's `"%s\n%s\n"`: the heading.
+pub(super) const TWO_LINES: &str = "%s\n%s\n";
+
+/// `%<w>llu` of a 64-bit size (`FmZofft(v, "w", "u")`).
+fn zofft_u(v: u64, w: usize) -> String {
+    format!("{v:>w$}")
+}
+
+/// list.c:LongHdrStats, `"%s  %-7s%s %4s %02u%c%02u%c%02u %02u:%02u %08lx %c"`:
+/// the size (`%8llu`), method, compressed size (`%8llu`), ratio, date
+/// (`fields` in print order: month, day, year, hour, minute under
+/// `DF_MDY`), CRC and the case mark.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn long_hdr_stats(
+    ucsize: u64,
+    methbuf: &[u8],
+    csiz: u64,
+    cfactorstr: &[u8],
+    fields: [u64; 5],
+    sep: u8,
+    crc: u32,
+    lc: u8,
+) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(zofft_u(ucsize, 8).as_bytes());
+    v.extend_from_slice(b"  ");
+    v.extend_from_slice(methbuf);
+    v.extend(std::iter::repeat_n(
+        b' ',
+        7usize.saturating_sub(methbuf.len()),
+    ));
+    v.extend_from_slice(zofft_u(csiz, 8).as_bytes());
+    v.push(b' ');
+    v.extend(std::iter::repeat_n(
+        b' ',
+        4usize.saturating_sub(cfactorstr.len()),
+    ));
+    v.extend_from_slice(cfactorstr);
+    v.push(b' ');
+    date_time(&mut v, fields, sep);
+    v.extend_from_slice(format!(" {crc:08x} ").as_bytes());
+    v.push(lc);
+    v
+}
+
+/// `%02u%c%02u%c%02u %02u:%02u`.
+fn date_time(v: &mut Vec<u8>, [a, b, c, hh, mm]: [u64; 5], sep: u8) {
+    v.extend_from_slice(format!("{a:02}").as_bytes());
+    v.push(sep);
+    v.extend_from_slice(format!("{b:02}").as_bytes());
+    v.push(sep);
+    v.extend_from_slice(format!("{c:02} {hh:02}:{mm:02}").as_bytes());
+}
+
+/// list.c:ShortHdrStats (no `OS2_EAS`), `"%s  %02u%c%02u%c%02u %02u:%02u  %c"`:
+/// the size (`%9llu`), date and the case mark.
+pub(super) fn short_hdr_stats(ucsize: u64, fields: [u64; 5], sep: u8, lc: u8) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(zofft_u(ucsize, 9).as_bytes());
+    v.extend_from_slice(b"  ");
+    date_time(&mut v, fields, sep);
+    v.extend_from_slice(b"  ");
+    v.push(lc);
+    v
+}
+
+/// list.c:LongFileTrailer: the sizes (`%8llu`), the ratio (`%4s`), the
+/// count (`%lu file%s`).
+pub(super) fn long_file_trailer(
+    ucsize: u64,
+    csize: u64,
+    cfactorstr: &[u8],
+    members: u64,
+) -> Vec<u8> {
+    let mut v = b"--------          -------  ---                            -------\n".to_vec();
+    v.extend_from_slice(zofft_u(ucsize, 8).as_bytes());
+    v.extend_from_slice(b"         ");
+    v.extend_from_slice(zofft_u(csize, 8).as_bytes());
+    v.push(b' ');
+    v.extend(std::iter::repeat_n(
+        b' ',
+        4usize.saturating_sub(cfactorstr.len()),
+    ));
+    v.extend_from_slice(cfactorstr);
+    v.extend_from_slice(b"                            ");
+    files(&mut v, members);
+    v
+}
+
+/// list.c:ShortFileTrailer (no `OS2_EAS`): the size (`%9llu`), the count.
+pub(super) fn short_file_trailer(ucsize: u64, members: u64) -> Vec<u8> {
+    let mut v = b"---------                     -------\n".to_vec();
+    v.extend_from_slice(zofft_u(ucsize, 9).as_bytes());
+    v.extend_from_slice(b"                     ");
+    files(&mut v, members);
+    v
+}
+
+/// `%lu file%s\n`.
+fn files(v: &mut Vec<u8>, members: u64) {
+    v.extend_from_slice(members.to_string().as_bytes());
+    v.extend_from_slice(if members == 1 {
+        b" file\n"
+    } else {
+        b" files\n"
+    });
+}
+
 // ---- stuffr's own ----
 
 /// stuffr's own: the flavour variable holds neither name (exit 1). `%s` is
 /// the program name, then the value.
 pub(super) const FLAVOR_REFUSED: &str =
     "%s: STUFFR_UNZIP_FLAVOR must be apple or ubuntu, not '%s'\n";
-/// stuffr's own, until Tasks 8–11 build archive processing: what a run
-/// that parsed its command line says instead of opening the archive (exit
-/// `PK_BADERR`). `%s` is `unzip` or `zipinfo`.
+/// stuffr's own, until Tasks 9 and 10 build zipinfo's listings and the
+/// extraction: what a run that found the archive's directory says instead
+/// of listing (zipinfo), testing or extracting it (exit `PK_BADERR`). `%s`
+/// is `unzip` or `zipinfo`.
 pub(super) const NOT_BUILT_YET: &str =
     "%s:  archive processing is not implemented in this build yet (stuffr)\n";
 /// stuffr's own, until Task 12 builds funzip's decoder (exit 3, funzip.c's

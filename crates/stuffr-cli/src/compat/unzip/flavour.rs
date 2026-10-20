@@ -117,3 +117,61 @@ pub(crate) fn compiled_with(f: Flavour) -> &'static str {
         Flavour::Ubuntu => super::messages::UBUNTU_COMPILED_WITH,
     }
 }
+
+/// unzpriv.h's `DATE_FORMAT`: the order the listings print a date in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DateFormat {
+    /// `DF_MDY`, `10-26-91` (unix's default).
+    Mdy,
+    /// `DF_DMY`, `26-10-91`.
+    #[allow(dead_code)]
+    Dmy,
+    /// `DF_YMD`, `91-10-26`.
+    #[allow(dead_code)]
+    Ymd,
+}
+
+/// `-DDATE_FORMAT=DF_YMD`, Ubuntu only: dates print year first.
+///
+/// Pass-through until Task 13: Apple's answer (`DF_MDY`) for both.
+pub(crate) fn date_format(_f: Flavour) -> DateFormat {
+    DateFormat::Mdy
+}
+
+/// `-DNO_WORKING_ISPRINT`, Ubuntu only: `fnfilter()` escapes control
+/// bytes and leaves every other byte as it is (Apple's `isprint()` makes
+/// a byte it refuses `?`).
+///
+/// Pass-through until Task 13: Apple's answer (`false`) for both.
+pub(crate) fn no_working_isprint(_f: Flavour) -> bool {
+    false
+}
+
+/// `21-fix-warning-messages-on-big-files.patch`, Ubuntu only:
+/// `makeint64()` reads byte 5 of a 64-bit field, which upstream's (and
+/// Apple's) leaves out.
+///
+/// Pass-through until Task 14: Apple's answer (`false`) for both.
+pub(crate) fn makeint64_reads_byte_5(_f: Flavour) -> bool {
+    false
+}
+
+/// `handle_windows_zip64.patch`, Ubuntu only: `find_ecrec64()` takes a
+/// Zip64 locator whose disk count is 0 (as Windows writes it) as no
+/// contradiction of the classic record's disk number.
+///
+/// Pass-through until Task 14: Apple's answer (`false`) for both.
+pub(crate) fn handle_windows_zip64(_f: Flavour) -> bool {
+    false
+}
+
+/// unzpriv.h's `FILNAMSIZ`, the platform's `PATH_MAX`: the longest name
+/// (with its NUL) `G.filename` holds. Not a define or a patch but each
+/// reference's platform constant, so both are exact now: macOS's 1024,
+/// Linux's 4096.
+pub(crate) fn filnamsiz(f: Flavour) -> usize {
+    match f {
+        Flavour::Apple => 1024,
+        Flavour::Ubuntu => 4096,
+    }
+}

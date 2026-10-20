@@ -23,12 +23,16 @@
 //! options and the state, so a sandboxed run ([`run_in_counted`]) touches
 //! nothing of the process.
 //!
-//! **Built so far** (0.16.0 Task 7): the names, the flavour, the command
-//! line (`unzip.c`'s `unzip()` front half and `uz_opts()`, `zipinfo.c`'s
-//! `zi_opts()`, `envargs.c`), the usage screens, `-hh`, the `-v` screen,
-//! and funzip's usage. A command line that names an archive gets a
-//! placeholder answer (`messages::NOT_BUILT_YET`, exit 3) until archive
-//! processing lands (Tasks 8–14).
+//! **Built so far** (0.16.0 Tasks 7 and 8): the names, the flavour, the
+//! command line (`unzip.c`'s `unzip()` front half and `uz_opts()`,
+//! `zipinfo.c`'s `zi_opts()`, `envargs.c`), the usage screens, `-hh`, the
+//! `-v` screen and funzip's usage (Task 7); opening archives, wildcard
+//! archive names, the end records, Zip64, the central directory walk,
+//! wildcards and unzip's listings `-l`, `-v`, `-z`, `-T` (`process.rs`,
+//! `unix.rs`, `matching.rs`, `list.rs`, `fileio.rs`: Task 8). zipinfo's
+//! listings, testing and extraction answer with a placeholder
+//! (`messages::NOT_BUILT_YET`, exit 3) once the archive's directory is
+//! found, until Tasks 9 and 10.
 //!
 //! Known deviations (the source of truth; the README and the spec mirror
 //! this list):
@@ -65,8 +69,13 @@ use super::CountedRun;
 use super::host::{self, Host, SANDBOX_OUTPUT_CAP, Sandbox};
 
 pub(crate) mod cli;
+mod fileio;
 pub(crate) mod flavour;
+mod list;
+mod matching;
 mod messages;
+mod process;
+mod unix;
 
 pub use flavour::Flavour;
 use messages::{self as m, printf};
@@ -79,10 +88,23 @@ const FLAVOR_VAR: &str = "STUFFR_UNZIP_FLAVOR";
 pub(crate) const PK_OK: i32 = 0;
 /// unzip.h:PK_COOL, no error (the usage screen was asked for).
 pub(crate) const PK_COOL: i32 = 0;
+/// unzip.h:PK_WARN, a warning.
+pub(crate) const PK_WARN: i32 = 1;
+/// unzip.h:PK_ERR, an error in the archive.
+pub(crate) const PK_ERR: i32 = 2;
 /// unzip.h:PK_BADERR, a severe error.
 pub(crate) const PK_BADERR: i32 = 3;
+/// unzip.h:PK_NOZIP, the archive was not found.
+pub(crate) const PK_NOZIP: i32 = 9;
 /// unzip.h:PK_PARAM, bad or illegal parameters.
 pub(crate) const PK_PARAM: i32 = 10;
+/// unzip.h:PK_FIND, no files found.
+pub(crate) const PK_FIND: i32 = 11;
+/// unzip.h:PK_EOF, an unexpected end of the archive.
+pub(crate) const PK_EOF: i32 = 51;
+/// unzpriv.h:IZ_DIR, the archive operand is a directory (never an exit
+/// code: `process_zipfiles()` counts it).
+pub(crate) const IZ_DIR: i32 = 76;
 
 // unzpriv.h's message flag bits, read by `Uz::info` (fileio.c's
 // `UzpMessagePrnt`).
@@ -159,10 +181,10 @@ pub(crate) struct Uz<'a> {
     /// zipinfo).
     pub(crate) extract_flag: bool,
     /// `G.process_all_files`: no names were given after the archive.
-    #[allow(dead_code)]
     pub(crate) process_all_files: bool,
     /// `G.native_is_utf8` (ubuntu: -DUTF8_MAYBE_NATIVE): the locale's
-    /// codeset is UTF-8 (Task 13 reads it; `false` under `LANG=C`).
+    /// codeset is UTF-8 ([`ctype_is_utf8`]; `false` under `LANG=C`).
+    /// Apple's `fnfilter()` reads the same fact through `isprint()`.
     pub(crate) native_is_utf8: bool,
     /// `G.unicode_escape_all` (ubuntu: -DUNICODE_WCHAR): `-U` given once.
     #[allow(dead_code)]
@@ -177,10 +199,38 @@ pub(crate) struct Uz<'a> {
     pub(crate) qf: Option<Vec<u8>>,
     /// `G.area.Slide`: the one window every decoder writes into and the
     /// message layer formats into (rulings P13/P16), at least
-    /// `stuffr::infozip::WSIZE`, reused across entries. Unused until the
-    /// archive tasks.
-    #[allow(dead_code)]
+    /// `stuffr::infozip::WSIZE`, reused across entries. `fnfilter()` and
+    /// `do_string()` write into it as the C does.
     pub(crate) slide: Box<[u8]>,
+    /// The archive input: `G.zipfd`, `G.inbuf` and `readbuf()`'s state.
+    pub(crate) zin: fileio::ZipIn,
+    /// `G.wildzipfn`: the archive operand as given.
+    pub(crate) wildzipfn: Vec<u8>,
+    /// `G.zipfn`: the archive being processed.
+    pub(crate) zipfn: Vec<u8>,
+    /// `G.pfnames[0..G.filespecs]`: the include patterns.
+    pub(crate) pfnames: Vec<Vec<u8>>,
+    /// `G.pxnames[0..G.xfilespecs]`: the exclude patterns.
+    pub(crate) pxnames: Vec<Vec<u8>>,
+    /// `G.no_ecrec`: an earlier candidate had no end record (so the last
+    /// chance says "cannot find zipfile directory").
+    pub(crate) no_ecrec: bool,
+    /// `G.ecrec`: the end-of-central-directory record.
+    pub(crate) ecrec: process::Ecrec,
+    /// `G.lrec`: the last local header read (getZip64Data() reads it too).
+    pub(crate) lrec: process::Lrec,
+    /// `G.csize`: the entry's compressed bytes left (a C `zoff_t`).
+    pub(crate) csize: i64,
+    /// `G.real_ecrec_offset`: where the end record was found.
+    pub(crate) real_ecrec_offset: i64,
+    /// `G.expect_ecrec_offset`: where the directory says it should be.
+    pub(crate) expect_ecrec_offset: i64,
+    /// `G.sig`: the last signature read (bytes a short read did not
+    /// replace are the earlier ones).
+    pub(crate) sig: [u8; 4],
+    /// `G.filename`, `FILNAMSIZ` bytes (`flavour::filnamsiz`): the entry's
+    /// name as a C string, the bytes past its NUL left from earlier names.
+    pub(crate) filename: Vec<u8>,
 }
 
 impl<'a> Uz<'a> {
@@ -212,6 +262,19 @@ impl<'a> Uz<'a> {
             // apple: globals.c:165 (`G.qf = NULL`)
             qf: None,
             slide: vec![0u8; stuffr::infozip::WSIZE].into_boxed_slice(),
+            zin: fileio::ZipIn::new(),
+            wildzipfn: Vec::new(),
+            zipfn: Vec::new(),
+            pfnames: Vec::new(),
+            pxnames: Vec::new(),
+            no_ecrec: false,
+            ecrec: process::Ecrec::default(),
+            lrec: process::Lrec::default(),
+            csize: 0,
+            real_ecrec_offset: 0,
+            expect_ecrec_offset: 0,
+            sig: [0; 4],
+            filename: vec![0u8; flavour::filnamsiz(flavour)],
         }
     }
 
@@ -352,6 +415,7 @@ fn main(
         return funzip(flavour, args, &host, err);
     }
     let mut uz = Uz::new(host, flavour, env, err);
+    uz.native_is_utf8 = ctype_is_utf8(env);
     let code = unzip(&mut uz, argv0, args);
     let _ = uz.out.flush();
     code
@@ -389,16 +453,25 @@ fn unzip(uz: &mut Uz, argv0: &[u8], args: &[OsString]) -> i32 {
     }
 }
 
-/// process.c's `process_zipfiles()`, until Tasks 8–11 port it: a
-/// placeholder that names what is missing.
-fn process_zipfiles(uz: &mut Uz, _parsed: &cli::Parsed) -> i32 {
-    let who: &[u8] = if uz.o.zipinfo_mode {
-        b"zipinfo"
-    } else {
-        b"unzip"
-    };
-    uz.info_fmt(0x401, m::NOT_BUILT_YET, &[who]);
-    PK_BADERR
+/// `process.c`'s `process_zipfiles()`.
+fn process_zipfiles(uz: &mut Uz, parsed: &cli::Parsed) -> i32 {
+    process::process_zipfiles(uz, parsed)
+}
+
+/// Whether the locale's character type codeset is UTF-8, as `setlocale(
+/// LC_CTYPE, "")` makes it: the first of `LC_ALL`, `LC_CTYPE` and `LANG`
+/// that is set and not empty, a UTF-8 locale when it ends in `.UTF-8`
+/// (deviation 6: `C`, `C.UTF-8` and `en_US.UTF-8` are the locales the
+/// family answers alike in).
+/// probe: Apple's `unzip -l` shows 0xe9 in a name raw under `LANG=C.UTF-8`,
+/// `LANG=en_US.UTF-8` and `LC_CTYPE=en_US.UTF-8 LANG=C`, and as `?` under
+/// `LANG=C`, `LC_ALL=C LANG=en_US.UTF-8`, `LANG=en_US.utf8` (no such locale
+/// on macOS) and no locale variable at all.
+pub(crate) fn ctype_is_utf8(env: &dyn Fn(&str) -> Option<OsString>) -> bool {
+    ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .find_map(|k| env(k).filter(|v| !v.is_empty()))
+        .is_some_and(|v| v.as_encoded_bytes().ends_with(b".UTF-8"))
 }
 
 // port: funzip.c:main

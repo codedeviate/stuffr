@@ -163,6 +163,26 @@ mod unix {
         )
     }
 
+    /// `a.zip`'s entries under an archive comment (CR LF, an escape, a ^S)
+    /// and an entry comment.
+    fn comment_zip() -> Vec<u8> {
+        zip_with(
+            &[ZipEntrySpec::new(b"a.txt", b"alpha\n")],
+            b"archive\r\ncomment\x1b[1m here\x13\nend",
+            b"",
+        )
+    }
+
+    /// No entries, no comment: the end record alone.
+    fn empty_zip() -> Vec<u8> {
+        zip_with(&[], b"", b"")
+    }
+
+    /// No entries, only a comment.
+    fn comment_only_zip() -> Vec<u8> {
+        zip_with(&[], b"just a comment", b"")
+    }
+
     /// `a.txt` stored with one byte changed after its CRC was taken.
     fn crc_zip() -> Vec<u8> {
         zip_with(
@@ -787,9 +807,10 @@ mod unix {
                 ),
                 "",
             ),
+            // Testing it is Task 10's.
             row(
                 Both,
-                8,
+                10,
                 "preamble",
                 "unzip",
                 &["-t", "pre.zip"],
@@ -805,9 +826,10 @@ mod unix {
                 ),
                 "",
             ),
+            // The caution is the extraction's (Task 10).
             row(
                 Both,
-                8,
+                10,
                 "no match",
                 "unzip",
                 &["a.zip", "nomatch"],
@@ -815,6 +837,270 @@ mod unix {
                 11,
                 "Archive:  a.zip\n",
                 "caution: filename not matched:  nomatch\n",
+            ),
+        ]);
+        // Listing (Task 8): what does not print a date is the same in both
+        // builds (Ubuntu's dates are year first, Task 13).
+        v.extend([
+            row(
+                Both,
+                8,
+                "-l",
+                "unzip",
+                &["-l", "a.zip"],
+                a(),
+                0,
+                "Archive:  a.zip\n  Length      Date    Time    Name\n---------  ---------- -----   ----\n",
+                "",
+            ),
+            row(
+                Both,
+                8,
+                "-l totals",
+                "unzip",
+                &["-l", "a.zip"],
+                a(),
+                0,
+                "---------                     -------\n     2206                     2 files\n",
+                "",
+            ),
+            row(
+                Both,
+                8,
+                "-v",
+                "unzip",
+                &["-v", "a.zip"],
+                a(),
+                0,
+                concat!(
+                    " Length   Method    Size  Cmpr    Date    Time   CRC-32   Name\n",
+                    "--------  ------  ------- ---- ---------- ----- --------  ----\n",
+                ),
+                "",
+            ),
+            row(
+                Both,
+                8,
+                "-v entry",
+                "unzip",
+                &["-v", "a.zip"],
+                a(),
+                0,
+                "       6  Stored        6   0% ",
+                "",
+            ),
+            row(
+                Both,
+                8,
+                "-z",
+                "unzip",
+                &["-z", "c.zip"],
+                vec![("c.zip", comment_zip())],
+                0,
+                "Archive:  c.zip\narchive\ncomment^[[1m here\nend\n",
+                "",
+            ),
+            row(
+                Both,
+                8,
+                "-l comment",
+                "unzip",
+                &["-l", "c.zip"],
+                vec![("c.zip", comment_zip())],
+                0,
+                "Archive:  c.zip\narchive\ncomment^[[1m here\nend\n  Length",
+                "",
+            ),
+            row(
+                Both,
+                8,
+                "-lq",
+                "unzip",
+                &["-lq", "a.zip"],
+                a(),
+                0,
+                "  Length      Date    Time    Name\n",
+                "",
+            ),
+            row(
+                Both,
+                8,
+                "-lqq",
+                "unzip",
+                &["-lqq", "a.zip"],
+                a(),
+                0,
+                "   a.txt\n",
+                "",
+            ),
+            row(
+                Both,
+                8,
+                "-l include and exclude",
+                "unzip",
+                &["-l", "a.zip", "*.txt", "-x", "b.txt"],
+                a(),
+                0,
+                "     1 file\n",
+                "",
+            ),
+            row(
+                Both,
+                8,
+                "-l no match",
+                "unzip",
+                &["-l", "a.zip", "B.TXT"],
+                a(),
+                11,
+                "        0                     0 files\n",
+                "",
+            ),
+            row(
+                Both,
+                8,
+                "-lC",
+                "unzip",
+                &["-lC", "a.zip", "B.TXT"],
+                a(),
+                0,
+                "   b.txt\n",
+                "",
+            ),
+            // One archive of three has no end record: the only text on
+            // standard error is its own and the summary's, whatever order
+            // the directory lists them in.
+            row(
+                Both,
+                8,
+                "-l by wildcard",
+                "unzip",
+                &["-l", "*.zip"],
+                vec![
+                    ("a.zip", a_zip()),
+                    ("c.zip", comment_zip()),
+                    ("bad.zip", b"junk".to_vec()),
+                ],
+                9,
+                "Archive:  bad.zip\n",
+                concat!(
+                    "  End-of-central-directory signature not found.  Either this file is not\n",
+                    "  a zipfile, or it constitutes one disk of a multi-part archive.  In the\n",
+                    "  latter case the central directory and zipfile comment will be found on\n",
+                    "  the last disk(s) of this archive.\n",
+                    "\n",
+                    "2 archives were successfully processed.\n",
+                    "1 file had no zipfile directory.\n",
+                ),
+            ),
+            row(
+                Both,
+                8,
+                "wildcard matching nothing",
+                "unzip",
+                &["-l", "nomatch*.zip"],
+                a(),
+                9,
+                "",
+                "unzip:  cannot find or open nomatch*.zip, nomatch*.zip.zip or nomatch*.zip.ZIP.\n\nNo zipfiles found.\n",
+            ),
+            row(
+                Both,
+                8,
+                "-l a directory",
+                "unzip",
+                &["-l", "d"],
+                vec![("d/x", b"x".to_vec())],
+                9,
+                "",
+                "unzip:  cannot find or open d, d.zip or d.ZIP.\n",
+            ),
+            row(
+                Both,
+                8,
+                "-l .zip added",
+                "unzip",
+                &["-l", "a"],
+                a(),
+                0,
+                "Archive:  a.zip\n",
+                "",
+            ),
+            row(
+                Both,
+                8,
+                "-l not a zip",
+                "unzip",
+                &["-l", "notazip"],
+                vec![("notazip", b"this is not a zip file\n".to_vec())],
+                9,
+                "Archive:  notazip\n",
+                whole(
+                    NO_EOCD.trim_end_matches('\n'),
+                    "unzip:  cannot find zipfile directory in one of notazip or\n        \
+                     notazip.zip, and cannot find notazip.ZIP, period.\n",
+                ),
+            ),
+            row(
+                Both,
+                8,
+                "-lq truncated",
+                "unzip",
+                &["-lq", "cut.zip"],
+                vec![("cut.zip", truncated_zip())],
+                9,
+                "",
+                whole(
+                    &format!("[cut.zip]\n{}", NO_EOCD.trim_end_matches('\n')),
+                    "unzip:  cannot find zipfile directory in one of cut.zip or\n        \
+                     cut.zip.zip, and cannot find cut.zip.ZIP, period.\n",
+                ),
+            ),
+            row(
+                Both,
+                8,
+                "-l preamble",
+                "unzip",
+                &["-l", "pre.zip"],
+                vec![("pre.zip", preamble_zip())],
+                1,
+                "     2206                     2 files\n",
+                concat!(
+                    "warning [pre.zip]:  17 extra bytes at beginning or within zipfile\n",
+                    "  (attempting to process anyway)\n",
+                ),
+            ),
+            row(
+                Both,
+                8,
+                "-l comment only",
+                "unzip",
+                &["-l", "conly.zip"],
+                vec![("conly.zip", comment_only_zip())],
+                1,
+                "Archive:  conly.zip\njust a comment\n",
+                "warning [conly.zip]:  zipfile is empty\n",
+            ),
+            row(
+                Both,
+                8,
+                "-z comment only",
+                "unzip",
+                &["-z", "conly.zip"],
+                vec![("conly.zip", comment_only_zip())],
+                0,
+                "Archive:  conly.zip\njust a comment\n",
+                "",
+            ),
+            row(
+                Both,
+                8,
+                "-l empty",
+                "unzip",
+                &["-l", "empty.zip"],
+                vec![("empty.zip", empty_zip())],
+                1,
+                "Archive:  empty.zip\n",
+                "warning [empty.zip]:  zipfile is empty\n",
             ),
         ]);
         // Testing entries (Task 10), passwords (Task 11).
@@ -1060,8 +1346,11 @@ mod unix {
         run_group("task7-ubuntu", &cases, Skipped::none(), &assert_same_unzip);
     }
 
+    /// Task 8's rows (opening archives, wildcards, listings): Apple's and
+    /// the `Both` rows on macOS; Ubuntu's side waits for Task 13 (R13, its
+    /// dates and `-W`), as `Row::task_here` tags it.
     #[test]
-    #[ignore = "Task 8"]
+    #[cfg_attr(not(target_os = "macos"), ignore = "Task 13 (R13: Ubuntu's side)")]
     fn task8_rows_match_stuffr() {
         differential(8);
     }

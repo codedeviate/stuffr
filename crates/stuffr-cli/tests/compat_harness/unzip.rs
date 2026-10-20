@@ -650,14 +650,21 @@ pub fn assert_same_unzip(c: &Case) -> bool {
         return false;
     }
     let r = unzip_run(&exe, c, false);
+    let ours = stuffr_unzip(c);
+    compare_unzip(c, &r, &ours);
+    true
+}
+
+/// stuffr's run of `c` alone, through a link named `c.name` (in
+/// `c.unzip_flavour`), as [`assert_same_unzip`] makes it: for the rulings
+/// on upstream undefined behaviour, which have no reference to compare.
+pub fn stuffr_unzip(c: &Case) -> UnzipRun {
     let s = Scratch::new();
     let bin = s.0.join("bin");
     fs::create_dir_all(&bin).unwrap();
     let link = bin.join(c.name);
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
-    let ours = unzip_run(&link, c, true);
-    compare_unzip(c, &r, &ours);
-    true
+    unzip_run(&link, c, true)
 }
 
 /// The reference's run of `c` alone, as [`assert_same_unzip`] makes it
