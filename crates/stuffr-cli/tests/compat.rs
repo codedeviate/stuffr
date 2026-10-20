@@ -36,7 +36,7 @@ mod unix {
     }
 
     const STUFFR: &str = env!("CARGO_BIN_EXE_stuffr");
-    const ALL: [&str; 22] = [
+    const ALL: [&str; 25] = [
         "bzip2",
         "bunzip2",
         "bzcat",
@@ -59,6 +59,9 @@ mod unix {
         "unlz4",
         "lz4cat",
         "lz4c",
+        "unzip",
+        "zipinfo",
+        "funzip",
     ];
 
     /// A scratch directory removed on drop.
@@ -535,7 +538,7 @@ mod unix {
         assert_eq!(std::fs::read_dir(&one.0).unwrap().count(), 2);
     }
 
-    /// The four lz4 names are links like the rest (twenty-two in all), and
+    /// The four lz4 names are links like the rest (twenty-five in all), and
     /// a link runs as its name: `-h` prints its own name in the usage line
     /// (to standard error, as lz4 does), `lz4c`'s lists the legacy
     /// arguments, and `-V` prints stuffr's banner (spec deviation 1).
@@ -544,7 +547,7 @@ mod unix {
         let s = Scratch::new("lz4");
         let o = il(&s.0, &[]);
         assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-        assert_eq!(std::fs::read_dir(&s.0).unwrap().count(), 22);
+        assert_eq!(std::fs::read_dir(&s.0).unwrap().count(), 25);
         let dir = s.0.canonicalize().unwrap();
         let banner = format!(
             "*** lz4 v1.10.0 64-bit multithread (stuffr {}), by Yann Collet ***\n",
@@ -578,6 +581,53 @@ mod unix {
         let o = il(&one.0, &["--names", "lz4c,unlz4"]);
         assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
         assert_eq!(std::fs::read_dir(&one.0).unwrap().count(), 2);
+    }
+
+    /// The three unzip names (0.16.0) are links like the rest: each runs as
+    /// its name in the flavour `STUFFR_UNZIP_FLAVOR` picks (the banner says
+    /// whose build, R2), and refuses any other value of it, exit 1, in
+    /// stuffr's words.
+    #[test]
+    fn install_links_creates_the_unzip_names() {
+        let s = Scratch::new("unzip");
+        let o = il(&s.0, &["--names", "unzip,zipinfo,funzip"]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert_eq!(std::fs::read_dir(&s.0).unwrap().count(), 3);
+        let dir = s.0.canonicalize().unwrap();
+        let v = env!("CARGO_PKG_VERSION");
+        let run = |n: &str, args: &[&str], flavor: &str| {
+            let link = dir.join(n);
+            assert_eq!(std::fs::read_link(&link).unwrap(), canon_stuffr(), "{n}");
+            Command::new(&link)
+                .args(args)
+                .env("STUFFR_UNZIP_FLAVOR", flavor)
+                .env_remove("UNZIP")
+                .env_remove("UNZIPOPT")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap()
+        };
+        let o = run("unzip", &["-v"], "apple");
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert!(stdout(&o).starts_with(&format!(
+            "UnZip 6.00 of 20 April 2009, by stuffr {v} (altered; original by Info-ZIP, \
+             with modifications by Apple Inc.).\n"
+        )));
+        let o = run("zipinfo", &["-h"], "ubuntu");
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert!(stdout(&o).starts_with(&format!(
+            "ZipInfo 3.00 of 20 April 2009, by stuffr {v} (altered; Debian's build, \
+             original by Greg Roelofs and the Info-ZIP group).\n"
+        )));
+        for n in ["unzip", "zipinfo", "funzip"] {
+            let o = run(n, &["-h"], "debian");
+            assert_eq!(o.status.code(), Some(1), "{n}");
+            assert_eq!(
+                stderr(&o),
+                format!("{n}: STUFFR_UNZIP_FLAVOR must be apple or ubuntu, not 'debian'\n")
+            );
+            assert!(o.stdout.is_empty(), "{n}");
+        }
     }
 
     /// Run `exe` (with `stdin` piped in) under `flavor` as the only extra

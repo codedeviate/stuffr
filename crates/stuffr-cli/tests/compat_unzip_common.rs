@@ -55,6 +55,8 @@ mod unix {
         files: Vec<(&'static str, Vec<u8>)>,
         /// Piped standard input; `None` is `/dev/null`.
         stdin: Option<Vec<u8>>,
+        /// Extra environment (`UNZIP`, `ZIPINFO`, ...), both sides.
+        env: Vec<(&'static str, &'static str)>,
         /// The reference's exit code.
         code: i32,
         /// Text its standard output holds (`""`: nothing is checked).
@@ -78,7 +80,14 @@ mod unix {
         fn case(&self) -> Case<'_> {
             let mut c = unzip_case(self.name, self.args.clone(), self.files.clone());
             c.stdin = self.stdin.clone();
+            c.env = self.env.clone();
             c
+        }
+
+        /// The row run with `env` added to its environment.
+        fn env(mut self, env: &[(&'static str, &'static str)]) -> Row {
+            self.env = env.to_vec();
+            self
         }
     }
 
@@ -102,6 +111,7 @@ mod unix {
             args: args.to_vec(),
             files,
             stdin: None,
+            env: Vec::new(),
             code,
             stdout_contains,
             stderr,
@@ -378,6 +388,18 @@ mod unix {
         Box::leak(format!("{banner}\n{body}").into_boxed_str())
     }
 
+    /// unzip.c:Zfirst.
+    const Z_FIRST: &str =
+        "error:  -Z must be first option for ZipInfo mode (check UNZIP variable?)\n";
+
+    /// unzip.c:MustGiveExdir.
+    const MUST_GIVE_EXDIR: &str =
+        "error:  must specify directory to which to extract with -d option\n";
+
+    /// unzip.c:InvalidOptionsMsg (on standard output under `-t`).
+    const INVALID_OPTIONS: &str =
+        "error:  -fn or any combination of -c, -l, -p, -t, -u and -v options invalid\n";
+
     /// End-of-central-directory not found (unzip's `find_ecrec` failure),
     /// for `name`, after `Archive:  name`.
     const NO_EOCD: &str = concat!(
@@ -469,8 +491,258 @@ mod unix {
                     zipinfo,
                     "",
                 ),
+                // Task 7's probes (2026-10-20): no archive, `-Z` late, the
+                // environment's options (zipinfo mode reads ZIPINFO only).
+                row(
+                    who,
+                    task,
+                    "options, no archive",
+                    "unzip",
+                    &["-l"],
+                    vec![],
+                    10,
+                    "",
+                    whole(banner, usage),
+                ),
+                row(
+                    who,
+                    task,
+                    "zipinfo, options, no archive",
+                    "zipinfo",
+                    &["-l"],
+                    vec![],
+                    0,
+                    zipinfo,
+                    "",
+                ),
+                row(
+                    who,
+                    task,
+                    "zipinfo bad option",
+                    "zipinfo",
+                    &["-k"],
+                    vec![],
+                    10,
+                    "",
+                    whole(ZIPINFO_BANNER, zipinfo),
+                ),
+                row(
+                    who,
+                    task,
+                    "-Z not first",
+                    "unzip",
+                    &["-lZ", "a.zip"],
+                    a(),
+                    10,
+                    "",
+                    Box::leak(format!("{Z_FIRST}{}", whole(banner, usage)).into_boxed_str()),
+                ),
+                row(who, task, "UNZIP alone", "unzip", &[], vec![], 0, usage, "")
+                    .env(&[("UNZIP", "-q")]),
+                row(
+                    who,
+                    task,
+                    "UNZIP negated",
+                    "unzip",
+                    &["--v"],
+                    vec![],
+                    10,
+                    "",
+                    whole(banner, usage),
+                )
+                .env(&[("UNZIP", "-v")]),
+                row(
+                    who,
+                    task,
+                    "UNZIP -Z",
+                    "unzip",
+                    &["-l", "a.zip"],
+                    a(),
+                    10,
+                    "",
+                    Box::leak(format!("{Z_FIRST}{}", whole(banner, usage)).into_boxed_str()),
+                )
+                .env(&[("UNZIP", "-Z")]),
+                row(
+                    who,
+                    task,
+                    "ZIPINFO bad option",
+                    "zipinfo",
+                    &[],
+                    vec![],
+                    10,
+                    "",
+                    whole(ZIPINFO_BANNER, zipinfo),
+                )
+                .env(&[("ZIPINFO", "-k")]),
+                row(
+                    who,
+                    task,
+                    "-Z skips UNZIP",
+                    "unzip",
+                    &["-Z"],
+                    vec![],
+                    0,
+                    zipinfo,
+                    "",
+                )
+                .env(&[("UNZIP", "-k")]),
             ]);
         }
+        // Task 7's probes both references answer alike (2026-10-20).
+        let long: &'static str = Box::leak("a".repeat(16225).into_boxed_str());
+        v.extend([
+            row(
+                Both,
+                7,
+                "-hh",
+                "unzip",
+                &["-hh"],
+                vec![],
+                0,
+                "\nExtended Help for UnZip\n",
+                "",
+            ),
+            row(
+                Both,
+                7,
+                "-vqqqq",
+                "unzip",
+                &["-vqqqq"],
+                vec![],
+                0,
+                "600\n",
+                "",
+            ),
+            row(
+                Both,
+                7,
+                "-d alone",
+                "unzip",
+                &["-d"],
+                vec![],
+                10,
+                "",
+                MUST_GIVE_EXDIR,
+            ),
+            row(
+                Both,
+                7,
+                "-d -x",
+                "unzip",
+                &["-d", "-x", "a.zip"],
+                a(),
+                10,
+                "",
+                MUST_GIVE_EXDIR,
+            ),
+            row(
+                Both,
+                7,
+                "-d twice",
+                "unzip",
+                &["-d", "x", "-d", "y", "a.zip"],
+                a(),
+                10,
+                "",
+                "error:  -d option used more than once (only one exdir allowed)\n",
+            ),
+            row(
+                Both,
+                7,
+                "-P alone",
+                "unzip",
+                &["-P"],
+                vec![],
+                10,
+                "",
+                "error:  must give decryption password with -P option\n",
+            ),
+            // Under -t the message and the usage go to standard output.
+            row(
+                Both,
+                7,
+                "-ct",
+                "unzip",
+                &["-ct", "a.zip"],
+                a(),
+                10,
+                INVALID_OPTIONS,
+                "",
+            ),
+            row(
+                Both,
+                7,
+                "UNZIP -t",
+                "unzip",
+                &["-c"],
+                vec![],
+                10,
+                INVALID_OPTIONS,
+                "",
+            )
+            .env(&[("UNZIP", "-t")]),
+            row(
+                Both,
+                7,
+                "argument too long",
+                "unzip",
+                &[long],
+                vec![],
+                10,
+                "",
+                "error:  command line parameter #1 exceeds internal size limit\n",
+            ),
+            row(
+                Both,
+                7,
+                "UNZIP -v",
+                "unzip",
+                &[],
+                vec![],
+                0,
+                "           UNZIP:  -v\n",
+                "",
+            )
+            .env(&[("UNZIP", "-v")]),
+            row(
+                Both,
+                7,
+                "UNZIPOPT -v",
+                "unzip",
+                &[],
+                vec![],
+                0,
+                "        UNZIPOPT:  -v\n",
+                "",
+            )
+            .env(&[("UNZIPOPT", "-v")]),
+            row(
+                Both,
+                7,
+                "blank UNZIP, UNZIPOPT -v",
+                "unzip",
+                &[],
+                vec![],
+                0,
+                "           UNZIP:     \n        UNZIPOPT:  -v\n",
+                "",
+            )
+            .env(&[("UNZIP", "   "), ("UNZIPOPT", "-v")]),
+            row(
+                Both,
+                7,
+                "UNZIP quoted",
+                "unzip",
+                &["-v"],
+                vec![],
+                0,
+                "           UNZIP:  -q \"-d\" x \"-\\q\"\n",
+                "",
+            )
+            // `"-d"` and `x` are `-d x`; `"-\q"` unquotes to `-q`.
+            .env(&[("UNZIP", r#"-q "-d" x "-\q""#)]),
+        ]);
         // Opening the archive (Task 8): both builds answer alike.
         v.extend([
             row(
@@ -757,10 +1029,35 @@ mod unix {
         );
     }
 
+    /// Task 7's rows: Apple's (and the `Both` rows) on macOS. R13: Ubuntu's
+    /// side of them is tagged Task 13 (`Row::task_here`), so on Linux this
+    /// test has nothing to run until then, and `task7_ubuntu_rows_match_stuffr`
+    /// says so explicitly.
     #[test]
-    #[ignore = "Task 7"]
+    #[cfg_attr(not(target_os = "macos"), ignore = "Task 13 (R13: Ubuntu's side)")]
     fn task7_rows_match_stuffr() {
         differential(7);
+    }
+
+    /// Ubuntu's side of Task 7's rows (usage, `-v`, the environment), which
+    /// R13 leaves to Task 13; runs on Linux only.
+    #[test]
+    #[ignore = "Task 13"]
+    fn task7_ubuntu_rows_match_stuffr() {
+        if own() != Which::Ubuntu {
+            return;
+        }
+        // The usage loop records Ubuntu's rows under Task 13; the `Both`
+        // rows are Task 7's.
+        let rows: Vec<Row> = rows()
+            .into_iter()
+            .filter(|r| {
+                (r.flavour == Which::Ubuntu && r.task == 13)
+                    || (r.flavour == Which::Both && r.task == 7)
+            })
+            .collect();
+        let cases: Vec<Case> = rows.iter().map(Row::case).collect();
+        run_group("task7-ubuntu", &cases, Skipped::none(), &assert_same_unzip);
     }
 
     #[test]

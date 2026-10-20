@@ -4,7 +4,8 @@
 //! Apple/BSD), the xz family (0.13.0 Task 9: `xz`, `unxz`, `xzcat`,
 //! `lzma`, `unlzma`, `lzcat`) and the zstd family (0.14.0 Task 10: `zstd`,
 //! `unzstd`, `zstdcat`, `zstdmt`) and the lz4 family (0.15.0 Task 8:
-//! `lz4`, `unlz4`, `lz4cat`, `lz4c`), through
+//! `lz4`, `unlz4`, `lz4cat`, `lz4c`) and the unzip family's command line
+//! (0.16.0 Task 7: `unzip`, `zipinfo`, `funzip`), through
 //! `stuffr_cli::compat::run_in_counted` and `bzip2recover::recover`.
 //!
 //! The only fuzz coverage of `stuffr::bzip2_stream::StreamReader`, the
@@ -151,7 +152,7 @@ use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use libfuzzer_sys::fuzz_target;
-use stuffr_cli::compat::{self, bzip2recover, gzip::Flavour};
+use stuffr_cli::compat::{self, bzip2recover, gzip::Flavour, unzip};
 use stuffr_core::testing::{
     COMPAT_FILES, COMPAT_FUZZ_MAX_INPUT, COMPAT_TOKENS, check_extraction_contained,
     check_scan_is_linear, decode_compat_case,
@@ -467,8 +468,9 @@ fn run_gzip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8], pa
         Flavour::Bsd
     };
     let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
-    let (code, _out, err, reads) = compat::run_in_counted(dir, name, os_args, stdin, flavour)
-        .expect("a COMPAT_NAMES entry is a compat name");
+    let (code, _out, err, reads) =
+        compat::run_in_counted(dir, name, os_args, stdin, flavour, unzip::default_flavour())
+            .expect("a COMPAT_NAMES entry is a compat name");
     let why = || String::from_utf8_lossy(&err).into_owned();
     if std::env::var_os("STUFFR_FUZZ_COMPAT_TRACE").is_some() {
         eprintln!("compat: {name} {flavour:?} {args:?} -> {code}");
@@ -724,8 +726,15 @@ fn run_xz(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
         return;
     }
     let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
-    let (code, out, err, reads) = compat::run_in_counted(dir, name, os_args, stdin, Flavour::Gnu)
-        .expect("a COMPAT_NAMES entry is a compat name");
+    let (code, out, err, reads) = compat::run_in_counted(
+        dir,
+        name,
+        os_args,
+        stdin,
+        Flavour::Gnu,
+        unzip::default_flavour(),
+    )
+    .expect("a COMPAT_NAMES entry is a compat name");
     let why = || String::from_utf8_lossy(&err).into_owned();
     if std::env::var_os("STUFFR_FUZZ_COMPAT_TRACE").is_some() {
         eprintln!("compat: {name} {args:?} -> {code}");
@@ -1072,8 +1081,15 @@ fn run_zstd(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
         return;
     }
     let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
-    let (code, out, err, reads) = compat::run_in_counted(dir, name, os_args, stdin, Flavour::Gnu)
-        .expect("a COMPAT_NAMES entry is a compat name");
+    let (code, out, err, reads) = compat::run_in_counted(
+        dir,
+        name,
+        os_args,
+        stdin,
+        Flavour::Gnu,
+        unzip::default_flavour(),
+    )
+    .expect("a COMPAT_NAMES entry is a compat name");
     let why = || String::from_utf8_lossy(&err).into_owned();
     if std::env::var_os("STUFFR_FUZZ_COMPAT_TRACE").is_some() {
         eprintln!("compat: {name} {args:?} ({:?}) -> {code}", z.mode);
@@ -1406,8 +1422,15 @@ fn lz4_failure_lines(stderr: &[u8]) -> u64 {
 fn run_lz4(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
     let before = contents(dir);
     let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
-    let (code, out, err, reads) = compat::run_in_counted(dir, name, os_args, stdin, Flavour::Gnu)
-        .expect("a COMPAT_NAMES entry is a compat name");
+    let (code, out, err, reads) = compat::run_in_counted(
+        dir,
+        name,
+        os_args,
+        stdin,
+        Flavour::Gnu,
+        unzip::default_flavour(),
+    )
+    .expect("a COMPAT_NAMES entry is a compat name");
     let why = || String::from_utf8_lossy(&err).into_owned();
     if std::env::var_os("STUFFR_FUZZ_COMPAT_TRACE").is_some() {
         eprintln!("compat: {name} {args:?} -> {code}");
@@ -1463,9 +1486,15 @@ fn run_lz4(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
             }
             let loud = lz4_unquieted(name, args);
             let os_loud: Vec<OsString> = loud.iter().map(OsString::from).collect();
-            let (code2, _, err2, _) =
-                compat::run_in_counted(&again, name, os_loud, stdin, Flavour::Gnu)
-                    .expect("a COMPAT_NAMES entry is a compat name");
+            let (code2, _, err2, _) = compat::run_in_counted(
+                &again,
+                name,
+                os_loud,
+                stdin,
+                Flavour::Gnu,
+                unzip::default_flavour(),
+            )
+            .expect("a COMPAT_NAMES entry is a compat name");
             assert_eq!(
                 code, code2,
                 "{name} {args:?}: the loud re-run {loud:?} exits differently"
@@ -1541,6 +1570,28 @@ fn run_lz4(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
     check_budget(dir, name, args, &out, &before);
 }
 
+/// The unzip family (0.16.0 Task 7: the command line only), through
+/// `compat::run_in_counted` in this build's default flavour (Task 15 takes
+/// the flavour from the name byte and adds the archive oracles): no panic,
+/// and the exit is one of that flavour's (`unzip::EXIT_CODES_APPLE`,
+/// `unzip::EXIT_CODES_UBUNTU`).
+fn run_unzip(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
+    let flavour = unzip::default_flavour();
+    let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
+    let (code, _out, err, _reads) =
+        compat::run_in_counted(dir, name, os_args, stdin, Flavour::Gnu, flavour)
+            .expect("a COMPAT_NAMES entry is a compat name");
+    let codes = match flavour {
+        unzip::Flavour::Apple => unzip::EXIT_CODES_APPLE,
+        unzip::Flavour::Ubuntu => unzip::EXIT_CODES_UBUNTU,
+    };
+    assert!(
+        codes.contains(&code),
+        "{name}: exit {code} is not one the {flavour:?} reference gives\n{}",
+        String::from_utf8_lossy(&err)
+    );
+}
+
 fuzz_target!(|data: &[u8]| {
     if data.len() > COMPAT_FUZZ_MAX_INPUT {
         return;
@@ -1575,6 +1626,7 @@ fuzz_target!(|data: &[u8]| {
         "bzip2" | "bunzip2" | "bzcat" => run_bzip2(&dir, case.name, &case.args, stdin),
         "zstd" | "unzstd" | "zstdcat" | "zstdmt" => run_zstd(&dir, case.name, &case.args, stdin),
         "lz4" | "unlz4" | "lz4cat" | "lz4c" => run_lz4(&dir, case.name, &case.args, stdin),
+        "unzip" | "zipinfo" | "funzip" => run_unzip(&dir, case.name, &case.args, stdin),
         other => unreachable!("{other} is in COMPAT_NAMES but has no arm here"),
     }
 

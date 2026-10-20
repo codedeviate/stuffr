@@ -950,6 +950,13 @@ const COMPAT_SHAPES: &[&str] = &[
     "lz4-multiple-declined-prompt",
     "lz4cat-two-undecodable",
     "lz4-multiple-test-undecodable",
+    // 0.16.0 Task 7: the unzip family's names, one seed each, for its
+    // command line (usage, the version screen, funzip's password); Task 15
+    // adds the archive shapes.
+    "unzip-help",
+    "unzip-version",
+    "zipinfo-help",
+    "funzip-stdin-password",
 ];
 
 /// `plain` as one zstd frame, through this build's encoder (weak on the
@@ -1736,6 +1743,10 @@ fn compat_seed(work: &Path, shape: &str) -> stuffr_core::Result<Vec<u8>> {
             e("bzip2recover", &["a.bz2"], &["a.bz2"], false, &bytes)
         }
         "bzip2recover-usage" => e("bzip2recover", &[], &[], false, b""),
+        "unzip-help" => e("unzip", &["-h"], &[], false, b""),
+        "unzip-version" => e("unzip", &["-v"], &[], false, b""),
+        "zipinfo-help" => e("zipinfo", &["-h"], &[], false, b""),
+        "funzip-stdin-password" => e("funzip", &["-x"], &[], true, &text),
         other => unreachable!("COMPAT_SHAPES lists an unhandled shape {other:?}"),
     })
 }

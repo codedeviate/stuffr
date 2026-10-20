@@ -14,6 +14,7 @@ pub mod gzip;
 mod host;
 pub mod links;
 pub mod lz4;
+pub mod unzip;
 pub mod xz;
 pub mod zstd;
 
@@ -40,6 +41,9 @@ pub enum Family {
     Zstd,
     /// `lz4`, `unlz4`, `lz4cat`, `lz4c`.
     Lz4,
+    /// `unzip`, `zipinfo`, `funzip`, in the flavour
+    /// [`unzip::default_flavour`] or `STUFFR_UNZIP_FLAVOR` picks.
+    Unzip,
 }
 
 /// Invoked name to family. The name is matched exactly, after the directory
@@ -67,6 +71,9 @@ const NAMES: &[(&str, Family)] = &[
     ("unlz4", Family::Lz4),
     ("lz4cat", Family::Lz4),
     ("lz4c", Family::Lz4),
+    ("unzip", Family::Unzip),
+    ("zipinfo", Family::Unzip),
+    ("funzip", Family::Unzip),
 ];
 
 /// Every compatibility name, from the one table `family_for` also reads.
@@ -112,6 +119,7 @@ pub fn dispatch(args: Vec<OsString>) -> Option<ExitCode> {
         Family::Xz => xz::run(name, &argv0, rest),
         Family::Zstd => zstd::run(name, &argv0, rest),
         Family::Lz4 => lz4::run(name, &argv0, rest),
+        Family::Unzip => unzip::run(name, &argv0, rest),
     })
 }
 
@@ -121,7 +129,9 @@ pub fn dispatch(args: Vec<OsString>) -> Option<ExitCode> {
 /// Neither stream is a terminal, the environment is not read and `SIGPIPE`
 /// keeps its disposition. `None` when `name` is not a compatibility name.
 /// The gzip family runs as `gzip_flavour` (the environment's
-/// `STUFFR_GZIP_FLAVOR` is not read); the other families ignore it.
+/// `STUFFR_GZIP_FLAVOR` is not read); the other families ignore it. The
+/// unzip family runs as [`unzip::default_flavour`] here; pick its flavour
+/// with [`run_in_counted`].
 /// Same code as [`dispatch`] below the process boundary; for the fuzz
 /// target, not a stable interface.
 #[doc(hidden)]
@@ -132,7 +142,15 @@ pub fn run_in(
     stdin: &[u8],
     gzip_flavour: gzip::Flavour,
 ) -> Option<(i32, Vec<u8>, Vec<u8>)> {
-    run_in_counted(dir, name, args, stdin, gzip_flavour).map(|(code, out, err, _)| (code, out, err))
+    run_in_counted(
+        dir,
+        name,
+        args,
+        stdin,
+        gzip_flavour,
+        unzip::default_flavour(),
+    )
+    .map(|(code, out, err, _)| (code, out, err))
 }
 
 /// [`run_in`], also returning the inputs the run opened and what it read
@@ -140,7 +158,9 @@ pub fn run_in(
 /// empty for the others. The xz family runs with a fixed machine and a
 /// capped decoder memory limit ([`xz::run_in_counted`]), the zstd family
 /// with a fixed machine and R9's bounds ([`zstd::run_in_counted`]), and
-/// the lz4 family with a fixed machine ([`lz4::run_in_counted`]).
+/// the lz4 family with a fixed machine ([`lz4::run_in_counted`]). The unzip
+/// family runs as `unzip_flavour` (R7; `STUFFR_UNZIP_FLAVOR` is not read),
+/// as [`unzip::run_in_counted`] describes.
 #[doc(hidden)]
 pub fn run_in_counted(
     dir: &Path,
@@ -148,6 +168,7 @@ pub fn run_in_counted(
     args: Vec<OsString>,
     stdin: &[u8],
     gzip_flavour: gzip::Flavour,
+    unzip_flavour: unzip::Flavour,
 ) -> Option<CountedRun> {
     let (family, canonical) = family_for(OsStr::new(name))?;
     Some(match family {
@@ -163,6 +184,9 @@ pub fn run_in_counted(
         Family::Xz => xz::run_in_counted(dir, canonical, &args, stdin, &|_| None),
         Family::Zstd => zstd::run_in_counted(dir, canonical, &args, stdin, &|_| None),
         Family::Lz4 => lz4::run_in_counted(dir, canonical, &args, stdin, &|_| None),
+        Family::Unzip => {
+            unzip::run_in_counted(unzip_flavour, dir, canonical, &args, stdin, &|_| None)
+        }
     })
 }
 
@@ -224,6 +248,58 @@ mod tests {
 
     /// The gzip flavour `run_in` gets; the bzip2 family ignores it.
     const G: gzip::Flavour = gzip::Flavour::Gnu;
+
+    /// The unzip flavour `run_in_counted` gets; the other families ignore
+    /// it.
+    const U: unzip::Flavour = unzip::Flavour::Apple;
+
+    /// `STUFFR_UNZIP_FLAVOR` selects `apple` or `ubuntu`, unset or empty is
+    /// the default, and anything else (another case, a blank) is refused.
+    #[test]
+    fn flavour_var_rejects_other_values() {
+        let d = unzip::default_flavour();
+        assert_eq!(unzip::flavour_from(None), Ok(d));
+        assert_eq!(unzip::flavour_from(Some("".into())), Ok(d));
+        assert_eq!(
+            unzip::flavour_from(Some("apple".into())),
+            Ok(unzip::Flavour::Apple)
+        );
+        assert_eq!(
+            unzip::flavour_from(Some("ubuntu".into())),
+            Ok(unzip::Flavour::Ubuntu)
+        );
+        for bad in ["Apple", "UBUNTU", " apple", "debian", "bsd"] {
+            assert_eq!(unzip::flavour_from(Some(bad.into())), Err(bad.into()));
+        }
+    }
+
+    /// `run_in_counted` reaches the unzip family in the flavour it is
+    /// given, and `zipinfo` and `funzip` by name.
+    #[test]
+    fn run_in_counted_reaches_the_unzip_family() {
+        let dir = std::env::temp_dir();
+        let run = |name: &str, f: unzip::Flavour| {
+            let (code, out, err, reads) =
+                run_in_counted(&dir, name, vec!["-h".into()], b"", G, f).unwrap();
+            assert!(reads.is_empty(), "{reads:?}");
+            (code, String::from_utf8(out).unwrap(), err)
+        };
+        let (code, out, _) = run("unzip", unzip::Flavour::Apple);
+        assert_eq!(code, 0);
+        assert!(out.contains("Please report bugs to Apple."), "{out}");
+        let (_, out, _) = run("unzip", unzip::Flavour::Ubuntu);
+        assert!(!out.contains("Apple"), "{out}");
+        let (code, out, _) = run("zipinfo", U);
+        assert_eq!(code, 0);
+        assert!(
+            out.starts_with("ZipInfo 3.00 of 20 April 2009, by stuffr "),
+            "{out}"
+        );
+        // `-h` is funzip's password; with no terminal it never shows usage.
+        let (code, out, err) = run("funzip", U);
+        assert_eq!((code, out.as_str()), (3, ""));
+        assert!(err.starts_with(b"funzip error: "));
+    }
 
     /// The `compat` fuzz target picks its tool from `COMPAT_NAMES`; a name
     /// added here and not there would go unfuzzed.
@@ -323,7 +399,7 @@ mod tests {
             std::fs::write(dir.join("a"), b"hello hello hello\n").unwrap();
             let args = |a: &[&str]| a.iter().map(OsString::from).collect::<Vec<_>>();
             let (code, _, err, reads) =
-                run_in_counted(&dir, "gzip", args(&["-k", "a"]), b"", flavour).unwrap();
+                run_in_counted(&dir, "gzip", args(&["-k", "a"]), b"", flavour, U).unwrap();
             assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
             let a = reads[&dir.join("a")];
             assert_eq!((a.opens, a.bytes, a.len), (1, 18, 18), "{flavour:?}");
@@ -332,7 +408,7 @@ mod tests {
             let len = std::fs::metadata(dir.join("a.gz")).unwrap().len();
             for mode in [&["-t", "a.gz", "a.gz"][..], &["-l", "a.gz"]] {
                 let (code, _, err, reads) =
-                    run_in_counted(&dir, "gzip", args(mode), b"", flavour).unwrap();
+                    run_in_counted(&dir, "gzip", args(mode), b"", flavour, U).unwrap();
                 assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
                 let gz = reads[&dir.join("a.gz")];
                 assert_eq!(gz.opens, mode.len() as u64 - 1, "{flavour:?} {mode:?}");
@@ -340,7 +416,7 @@ mod tests {
                 assert!(gz.bytes > 0 && gz.bytes <= 2 * len * gz.opens, "{gz:?}");
             }
             let (_, _, _, reads) =
-                run_in_counted(&dir, "bzip2", args(&["-k", "a"]), b"", flavour).unwrap();
+                run_in_counted(&dir, "bzip2", args(&["-k", "a"]), b"", flavour, U).unwrap();
             assert!(reads.is_empty(), "{reads:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -357,7 +433,7 @@ mod tests {
         let args = |a: &[&str]| a.iter().map(OsString::from).collect::<Vec<_>>();
         let run = |a: &[&str]| {
             let (code, _, err, reads) =
-                run_in_counted(&dir, "zstd", args(a), b"", gzip::Flavour::Gnu).unwrap();
+                run_in_counted(&dir, "zstd", args(a), b"", gzip::Flavour::Gnu, U).unwrap();
             assert_eq!(code, 0, "{a:?}: {}", String::from_utf8_lossy(&err));
             reads
         };
@@ -456,7 +532,10 @@ mod tests {
                 "lz4",
                 "unlz4",
                 "lz4cat",
-                "lz4c"
+                "lz4c",
+                "unzip",
+                "zipinfo",
+                "funzip"
             ]
         );
     }

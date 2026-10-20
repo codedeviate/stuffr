@@ -1293,8 +1293,8 @@ COMPATIBILITY LINKS (INSTALL-LINKS)
   stuffr install-links --dir ~/.local/bin
       Creates symlinks named bzip2, bunzip2, bzcat, bzip2recover, gzip,
       gunzip, zcat, gzcat, xz, unxz, xzcat, lzma, unlzma, lzcat, zstd,
-      unzstd, zstdcat, zstdmt, lz4, unlz4, lz4cat and lz4c in that
-      directory, each pointing at this stuffr binary. Run under one of those
+      unzstd, zstdcat, zstdmt, lz4, unlz4, lz4cat, lz4c, unzip, zipinfo
+      and funzip in that directory, each pointing at this stuffr binary. Run under one of those
       names, the binary behaves as that tool, with its flags, messages and
       exit codes. This is opt-in: nothing creates these links unless you run
       this verb. The directory must exist (exit 2 if not); one that cannot
@@ -1337,6 +1337,13 @@ COMPATIBILITY LINKS (INSTALL-LINKS)
       and lz4c also reads the legacy arguments -c0, -c1, -c2, -hc and -y.
       LZ4_CLEVEL and LZ4_NBWORKERS are read as lz4 reads them. -V's banner
       names stuffr. The benchmark options (-b, -e, -i) are refused.
+
+      The unzip, zipinfo and funzip names behave as Info-ZIP UnZip 6.00:
+      Apple's build on macOS and the BSDs, Ubuntu 24.04's elsewhere;
+      STUFFR_UNZIP_FLAVOR=apple or ubuntu overrides that (any other value is
+      refused, exit 1). UNZIP and UNZIPOPT (ZIPINFO and ZIPINFOOPT for
+      zipinfo) are read before the command line, as unzip reads them. The
+      first line of the usage and -v screens names stuffr.
 
   stuffr install-links --dir ~/.local/bin --names bzcat,zcat
       Only the named links; --names takes a comma-separated list. A name that

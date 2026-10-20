@@ -1,0 +1,531 @@
+//! The unzip family (`unzip`, `zipinfo`, `funzip`): stuffr behaving as the
+//! platform's Info-ZIP UnZip 6.00.
+//!
+//! **A port** of Apple's `zip-33` tree (`unzip/unzip60/`, the Info-ZIP
+//! licence version 2009-Jan-02, `LICENSE-infozip`; this is an altered
+//! version, marked as such by every banner). Each ported function carries
+//! `// port: <file>.c:<function>`, each Apple change `// apple:
+//! <file>.c:<line>`, each Ubuntu difference `// ubuntu: <patch>` or `//
+//! ubuntu: -D<DEFINE>`, and each rule taken from the binary rather than the
+//! source `// probe: <command>`; where the two disagree, the binary wins.
+//! Every string is in `messages.rs`.
+//!
+//! **Flavours** ([`Flavour`], `flavour.rs`): Apple's `/usr/bin/unzip` on
+//! macOS and the BSDs, Ubuntu 24.04's `6.0-28ubuntu4.1` elsewhere
+//! ([`default_flavour`]), or as `STUFFR_UNZIP_FLAVOR` (`apple`, `ubuntu`)
+//! says; [`run`] reads it once, and anything else in it is refused, exit 1,
+//! in stuffr's own words. Ubuntu's build options and patches are flavour
+//! checks at the points they change behaviour (R13: filled by Tasks 13 and
+//! 14; until then those checks give Apple's answer).
+//!
+//! **G becomes `Uz`** (R5): Info-ZIP's global `G` (and its `uO`
+//! options) is one value per run, holding the host, the flavour, the
+//! options and the state, so a sandboxed run ([`run_in_counted`]) touches
+//! nothing of the process.
+//!
+//! **Built so far** (0.16.0 Task 7): the names, the flavour, the command
+//! line (`unzip.c`'s `unzip()` front half and `uz_opts()`, `zipinfo.c`'s
+//! `zi_opts()`, `envargs.c`), the usage screens, `-hh`, the `-v` screen,
+//! and funzip's usage. A command line that names an archive gets a
+//! placeholder answer (`messages::NOT_BUILT_YET`, exit 3) until archive
+//! processing lands (Tasks 8–14).
+//!
+//! Known deviations (the source of truth; the README and the spec mirror
+//! this list):
+//!
+//! 1. SIGPIPE: `run` restores SIGPIPE's default action, as the other
+//!    families do; under a parent that ignores SIGPIPE, unzip sees `EPIPE`
+//!    and stuffr still dies of the signal (the Rust runtime ignores it
+//!    before `main`, so the inherited disposition cannot be told apart).
+//! 2. The first banner line of each program's usage and `-v` names stuffr
+//!    and says it is altered (Info-ZIP licence clause 3):
+//!    `UnZip 6.00 of 20 April 2009, by stuffr X.Y.Z (altered; original by
+//!    Info-ZIP, with modifications by Apple Inc.).` (Ubuntu: `(altered;
+//!    Debian's build, original by Info-ZIP).`), and likewise for zipinfo
+//!    and funzip.
+//! 3. Pre-existing symlinks: the Ubuntu flavour also stays beneath the
+//!    extraction root, as Apple's does.
+//! 4. The archive being read is never overwritten.
+//! 5. `-O`/`-I` (Ubuntu) convert names through `iconv(3)`; they are
+//!    unavailable on Windows.
+//! 6. Locale-dependent output is identical under `C`, `C.UTF-8` and
+//!    `en_US.UTF-8` only.
+//! 7. On macOS the Ubuntu flavour also propagates the archive's quarantine
+//!    attribute (R9), as Apple's does.
+
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
+use std::io::{self, BufWriter, Write};
+use std::path::Path;
+use std::process::ExitCode;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
+
+use super::CountedRun;
+use super::host::{self, Host, SANDBOX_OUTPUT_CAP, Sandbox};
+
+pub(crate) mod cli;
+pub(crate) mod flavour;
+mod messages;
+
+pub use flavour::Flavour;
+use messages::{self as m, printf};
+
+/// The environment variable that overrides [`default_flavour`].
+const FLAVOR_VAR: &str = "STUFFR_UNZIP_FLAVOR";
+
+// unzip.h's PK_* exit codes (those the front end returns).
+/// unzip.h:PK_OK, no error.
+pub(crate) const PK_OK: i32 = 0;
+/// unzip.h:PK_COOL, no error (the usage screen was asked for).
+pub(crate) const PK_COOL: i32 = 0;
+/// unzip.h:PK_BADERR, a severe error.
+pub(crate) const PK_BADERR: i32 = 3;
+/// unzip.h:PK_PARAM, bad or illegal parameters.
+pub(crate) const PK_PARAM: i32 = 10;
+
+// unzpriv.h's message flag bits, read by `Uz::info` (fileio.c's
+// `UzpMessagePrnt`).
+/// unzpriv.h:MSG_STDERR, bit 0: standard error (standard output under `-t`).
+pub(crate) const MSG_STDERR: u32 = 0x0001;
+/// unzpriv.h:MSG_LNEWLN, bit 5: a leading newline when not at the start of
+/// a line.
+pub(crate) const MSG_LNEWLN: u32 = 0x0020;
+/// unzpriv.h:MSG_TNEWLN, bit 6: a trailing newline when the text lacks one.
+pub(crate) const MSG_TNEWLN: u32 = 0x0040;
+
+/// The exit codes the family can return under Apple's flavour (the plan's
+/// Global Constraints): 0–3, 4–8 (`PK_MEM*`, only where the reference gives
+/// them), 9–11, 50, 51, 80–82. For the `compat` fuzz target (Task 15).
+#[doc(hidden)]
+pub const EXIT_CODES_APPLE: &[i32] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 50, 51, 80, 81, 82];
+/// [`EXIT_CODES_APPLE`] plus 12 (`PK_BOMB`, ubuntu:
+/// 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch).
+#[doc(hidden)]
+pub const EXIT_CODES_UBUNTU: &[i32] =
+    &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 50, 51, 80, 81, 82];
+
+/// The flavour a build uses when `STUFFR_UNZIP_FLAVOR` is unset or empty:
+/// Apple on macOS and the BSDs, Ubuntu everywhere else, Windows included.
+pub fn default_flavour() -> Flavour {
+    if cfg!(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )) {
+        Flavour::Apple
+    } else {
+        Flavour::Ubuntu
+    }
+}
+
+/// The flavour `STUFFR_UNZIP_FLAVOR`'s value selects: `apple` or `ubuntu`,
+/// the default when unset or empty, and `Err(value)` for anything else.
+pub(crate) fn flavour_from(value: Option<OsString>) -> Result<Flavour, OsString> {
+    match value {
+        None => Ok(default_flavour()),
+        Some(v) if v.is_empty() => Ok(default_flavour()),
+        Some(v) if v == "apple" => Ok(Flavour::Apple),
+        Some(v) if v == "ubuntu" => Ok(Flavour::Ubuntu),
+        Some(v) => Err(v),
+    }
+}
+
+/// One run's state: Info-ZIP's `G` (globals.h `Uz_Globs`) with its `uO`
+/// ([`cli::Options`]), R5. Tasks 8–14 add the archive state; what is here is
+/// what the command line and the message layer need, and the window the
+/// decoders will share.
+pub(crate) struct Uz<'a> {
+    /// The process, or a sandbox's stand-ins for it.
+    pub(crate) host: Host,
+    /// Which reference this run behaves as.
+    pub(crate) flavour: Flavour,
+    /// `G.UzO` (`uO`): the options.
+    pub(crate) o: cli::Options,
+    /// `getenv`: the process's environment, or a sandbox's stand-in.
+    pub(crate) env: &'a dyn Fn(&str) -> Option<OsString>,
+    /// Standard output (stdio's `stdout`), flushed after every message as
+    /// `UzpMessagePrnt` does.
+    pub(crate) out: BufWriter<Box<dyn Write + Send>>,
+    /// Standard error.
+    pub(crate) err: &'a mut dyn Write,
+    /// `G.sol`: the last message ended a line (`TRUE` at start).
+    pub(crate) sol: bool,
+    /// `G.noargs`: the command line had no arguments at all.
+    pub(crate) noargs: bool,
+    /// `G.extract_flag`: the run extracts (no `-c -t -l -v -z -T`, not
+    /// zipinfo).
+    pub(crate) extract_flag: bool,
+    /// `G.process_all_files`: no names were given after the archive.
+    #[allow(dead_code)]
+    pub(crate) process_all_files: bool,
+    /// `G.native_is_utf8` (ubuntu: -DUTF8_MAYBE_NATIVE): the locale's
+    /// codeset is UTF-8 (Task 13 reads it; `false` under `LANG=C`).
+    pub(crate) native_is_utf8: bool,
+    /// `G.unicode_escape_all` (ubuntu: -DUNICODE_WCHAR): `-U` given once.
+    #[allow(dead_code)]
+    pub(crate) unicode_escape_all: bool,
+    /// `G.rootdir`, Apple's descriptor for the extraction root (`-1`: none;
+    /// apple: globals.c:163, `apple_globals_ctor`). Task 10 opens it.
+    #[allow(dead_code)]
+    pub(crate) rootdir: Option<std::fs::File>,
+    /// `G.qf`, the archive's quarantine information (`NULL`: none; apple:
+    /// globals.c:164, `apple_globals_ctor`). Task 10 reads it (R9).
+    #[allow(dead_code)]
+    pub(crate) qf: Option<Vec<u8>>,
+    /// `G.area.Slide`: the one window every decoder writes into and the
+    /// message layer formats into (rulings P13/P16), at least
+    /// `stuffr::infozip::WSIZE`, reused across entries. Unused until the
+    /// archive tasks.
+    #[allow(dead_code)]
+    pub(crate) slide: Box<[u8]>,
+}
+
+impl<'a> Uz<'a> {
+    // port: globals.c:globalsCtor
+    /// A run's `G` as `globalsCtor()` and Apple's `apple_globals_ctor()`
+    /// leave it.
+    pub(crate) fn new(
+        host: Host,
+        flavour: Flavour,
+        env: &'a dyn Fn(&str) -> Option<OsString>,
+        err: &'a mut dyn Write,
+    ) -> Uz<'a> {
+        let out = host.out_writer(None);
+        Uz {
+            host,
+            flavour,
+            o: cli::Options::new(),
+            env,
+            out,
+            err,
+            sol: true, // at start of line
+            noargs: false,
+            extract_flag: false,
+            process_all_files: false,
+            native_is_utf8: false,
+            unicode_escape_all: false,
+            // apple: globals.c:163 (`G.rootdir = -1`)
+            rootdir: None,
+            // apple: globals.c:164 (`G.qf = NULL`)
+            qf: None,
+            slide: vec![0u8; stuffr::infozip::WSIZE].into_boxed_slice(),
+        }
+    }
+
+    // port: fileio.c:UzpMessagePrnt
+    /// `Info(slide, flag, ...)`: print `buf` to standard error when `flag`
+    /// has [`MSG_STDERR`] and `-t` is not set, else to standard output,
+    /// with the leading and trailing newlines `flag` asks for, and flush.
+    /// Write errors are ignored, as every `Info()` caller ignores them.
+    /// (`-M`'s pager is Task 11's.)
+    pub(crate) fn info(&mut self, flag: u32, buf: &[u8]) {
+        let to_stderr = flag & MSG_STDERR != 0 && !self.o.tflag;
+        let owned: Vec<u8>;
+        let buf = if flag & MSG_TNEWLN != 0
+            && ((buf.is_empty() && !self.sol) || (!buf.is_empty() && buf.last() != Some(&b'\n')))
+        {
+            owned = [buf, b"\n"].concat();
+            &owned[..]
+        } else {
+            buf
+        };
+        // error output from testing redirected:  also send to stderr
+        let also_stderr = flag & MSG_STDERR != 0
+            && self.o.tflag
+            && !self.host.stdout_is_tty()
+            && self.host.stderr_is_tty();
+        if flag & MSG_LNEWLN != 0 && !self.sol {
+            // not at start of line:  want newline
+            self.write(to_stderr, b"\n");
+            if also_stderr {
+                let _ = self.err.write_all(b"\n");
+                let _ = self.err.flush();
+            }
+            self.sol = true;
+        }
+        if !buf.is_empty() {
+            self.write(to_stderr, buf);
+            if also_stderr {
+                let _ = self.err.write_all(buf);
+                let _ = self.err.flush();
+            }
+            self.sol = buf.last() == Some(&b'\n');
+        }
+    }
+
+    /// [`Uz::info`] of `fmt` with its `%s`/`%d` filled from `args`.
+    pub(crate) fn info_fmt(&mut self, flag: u32, fmt: &str, args: &[&[u8]]) {
+        let mut buf = Vec::new();
+        printf(&mut buf, fmt, args);
+        self.info(flag, &buf);
+    }
+
+    /// One message to one stream, flushed (`WriteTxtErr` + `fflush`).
+    fn write(&mut self, to_stderr: bool, buf: &[u8]) {
+        if to_stderr {
+            let _ = self.err.write_all(buf);
+            let _ = self.err.flush();
+        } else {
+            let _ = self.out.write_all(buf);
+            let _ = self.out.flush();
+        }
+    }
+}
+
+/// Entry point for `unzip`, `zipinfo` and `funzip`; `name` is the
+/// canonical invoked name, `argv0` the program as invoked (unzip.c reads
+/// its last component for ZipInfo mode) and `args` the arguments after it.
+pub fn run(name: &'static str, argv0: &OsStr, args: Vec<OsString>) -> ExitCode {
+    // Deviation 1: as the other families.
+    host::reset_sigpipe();
+    let env = |k: &str| std::env::var_os(k);
+    let mut err = io::stderr();
+    let flavour = match flavour_from(env(FLAVOR_VAR)) {
+        Ok(f) => f,
+        Err(v) => {
+            printf(
+                &mut err,
+                m::FLAVOR_REFUSED,
+                &[name.as_bytes(), v.as_encoded_bytes()],
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let argv0 = if argv0.is_empty() {
+        name.as_bytes()
+    } else {
+        argv0.as_encoded_bytes()
+    };
+    let code = main(flavour, name, argv0, &args, &env, Host::Real, &mut err);
+    // The process's exit status is the code's low byte, as `exit()` makes
+    // it (every code here is below 256).
+    ExitCode::from(code as u8)
+}
+
+/// [`run`] without the process, as `flavour` (R7): operands resolve against
+/// `dir`, standard input is `stdin` (a pipe of bytes), standard output and
+/// error are captured and returned with the exit code and what each input
+/// read, neither is a terminal, `env` stands in for the environment
+/// (`UNZIP`, `UNZIPOPT`, `ZIPINFO`, `ZIPINFOOPT`; `STUFFR_UNZIP_FLAVOR` is
+/// not consulted), no signal is touched, and standard output and output
+/// files share the [`SANDBOX_OUTPUT_CAP`] budget. For the fuzz target; not
+/// a stable interface.
+#[doc(hidden)]
+pub fn run_in_counted(
+    flavour: Flavour,
+    dir: &Path,
+    name: &'static str,
+    args: &[OsString],
+    stdin: &[u8],
+    env: &dyn Fn(&str) -> Option<OsString>,
+) -> CountedRun {
+    let stdout = Arc::new(Mutex::new(Vec::new()));
+    let reads = Arc::new(Mutex::new(BTreeMap::new()));
+    let host = Host::Sandbox(Sandbox {
+        dir: dir.to_path_buf(),
+        stdin: Some(stdin.to_vec()),
+        stdout: stdout.clone(),
+        budget: Arc::new(AtomicU64::new(SANDBOX_OUTPUT_CAP)),
+        reads: reads.clone(),
+    });
+    let mut err = Vec::new();
+    let code = main(flavour, name, name.as_bytes(), args, env, host, &mut err);
+    let out = std::mem::take(&mut *stdout.lock().unwrap_or_else(|p| p.into_inner()));
+    let reads = std::mem::take(&mut *reads.lock().unwrap_or_else(|p| p.into_inner()));
+    (code, out, err, reads)
+}
+
+/// The run below the process boundary. Returns the exit code.
+fn main(
+    flavour: Flavour,
+    name: &str,
+    argv0: &[u8],
+    args: &[OsString],
+    env: &dyn Fn(&str) -> Option<OsString>,
+    host: Host,
+    err: &mut dyn Write,
+) -> i32 {
+    if name == "funzip" {
+        return funzip(flavour, args, &host, err);
+    }
+    let mut uz = Uz::new(host, flavour, env, err);
+    let code = unzip(&mut uz, argv0, args);
+    let _ = uz.out.flush();
+    code
+}
+
+/// Whether `s` begins with `prefix`, ignoring ASCII case (`STRNICMP(s,
+/// prefix, n) == 0` with `n` the prefix's length).
+fn starts_with_ignore_case(s: &[u8], prefix: &[u8]) -> bool {
+    s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+// port: unzip.c:unzip
+/// unzip.c's `unzip()`: ZipInfo mode or UnZip mode, the command line, then
+/// the archives.
+fn unzip(uz: &mut Uz, argv0: &[u8], args: &[OsString]) -> i32 {
+    // The program name's last component (after `DIR_END`).
+    let start = argv0
+        .iter()
+        .rposition(|&b| b == b'/' || (cfg!(windows) && b == b'\\'))
+        .map_or(0, |i| i + 1);
+    let p = &argv0[start..];
+    let zipinfo = starts_with_ignore_case(p, b"zipinfo")
+        || starts_with_ignore_case(p, b"ii")
+        || args
+            .first()
+            .is_some_and(|a| a.as_encoded_bytes().starts_with(b"-Z"));
+    let parsed = if zipinfo {
+        cli::parse_zipinfo(uz, args)
+    } else {
+        cli::parse_unzip(uz, args)
+    };
+    match parsed {
+        Ok(p) => process_zipfiles(uz, &p),
+        Err(code) => code,
+    }
+}
+
+/// process.c's `process_zipfiles()`, until Tasks 8–11 port it: a
+/// placeholder that names what is missing.
+fn process_zipfiles(uz: &mut Uz, _parsed: &cli::Parsed) -> i32 {
+    let who: &[u8] = if uz.o.zipinfo_mode {
+        b"zipinfo"
+    } else {
+        b"unzip"
+    };
+    uz.info_fmt(0x401, m::NOT_BUILT_YET, &[who]);
+    PK_BADERR
+}
+
+// port: funzip.c:main
+/// funzip: its usage when there is no input file and standard input is a
+/// terminal (exit 3), else, until Task 12, a placeholder (exit 3).
+fn funzip(flavour: Flavour, args: &[OsString], host: &Host, err: &mut dyn Write) -> i32 {
+    let a = cli::parse_funzip(args);
+    // if no file argument and stdin not redirected, give the user help
+    if a.input.is_none() && host.stdin_is_tty() {
+        printf(
+            err,
+            flavour::funzip_banner(flavour),
+            &[env!("CARGO_PKG_VERSION").as_bytes()],
+        );
+        let _ = err.write_all(m::FUNZIP_USAGE.as_bytes());
+        return 3;
+    }
+    let _ = err.write_all(m::FUNZIP_NOT_BUILT_YET.as_bytes());
+    3
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(f: Flavour, name: &'static str, args: &[&str]) -> (i32, String, String) {
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let dir = std::env::temp_dir();
+        let (code, out, err, _) = run_in_counted(f, &dir, name, &args, b"", &|_| None);
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    }
+
+    #[test]
+    fn the_default_flavour_follows_the_platform() {
+        let apple = cfg!(any(
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly"
+        ));
+        let want = if apple {
+            Flavour::Apple
+        } else {
+            Flavour::Ubuntu
+        };
+        assert_eq!(default_flavour(), want);
+    }
+
+    /// Each flavour's banners say whose build they alter (R2), with this
+    /// stuffr's version.
+    #[test]
+    fn banners_name_stuffr_and_the_build() {
+        let v = env!("CARGO_PKG_VERSION");
+        let (code, out, err) = run(Flavour::Apple, "unzip", &[]);
+        assert_eq!((code, err.as_str()), (0, ""));
+        let want = format!(
+            "UnZip 6.00 of 20 April 2009, by stuffr {v} (altered; original by Info-ZIP, \
+             with modifications by Apple Inc.).\nPlease report bugs to Apple.\n\nUsage: "
+        );
+        assert!(out.starts_with(&want), "{out}");
+        let (_, out, _) = run(Flavour::Ubuntu, "unzip", &["-h"]);
+        let want = format!(
+            "UnZip 6.00 of 20 April 2009, by stuffr {v} (altered; Debian's build, original \
+             by Info-ZIP).\n\nUsage: "
+        );
+        assert!(out.starts_with(&want), "{out}");
+        let (code, out, _) = run(Flavour::Apple, "zipinfo", &[]);
+        assert_eq!(code, 0);
+        assert!(
+            out.starts_with(&format!(
+                "ZipInfo 3.00 of 20 April 2009, by stuffr {v} (altered; original by Greg \
+                 Roelofs and the Info-ZIP group, with modifications by Apple Inc.).\n\nList"
+            )),
+            "{out}"
+        );
+        let (_, out, _) = run(Flavour::Ubuntu, "unzip", &["-Z"]);
+        assert!(
+            out.starts_with(&format!(
+                "ZipInfo 3.00 of 20 April 2009, by stuffr {v} (altered; Debian's build, \
+                 original by Greg Roelofs and the Info-ZIP group).\n"
+            )),
+            "{out}"
+        );
+        let (_, out, _) = run(Flavour::Ubuntu, "unzip", &["-v"]);
+        assert!(
+            out.contains("\nCompiled with gcc 13.2.0 for Unix (Linux ELF).\n\n"),
+            "{out}"
+        );
+    }
+
+    /// Without a terminal, funzip never prints its usage; its decoder is
+    /// Task 12's. Neither it nor an archive operand panics.
+    #[test]
+    fn placeholders_answer_without_panicking() {
+        for f in [Flavour::Apple, Flavour::Ubuntu] {
+            let (code, out, err) = run(f, "funzip", &[]);
+            assert_eq!((code, out.as_str()), (3, ""));
+            assert!(err.starts_with("funzip error: "), "{err}");
+            let (code, _, err) = run(f, "unzip", &["-l", "a.zip", "x", "-x", "y"]);
+            assert_eq!(code, 3, "{err}");
+            assert!(err.starts_with("unzip:  archive processing"), "{err}");
+            // zipinfo's default listing sets its totals flag, `uO.tflag`,
+            // which sends every message to standard output.
+            let (code, out, err) = run(f, "zipinfo", &["a.zip"]);
+            assert_eq!((code, err.as_str()), (3, ""));
+            assert!(out.starts_with("zipinfo:  archive processing"), "{out}");
+        }
+    }
+
+    /// The exit-code tables differ by `PK_BOMB` only.
+    #[test]
+    fn ubuntu_adds_only_pk_bomb() {
+        let extra: Vec<i32> = EXIT_CODES_UBUNTU
+            .iter()
+            .copied()
+            .filter(|c| !EXIT_CODES_APPLE.contains(c))
+            .collect();
+        assert_eq!(extra, [12]);
+        assert!(
+            EXIT_CODES_APPLE
+                .iter()
+                .all(|c| EXIT_CODES_UBUNTU.contains(c))
+        );
+    }
+}
