@@ -175,3 +175,97 @@ pub(crate) fn filnamsiz(f: Flavour) -> usize {
         Flavour::Ubuntu => 4096,
     }
 }
+
+// ---- extraction (Task 10) ----
+//
+// ruling: T10-1. Apple's own changes to upstream's extraction code (its
+// `__APPLE__` blocks in extract.c, fileio.c and unix.c) are the Ubuntu
+// flavour's upstream code the other way round: no define and no patch
+// carries them, so no later task fills them, and these hooks give each
+// flavour its own tree's answer now (not R13 pass-throughs).
+
+/// apple: extract.c:370, unix.c:1161 (`G.rootpath = realpath(...)`): the
+/// extraction root is always set (`-d` or `.`), held as its real absolute
+/// path without a trailing `/`, and names are shown relative to it after
+/// `uO.exdir` (`FnFilterP`); a directory in the path that is a symlink is
+/// left for the beneath walk, and a parent that will not open is "cannot
+/// enter". Upstream (Ubuntu) sets a root only for `-d`, as the operand plus
+/// `/`, and shows the whole built path (`FnFilter1(G.filename)`).
+pub(crate) fn apple_root(f: Flavour) -> bool {
+    f == Flavour::Apple
+}
+
+/// apple: extract.c:1984 (`error = close_outfile(__G)`): the decoder's code
+/// is replaced by what `close_outfile()` returns. Upstream keeps it.
+/// ruling: T10-2. Apple's `close_outfile()` has no `return` on its
+/// regular-file path (undefined behaviour); its binary answers as if it
+/// returned 0: probe: `unzip bad.zip` of a corrupt deflate entry prints
+/// `error:  invalid compressed data to inflate` then ` bad CRC 00000000
+/// (should be ...)` and keeps the file, exit 2. Here it returns `PK_COOL`.
+pub(crate) fn close_outfile_replaces_error(f: Flavour) -> bool {
+    f == Flavour::Apple
+}
+
+/// apple: extract.c:649 (`error = set_deferred_symlink(...)`): a failed
+/// deferred symlink counts in the exit code. Upstream's returns nothing.
+pub(crate) fn deferred_symlink_errors_count(f: Flavour) -> bool {
+    f == Flavour::Apple
+}
+
+/// apple: extract.c:701 (`if (error > error_in_archive)`): a failed
+/// directory attribute raises the exit code to its own; upstream's `if
+/// (!error_in_archive)` only sets it when it was 0.
+pub(crate) fn dir_attrib_error_is_max(f: Flavour) -> bool {
+    f == Flavour::Apple
+}
+
+/// `-DIZ_HAVE_UXUIDGID`, Ubuntu only: `ef_scan_for_izux()` reads the owner
+/// from `ux`/`Ux`/`UX` blocks, so `-X` can restore it.
+///
+/// Pass-through until Task 13: Apple's answer (`false`) for both.
+pub(crate) fn iz_have_uxuidgid(_f: Flavour) -> bool {
+    false
+}
+
+/// `-DNO_LCHMOD`, Ubuntu only: a deferred symlink's mode is not set.
+///
+/// Pass-through until Task 13: Apple's answer (`false`: `lchmod()`) for
+/// both.
+pub(crate) fn no_lchmod(_f: Flavour) -> bool {
+    false
+}
+
+/// `14-cve-2015-7696.patch`, Ubuntu only: `decrypt()` gives up on an
+/// encryption header cut short (`PK_ERR`, "unable to get password").
+///
+/// Pass-through until Task 14: Apple's answer (`false`: the missing bytes
+/// read as `EOF`'s 0xff) for both.
+pub(crate) fn cve_2015_7696_short_header(_f: Flavour) -> bool {
+    false
+}
+
+/// `16-fix-integer-underflow-csiz-decrypted.patch`, Ubuntu only: an
+/// encrypted stored entry shorter than its header is refused before its
+/// sizes are compared.
+///
+/// Pass-through until Task 14: Apple's answer (`false`) for both.
+pub(crate) fn csize_below_header_refused(_f: Flavour) -> bool {
+    false
+}
+
+/// `23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch`, Ubuntu
+/// only: entries whose data overlap end the run (`PK_BOMB`).
+///
+/// Pass-through until Task 14: Apple's answer (`false`) for both.
+pub(crate) fn detects_overlapped_entries(_f: Flavour) -> bool {
+    false
+}
+
+/// `22-cve-2019-13232-fix-bug-in-undefer-input.patch`, Ubuntu only:
+/// `undefer_input()` clamps a negative `G.csize` (a decoder read past the
+/// entry) to 0 before giving the buffer back.
+///
+/// Pass-through until Task 14: Apple's answer (`false`) for both.
+pub(crate) fn cve_2019_13232_undefer_input(_f: Flavour) -> bool {
+    false
+}

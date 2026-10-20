@@ -368,16 +368,51 @@ fn normalise_path_bytes(raw: &[u8], exe: &Path, name: &str) -> Vec<u8> {
     out
 }
 
+/// `raw` with every occurrence of each of `dirs` replaced by `<work>`:
+/// Apple's unzip names the extraction root by its real absolute path in
+/// some messages, and each run has its own scratch directory.
+fn mask_work(raw: &[u8], dirs: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = raw.to_vec();
+    for d in dirs.iter().filter(|d| !d.is_empty()) {
+        let mut v = Vec::with_capacity(out.len());
+        let mut i = 0;
+        while i < out.len() {
+            if out[i..].starts_with(d) {
+                v.extend_from_slice(b"<work>");
+                i += d.len();
+            } else {
+                v.push(out[i]);
+                i += 1;
+            }
+        }
+        out = v;
+    }
+    out
+}
+
 /// Run case `c` with `exe` in a fresh scratch directory: the reference
-/// (`stuffr_side` false) or stuffr (true).
+/// (`stuffr_side` false) or stuffr (true). The work directory's path (as
+/// given and real) reads `<work>` in both streams and in symlink targets.
 fn unzip_run(exe: &Path, c: &Case, stuffr_side: bool) -> UnzipRun {
+    use std::os::unix::ffi::OsStrExt;
     let s = Scratch::new();
     let (code, stdout, stderr, start) = spawn_case(exe, &s, c, stuffr_side);
+    let work = s.0.join("work");
+    let mut dirs = vec![work.as_os_str().as_bytes().to_vec()];
+    if let Ok(real) = fs::canonicalize(&work) {
+        dirs.insert(0, real.as_os_str().as_bytes().to_vec());
+    }
+    let mut tree = snapshot_unzip_tree(&work, &[]);
+    for node in tree.values_mut() {
+        if let UnzipNode::Symlink { target, .. } = node {
+            *target = mask_work(target, &dirs);
+        }
+    }
     UnzipRun {
         code,
-        stdout: normalise_path_bytes(&stdout, exe, c.name),
-        stderr,
-        tree: snapshot_unzip_tree(&s.0.join("work"), &[]),
+        stdout: mask_work(&normalise_path_bytes(&stdout, exe, c.name), &dirs),
+        stderr: String::from_utf8_lossy(&mask_work(stderr.as_bytes(), &dirs)).into_owned(),
+        tree,
         start,
     }
 }

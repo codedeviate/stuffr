@@ -24,8 +24,7 @@ use crate::compat::host;
 
 /// The central directory header's signature, `PK\1\2`.
 pub(crate) const CENTRAL_HDR_SIG: [u8; 4] = *b"PK\x01\x02";
-/// The local header's, `PK\3\4` (the extraction's, Task 10).
-#[allow(dead_code)]
+/// The local header's, `PK\3\4`.
 pub(crate) const LOCAL_HDR_SIG: [u8; 4] = *b"PK\x03\x04";
 /// The end-of-central-directory record's, `PK\5\6`.
 pub(crate) const END_CENTRAL_SIG: [u8; 4] = *b"PK\x05\x06";
@@ -165,6 +164,17 @@ pub(crate) fn process_zipfiles(uz: &mut Uz, parsed: &super::cli::Parsed) -> i32 
         .map(|a| super::cli::bytes(a))
         .collect();
 
+    // Initialize the internal flag holding the mode of processing
+    // "overwrite existing file" cases.  In case of conflicting options, the
+    // 'safer' flag uO.overwrite_none takes precedence.
+    uz.overwrite_mode = if uz.o.overwrite_none {
+        super::extract::OVERWRT_NEVER
+    } else if uz.o.overwrite_all != 0 {
+        super::extract::OVERWRT_ALWAYS
+    } else {
+        super::extract::OVERWRT_QUERY
+    };
+
     let mut error = 0;
     let mut error_in_archive = 0;
     let mut lastzipfn: Option<Vec<u8>> = None;
@@ -190,6 +200,10 @@ pub(crate) fn process_zipfiles(uz: &mut Uz, parsed: &super::cli::Parsed) -> i32 
         }
 
         error = do_seekable(uz, false);
+        // readbyte()'s `EXIT(PK_BADERR)` after a read error
+        if let Some(code) = uz.abort {
+            return code;
+        }
         if error == PK_WARN {
             num_warn += 1;
         } else if error == IZ_DIR {
@@ -317,9 +331,10 @@ fn open_input_file(uz: &mut Uz) -> i32 {
     let path = uz.host.path(&uz.zipfn);
     match std::fs::File::open(&path) {
         Ok(f) => {
+            // apple: fileio.c:262 (`qtn_file_init_with_fd` on the archive,
+            // R9; deviation 7: both flavours on macOS)
+            uz.qf = super::unix::attrs::archive_quarantine(&uz.host, &f);
             uz.zin.fd = Some(uz.host.track(&path, f));
-            // apple: fileio.c:262 (`qtn_file_init_with_fd` on the archive):
-            // Task 10 reads the quarantine information (R9).
             0
         }
         Err(e) => {
@@ -546,8 +561,11 @@ fn do_seekable(uz: &mut Uz, lastchance: bool) -> i32 {
         } else if uz.o.vflag != 0 && !uz.o.tflag && !uz.o.cflag {
             list::list_files(uz) // LIST 'EM
         } else {
-            not_built_yet(uz) // EXTRACT OR TEST 'EM: Task 10
+            super::extract::extract_or_test_files(uz) // EXTRACT OR TEST 'EM
         };
+        if uz.abort.is_some() {
+            return error;
+        }
 
         if error > error_in_archive {
             // don't overwrite stronger error with (for example) a warning
@@ -581,15 +599,6 @@ pub(crate) fn read_sig(uz: &mut Uz) -> usize {
     let n = readbuf(uz, &mut sig);
     uz.sig = sig;
     n
-}
-
-/// stuffr's own placeholder for what Task 10 builds (extraction and
-/// testing): it names what is missing, exit `PK_BADERR`. Never reached by
-/// a listing.
-fn not_built_yet(uz: &mut Uz) -> i32 {
-    let w = who(uz);
-    uz.info_fmt(0x401, m::NOT_BUILT_YET, &[w]);
-    PK_BADERR
 }
 
 // port: process.c:process_cdir_file_hdr
@@ -640,8 +649,8 @@ pub(crate) fn process_cdir_file_hdr(uz: &mut Uz) -> Result<CentralEntry, i32> {
     e.pinfo.has_ux_att = e.external_file_attributes & 0xffff_0000 != 0;
 
     // ubuntu: -DUNICODE_SUPPORT notes general-purpose bit 11 here (Task 13).
-    // The symlink flag (`G.pInfo->symlink = 0`) is the extraction's (Task
-    // 10).
+    // The symlink flag (`G.pInfo->symlink = 0`) starts false in each
+    // `extract::Info`.
     Ok(e)
 }
 
@@ -680,10 +689,9 @@ fn get_cdir_ent(uz: &mut Uz) -> Result<CentralEntry, i32> {
 /// The local header at the archive's position into `G.lrec`; with
 /// general-purpose bit 3 its CRC and sizes are the central directory's
 /// (`G.pInfo`'s, from `e`). Sets `G.csize`. `PK_EOF` when none could be
-/// read. For the extraction (Task 10).
+/// read.
 /// ruling: a header cut short leaves the C's `byterec` partly
 /// uninitialised; the bytes not read are zeros here.
-#[allow(dead_code)]
 pub(crate) fn process_local_file_hdr(uz: &mut Uz, e: &CentralEntry) -> i32 {
     let mut b = [0u8; LREC_SIZE];
     if readbuf(uz, &mut b) == 0 {

@@ -1196,18 +1196,254 @@ pub(super) fn sht_ymdhm_time(yr: u32, month: &[u8], dy: u32, hh: u32, mm: u32) -
     v
 }
 
+// ---- extract.c (Task 10) ----
+
+/// extract.c:VersionMsg. The name is padded by the caller (`%-22s`).
+pub(super) const VERSION_MSG: &str = "   skipping: %s  need %s compat. v%s.%s (can do v%s.%s)\n";
+/// extract.c:ComprMsgNum (`%-22s`, `%u`).
+pub(super) const COMPR_MSG_NUM: &str = "   skipping: %s  unsupported compression method %s\n";
+/// extract.c:ComprMsgName (`%-22s`).
+pub(super) const COMPR_MSG_NAME: &str = "   skipping: %s  `%s' method not supported\n";
+/// extract.c:ComprNames, by extract.c:ComprIDs (`find_compr_idx()`).
+pub(super) const COMPR_NAMES: [(u16, &str); 17] = [
+    (0, "store"),
+    (1, "shrink"),
+    (2, "reduce"),
+    (3, "reduce"),
+    (4, "reduce"),
+    (5, "reduce"),
+    (6, "implode"),
+    (7, "tokenize"),
+    (8, "deflate"),
+    (9, "deflate64"),
+    (10, "DCL implode"),
+    (12, "bzip2"),
+    (14, "LZMA"),
+    (18, "IBM/Terse"),
+    (19, "IBM LZ77"),
+    (97, "WavPack"),
+    (98, "PPMd"),
+];
+/// extract.c:FilNamMsg (`central` or `local`).
+pub(super) const FIL_NAM_MSG: &str = "%s:  bad filename length (%s)\n";
+/// extract.c:LvsCFNamMsg.
+pub(super) const LVS_CF_NAM_MSG: &str = "%s:  mismatching \"local\" filename (%s),\n         continuing with \"central\" filename version\n";
+/// extract.c:WrnStorUCSizCSizDiff.
+pub(super) const WRN_STOR_UCSIZ_CSIZ_DIFF: &str = "%s:  ucsize %s <> csize %s for STORED entry\n         continuing with \"compressed\" size value\n";
+/// extract.c:ExtFieldMsg.
+pub(super) const EXT_FIELD_MSG: &str = "%s:  bad extra field length (%s)\n";
+/// extract.c:OffsetMsg (`%lu`, `%s`, `%ld`).
+pub(super) const OFFSET_MSG: &str = "file #%s:  bad zipfile offset (%s):  %s\n";
+/// extract.c:ExtractMsg: `%8s` (right-aligned verb) and `%-22s` are the
+/// caller's.
+pub(super) const EXTRACT_MSG: &str = "%sing: %s  %s%s";
+/// extract.c:LengthMsg.
+pub(super) const LENGTH_MSG: &str = "%s  %s:  %s bytes required to uncompress to %s bytes;\n    %s      supposed to require %s bytes%s%s%s\n";
+/// extract.c:BadFileCommLength.
+pub(super) const BAD_FILE_COMM_LENGTH: &str = "%s:  bad file comment length\n";
+/// extract.c:LocalHdrSig.
+pub(super) const LOCAL_HDR_SIG: &str = "local header sig";
+/// extract.c:BadLocalHdr.
+pub(super) const BAD_LOCAL_HDR: &str = "file #%s:  bad local header\n";
+/// extract.c:AttemptRecompensate.
+pub(super) const ATTEMPT_RECOMPENSATE: &str = "  (attempting to re-compensate)\n";
+/// extract.c:BackslashPathSep.
+pub(super) const BACKSLASH_PATH_SEP: &str =
+    "warning:  %s appears to use backslashes as path separators\n";
+/// extract.c:AbsolutePathWarning.
+pub(super) const ABSOLUTE_PATH_WARNING: &str = "warning:  stripped absolute path spec from %s\n";
+/// extract.c:SkipVolumeLabel (`%-22s`).
+pub(super) const SKIP_VOLUME_LABEL: &str = "   skipping: %s  %svolume label\n";
+/// extract.c:DirlistSetAttrFailed.
+pub(super) const DIRLIST_SET_ATTR_FAILED: &str = "warning:  set times/attribs failed for %s\n";
+/// extract.c:DirlistFailAttrSum (`%lu`).
+pub(super) const DIRLIST_FAIL_ATTR_SUM: &str =
+    "     failed setting times/attribs for %s dir entries";
+/// extract.c:SymLnkWarnInvalid.
+pub(super) const SYM_LNK_WARN_INVALID: &str =
+    "warning:  deferred symlink (%s) failed:\n          invalid placeholder file\n";
+/// extract.c:SymLnkDeferred.
+pub(super) const SYM_LNK_DEFERRED: &str = "finishing deferred symbolic links:\n";
+/// extract.c:SymLnkFinish (`%-22s`).
+pub(super) const SYM_LNK_FINISH: &str = "  %s -> %s\n";
+/// extract.c:set_deferred_symlink's `perror("symlink error")`.
+pub(super) const SYMLINK_ERROR: &str = "symlink error";
+/// extract.c:ReplaceQuery.
+pub(super) const REPLACE_QUERY: &str = "replace %s? [y]es, [n]o, [A]ll, [N]one, [r]ename: ";
+/// extract.c:AssumeNone.
+pub(super) const ASSUME_NONE: &str = " NULL\n(EOF or read error, treating as \"[N]one\" ...)\n";
+/// extract.c:NewNameQuery.
+pub(super) const NEW_NAME_QUERY: &str = "new name: ";
+/// extract.c:InvalidResponse.
+pub(super) const INVALID_RESPONSE: &str = "error:  invalid response [%s]\n";
+/// extract_or_test_entrylist's echo of an empty answer.
+pub(super) const ENTER: &[u8] = b"{ENTER}";
+/// extract.c:ErrorInArchive.
+pub(super) const ERROR_IN_ARCHIVE: &str = "At least one %serror was detected in %s.\n";
+/// extract.c:ZeroFilesTested.
+pub(super) const ZERO_FILES_TESTED: &str = "Caution:  zero files tested in %s.\n";
+/// extract.c:VMSFormatQuery.
+pub(super) const VMS_FORMAT_QUERY: &str = "\n%s:  stored in VMS format.  Extract anyway? (y/n) ";
+/// extract.c:SkipCannotGetPasswd (`%-22s`).
+pub(super) const SKIP_CANNOT_GET_PASSWD: &str = "   skipping: %s  unable to get password\n";
+/// extract.c:SkipIncorrectPasswd (`%-22s`).
+pub(super) const SKIP_INCORRECT_PASSWD: &str = "   skipping: %s  incorrect password\n";
+/// extract.c:FilesSkipBadPasswd (`%lu`).
+pub(super) const FILES_SKIP_BAD_PASSWD: &str = "%s file%s skipped because of incorrect password.\n";
+/// extract.c:MaybeBadPasswd.
+pub(super) const MAYBE_BAD_PASSWD: &str = "    (may instead be incorrect password)\n";
+/// extract.c:NoErrInCompData.
+pub(super) const NO_ERR_IN_COMP_DATA: &str = "No errors detected in compressed data of %s.\n";
+/// extract.c:NoErrInTestedFiles (`%lu`).
+pub(super) const NO_ERR_IN_TESTED_FILES: &str =
+    "No errors detected in %s for the %s file%s tested.\n";
+/// extract.c:FilesSkipped (`%lu`).
+pub(super) const FILES_SKIPPED: &str =
+    "%s file%s skipped because of unsupported compression or encoding.\n";
+/// extract.c:ErrUnzipFile.
+pub(super) const ERR_UNZIP_FILE: &str = "  error:  %s%s %s\n";
+/// extract.c:ErrUnzipNoFile.
+pub(super) const ERR_UNZIP_NO_FILE: &str = "\n  error:  %s%s\n";
+/// extract.c:NotEnoughMem.
+pub(super) const NOT_ENOUGH_MEM: &str = "not enough memory to ";
+/// extract.c:InvalidComprData.
+pub(super) const INVALID_COMPR_DATA: &str = "invalid compressed data to ";
+/// extract.c:Inflate.
+pub(super) const INFLATE: &str = "inflate";
+/// extract.c:Explode.
+pub(super) const EXPLODE: &str = "explode";
+/// extract.c:Unshrink.
+pub(super) const UNSHRINK: &str = "unshrink";
+/// extract.c:FileTruncated.
+pub(super) const FILE_TRUNCATED: &str = "warning:  %s is probably truncated\n";
+/// extract.c:FileUnknownCompMethod.
+pub(super) const FILE_UNKNOWN_COMP_METHOD: &str = "%s:  unknown compression method\n";
+/// extract.c:BadCRC (`%08lx` twice, formatted by the caller).
+pub(super) const BAD_CRC: &str = " bad CRC %s  (should be %s)\n";
+/// extract_or_test_member's `"%-22s "` (the name padded by the caller).
+pub(super) const NAME_22: &str = "%s ";
+/// extract_or_test_member's and TestExtraField's `" OK\n"`.
+pub(super) const OK: &str = " OK\n";
+/// extract.c's verbs (`%8s`, padded by the caller) and file kinds.
+pub(super) const VERB_TEST: &[u8] = b"test";
+pub(super) const VERB_LINK: &[u8] = b"link";
+pub(super) const VERB_EXTRACT: &[u8] = b"extract";
+pub(super) const VERB_UNSHRINK: &[u8] = b"unshrink";
+pub(super) const VERB_EXPLOD: &[u8] = b"explod";
+pub(super) const VERB_INFLAT: &[u8] = b"inflat";
+/// extract_or_test_member's `nul`, `txt`, `bin`.
+pub(super) const KIND_EMPTY: &[u8] = b"[empty] ";
+pub(super) const KIND_TEXT: &[u8] = b"[text]  ";
+pub(super) const KIND_BINARY: &[u8] = b"[binary]";
+/// extract.c:TruncEAs (`%d`).
+pub(super) const TRUNC_EAS: &str = " compressed EA data missing (%s bytes)%s";
+/// extract.c:TruncNTSD (`%d`).
+pub(super) const TRUNC_NTSD: &str = " compressed WinNT security data missing (%s bytes)%s";
+/// extract.c:InconsistEFlength (`%u` twice).
+pub(super) const INCONSIST_EF_LENGTH: &str = "bad extra-field entry:\n      EF block length (%s bytes) exceeds remaining EF data (%s bytes)\n";
+/// extract.c:TooSmallEBlength (`%u`, `%d`).
+pub(super) const TOO_SMALL_EB_LENGTH: &str =
+    "bad extra-field entry:\n      EF block length (%s bytes) invalid (< %s)\n";
+/// extract.c:InvalidComprDataEAs.
+pub(super) const INVALID_COMPR_DATA_EAS: &str = " invalid compressed data for EAs\n";
+/// extract.c:UnsuppNTSDVersEAs (`%d`).
+pub(super) const UNSUPP_NTSD_VERS_EAS: &str = " unsupported NTSD EAs version %s\n";
+/// extract.c:BadCRC_EAs.
+pub(super) const BAD_CRC_EAS: &str = " bad CRC for extended attributes\n";
+/// extract.c:UnknComprMethodEAs (`%u`).
+pub(super) const UNKN_COMPR_METHOD_EAS: &str = " unknown compression method for EAs (%s)\n";
+/// extract.c:NotEnoughMemEAs.
+pub(super) const NOT_ENOUGH_MEM_EAS: &str = " out of memory while inflating EAs\n";
+/// extract.c:UnknErrorEAs.
+pub(super) const UNKN_ERROR_EAS: &str = " unknown error on extended attributes\n";
+/// extract.c:UnsupportedExtraField (`%u`).
+pub(super) const UNSUPPORTED_EXTRA_FIELD: &str =
+    "\nerror:  unsupported extra-field compression type (%s)--skipping\n";
+/// extract.c:BadExtraFieldCRC (`%08lx` twice).
+pub(super) const BAD_EXTRA_FIELD_CRC: &str = "error [%s]:  bad extra-field CRC %s (should be %s)\n";
+
+// ---- fileio.c's output side (Task 10) ----
+
+/// fileio.c:is_vms_varlen_txt's warning for a PKWARE VMS block whose CRC
+/// does not match.
+pub(super) const VMS_CRC_WARNING: &str = "[Warning: CRC error, discarding PKWARE extra field]\n";
+
+/// fileio.c:CannotDeleteOldFile.
+pub(super) const CANNOT_DELETE_OLD_FILE: &str = "error:  cannot delete old %s\n        %s\n";
+/// fileio.c:CannotRenameOldFile.
+pub(super) const CANNOT_RENAME_OLD_FILE: &str = "error:  cannot rename old %s\n        %s\n";
+/// fileio.c:BackupSuffix.
+pub(super) const BACKUP_SUFFIX: &[u8] = b"~";
+/// fileio.c:CannotCreateFile.
+pub(super) const CANNOT_CREATE_FILE: &str = "error:  cannot create %s\n        %s\n";
+/// apple: fileio.c:168, CannotEnterDir.
+pub(super) const CANNOT_ENTER_DIR: &str = "error:  cannot enter %s\n        %s\n";
+/// fileio.c:DiskFullQuery.
+pub(super) const DISK_FULL_QUERY: &str = "%s:  write error (disk full?).  Continue? (y/n/^C) ";
+/// fileio.c:FileIsSymLink.
+pub(super) const FILE_IS_SYMLINK: &str = "%s exists and is a symbolic link%s.\n";
+/// check_for_newer()'s second `FileIsSymLink` argument.
+pub(super) const WITH_NO_REAL_FILE: &[u8] = b" with no real file";
+/// apple: unix.c:1003, `ENOTCAPABLE`'s text on macOS (`strerror(107)`),
+/// for an escape off macOS, where the errno does not exist.
+/// probe: `strerror(ENOTCAPABLE)` on this Mac.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(super) const NOT_CAPABLE: &str = "Capabilities insufficient";
+
+// ---- unix/unix.c (Task 10) ----
+
+/// unix.c:CannotSetItemUidGid (`%lu` twice).
+pub(super) const CANNOT_SET_ITEM_UID_GID: &str =
+    "warning:  cannot set UID %s and/or GID %s for %s\n          %s\n";
+/// unix.c:CannotSetUidGid (`%lu` twice).
+pub(super) const CANNOT_SET_UID_GID: &str =
+    " (warning) cannot set UID %s and/or GID %s\n          %s";
+/// unix.c:CannotSetItemTimestamps.
+pub(super) const CANNOT_SET_ITEM_TIMESTAMPS: &str =
+    "warning:  cannot set modif./access times for %s\n          %s\n";
+/// unix.c:CannotSetTimestamps.
+pub(super) const CANNOT_SET_TIMESTAMPS: &str =
+    " (warning) cannot set modif./access times\n          %s";
+/// unix.c:DirlistChmodFailed.
+pub(super) const DIRLIST_CHMOD_FAILED: &str =
+    "warning:  cannot set permissions for %s\n          %s\n";
+/// unix.c:mapname's warning for stripped `../` components.
+pub(super) const SKIPPED_DDOT: &str = "warning:  skipped \"../\" path component(s) in %s\n";
+/// unix.c:mapname's report of a created directory.
+pub(super) const CREATING: &str = "   creating: %s\n";
+/// unix.c:mapname's `perror()` texts.
+pub(super) const PERROR_DIR_ATTRS: &str = "Could not read directory attributes";
+pub(super) const PERROR_CHMOD_DIR: &str = "chmod (directory attributes) error";
+/// unix.c:close_outfile's `perror()`.
+pub(super) const PERROR_FCHMOD: &str = "fchmod (file attributes) error";
+/// unix.c:set_symlnk_attribs's `perror()`.
+pub(super) const PERROR_LCHMOD: &str = "lchmod (file attributes) error";
+/// unix.c:mapname, a name that maps to nothing.
+pub(super) const MAPNAME_FAILED: &str = "mapname:  conversion of %s failed\n";
+/// unix.c:checkdir, `APPEND_DIR` past `FILNAMSIZ`.
+pub(super) const CHECKDIR_TOO_LONG: &str = "checkdir error:  path too long: %s\n";
+/// unix.c:checkdir, a directory that could not be made.
+pub(super) const CHECKDIR_CANNOT_CREATE: &str = "checkdir error:  cannot create %s\n                 %s\n                 unable to process %s.\n";
+/// unix.c:checkdir, a path component that is not a directory.
+pub(super) const CHECKDIR_NOT_DIR: &str =
+    "checkdir error:  %s exists but is not directory\n                 unable to process %s.\n";
+/// unix.c:checkdir, `APPEND_NAME` past `FILNAMSIZ`.
+pub(super) const CHECKDIR_TRUNCATING: &str =
+    "checkdir warning:  path too long; truncating\n                   %s\n                -> %s\n";
+/// unix.c:checkdir, `ROOT` that could not be made.
+pub(super) const CHECKDIR_CANNOT_CREATE_ROOT: &str =
+    "checkdir:  cannot create extraction directory: %s\n           %s\n";
+/// unix.c:close_outfile, a symlink whose target could not be read back.
+pub(super) const SYMLINK_FAILED: &str = "warning:  symbolic link (%s) failed\n";
+/// unix.c:close_outfile, the link target after the name.
+pub(super) const SYMLINK_ARROW: &str = "-> %s ";
+
 // ---- stuffr's own ----
 
 /// stuffr's own: the flavour variable holds neither name (exit 1). `%s` is
 /// the program name, then the value.
 pub(super) const FLAVOR_REFUSED: &str =
     "%s: STUFFR_UNZIP_FLAVOR must be apple or ubuntu, not '%s'\n";
-/// stuffr's own, until Tasks 9 and 10 build zipinfo's listings and the
-/// extraction: what a run that found the archive's directory says instead
-/// of listing (zipinfo), testing or extracting it (exit `PK_BADERR`). `%s`
-/// is `unzip` or `zipinfo`.
-pub(super) const NOT_BUILT_YET: &str =
-    "%s:  archive processing is not implemented in this build yet (stuffr)\n";
 /// stuffr's own, until Task 12 builds funzip's decoder (exit 3, funzip.c's
 /// `err()` code for a bad input).
 pub(super) const FUNZIP_NOT_BUILT_YET: &str =

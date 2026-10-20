@@ -23,18 +23,19 @@
 //! options and the state, so a sandboxed run ([`run_in_counted`]) touches
 //! nothing of the process.
 //!
-//! **Built so far** (0.16.0 Tasks 7 and 8): the names, the flavour, the
+//! **Built so far** (0.16.0 Tasks 7 to 10): the names, the flavour, the
 //! command line (`unzip.c`'s `unzip()` front half and `uz_opts()`,
 //! `zipinfo.c`'s `zi_opts()`, `envargs.c`), the usage screens, `-hh`, the
 //! `-v` screen and funzip's usage (Task 7); opening archives, wildcard
 //! archive names, the end records, Zip64, the central directory walk,
 //! wildcards and unzip's listings `-l`, `-v`, `-z`, `-T` (`process.rs`,
-//! `unix.rs`, `matching.rs`, `list.rs`, `fileio.rs`: Task 8); zipinfo's
+//! `unix/mod.rs`, `matching.rs`, `list.rs`, `fileio.rs`: Task 8); zipinfo's
 //! listings, every format, the totals and the `-v` report (`zipinfo/`:
-//! Task 9). Testing and extraction answer with a placeholder
-//! (`messages::NOT_BUILT_YET`, exit 3) once the archive's directory is
-//! found, until Task 10.
-//!
+//! Task 9); testing and extraction (`extract/`: `extract.c`, `fileio.c`'s
+//! output side, crypt.c's `decrypt()`; `unix/mapname.rs`, `unix/attrs.rs`:
+//! `unix.c`'s names, paths, modes, times and symlinks; `unix/beneath.rs`:
+//! the resolve-beneath walk every change goes through; Task 10).
+
 //! Known deviations (the source of truth; the README and the spec mirror
 //! this list):
 //!
@@ -70,6 +71,7 @@ use super::CountedRun;
 use super::host::{self, Host, SANDBOX_OUTPUT_CAP, Sandbox};
 
 pub(crate) mod cli;
+mod extract;
 mod fileio;
 pub(crate) mod flavour;
 mod list;
@@ -192,14 +194,33 @@ pub(crate) struct Uz<'a> {
     /// `G.unicode_escape_all` (ubuntu: -DUNICODE_WCHAR): `-U` given once.
     #[allow(dead_code)]
     pub(crate) unicode_escape_all: bool,
-    /// `G.rootdir`, Apple's descriptor for the extraction root (`-1`: none;
-    /// apple: globals.c:164, `apple_globals_ctor`). Task 10 opens it.
-    #[allow(dead_code)]
-    pub(crate) rootdir: Option<std::fs::File>,
-    /// `G.qf`, the archive's quarantine information (`NULL`: none; apple:
-    /// globals.c:165, `apple_globals_ctor`). Task 10 reads it (R9).
-    #[allow(dead_code)]
+    /// `checkdir()`'s state: the extraction root (`G.rootpath`,
+    /// `G.rootlen`, Apple's `G.rootdir`: apple: globals.c:164, `-1` at
+    /// start) and the path being built (`unix/mapname.rs`).
+    pub(crate) ck: unix::mapname::Checkdir,
+    /// `G.qf`, what the archive's quarantine gives what is extracted from
+    /// it (P7's rewritten value; `NULL`: none; apple: globals.c:165).
     pub(crate) qf: Option<Vec<u8>>,
+    /// `G.overwrite_mode`: query, always or never (`extract::OVERWRT_*`).
+    pub(crate) overwrite_mode: i32,
+    /// `G.answerbuf`: the last answer read from standard input (kept when
+    /// an answer finds the end of input).
+    pub(crate) answerbuf: [u8; 10],
+    /// Standard input as one stdio stream for the run (`fgets(...,
+    /// stdin)`), opened at the first question.
+    pub(crate) stdin: Option<host::Input>,
+    /// `G.key`: the password tried on encrypted entries.
+    pub(crate) key: Option<Vec<u8>>,
+    /// `G.nopwd`: no more prompting (`-P`, or "skip all").
+    pub(crate) nopwd: bool,
+    /// `G.newzip`: no encrypted entry of this archive seen yet.
+    pub(crate) newzip: bool,
+    /// The run ends with this code: readbyte()'s `EXIT(PK_BADERR)` after a
+    /// read error.
+    pub(crate) abort: Option<i32>,
+    /// What `Info()` formatted into `slide` while a decoder held it, in
+    /// order: written to its front when it comes back (P13).
+    pub(crate) pending_slide: Vec<Vec<u8>>,
     /// `G.area.Slide`: the one window every decoder writes into and the
     /// message layer formats into (rulings P13/P16), at least
     /// `stuffr::infozip::WSIZE`, reused across entries. `fnfilter()` and
@@ -265,9 +286,17 @@ impl<'a> Uz<'a> {
             native_is_utf8: false,
             unicode_escape_all: false,
             // apple: globals.c:164 (`G.rootdir = -1`)
-            rootdir: None,
+            ck: unix::mapname::Checkdir::default(),
             // apple: globals.c:165 (`G.qf = NULL`)
             qf: None,
+            overwrite_mode: extract::OVERWRT_QUERY,
+            answerbuf: [0; 10],
+            stdin: None,
+            key: None,
+            nopwd: false,
+            newzip: false,
+            abort: None,
+            pending_slide: Vec::new(),
             slide: vec![0u8; stuffr::infozip::WSIZE].into_boxed_slice(),
             zin: fileio::ZipIn::new(),
             wildzipfn: Vec::new(),
@@ -286,13 +315,51 @@ impl<'a> Uz<'a> {
         }
     }
 
-    // port: fileio.c:UzpMessagePrnt
-    /// `Info(slide, flag, ...)`: print `buf` to standard error when `flag`
-    /// has [`MSG_STDERR`] and `-t` is not set, else to standard output,
-    /// with the leading and trailing newlines `flag` asks for, and flush.
-    /// Write errors are ignored, as every `Info()` caller ignores them.
-    /// (`-M`'s pager is Task 11's.)
+    /// `Info(slide, flag, ((char *)slide, ...))`: the message formatted into
+    /// `slide`'s front (and its NUL), as the C's `sprintf` puts it there
+    /// (P13), then printed ([`Uz::print_raw`]).
     pub(crate) fn info(&mut self, flag: u32, buf: &[u8]) {
+        let owned: Vec<u8>;
+        let buf = if flag & MSG_TNEWLN != 0
+            && ((buf.is_empty() && !self.sol) || (!buf.is_empty() && buf.last() != Some(&b'\n')))
+        {
+            // UzpMessagePrnt appends the newline in the buffer itself
+            owned = [buf, b"\n"].concat();
+            &owned[..]
+        } else {
+            buf
+        };
+        self.put_in_slide(buf);
+        self.print_raw(flag & !MSG_TNEWLN, buf);
+    }
+
+    /// `buf` at `slide`'s front with a NUL after it (or, while a decoder
+    /// holds the window, kept for [`Uz::restore_slide`]).
+    fn put_in_slide(&mut self, buf: &[u8]) {
+        let n = buf.len();
+        if self.slide.len() > n {
+            self.slide[..n].copy_from_slice(buf);
+            self.slide[n] = 0;
+        } else if self.slide.is_empty() {
+            self.pending_slide.push(buf.to_vec());
+        }
+    }
+
+    /// The window is back from a decoder: what `Info()` formatted meanwhile
+    /// goes to its front, in order.
+    pub(crate) fn restore_slide(&mut self) {
+        for p in std::mem::take(&mut self.pending_slide) {
+            self.put_in_slide(&p);
+        }
+    }
+
+    // port: fileio.c:UzpMessagePrnt
+    /// `(*G.message)(&G, buf, size, flag)`: print `buf` to standard error
+    /// when `flag` has [`MSG_STDERR`] and `-t` is not set, else to standard
+    /// output, with the leading and trailing newlines `flag` asks for, and
+    /// flush. Write errors are ignored, as every `Info()` caller ignores
+    /// them. (`-M`'s pager is Task 11's.)
+    pub(crate) fn print_raw(&mut self, flag: u32, buf: &[u8]) {
         let to_stderr = flag & MSG_STDERR != 0 && !self.o.tflag;
         let owned: Vec<u8>;
         let buf = if flag & MSG_TNEWLN != 0
@@ -325,6 +392,19 @@ impl<'a> Uz<'a> {
             }
             self.sol = buf.last() == Some(&b'\n');
         }
+    }
+
+    /// `(*G.message)(&G, rawbuf, size, 0)` for `-c` and `-p`'s data:
+    /// standard output, flushed; a failed write is returned (flush() then
+    /// gives up on the entry).
+    pub(crate) fn print_data(&mut self, buf: &[u8]) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        self.out.write_all(buf)?;
+        self.out.flush()?;
+        self.sol = buf.last() == Some(&b'\n');
+        Ok(())
     }
 
     /// [`Uz::info`] of `fmt` with its `%s`/`%d` filled from `args`.

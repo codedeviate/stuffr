@@ -1452,6 +1452,132 @@ mod unix {
                 "",
             ),
         ]);
+        // Extraction (Task 10), as both references extract.
+        let up = || {
+            vec![(
+                "up.zip",
+                zip_with(
+                    &[
+                        ZipEntrySpec::new(b"../up.txt", b"up\n"),
+                        ZipEntrySpec::new(b"/abs.txt", b"abs\n"),
+                    ],
+                    b"",
+                    b"",
+                ),
+            )]
+        };
+        let linked = || {
+            vec![(
+                "l.zip",
+                zip_with(
+                    &[
+                        ZipEntrySpec::new(b"a.txt", b"alpha\n"),
+                        ZipEntrySpec {
+                            external_attr: 0o120777 << 16,
+                            ..ZipEntrySpec::new(b"l", b"a.txt")
+                        },
+                    ],
+                    b"",
+                    b"",
+                ),
+            )]
+        };
+        let existing = || {
+            let mut f = a();
+            f.push(("a.txt", b"already here\n".to_vec()));
+            f
+        };
+        v.extend([
+            row(
+                Both,
+                10,
+                "extract",
+                "unzip",
+                &["a.zip"],
+                a(),
+                0,
+                concat!(
+                    "Archive:  a.zip\n",
+                    " extracting: a.txt                   \n",
+                    "  inflating: b.txt                   \n",
+                ),
+                "",
+            ),
+            row(Both, 10, "-p", "unzip", &["-p", "a.zip", "a.txt"], a(), 0, "alpha\n", ""),
+            row(
+                Both,
+                10,
+                "-d, made",
+                "unzip",
+                &["-d", "new", "a.zip"],
+                a(),
+                0,
+                " extracting: new/a.txt               \n",
+                "",
+            ),
+            row(
+                Both,
+                10,
+                "../ and absolute names",
+                "unzip",
+                &["up.zip"],
+                up(),
+                1,
+                concat!(
+                    "warning:  skipped \"../\" path component(s) in ../up.txt\n",
+                    " extracting: up.txt                  \n",
+                ),
+                "warning:  stripped absolute path spec from /abs.txt\n",
+            ),
+            row(
+                Both,
+                10,
+                "existing file, no answer",
+                "unzip",
+                &["a.zip"],
+                existing(),
+                1,
+                "  inflating: b.txt                   \n",
+                "replace a.txt? [y]es, [n]o, [A]ll, [N]one, [r]ename:  NULL\n(EOF or read error, treating as \"[N]one\" ...)\n",
+            ),
+            row(
+                Both,
+                10,
+                "existing file, -n",
+                "unzip",
+                &["-n", "a.zip"],
+                existing(),
+                0,
+                "Archive:  a.zip\n  inflating: b.txt                   \n",
+                "",
+            ),
+            row(
+                Both,
+                10,
+                "existing file, -o",
+                "unzip",
+                &["-o", "a.zip"],
+                existing(),
+                0,
+                " extracting: a.txt                   \n",
+                "",
+            ),
+            row(
+                Both,
+                10,
+                "a symlink, deferred",
+                "unzip",
+                &["l.zip"],
+                linked(),
+                0,
+                concat!(
+                    "    linking: l                       -> a.txt \n",
+                    "finishing deferred symbolic links:\n",
+                    "  l                      -> a.txt\n",
+                ),
+                "",
+            ),
+        ]);
         // The overlapped archive: Apple tests both entries; Ubuntu's
         // bomb-detection patch (Task 14) stops at the second, exit 12.
         v.extend([
@@ -1647,8 +1773,11 @@ mod unix {
         differential(9);
     }
 
+    /// Task 10's rows (testing and extraction): Apple's and the `Both` rows
+    /// on macOS; Ubuntu's side waits for Task 13 (R13), as `Row::task_here`
+    /// tags it.
     #[test]
-    #[ignore = "Task 10"]
+    #[cfg_attr(not(target_os = "macos"), ignore = "Task 13 (R13: Ubuntu's side)")]
     fn task10_rows_match_stuffr() {
         differential(10);
     }

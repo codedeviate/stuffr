@@ -1,10 +1,17 @@
-//! `unix/unix.c`'s pieces the archive walk needs: `do_wild()` (a wildcard
-//! archive name, expanded in its directory) and `stamp_file()` (`-T`).
-//! The extraction (Task 10) adds `mapattr()`, `checkdir()` and
-//! `close_outfile()` here.
+//! `unix/unix.c`: `do_wild()` (a wildcard archive name, expanded in its
+//! directory) and `stamp_file()` (`-T`) here; the extraction's names and
+//! paths (`mapname.rs`: `mapname()`, `checkdir()`), attributes
+//! (`attrs.rs`: `mapattr()`, `close_outfile()`, `defer_dir_attribs()`,
+//! `set_direc_attribs()`, `set_symlnk_attribs()`, Apple's quarantine) and
+//! the resolve-beneath walk every one of them goes through (`beneath.rs`,
+//! deviation 3).
 
 use super::matching::{iswild, matches};
 use super::{Uz, flavour};
+
+pub(crate) mod attrs;
+pub(crate) mod beneath;
+pub(crate) mod mapname;
 
 /// `do_wild()`'s state (`SYSTEM_SPECIFIC_GLOBALS`: `wild_dir`, `wildname`,
 /// `dirname`, `matchname`, `notfirstcall`, `have_dirname`, `dirnamelen`).

@@ -16,6 +16,10 @@
 mod compat_harness;
 
 #[cfg(target_os = "macos")]
+#[path = "compat_unzip_apple/task10.rs"]
+mod task10;
+
+#[cfg(target_os = "macos")]
 mod macos {
     use super::compat_harness::*;
     use std::path::Path;
@@ -254,6 +258,60 @@ mod macos {
             &ditto,
             &[(&["-l", "@", "-x", "__MACOSX/*"], &[], None)],
         ));
+        // The extraction half (Task 10): each archive tested, extracted
+        // (into `.`, a new `-d`, junked, `-a`), and Windows' names folded.
+        // Without the CP850 name: on APFS its ISO 8859-1 bytes are no UTF-8
+        // name (`EILSEQ`), and Apple's unzip then writes through the
+        // previous entry's closed stream (T10-11, pinned stuffr-only in
+        // compat_unzip_safety).
+        let windows = zip_with(
+            &[
+                dos(b"WINDIR\\", b"", 0x10),
+                dos(b"WINDIR\\Sub\\File.TXT", b"in a folder\r\n", 0x20),
+                dos(b"README.TXT", b"read me\r\n", 0x21),
+                dos(b"HIDDEN.SYS", b"hidden\r\n", 0x27),
+                dos(b"DISKLABE.L01", b"", 0x08),
+            ],
+            b"made on Windows\r\n",
+            b"",
+        );
+        for (name, bytes) in [
+            ("windows.zip", &windows),
+            ("streamed.zip", &streamed),
+            ("utf8.zip", &utf8),
+            ("sfx.zip", &sfx),
+            ("infozip.zip", &infozip),
+            ("ditto.zip", &ditto),
+        ] {
+            cases.extend(listings(
+                name,
+                bytes,
+                &[
+                    (&["-t"], &[], None),
+                    (&[], &[], None),
+                    (&["-d", "out"], &[], None),
+                    (&["-j"], &[], None),
+                    (&["-a"], &[], None),
+                    (&["-q"], &[], None),
+                    (&[], &[], Some("America/New_York")),
+                    (&[], &[("LANG", "en_US.UTF-8")], None),
+                ],
+            ));
+        }
+        cases.extend(listings(
+            "windows.zip",
+            &windows,
+            &[
+                (&["-L"], &[], None),
+                (&["-LL"], &[], None),
+                (&["-aa"], &[], None),
+            ],
+        ));
+        cases.extend(listings(
+            "ditto.zip",
+            &ditto,
+            &[(&["@", "-x", "__MACOSX/*"], &[], None)],
+        ));
         compare("archives_from_other_makers", &cases);
     }
 
@@ -416,9 +474,20 @@ mod macos {
                     (&["-l"], &[], None),
                     (&["-v"], &[], None),
                     (&["-lq"], &[], None),
+                    // Task 10: tested, and the small ones extracted
+                    (&["-t"], &[], None),
+                    (&["-tq"], &[], None),
+                    (&[], &[], None),
                 ],
             ));
         }
+        // Task 10: the 70,000 entries tested (extracting them would make
+        // 70,000 files per side: tested only).
+        cases.extend(listings(
+            "many.zip",
+            &many,
+            &[(&["-tq"], &[], None), (&["-t", "@", "e6999*"], &[], None)],
+        ));
         // Not vacuous: the reference lists every entry of many.zip, and
         // stuffr agrees (below).
         if let Some(r) = unzip_reference(&cases[0]) {
@@ -500,6 +569,54 @@ mod macos {
             vec!["-lq", "names.zip", starsx],
             vec![("names.zip", z.clone())],
         ));
+        // The extraction half (Task 10): `A` and `a` meet on a
+        // case-insensitive volume (the question, answered or not), control
+        // bytes are dropped from the made names (`-^` keeps them), `../`
+        // and `/` stripped, the empty name refused. Without the names APFS
+        // refuses (high bytes that are no UTF-8, a component past 255
+        // bytes): Apple's unzip then writes through the previous entry's
+        // closed stream (T10-11, pinned stuffr-only).
+        let z: Vec<u8> = zip_with(
+            &names
+                .iter()
+                .filter(|n| !n.starts_with(b"ctl"))
+                .map(|n| ZipEntrySpec {
+                    // a directory the harness can walk afterwards
+                    external_attr: if n.ends_with(b"/") {
+                        0o40755 << 16
+                    } else {
+                        0o100644 << 16
+                    },
+                    ..ZipEntrySpec::new(n, b"x")
+                })
+                .collect::<Vec<_>>(),
+            b"",
+            b"",
+        );
+        let ex = listings(
+            "names.zip",
+            &z,
+            &[
+                (&[], &[], None),
+                (&["-t"], &[], None),
+                (&["-o"], &[], None),
+                (&["-n"], &[], None),
+                (&["-^"], &[], None),
+                (&["-j"], &[], None),
+                (&["-L"], &[], None),
+                (&["-d", "x"], &[], None),
+                (&["@", "a"], &[], None),
+                (&["-C", "@", "a"], &[], None),
+                (&["-p"], &[], None),
+                (&[], UTF8, None),
+            ],
+        );
+        cases.extend(ex);
+        for stdin in [&b"y\n"[..], b"n\n", b"r\nother\n", b"A\n"] {
+            let mut c = unzip_case("unzip", vec!["names.zip"], vec![("names.zip", z.clone())]);
+            c.stdin = Some(stdin.to_vec());
+            cases.push(c);
+        }
         compare("awkward_names", &cases);
     }
 

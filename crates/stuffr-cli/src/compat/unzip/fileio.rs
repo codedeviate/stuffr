@@ -83,6 +83,28 @@ pub(crate) struct ZipIn {
     pub(crate) extra_bytes: i64,
     /// `G.ziplen`: the archive's size by `stat()`.
     pub(crate) ziplen: i64,
+    /// `G.inptr_leftover`, `G.incnt_leftover`: the buffer's bytes past the
+    /// entry being decoded (`defer_leftover_input()`).
+    pub(crate) inptr_leftover: usize,
+    pub(crate) incnt_leftover: i64,
+}
+
+impl Default for ZipIn {
+    /// A stand-in while the extraction holds the real one (no buffer, no
+    /// archive).
+    fn default() -> ZipIn {
+        ZipIn {
+            fd: None,
+            inbuf: Box::default(),
+            incnt: 0,
+            inptr: 0,
+            cur_zipfile_bufstart: 0,
+            extra_bytes: 0,
+            ziplen: 0,
+            inptr_leftover: 0,
+            incnt_leftover: 0,
+        }
+    }
 }
 
 impl ZipIn {
@@ -95,6 +117,8 @@ impl ZipIn {
             cur_zipfile_bufstart: 0,
             extra_bytes: 0,
             ziplen: 0,
+            inptr_leftover: 0,
+            incnt_leftover: 0,
         }
     }
 
@@ -607,6 +631,34 @@ pub(crate) fn fnfilter_at(uz: &mut Uz, raw: &[u8], at: usize, size: usize) -> Ve
 /// `WSIZE/4` bytes.
 pub(crate) fn fnfilter1(uz: &mut Uz, raw: &[u8]) -> Vec<u8> {
     fnfilter_at(uz, raw, WSIZE >> 1, WSIZE >> 2)
+}
+
+/// unzpriv.h's `FnFilter2(fname)`: `fnfilter()` into `slide + WSIZE/2 +
+/// WSIZE/4`, `WSIZE/4` bytes.
+pub(crate) fn fnfilter2(uz: &mut Uz, raw: &[u8]) -> Vec<u8> {
+    fnfilter_at(uz, raw, (WSIZE >> 1) + (WSIZE >> 2), WSIZE >> 2)
+}
+
+// port: extract.c:fnfilterp
+/// apple: extract.c:2788, `fnfilterp(pfx, raw, slide + WSIZE/2, WSIZE/4)`:
+/// `pfx` (when given and not empty) filtered, a `/`, then `raw` filtered
+/// in the space left.
+pub(crate) fn fnfilterp(uz: &mut Uz, pfx: Option<&[u8]>, raw: &[u8]) -> Vec<u8> {
+    let (mut at, mut size) = (WSIZE >> 1, WSIZE >> 2);
+    let mut out = Vec::new();
+    if let Some(pfx) = pfx.filter(|p| !p.is_empty()) {
+        let p = fnfilter_at(uz, pfx, at, size);
+        let n = c_str(&p).len().min(size);
+        at += n;
+        size -= n;
+        out.extend_from_slice(&p[..n]);
+        uz.slide[at] = b'/';
+        out.push(b'/');
+        at += 1;
+        size = size.saturating_sub(1);
+    }
+    out.extend_from_slice(&fnfilter_at(uz, raw, at, size));
+    out
 }
 
 // port: list.c:fnprint
