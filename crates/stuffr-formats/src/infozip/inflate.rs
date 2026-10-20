@@ -371,18 +371,23 @@ pub(crate) fn huft_build(
 macro_rules! needbits {
     ($self:ident, $b:ident, $k:ident, $n:expr) => {
         while ($k as i32) < ($n as i32) {
-            match $self.src.next_byte() {
+            match $self.src.next_bits() {
                 None => {
                     if ($k as i32) >= 0 {
                         break;
                     }
                     return Err(Stop::Code(1));
                 }
-                // The C shifts by a `k` that is never negative here: its
-                // EOF is sticky. `wrapping_shl` keeps a source whose EOF is
-                // not sticky from panicking.
+                // unzip's EOF is sticky, so it shifts by a `k` that is never
+                // negative here. funzip's encrypted `NEXTBYTE` is not
+                // ([`ByteSource::next_bits`]): after its `EOF` it can give a
+                // value again, with `k` "negative", and `(ulg)c << k` is
+                // then undefined in C.
+                // ruling: T12-2. The shift is taken modulo 64
+                // (`wrapping_shl`), as the AArch64 `lsl` and x86-64 `shl`
+                // both references run on take it.
                 Some(c) => {
-                    $b |= u64::from(c).wrapping_shl($k);
+                    $b |= c.wrapping_shl($k);
                     $k = $k.wrapping_add(8);
                 }
             }

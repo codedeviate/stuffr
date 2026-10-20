@@ -1206,3 +1206,82 @@ mod inflate {
         run_in(&[0b0000_0011, 0], false, &mut [0; 100]);
     }
 }
+
+/// `ByteSource::next_bits`: funzip's encrypted `NEXTBYTE`, which can give
+/// a value again after its `EOF` and a value outside a byte (ruling T12-2).
+mod next_bits {
+    use crate::infozip::{ByteSource, Stop, WSIZE, inflate};
+
+    /// A source of C `int`s, `None` standing for `EOF`.
+    struct Ints(std::vec::IntoIter<Option<i32>>);
+
+    impl ByteSource for Ints {
+        fn next_byte(&mut self) -> Option<u8> {
+            self.next_bits().map(|c| c as u8)
+        }
+        fn next_bits(&mut self) -> Option<u64> {
+            self.0.next().flatten().map(|c| i64::from(c) as u64)
+        }
+        fn remaining(&self) -> u64 {
+            0
+        }
+    }
+
+    fn run(ints: Vec<Option<i32>>) -> (Result<(), Stop<()>>, Vec<u8>) {
+        let mut src = Ints(ints.into_iter());
+        let mut out = Vec::new();
+        let mut window = vec![0; WSIZE];
+        let r = inflate(
+            &mut src,
+            false,
+            &mut window,
+            &mut |b: &[u8]| {
+                out.extend_from_slice(b);
+                Ok(())
+            },
+            &mut |_| {},
+        );
+        (r, out)
+    }
+
+    /// ruling: T12-2. A stored block (`0x01`) whose LEN finds `EOF` with
+    /// `k` 0: LEN is 0 and `k` goes to -16, so NLEN is read with `k`
+    /// "negative" from the values after that `EOF`. The shift is modulo
+    /// 64, which puts the first two values in bits 48..63, and the next two
+    /// (`0xff`, `0xff`) make NLEN 0xffff: an empty last block, no error.
+    #[test]
+    fn a_value_after_eof_is_shifted_modulo_64() {
+        let (r, out) = run(vec![
+            Some(0x01),
+            None,
+            Some(0xaa),
+            Some(0xbb),
+            Some(0xff),
+            Some(0xff),
+        ]);
+        assert!(r.is_ok(), "{r:?}");
+        assert!(out.is_empty());
+    }
+
+    /// A negative `int` sign-extends into the bit buffer (`(ulg)c`). A
+    /// fixed last block (`0xfb`: then five one bits) followed by funzip's
+    /// `EOF ^ k` values (here -2, low byte `0xfe`): its low byte gives one
+    /// zero bit, every bit above it is one, and later values cannot clear
+    /// any, so the codes are `111110111` (literal 0xf7) and then `1` x 9
+    /// (literal 0xff) for as long as the source gives values. Widened as
+    /// bytes, the same values would decode otherwise.
+    #[test]
+    fn a_negative_value_reads_as_ones() {
+        let mut ints = vec![Some(0xfb)];
+        ints.extend(std::iter::repeat_n(Some(-2), 80_000));
+        let (r, out) = run(ints);
+        assert!(matches!(r, Err(Stop::Code(1))), "{r:?}");
+        // only the full window was flushed before the source ran out
+        assert_eq!(out.len(), WSIZE);
+        assert_eq!(out[0], 0xf7);
+        assert!(out[1..].iter().all(|&b| b == 0xff));
+        let mut bytes = vec![Some(0xfb)];
+        bytes.extend(std::iter::repeat_n(Some(0xfe), 80_000));
+        assert_ne!(run(bytes).1, out);
+    }
+}

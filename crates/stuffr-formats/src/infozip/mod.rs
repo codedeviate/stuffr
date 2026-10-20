@@ -56,6 +56,19 @@ pub trait ByteSource {
     /// The next byte of the entry, or `None` at unzip's EOF.
     fn next_byte(&mut self) -> Option<u8>;
 
+    /// `NEXTBYTE` as the C `int` [`inflate()`] ORs into its bit buffer,
+    /// `(ulg)c`: the byte widened, unless the source's `NEXTBYTE` can give
+    /// a value outside `0..=255` that is not `EOF`. funzip's can: for an
+    /// encrypted entry it is `update_keys(getc(in) ^ decrypt_byte())`
+    /// (crypt.h, `FUNZIP`), which at the end of its input is `-1 ^ k`, a
+    /// negative `int` other than `EOF` unless `k` is 0, so inflate goes on
+    /// decoding sign-extended bits. Such a source may give `Some` again
+    /// after a `None`; only inflate reads through this, and it tolerates
+    /// that (`needbits`'s shift is taken modulo 64, ruling T12-2).
+    fn next_bits(&mut self) -> Option<u64> {
+        self.next_byte().map(u64::from)
+    }
+
     /// unzip's `G.csize + G.incnt` before any EOF: the entry's compressed
     /// bytes not yet returned. It is 0 once `next_byte` has returned `None`
     /// at the end of the entry's data; a `None` while it is still positive
