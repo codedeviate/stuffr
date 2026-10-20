@@ -15524,3 +15524,132 @@ fn skip_reason_keeps_the_exact_spelling_when_a_folded_directory_was_rerecorded()
         "{stderr}"
     );
 }
+
+/// An Info-ZIP fixture's bytes, or `None` when the fixture directory is absent
+/// (it is excluded from the published `stuffr-formats` crate; ruling P8). A
+/// named file missing from a present directory panics.
+fn infozip_fixture(name: &str) -> Option<Vec<u8>> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../stuffr-formats/tests/data/infozip");
+    if !dir.is_dir() {
+        eprintln!("note: {} is absent; skipping", dir.display());
+        return None;
+    }
+    Some(std::fs::read(dir.join(name)).unwrap_or_else(|e| panic!("fixture {name}: {e}")))
+}
+
+/// Shrink (method 1) and implode (method 6) entries unpack through the Info-ZIP
+/// decoders; the header CRC-32 is checked on the way, so equal sizes here also
+/// mean the bytes hash to what each archive's own header declares.
+#[test]
+fn unpack_reads_shrink_and_implode() {
+    let cases: [(&str, &[(&str, usize)]); 4] = [
+        ("shrink-full-table.zip", &[]),
+        ("implode-hand-4k-3trees.zip", &[("hand.txt", 9400)]),
+        ("implode-hand-8k-2trees.zip", &[("hand.txt", 9400)]),
+        ("shrink-commons.zip", &[]),
+    ];
+    let dir = tmp_dir();
+    for (fixture, sizes) in cases {
+        let Some(bytes) = infozip_fixture(fixture) else {
+            return;
+        };
+        let archive = dir.join(fixture);
+        std::fs::write(&archive, &bytes).unwrap();
+        let dest = dir.join(format!("out-{fixture}"));
+        let out = run_output(&[
+            "unpack",
+            archive.to_str().unwrap(),
+            "-C",
+            dest.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{fixture}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for (name, len) in sizes {
+            assert_eq!(std::fs::read(dest.join(name)).unwrap().len(), *len);
+        }
+        assert!(
+            std::fs::read_dir(&dest).unwrap().count() > 0,
+            "{fixture}: nothing extracted"
+        );
+        let test = run_output(&["test", archive.to_str().unwrap()]);
+        assert_eq!(test.status.code(), Some(0), "{fixture}");
+    }
+    // The four hand-built variants hold the same 9400 bytes.
+    let mut first: Option<Vec<u8>> = None;
+    for v in ["4k-2trees", "4k-3trees", "8k-2trees", "8k-3trees"] {
+        let dest = dir.join(format!("out-implode-hand-{v}.zip"));
+        if !dest.exists() {
+            let archive = dir.join(format!("implode-hand-{v}.zip"));
+            std::fs::write(
+                &archive,
+                infozip_fixture(&format!("implode-hand-{v}.zip")).unwrap(),
+            )
+            .unwrap();
+            let out = run_output(&[
+                "unpack",
+                archive.to_str().unwrap(),
+                "-C",
+                dest.to_str().unwrap(),
+            ]);
+            assert_eq!(out.status.code(), Some(0), "{v}");
+        }
+        let got = std::fs::read(dest.join("hand.txt")).unwrap();
+        assert_eq!(got.len(), 9400);
+        assert_eq!(*first.get_or_insert_with(|| got.clone()), got, "{v}");
+    }
+}
+
+#[test]
+fn unpack_damaged_implode_is_exit_5() {
+    let Some(mut bytes) = infozip_fixture("implode-hand-4k-2trees.zip") else {
+        return;
+    };
+    let dir = tmp_dir();
+    // Inside the payload (the local header is 30 + name bytes).
+    bytes[200] ^= 0x5A;
+    let archive = dir.join("damaged.zip");
+    std::fs::write(&archive, &bytes).unwrap();
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dir.join("out").to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `list` enumerates shrink and implode archives (it opened every entry, so it
+/// used to refuse them with exit 3). The CLI's listing has no codec column;
+/// `zip::tests::shrink_and_implode_entries_decode` pins the per-entry codec.
+#[test]
+fn list_shows_the_methods() {
+    let dir = tmp_dir();
+    for (fixture, name, size) in [
+        ("shrink-commons.zip", "TEST1.XML", 76),
+        ("implode-hand-8k-3trees.zip", "hand.txt", 9400),
+    ] {
+        let Some(bytes) = infozip_fixture(fixture) else {
+            return;
+        };
+        let archive = dir.join(fixture);
+        std::fs::write(&archive, &bytes).unwrap();
+        let out = run_output(&["list", "--json", archive.to_str().unwrap()]);
+        assert_eq!(out.status.code(), Some(0), "{fixture}");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains(name), "{fixture}: {text}");
+        assert!(
+            text.contains(&format!("\"size\":{size}")),
+            "{fixture}: {text}"
+        );
+    }
+}

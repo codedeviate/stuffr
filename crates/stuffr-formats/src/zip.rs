@@ -137,12 +137,20 @@
 //! refusal indistinguishable from an internal failure.
 //! Note the asymmetry that makes this worth spelling out: the pure tier reads
 //! a standalone `.zst` file fine, through `ruzstd`; it is only the in-zip
-//! method that is missing. Encrypted entries and the legacy pre-deflate
-//! methods are refused the same way, for the same reason.
+//! method that is missing. Encrypted entries and the reduce methods (2-5)
+//! are refused the same way, for the same reason.
+//!
+//! **Shrink (1) and implode (6)** are read, on a seekable source, through
+//! `crate::infozip` (`zip` has no decoder for them): the entry is read raw,
+//! decoded whole in memory (declared sizes capped at
+//! `MAX_LEGACY_ENTRY_BYTES`, exit 6), and its CRC-32 checked; a decode
+//! failure or a CRC mismatch is `Error::Corrupt` (exit 5). On a forward-only
+//! pipe they stay refused, and salvage does not decode them.
 
 use std::cell::RefCell;
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use stuffr_core::{
@@ -308,7 +316,8 @@ impl Container for Zip {
             // fidelity". Read the declared count from the EOCD BEFORE the
             // source is moved into the archive (nothing gets it back out
             // afterwards) and hold the enumeration to it.
-            let mut adapter = SeekAdapter(source);
+            let mut adapter = SeekAdapter::new(source);
+            let handle = adapter.clone();
             let declared = read_declared_index(&mut adapter);
             // Read while the source is still reachable, for the same reason
             // `read_declared_index` is: nothing gets the bytes back out from
@@ -320,6 +329,7 @@ impl Container for Zip {
             note_unreachable_records(&mut report, &archive, declared);
             return Ok(Box::new(ZipIndexed {
                 archive,
+                handle,
                 report,
                 next: 0,
             }));
@@ -388,7 +398,7 @@ impl Container for Zip {
 ///
 /// * `UnsupportedArchive` and `CompressionMethodNotSupported` describe a
 ///   perfectly good zip this build cannot fully read — an encrypted entry, a
-///   pre-deflate legacy method, a zstd entry on the pure tier, or a
+///   reduce entry (methods 2-5), a zstd entry on the pure tier, or a
 ///   data-descriptor entry met on a pipe. Reporting exit 5 there would tell
 ///   the user their file is damaged when it is not.
 /// * A genuine source failure (`ZipError::Io` carrying `PermissionDenied`,
@@ -501,18 +511,38 @@ fn method_hint(id: u16) -> &'static str {
 /// Only constructed once `source.caps().seekable` is known true, so `as_seek`
 /// returning `None` is unreachable; it is reported as an I/O error rather than
 /// a panic because `Seek` has no other channel.
-struct SeekAdapter(Box<dyn Source>);
+///
+/// The source is shared (`Clone` is another handle on the SAME source), so
+/// [`ZipIndexed`] can keep one after the archive owns the other: `zip` exposes
+/// no accessor for an entry's general-purpose flags, and explode needs bits 1-2
+/// of them. A second handle's position moves the first's, which is harmless
+/// only because `zip` seeks before every read it makes and the flags are read
+/// strictly between payload reads.
+#[derive(Clone)]
+struct SeekAdapter(Arc<Mutex<Box<dyn Source>>>);
+
+impl SeekAdapter {
+    fn new(source: Box<dyn Source>) -> Self {
+        Self(Arc::new(Mutex::new(source)))
+    }
+
+    fn lock(&self) -> io::Result<std::sync::MutexGuard<'_, Box<dyn Source>>> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("zip: source lock poisoned"))
+    }
+}
 
 impl Read for SeekAdapter {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
+        self.lock()?.read(buf)
     }
 }
 
 impl Seek for SeekAdapter {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let seek: &mut dyn SeekRead = self
-            .0
+        let mut guard = self.lock()?;
+        let seek: &mut dyn SeekRead = guard
             .as_seek()
             .ok_or_else(|| io::Error::other("zip: source reported seekable but cannot seek"))?;
         seek.seek(pos)
@@ -1301,6 +1331,8 @@ fn refuse_an_index_that_reaches_nothing(
 
 struct ZipIndexed {
     archive: zip::ZipArchive<SeekAdapter>,
+    /// A second handle on the archive's source, for the local-header flags.
+    handle: SeekAdapter,
     report: FidelityReport,
     /// Cursor for `next_entry`. `by_index` does not disturb it — the two are
     /// independent views of the same index, which is the point of having one.
@@ -1309,6 +1341,11 @@ struct ZipIndexed {
 
 impl ZipIndexed {
     fn entry_at(&mut self, index: usize) -> Result<Entry<'_>> {
+        // Shrink and implode: `zip` has no decoder for either on this build,
+        // so the entry is read raw and decoded by `infozip`.
+        if let Some(method) = self.legacy_method_at(index)? {
+            return self.legacy_entry_at(index, method);
+        }
         let mut file = self.archive.by_index(index).map_err(classify_zip_error)?;
         let mut meta = entry_meta(&file, file.unix_mode());
 
@@ -1334,6 +1371,185 @@ impl ZipIndexed {
             )),
         ))
     }
+}
+
+/// Which of the two legacy methods this build decodes through `infozip`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LegacyMethod {
+    Shrink,
+    Implode,
+}
+
+impl LegacyMethod {
+    fn name(self) -> &'static str {
+        match self {
+            LegacyMethod::Shrink => "shrink",
+            LegacyMethod::Implode => "implode",
+        }
+    }
+}
+
+/// Ceiling on a shrink or implode entry, compressed and uncompressed alike.
+/// Those decoders are callback-driven and cannot be pulled through `Read`, so
+/// an entry is decoded whole into memory; this bounds that. Checked against
+/// the DECLARED sizes before anything is allocated, so past it is
+/// `Error::ResourceLimit` (exit 6), as with `MAX_SYMLINK_TARGET_LEN`.
+const MAX_LEGACY_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
+
+impl ZipIndexed {
+    /// `Some` when entry `index` is stored with method 1 or 6 and is not
+    /// encrypted (an encrypted one keeps `zip`'s own refusal).
+    fn legacy_method_at(&mut self, index: usize) -> Result<Option<LegacyMethod>> {
+        let raw = match self.archive.by_index_raw(index) {
+            Ok(raw) => raw,
+            // Leave header trouble to the normal path's classification.
+            Err(_) => return Ok(None),
+        };
+        if raw.encrypted() {
+            return Ok(None);
+        }
+        Ok(if raw.compression() == CompressionMethod::SHRINK {
+            Some(LegacyMethod::Shrink)
+        } else if raw.compression() == CompressionMethod::IMPLODE {
+            Some(LegacyMethod::Implode)
+        } else {
+            None
+        })
+    }
+
+    fn legacy_entry_at(&mut self, index: usize, method: LegacyMethod) -> Result<Entry<'_>> {
+        let (mut meta, header_start, expected_crc, csize, usize_) = {
+            let raw = self
+                .archive
+                .by_index_raw(index)
+                .map_err(classify_zip_error)?;
+            (
+                entry_meta(&raw, raw.unix_mode()),
+                raw.header_start(),
+                raw.crc32(),
+                raw.compressed_size(),
+                raw.size(),
+            )
+        };
+        let name = meta.name.clone();
+        if meta.kind == EntryKind::Dir {
+            return Ok(Entry::new(meta, Box::new(io::empty())));
+        }
+        for (what, n) in [("compressed", csize), ("uncompressed", usize_)] {
+            if n > MAX_LEGACY_ENTRY_BYTES {
+                return Err(Error::ResourceLimit(format!(
+                    "entry `{name}` declares {n} {what} bytes, past the \
+                     {MAX_LEGACY_ENTRY_BYTES}-byte ceiling for a {} entry, which is \
+                     decoded in memory",
+                    method.name()
+                )));
+            }
+        }
+        let mut packed = Vec::new();
+        {
+            let mut raw = self
+                .archive
+                .by_index_raw(index)
+                .map_err(classify_zip_error)?;
+            raw.read_to_end(&mut packed)
+                .map_err(|e| Error::from_decode_io(normalize_payload_error(e)))?;
+        }
+        if packed.len() as u64 != csize {
+            return Err(Error::Corrupt(format!(
+                "entry `{name}` is {} bytes short of the compressed size its header \
+                 declares; the archive is truncated",
+                csize - packed.len() as u64
+            )));
+        }
+        let flags = if method == LegacyMethod::Implode {
+            local_header_flags(&mut self.handle.clone(), header_start)
+                .map_err(|e| Error::from_decode_io(normalize_payload_error(e)))?
+        } else {
+            0
+        };
+        let corrupt = |why: String| Error::Corrupt(format!("entry `{name}`: {why}"));
+        let data = decode_legacy(method, flags, &packed, usize_).map_err(corrupt)?;
+        let mut crc = flate2::Crc::new();
+        crc.update(&data);
+        if crc.sum() != expected_crc {
+            return Err(Error::Corrupt(format!(
+                "entry `{name}`: CRC-32 mismatch after {} decompression (header {expected_crc:08x}, \
+                 data {:08x})",
+                method.name(),
+                crc.sum()
+            )));
+        }
+        meta.kind = EntryKind::File;
+        Ok(Entry::new(meta, Box::new(io::Cursor::new(data))))
+    }
+}
+
+/// The general-purpose bit flag of the local header at `header_start`.
+fn local_header_flags<R: Read + Seek>(r: &mut R, header_start: u64) -> io::Result<u16> {
+    let mut fixed = [0u8; 30];
+    r.seek(SeekFrom::Start(header_start))?;
+    r.read_exact(&mut fixed)?;
+    if fixed[..4] != SIG_LOCAL_HEADER {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "zip local file header signature missing",
+        ));
+    }
+    Ok(le16(&fixed[6..8]))
+}
+
+/// Runs `infozip`'s decoder over `packed`, producing exactly `declared`
+/// bytes. `Err` is a sentence for `Error::Corrupt`.
+fn decode_legacy(
+    method: LegacyMethod,
+    flags: u16,
+    packed: &[u8],
+    declared: u64,
+) -> std::result::Result<Vec<u8>, String> {
+    use crate::infozip::{Stop, WSIZE, explode, unshrink};
+    let mut out: Vec<u8> = Vec::new();
+    let mut window = vec![0u8; WSIZE];
+    let mut src = packed.iter();
+    let mut flush = |chunk: &[u8]| -> std::result::Result<(), ()> {
+        if (out.len() + chunk.len()) as u64 > declared {
+            return Err(());
+        }
+        out.extend_from_slice(chunk);
+        Ok(())
+    };
+    let result = match method {
+        LegacyMethod::Shrink => unshrink(&mut src, &mut window, &mut flush),
+        LegacyMethod::Implode => explode(&mut src, flags, declared, &mut window, &mut flush),
+    };
+    match result {
+        Ok(()) => {}
+        Err(Stop::Code(c)) => {
+            return Err(format!(
+                "{} data is corrupt (Info-ZIP code {c})",
+                method.name()
+            ));
+        }
+        Err(Stop::Length { .. }) => {
+            return Err(format!(
+                "{} data does not end at the compressed size its header declares",
+                method.name()
+            ));
+        }
+        Err(Stop::Flush(())) => {
+            return Err(format!(
+                "{} data decodes to more bytes than the size its header declares",
+                method.name()
+            ));
+        }
+    }
+    if out.len() as u64 != declared {
+        return Err(format!(
+            "{} data decodes to {} bytes but the header declares {declared}",
+            method.name(),
+            out.len()
+        ));
+    }
+    Ok(out)
 }
 
 impl ArchiveRead for ZipIndexed {
@@ -1821,6 +2037,8 @@ fn normalize_payload_error(e: io::Error) -> io::Error {
 fn codec_for(method: CompressionMethod) -> FormatId {
     for (m, id) in [
         (CompressionMethod::STORE, STORE),
+        (CompressionMethod::SHRINK, FormatId::new("shrink")),
+        (CompressionMethod::IMPLODE, FormatId::new("implode")),
         (CompressionMethod::DEFLATE, FormatId::new("deflate")),
         (CompressionMethod::DEFLATE64, FormatId::new("deflate64")),
         (CompressionMethod::BZIP2, FormatId::new("bzip2")),
@@ -2388,6 +2606,104 @@ mod tests {
 
     fn open_seekable(bytes: &[u8]) -> Box<dyn ArchiveRead> {
         try_open_seekable(bytes).expect("open")
+    }
+
+    /// An Info-ZIP fixture, or `None` when the directory is absent (it is
+    /// excluded from the published crate; ruling P8). A named file that is
+    /// missing from a present directory panics.
+    fn infozip_fixture(name: &str) -> Option<Vec<u8>> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/infozip");
+        if !dir.is_dir() {
+            eprintln!("note: {} absent; skipping", dir.display());
+            return None;
+        }
+        Some(std::fs::read(dir.join(name)).unwrap_or_else(|e| panic!("fixture {name}: {e}")))
+    }
+
+    fn read_indexed(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut ar = try_open_seekable(bytes)?;
+        let mut out = Vec::new();
+        while let Some(mut e) = ar.next_entry()? {
+            let mut data = Vec::new();
+            e.reader()
+                .read_to_end(&mut data)
+                .map_err(Error::from_decode_io)?;
+            out.push((e.meta().name.clone(), data));
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn shrink_and_implode_entries_decode() {
+        let Some(shrink) = infozip_fixture("shrink-commons.zip") else {
+            return;
+        };
+        let entries = read_indexed(&shrink).expect("shrink");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            codec_for(CompressionMethod::SHRINK),
+            FormatId::new("shrink")
+        );
+        assert_eq!(
+            codec_for(CompressionMethod::IMPLODE),
+            FormatId::new("implode")
+        );
+        assert_eq!(entries[0].1.len(), 76);
+        assert_eq!(entries[1].1.len(), 81);
+        let full = infozip_fixture("shrink-full-table.zip").unwrap();
+        assert_eq!(read_indexed(&full).unwrap()[0].1.len(), 26001);
+        let mut hand = Vec::new();
+        for n in [
+            "implode-hand-4k-2trees.zip",
+            "implode-hand-4k-3trees.zip",
+            "implode-hand-8k-2trees.zip",
+            "implode-hand-8k-3trees.zip",
+            "implode-4k-2trees.zip",
+            "implode-8k-3trees.zip",
+        ] {
+            let e =
+                read_indexed(&infozip_fixture(n).unwrap()).unwrap_or_else(|e| panic!("{n}: {e}"));
+            hand.push(e);
+        }
+        assert!(
+            hand[..4]
+                .iter()
+                .all(|e| e[0].1.len() == 9400 && e[0].1 == hand[0][0].1)
+        );
+    }
+
+    /// A header CRC that the decoded bytes do not hash to is corruption, exit 5.
+    #[test]
+    fn shrink_crc_mismatch_is_corrupt() {
+        let Some(mut bytes) = infozip_fixture("shrink-commons.zip") else {
+            return;
+        };
+        let cd = bytes
+            .windows(4)
+            .position(|w| w == b"PK\x01\x02")
+            .expect("central directory");
+        bytes[cd + 16] ^= 0xFF;
+        let err = read_indexed(&bytes).expect_err("a bad crc must be refused");
+        assert!(matches!(err, Error::Corrupt(_)), "{err:?}");
+        assert_eq!(err.exit_code(), 5);
+    }
+
+    /// A flipped payload byte in an imploded entry never exits 1.
+    #[test]
+    fn damaged_implode_payload_is_never_exit_1() {
+        let Some(orig) = infozip_fixture("implode-hand-8k-3trees.zip") else {
+            return;
+        };
+        for at in [40usize, 80, 200, 500, 1000, 2000] {
+            let mut bytes = orig.clone();
+            if at >= bytes.len() {
+                continue;
+            }
+            bytes[at] ^= 0x55;
+            if let Err(e) = read_indexed(&bytes) {
+                assert!(matches!(e.exit_code(), 5), "at {at}: {e:?}");
+            }
+        }
     }
 
     /// The writer's backstop (`plan_entry_write` keeps links away from it): a
