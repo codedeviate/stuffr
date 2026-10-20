@@ -291,21 +291,48 @@ mod imp_unix {
         }
 
         /// `fstatat(rootdir, rel, AT_RESOLVE_BENEATH)`: the last component
-        /// followed too, beneath the root.
+        /// followed too, as `stat()` follows it (to a file as well as a
+        /// directory), while it stays beneath the root.
         pub(crate) fn stat(&self, rel: &[u8]) -> io::Result<Stat> {
-            let (d, name) = self.parent(rel)?;
-            if is_here(&name) || name == b".." {
-                return self.dir(rel)?.stat_self();
-            }
-            match d.lstat(&name)? {
-                st if st.is_symlink() => self.dir(rel)?.stat_self(),
-                st => Ok(st),
+            let mut path: VecDeque<Vec<u8>> = components(rel).map(<[u8]>::to_vec).collect();
+            let mut links = 0u32;
+            loop {
+                let last = path.pop_back().unwrap_or_default();
+                let (d, mut names) = self.resolve_names(path)?;
+                if is_here(&last) || last == b".." {
+                    names.push(last);
+                    return self.resolve(names.into())?.stat_self();
+                }
+                let st = d.lstat(&last)?;
+                if !st.is_symlink() {
+                    return Ok(st);
+                }
+                links += 1;
+                if links > MAXSYMLINKS {
+                    return Err(io::Error::from_raw_os_error(libc::ELOOP));
+                }
+                let target = readlink_at(d.fd.as_raw_fd(), &last)?;
+                if target.first() == Some(&b'/') {
+                    return Err(escape());
+                }
+                if target.is_empty() {
+                    return Err(io::Error::from_raw_os_error(libc::ENOENT));
+                }
+                // the target, from the directory the link is in
+                path = names.into_iter().collect();
+                path.extend(components(&target).map(<[u8]>::to_vec));
             }
         }
 
         /// The walk: `comps` in order from the root; a symlink's relative
         /// target is spliced in where it stood.
-        fn resolve(&self, mut q: VecDeque<Vec<u8>>) -> io::Result<Dir> {
+        fn resolve(&self, q: VecDeque<Vec<u8>>) -> io::Result<Dir> {
+            Ok(self.resolve_names(q)?.0)
+        }
+
+        /// [`Root::resolve`], with the real directories it went through
+        /// (from the root, no symlink among them).
+        fn resolve_names(&self, mut q: VecDeque<Vec<u8>>) -> io::Result<(Dir, Vec<Vec<u8>>)> {
             // The real directories resolved so far, from the root.
             let mut names: Vec<Vec<u8>> = Vec::new();
             let mut cur = self.fd.try_clone()?;
@@ -351,7 +378,7 @@ mod imp_unix {
                     },
                 }
             }
-            Ok(Dir { fd: cur })
+            Ok((Dir { fd: cur }, names))
         }
 
         /// The real directories `names` from the root again (after a `..`),
@@ -367,6 +394,9 @@ mod imp_unix {
 
     /// A name an operation that changes it refuses: `..` (which may be
     /// above the root) and `.` (the directory itself).
+    /// ruling: T10-10. Apple's `-:` keeps `..` components, makes `..` "exist"
+    /// (`mkdirat` EEXIST) and then changes the directory above the root by
+    /// plain path; here `..` is never the object of a change.
     fn changing(name: &[u8]) -> io::Result<()> {
         if name == b".." || is_here(name) {
             Err(escape())
@@ -644,6 +674,16 @@ mod imp_std {
         }
     }
 
+    /// As the unix walk's: `..` and `.` are never the object of a change
+    /// (T10-10).
+    fn changing(name: &[u8]) -> io::Result<()> {
+        if name == b".." || is_here(name) {
+            Err(escape())
+        } else {
+            Ok(())
+        }
+    }
+
     impl Dir {
         fn at(&self, name: &[u8]) -> PathBuf {
             self.dir.join(os(name))
@@ -658,6 +698,7 @@ mod imp_std {
         }
 
         pub(crate) fn create_file(&self, name: &[u8]) -> io::Result<File> {
+            changing(name)?;
             File::options()
                 .read(true)
                 .write(true)
@@ -667,6 +708,7 @@ mod imp_std {
         }
 
         pub(crate) fn open_file(&self, name: &[u8]) -> io::Result<File> {
+            changing(name)?;
             File::open(self.at(name))
         }
 
@@ -675,6 +717,7 @@ mod imp_std {
         }
 
         pub(crate) fn unlink(&self, name: &[u8], dir: bool) -> io::Result<()> {
+            changing(name)?;
             if dir {
                 fs::remove_dir(self.at(name))
             } else {
@@ -683,6 +726,8 @@ mod imp_std {
         }
 
         pub(crate) fn rename_to(&self, from: &[u8], to_dir: &Dir, to: &[u8]) -> io::Result<()> {
+            changing(from)?;
+            changing(to)?;
             fs::rename(self.at(from), to_dir.at(to))
         }
 

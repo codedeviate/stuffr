@@ -173,9 +173,16 @@ pub(crate) fn mapattr(uz: &Uz, e: &CentralEntry, info: &mut Info) {
 /// owner `-X` restores, when the build reads one (`IZ_HAVE_UXUIDGID`).
 pub(crate) fn get_extattribs(uz: &Uz, ex: &Ex) -> (IzTimes, Option<[u64; 2]>) {
     let mut z = IzTimes::default();
+    let mut ug = [0u64; 2];
     let dos = uz.lrec.last_mod_dos_datetime;
+    // ubuntu: -DIZ_HAVE_UXUIDGID (`flavour::iz_have_uxuidgid`, Task 13): the
+    // scan reads the owner (and a `ux` block then drops earlier times),
+    // whether or not `-X` asks for it, as the C passes `z_uidgid` always.
+    let owner = flavour::iz_have_uxuidgid(uz.flavour).then_some((&mut ug, uz.flavour));
     let flags = match ex.extra_field.as_deref() {
-        Some(ef) => super::super::process::ef_scan_for_izux(ef, false, dos, Some(&mut z)),
+        Some(ef) => {
+            super::super::process::ef_scan_for_izux_owner(ef, false, dos, Some(&mut z), owner)
+        }
         None => 0,
     };
     if flags & EB_UT_FL_MTIME == 0 {
@@ -185,11 +192,10 @@ pub(crate) fn get_extattribs(uz: &Uz, ex: &Ex) -> (IzTimes, Option<[u64; 2]>) {
         z.atime = z.mtime;
     }
     // if -X option was specified and we have UID/GID info, restore it
-    // ubuntu: -DIZ_HAVE_UXUIDGID: `ef_scan_for_izux()` returns the owner
-    // (`EB_UX2_VALID`) only in Ubuntu's build (Task 13).
-    let uidgid =
-        None.filter(|_: &[u64; 2]| flavour::iz_have_uxuidgid(uz.flavour) && uz.o.x_flag != 0);
-    (z, uidgid)
+    // (`RESTORE_UIDGID` is in both builds; the `chown` is tried for any
+    // user, as the C tries it)
+    let have = uz.o.x_flag != 0 && flags & super::super::process::EB_UX2_VALID != 0;
+    (z, have.then_some(ug))
 }
 
 /// `(ulg)(uid_t)(v) == v`: the value fits `uid_t`/`gid_t` (32 bits).

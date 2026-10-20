@@ -220,7 +220,8 @@ pub(crate) struct Uz<'a> {
     pub(crate) abort: Option<i32>,
     /// What `Info()` formatted into `slide` while a decoder held it, in
     /// order: written to its front when it comes back (P13).
-    pub(crate) pending_slide: Vec<Vec<u8>>,
+    /// Each is an offset, the bytes and whether a NUL follows them.
+    pub(crate) pending_slide: Vec<(usize, Vec<u8>, bool)>,
     /// `G.area.Slide`: the one window every decoder writes into and the
     /// message layer formats into (rulings P13/P16), at least
     /// `stuffr::infozip::WSIZE`, reused across entries. `fnfilter()` and
@@ -336,20 +337,33 @@ impl<'a> Uz<'a> {
     /// `buf` at `slide`'s front with a NUL after it (or, while a decoder
     /// holds the window, kept for [`Uz::restore_slide`]).
     fn put_in_slide(&mut self, buf: &[u8]) {
-        let n = buf.len();
-        if self.slide.len() > n {
-            self.slide[..n].copy_from_slice(buf);
-            self.slide[n] = 0;
-        } else if self.slide.is_empty() {
-            self.pending_slide.push(buf.to_vec());
+        self.put_slide_at(0, buf, true);
+    }
+
+    /// `buf` into `slide` at `at`, and a NUL after it when `nul` and it
+    /// fits: what `sprintf()` and `fnfilter()` write there. While a decoder
+    /// holds the window (`slide` empty) it is kept for
+    /// [`Uz::restore_slide`]; a write past the window's end is the C's
+    /// never-reached case and is dropped.
+    pub(crate) fn put_slide_at(&mut self, at: usize, buf: &[u8], nul: bool) {
+        if self.slide.is_empty() {
+            self.pending_slide.push((at, buf.to_vec(), nul));
+            return;
+        }
+        let end = at + buf.len();
+        if end <= self.slide.len() {
+            self.slide[at..end].copy_from_slice(buf);
+            if nul && end < self.slide.len() {
+                self.slide[end] = 0;
+            }
         }
     }
 
-    /// The window is back from a decoder: what `Info()` formatted meanwhile
-    /// goes to its front, in order.
+    /// The window is back from a decoder: what `Info()` and `fnfilter()`
+    /// wrote meanwhile goes to it, in order (P13).
     pub(crate) fn restore_slide(&mut self) {
-        for p in std::mem::take(&mut self.pending_slide) {
-            self.put_in_slide(&p);
+        for (at, b, nul) in std::mem::take(&mut self.pending_slide) {
+            self.put_slide_at(at, &b, nul);
         }
     }
 

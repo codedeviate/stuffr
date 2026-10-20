@@ -60,6 +60,11 @@ const EF_IZUNIX2: u16 = 0x7855;
 const EF_IZUNIX3: u16 = 0x7875;
 const EF_TIME: u16 = 0x5455;
 const EB_UX_MINLEN: usize = 8;
+const EB_UX_FULLSIZE: usize = 12;
+const EB_UX_UID: usize = 8;
+const EB_UX_GID: usize = 10;
+const EB_UX2_MINLEN: usize = 4;
+const EB_UX3_MINLEN: usize = 7;
 const EB_UX_ATIME: usize = 0;
 const EB_UX_MTIME: usize = 4;
 const EB_UT_MINLEN: usize = 1;
@@ -996,6 +1001,41 @@ pub(crate) fn ef_scan_for_izux(
     dos_mdatetime: u32,
     z_utim: Option<&mut IzTimes>,
 ) -> u32 {
+    ef_scan_for_izux_owner(ef, ef_is_c, dos_mdatetime, z_utim, None)
+}
+
+/// unzpriv.h's `EB_UX2_VALID`: [`ef_scan_for_izux_owner`] found the owner.
+pub(crate) const EB_UX2_VALID: u32 = 1 << 8;
+
+/// `read_ux3_value()`: a `ux` block's UID or GID of `size` bytes (2, 4 or
+/// 8; an 8-byte one always fits a 64-bit `ulg`). The C leaves the value as
+/// it was for any other size: 0 here (T10-12).
+fn read_ux3_value(f: flavour::Flavour, b: &[u8], size: usize) -> Option<u64> {
+    match size {
+        2 => Some(u64::from(fileio::makeword(b))),
+        4 => Some(u64::from(fileio::makelong(b))),
+        8 => Some(fileio::makeint64(f, b)),
+        _ => Some(0),
+    }
+}
+
+/// [`ef_scan_for_izux`] with `-DIZ_HAVE_UXUIDGID`'s owner: `owner`, when
+/// given (the build reads owners: `flavour::iz_have_uxuidgid`), takes the
+/// UID and GID of a `Ux` block of exactly 4 bytes, a `ux` block of version 1
+/// (which then also drops earlier times), or a full `UX` block, and the
+/// flags gain [`EB_UX2_VALID`]. Ubuntu builds with the patched
+/// (05-fix-uid-gid-handling.patch) form of the `ux` reading, which is what
+/// is ported.
+/// ruling: T10-12. A `ux` block whose UID/GID sizes run past the block makes
+/// the C read past it; here the owner is then not taken. A size other than
+/// 2, 4 or 8 leaves the C's (uninitialised) value: 0 here.
+pub(crate) fn ef_scan_for_izux_owner(
+    ef: &[u8],
+    ef_is_c: bool,
+    dos_mdatetime: u32,
+    z_utim: Option<&mut IzTimes>,
+    mut owner: Option<(&mut [u64; 2], flavour::Flavour)>,
+) -> u32 {
     let mut flags: u32 = 0;
     let mut have_new_type_eb = 0;
     let mut ut_zip_unzip_compatible = false;
@@ -1079,13 +1119,48 @@ pub(crate) fn ef_scan_for_izux(
                     }
                 }
             }
-            EF_IZUNIX2 if have_new_type_eb == 0 => {
-                flags &= !0x0ff; // ignore any previous IZUNIX field
-                have_new_type_eb = 1;
+            EF_IZUNIX2 => {
+                if have_new_type_eb == 0 {
+                    flags &= !0x0ff; // ignore any previous IZUNIX field
+                    have_new_type_eb = 1;
+                }
+                // IZUNIX3 overrides IZUNIX2 e.f. block !
+                if have_new_type_eb <= 1
+                    && eb_len == EB_UX2_MINLEN
+                    && let Some((ug, _)) = owner.as_mut()
+                {
+                    ug[0] = u64::from(fileio::makeword(data));
+                    ug[1] = u64::from(fileio::makeword(&data[2..]));
+                    flags |= EB_UX2_VALID; // signal success
+                }
             }
             EF_IZUNIX3 => {
                 // new 3rd generation Unix ef
                 have_new_type_eb = 2;
+                if eb_len >= EB_UX3_MINLEN
+                    && data[0] == 1
+                    && let Some((ug, f)) = owner.as_mut()
+                {
+                    // only know about version 1
+                    let uid_size = usize::from(data[1]);
+                    flags &= !0x0ff; // ignore any previous UNIX field
+                    let gid_at = uid_size + 2;
+                    if let Some(&gid_size) = data.get(gid_at) {
+                        let gid_size = usize::from(gid_size);
+                        let uid = data.get(2..2 + uid_size);
+                        let gid = data.get(gid_at + 1..gid_at + 1 + gid_size);
+                        if let (Some(u), Some(g)) = (uid, gid)
+                            && let (Some(u), Some(g)) = (
+                                read_ux3_value(*f, &pad8(u), uid_size),
+                                read_ux3_value(*f, &pad8(g), gid_size),
+                            )
+                        {
+                            ug[0] = u;
+                            ug[1] = g;
+                            flags |= EB_UX2_VALID; // signal success
+                        }
+                    }
+                }
             }
             // PKUNIX e.f. layout is identical to IZUNIX
             EF_IZUNIX | EF_PKUNIX if eb_len >= EB_UX_MINLEN && have_new_type_eb == 0 => {
@@ -1111,6 +1186,13 @@ pub(crate) fn ef_scan_for_izux(
                     } else {
                         z_utim.atime = i_time;
                     }
+                    if eb_len >= EB_UX_FULLSIZE
+                        && let Some((ug, _)) = owner.as_mut()
+                    {
+                        ug[0] = u64::from(fileio::makeword(&data[EB_UX_UID..]));
+                        ug[1] = u64::from(fileio::makeword(&data[EB_UX_GID..]));
+                        flags |= EB_UX2_VALID;
+                    }
                 }
             }
             _ => {}
@@ -1119,6 +1201,15 @@ pub(crate) fn ef_scan_for_izux(
         ef = &ef[eb_len + EB_HEADSIZE..];
     }
     flags
+}
+
+/// `b` read as at least 8 bytes (what a value of `b.len()` bytes needs).
+fn pad8(b: &[u8]) -> Vec<u8> {
+    let mut v = b.to_vec();
+    if v.len() < 8 {
+        v.resize(8, 0);
+    }
+    v
 }
 
 mod end;

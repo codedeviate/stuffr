@@ -155,3 +155,29 @@ fn names_made_of_dots_stay_at_the_root() {
     assert!(is_escape(&d.rename_to(b"a", &d, &name).unwrap_err()));
     assert!(empty(&s.outside()));
 }
+
+/// `stat()` beneath the root follows a last symlink to a file as to a
+/// directory (fix round 1), while it stays beneath; a link out is the
+/// escape.
+#[test]
+fn stat_follows_a_last_link_to_a_file_beneath() {
+    let s = Scratch::new("statfile");
+    std::fs::create_dir(s.root().join("d")).unwrap();
+    std::fs::write(s.root().join("d/f"), b"f").unwrap();
+    symlink("d/f", s.root().join("tofile")).unwrap();
+    symlink("../d/f", s.root().join("d/up")).unwrap();
+    symlink("d", s.root().join("todir")).unwrap();
+    symlink("todir/up", s.root().join("chain")).unwrap();
+    symlink("../outside", s.root().join("out")).unwrap();
+    let r = s.open();
+    assert!(is_file(&r.stat(b"tofile").unwrap()));
+    assert!(is_file(&r.stat(b"d/up").unwrap()));
+    assert!(r.stat(b"todir").unwrap().is_dir());
+    assert!(is_file(&r.stat(b"chain").unwrap()));
+    assert!(is_escape(&r.stat(b"out").unwrap_err()));
+    assert!(r.lstat(b"tofile").unwrap().is_symlink());
+}
+
+fn is_file(st: &Stat) -> bool {
+    st.mode & 0o170000 == 0o100000
+}

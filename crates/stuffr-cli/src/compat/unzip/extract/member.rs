@@ -132,15 +132,15 @@ pub(crate) fn extract_or_test_member(uz: &mut Uz, ex: &mut Ex) -> i32 {
     }
     ex.outfile = None;
 
-    if error > PK_WARN {
-        if flavour::close_outfile_replaces_error(uz.flavour) {
-            // apple: extract.c:1990
-            let full = c_str(&uz.filename).to_vec();
-            if let Ok((root, rel)) = mapname::target(uz, &full)
-                && let Ok((d, name)) = root.parent(rel)
-            {
-                let _ = d.unlink(&name, false);
-            }
+    // apple: extract.c:1988 (an early return before the disk-full check;
+    // upstream has none: it reports a truncated file whatever the code)
+    if error > PK_WARN && flavour::close_outfile_replaces_error(uz.flavour) {
+        // apple: extract.c:1990
+        let full = c_str(&uz.filename).to_vec();
+        if let Ok((root, rel)) = mapname::target(uz, &full)
+            && let Ok((d, name)) = root.parent(rel)
+        {
+            let _ = d.unlink(&name, false);
         }
         return error;
     }

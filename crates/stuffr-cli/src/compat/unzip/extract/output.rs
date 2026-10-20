@@ -256,6 +256,10 @@ pub(crate) fn open_outfile(uz: &mut Uz, ex: &mut Ex) -> i32 {
         }
     }
 
+    // ruling: T10-11. When the create fails, `G.outfile` is "none" here;
+    // Apple's `__open_outfile()` leaves it at the previous entry's closed
+    // stream and writes through that (a use after `fclose`), where this
+    // gives upstream's "cannot create" and the run goes on.
     let file = pd.create_file(&fname).and_then(|f| {
         // apple: fileio.c:561
         match super::super::unix::attrs::quarantine_fd(uz, &f) {
@@ -321,10 +325,19 @@ fn backup(uz: &mut Uz, pd: &Dir, fname: &[u8], full: &[u8]) -> i32 {
         }
     };
     let exists = |uz: &Uz, t: &[u8]| locate(uz, t).is_ok_and(|(d, n)| d.lstat(&n).is_ok());
+    // ruling: T10-7 (deviation 4). The backup's name may be the archive
+    // being read: it is neither removed (`-oB`) nor renamed over.
+    let is_archive = |uz: &Uz, t: &[u8]| {
+        locate(uz, t).is_ok_and(|(d, n)| d.lstat(&n).is_ok_and(|st| same_as_archive(uz, &st)))
+    };
 
     if uz.overwrite_mode == OVERWRT_ALWAYS {
         // If there is a previous backup file, delete it, otherwise the
         // following rename operation may fail.
+        if is_archive(uz, &tname) {
+            cannot_create(uz, full, &archive_busy());
+            return 1;
+        }
         if let Ok((d, n)) = locate(uz, &tname)
             && d.lstat(&n).is_ok()
         {
@@ -351,6 +364,11 @@ fn backup(uz: &mut Uz, pd: &Dir, fname: &[u8], full: &[u8]) -> i32 {
         }
     }
 
+    // (the numbered search can stop at `maxtail` on an existing name)
+    if is_archive(uz, &tname) {
+        cannot_create(uz, full, &archive_busy());
+        return 1;
+    }
     let renamed = locate(uz, &tname).and_then(|(d, n)| pd.rename_to(fname, &d, &n));
     if let Err(e) = renamed {
         let shown = mapname::shown(uz, full);

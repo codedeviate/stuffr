@@ -620,10 +620,7 @@ pub(crate) fn fnfilter_at(uz: &mut Uz, raw: &[u8], at: usize, size: usize) -> Ve
     }
     // The text never passes `size` bytes; its NUL can sit at `size`.
     let n = out.len().min(size);
-    uz.slide[at..at + n].copy_from_slice(&out[..n]);
-    if let Some(b) = uz.slide.get_mut(at + n) {
-        *b = 0;
-    }
+    uz.put_slide_at(at, &out[..n], true);
     out
 }
 
@@ -652,7 +649,7 @@ pub(crate) fn fnfilterp(uz: &mut Uz, pfx: Option<&[u8]>, raw: &[u8]) -> Vec<u8> 
         at += n;
         size -= n;
         out.extend_from_slice(&p[..n]);
-        uz.slide[at] = b'/';
+        uz.put_slide_at(at, b"/", false);
         out.push(b'/');
         at += 1;
         size = size.saturating_sub(1);

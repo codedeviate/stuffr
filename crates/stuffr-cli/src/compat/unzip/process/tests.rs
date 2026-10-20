@@ -280,3 +280,48 @@ fn includes_and_excludes() {
     assert!(selected(&uz, b"y", None, None));
     assert!(!selected(&uz, b"B", None, None));
 }
+
+/// `-DIZ_HAVE_UXUIDGID`'s owner (Task 10 fix round: the scan is wired, the
+/// hook decides): `Ux` of exactly 4 bytes, `ux` version 1 (sizes 2, 4, 8;
+/// one that runs past the block is not taken: T10-12), a full `UX`; none
+/// without an owner to fill.
+#[test]
+fn the_owner_comes_from_ux_blocks() {
+    use super::super::Flavour;
+    let block = |id: u16, data: &[u8]| {
+        let mut v = id.to_le_bytes().to_vec();
+        v.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        v.extend_from_slice(data);
+        v
+    };
+    let scan = |ef: &[u8]| {
+        let mut z = IzTimes::default();
+        let mut ug = [7u64, 7];
+        let f = ef_scan_for_izux_owner(ef, false, 0, Some(&mut z), Some((&mut ug, Flavour::Apple)));
+        (f & EB_UX2_VALID != 0, ug)
+    };
+    assert_eq!(
+        scan(&block(0x7855, &[0xe8, 3, 0xf4, 1])),
+        (true, [1000, 500])
+    );
+    assert!(!scan(&block(0x7855, &[0xe8, 3, 0xf4])).0);
+    assert_eq!(
+        scan(&block(0x7875, &[1, 4, 0xe8, 3, 0, 0, 4, 0xf4, 1, 0, 0])),
+        (true, [1000, 500])
+    );
+    assert_eq!(
+        scan(&block(
+            0x7875,
+            &[1, 2, 0xe8, 3, 8, 0xf4, 1, 0, 0, 0, 0, 0, 0]
+        )),
+        (true, [1000, 500])
+    );
+    assert!(!scan(&block(0x7875, &[1, 4, 0xe8, 3, 0, 0, 9, 1])).0);
+    assert!(!scan(&block(0x7875, &[2, 2, 0xe8, 3, 2, 0xf4, 1])).0);
+    let mut ux = vec![0u8; 8];
+    ux.extend_from_slice(&[0xe8, 3, 0xf4, 1]);
+    assert_eq!(scan(&block(0x5855, &ux)), (true, [1000, 500]));
+    let mut z = IzTimes::default();
+    let f = ef_scan_for_izux(&block(0x7855, &[0xe8, 3, 0xf4, 1]), false, 0, Some(&mut z));
+    assert_eq!(f & EB_UX2_VALID, 0);
+}

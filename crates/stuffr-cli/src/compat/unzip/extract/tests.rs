@@ -328,3 +328,59 @@ fn names_are_padded_as_printf_pads_them() {
     assert_eq!(pad22(b"a.txt"), [&b"a.txt"[..], &[b' '; 17]].concat());
     assert_eq!(pad22(&[b'x'; 30]), [b'x'; 30]);
 }
+
+/// R7 (fix round 1): a sandbox's 8 MiB budget spent mid-entry is a full
+/// disk, for extraction, `-c`, `-p` and `-t` alike: the decoder holds the
+/// window then, and the question formats into it all the same.
+/// "write error (disk full?).  Continue? (y/n/^C) ", no answer: stop,
+/// exit 50, with "... is probably truncated" (not from Apple's `-c`, `-p`,
+/// `-t`);
+/// `y`: that file is left and the run goes on.
+#[test]
+fn a_spent_budget_is_a_full_disk() {
+    let big = vec![0u8; 9 << 20];
+    let z = zip(&[
+        deflated(b"big.bin", &big),
+        stored(b"small.txt", b"small\n", 0o100644 << 16),
+    ]);
+    for f in [Flavour::Apple, Flavour::Ubuntu] {
+        for args in [
+            &["-o", "a.zip"][..],
+            &["-c", "a.zip"],
+            &["-p", "a.zip"],
+            &["-t", "a.zip"],
+        ] {
+            for stdin in [&b""[..], b"y\n"] {
+                let d = Dir::new("budget");
+                let root = d.0.join("root");
+                std::fs::write(root.join("a.zip"), &z).unwrap();
+                let argv: Vec<OsString> = args.iter().map(OsString::from).collect();
+                let (code, out, err, _) =
+                    run_in_counted(f, &root, "unzip", &argv, stdin, &|_| None);
+                // under -t the "stderr" messages are on standard output
+                let err = if args[0] == "-t" { out } else { err };
+                let err = String::from_utf8_lossy(&err).into_owned();
+                let what = format!("{f:?} {args:?} {stdin:?}: exit {code}: {err}");
+                assert!(
+                    err.contains("big.bin:  write error (disk full?).  Continue? (y/n/^C) "),
+                    "{what}"
+                );
+                if stdin.is_empty() {
+                    // Apple's extraction reaches the warning (its
+                    // `close_outfile()` replaces the code: T10-2), its `-c`,
+                    // `-p`, `-t` return first; upstream always warns
+                    let warned = f == Flavour::Ubuntu || args[0] == "-o";
+                    assert_eq!(
+                        err.contains("big.bin is probably truncated\n"),
+                        warned,
+                        "{what}"
+                    );
+                    assert_eq!(code, 50, "{what}");
+                } else {
+                    assert!(!err.contains("probably truncated"), "{what}");
+                    assert!([2, 50].contains(&code), "{what}");
+                }
+            }
+        }
+    }
+}

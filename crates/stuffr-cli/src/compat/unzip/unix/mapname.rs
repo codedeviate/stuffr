@@ -178,11 +178,12 @@ fn mkdir_qtn(uz: &Uz, path: &[u8], mode: u32) -> io::Result<()> {
     }
     if uz.qf.is_some()
         && let Ok(d) = root.dir(rel)
-        && super::attrs::quarantine_dir(uz, &d).is_err()
+        && let Err(e) = super::attrs::quarantine_dir(uz, &d)
     {
-        // apple: unix.c:809 (the new directory is removed again)
+        // apple: unix.c:809 (the new directory is removed again; the error
+        // is the quarantine's)
         let _ = dir.unlink(&name, true);
-        return Err(io::Error::last_os_error());
+        return Err(e);
     }
     Ok(())
 }
@@ -214,10 +215,10 @@ fn mkdir_root(uz: &Uz, tmproot: &[u8], mode: u32) -> io::Result<()> {
     if uz.qf.is_some()
         && let Ok(r) = Root::open(&p)
         && let Ok(d) = r.top()
-        && super::attrs::quarantine_dir(uz, &d).is_err()
+        && let Err(e) = super::attrs::quarantine_dir(uz, &d)
     {
         let _ = std::fs::remove_dir(&p);
-        return Err(io::Error::last_os_error());
+        return Err(e);
     }
     Ok(())
 }

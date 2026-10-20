@@ -357,6 +357,161 @@ mod unix {
         }
     }
 
+    /// Deviation 4 under `-B` (fix round 1): the backup's name is the
+    /// archive being read (`c.zip~` holds `c.zip`, which exists). `-oB`
+    /// would remove the "old backup" and rename over it; `-B` would stop its
+    /// numbered search there. Refused, the archive whole.
+    #[test]
+    fn a_backup_never_lands_on_the_archive() {
+        let z = zip_with(
+            &[ZipEntrySpec::new(b"c.zip", b"from the archive\n")],
+            b"",
+            b"",
+        );
+        fn existing(w: &Path) {
+            std::fs::write(w.join("c.zip"), b"was here\n").unwrap();
+        }
+        let busy = strerror(libc::EBUSY);
+        for f in FLAVOURS {
+            for args in [&["-oB", "c.zip~"][..], &["-B", "c.zip~"]] {
+                let r = run(
+                    f,
+                    args,
+                    &[("c.zip~", z.clone())],
+                    Some(existing),
+                    Some(b"y\n"),
+                );
+                let what = format!("{f} {args:?}: exit {} stderr {:?}", r.code, r.stderr);
+                match r.tree.get(&b"c.zip~"[..]) {
+                    Some(UnzipNode::File { bytes, .. }) => assert_eq!(bytes, &z, "{what}"),
+                    other => panic!("{what}: the archive is {other:?}"),
+                }
+                if args[0] == "-oB" {
+                    assert!(
+                        r.stderr
+                            .contains(&format!("error:  cannot create c.zip\n        {busy}\n")),
+                        "{what}"
+                    );
+                    assert_eq!(r.code, 50, "{what}");
+                }
+            }
+        }
+    }
+
+    /// A real full disk (fix round 1): `RLIMIT_FSIZE` with `SIGXFSZ`
+    /// ignored, so a write past the limit fails (`EFBIG`) mid-entry, the
+    /// decoder holding the window. Against this platform's reference when
+    /// it has one (Apple on macOS, Ubuntu on Linux), stuffr in its flavour:
+    /// the same streams, exit code and file sizes, with no answer and with
+    /// `y`. Without a reference: the question and exit 50.
+    #[test]
+    fn a_file_size_limit_is_a_full_disk() {
+        use std::os::unix::process::CommandExt;
+        let big: Vec<u8> = (0..300_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let z = zip_with(
+            &[
+                ZipEntrySpec::new(b"big.bin", &big),
+                ZipEntrySpec {
+                    method: 8,
+                    ..ZipEntrySpec::new(b"big2.bin", &big)
+                },
+                ZipEntrySpec::new(b"small.txt", b"small\n"),
+            ],
+            b"",
+            b"",
+        );
+        let base = std::env::temp_dir().join(format!("stuffr-unzip-fsize-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("bin")).unwrap();
+        let link = base.join("bin/unzip");
+        symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
+        let flavour = platform_unzip_flavour();
+        let mut n = 0;
+        let mut run_one = |exe: &Path, args: &[&str], stdin: &[u8]| {
+            n += 1;
+            let w = base.join(format!("w{n}"));
+            std::fs::create_dir_all(&w).unwrap();
+            std::fs::write(w.join("a.zip"), &z).unwrap();
+            let mut cmd = std::process::Command::new(exe);
+            cmd.args(args)
+                .current_dir(&w)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("LANG", "C")
+                .env("TZ", "UTC")
+                .env("STUFFR_UNZIP_FLAVOR", flavour)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            // SAFETY: between fork and exec only async-signal-safe calls:
+            // `signal` and `setrlimit`, on plain values.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                    let lim = libc::rlimit {
+                        rlim_cur: 200 * 512,
+                        rlim_max: 200 * 512,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_FSIZE, &lim) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = cmd.spawn().unwrap();
+            {
+                use std::io::Write;
+                let _ = child.stdin.take().unwrap().write_all(stdin);
+            }
+            let out = child.wait_with_output().unwrap();
+            let real = std::fs::canonicalize(&w).unwrap();
+            let mask = |b: &[u8]| {
+                String::from_utf8_lossy(b)
+                    .replace(&*real.to_string_lossy(), "<work>")
+                    .replace(&*w.to_string_lossy(), "<work>")
+            };
+            let mut sizes: Vec<(String, u64)> = std::fs::read_dir(&w)
+                .unwrap()
+                .map(|e| e.unwrap())
+                .filter(|e| e.file_name() != "a.zip")
+                .map(|e| {
+                    (
+                        e.file_name().to_string_lossy().into_owned(),
+                        e.metadata().unwrap().len(),
+                    )
+                })
+                .collect();
+            sizes.sort();
+            (
+                out.status.code(),
+                mask(&out.stdout),
+                mask(&out.stderr),
+                sizes,
+            )
+        };
+        for args in [&["-o", "a.zip"][..], &["-oq", "a.zip"]] {
+            for stdin in [&b""[..], b"y\ny\n"] {
+                let ours = run_one(&link, args, stdin);
+                let what = format!("{args:?} {stdin:?}: {ours:?}");
+                assert!(
+                    ours.2
+                        .contains("big.bin:  write error (disk full?).  Continue? (y/n/^C) "),
+                    "{what}"
+                );
+                if stdin.is_empty() {
+                    assert_eq!(ours.0, Some(50), "{what}");
+                }
+                if let Some(dir) = unzip_dir() {
+                    let theirs = run_one(&Path::new(dir).join("unzip"), args, stdin);
+                    assert_eq!(theirs, ours, "{args:?} {stdin:?}: reference vs stuffr");
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// ruling: T10-9. "r", an empty new name, then the end of input: the C
     /// asks "new name: " forever; stuffr answers as the first question's end
     /// of input does ("[N]one"), and the file is kept.
