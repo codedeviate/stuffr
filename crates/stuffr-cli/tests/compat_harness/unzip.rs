@@ -175,6 +175,8 @@ pub fn unzip_case<'a>(
         roundtrip: Roundtrip::Bzip2,
         tz: None,
         unzip_flavour: Some(platform_unzip_flavour()),
+        tty_ctl: false,
+        tty_signal: None,
     }
 }
 
@@ -344,6 +346,9 @@ pub struct UnzipRun {
     pub tree: UnzipTree,
     /// Unix seconds when this run began (before its inputs were created).
     pub start: i64,
+    /// With [`Case::tty_ctl`]: echo and canonical mode of the controlling
+    /// terminal after the run (whether it was put back).
+    pub tty_mode: Option<(bool, bool)>,
 }
 
 /// `raw` with every whole occurrence of the program path replaced by the
@@ -396,7 +401,13 @@ fn mask_work(raw: &[u8], dirs: &[Vec<u8>]) -> Vec<u8> {
 fn unzip_run(exe: &Path, c: &Case, stuffr_side: bool) -> UnzipRun {
     use std::os::unix::ffi::OsStrExt;
     let s = Scratch::new();
-    let (code, stdout, stderr, start) = spawn_case(exe, &s, c, stuffr_side);
+    let Spawned {
+        code,
+        stdout,
+        stderr,
+        start,
+        tty_mode,
+    } = spawn_case(exe, &s, c, stuffr_side);
     let work = s.0.join("work");
     let mut dirs = vec![work.as_os_str().as_bytes().to_vec()];
     if let Ok(real) = fs::canonicalize(&work) {
@@ -414,6 +425,7 @@ fn unzip_run(exe: &Path, c: &Case, stuffr_side: bool) -> UnzipRun {
         stderr: String::from_utf8_lossy(&mask_work(stderr.as_bytes(), &dirs)).into_owned(),
         tree,
         start,
+        tty_mode,
     }
 }
 
@@ -505,6 +517,12 @@ pub fn unzip_differences(c: &Case, r: &UnzipRun, s: &UnzipRun) -> Vec<String> {
             "stderr differs:\n  reference: {:?}\n  stuffr:    {:?}",
             String::from_utf8_lossy(&re),
             String::from_utf8_lossy(&se)
+        ));
+    }
+    if r.tty_mode != s.tty_mode {
+        d.push(format!(
+            "terminal mode (echo, canonical) after the run: reference {:?} vs stuffr {:?}",
+            r.tty_mode, s.tty_mode
         ));
     }
     let now = now_secs();
@@ -712,7 +730,7 @@ pub fn unzip_reference(c: &Case) -> Option<UnzipRun> {
 
 /// One byte of the CRC-32 that traditional zip encryption updates its keys
 /// with (APPNOTE 6.1.5: polynomial 0xEDB88320, no pre- or post-inversion).
-fn crc32_byte(crc: u32, b: u8) -> u32 {
+pub fn crc32_byte(crc: u32, b: u8) -> u32 {
     let mut c = (crc ^ u32::from(b)) & 0xff;
     for _ in 0..8 {
         c = if c & 1 != 0 {

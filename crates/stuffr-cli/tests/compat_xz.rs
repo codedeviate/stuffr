@@ -113,6 +113,8 @@ mod unix {
             compare_output_bytes: false,
             tz: None,
             unzip_flavour: None,
+            tty_ctl: false,
+            tty_signal: None,
             expect_stdout_plain: None,
             setup: None,
             roundtrip: Roundtrip::Xz { ref_xz: ref_xz() },

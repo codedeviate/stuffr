@@ -114,6 +114,7 @@ mod unix {
             stderr: String::new(),
             tree: snapshot_unzip_tree(dir, &[]),
             start: now_secs(),
+            tty_mode: None,
         }
     }
 
@@ -198,6 +199,7 @@ mod unix {
             stderr: String::new(),
             tree: Default::default(),
             start: now_secs(),
+            tty_mode: None,
         };
         let mut c = unzip_case("unzip", vec![], vec![]);
         c.unzip_flavour = Some("apple");
@@ -323,5 +325,30 @@ mod unix {
             let out = String::from_utf8(run_program(env, &c, side).stdout).unwrap();
             assert!(out.lines().any(|l| l == "TZ=Europe/Stockholm"), "{out}");
         }
+    }
+
+    /// R12: `tty_ctl` makes standard input the controlling terminal
+    /// (`/dev/tty` opens it, `tty` names it), and types each line only once
+    /// the program waits for it with echo off (each prompt is written
+    /// before its `stty`).
+    #[test]
+    fn tty_ctl_types_each_line_at_its_prompt() {
+        let sh = Path::new("/bin/sh");
+        let script = concat!(
+            "for p in one two three; do ",
+            "printf '%s: ' $p >&2; stty -echo </dev/tty; ",
+            "IFS= read -r x </dev/tty; stty echo </dev/tty; got=\"$got$x/\"; ",
+            "done; printf '%s\\n' \"$got\"; tty -s && echo tty",
+        );
+        let mut c = unzip_case("sh", vec!["-c", script], vec![]);
+        c.tty_ctl = true;
+        c.stdin = Some(b"first\nsecond\nthird\n".to_vec());
+        let r = run_program(sh, &c, false);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        assert_eq!(
+            String::from_utf8_lossy(&r.stdout),
+            "first/second/third/\ntty\n"
+        );
+        assert_eq!(r.stderr, "one: two: three: ");
     }
 }

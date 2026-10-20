@@ -883,6 +883,25 @@ pub struct Case<'a> {
     pub stdin: Option<Vec<u8>>,
     pub tty_stdin: bool,
     pub tty_stdout: bool,
+    /// R12: standard input is a terminal that is also the child's
+    /// controlling terminal (`setsid` + `TIOCSCTTY`), so `/dev/tty` opens
+    /// it, in its default mode (echo on). `stdin` is typed there a line at
+    /// a time (a [`TTY_BREAK`] byte also ends a piece, and is not typed:
+    /// single keys for a pager), each piece once the child waits for it: it has written
+    /// something since the last line was read, nothing typed is pending,
+    /// and either the terminal has echo or canonical mode off (a password
+    /// or a key is being read) and its output has been quiet for 20 ms, or
+    /// it has been quiet for 300 ms. A line typed earlier would be lost to
+    /// the `TCSAFLUSH` with which unzip changes the mode. No end of file is
+    /// typed. Each piece must make the program write something before it
+    /// reads the next (a prompt, a pager's screen): a piece it reads in
+    /// silence, such as a key a pager ignores, leaves the next untyped and
+    /// the run times out. The terminal's mode after the run is reported
+    /// (`spawn_case`'s `tty_mode`).
+    pub tty_ctl: bool,
+    /// With `tty_ctl`: this signal is sent once the child waits after the
+    /// last line.
+    pub tty_signal: Option<i32>,
     /// Extra environment. The environment is otherwise cleared and only
     /// `PATH` and `LANG` are set, so `BZIP2`/`BZIP` never leak in.
     pub env: Vec<(&'a str, &'a str)>,
@@ -906,6 +925,10 @@ pub struct Case<'a> {
     /// reference never sees the variable.
     pub unzip_flavour: Option<&'a str>,
 }
+
+/// In [`Case::tty_ctl`]'s input, ends a piece without being typed (ASCII
+/// unit separator).
+pub const TTY_BREAK: u8 = 0x1f;
 
 /// File bytes, mode (permission bits) and mtime (seconds).
 pub type Tree = BTreeMap<String, (Vec<u8>, u32, i64)>;
@@ -1075,7 +1098,13 @@ pub fn run_program(exe: &Path, c: &Case, stuffr_side: bool) -> Run {
 }
 
 fn execute(exe: &Path, s: &Scratch, c: &Case, stuffr_side: bool) -> Run {
-    let (code, stdout, stderr, start) = spawn_case(exe, s, c, stuffr_side);
+    let Spawned {
+        code,
+        stdout,
+        stderr,
+        start,
+        ..
+    } = spawn_case(exe, s, c, stuffr_side);
     Run {
         code,
         stdout,
@@ -1085,10 +1114,120 @@ fn execute(exe: &Path, s: &Scratch, c: &Case, stuffr_side: bool) -> Run {
     }
 }
 
+/// What [`spawn_case`] observed.
+struct Spawned {
+    /// The exit code, or minus the signal number that killed it.
+    code: i32,
+    stdout: Vec<u8>,
+    /// Normalised ([`normalise_stderr`]).
+    stderr: String,
+    /// Unix seconds before the inputs were created.
+    start: i64,
+    /// With [`Case::tty_ctl`]: whether the controlling terminal had echo
+    /// and canonical mode on after the run.
+    tty_mode: Option<(bool, bool)>,
+}
+
+/// Bytes the child has written to its standard output and error so far,
+/// and when it last wrote: [`Case::tty_ctl`]'s typing waits on them.
+#[derive(Default)]
+struct Activity {
+    bytes: AtomicUsize,
+    /// Milliseconds since `epoch` at the last write.
+    last_ms: std::sync::atomic::AtomicU64,
+    epoch: std::sync::OnceLock<Instant>,
+}
+
+impl Activity {
+    fn now_ms(&self) -> u64 {
+        self.epoch.get_or_init(Instant::now).elapsed().as_millis() as u64
+    }
+    fn wrote(&self, n: usize) {
+        if n > 0 {
+            self.bytes.fetch_add(n, Ordering::SeqCst);
+            self.last_ms.store(self.now_ms(), Ordering::SeqCst);
+        }
+    }
+    fn quiet_ms(&self) -> u64 {
+        self.now_ms()
+            .saturating_sub(self.last_ms.load(Ordering::SeqCst))
+    }
+}
+
+/// The local modes of the terminal `fd` is on, if it still has them.
+fn lflag_of(fd: &impl AsRawFd) -> Option<libc::tcflag_t> {
+    // SAFETY: termios is plain data, filled by a successful tcgetattr.
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: tcgetattr writes the termios we own.
+    (unsafe { libc::tcgetattr(fd.as_raw_fd(), &mut t) } == 0).then_some(t.c_lflag)
+}
+
+/// Bytes typed at the terminal `slave` is on and not read yet (0 once it
+/// is gone).
+fn pending_input(slave: &impl AsRawFd) -> usize {
+    let mut n: libc::c_int = 0;
+    // SAFETY: FIONREAD writes one int we own.
+    let rc = unsafe { libc::ioctl(slave.as_raw_fd(), libc::FIONREAD as _, &mut n) };
+    if rc == 0 { n.max(0) as usize } else { 0 }
+}
+
+/// [`Case::tty_ctl`]'s typist: `lines` typed on `master`, each once the
+/// child waits for it, then `signal` sent to `pid` likewise. Returns when
+/// done, or when `done` says the child has exited.
+fn type_paced(
+    master: std::fs::File,
+    slave: OwnedFd,
+    lines: Vec<Vec<u8>>,
+    signal: Option<i32>,
+    pid: u32,
+    activity: std::sync::Arc<Activity>,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut master = master;
+    let mut seen = 0;
+    let steps = lines.len() + usize::from(signal.is_some());
+    for step in 0..steps {
+        // wait until the child waits
+        loop {
+            if done.load(Ordering::SeqCst) {
+                return;
+            }
+            let Some(lf) = lflag_of(&master) else { return };
+            let raw = lf & libc::ECHO == 0 || lf & libc::ICANON == 0;
+            let quiet = activity.quiet_ms();
+            if activity.bytes.load(Ordering::SeqCst) > seen
+                && pending_input(&slave) == 0
+                && ((raw && quiet >= 20) || quiet >= 300)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // What the child writes from here on, it writes after reading this
+        // line: the next wait needs some of it.
+        seen = activity.bytes.load(Ordering::SeqCst);
+        match lines.get(step) {
+            Some(line) => {
+                if master.write_all(line).is_err() {
+                    return;
+                }
+            }
+            None => {
+                // SAFETY: kill on our child, which `done` says is unreaped.
+                unsafe { libc::kill(pid as libc::pid_t, signal.unwrap_or(0)) };
+                return;
+            }
+        }
+        // wait until the line is read
+        while !done.load(Ordering::SeqCst) && pending_input(&slave) > 0 {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
 /// Create the case's inputs in `s`'s work directory, run `exe` there, and
-/// return its exit code (minus the signal number if one killed it),
-/// standard output, normalised standard error and start time.
-fn spawn_case(exe: &Path, s: &Scratch, c: &Case, stuffr_side: bool) -> (i32, Vec<u8>, String, i64) {
+/// return what it did ([`Spawned`]).
+fn spawn_case(exe: &Path, s: &Scratch, c: &Case, stuffr_side: bool) -> Spawned {
     let work = s.0.join("work");
     let start = now_secs();
     for (name, bytes) in &c.files {
@@ -1119,7 +1258,27 @@ fn spawn_case(exe: &Path, s: &Scratch, c: &Case, stuffr_side: bool) -> (i32, Vec
     }
 
     let mut stdin_master: Option<std::fs::File> = None;
-    if c.tty_stdin {
+    // R12: the controlling terminal, its slave kept for `pending_input`.
+    let mut ctl: Option<(std::fs::File, OwnedFd)> = None;
+    if c.tty_ctl {
+        let (m, sl) = openpty_terminal();
+        let keep = sl.try_clone().expect("dup pty slave");
+        cmd.stdin(Stdio::from(sl));
+        set_nonblocking(&m);
+        ctl = Some((std::fs::File::from(m), keep));
+        // SAFETY: only async-signal-safe calls between fork and exec: a new
+        // session, then standard input (the pty slave, already in place)
+        // as its controlling terminal.
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    } else if c.tty_stdin {
         let (m, sl) = openpty();
         cmd.stdin(Stdio::from(sl));
         stdin_master = Some(std::fs::File::from(m));
@@ -1154,7 +1313,28 @@ fn spawn_case(exe: &Path, s: &Scratch, c: &Case, stuffr_side: bool) -> (i32, Vec
         .push((work.clone(), child.id()));
     let registered = Registered(work.clone());
 
-    let writer = if let Some(m) = &stdin_master {
+    let activity = std::sync::Arc::new(Activity::default());
+    let child_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let typist = ctl.as_ref().map(|(m, keep)| {
+        let mut lines = Vec::new();
+        for line in c
+            .stdin
+            .clone()
+            .unwrap_or_default()
+            .split_inclusive(|&b| b == b'\n')
+        {
+            for piece in line.split(|&b| b == TTY_BREAK).filter(|p| !p.is_empty()) {
+                lines.push(piece.to_vec());
+            }
+        }
+        let (m, keep) = (m.try_clone().unwrap(), keep.try_clone().unwrap());
+        let (sig, pid) = (c.tty_signal, child.id());
+        let (a, d) = (activity.clone(), child_done.clone());
+        std::thread::spawn(move || type_paced(m, keep, lines, sig, pid, a, d))
+    });
+    let writer = if c.tty_ctl {
+        None
+    } else if let Some(m) = &stdin_master {
         // Type the input, then end-of-file. Canonical mode honours ^D only at
         // the start of a line, so add a newline unless the data ends in one.
         let mut data = c.stdin.clone().unwrap_or_default();
@@ -1174,19 +1354,33 @@ fn spawn_case(exe: &Path, s: &Scratch, c: &Case, stuffr_side: bool) -> (i32, Vec
             })
         })
     };
-    let out_t = child.stdout.take().map(drain);
-    let err_t = child.stderr.take().map(drain);
+    let out_t = child
+        .stdout
+        .take()
+        .map(|r| drain_counting(r, activity.clone()));
+    let err_t = child
+        .stderr
+        .take()
+        .map(|r| drain_counting(r, activity.clone()));
+    let mut echo_buf = Vec::new();
 
     let mut tty_buf = Vec::new();
     let deadline = Instant::now() + TIMEOUT;
     let status = loop {
         if let Some((m, _)) = &mut tty_out {
+            let before = tty_buf.len();
             read_available(m, &mut tty_buf);
+            activity.wrote(tty_buf.len() - before);
+        }
+        if let Some((m, _)) = &mut ctl {
+            // what the terminal echoes; never compared
+            read_available(m, &mut echo_buf);
         }
         if let Some(st) = child.try_wait().unwrap() {
             break st;
         }
         if Instant::now() > deadline {
+            child_done.store(true, Ordering::SeqCst);
             let _ = child.kill();
             let _ = child.wait();
             panic!("{exe:?} {:?} timed out after {TIMEOUT:?}", c.args);
@@ -1201,6 +1395,15 @@ fn spawn_case(exe: &Path, s: &Scratch, c: &Case, stuffr_side: bool) -> (i32, Vec
         }
     };
     drop(registered);
+    child_done.store(true, Ordering::SeqCst);
+    if let Some(t) = typist {
+        t.join().unwrap();
+    }
+    let tty_mode = ctl.take().and_then(|(m, keep)| {
+        let lf = lflag_of(&m);
+        drop(keep);
+        lf.map(|lf| (lf & libc::ECHO != 0, lf & libc::ICANON != 0))
+    });
     if let Some((mut m, keep)) = tty_out.take() {
         read_available(&mut m, &mut tty_buf);
         drop(keep);
@@ -1222,7 +1425,13 @@ fn spawn_case(exe: &Path, s: &Scratch, c: &Case, stuffr_side: bool) -> (i32, Vec
     let code = status
         .code()
         .unwrap_or_else(|| -status.signal().unwrap_or(0));
-    (code, stdout, stderr, start)
+    Spawned {
+        code,
+        stdout,
+        stderr,
+        start,
+        tty_mode,
+    }
 }
 
 /// The only normalisation: the program path becomes the bare invoked name.
@@ -1246,6 +1455,22 @@ pub fn normalise_stderr(raw: &[u8], exe: &Path, name: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// [`drain`], counting what arrives in `activity` as it arrives.
+fn drain_counting<R: Read + Send + 'static>(
+    r: R,
+    activity: std::sync::Arc<Activity>,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    struct Counting<R>(R, std::sync::Arc<Activity>);
+    impl<R: Read> Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.0.read(buf)?;
+            self.1.wrote(n);
+            Ok(n)
+        }
+    }
+    drain(Counting(r, activity))
 }
 
 /// Read to end-of-file on a worker thread. A pty master reports hang-up as
@@ -1346,6 +1571,32 @@ fn openpty() -> (OwnedFd, OwnedFd) {
         t.c_lflag &= !(libc::ECHO | libc::ECHONL);
         t.c_iflag &= !libc::ICRNL;
         assert_eq!(libc::tcsetattr(s.as_raw_fd(), libc::TCSANOW, &t), 0);
+    }
+    (m, s)
+}
+
+/// A pty pair for a controlling terminal ([`Case::tty_ctl`]): the
+/// system's default mode (echo and canonical mode on), close-on-exec on
+/// both ends.
+fn openpty_terminal() -> (OwnedFd, OwnedFd) {
+    let (mut m, mut s) = (0, 0);
+    // SAFETY: out-pointers are valid; the null name/termios/winsize are allowed.
+    let rc = unsafe {
+        libc::openpty(
+            &mut m,
+            &mut s,
+            std::ptr::null_mut(),
+            NULL_TERMIOS,
+            NULL_WINSIZE,
+        )
+    };
+    assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
+    // SAFETY: openpty returned two fresh descriptors we now own.
+    let (m, s) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s)) };
+    for fd in [&m, &s] {
+        // SAFETY: valid descriptor.
+        let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+        assert_eq!(rc, 0, "fcntl: {}", std::io::Error::last_os_error());
     }
     (m, s)
 }

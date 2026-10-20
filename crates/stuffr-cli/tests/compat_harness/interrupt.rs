@@ -77,13 +77,16 @@ pub fn take_reference_hung() -> bool {
 }
 
 /// Whether `exe` is the stuffr binary under test (directly or by a link).
+/// When either path cannot be resolved it counts as stuffr, so a hang
+/// fails the test rather than passing as a reference's miss (0.16.0: the
+/// check used to fail open).
 fn is_stuffr(exe: &Path) -> bool {
     match (
         std::fs::canonicalize(exe),
         std::fs::canonicalize(env!("CARGO_BIN_EXE_stuffr")),
     ) {
         (Ok(a), Ok(b)) => a == b,
-        _ => false,
+        _ => true,
     }
 }
 
@@ -301,6 +304,50 @@ pub fn stored_gzip(data: &[u8]) -> Vec<u8> {
     }
     v.extend_from_slice(&super::crc32(data).to_le_bytes());
     v.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    v
+}
+
+/// A zip archive of one stored entry `name` holding `data` (unix mode
+/// 0644): valid, fast to make, as large as its input, so an extraction of
+/// it lasts (the unzip family).
+pub fn stored_zip(name: &[u8], data: &[u8]) -> Vec<u8> {
+    let crc = super::crc32(data);
+    let size = u32::try_from(data.len()).expect("under 4 GiB");
+    let n = u16::try_from(name.len()).unwrap();
+    let mut v = Vec::with_capacity(data.len() + 200);
+    v.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+    for x in [20u16, 0, 0, 0, 0x5021] {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    for x in [crc, size, size] {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    v.extend_from_slice(&n.to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v.extend_from_slice(name);
+    v.extend_from_slice(data);
+    let cd_at = u32::try_from(v.len()).unwrap();
+    v.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+    for x in [0x031eu16, 20, 0, 0, 0, 0x5021] {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    for x in [crc, size, size] {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    for x in [n, 0, 0, 0, 0] {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    v.extend_from_slice(&(0o100644u32 << 16).to_le_bytes());
+    v.extend_from_slice(&0u32.to_le_bytes());
+    v.extend_from_slice(name);
+    let cd_len = u32::try_from(v.len()).unwrap() - cd_at;
+    v.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    for x in [0u16, 0, 1, 1] {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    v.extend_from_slice(&cd_len.to_le_bytes());
+    v.extend_from_slice(&cd_at.to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes());
     v
 }
 

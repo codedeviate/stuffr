@@ -64,6 +64,8 @@ mod differential {
             compare_output_bytes: false,
             tz: None,
             unzip_flavour: None,
+            tty_ctl: false,
+            tty_signal: None,
             expect_stdout_plain: None,
             setup: None,
             roundtrip: Roundtrip::Gzip {
@@ -114,6 +116,8 @@ mod differential {
             compare_output_bytes: c.compare_output_bytes,
             tz: None,
             unzip_flavour: None,
+            tty_ctl: false,
+            tty_signal: None,
             expect_stdout_plain: c.expect_stdout_plain.clone(),
             setup: c.setup,
             roundtrip: c.roundtrip,

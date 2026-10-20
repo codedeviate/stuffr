@@ -91,6 +91,8 @@ mod unix {
             compare_output_bytes: exact_for(args),
             tz: None,
             unzip_flavour: None,
+            tty_ctl: false,
+            tty_signal: None,
             expect_stdout_plain: None,
             setup: None,
             roundtrip: Roundtrip::Zstd {
@@ -3505,6 +3507,8 @@ mod unix {
             compare_output_bytes: c.compare_output_bytes,
             tz: None,
             unzip_flavour: None,
+            tty_ctl: false,
+            tty_signal: None,
             expect_stdout_plain: None,
             setup: c.setup,
             roundtrip: c.roundtrip,

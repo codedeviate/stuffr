@@ -46,6 +46,8 @@ mod bytes {
             compare_output_bytes: EXACT,
             tz: None,
             unzip_flavour: None,
+            tty_ctl: false,
+            tty_signal: None,
             expect_stdout_plain: None,
             setup: None,
             roundtrip: Roundtrip::Lz4 { ref_lz4: ref_lz4() },
@@ -134,6 +136,8 @@ mod bytes {
                 cases.push(Case {
                     tz: None,
                     unzip_flavour: None,
+                    tty_ctl: false,
+                    tty_signal: None,
                     expect_stdout_plain: Some(data.clone()),
                     ..case("lz4", out, files.clone())
                 });
@@ -177,6 +181,8 @@ mod bytes {
                 cases.push(Case {
                     tz: None,
                     unzip_flavour: None,
+                    tty_ctl: false,
+                    tty_signal: None,
                     expect_stdout_plain: Some(data.clone()),
                     ..case("lz4", args, files)
                 });

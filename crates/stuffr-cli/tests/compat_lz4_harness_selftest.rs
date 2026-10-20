@@ -48,6 +48,8 @@ Done in 0.00 s ==> 20.94 MiB/s  (cpu load : 67%)\n";
             compare_output_bytes: true,
             tz: None,
             unzip_flavour: None,
+            tty_ctl: false,
+            tty_signal: None,
             expect_stdout_plain: None,
             setup: None,
             roundtrip: Roundtrip::Lz4 {
@@ -437,6 +439,8 @@ no-such-file: No such file or directory \n";
             compare_output_bytes: false,
             tz: None,
             unzip_flavour: None,
+            tty_ctl: false,
+            tty_signal: None,
             expect_stdout_plain: None,
             setup: None,
             roundtrip: Roundtrip::Lz4 {

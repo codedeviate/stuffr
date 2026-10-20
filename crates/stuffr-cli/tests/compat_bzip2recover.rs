@@ -140,6 +140,8 @@ mod differential {
             compare_output_bytes: true,
             tz: None,
             unzip_flavour: None,
+            tty_ctl: false,
+            tty_signal: None,
             expect_stdout_plain: None,
             setup: None,
             roundtrip: Roundtrip::Bzip2,

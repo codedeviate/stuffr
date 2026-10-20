@@ -41,6 +41,8 @@ mod unix {
             compare_output_bytes,
             tz: None,
             unzip_flavour: None,
+            tty_ctl: false,
+            tty_signal: None,
             expect_stdout_plain: None,
             setup: None,
             roundtrip: roundtrip(),
