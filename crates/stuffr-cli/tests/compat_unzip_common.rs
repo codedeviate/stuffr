@@ -183,6 +183,16 @@ mod unix {
         zip_with(&[], b"just a comment", b"")
     }
 
+    /// One entry whose name holds high bytes (0x80, 0xa0, 0xad, 0xe9, 0xff)
+    /// and DEL: what each locale's `isprint()` lets through.
+    fn high_zip() -> Vec<u8> {
+        zip_with(
+            &[ZipEntrySpec::new(b"c\x80\xa0\xad\xe9\xff\x7f.txt", b"x")],
+            b"",
+            b"",
+        )
+    }
+
     /// `a.txt` stored with one byte changed after its CRC was taken.
     fn crc_zip() -> Vec<u8> {
         zip_with(
@@ -1326,6 +1336,57 @@ mod unix {
                 "",
             ),
         ]);
+        // The locale unzip.c's `setlocale(LC_CTYPE, "")` takes, as Apple's
+        // libc reads it (P24): `UTF-8` alone is a macOS locale, a missing
+        // one leaves C, ISO8859-1 prints the Latin-1 letters. `\u{fffd}` is
+        // how the check's lossy view shows each high byte let through.
+        let high = || vec![("h.zip", high_zip())];
+        for (label, env, shown) in [
+            (
+                "locale LC_CTYPE=UTF-8",
+                ("LC_CTYPE", "UTF-8"),
+                "c?\u{fffd}?\u{fffd}\u{fffd}?.txt\n",
+            ),
+            (
+                "locale xx_XX.UTF-8",
+                ("LANG", "xx_XX.UTF-8"),
+                "c??????.txt\n",
+            ),
+            (
+                "locale ISO8859-1",
+                ("LC_CTYPE", "en_US.ISO8859-1"),
+                "c???\u{fffd}\u{fffd}?.txt\n",
+            ),
+        ] {
+            v.push(
+                row(
+                    Apple,
+                    9,
+                    label,
+                    "zipinfo",
+                    &["-1", "h.zip"],
+                    high(),
+                    0,
+                    shown,
+                    "",
+                )
+                .env(&[env]),
+            );
+            v.push(
+                row(
+                    Apple,
+                    9,
+                    label,
+                    "unzip",
+                    &["-l", "h.zip"],
+                    high(),
+                    0,
+                    shown,
+                    "",
+                )
+                .env(&[env]),
+            );
+        }
         // Testing entries (Task 10), passwords (Task 11).
         v.extend([
             row(

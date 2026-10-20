@@ -740,6 +740,32 @@ mod macos {
             "{out}"
         );
 
+        // ruling (P23, replacing T8-6's wrap): `cfactor`'s `+ 5` at INT_MIN
+        // and INT_MAX is unsigned arithmetic, as both references print it
+        // (`ratios_at_the_int_limits` compares them).
+        for (k, want) in [
+            (0i64, "    1000  Stored 2147484648 -214748365% "),
+            (1, "    1000  Stored 2147484649  214748365% "),
+            (4, "    1000  Stored 2147484652  214748364% "),
+        ] {
+            let z = central_only(
+                &[CentralSpec {
+                    csize: ((1i64 << 31) + 1000 + k) as u32,
+                    ucsize: 1000,
+                    ..CentralSpec::new(b"w")
+                }],
+                None,
+                b"",
+            );
+            let run = stuffr_unzip(&unzip_case(
+                "unzip",
+                vec!["-v", "r.zip"],
+                vec![("r.zip", z)],
+            ));
+            let out = String::from_utf8_lossy(&run.stdout);
+            assert!(out.contains(want), "k {k}: {out}");
+        }
+
         // ruling (T8-3): a central header cut short by the end of a short
         // archive (its `PK\1\2` just before the end record, which sits in the
         // last 22-25 bytes) reads zeros past the file: under 8 KiB, so
@@ -1869,5 +1895,54 @@ mod macos {
             out,
             "1 file, 1000 bytes uncompressed, 2147484648 bytes compressed:  -214748364.8%\n"
         );
+        // ruling: `-m`'s `ratio() + 5` at INT_MAX wraps (both references'
+        // answer too): `b--214748364%`.
+        let top = CentralSpec {
+            csize: (1 << 31) + 1001,
+            ucsize: 1000,
+            ..CentralSpec::new(b"w")
+        };
+        assert_eq!(
+            line(&one(top, &["-m"])),
+            "-rw-r--r--  3.0 unx     1000 b--214748364% stor 20-Jan-02 03:04 w"
+        );
+    }
+
+    /// The ratios at the limits of an `int`: 1000 bytes stored in 2^31 +
+    /// 1000 + k, where ratio() is INT_MIN (k = 0), INT_MAX (k = 1) and the
+    /// `+ 5` overflows (k up to 5), in unzip's `-v`/`-l` (P23: unsigned)
+    /// and zipinfo's `-m`, `-s` and totals (T9: `-m` wraps, the totals
+    /// print the magnitude). Both references print these alike.
+    #[test]
+    fn ratios_at_the_int_limits() {
+        let mut cases = Vec::new();
+        for k in [-6i64, -1, 0, 1, 2, 3, 4, 5, 6] {
+            let z = central_only(
+                &[CentralSpec {
+                    csize: ((1i64 << 31) + 1000 + k) as u32,
+                    ucsize: 1000,
+                    ..CentralSpec::new(b"w")
+                }],
+                None,
+                b"",
+            );
+            let name = leak(format!("r{k}.zip"));
+            cases.extend(listings(
+                name,
+                &z,
+                &[(&["-v"], &[], None), (&["-l"], &[], None)],
+            ));
+            cases.extend(zi_runs(
+                "zipinfo",
+                name,
+                &z,
+                &[
+                    (&["-m"], &[], None),
+                    (&["-t"], &[], None),
+                    (&["-v"], &[], None),
+                ],
+            ));
+        }
+        compare("ratios_at_the_int_limits", &cases);
     }
 }

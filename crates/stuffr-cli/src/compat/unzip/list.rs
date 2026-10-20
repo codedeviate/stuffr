@@ -60,15 +60,20 @@ pub(crate) fn ratio(uc: u64, c: u64) -> i32 {
 
 /// `ratio()` as the listings print it: the sign and the rounded percent
 /// (`cfactor`).
-/// ruling: `(-cfactor + 5) / 10` and `(cfactor + 5) / 10` overflow `int`
-/// near its limits (undefined behaviour); they wrap here.
+/// ruling (P23, replacing T8-6's wrap): `(-cfactor + 5) / 10` overflows
+/// `int` for a ratio of INT_MIN, and `(cfactor + 5) / 10` for one above
+/// INT_MAX - 5 (undefined behaviour). Both references compute these as
+/// unsigned: clang and gcc take the operand as non-negative after the sign
+/// test, so the figure is `(|ratio| + 5) / 10` in unsigned arithmetic
+/// (`-214748365%` for INT_MIN, ` 214748365%` for INT_MAX), and so it is
+/// here.
+/// probe: unzip -v of 1000 bytes stored in 2^31 + 1000 + k, k in -6..=6,
+/// on both references (Apple and Ubuntu print the same figures)
 fn cfactor(uc: u64, c: u64) -> (u8, i32) {
     let r = ratio(uc, c);
-    if r < 0 {
-        (b'-', r.wrapping_neg().wrapping_add(5) / 10)
-    } else {
-        (b' ', r.wrapping_add(5) / 10)
-    }
+    let sgn = if r < 0 { b'-' } else { b' ' };
+    // at most (2^31 + 5) / 10, which fits an `int`
+    (sgn, ((r.unsigned_abs() + 5) / 10) as i32)
 }
 
 /// `cfactorstr`: `100%` or the sign and the percent (`CompFactor100`,
@@ -349,6 +354,15 @@ mod tests {
         assert_eq!(cfactorstr(b'-', 50), b"-50%");
         // An expansion over 2 MB takes the other branch.
         assert_eq!(cfactor(4_000_000, 8_000_000), (b'-', 100));
+        // ruling (P23): at INT_MIN and near INT_MAX the figure is the
+        // unsigned one both references print.
+        let k = |k: i64| ((1u64 << 31) as i64 + 1000 + k) as u64;
+        assert_eq!(ratio(1000, k(0)), i32::MIN);
+        assert_eq!(cfactor(1000, k(0)), (b'-', 214_748_365));
+        assert_eq!(ratio(1000, k(1)), i32::MAX);
+        assert_eq!(cfactor(1000, k(1)), (b' ', 214_748_365));
+        assert_eq!(cfactor(1000, k(4)), (b' ', 214_748_364));
+        assert_eq!(cfactor(1000, k(-6)), (b'-', 214_748_364));
     }
 
     #[test]

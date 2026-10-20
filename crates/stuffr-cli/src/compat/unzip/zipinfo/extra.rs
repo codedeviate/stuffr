@@ -7,7 +7,6 @@
 
 use super::super::Uz;
 use super::super::fileio::{self, makelong, makeword};
-use super::super::flavour;
 use super::super::messages as m;
 use super::UNIX_;
 
@@ -478,20 +477,12 @@ fn ef_byte(uz: &mut Uz, b: u8) {
     uz.info_fmt(0, m::EF_FORMAT, &[format!("{b:02x}").as_bytes()]);
 }
 
-/// unix `isprint()` as zi_showMacTypeCreator() calls it: the locale's.
-fn libc_isprint(uz: &Uz, c: u8) -> bool {
-    if c >= 0x80 && !flavour::isprint_high_bytes_in_utf8(uz.flavour) {
-        return false;
-    }
-    fileio::is_print(uz, c)
-}
-
 // port: zipinfo.c:zi_showMacTypeCreator
 /// A Macintosh type and creator, `ebfield[0..8]`: as characters when all
 /// eight print, else as two hex words.
 fn show_mac_type_creator(uz: &mut Uz, ebfield: &[u8]) {
     // not every Type / Creator character is printable
-    if ebfield.iter().all(|&c| libc_isprint(uz, c)) {
+    if ebfield.iter().all(|&c| fileio::is_print(uz, c)) {
         uz.info_fmt(0, m::MAC_OS_DATA, &[&ebfield[..4], &ebfield[4..8]]);
     } else {
         let word = |b: &[u8]| {

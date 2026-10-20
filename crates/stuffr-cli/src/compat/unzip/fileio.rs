@@ -14,7 +14,7 @@ use std::io::{Read, Seek, SeekFrom};
 
 use super::messages as m;
 use super::{PK_COOL, PK_EOF, PK_OK, PK_WARN, Uz, flavour};
-use crate::compat::host::InFile;
+use crate::compat::host::{Host, InFile};
 
 /// unzpriv.h's `INBUFSIZ` ("larger buffers for real OSes").
 pub(crate) const INBUFSIZ: usize = 8192;
@@ -479,14 +479,64 @@ pub(crate) fn read_filename(uz: &mut Uz, length: usize, pinfo: &PInfo, islochdr:
     error
 }
 
-/// unix `isprint()` for `fnfilter()` (`HAVE_WORKING_ISPRINT`): printable
-/// ASCII, and under a UTF-8 locale (`uz.native_is_utf8`) also 0xa0..0xff
-/// but 0xad, which Apple's libc counts printable there.
-/// probe: `LANG=en_US.UTF-8 unzip -l` of a name holding 0x80..0xff (also
-/// `C.UTF-8`; `LANG=C`, `LC_ALL=C LANG=en_US.UTF-8` and `en_US.utf8` give
-/// `?` for every high byte).
+// port: unzip.c:unzip
+/// unzip.c's `SETLOCALE(LC_CTYPE, "")` and its `UTF8_MAYBE_NATIVE` test
+/// (`nl_langinfo(CODESET)` is `"UTF-8"`): whether the run's character type
+/// locale is UTF-8 (`G.native_is_utf8`). Under `Host::Real` on unix this
+/// sets the process's `LC_CTYPE` from the environment as unzip does, so
+/// [`is_print`] then answers as the reference's `isprint()`; a sandbox, and
+/// a build off unix, is the C locale (R7, R8).
+/// probe: Apple's `unzip -l` of a name holding 0xe9 shows it raw under
+/// `LC_CTYPE=UTF-8` (a macOS locale), `LANG=en_US.UTF-8`, `C.UTF-8` and
+/// `LC_CTYPE=en_US.ISO8859-1`, and `?` under `LANG=C` and `LANG=xx_XX.UTF-8`
+/// (no such locale: setlocale fails and C stays).
+pub(crate) fn init_locale(host: &Host) -> bool {
+    if !matches!(host, Host::Real) {
+        return false;
+    }
+    real_locale_is_utf8()
+}
+
+#[cfg(unix)]
+fn real_locale_is_utf8() -> bool {
+    // SAFETY: called once, from the run's single thread, before anything
+    // else reads the locale (unzip.c does it first thing too); the strings
+    // passed are NUL-terminated, and the one `nl_langinfo` returns is valid
+    // until the next locale call, read at once here.
+    unsafe {
+        libc::setlocale(libc::LC_CTYPE, c"".as_ptr());
+        let codeset = libc::nl_langinfo(libc::CODESET);
+        !codeset.is_null() && std::ffi::CStr::from_ptr(codeset).to_bytes() == b"UTF-8"
+    }
+}
+
+#[cfg(not(unix))]
+fn real_locale_is_utf8() -> bool {
+    false
+}
+
+/// unix `isprint()` (`HAVE_WORKING_ISPRINT`) in the locale [`init_locale`]
+/// set: the C library's answer under `Host::Real` on unix (Apple's counts
+/// 0xa0..0xff but 0xad printable under a UTF-8 locale, and the Latin-1
+/// letters under ISO8859-1; glibc's no byte above 0x7e under UTF-8), the C
+/// locale's (printable ASCII) in a sandbox and off unix.
 pub(crate) fn is_print(uz: &Uz, c: u8) -> bool {
-    (0x20..0x7f).contains(&c) || (uz.native_is_utf8 && c >= 0xa0 && c != 0xad)
+    if matches!(uz.host, Host::Real) {
+        return libc_isprint(c);
+    }
+    (0x20..0x7f).contains(&c)
+}
+
+#[cfg(unix)]
+fn libc_isprint(c: u8) -> bool {
+    // SAFETY: `isprint` takes any `unsigned char` value as an `int` and
+    // reads only the locale's character table.
+    unsafe { libc::isprint(libc::c_int::from(c)) != 0 }
+}
+
+#[cfg(not(unix))]
+fn libc_isprint(c: u8) -> bool {
+    (0x20..0x7f).contains(&c)
 }
 
 // port: extract.c:fnfilter

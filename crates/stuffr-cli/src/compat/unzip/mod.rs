@@ -185,7 +185,8 @@ pub(crate) struct Uz<'a> {
     /// `G.process_all_files`: no names were given after the archive.
     pub(crate) process_all_files: bool,
     /// `G.native_is_utf8` (ubuntu: -DUTF8_MAYBE_NATIVE): the locale's
-    /// codeset is UTF-8 ([`ctype_is_utf8`]; `false` under `LANG=C`).
+    /// codeset is UTF-8 (`fileio::init_locale`; `false` under `LANG=C` and
+    /// in a sandbox).
     /// Apple's `fnfilter()` reads the same fact through `isprint()`.
     pub(crate) native_is_utf8: bool,
     /// `G.unicode_escape_all` (ubuntu: -DUNICODE_WCHAR): `-U` given once.
@@ -422,7 +423,7 @@ fn main(
         return funzip(flavour, args, &host, err);
     }
     let mut uz = Uz::new(host, flavour, env, err);
-    uz.native_is_utf8 = ctype_is_utf8(env);
+    uz.native_is_utf8 = fileio::init_locale(&uz.host);
     let code = unzip(&mut uz, argv0, args);
     let _ = uz.out.flush();
     code
@@ -463,22 +464,6 @@ fn unzip(uz: &mut Uz, argv0: &[u8], args: &[OsString]) -> i32 {
 /// `process.c`'s `process_zipfiles()`.
 fn process_zipfiles(uz: &mut Uz, parsed: &cli::Parsed) -> i32 {
     process::process_zipfiles(uz, parsed)
-}
-
-/// Whether the locale's character type codeset is UTF-8, as `setlocale(
-/// LC_CTYPE, "")` makes it: the first of `LC_ALL`, `LC_CTYPE` and `LANG`
-/// that is set and not empty, a UTF-8 locale when it ends in `.UTF-8`
-/// (deviation 6: `C`, `C.UTF-8` and `en_US.UTF-8` are the locales the
-/// family answers alike in).
-/// probe: Apple's `unzip -l` shows 0xe9 in a name raw under `LANG=C.UTF-8`,
-/// `LANG=en_US.UTF-8` and `LC_CTYPE=en_US.UTF-8 LANG=C`, and as `?` under
-/// `LANG=C`, `LC_ALL=C LANG=en_US.UTF-8`, `LANG=en_US.utf8` (no such locale
-/// on macOS) and no locale variable at all.
-pub(crate) fn ctype_is_utf8(env: &dyn Fn(&str) -> Option<OsString>) -> bool {
-    ["LC_ALL", "LC_CTYPE", "LANG"]
-        .iter()
-        .find_map(|k| env(k).filter(|v| !v.is_empty()))
-        .is_some_and(|v| v.as_encoded_bytes().ends_with(b".UTF-8"))
 }
 
 // port: funzip.c:main

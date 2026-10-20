@@ -27,6 +27,23 @@ fn with_uz<R>(f: impl FnOnce(&mut Uz) -> R) -> R {
     f(&mut uz)
 }
 
+/// A scratch directory `stuffr-zipinfo-<tag>-<pid>`, removed when dropped
+/// (a failing assertion included).
+struct Dir(std::path::PathBuf);
+impl Dir {
+    fn new(tag: &str) -> Dir {
+        let d = std::env::temp_dir().join(format!("stuffr-zipinfo-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        Dir(d)
+    }
+}
+impl Drop for Dir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// 2020-01-02 03:04:06 as an MS-DOS date and time.
 const DOS_2020: u32 = ((((2020 - 1980) << 9) | (1 << 5) | 2) << 16) | (3 << 11) | (4 << 5) | 3;
 
@@ -195,9 +212,8 @@ impl Rng {
 /// beyond a field's width.
 #[test]
 fn hostile_directories_never_panic() {
-    let dir = std::env::temp_dir().join(format!("stuffr-zipinfo-hostile-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = Dir::new("hostile");
+    let dir = &scratch.0;
     let ids: [u16; 24] = [
         0x0001, 0x0009, 0x4c41, 0x4453, 0x4d49, 0x5855, 0x7855, 0x7875, 0x5455, 0x7075, 0x6375,
         0x334d, 0x07c8, 0x2605, 0x2705, 0x4d63, 0x6542, 0x7441, 0xfb4a, 0x5356, 0x4154, 0x4b46,
@@ -266,12 +282,11 @@ fn hostile_directories_never_panic() {
             for args in formats {
                 let mut a: Vec<OsString> = args.iter().map(OsString::from).collect();
                 a.push("h.zip".into());
-                let (code, ..) = run_in_counted(f, &dir, "zipinfo", &a, b"", &|_| None);
+                let (code, ..) = run_in_counted(f, dir, "zipinfo", &a, b"", &|_| None);
                 assert!(codes.contains(&code), "round {round} {args:?}: exit {code}");
             }
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A host number between 20 and 29 is `(null)` in `-v` (the C passes
@@ -279,16 +294,15 @@ fn hostile_directories_never_panic() {
 /// `???` in `-s`.
 #[test]
 fn unnamed_hosts() {
-    let dir = std::env::temp_dir().join(format!("stuffr-zipinfo-hosts-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = Dir::new("hosts");
+    let dir = &scratch.0;
     let z = central_archive(&[header(0x141e, 0, 0o100644 << 16, b"h", b"")], 1);
     std::fs::write(dir.join("h.zip"), z).unwrap();
     let run = |args: &[&str]| {
         let mut a: Vec<OsString> = args.iter().map(OsString::from).collect();
         a.push("h.zip".into());
         let (code, out, err, _) =
-            run_in_counted(Flavour::Apple, &dir, "zipinfo", &a, b"", &|_| None);
+            run_in_counted(Flavour::Apple, dir, "zipinfo", &a, b"", &|_| None);
         assert_eq!((code, err.as_slice()), (0, &b""[..]));
         String::from_utf8(out).unwrap()
     };
@@ -308,5 +322,4 @@ fn unnamed_hosts() {
         ["-rw-r--r--", "3.0", "???", "0", "b-", "stor"],
         "{s}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }

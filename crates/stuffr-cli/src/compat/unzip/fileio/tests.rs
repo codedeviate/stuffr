@@ -135,12 +135,10 @@ fn fnfilter_escapes_and_truncates() {
         assert_eq!(fnfilter1(uz, b"\x7f\x80\xe9"), b"???");
         // A C string: the name ends at its NUL.
         assert_eq!(fnfilter1(uz, b"ab\0cd"), b"ab");
-        // Under a UTF-8 locale 0xa0..0xff but 0xad are printable.
+        // A sandbox is the C locale whatever `native_is_utf8` says (the
+        // real locale's answers are the Apple suite's: `init_locale`).
         uz.native_is_utf8 = true;
-        assert_eq!(
-            fnfilter1(uz, b"\x80\x9f\xa0\xad\xe9\xff"),
-            b"??\xa0?\xe9\xff"
-        );
+        assert_eq!(fnfilter1(uz, b"\x80\x9f\xa0\xad\xe9\xff"), b"??????");
         uz.native_is_utf8 = false;
         // Past `size - 4` bytes of output the name ends in `...`.
         let long = vec![b'n'; WSIZE];

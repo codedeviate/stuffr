@@ -398,7 +398,12 @@ pub(super) fn zi_short(uz: &mut Uz, e: &CentralEntry) -> i32 {
         if e.general_purpose_bit_flag & 1 != 0 {
             csiz = csiz.wrapping_sub(12); // if encrypted, don't count encryption header
         }
-        // ruling: `ratio() + 5` wraps at INT_MAX, as T8-6 rules.
+        // ruling: `ratio() + 5` overflows `int` for a ratio above INT_MAX -
+        // 5 (undefined behaviour); here, unlike list.c's (P23), both
+        // references' compilers know nothing of its sign and the sum wraps
+        // (`-214748364%` for INT_MAX), and so it does here.
+        // probe: zipinfo -m of 1000 bytes stored in 2^31 + 1000 + k, k in
+        // 1..=5, on both references
         let pct = format!("{:>3}", ratio(e.ucsize, csiz).wrapping_add(5) / 10).into_bytes();
         uz.info_fmt(0, m::ZI_SHORT_PERCENT, &[&pct]);
     } else if uz.o.lflag == 5 {
