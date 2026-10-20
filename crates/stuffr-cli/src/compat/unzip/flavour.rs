@@ -165,6 +165,16 @@ pub(crate) fn handle_windows_zip64(_f: Flavour) -> bool {
     false
 }
 
+/// The C library's `isprint()` under a UTF-8 locale for a byte above
+/// 0x7f, which zipinfo's `zi_showMacTypeCreator()` asks: Apple's libc
+/// counts 0xa0..0xff printable there but 0xad (`fileio::is_print`, probed
+/// in Task 8); glibc's answer is Task 13's to probe.
+///
+/// Pass-through until Task 13: Apple's answer (`true`) for both.
+pub(crate) fn isprint_high_bytes_in_utf8(_f: Flavour) -> bool {
+    true
+}
+
 /// unzpriv.h's `FILNAMSIZ`, the platform's `PATH_MAX`: the longest name
 /// (with its NUL) `G.filename` holds. Not a define or a patch but each
 /// reference's platform constant, so both are exact now: macOS's 1024,

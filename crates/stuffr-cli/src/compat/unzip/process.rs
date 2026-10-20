@@ -540,7 +540,7 @@ fn do_seekable(uz: &mut Uz, lastchance: bool) -> i32 {
         }
 
         let error = if uz.o.zipinfo_mode {
-            not_built_yet(uz) // ZIPINFO 'EM: Task 9
+            super::zipinfo::zipinfo(uz) // ZIPINFO 'EM
         } else if uz.o.t_flag {
             list::get_time_stamp(uz, &mut uxstamp, &mut nmember)
         } else if uz.o.vflag != 0 && !uz.o.tflag && !uz.o.cflag {
@@ -576,16 +576,16 @@ fn do_seekable(uz: &mut Uz, lastchance: bool) -> i32 {
 
 /// `readbuf(__G__ G.sig, 4)`: the bytes read into `G.sig`, the rest of it
 /// (after a short read) left as it was.
-fn read_sig(uz: &mut Uz) -> usize {
+pub(crate) fn read_sig(uz: &mut Uz) -> usize {
     let mut sig = uz.sig;
     let n = readbuf(uz, &mut sig);
     uz.sig = sig;
     n
 }
 
-/// stuffr's own placeholder for what Tasks 9 and 10 build (zipinfo's
-/// listings, extraction and testing): it names what is missing, exit
-/// `PK_BADERR`. Never reached by a listing.
+/// stuffr's own placeholder for what Task 10 builds (extraction and
+/// testing): it names what is missing, exit `PK_BADERR`. Never reached by
+/// a listing.
 fn not_built_yet(uz: &mut Uz) -> i32 {
     let w = who(uz);
     uz.info_fmt(0x401, m::NOT_BUILT_YET, &[w]);
@@ -778,7 +778,7 @@ pub(crate) fn get_zip64_data(uz: &mut Uz, e: &mut CentralEntry, ef: &[u8]) -> i3
 /// field into `e.extra`, its Zip64 values taken (`getZip64Data()`, whose
 /// failure is warned about). `PK_EOF` when nothing could be read,
 /// `PK_ERR` for a short read.
-fn read_extra_field(uz: &mut Uz, e: &mut CentralEntry) -> i32 {
+pub(crate) fn read_extra_field(uz: &mut Uz, e: &mut CentralEntry) -> i32 {
     let length = usize::from(e.extra_field_length);
     if length == 0 {
         return PK_COOL;

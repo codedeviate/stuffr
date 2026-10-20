@@ -743,6 +743,459 @@ fn files(v: &mut Vec<u8>, members: u64) {
     });
 }
 
+// ---- consts.h: the not-matched cautions (zipinfo.c's, Task 9; extract.c's
+// too) ----
+
+/// consts.h:FilenameNotMatched. `%s` is the pattern.
+pub(super) const FILENAME_NOT_MATCHED: &str = "caution: filename not matched:  %s\n";
+/// consts.h:ExclFilenameNotMatched. `%s` is the pattern.
+pub(super) const EXCL_FILENAME_NOT_MATCHED: &str = "caution: excluded filename not matched:  %s\n";
+
+// ---- zipinfo.c (Task 9) ----
+//
+// Every `%s` below stands for the C's own conversion, which the caller
+// applies and the doc names: `FmZofft(v, "11", NULL)` is `%11lld`,
+// `FmZofft(v, NULL, "u")` `%llu`, `FmZofft(v, FZOFFT_HEX_DOT_WID, "X")`
+// `%.16llX` (`LARGE_FILE_SUPPORT`'s `FZOFFT_HEX_WID_VALUE` is "16").
+
+/// zipinfo.c:ZipInfHeader2: `%s` the archive's size (`%lld`), then the
+/// entry count (`%llu`).
+pub(super) const ZIP_INF_HEADER2: &str = "Zip file size: %s bytes, number of entries: %s\n";
+/// zipinfo.c:EndCentDirRec.
+pub(super) const END_CENT_DIR_REC: &str = "\nEnd-of-central-directory record:\n";
+/// zipinfo.c:LineSeparators.
+pub(super) const LINE_SEPARATORS: &str = "-------------------------------\n\n";
+/// zipinfo.c:ZipFSizeVerbose: the size (`%11lld`, `%.16llX`).
+pub(super) const ZIP_FSIZE_VERBOSE: &str = "  Zip archive file size:               %s (%sh)\n";
+/// zipinfo.c:ActOffsetCentDir: the actual and the expected end record
+/// offsets (`%11llu`, `%.16llX` each).
+pub(super) const ACT_OFFSET_CENT_DIR: &str = "  Actual end-cent-dir record offset:   %s (%sh)\n  \
+     Expected end-cent-dir record offset: %s (%sh)\n  (based on the length of the central \
+     directory and its expected offset)\n\n";
+/// zipinfo.c:SinglePartArchive1: the entry count (`%llu`), `entry` or
+/// `entries`, the directory's size (`%llu`, `%.16llX`).
+pub(super) const SINGLE_PART_ARCHIVE1: &str = "  This zipfile constitutes the sole disk of a \
+     single-part archive; its\n  central directory contains %s %s.\n  The central directory \
+     is %s (%sh) bytes long,\n";
+/// zipinfo.c:SinglePartArchive2: the directory's offset (`%llu`,
+/// `%.16llX`).
+pub(super) const SINGLE_PART_ARCHIVE2: &str = "  and its (expected) offset in bytes from the \
+     beginning of the zipfile\n  is %s (%sh).\n\n";
+/// zipinfo.c:MultiPartArchive1: the disks (`%lu` each, plus one).
+pub(super) const MULTI_PART_ARCHIVE1: &str = "  This zipfile constitutes disk %s of a \
+     multi-part archive.  The central\n  directory starts on disk %s at an offset within that \
+     archive part\n";
+/// zipinfo.c:MultiPartArchive2: the directory's offset and size (`%llu`,
+/// `%.16llX` each).
+pub(super) const MULTI_PART_ARCHIVE2: &str = "  of %s (%sh) bytes.  The entire\n  central \
+     directory is %s (%sh) bytes long.\n";
+/// zipinfo.c:MultiPartArchive3: this disk's count (`%llu`), `is` or `are`,
+/// the total (`%llu`), `entry` or `entries`.
+pub(super) const MULTI_PART_ARCHIVE3: &str = "  %s of the archive entries %s contained within \
+     this zipfile volume,\n  out of a total of %s %s.\n\n";
+/// zi_end_central()'s count words.
+pub(super) const ENTRY: &str = "entry";
+pub(super) const ENTRIES: &str = "entries";
+pub(super) const IS: &str = "is";
+pub(super) const ARE: &str = "are";
+/// zipinfo.c:CentralDirEntry: the entry's number (`%lu`).
+pub(super) const CENTRAL_DIR_ENTRY: &str =
+    "\nCentral directory entry #%s:\n---------------------------\n\n";
+/// zipinfo.c:ZipfileStats: the count (`%lu`), `s` or nothing (`PlurSufx`,
+/// `nullStr`), the sizes (`%llu` each), the sign, the ratio's percent and
+/// tenth (`%d.%d`).
+pub(super) const ZIPFILE_STATS: &str =
+    "%s file%s, %s bytes uncompressed, %s bytes compressed:  %s%s.%s%%\n";
+/// zipinfo.c:PlurSufx.
+pub(super) const PLUR_SUFX: &str = "s";
+
+/// zi_long()'s `os[NUM_HOSTS]`: the host names (`OS_FAT` .. `OS_AtheOS`),
+/// by host number; `None` where the C has `NULL` (20..29).
+pub(super) const OS_NAMES: [Option<&str>; 31] = [
+    Some("MS-DOS, OS/2 or NT FAT"),
+    Some("Amiga"),
+    Some("VMS"),
+    Some("Unix"),
+    Some("VM/CMS"),
+    Some("Atari ST"),
+    Some("OS/2 or NT HPFS"),
+    Some("Macintosh HFS"),
+    Some("Z-System"),
+    Some("CP/M"),
+    Some("TOPS-20"),
+    Some("NTFS"),
+    Some("SMS/QDOS"),
+    Some("Acorn RISC OS"),
+    Some("Win32 VFAT"),
+    Some("MVS"),
+    Some("BeOS"),
+    Some("Tandem NSK"),
+    Some("Theos"),
+    Some("Mac OS/X (Darwin)"),
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    Some("AtheOS"),
+];
+/// What both references' `printf("%s", NULL)` prints (Apple's libc and
+/// glibc alike): zi_long()'s host name for host numbers 20..29.
+/// probe: `zipinfo -v` of an entry made by host 20.
+pub(super) const PRINTF_NULL: &str = "(null)";
+
+/// zi_long()'s `method[NUM_METHODS]` (`MthdNone` .. `MthdPPMd`), by
+/// `find_compr_idx()`.
+pub(super) const ZI_LONG_METHODS: [&str; 17] = [
+    "none (stored)",
+    "shrunk",
+    "reduced (factor 1)",
+    "reduced (factor 2)",
+    "reduced (factor 3)",
+    "reduced (factor 4)",
+    "imploded",
+    "tokenized",
+    "deflated",
+    "deflated (enhanced-64k)",
+    "imploded (PK DCL)",
+    "bzipped",
+    "LZMA-ed",
+    "tersed (IBM)",
+    "LZ77-compressed (IBM)",
+    "WavPacked",
+    "PPMd-ed",
+];
+/// zi_long()'s `dtypelng[4]` (`DeflNorm` .. `DeflSFast`), by flag bits 1-2.
+pub(super) const DTYPELNG: [&str; 4] = ["normal", "maximum", "fast", "superfast"];
+
+/// zipinfo.c:ExtraBytesPreceding: the gap (`%lld`).
+pub(super) const EXTRA_BYTES_PRECEDING: &str =
+    "  There are an extra %s bytes preceding this file.\n\n";
+/// zipinfo.c:UnknownNo: the number (`%d`).
+pub(super) const UNKNOWN_NO: &str = "unknown (%s)";
+/// zipinfo.c:LocalHeaderOffset (`ZIP64_SUPPORT`): the offset (`%llu`,
+/// `%.16llX`).
+pub(super) const LOCAL_HEADER_OFFSET: &str = "\n  offset of local header from start of \
+     archive:   %s\n                                                  (%sh) bytes\n";
+/// zipinfo.c:HostOS.
+pub(super) const HOST_OS: &str = "  file system or operating system of origin:      %s\n";
+/// zipinfo.c:EncodeSWVer: the version's two digits (`%u.%u`).
+pub(super) const ENCODE_SW_VER: &str = "  version of encoding software:                   %s.%s\n";
+/// zipinfo.c:MinOSCompReq.
+pub(super) const MIN_OS_COMP_REQ: &str = "  minimum file system compatibility required:     %s\n";
+/// zipinfo.c:MinSWVerReq (`%u.%u`).
+pub(super) const MIN_SW_VER_REQ: &str = "  minimum software version required to extract:   %s.%s\n";
+/// zipinfo.c:CompressMethod.
+pub(super) const COMPRESS_METHOD: &str = "  compression method:                             %s\n";
+/// zipinfo.c:SlideWindowSizeImplode (`%c`).
+pub(super) const SLIDE_WINDOW_SIZE_IMPLODE: &str =
+    "  size of sliding dictionary (implosion):         %sK\n";
+/// zipinfo.c:ShannonFanoTrees (`%c`).
+pub(super) const SHANNON_FANO_TREES: &str =
+    "  number of Shannon-Fano trees (implosion):       %s\n";
+/// zipinfo.c:CompressSubtype.
+pub(super) const COMPRESS_SUBTYPE: &str = "  compression sub-type (deflation):               %s\n";
+/// zipinfo.c:FileSecurity: `""` or `"not "`.
+pub(super) const FILE_SECURITY: &str =
+    "  file security status:                           %sencrypted\n";
+/// zi_long()'s `"not "`.
+pub(super) const NOT_: &str = "not ";
+/// zipinfo.c:ExtendedLocalHdr.
+pub(super) const EXTENDED_LOCAL_HDR: &str =
+    "  extended local header:                          %s\n";
+/// zi_long()'s `"yes"` and `"no"`.
+pub(super) const YES: &str = "yes";
+pub(super) const NO: &str = "no";
+/// zipinfo.c:FileModDate.
+pub(super) const FILE_MOD_DATE: &str = "  file last modified on (DOS date/time):          %s\n";
+/// zipinfo.c:UT_FileModDate (`USE_EF_UT_TIME`): the time, `local` or `UTC`.
+pub(super) const UT_FILE_MOD_DATE: &str =
+    "  file last modified on (UT extra field modtime): %s %s\n";
+/// zipinfo.c:LocalTime.
+pub(super) const LOCAL_TIME: &str = "local";
+/// zipinfo.c:GMTime.
+pub(super) const GM_TIME: &str = "UTC";
+/// zipinfo.c:CRC32Value (`%.8lx`).
+pub(super) const CRC32_VALUE: &str = "  32-bit CRC value (hex):                         %s\n";
+/// zipinfo.c:CompressedFileSize (`%llu`).
+pub(super) const COMPRESSED_FILE_SIZE: &str =
+    "  compressed size:                                %s bytes\n";
+/// zipinfo.c:UncompressedFileSize (`%llu`).
+pub(super) const UNCOMPRESSED_FILE_SIZE: &str =
+    "  uncompressed size:                              %s bytes\n";
+/// zipinfo.c:FilenameLength (`%u`).
+pub(super) const FILENAME_LENGTH: &str =
+    "  length of filename:                             %s characters\n";
+/// zipinfo.c:ExtraFieldLength (`%u`).
+pub(super) const EXTRA_FIELD_LENGTH: &str =
+    "  length of extra field:                          %s bytes\n";
+/// zipinfo.c:FileCommentLength (`%u`).
+pub(super) const FILE_COMMENT_LENGTH: &str =
+    "  length of file comment:                         %s characters\n";
+/// zipinfo.c:FileDiskNum (`%lu`).
+pub(super) const FILE_DISK_NUM: &str =
+    "  disk number on which file begins:               disk %s\n";
+/// zipinfo.c:ApparentFileType.
+pub(super) const APPARENT_FILE_TYPE: &str =
+    "  apparent file type:                             %s\n";
+/// zi_long()'s file types, by internal attribute bits 0 and 1.
+pub(super) const TEXT: &str = "text";
+pub(super) const EBCDIC: &str = "ebcdic";
+pub(super) const BINARY: &str = "binary";
+/// zipinfo.c:VMSFileAttributes (`%06o`).
+pub(super) const VMS_FILE_ATTRIBUTES: &str = "  VMS file attributes (%s octal):             %s\n";
+/// zipinfo.c:AmigaFileAttributes (`%06o`).
+pub(super) const AMIGA_FILE_ATTRIBUTES: &str = "  Amiga file attributes (%s octal):           %s\n";
+/// zipinfo.c:UnixFileAttributes (`%06o`).
+pub(super) const UNIX_FILE_ATTRIBUTES: &str = "  Unix file attributes (%s octal):            %s\n";
+/// zipinfo.c:NonMSDOSFileAttributes (`%06lX`).
+pub(super) const NON_MSDOS_FILE_ATTRIBUTES: &str =
+    "  non-MSDOS external file attributes:             %s hex\n";
+/// zipinfo.c:MSDOSFileAttributes (`%02X`).
+pub(super) const MSDOS_FILE_ATTRIBUTES: &str =
+    "  MS-DOS file attributes (%s hex):                none\n";
+/// zipinfo.c:MSDOSFileAttributesRO (`%02X`).
+pub(super) const MSDOS_FILE_ATTRIBUTES_RO: &str =
+    "  MS-DOS file attributes (%s hex):                read-only\n";
+/// zipinfo.c:MSDOSFileAttributesAlpha (`%02X`, then the eight words).
+pub(super) const MSDOS_FILE_ATTRIBUTES_ALPHA: &str =
+    "  MS-DOS file attributes (%s hex):                %s%s%s%s%s%s%s%s\n";
+/// zi_long()'s MS-DOS attribute words, bit 0 to bit 7.
+pub(super) const MSDOS_ATTR_WORDS: [&str; 8] = [
+    "rdo ", "hid ", "sys ", "lab ", "dir ", "arc ", "lnk ", "exe",
+];
+/// zipinfo.c:TheosFileAttributes (`%04X`).
+pub(super) const THEOS_FILE_ATTRIBUTES: &str =
+    "  Theos file attributes (%s hex):               %s\n";
+/// zipinfo.c:TheosFTyp*: the Theos file types (`TheosFTypLib` ..
+/// `TheosFTypP32`, then `TheosFTypUkn`).
+pub(super) const THEOS_FTYP_LIB: &str = "Library     ";
+pub(super) const THEOS_FTYP_DIR: &str = "Directory   ";
+pub(super) const THEOS_FTYP_REG: &str = "Sequential  ";
+pub(super) const THEOS_FTYP_REL: &str = "Direct      ";
+pub(super) const THEOS_FTYP_KEY: &str = "Keyed       ";
+pub(super) const THEOS_FTYP_IND: &str = "Indexed     ";
+pub(super) const THEOS_FTYP_R16: &str = " 86 program ";
+pub(super) const THEOS_FTYP_P16: &str = "286 program ";
+pub(super) const THEOS_FTYP_P32: &str = "386 program ";
+pub(super) const THEOS_FTYP_UKN: &str = "???         ";
+
+/// zipinfo.c:ExtraFieldTrunc: the block's id (`%04x`), its length and what
+/// is left (`%u` each).
+pub(super) const EXTRA_FIELD_TRUNC: &str = "\n  error: EF data block (type 0x%s) size %s \
+     exceeds remaining extra field\n         space %s; block length has been truncated.\n";
+/// zipinfo.c:ExtraFields.
+pub(super) const EXTRA_FIELDS: &str = "\n  The central-directory extra field contains:";
+/// zipinfo.c:ExtraFieldType: the id (`%04x`), its name, the length (`%u`).
+pub(super) const EXTRA_FIELD_TYPE: &str = "\n  - A subfield with ID 0x%s (%s) and %s data bytes";
+/// zipinfo.c:efPKSZ64 .. efUnknown: the extra block names.
+pub(super) const EF_PKSZ64_NAME: &str = "PKWARE 64-bit sizes";
+pub(super) const EF_AV_NAME: &str = "PKWARE AV";
+pub(super) const EF_OS2_NAME: &str = "OS/2";
+pub(super) const EF_PKVMS_NAME: &str = "PKWARE VMS";
+pub(super) const EF_PKWIN32_NAME: &str = "PKWARE Win32";
+pub(super) const EF_PKUNIX_NAME: &str = "PKWARE Unix";
+pub(super) const EF_IZVMS_NAME: &str = "Info-ZIP VMS";
+pub(super) const EF_IZUNIX_NAME: &str = "old Info-ZIP Unix/OS2/NT";
+pub(super) const EF_IZUNIX2_NAME: &str = "Unix UID/GID (16-bit)";
+pub(super) const EF_IZUNIX3_NAME: &str = "Unix UID/GID (any size)";
+pub(super) const EF_TIME_NAME: &str = "universal time";
+pub(super) const EF_U8PATH_NAME: &str = "UTF8 path name";
+pub(super) const EF_U8COMMNT_NAME: &str = "UTF8 entry comment";
+pub(super) const EF_JLMAC_NAME: &str = "old Info-ZIP Macintosh";
+pub(super) const EF_MAC3_NAME: &str = "new Info-ZIP Macintosh";
+pub(super) const EF_ZIPIT_NAME: &str = "ZipIt Macintosh";
+pub(super) const EF_SMARTZIP_NAME: &str = "SmartZip Macintosh";
+pub(super) const EF_ZIPIT2_NAME: &str = "ZipIt Macintosh (short)";
+pub(super) const EF_VMCMS_NAME: &str = "VM/CMS";
+pub(super) const EF_MVS_NAME: &str = "MVS";
+pub(super) const EF_ACL_NAME: &str = "OS/2 ACL";
+pub(super) const EF_NTSD_NAME: &str = "Security Descriptor";
+pub(super) const EF_ATHEOS_NAME: &str = "AtheOS";
+pub(super) const EF_BEOS_NAME: &str = "BeOS";
+pub(super) const EF_QDOS_NAME: &str = "SMS/QDOS";
+pub(super) const EF_AOSVS_NAME: &str = "AOS/VS";
+pub(super) const EF_SPARK_NAME: &str = "Acorn SparkFS";
+pub(super) const EF_MD5_NAME: &str = "Fred Kantor MD5";
+pub(super) const EF_ASIUNIX_NAME: &str = "ASi Unix";
+pub(super) const EF_TANDEM_NAME: &str = "Tandem NSK";
+pub(super) const EF_THEOS_NAME: &str = "Theos";
+pub(super) const EF_UNKNOWN_NAME: &str = "unknown";
+
+/// zipinfo.c:OS2EAs (`%lu`).
+pub(super) const OS2_EAS: &str = ".\n    The local extra field has %s bytes of OS/2 extended \
+     attributes.\n    (May not match OS/2 \"dir\" amount due to storage method)";
+/// zipinfo.c:izVMSdata: the storage word, the size (`%u`), the record
+/// kind, the version note.
+pub(super) const IZ_VMS_DATA: &str =
+    ".  The extra\n    field is %s and has %s bytes of VMS %s information%s";
+/// zipinfo.c:izVMScomp[4] (`izVMSstored` .. `izVMScunknw`).
+pub(super) const IZ_VMS_COMP: [&str; 4] =
+    ["stored", "run-length encoded", "deflated", "compressed(?)"];
+/// zi_long()'s IZVMS record kinds, by tag (`VFAB` .. `VMSV`, then the
+/// rest).
+pub(super) const VMS_FAB: &str = "FAB";
+pub(super) const VMS_XABALL: &str = "XABALL";
+pub(super) const VMS_XABFHC: &str = "XABFHC";
+pub(super) const VMS_XABDAT: &str = "XABDAT";
+pub(super) const VMS_XABRDT: &str = "XABRDT";
+pub(super) const VMS_XABPRO: &str = "XABPRO";
+pub(super) const VMS_XABKEY: &str = "XABKEY";
+pub(super) const VMS_VERSION: &str = "version";
+pub(super) const VMS_UNKNOWN: &str = "unknown";
+/// zipinfo.c:ACLdata (`%lu`).
+pub(super) const ACL_DATA: &str =
+    ".\n    The local extra field has %s bytes of access control list information";
+/// zipinfo.c:NTSDData (`%lu`).
+pub(super) const NTSD_DATA: &str =
+    ".\n    The local extra field has %s bytes of NT security descriptor data";
+/// zipinfo.c:UTdata: the time names, `s` or nothing.
+pub(super) const UT_DATA: &str = ".\n    The local extra field has UTC/GMT %s time%s";
+/// zipinfo.c:UTmodification, UTaccess, UTcreation.
+pub(super) const UT_MODIFICATION: &str = "modification";
+pub(super) const UT_ACCESS: &str = "access";
+pub(super) const UT_CREATION: &str = "creation";
+/// zipinfo.c:U8PthCmnComplete: the version (`%u`), the name's CRC (`%.8lx`).
+pub(super) const U8_PTH_CMN_COMPLETE: &str = ".\n    The UTF8 data of the extra field (V%s, \
+     ASCII name CRC `%s') are:\n   ";
+/// zipinfo.c:U8PthCmnF24 (as `U8PthCmnComplete`).
+pub(super) const U8_PTH_CMN_F24: &str = ". The first\n    24 UTF8 bytes in the extra field \
+     (V%s, ASCII name CRC `%s') are:\n   ";
+/// zipinfo.c:ZipItFname.
+pub(super) const ZIP_IT_FNAME: &str = ".\n    The Mac long filename is %s";
+/// zipinfo.c:Mac3data (`%lu`, then `un` or nothing).
+pub(super) const MAC3_DATA: &str = ".\n    The local extra field has %s bytes of %scompressed \
+     Macintosh\n    finder attributes";
+/// zi_long()'s `"un"`.
+pub(super) const UN: &str = "un";
+/// zipinfo.c:MacOSdata: the type and creator, a `%c` each.
+pub(super) const MAC_OS_DATA: &str =
+    ".\n    The associated file has type code `%s' and creator code `%s'";
+/// zipinfo.c:MacOSdata1 (`0x%lx` each).
+pub(super) const MAC_OS_DATA1: &str =
+    ".\n    The associated file has type code `0x%s' and creator code `0x%s'";
+/// zipinfo.c:MacOSJLEEflags.
+pub(super) const MAC_OS_JLEE_FLAGS: &str = ".\n    File is marked as %s";
+/// zipinfo.c:MacOS_RF, MacOS_DF.
+pub(super) const MAC_OS_RF: &str = "Resource-fork";
+pub(super) const MAC_OS_DF: &str = "Data-fork";
+/// zipinfo.c:MacOSMAC3flags: the fork, the time width (`%d`).
+pub(super) const MAC_OS_MAC3_FLAGS: &str = ".\n    File is marked as %s, File Dates are in %s Bit";
+/// zipinfo.c:AtheOSdata (`%lu`, `un` or nothing).
+pub(super) const ATHE_OS_DATA: &str =
+    ".\n    The local extra field has %s bytes of %scompressed AtheOS file attributes";
+/// zipinfo.c:BeOSdata (`%lu`, `un` or nothing).
+pub(super) const BE_OS_DATA: &str =
+    ".\n    The local extra field has %s bytes of %scompressed BeOS file attributes";
+/// zipinfo.c:QDOSdata: four `%c`.
+pub(super) const QDOS_DATA: &str = ".\n    The QDOS extra field subtype is `%s'";
+/// zipinfo.c:AOSVSdata (`%d.%d`).
+pub(super) const AOSVS_DATA: &str = ".\n    The AOS/VS extra field revision is %s.%s";
+/// zipinfo.c:TandemFileformat[6] (`TandemUnstr` .. `TandemObj`).
+pub(super) const TANDEM_FILEFORMAT: [&str; 6] = [
+    "Unstructured",
+    "Relative",
+    "Entry Sequenced",
+    "Key Sequenced",
+    "Edit",
+    "Object",
+];
+/// zipinfo.c:Tandemdata: the format, the file code (`%u`).
+pub(super) const TANDEM_DATA: &str =
+    ".\n    The file was originally a Tandem %s file, with file code %s";
+/// zipinfo.c:MD5data.
+pub(super) const MD5_DATA: &str = ".\n    The 128-bit MD5 signature is %s";
+/// zipinfo.c:First20.
+pub(super) const FIRST20: &str = ".  The first\n    20 are:  ";
+/// zipinfo.c:ColonIndent.
+pub(super) const COLON_INDENT: &str = ":\n   ";
+/// zipinfo.c:efFormat (`" %02x"`): one byte.
+pub(super) const EF_FORMAT: &str = " %s";
+/// zipinfo.c:lExtraFieldType: `is` or `may be`, the id (`%04x`), its
+/// name, the length (`%u`), what it holds.
+pub(super) const L_EXTRA_FIELD_TYPE: &str = "\n  There %s a local extra field with ID 0x%s \
+     (%s) and\n  %s data bytes (%s).\n";
+/// zi_long()'s `"may be"`.
+pub(super) const MAY_BE: &str = "may be";
+/// zipinfo.c:efIZuid.
+pub(super) const EF_IZ_UID: &str = "GMT modification/access times and Unix UID/GID";
+/// zipinfo.c:efIZnouid.
+pub(super) const EF_IZ_NOUID: &str = "GMT modification/access times only";
+/// zipinfo.c:NoFileComment.
+pub(super) const NO_FILE_COMMENT: &str = "\n  There is no file comment.\n";
+/// zipinfo.c:FileCommBegin.
+pub(super) const FILE_COMM_BEGIN: &str = "\n------------------------- file comment begins \
+     ----------------------------\n";
+/// zipinfo.c:FileCommEnd.
+pub(super) const FILE_COMM_END: &str =
+    "-------------------------- file comment ends -----------------------------\n";
+
+/// zi_short()'s `os[NUM_HOSTS+1][4]`: three-letter host names.
+pub(super) const ZI_SHORT_OS: [&str; 32] = [
+    "fat", "ami", "vms", "unx", "cms", "atr", "hpf", "mac", "zzz", "cpm", "t20", "ntf", "qds",
+    "aco", "vft", "mvs", "be ", "nsk", "ths", "osx", "???", "???", "???", "???", "???", "???",
+    "???", "???", "???", "???", "ath", "???",
+];
+/// zi_short()'s `method[NUM_METHODS+1][5]`, by `find_compr_idx()`.
+pub(super) const ZI_SHORT_METHODS: [&str; 18] = [
+    "stor", "shrk", "re:1", "re:2", "re:3", "re:4", "i#:#", "tokn", "def#", "d64#", "dcli", "bzp2",
+    "lzma", "ters", "lz77", "wavp", "ppmd", "u###",
+];
+/// zi_short()'s MS-DOS attribute template (`".r.-...     %u.%u"`): the
+/// version follows.
+pub(super) const ZI_SHORT_FAT_ATTRIBS: &str = ".r.-...     ";
+/// zi_short()'s executable extensions (`STRNICMP(p, ..., 3)`).
+pub(super) const ZI_SHORT_EXE_EXTS: [&str; 5] = ["com", "exe", "btm", "cmd", "bat"];
+/// zi_short()'s `"%s %s %s "`: the attributes, the host, the size
+/// (`%8llu`).
+pub(super) const ZI_SHORT_HEAD: &str = "%s %s %s ";
+/// zi_short()'s `"%3d%%"` (`-m`): the ratio.
+pub(super) const ZI_SHORT_PERCENT: &str = "%s%%";
+/// zi_short()'s `" %s"` (`-l`): the compressed size (`%8llu`).
+pub(super) const ZI_SHORT_CSIZE: &str = " %s";
+/// zi_short()'s `" %s %s "`: the method and the time.
+pub(super) const ZI_SHORT_TAIL: &str = " %s %s ";
+
+/// zi_time()'s `month[12][4]`.
+pub(super) const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+/// zipinfo.c:lngYMDHMSTimeError (`USE_EF_UT_TIME`).
+pub(super) const LNG_YMDHMS_TIME_ERROR: &str = "???? ??? ?? ??:??:??";
+
+/// zipinfo.c:lngYMDHMSTime, `"%u %s %u %02u:%02u:%02u"`.
+pub(super) fn lng_ymdhms_time(
+    yr: u32,
+    month: &[u8],
+    dy: u32,
+    hh: u32,
+    mm: u32,
+    ss: u32,
+) -> Vec<u8> {
+    let mut v = format!("{yr} ").into_bytes();
+    v.extend_from_slice(month);
+    v.extend_from_slice(format!(" {dy} {hh:02}:{mm:02}:{ss:02}").as_bytes());
+    v
+}
+
+/// zipinfo.c:DecimalTime, `"%04u%02u%02u.%02u%02u%02u"`.
+pub(super) fn decimal_time(yr: u32, mo: u32, dy: u32, hh: u32, mm: u32, ss: u32) -> Vec<u8> {
+    format!("{yr:04}{mo:02}{dy:02}.{hh:02}{mm:02}{ss:02}").into_bytes()
+}
+
+/// zipinfo.c:shtYMDHMTime, `"%02u-%s-%02u %02u:%02u"`.
+pub(super) fn sht_ymdhm_time(yr: u32, month: &[u8], dy: u32, hh: u32, mm: u32) -> Vec<u8> {
+    let mut v = format!("{yr:02}-").into_bytes();
+    v.extend_from_slice(month);
+    v.extend_from_slice(format!("-{dy:02} {hh:02}:{mm:02}").as_bytes());
+    v
+}
+
 // ---- stuffr's own ----
 
 /// stuffr's own: the flavour variable holds neither name (exit 1). `%s` is

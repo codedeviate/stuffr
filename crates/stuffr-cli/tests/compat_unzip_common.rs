@@ -1103,6 +1103,229 @@ mod unix {
                 "warning [empty.zip]:  zipfile is empty\n",
             ),
         ]);
+        // zipinfo's listings (Task 9): zi_time() takes no DATE_FORMAT, so
+        // both builds print the same dates.
+        let enc = || vec![("e.zip", encrypted_zip())];
+        v.extend([
+            row(
+                Both,
+                9,
+                "zipinfo",
+                "zipinfo",
+                &["a.zip"],
+                a(),
+                0,
+                "-rw-r--r--  3.0 unx        6 b- stor 20-Jan-02 03:04 a.txt\n",
+                "",
+            ),
+            row(
+                Both,
+                9,
+                "zipinfo totals",
+                "zipinfo",
+                &["a.zip"],
+                a(),
+                0,
+                "2 files, 2206 bytes uncompressed, ",
+                "",
+            ),
+            row(
+                Both,
+                9,
+                "zipinfo -1",
+                "zipinfo",
+                &["-1", "a.zip"],
+                a(),
+                0,
+                "a.txt\nb.txt\n",
+                "",
+            ),
+            row(
+                Both,
+                9,
+                "zipinfo -2ht",
+                "zipinfo",
+                &["-2ht", "a.zip"],
+                a(),
+                0,
+                "a.txt\nb.txt\n2 files, 2206 bytes uncompressed, ",
+                "",
+            ),
+            row(
+                Both,
+                9,
+                "zipinfo -m",
+                "zipinfo",
+                &["-m", "a.zip"],
+                a(),
+                0,
+                "-rw-r--r--  3.0 unx        6 b-  0% stor 20-Jan-02 03:04 a.txt\n",
+                "",
+            ),
+            row(
+                Both,
+                9,
+                "zipinfo -l",
+                "zipinfo",
+                &["-l", "a.zip"],
+                a(),
+                0,
+                "-rw-r--r--  3.0 unx        6 b-        6 stor 20-Jan-02 03:04 a.txt\n",
+                "",
+            ),
+            row(
+                Both,
+                9,
+                "zipinfo -T",
+                "zipinfo",
+                &["-T", "a.zip"],
+                a(),
+                0,
+                " stor 20200102.030406 a.txt\n",
+                "",
+            ),
+            row(
+                Both,
+                9,
+                "zipinfo -v",
+                "zipinfo",
+                &["-v", "a.zip"],
+                a(),
+                0,
+                concat!(
+                    "\nCentral directory entry #1:\n---------------------------\n\n  a.txt\n\n",
+                    "  offset of local header from start of archive:   0\n",
+                    "                                                  (0000000000000000h) bytes\n",
+                    "  file system or operating system of origin:      Unix\n",
+                ),
+                "",
+            ),
+            row(
+                Both,
+                9,
+                "zipinfo -v times",
+                "zipinfo",
+                &["-v", "a.zip"],
+                a(),
+                0,
+                "  file last modified on (DOS date/time):          2020 Jan 2 03:04:06\n",
+                "",
+            ),
+            row(
+                Both,
+                9,
+                "zipinfo -h",
+                "zipinfo",
+                &["-h", "a.zip"],
+                a(),
+                0,
+                "Archive:  a.zip\nZip file size: ",
+                "",
+            ),
+            row(
+                Both,
+                9,
+                "zipinfo -z",
+                "zipinfo",
+                &["-z", "c.zip"],
+                vec![("c.zip", comment_zip())],
+                0,
+                "Archive:  c.zip\narchive\ncomment^[[1m here\nend\nZip file size: ",
+                "",
+            ),
+            row(
+                Both,
+                9,
+                "zipinfo encrypted",
+                "zipinfo",
+                &["-m", "e.zip"],
+                enc(),
+                0,
+                "       12 B-  0% stor 20-Jan-02 03:04 s.txt\n1 file, 12 bytes uncompressed, 12 bytes compressed:  0.0%\n",
+                "",
+            ),
+            row(
+                Both,
+                9,
+                "unzip -Z",
+                "unzip",
+                &["-Z", "a.zip"],
+                a(),
+                0,
+                "-rw-r--r--  3.0 unx        6 b- stor 20-Jan-02 03:04 a.txt\n",
+                "",
+            ),
+            row(
+                Both,
+                9,
+                "unzip -Z1",
+                "unzip",
+                &["-Z1", "a.zip"],
+                a(),
+                0,
+                "a.txt\nb.txt\n",
+                "",
+            ),
+            row(
+                Both,
+                9,
+                "zipinfo include and exclude",
+                "zipinfo",
+                &["a.zip", "*.txt", "-x", "b.txt"],
+                a(),
+                0,
+                " a.txt\n",
+                "",
+            ),
+            row(
+                Both,
+                9,
+                "zipinfo no match",
+                "zipinfo",
+                &["a.zip", "nomatch"],
+                a(),
+                11,
+                "",
+                "caution: filename not matched:  nomatch\n",
+            ),
+            row(
+                Both,
+                9,
+                "zipinfo -t no match",
+                "zipinfo",
+                &["-t", "a.zip", "nomatch", "-x", "nox"],
+                a(),
+                11,
+                concat!(
+                    "0 files, 0 bytes uncompressed, 0 bytes compressed:  0.0%\n",
+                    "caution: filename not matched:  nomatch\n",
+                    "caution: excluded filename not matched:  nox\n",
+                ),
+                "",
+            ),
+            row(
+                Both,
+                9,
+                "zipinfo empty",
+                "zipinfo",
+                &["empty.zip"],
+                vec![("empty.zip", empty_zip())],
+                1,
+                "Empty zipfile.\n",
+                "",
+            ),
+            row(
+                Both,
+                9,
+                "zipinfo not a zip",
+                "zipinfo",
+                &["notazip"],
+                vec![("notazip", b"just text\n".to_vec())],
+                9,
+                "",
+                "",
+            ),
+        ]);
         // Testing entries (Task 10), passwords (Task 11).
         v.extend([
             row(
@@ -1286,12 +1509,11 @@ mod unix {
         );
     }
 
-    /// Every stub below has rows to compare once enabled, except Task 9's
-    /// (zipinfo listings: that task records its own rows).
+    /// Every stub below has rows to compare once enabled.
     #[test]
     fn every_front_end_task_has_rows() {
         let rows = rows();
-        for task in [7, 8, 10, 11, 12, 13, 14] {
+        for task in [7, 8, 9, 10, 11, 12, 13, 14] {
             assert!(
                 rows.iter().any(|r| r.task == task),
                 "Task {task} has no row"
@@ -1355,8 +1577,11 @@ mod unix {
         differential(8);
     }
 
+    /// Task 9's rows (zipinfo's listings): Apple's and the `Both` rows on
+    /// macOS; Ubuntu's side waits for Task 13 (R13), as `Row::task_here`
+    /// tags it.
     #[test]
-    #[ignore = "Task 9"]
+    #[cfg_attr(not(target_os = "macos"), ignore = "Task 13 (R13: Ubuntu's side)")]
     fn task9_rows_match_stuffr() {
         differential(9);
     }

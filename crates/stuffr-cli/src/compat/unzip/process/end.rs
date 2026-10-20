@@ -334,9 +334,11 @@ pub(super) fn find_ecrec(uz: &mut Uz, searchlen: i64) -> i32 {
     uz.expect_ecrec_offset = (uz.ecrec.offset_start_central_directory as i64)
         .wrapping_add(uz.ecrec.size_central_directory as i64);
 
-    // In ZipInfo mode, additional info about the data found in the
-    // end-of-central-directory areas is printed out: zipinfo.c's
-    // zi_end_central() (Task 9).
+    if uz.o.zipinfo_mode {
+        // In ZipInfo mode, additional info about the data found in the
+        // end-of-central-directory areas is printed out.
+        super::super::zipinfo::zi_end_central(uz);
+    }
     error_in_archive
 }
 

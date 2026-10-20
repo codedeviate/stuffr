@@ -485,7 +485,7 @@ pub(crate) fn read_filename(uz: &mut Uz, length: usize, pinfo: &PInfo, islochdr:
 /// probe: `LANG=en_US.UTF-8 unzip -l` of a name holding 0x80..0xff (also
 /// `C.UTF-8`; `LANG=C`, `LC_ALL=C LANG=en_US.UTF-8` and `en_US.utf8` give
 /// `?` for every high byte).
-fn is_print(uz: &Uz, c: u8) -> bool {
+pub(crate) fn is_print(uz: &Uz, c: u8) -> bool {
     (0x20..0x7f).contains(&c) || (uz.native_is_utf8 && c >= 0xa0 && c != 0xad)
 }
 
@@ -579,6 +579,8 @@ pub(crate) struct Tm {
     pub mday: u32,
     pub hour: u32,
     pub min: u32,
+    /// `tm_sec` (zipinfo's long times show it).
+    pub sec: u32,
     /// `tm_gmtoff`: seconds east of UTC.
     pub gmtoff: i64,
 }
@@ -616,6 +618,7 @@ fn localtime_real(t: i64) -> Option<Tm> {
         mday: tm.tm_mday as u32,
         hour: tm.tm_hour as u32,
         min: tm.tm_min as u32,
+        sec: tm.tm_sec as u32,
         gmtoff: tm.tm_gmtoff as i64,
     })
 }
@@ -623,6 +626,11 @@ fn localtime_real(t: i64) -> Option<Tm> {
 #[cfg(not(unix))]
 fn localtime_real(t: i64) -> Option<Tm> {
     Some(utc(t))
+}
+
+/// `gmtime(&t)`: `t` in UTC (zipinfo's `-v` shows both).
+pub(crate) fn gmtime(t: i64) -> Tm {
+    utc(t)
 }
 
 /// `t` in UTC (days from the civil calendar).
@@ -644,6 +652,7 @@ fn utc(t: i64) -> Tm {
         mday: d as u32,
         hour: (secs / 3600) as u32,
         min: (secs / 60 % 60) as u32,
+        sec: (secs % 60) as u32,
         gmtoff: 0,
     }
 }

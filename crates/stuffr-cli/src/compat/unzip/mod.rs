@@ -29,10 +29,11 @@
 //! `-v` screen and funzip's usage (Task 7); opening archives, wildcard
 //! archive names, the end records, Zip64, the central directory walk,
 //! wildcards and unzip's listings `-l`, `-v`, `-z`, `-T` (`process.rs`,
-//! `unix.rs`, `matching.rs`, `list.rs`, `fileio.rs`: Task 8). zipinfo's
-//! listings, testing and extraction answer with a placeholder
+//! `unix.rs`, `matching.rs`, `list.rs`, `fileio.rs`: Task 8); zipinfo's
+//! listings, every format, the totals and the `-v` report (`zipinfo/`:
+//! Task 9). Testing and extraction answer with a placeholder
 //! (`messages::NOT_BUILT_YET`, exit 3) once the archive's directory is
-//! found, until Tasks 9 and 10.
+//! found, until Task 10.
 //!
 //! Known deviations (the source of truth; the README and the spec mirror
 //! this list):
@@ -76,6 +77,7 @@ mod matching;
 mod messages;
 mod process;
 mod unix;
+mod zipinfo;
 
 pub use flavour::Flavour;
 use messages::{self as m, printf};
@@ -231,6 +233,10 @@ pub(crate) struct Uz<'a> {
     /// `G.filename`, `FILNAMSIZ` bytes (`flavour::filnamsiz`): the entry's
     /// name as a C string, the bytes past its NUL left from earlier names.
     pub(crate) filename: Vec<u8>,
+    /// `G.crec.relative_offset_local_header` as zipinfo's loop last left
+    /// it (after `getZip64Data()` for a selected entry): `zipinfo()` starts
+    /// the next archive's `endprev` at 4 when it is 4.
+    pub(crate) crec_relative_offset_local_header: u64,
 }
 
 impl<'a> Uz<'a> {
@@ -275,6 +281,7 @@ impl<'a> Uz<'a> {
             expect_ecrec_offset: 0,
             sig: [0; 4],
             filename: vec![0u8; flavour::filnamsiz(flavour)],
+            crec_relative_offset_local_header: 0,
         }
     }
 

@@ -721,3 +721,112 @@ pub fn zipcrypto(password: &[u8], check: u8, body: &[u8]) -> Vec<u8> {
         })
         .collect()
 }
+
+/// One central directory header, every field settable: what zipinfo
+/// reads (it never reads a local header), for archives
+/// [`central_only`] makes. [`CentralSpec::new`] is a stored Unix entry of
+/// one byte, mode 0644, dated [`DOS_TIME_2020`].
+#[derive(Clone, Debug)]
+pub struct CentralSpec {
+    pub name: Vec<u8>,
+    /// High byte the host, low byte the version (`0x031e`: Unix, 3.0).
+    pub version_made_by: u16,
+    /// High byte the host, low byte the version (`20`: MS-DOS, 2.0).
+    pub version_needed: u16,
+    pub flags: u16,
+    pub method: u16,
+    pub dos_time: u32,
+    pub crc: u32,
+    pub csize: u32,
+    pub ucsize: u32,
+    pub extra: Vec<u8>,
+    pub comment: Vec<u8>,
+    pub disk: u16,
+    pub internal_attr: u16,
+    pub external_attr: u32,
+    pub offset: u32,
+    /// The name, extra field and comment lengths written, when not their
+    /// bytes' (a header that claims more than follows it).
+    pub lengths: Option<(u16, u16, u16)>,
+}
+
+impl CentralSpec {
+    pub fn new(name: &[u8]) -> Self {
+        CentralSpec {
+            name: name.to_vec(),
+            version_made_by: 0x031e,
+            version_needed: 20,
+            flags: 0,
+            method: 0,
+            dos_time: DOS_TIME_2020,
+            crc: 0x8cdc_1683,
+            csize: 1,
+            ucsize: 1,
+            extra: Vec::new(),
+            comment: Vec::new(),
+            disk: 0,
+            internal_attr: 0,
+            external_attr: 0o100644 << 16,
+            offset: 0,
+            lengths: None,
+        }
+    }
+
+    /// The header's bytes, signature first.
+    pub fn bytes(&self) -> Vec<u8> {
+        let (n, e, c) = self.lengths.unwrap_or((
+            self.name.len() as u16,
+            self.extra.len() as u16,
+            self.comment.len() as u16,
+        ));
+        let mut v = b"PK\x01\x02".to_vec();
+        for w in [
+            self.version_made_by,
+            self.version_needed,
+            self.flags,
+            self.method,
+        ] {
+            v.extend_from_slice(&w.to_le_bytes());
+        }
+        for l in [self.dos_time, self.crc, self.csize, self.ucsize] {
+            v.extend_from_slice(&l.to_le_bytes());
+        }
+        for w in [n, e, c, self.disk, self.internal_attr] {
+            v.extend_from_slice(&w.to_le_bytes());
+        }
+        v.extend_from_slice(&self.external_attr.to_le_bytes());
+        v.extend_from_slice(&self.offset.to_le_bytes());
+        v.extend_from_slice(&self.name);
+        v.extend_from_slice(&self.extra);
+        v.extend_from_slice(&self.comment);
+        v
+    }
+}
+
+/// An archive of 16 zero bytes (where the data would be), the central
+/// directory of `entries` (counted as `count`, or as many as there are),
+/// and an end record with the archive `comment`. No local headers: for
+/// zipinfo, which lists from the central directory alone.
+pub fn central_only(entries: &[CentralSpec], count: Option<u16>, comment: &[u8]) -> Vec<u8> {
+    let cd: Vec<u8> = entries.iter().flat_map(CentralSpec::bytes).collect();
+    let count = count.unwrap_or(entries.len() as u16);
+    let mut v = vec![0u8; 16];
+    v.extend_from_slice(&cd);
+    v.extend_from_slice(b"PK\x05\x06");
+    for w in [0u16, 0, count, count] {
+        v.extend_from_slice(&w.to_le_bytes());
+    }
+    v.extend_from_slice(&(cd.len() as u32).to_le_bytes());
+    v.extend_from_slice(&16u32.to_le_bytes());
+    v.extend_from_slice(&(comment.len() as u16).to_le_bytes());
+    v.extend_from_slice(comment);
+    v
+}
+
+/// An extra-field block: its id, length and `data`.
+pub fn extra_block(id: u16, data: &[u8]) -> Vec<u8> {
+    let mut v = id.to_le_bytes().to_vec();
+    v.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    v.extend_from_slice(data);
+    v
+}

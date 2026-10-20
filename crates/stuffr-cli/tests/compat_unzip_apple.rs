@@ -852,4 +852,1022 @@ mod macos {
             }
         }
     }
+
+    // ---- zipinfo (Task 9) ----
+
+    /// zipinfo's formats, each alone and in the combinations that change
+    /// what the others print: `-1 -2 -s -m -l -v`, `-h`/`-t` (forced on,
+    /// forced off), `-T`, `-z`, and `unzip -Z`.
+    const ZI_FORMATS: &[&[&str]] = &[
+        &[],
+        &["-1"],
+        &["-2"],
+        &["-s"],
+        &["-m"],
+        &["-l"],
+        &["-v"],
+        &["-h"],
+        &["-t"],
+        &["-T"],
+        &["-z"],
+        &["-hst"],
+        &["-2ht"],
+        &["-1ht"],
+        &["-mT"],
+        &["-lT"],
+        &["-vT"],
+        &["-vt"],
+        &["-v-h"],
+        &["-s-t"],
+        &["-s-h-t"],
+        &["-mz"],
+        &["-vz"],
+        &["-ht"],
+    ];
+
+    /// One zipinfo run per `(args, env, tz)` over the archive `name`; `@`
+    /// marks where the archive goes (else it is last). `prog` is
+    /// `zipinfo`, or `unzip` with `-Z` first in `args`.
+    fn zi_runs(
+        prog: &'static str,
+        name: &'static str,
+        bytes: &[u8],
+        runs: &[Run],
+    ) -> Vec<Case<'static>> {
+        runs.iter()
+            .map(|(args, env, tz)| {
+                let mut a: Vec<&'static str> = args.to_vec();
+                a.insert(a.iter().position(|x| *x == "@").unwrap_or(a.len()), name);
+                a.retain(|x| *x != "@");
+                let mut c = unzip_case(prog, a, vec![(name, bytes.to_vec())]);
+                c.env = env.to_vec();
+                c.tz = *tz;
+                c
+            })
+            .collect()
+    }
+
+    /// Every format of [`ZI_FORMATS`] over `name`.
+    fn zi_every_format(name: &'static str, bytes: &[u8]) -> Vec<Case<'static>> {
+        let runs: Vec<Run> = ZI_FORMATS.iter().map(|a| (*a, &[][..], None)).collect();
+        zi_runs("zipinfo", name, bytes, &runs)
+    }
+
+    /// The archives zipinfo is mostly pointed at, made by this Mac's own
+    /// `zip` (a tree with a directory and a symlink, `UT`/`ux` fields, an
+    /// archive comment, an entry comment, a deflated file), an encrypted
+    /// `zip -P` archive, `zip -fz`'s Zip64 one and Finder's `ditto` (with
+    /// `__MACOSX/`), each in every format; with include and exclude
+    /// patterns, `-C`, a wildcard archive name, `unzip -Z` and `ZIPINFO`.
+    #[test]
+    fn zipinfo_formats() {
+        let w = workdir("zipinfo");
+        let src = w.join("src");
+        let text = b"the quick brown fox jumps over the lazy dog\n".repeat(80);
+        file_at(&src, "a.txt", b"alpha\n");
+        file_at(&src, "big.txt", &text);
+        file_at(&src, "dir/inner.bin", &[0u8, 1, 2, 3, 255]);
+        file_at(&src, "dir/sub/deep.txt", b"deep\n");
+        std::os::unix::fs::symlink("a.txt", src.join("link")).unwrap();
+        run_tool(
+            &src,
+            Command::new("/usr/bin/zip").args([
+                "-q",
+                "-r",
+                "-y",
+                "../tree.zip",
+                "a.txt",
+                "big.txt",
+                "dir",
+                "link",
+            ]),
+        );
+        let mut zc = Command::new("/usr/bin/zip");
+        zc.args(["-q", "-z", "../tree.zip"]);
+        let out = zc
+            .current_dir(&src)
+            .env("TZ", "UTC")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut ch| {
+                use std::io::Write;
+                ch.stdin
+                    .take()
+                    .unwrap()
+                    .write_all(b"a comment\nfor the archive\n")?;
+                ch.wait()
+            })
+            .unwrap();
+        assert!(out.success());
+        let mut zc = Command::new("/usr/bin/zip");
+        let out = zc
+            .args(["-q", "-c", "../tree.zip", "a.txt"])
+            .current_dir(&src)
+            .env("TZ", "UTC")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut ch| {
+                use std::io::Write;
+                ch.stdin.take().unwrap().write_all(b"entry comment\n")?;
+                ch.wait()
+            })
+            .unwrap();
+        assert!(out.success());
+        run_tool(
+            &src,
+            Command::new("/usr/bin/zip").args([
+                "-q",
+                "-P",
+                "secret",
+                "../enc.zip",
+                "a.txt",
+                "big.txt",
+            ]),
+        );
+        run_tool(
+            &src,
+            Command::new("/usr/bin/zip").args(["-q", "-fz", "../fz.zip", "a.txt", "big.txt"]),
+        );
+        run_tool(
+            &w,
+            Command::new("/usr/bin/ditto").args([
+                "-c",
+                "-k",
+                "--sequesterRsrc",
+                "src",
+                "ditto.zip",
+            ]),
+        );
+        let tree = std::fs::read(w.join("tree.zip")).unwrap();
+        let enc = std::fs::read(w.join("enc.zip")).unwrap();
+        let fz = std::fs::read(w.join("fz.zip")).unwrap();
+        let ditto = std::fs::read(w.join("ditto.zip")).unwrap();
+        // A hand-made encrypted entry (flag bit 0, header check on the CRC)
+        // beside a plain one, and an archive comment with CRs and escapes.
+        let plain = b"secret data\n";
+        let body = zipcrypto(b"pw", (crc32(plain) >> 24) as u8, plain);
+        let mixed = zip_with(
+            &[
+                ZipEntrySpec {
+                    flags: 1,
+                    stored_data: Some(&body),
+                    ..ZipEntrySpec::new(b"s.txt", plain)
+                },
+                ZipEntrySpec {
+                    method: 8,
+                    ..ZipEntrySpec::new(b"p.txt", &text)
+                },
+            ],
+            b"mixed\r\narchive\x1b[1m comment",
+            b"",
+        );
+        let sfx = zip_with(
+            &[ZipEntrySpec::new(b"setup.ini", b"x\n")],
+            b"",
+            &[0x90; 300],
+        );
+        // Totals whose ratio is INT_MIN tenths (1000 bytes stored in 2^31 +
+        // 1000): both references print `-214748364.8%`.
+        let intmin = central_only(
+            &[CentralSpec {
+                csize: (1 << 31) + 1000,
+                ucsize: 1000,
+                ..CentralSpec::new(b"w")
+            }],
+            None,
+            b"",
+        );
+
+        let mut cases = Vec::new();
+        for (name, bytes) in [
+            ("tree.zip", &tree),
+            ("enc.zip", &enc),
+            ("fz.zip", &fz),
+            ("ditto.zip", &ditto),
+            ("mixed.zip", &mixed),
+            ("sfx.zip", &sfx),
+            ("intmin.zip", &intmin),
+        ] {
+            cases.extend(zi_every_format(name, bytes));
+        }
+        const UTF8: &[(&str, &str)] = &[("LANG", "en_US.UTF-8")];
+        cases.extend(zi_runs(
+            "zipinfo",
+            "tree.zip",
+            &tree,
+            &[
+                (&["@", "a.txt"], &[], None),
+                (&["-v", "@", "a.txt"], &[], None),
+                (&["@", "dir/*"], &[], None),
+                (&["-1", "@", "*", "-x", "dir/*"], &[], None),
+                (&["-h", "@", "a.txt"], &[], None),
+                (&["-t", "@", "a.txt", "nomatch"], &[], None),
+                (&["@", "nomatch"], &[], None),
+                (&["-v", "@", "nomatch"], &[], None),
+                (&["@", "*", "-x", "nomatch", "dir/*"], &[], None),
+                (&["-C", "@", "A.TXT"], &[], None),
+                (&["@", "A.TXT"], &[], None),
+                (&["-2", "@", "a.txt", "-x", "a.txt"], &[], None),
+                (&["-v"], &[], Some("America/New_York")),
+                (&["-s"], &[], Some("Australia/Lord_Howe")),
+                (&["-T"], &[], Some("Asia/Kolkata")),
+                (&["-v"], UTF8, None),
+                (&["-s"], &[("ZIPINFO", "-1")], None),
+                (&["-s"], &[("ZIPINFO", "-v")], None),
+                (&[], &[("ZIPINFOOPT", "-2t")], None),
+            ],
+        ));
+        cases.extend(zi_runs(
+            "unzip",
+            "tree.zip",
+            &tree,
+            &[
+                (&["-Z"], &[], None),
+                (&["-Z1"], &[], None),
+                (&["-Zv"], &[], None),
+                (&["-Z", "-m"], &[], None),
+                (&["-Zl", "@", "dir/*"], &[], None),
+                (&["-Z", "-2ht"], &[], None),
+                (&["-Z"], &[("UNZIP", "-l")], None),
+                (&["-Z"], &[("ZIPINFO", "-T")], None),
+            ],
+        ));
+        // A wildcard archive name: a blank line between archives, and the
+        // summary.
+        for args in [
+            vec!["*.zip"],
+            vec!["-1", "*.zip"],
+            vec!["-v", "*.zip"],
+            vec!["-t", "*.zip"],
+        ] {
+            cases.push(unzip_case(
+                "zipinfo",
+                args,
+                vec![("x.zip", tree.clone()), ("y.zip", mixed.clone())],
+            ));
+        }
+        // 70,000 entries under a Zip64 end record: the count past 65,535,
+        // the totals, `-v`'s end-record report.
+        let many = zip64_many(70_000);
+        let many_cases = zi_runs(
+            "zipinfo",
+            "many.zip",
+            &many,
+            &[
+                (&["-t"], &[], None),
+                (&["-1"], &[], None),
+                (&["-s"], &[], None),
+                (&["-h"], &[], None),
+                (&["-v", "@", "e6999[89]"], &[], None),
+                (
+                    &["-m", "@", "-x", "e0*", "e1*", "e2*", "e3*", "e4*", "e5*"],
+                    &[],
+                    None,
+                ),
+            ],
+        );
+        // Not vacuous: the reference lists all 70,000.
+        if let Some(r) = unzip_reference(&many_cases[0]) {
+            let out = String::from_utf8_lossy(&r.stdout);
+            assert_eq!(
+                (r.code, out.as_ref()),
+                (
+                    0,
+                    "70000 files, 0 bytes uncompressed, 0 bytes compressed:  0.0%\n"
+                )
+            );
+        }
+        cases.extend(many_cases);
+        compare("zipinfo_formats", &cases);
+    }
+
+    /// The `-s`/`-m`/`-l`/`-v` attributes of every host zipinfo knows (and
+    /// the numbers past them) under Unix, MS-DOS and odd modes; MS-DOS
+    /// entries whose Unix mode agrees with their attributes (zi_short()
+    /// then shows the Unix letters), executable extensions, volume
+    /// labels, the local-only `UX` mark (bit 15); every version byte; every
+    /// method number and option bit; encryption, text and EBCDIC marks;
+    /// sizes that expand or wrap.
+    #[test]
+    fn zipinfo_hosts_and_attributes() {
+        let mut hosts = Vec::new();
+        let attrs: [u32; 16] = [
+            0o100644 << 16,
+            (0o040755 << 16) | 0x10,
+            0x21,
+            0x10,
+            0o120777 << 16,
+            0o104755 << 16,
+            0o102745 << 16,
+            0o101777 << 16,
+            0o106000 << 16,
+            0x08,
+            0xffff_ffff,
+            0o060600 << 16,
+            0o020600 << 16,
+            0o010600 << 16,
+            0o140600 << 16,
+            0,
+        ];
+        for h in (0u16..32).chain([40, 255]) {
+            for a in attrs {
+                hosts.push(CentralSpec {
+                    version_made_by: (h << 8) | 30,
+                    external_attr: a,
+                    ..CentralSpec::new(format!("h{h}_{a:o}.txt").as_bytes())
+                });
+            }
+        }
+        let hosts = central_only(&hosts, None, b"");
+        let dos = |name: &str, host: u16, attr: u32| CentralSpec {
+            version_made_by: (host << 8) | 20,
+            external_attr: attr,
+            ..CentralSpec::new(name.as_bytes())
+        };
+        let fat = central_only(
+            &[
+                dos("C.EXE", 0, (0o100644 << 16) | 0x20),
+                dos("r.bat", 0, (0o100444 << 16) | 0x01),
+                dos("d/", 0, (0o040755 << 16) | 0x10),
+                dos("p.Com", 0, 0x20),
+                dos("p.co", 0, 0x20),
+                dos("p.cmdx", 0, 0x27),
+                dos("VOL", 0, 0x08),
+                dos("nt.btm", 11, 0x22),
+                dos("nt2", 11, 0xff),
+                dos("acorn", 13, 0x8000),
+                dos("ux8000", 3, 0x8000 | (0o100644 << 16)),
+                dos("ux0c", 3, 0xc000 | (0o100644 << 16)),
+                dos("fat8", 0, 0x8000),
+                dos("fatc", 0, 0xc000),
+                dos("hpfs", 6, 0xc000),
+                dos("vms-none", 2, 0),
+                dos("vms-all", 2, 0o777 << 16),
+                dos("vms-some", 2, 0o754 << 16),
+                dos("amiga", 1, 0o6377 << 16),
+                dos("theos", 18, 0x5abc << 16),
+                dos("theos-dir", 18, 0x4000 << 16),
+                dos("theos-chr", 18, 0x2fff << 16),
+            ],
+            None,
+            b"",
+        );
+        let mut vers = Vec::new();
+        for hv in [0u16, 9, 10, 63, 99] {
+            for h in [0u16, 1, 2, 3, 18, 14] {
+                vers.push(CentralSpec {
+                    version_made_by: (h << 8) | hv,
+                    version_needed: (h << 8) | hv,
+                    ..CentralSpec::new(format!("v{h}_{hv}").as_bytes())
+                });
+            }
+        }
+        for vne in [0x1f14u16, 0x1414, 0x2014, 0xff14, 0x0014, 0x0314] {
+            vers.push(CentralSpec {
+                version_needed: vne,
+                ..CentralSpec::new(format!("vne{vne:x}").as_bytes())
+            });
+        }
+        // Version 2.55 on Unix: patch 08's `%2u.%u` (Apple's tree too).
+        vers.push(CentralSpec {
+            version_made_by: 0x03ff,
+            ..CentralSpec::new(b"u255")
+        });
+        let vers = central_only(&vers, None, b"");
+        let mut meth = Vec::new();
+        for method in (0u16..21).chain([95, 96, 97, 98, 99, 999]) {
+            for flags in [0u16, 2, 4, 6, 1, 8, 9] {
+                meth.push(CentralSpec {
+                    method,
+                    flags,
+                    csize: 3,
+                    ucsize: 23,
+                    ..CentralSpec::new(format!("m{method}_{flags}").as_bytes())
+                });
+            }
+        }
+        let meth = central_only(&meth, None, b"");
+        let sized = |name: &str, flags: u16, csize: u32, ucsize: u32, iattr: u16| CentralSpec {
+            flags,
+            csize,
+            ucsize,
+            internal_attr: iattr,
+            ..CentralSpec::new(name.as_bytes())
+        };
+        let flags = central_only(
+            &[
+                sized("e1", 1, 14, 2, 0),
+                sized("e2", 1, 5, 10, 0),
+                sized("e3", 9, 14, 2, 1),
+                sized("t1", 0, 1, 1, 1),
+                sized("t2", 0, 1, 1, 2),
+                sized("t3", 0, 1, 1, 3),
+                sized("big", 0, 10, 5000, 0),
+                sized("exp", 0, 1000, 1, 0),
+                sized("huge", 0, 5, 4_000_000, 0),
+                sized("hugeexp", 0, 4_000_000, 5, 0),
+                sized("zero", 0, 0, 0, 0),
+                sized("desc", 8, 1, 1, 0),
+            ],
+            None,
+            b"",
+        );
+        let mut cases = Vec::new();
+        for (name, bytes) in [
+            ("hosts.zip", &hosts),
+            ("fat.zip", &fat),
+            ("vers.zip", &vers),
+            ("meth.zip", &meth),
+            ("flags.zip", &flags),
+        ] {
+            let runs: &[Run] = &[
+                (&["-s"], &[], None),
+                (&["-m"], &[], None),
+                (&["-l"], &[], None),
+                (&["-v"], &[], None),
+            ];
+            cases.extend(zi_runs("zipinfo", name, bytes, runs));
+        }
+        compare("zipinfo_hosts_and_attributes", &cases);
+    }
+
+    /// `-v`'s analysis of every extra-field block zipinfo has a layout
+    /// for, each long enough and too short for it (the hex fallback),
+    /// blocks it has no layout for (up to 24 bytes whole, else the first
+    /// 20), a block longer than what is left, bytes too few for a block
+    /// header, Macintosh type and creator codes that print and do not
+    /// (under `C` and a UTF-8 locale), the `UT` times (also in other
+    /// zones), and the extra field's effect on the next entry's "extra
+    /// bytes preceding" figure.
+    #[test]
+    fn zipinfo_extra_fields() {
+        let b = extra_block;
+        let le = |v: u32| v.to_le_bytes().to_vec();
+        let cat = |parts: &[&[u8]]| parts.concat();
+        let ut_m = b(0x5455, &cat(&[b"\x01", &le(1_600_000_000)]));
+        let blocks: Vec<Vec<u8>> = vec![
+            ut_m.clone(),
+            b(
+                0x5455,
+                &cat(&[
+                    b"\x07",
+                    &le(1_600_000_000),
+                    &le(1_600_000_001),
+                    &le(1_600_000_002),
+                ]),
+            ),
+            b(0x5455, &cat(&[b"\x06", &le(1_600_000_000)])),
+            b(0x5455, b""),
+            b(
+                0x5855,
+                &cat(&[&le(1_500_000_000), &le(1_400_000_000), b"\xf5\x01\x14\x00"]),
+            ),
+            b(0x7855, b"\xf5\x01\x14\x00"),
+            b(0x7875, b"\x01\x04\xf5\x01\x00\x00\x04\x14\x00\x00\x00"),
+            cat(&[
+                &ut_m,
+                &b(0x7875, b"\x01\x04\xf5\x01\x00\x00\x04\x14\x00\x00\x00"),
+            ]),
+            b(0x0009, &cat(&[&le(1234), b"\x00\x01\x02"])),
+            b(0x4c41, &le(77)),
+            b(0x4453, &cat(&[&le(99), b"\x00"])),
+            b(0x4453, b"\x01\x02"),
+            b(0x4d49, &cat(&[b"VFAB", b"\x02\x00\xf4\x01", &[0; 8]])),
+            b(
+                0x4d49,
+                &cat(&[b"VMSV", b"\x09\x00\xf4\x01", &[0; 4], b"V7.3xx"]),
+            ),
+            b(
+                0x4d49,
+                &cat(&[b"VMSV", b"\x01\x00\xf4\x01", &[0; 4], b"V7\x003"]),
+            ),
+            b(
+                0x4d49,
+                &cat(&[b"VMSV", b"\x01\x00\xf4\x01", &[0; 4], b"V7"]),
+            ),
+            b(0x4d49, b"QQQQ\x03\x00\xf4\x01"),
+            b(0x4d49, b"VALL\x03\x00"),
+            b(
+                0x7075,
+                &cat(&[b"\x01", &le(0xdead_beef), "café".as_bytes()]),
+            ),
+            b(
+                0x7075,
+                &cat(&[
+                    b"\x01",
+                    &le(0x1234_5678),
+                    b"abcdefghijklmnopqrstuvwxyz0123456789",
+                ]),
+            ),
+            b(0x6375, &cat(&[b"\x01", &le(1), b"cm"])),
+            b(0x6375, b"\x01\x02"),
+            b(0x334d, &cat(&[&le(4000), b"\x0d\x00TEXTttxt", &[0; 10]])),
+            b(
+                0x334d,
+                &cat(&[&le(4000), b"\x00\x00\x01\x02\x03\x04ttxt", &[0; 10]]),
+            ),
+            b(0x334d, &cat(&[&le(4000), b"\x01\x00\xe9ABCttxt", &[0; 10]])),
+            b(0x334d, &cat(&[&le(4000), b"\x01\x00\xadABCttxt", &[0; 10]])),
+            b(0x334d, &le(4000)),
+            b(0x2605, &cat(&[b"ZPIT\x05Hello", b"TEXTttxt"])),
+            b(0x2605, &cat(&[b"ZPIT\x05He\x00lo", b"TEXTttxt"])),
+            b(0x2605, b"ZPIT\x09He"),
+            b(0x2605, &cat(&[b"ZXIT\x05Hello", b"TEXTttxt"])),
+            b(0x2705, &cat(&[b"ZPITAPPLaplt", &[0; 4]])),
+            b(0x2705, b"ZPITAPP"),
+            b(0x07c8, &cat(&[b"JLEETEXTttxt", &[0; 19], b"\x01", &[0; 8]])),
+            b(0x07c8, &cat(&[b"JLEETEXTttxt", &[0; 19], b"\x00", &[0; 8]])),
+            b(0x07c8, b"JLEE"),
+            b(
+                0x4d63,
+                &cat(&[b"dZipTEXTttxt", &[0; 20], b"\x07SmartFn", &[0; 24]]),
+            ),
+            b(
+                0x4d63,
+                &cat(&[b"dZipTEXTttxt", &[0; 20], b"\x1f", &[b'A'; 31]]),
+            ),
+            b(0x4d63, b"dZip"),
+            b(0x6542, &cat(&[&le(300), b"\x01zz"])),
+            b(0x6542, &cat(&[&le(300), b"\x00"])),
+            b(0x7441, &cat(&[&le(300), b"\x01"])),
+            b(0x7441, b"\x01"),
+            b(0xfb4a, b"SMS2rest"),
+            b(0xfb4a, b"SM"),
+            b(0x5356, b"FCI\x00\x2a"),
+            b(0x4154, &cat(&[b"\x00\x65", &[0; 16], b"\x00\x00"])),
+            b(0x4154, &cat(&[b"\x00\x07", &[0; 16], b"\x40\x00"])),
+            b(0x4154, &cat(&[b"\x00\x64", &[0; 16], b"\x00\x00"])),
+            b(0x4154, &cat(&[b"\x00\x64", &[0; 16], b"\x60\x00"])),
+            b(0x4154, b"\x00\x64"),
+            b(
+                0x4b46,
+                &cat(&[&(0u8..16).collect::<Vec<u8>>(), b"\x00\x00\x00"]),
+            ),
+            b(0x4b46, &(0u8..10).collect::<Vec<u8>>()),
+            b(0x1234, &(0u8..24).collect::<Vec<u8>>()),
+            b(0x1234, &(0u8..25).collect::<Vec<u8>>()),
+            b(0x1234, b""),
+            b(0x0007, b"av"),
+            b(0x000a, &[0; 32]),
+            b(0x000c, b"vms"),
+            b(0x000d, b"pkunix"),
+            b(0x4341, b"abc"),
+            b(0x756e, b"abcd"),
+            b(0x6854, b"ab"),
+            b(0x470f, b"mvs"),
+            b(0x4704, b"cms"),
+            ut_m[..ut_m.len() - 2].to_vec(),
+            cat(&[b"\x34\x12\x64\x00", b"abc"]),
+            cat(&[&ut_m, b"\x01\x02\x03"]),
+            b"\x01".to_vec(),
+            b"\x01\x02\x03\x04".to_vec(),
+        ];
+        let mut entries: Vec<CentralSpec> = blocks
+            .iter()
+            .enumerate()
+            .map(|(i, x)| CentralSpec {
+                extra: x.clone(),
+                offset: (i as u32) * 7,
+                ..CentralSpec::new(format!("x{i:02}").as_bytes())
+            })
+            .collect();
+        // Zip64 sizes and offsets in the extra field, corrupt and whole.
+        let z64 = |vals: &[u64]| {
+            b(
+                0x0001,
+                &vals
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+            )
+        };
+        entries.extend([
+            CentralSpec {
+                extra: z64(&[5_000_000_000, 3_000_000_000]),
+                csize: 0xffff_ffff,
+                ucsize: 0xffff_ffff,
+                ..CentralSpec::new(b"z1")
+            },
+            CentralSpec {
+                extra: z64(&[5, 6, 0x1_0000_0000]),
+                csize: 0xffff_ffff,
+                ucsize: 0xffff_ffff,
+                offset: 0xffff_ffff,
+                ..CentralSpec::new(b"z2")
+            },
+            CentralSpec {
+                extra: z64(&[0x1_0000_0005]),
+                offset: 0xffff_ffff,
+                ..CentralSpec::new(b"z3")
+            },
+            CentralSpec {
+                extra: [z64(&[5, 6, 7]), le(3)].concat(),
+                csize: 0xffff_ffff,
+                ucsize: 0xffff_ffff,
+                offset: 0xffff_ffff,
+                disk: 0xffff,
+                ..CentralSpec::new(b"z5")
+            },
+            CentralSpec {
+                comment: b"entry comment\r\nline 2\x1b".to_vec(),
+                ..CentralSpec::new(b"c1")
+            },
+            CentralSpec {
+                comment: b"\x82caf\x82".to_vec(),
+                version_made_by: 0x0014,
+                external_attr: 0x20,
+                ..CentralSpec::new(b"c2")
+            },
+        ]);
+        let ef = central_only(&entries, None, b"");
+        // Gaps between entries ("extra bytes preceding"), an offset of 4.
+        let gap = |name: &str, offset: u32, csize: u32| CentralSpec {
+            offset,
+            csize,
+            ..CentralSpec::new(name.as_bytes())
+        };
+        let gaps = central_only(
+            &[
+                gap("g1", 0, 1),
+                gap("g2", 100, 1),
+                gap("g3", 4, 1),
+                gap("g4", 0xffff_fff0, 1),
+                gap("g5", 0, 1),
+            ],
+            None,
+            b"",
+        );
+        let off4 = central_only(&[gap("o", 4, 1)], None, b"");
+        let ut = |t: u32| b(0x5455, &cat(&[b"\x01", &le(t)]));
+        let times = central_only(
+            &[
+                CentralSpec {
+                    dos_time: 0,
+                    ..CentralSpec::new(b"dos0")
+                },
+                CentralSpec {
+                    dos_time: (40 << 25) | (13 << 21) | (1 << 16),
+                    ..CentralSpec::new(b"dosm13")
+                },
+                CentralSpec {
+                    dos_time: 0xffff_ffff,
+                    ..CentralSpec::new(b"dosmax")
+                },
+                CentralSpec {
+                    extra: ut(0x9000_0000),
+                    dos_time: 0x7500_0000 | (DOS_TIME_2020 & 0xffff),
+                    ..CentralSpec::new(b"ut2038")
+                },
+                CentralSpec {
+                    extra: ut(0x9000_0000),
+                    ..CentralSpec::new(b"utneg")
+                },
+                CentralSpec {
+                    extra: ut(0),
+                    ..CentralSpec::new(b"ut0")
+                },
+                CentralSpec {
+                    extra: ut(0x7fff_ffff),
+                    ..CentralSpec::new(b"utmax")
+                },
+            ],
+            None,
+            b"",
+        );
+        const UTF8: &[(&str, &str)] = &[("LANG", "en_US.UTF-8")];
+        let mut cases = zi_runs(
+            "zipinfo",
+            "ef.zip",
+            &ef,
+            &[
+                (&["-v"], &[], None),
+                (&["-v"], UTF8, None),
+                (&["-s"], &[], None),
+                (&["-l"], &[], None),
+                (&["-v", "@", "x2*"], &[], None),
+                (&["-v", "@", "-x", "x1*"], &[], None),
+            ],
+        );
+        for (name, bytes) in [("gaps.zip", &gaps), ("times.zip", &times)] {
+            cases.extend(zi_runs(
+                "zipinfo",
+                name,
+                bytes,
+                &[
+                    (&["-v"], &[], None),
+                    (&["-s"], &[], None),
+                    (&["-T"], &[], None),
+                    (&["-v"], &[], Some("America/New_York")),
+                    (&["-s"], &[], Some("Australia/Lord_Howe")),
+                    (&["-v", "@", "g[24]"], &[], None),
+                ],
+            ));
+        }
+        // The previous archive's last offset of 4 starts the next one's
+        // `endprev` at 4 (zipinfo.c reads the stale `G.crec`).
+        for args in [vec!["-v", "*.zip"], vec!["-v", "*.zip", "g*"]] {
+            cases.push(unzip_case(
+                "zipinfo",
+                args,
+                vec![("a1.zip", off4.clone()), ("a2.zip", gaps.clone())],
+            ));
+        }
+        compare("zipinfo_extra_fields", &cases);
+    }
+
+    /// zipinfo over a damaged directory: an extra field, name or comment
+    /// running into the end record, too many or too few entries, a header
+    /// cut short, a corrupt Zip64 field on a listed entry (`-v` then stops
+    /// with `PK_ERR`), each in the formats whose loop handles the error
+    /// differently, with the damaged entry selected and not; plus the end
+    /// record damage Task 8's suite covers, in zipinfo's verbose report.
+    #[test]
+    fn zipinfo_damaged_directories() {
+        let ut = extra_block(
+            0x5455,
+            &[&b"\x01"[..], &1_600_000_000u32.to_le_bytes()].concat(),
+        );
+        let a = CentralSpec {
+            extra: ut,
+            ..CentralSpec::new(b"a")
+        };
+        let claims = |name: &[u8], n: u16, e: u16, c: u16| CentralSpec {
+            lengths: Some((n, e, c)),
+            ..CentralSpec::new(name)
+        };
+        let corrupt64 = CentralSpec {
+            extra: extra_block(1, b"abcd"),
+            ucsize: 0xffff_ffff,
+            ..CentralSpec::new(b"a")
+        };
+        let mut cut = central_only(&[CentralSpec::new(b"a")], Some(2), b"");
+        let eocd = cut.len() - 22;
+        cut.splice(eocd..eocd, *b"PK\x01\x02");
+        let n = (cut.len() - 22 - 16) as u32;
+        let at = cut.len() - 10;
+        cut[at..at + 4].copy_from_slice(&n.to_le_bytes());
+        let mut cases = Vec::new();
+        for (name, bytes) in [
+            (
+                "exshort.zip",
+                central_only(&[a.clone(), claims(b"b", 1, 300, 0)], None, b""),
+            ),
+            (
+                "nameshort.zip",
+                central_only(&[a.clone(), claims(b"b", 300, 0, 0)], None, b""),
+            ),
+            (
+                "cmtshort.zip",
+                central_only(&[a.clone(), claims(b"b", 1, 0, 300)], None, b""),
+            ),
+            (
+                "count3.zip",
+                central_only(&[a.clone(), CentralSpec::new(b"b")], Some(3), b""),
+            ),
+            (
+                "count1.zip",
+                central_only(&[a.clone(), CentralSpec::new(b"b")], Some(1), b""),
+            ),
+            (
+                "z64.zip",
+                central_only(&[corrupt64.clone(), CentralSpec::new(b"b")], None, b""),
+            ),
+            ("cut.zip", cut.clone()),
+            (
+                "comment.zip",
+                central_only(std::slice::from_ref(&a), None, b"archive comment"),
+            ),
+            ("empty.zip", central_only(&[], None, b"")),
+            ("emptycmt.zip", central_only(&[], None, b"only a comment")),
+        ] {
+            let name = leak(name.to_owned());
+            cases.extend(zi_runs(
+                "zipinfo",
+                name,
+                &bytes,
+                &[
+                    (&["-s"], &[], None),
+                    (&["-v"], &[], None),
+                    (&["-1"], &[], None),
+                    (&["-2"], &[], None),
+                    (&["-m"], &[], None),
+                    (&["-h"], &[], None),
+                    (&["-t"], &[], None),
+                    (&["-z"], &[], None),
+                    (&["-s", "@", "b"], &[], None),
+                    (&["-v", "@", "b"], &[], None),
+                    (&["-1", "@", "b"], &[], None),
+                    (&["-t", "@", "a"], &[], None),
+                ],
+            ));
+        }
+        // End records Task 8 damaged, here in zipinfo's report: a
+        // preamble, missing bytes, a disk number, a NULL offset.
+        let base = zip_with(
+            &[
+                ZipEntrySpec::new(b"a.txt", b"alpha\n"),
+                ZipEntrySpec::new(b"b.txt", b"bravo\n"),
+            ],
+            b"",
+            b"",
+        );
+        let e = base.len() - 22;
+        let mut disk = base.clone();
+        disk[e + 4..e + 6].copy_from_slice(&1u16.to_le_bytes());
+        let mut disk2 = base.clone();
+        disk2[e + 6..e + 8].copy_from_slice(&1u16.to_le_bytes());
+        let mut off5 = base.clone();
+        let o = u32::from_le_bytes(off5[e + 16..e + 20].try_into().unwrap()) + 5;
+        off5[e + 16..e + 20].copy_from_slice(&o.to_le_bytes());
+        let mut nulloff = vec![b'X'; 30];
+        let mut b0 = base.clone();
+        b0[e + 16..e + 20].copy_from_slice(&0u32.to_le_bytes());
+        nulloff.extend(b0);
+        for (name, bytes) in [
+            ("pre.zip", [vec![b'P'; 40], base.clone()].concat()),
+            ("disk1.zip", disk),
+            ("disk01.zip", disk2),
+            ("off5.zip", off5),
+            ("nulloff.zip", nulloff),
+            ("notzip.zip", b"not a zip at all".to_vec()),
+        ] {
+            let name = leak(name.to_owned());
+            cases.extend(zi_runs(
+                "zipinfo",
+                name,
+                &bytes,
+                &[
+                    (&["-v"], &[], None),
+                    (&["-s"], &[], None),
+                    (&["-1"], &[], None),
+                ],
+            ));
+        }
+        compare("zipinfo_damaged_directories", &cases);
+    }
+
+    /// Review Focus 5, zipinfo's part: names that differ only in case (and
+    /// `-C`), a newline and control bytes (`^J`), an escape sequence, high
+    /// bytes under `C` and a UTF-8 locale, `../`, `/`, an empty name, a NUL
+    /// inside a name, a name past `FILNAMSIZ`, in every one-line format
+    /// and `-v`, and the patterns that pick among them.
+    #[test]
+    fn zipinfo_awkward_names() {
+        let names: &[&[u8]] = &[
+            b"A",
+            b"a",
+            b"nl\nname",
+            b"ctl\x01\x7f\x80\xe9\xad.txt",
+            b"esc\x1b[31mred",
+            b"../up",
+            b"../",
+            b"/",
+            b"",
+            b"dir/",
+            b"dir/[x].txt",
+            b"star*name",
+            b"nul\x00hidden",
+        ];
+        let long = [b"n".repeat(1030), b"\x01tail".to_vec()].concat();
+        let mut specs: Vec<ZipEntrySpec> =
+            names.iter().map(|n| ZipEntrySpec::new(n, b"x")).collect();
+        specs.push(ZipEntrySpec::new(&long, b"y"));
+        let z = zip_with(&specs, b"", b"");
+        const UTF8: &[(&str, &str)] = &[("LANG", "en_US.UTF-8")];
+        const CUTF8: &[(&str, &str)] = &[("LANG", "C.UTF-8")];
+        let cases = zi_runs(
+            "zipinfo",
+            "names.zip",
+            &z,
+            &[
+                (&["-1"], &[], None),
+                (&["-2"], &[], None),
+                (&["-s"], &[], None),
+                (&["-m"], &[], None),
+                (&["-l"], &[], None),
+                (&["-v"], &[], None),
+                (&["-s"], UTF8, None),
+                (&["-v"], CUTF8, None),
+                (&["-1"], UTF8, None),
+                (&["-1", "@", "a"], &[], None),
+                (&["-1", "@", "A"], &[], None),
+                (&["-1C", "@", "a"], &[], None),
+                (&["-1C", "@", "A", "-x", "a"], &[], None),
+                (&["-s", "@", "dir/*"], &[], None),
+                (&["-s", "@", "dir/\\[x\\].txt"], &[], None),
+                (&["-s", "@", "star\\*name"], &[], None),
+                (&["-s", "@", "[!a-z]*"], &[], None),
+                (&["-s", "@", "?"], &[], None),
+                (&["-s", "@", "nul"], &[], None),
+                (&["-v", "@", "*tail"], &[], None),
+                (&["-1", "@", "nomatch", "-x", "nomatch2"], &[], None),
+            ],
+        );
+        compare("zipinfo_awkward_names", &cases);
+    }
+
+    /// The rulings on zipinfo.c's undefined behaviour, pinned on stuffr
+    /// alone. On the `attribs[16]` and `methbuf[5]` overflows Apple's
+    /// build dies by `__sprintf_chk` (SIGTRAP, exit 133) and Ubuntu's by
+    /// FORTIFY (`*** buffer overflow detected ***`), except where Ubuntu's
+    /// CVE-2016-9844 patch prints `03E8`; the SmartZip and INT_MIN answers
+    /// are what both references happened to print (probe: `zipinfo -s`,
+    /// `-v`, `-t` of each archive here, both references).
+    #[test]
+    fn zipinfo_rulings() {
+        let one = |spec: CentralSpec, args: &[&'static str]| {
+            let z = central_only(&[spec], None, b"");
+            let mut a = args.to_vec();
+            a.push("r.zip");
+            let run = stuffr_unzip(&unzip_case("zipinfo", a, vec![("r.zip", z)]));
+            assert_eq!((run.code, run.stderr.as_str()), (0, ""), "{args:?}");
+            String::from_utf8(run.stdout).unwrap()
+        };
+        let line = |out: &str| out.lines().nth(2).unwrap_or_default().to_owned();
+        // ruling: `attribs[16]` overflowed by a version of 10.0 or more
+        // (MS-DOS template, VMS, Amiga, Theos): the whole version shows.
+        let host = |name: &[u8], made_by: u16, attr: u32| CentralSpec {
+            version_made_by: made_by,
+            external_attr: attr,
+            ..CentralSpec::new(name)
+        };
+        assert_eq!(
+            line(&one(host(b"f", 0x0064, 0x20), &["-s"])),
+            "-rw-a--     10.0 fat        1 b- stor 20-Jan-02 03:04 f"
+        );
+        assert_eq!(
+            line(&one(host(b"f", 0x00ff, 0x21), &["-s"])),
+            "-r--a--     25.5 fat        1 b- stor 20-Jan-02 03:04 f"
+        );
+        assert_eq!(
+            line(&one(host(b"v", 0x0264, 0), &["-s"])),
+            ",,          10.0 vms        1 b- stor 20-Jan-02 03:04 v"
+        );
+        assert_eq!(
+            line(&one(host(b"a", 0x0164, 0o100644 << 16), &["-s"])),
+            "?h-p--w--   10.0 ami        1 b- stor 20-Jan-02 03:04 a"
+        );
+        assert_eq!(
+            line(&one(host(b"t", 0x1264, 0x8000 << 16), &["-m"])),
+            "SHMWREXWR   10.0 ths        1 b-  0% stor 20-Jan-02 03:04 t"
+        );
+        // ruling: `methbuf[5]` overflowed by a method above 999: Ubuntu's
+        // CVE-2016-9844 form, four hex digits.
+        let m = |method: u16| CentralSpec {
+            method,
+            ..CentralSpec::new(b"m")
+        };
+        assert_eq!(
+            line(&one(m(1000), &["-s"])),
+            "-rw-r--r--  3.0 unx        1 b- 03E8 20-Jan-02 03:04 m"
+        );
+        assert_eq!(
+            line(&one(m(65535), &["-l"])),
+            "-rw-r--r--  3.0 unx        1 b-        1 FFFF 20-Jan-02 03:04 m"
+        );
+        assert_eq!(
+            line(&one(m(999), &["-s"])),
+            "-rw-r--r--  3.0 unx        1 b- u999 20-Jan-02 03:04 m"
+        );
+        // ruling: SmartZip's length byte above 31 (`filenameBuf[ef_ptr[32]]`
+        // outside the array): the 31 bytes copied, to their first NUL.
+        let smart = |len: u8, name: &[u8]| {
+            let mut d = b"dZipTEXTttxt".to_vec();
+            d.extend_from_slice(&[0; 20]);
+            d.push(len);
+            let mut n = name.to_vec();
+            n.resize(31, 0);
+            d.extend_from_slice(&n);
+            CentralSpec {
+                extra: extra_block(0x4d63, &d),
+                ..CentralSpec::new(b"s")
+            }
+        };
+        let out = one(smart(40, &[b'B'; 31]), &["-v"]);
+        assert!(
+            out.contains(&format!(
+                "    The Mac long filename is {}.\n",
+                "B".repeat(31)
+            )),
+            "{out}"
+        );
+        let out = one(smart(200, b"short\0rest"), &["-v"]);
+        assert!(
+            out.contains("    The Mac long filename is short.\n"),
+            "{out}"
+        );
+        // ruling: the totals' `-cfactor` of INT_MIN (1000 bytes stored in
+        // 2^31 + 1000: ratio() is INT_MIN tenths) prints its magnitude, as
+        // both references do (`zipinfo_formats` compares it too).
+        let wrap = CentralSpec {
+            csize: (1 << 31) + 1000,
+            ucsize: 1000,
+            ..CentralSpec::new(b"w")
+        };
+        let out = one(wrap, &["-t"]);
+        assert_eq!(
+            out,
+            "1 file, 1000 bytes uncompressed, 2147484648 bytes compressed:  -214748364.8%\n"
+        );
+    }
 }
