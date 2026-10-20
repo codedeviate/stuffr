@@ -15544,10 +15544,13 @@ fn infozip_fixture(name: &str) -> Option<Vec<u8>> {
 #[test]
 fn unpack_reads_shrink_and_implode() {
     let cases: [(&str, &[(&str, usize)]); 4] = [
-        ("shrink-full-table.zip", &[]),
+        ("shrink-full-table.zip", &[("x.txt", 26001)]),
         ("implode-hand-4k-3trees.zip", &[("hand.txt", 9400)]),
         ("implode-hand-8k-2trees.zip", &[("hand.txt", 9400)]),
-        ("shrink-commons.zip", &[]),
+        (
+            "shrink-commons.zip",
+            &[("TEST1.XML", 76), ("TEST2.XML", 81)],
+        ),
     ];
     let dir = tmp_dir();
     for (fixture, sizes) in cases {
@@ -15628,8 +15631,8 @@ fn unpack_damaged_implode_is_exit_5() {
     );
 }
 
-/// `list` enumerates shrink and implode archives (it opened every entry, so it
-/// used to refuse them with exit 3). The CLI's listing has no codec column;
+/// `list` enumerates shrink and implode archives without decoding them (the
+/// payload decodes on its first read, so listing a damaged one still works). The CLI's listing has no codec column;
 /// `zip::tests::shrink_and_implode_entries_decode` pins the per-entry codec.
 #[test]
 fn list_shows_the_methods() {
@@ -15652,4 +15655,52 @@ fn list_shows_the_methods() {
             "{fixture}: {text}"
         );
     }
+}
+
+/// Listing never decodes a payload, so a damaged implode entry still lists
+/// (exit 0); unpacking it is where the damage is found (exit 5).
+#[test]
+fn list_of_a_damaged_implode_is_exit_0_and_unpack_is_exit_5() {
+    let Some(mut bytes) = infozip_fixture("implode-hand-4k-2trees.zip") else {
+        return;
+    };
+    bytes[200] ^= 0x5A;
+    let dir = tmp_dir();
+    let archive = dir.join("damaged-list.zip");
+    std::fs::write(&archive, &bytes).unwrap();
+    let list = run_output(&["list", archive.to_str().unwrap()]);
+    assert_eq!(
+        list.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dir.join("out").to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(5));
+}
+
+/// On a pipe the zip is read forward-only, where shrink and implode are not
+/// decodable: exit 3, and the message says why and what to do instead.
+#[test]
+fn unpack_of_a_piped_implode_zip_is_exit_3_and_names_the_way_out() {
+    let Some(bytes) = infozip_fixture("implode-hand-4k-2trees.zip") else {
+        return;
+    };
+    let dir = tmp_dir();
+    let out = run_with_stdin_output(
+        &["unpack", "-", "-C", dir.join("out").to_str().unwrap()],
+        &bytes,
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{err}");
+    assert!(
+        err.contains("seekable source") && err.contains("stuffr convert"),
+        "{err}"
+    );
+    assert!(!err.contains("cannot decompress"), "{err}");
 }

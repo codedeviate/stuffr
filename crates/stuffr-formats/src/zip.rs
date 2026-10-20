@@ -422,6 +422,12 @@ fn classify_zip_error(e: ZipError) -> Error {
             "this build cannot read that zip: {msg}{}",
             unsupported_hint(msg)
         )),
+        ZipError::CompressionMethodNotSupported(id @ (1 | 6)) => Error::Unsupported(format!(
+            "zip entry uses compression method {id} ({}), which stuffr reads only from a \
+             seekable source: read the archive from a file rather than a pipe, or use \
+             `stuffr convert`, which spools it",
+            method_name(id)
+        )),
         ZipError::CompressionMethodNotSupported(id) => Error::Unsupported(format!(
             "zip entry uses compression method {id} ({}), which this build cannot decompress{}",
             method_name(id),
@@ -516,8 +522,9 @@ fn method_hint(id: u16) -> &'static str {
 /// [`ZipIndexed`] can keep one after the archive owns the other: `zip` exposes
 /// no accessor for an entry's general-purpose flags, and explode needs bits 1-2
 /// of them. A second handle's position moves the first's, which is harmless
-/// only because `zip` seeks before every read it makes and the flags are read
-/// strictly between payload reads.
+/// only because of the borrow: `ZipIndexed` uses its handle (through an
+/// entry's payload) under `&mut self`, so no `ZipFile` is alive then, and the
+/// archive repositions itself on every `by_index*` before reading.
 #[derive(Clone)]
 struct SeekAdapter(Arc<Mutex<Box<dyn Source>>>);
 
@@ -1417,71 +1424,118 @@ impl ZipIndexed {
         })
     }
 
+    /// The entry itself is cheap: sizes are checked against the ceiling and
+    /// nothing is read. The raw read, the decode and the CRC-32 check run on
+    /// the payload's first `read`, so a verb that only enumerates never pays
+    /// for them (as with every other method).
     fn legacy_entry_at(&mut self, index: usize, method: LegacyMethod) -> Result<Entry<'_>> {
-        let (mut meta, header_start, expected_crc, csize, usize_) = {
+        let (meta, params) = {
             let raw = self
                 .archive
                 .by_index_raw(index)
                 .map_err(classify_zip_error)?;
-            (
-                entry_meta(&raw, raw.unix_mode()),
-                raw.header_start(),
-                raw.crc32(),
-                raw.compressed_size(),
-                raw.size(),
-            )
+            let meta = entry_meta(&raw, raw.unix_mode());
+            let Some(data_start) = raw.data_start() else {
+                return Err(Error::Corrupt(format!(
+                    "entry `{}`: zip did not locate its data",
+                    meta.name
+                )));
+            };
+            let params = LegacyParams {
+                name: meta.name.clone(),
+                method,
+                header_start: raw.header_start(),
+                data_start,
+                crc: raw.crc32(),
+                csize: raw.compressed_size(),
+                usize_: raw.size(),
+            };
+            (meta, params)
         };
-        let name = meta.name.clone();
         if meta.kind == EntryKind::Dir {
             return Ok(Entry::new(meta, Box::new(io::empty())));
         }
-        for (what, n) in [("compressed", csize), ("uncompressed", usize_)] {
+        for (what, n) in [
+            ("compressed", params.csize),
+            ("uncompressed", params.usize_),
+        ] {
             if n > MAX_LEGACY_ENTRY_BYTES {
                 return Err(Error::ResourceLimit(format!(
-                    "entry `{name}` declares {n} {what} bytes, past the \
+                    "entry `{}` declares {n} {what} bytes, past the \
                      {MAX_LEGACY_ENTRY_BYTES}-byte ceiling for a {} entry, which is \
                      decoded in memory",
+                    params.name,
                     method.name()
                 )));
             }
         }
-        let mut packed = Vec::new();
-        {
-            let mut raw = self
-                .archive
-                .by_index_raw(index)
-                .map_err(classify_zip_error)?;
-            raw.read_to_end(&mut packed)
-                .map_err(|e| Error::from_decode_io(normalize_payload_error(e)))?;
-        }
-        if packed.len() as u64 != csize {
-            return Err(Error::Corrupt(format!(
-                "entry `{name}` is {} bytes short of the compressed size its header \
-                 declares; the archive is truncated",
-                csize - packed.len() as u64
-            )));
-        }
-        let flags = if method == LegacyMethod::Implode {
-            local_header_flags(&mut self.handle.clone(), header_start)
-                .map_err(|e| Error::from_decode_io(normalize_payload_error(e)))?
-        } else {
-            0
-        };
-        let corrupt = |why: String| Error::Corrupt(format!("entry `{name}`: {why}"));
-        let data = decode_legacy(method, flags, &packed, usize_).map_err(corrupt)?;
-        let mut crc = flate2::Crc::new();
-        crc.update(&data);
-        if crc.sum() != expected_crc {
-            return Err(Error::Corrupt(format!(
-                "entry `{name}`: CRC-32 mismatch after {} decompression (header {expected_crc:08x}, \
-                 data {:08x})",
-                method.name(),
-                crc.sum()
-            )));
-        }
-        meta.kind = EntryKind::File;
-        Ok(Entry::new(meta, Box::new(io::Cursor::new(data))))
+        Ok(Entry::new(
+            meta,
+            Box::new(LegacyPayload {
+                pending: Some((params, self.handle.clone())),
+                data: io::Cursor::new(Vec::new()),
+            }),
+        ))
     }
+}
+
+/// Everything a deferred shrink/implode decode needs.
+struct LegacyParams {
+    name: String,
+    method: LegacyMethod,
+    header_start: u64,
+    data_start: u64,
+    crc: u32,
+    csize: u64,
+    usize_: u64,
+}
+
+/// A shrink or implode entry's payload, decoded on the first `read`. Errors
+/// are `io::Error`s of kind `InvalidData` for corruption (so
+/// `Error::from_decode_io` gives exit 5) and the source's own otherwise.
+struct LegacyPayload {
+    pending: Option<(LegacyParams, SeekAdapter)>,
+    data: io::Cursor<Vec<u8>>,
+}
+
+impl Read for LegacyPayload {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some((p, mut handle)) = self.pending.take() {
+            self.data = io::Cursor::new(decode_legacy_entry(&p, &mut handle)?);
+        }
+        self.data.read(buf)
+    }
+}
+
+fn decode_legacy_entry(p: &LegacyParams, handle: &mut SeekAdapter) -> io::Result<Vec<u8>> {
+    let bad =
+        |why: String| io::Error::new(ErrorKind::InvalidData, format!("entry `{}`: {why}", p.name));
+    let mut packed = Vec::new();
+    handle.seek(SeekFrom::Start(p.data_start))?;
+    handle.by_ref().take(p.csize).read_to_end(&mut packed)?;
+    if packed.len() as u64 != p.csize {
+        return Err(bad(format!(
+            "{} bytes short of the compressed size its header declares; the archive is truncated",
+            p.csize - packed.len() as u64
+        )));
+    }
+    let flags = if p.method == LegacyMethod::Implode {
+        local_header_flags(handle, p.header_start)?
+    } else {
+        0
+    };
+    let data = decode_legacy(p.method, flags, &packed, p.usize_).map_err(bad)?;
+    let mut crc = flate2::Crc::new();
+    crc.update(&data);
+    if crc.sum() != p.crc {
+        return Err(bad(format!(
+            "CRC-32 mismatch after {} decompression (header {:08x}, data {:08x})",
+            p.method.name(),
+            p.crc,
+            crc.sum()
+        )));
+    }
+    Ok(data)
 }
 
 /// The general-purpose bit flag of the local header at `header_start`.
