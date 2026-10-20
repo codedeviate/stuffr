@@ -920,13 +920,20 @@ pub(crate) fn walk(
 /// (list.c, zipinfo.c and extract.c's `do_this_file` test). `-C` folds
 /// case; Ubuntu's `-W` stops wildcards at `/`. `fn_matched` and
 /// `xn_matched`, when given, note which patterns matched (zipinfo's and
-/// the extraction's "not matched" cautions).
+/// the extraction's "not matched" cautions); each must have one flag per
+/// pattern (`uz.pfnames`, `uz.pxnames`).
 pub(crate) fn selected(
     uz: &Uz,
     name: &[u8],
     mut fn_matched: Option<&mut [bool]>,
     mut xn_matched: Option<&mut [bool]>,
 ) -> bool {
+    if let Some(m) = fn_matched.as_deref() {
+        assert_eq!(m.len(), uz.pfnames.len(), "one fn_matched flag per pattern");
+    }
+    if let Some(m) = xn_matched.as_deref() {
+        assert_eq!(m.len(), uz.pxnames.len(), "one xn_matched flag per pattern");
+    }
     if uz.process_all_files {
         return true;
     }

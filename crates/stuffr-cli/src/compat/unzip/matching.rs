@@ -9,10 +9,12 @@
 //! deviation 6 admits (probe: `LANG=en_US.UTF-8 unzip -LL -l` keeps
 //! `0xc0..0xde`).
 //!
-//! `recmatch` recurses only at `*` here: the C's other recursive calls are
-//! tail calls (a literal, `?`, a bracket), which are a loop. So the depth is
-//! the pattern's number of stars, as deep as the C's, and the result is the
-//! C's for every input.
+//! `recmatch` does not recurse: the C's recursion at each `*` is an
+//! explicit stack of open `*` loops (at most one per star, so bounded by
+//! the pattern's length), and its other recursive calls are tail calls,
+//! which are a loop. The 0/1/2 answers propagate as the C's do, so the
+//! result is the C's for every input, and a pattern of 16,000 stars needs
+//! no deeper stack than one star.
 
 /// unix `ToLower`: `isupper(c) ? tolower(c) : c` in the C locale.
 fn to_lower(c: u8) -> u8 {
@@ -49,178 +51,257 @@ pub(crate) fn matches(pattern: &[u8], name: &[u8], ignore_case: bool, stop_at_di
 }
 
 // port: match.c:recmatch
-/// 1 if `s` matches `p`, 0 if it does not, 2 if it cannot (the C's "give
-/// up", which `match()` reads as no match). `p` and `s` hold no NUL.
-fn recmatch(mut p: &[u8], mut s: &[u8], ic: bool, sepc: u8) -> i32 {
+/// 1 if `s` matches `pat`, 0 if it does not, 2 if it cannot (the C's "give
+/// up", which `match()` reads as no match). `pat` and `s` hold no NUL.
+///
+/// The C recurses at each `*`: a loop over the positions of `s`, calling
+/// itself on the rest of the pattern and returning the first nonzero
+/// answer. Every caller returns a nonzero answer as it gets it, so the
+/// first 1 or 2 anywhere is the whole match's answer; only a 0 sends a
+/// `*` on to its next position. That is a depth-first search, kept here
+/// as an explicit stack of the open `*` loops ([`Star`]), one per star at
+/// most, so no pattern can exhaust the thread's stack. Its other recursive
+/// calls (a literal, `?`, a bracket, `WILD_STOP_AT_DIR`'s continuation)
+/// are tail calls: the loop goes on in place.
+fn recmatch(pat: &[u8], s: &[u8], ic: bool, sepc: u8) -> i32 {
     let case = |x: u8| if ic { to_lower(x) } else { x };
-    loop {
-        // Get first character, the pattern for new recmatch calls follows
-        let c = at(p, 0);
-        p = p.get(1..).unwrap_or(&[]);
+    let mut stack: Vec<Star> = Vec::new();
+    // The call being evaluated: pattern from `pi`, string from `si`.
+    let (mut pi, mut si) = (0usize, 0usize);
+    'call: loop {
+        let r: i32 = 'eval: loop {
+            // Get first character, the pattern for new recmatch calls
+            // follows
+            let c = at(pat, pi);
+            pi += 1;
 
-        // If that was the end of the pattern, match if string empty too
-        if c == 0 {
-            return i32::from(at(s, 0) == 0);
-        }
-
-        // '?' matches any character (but not an empty string)
-        if c == b'?' {
-            // ubuntu: -DWILD_STOP_AT_DIR (with -W it won't match '/')
-            if at(s, 0) != 0 && (sepc == 0 || at(s, 0) != sepc) {
-                s = &s[1..];
-                continue;
+            // If that was the end of the pattern, match if string empty too
+            if c == 0 {
+                break 'eval i32::from(at(s, si) == 0);
             }
-            return 0;
-        }
 
-        // '*' matches any number of characters, including zero
-        if c == b'*' {
-            // ubuntu: -DWILD_STOP_AT_DIR
-            if sepc != 0 {
-                // check for single "*" or double "**"
-                if at(p, 0) != b'*' {
-                    // single "*": this doesn't match the dirsep character
-                    while at(s, 0) != 0 && at(s, 0) != sepc {
-                        let r = recmatch(p, s, ic, sepc);
-                        if r != 0 {
-                            return r;
+            // '?' matches any character (but not an empty string)
+            if c == b'?' {
+                // ubuntu: -DWILD_STOP_AT_DIR (with -W it won't match '/')
+                if at(s, si) != 0 && (sepc == 0 || at(s, si) != sepc) {
+                    si += 1;
+                    continue 'eval;
+                }
+                break 'eval 0;
+            }
+
+            // '*' matches any number of characters, including zero
+            if c == b'*' {
+                // ubuntu: -DWILD_STOP_AT_DIR
+                if sepc != 0 {
+                    // check for single "*" or double "**"
+                    if at(pat, pi) != b'*' {
+                        // single "*": this doesn't match the dirsep
+                        // character: for each position before one, try the
+                        // rest of the pattern there
+                        if at(s, si) != 0 && at(s, si) != sepc {
+                            stack.push(Star {
+                                p: pi,
+                                s: si,
+                                component: true,
+                            });
+                            continue 'eval;
                         }
-                        s = &s[1..];
+                        match after_component(pat, s, pi, si, sepc) {
+                            None => continue 'eval,
+                            Some(r) => break 'eval r,
+                        }
                     }
-                    // end of pattern: matched if at end of string, else
-                    // continue
-                    if at(p, 0) == 0 {
-                        return i32::from(at(s, 0) == 0);
+                    // "**": this matches slashes
+                    pi += 1;
+                    // and continue with the non-W_flag code variant
+                }
+                if at(pat, pi) == 0 {
+                    break 'eval 1;
+                }
+                let p = &pat[pi..];
+                if isshexp(p).is_none() {
+                    // Optimization for rest of pattern being a literal
+                    // string: compare the literal string tail.
+                    let rest = &s[si.min(s.len())..];
+                    if rest.len() < p.len() {
+                        // remaining literal string from pattern is longer
+                        // than rest of test string, there can't be a match
+                        break 'eval 0;
                     }
-                    // continue to match if at sepc in pattern, else give up
-                    if at(p, 0) == sepc || (at(p, 0) == b'\\' && at(p, 1) == sepc) {
-                        continue;
-                    }
-                    return 2;
+                    let srest = &rest[rest.len() - p.len()..];
+                    break 'eval i32::from(if ic {
+                        namecmp(p, srest) == 0
+                    } else {
+                        p == srest
+                    });
                 }
-                // "**": this matches slashes
-                p = &p[1..];
-                // and continue with the non-W_flag code variant
-            }
-            if at(p, 0) == 0 {
-                return 1;
-            }
-            if isshexp(p).is_none() {
-                // Optimization for rest of pattern being a literal string:
-                // compare the literal string tail.
-                if s.len() < p.len() {
-                    // remaining literal string from pattern is longer than
-                    // rest of test string, there can't be a match
-                    return 0;
+                // pattern contains more wildcards, continue with
+                // recursion... (for each position of the string)
+                if at(s, si) != 0 {
+                    stack.push(Star {
+                        p: pi,
+                        s: si,
+                        component: false,
+                    });
+                    continue 'eval;
                 }
-                let srest = &s[s.len() - p.len()..];
-                return i32::from(if ic {
-                    namecmp(p, srest) == 0
-                } else {
-                    p == srest
-                });
+                break 'eval 2; // 2 means give up--match will return false
             }
-            // pattern contains more wildcards, continue with recursion...
-            while at(s, 0) != 0 {
-                let r = recmatch(p, s, ic, sepc);
-                if r != 0 {
-                    return r;
-                }
-                s = &s[1..];
-            }
-            return 2; // 2 means give up--match will return false
-        }
 
-        // Parse and process the list of characters and ranges in brackets
-        if c == b'[' {
-            if at(s, 0) == 0 {
-                // need a character to match
-                return 0;
-            }
-            let r = at(p, 0) == b'!' || at(p, 0) == b'^'; // see if reverse
-            if r {
-                p = &p[1..];
-            }
-            // find closing bracket
-            let mut q = 0usize;
-            let mut e = false;
-            while at(p, q) != 0 {
-                if e {
-                    e = false;
-                } else if at(p, q) == b'\\' {
-                    e = true;
-                } else if at(p, q) == b']' {
-                    break;
+            // Parse and process the list of characters and ranges in
+            // brackets
+            if c == b'[' {
+                if at(s, si) == 0 {
+                    // need a character to match
+                    break 'eval 0;
                 }
-                q += 1;
-            }
-            if at(p, q) != b']' {
-                // nothing matches if bad syntax
-                return 0;
-            }
-            // go through the list
-            let mut cr: u32 = 0; // start of a range
-            let mut e = at(p, 0) == b'-';
-            let cc = u32::from(case(at(s, 0)));
-            for i in 0..q {
-                let pi = at(p, i);
-                if !e && pi == b'\\' {
-                    // set escape flag if \
-                    e = true;
-                } else if !e && pi == b'-' {
-                    // set start of range if -
-                    cr = u32::from(at(p, i.wrapping_sub(1)));
-                } else {
-                    if at(p, i + 1) != b'-' {
-                        // compare range
-                        let mut c = if cr != 0 { cr } else { u32::from(pi) };
-                        while c <= u32::from(pi) {
-                            // `Case(c)` of an unsigned int: its low byte
-                            if u32::from(case(c as u8)) == cc {
-                                if r {
-                                    return 0;
+                let r = at(pat, pi) == b'!' || at(pat, pi) == b'^'; // see if reverse
+                if r {
+                    pi += 1;
+                }
+                let p = &pat[pi.min(pat.len())..];
+                // find closing bracket
+                let mut q = 0usize;
+                let mut e = false;
+                while at(p, q) != 0 {
+                    if e {
+                        e = false;
+                    } else if at(p, q) == b'\\' {
+                        e = true;
+                    } else if at(p, q) == b']' {
+                        break;
+                    }
+                    q += 1;
+                }
+                if at(p, q) != b']' {
+                    // nothing matches if bad syntax
+                    break 'eval 0;
+                }
+                // go through the list
+                let mut cr: u32 = 0; // start of a range
+                let mut e = at(p, 0) == b'-';
+                let cc = u32::from(case(at(s, si)));
+                let mut hit = false;
+                'set: for i in 0..q {
+                    let pc = at(p, i);
+                    if !e && pc == b'\\' {
+                        // set escape flag if \
+                        e = true;
+                    } else if !e && pc == b'-' {
+                        // set start of range if -
+                        cr = u32::from(at(p, i.wrapping_sub(1)));
+                    } else {
+                        if at(p, i + 1) != b'-' {
+                            // compare range
+                            let mut c = if cr != 0 { cr } else { u32::from(pc) };
+                            while c <= u32::from(pc) {
+                                // `Case(c)` of an unsigned int: its low byte
+                                if u32::from(case(c as u8)) == cc {
+                                    hit = true;
+                                    break 'set;
                                 }
-                                p = &p[q + 1..];
-                                s = &s[1..];
-                                return recmatch(p, s, ic, sepc);
+                                c += 1;
                             }
-                            c += 1;
                         }
+                        cr = 0; // clear range, escape flags
+                        e = false;
                     }
-                    cr = 0; // clear range, escape flags
-                    e = false;
+                }
+                if hit == r {
+                    // a member under `[!...]`, or bracket match failed
+                    break 'eval 0;
+                }
+                // `recmatch(q + 1, s + 1)`: a tail call
+                pi += q + 1;
+                si += 1;
+                continue 'eval;
+            }
+
+            // if escape ('\\'), just compare next character
+            let c = if c == b'\\' {
+                let n = at(pat, pi);
+                if n == 0 {
+                    // if \ at end, then syntax error
+                    break 'eval 0;
+                }
+                pi += 1;
+                n
+            } else {
+                c
+            };
+
+            // just a character--compare it (`c` is never 0 here, so the
+            // string's end is a mismatch)
+            if at(s, si) != 0 && case(c) == case(at(s, si)) {
+                si += 1;
+                continue 'eval;
+            }
+            break 'eval 0;
+        };
+        if r != 0 {
+            // every open `*` loop returns it as it gets it
+            return r;
+        }
+        // A 0: the innermost open `*` loop tries its next position.
+        loop {
+            let Some(top) = stack.last_mut() else {
+                return 0;
+            };
+            top.s += 1;
+            let Star {
+                p,
+                s: at_s,
+                component,
+            } = *top;
+            if component {
+                if at(s, at_s) != 0 && at(s, at_s) != sepc {
+                    (pi, si) = (p, at_s);
+                    continue 'call;
+                }
+                stack.pop();
+                match after_component(pat, s, p, at_s, sepc) {
+                    None => {
+                        (pi, si) = (p, at_s);
+                        continue 'call;
+                    }
+                    Some(0) => continue,
+                    Some(r) => return r,
                 }
             }
-            // bracket match failed
-            if r {
-                p = &p[q + 1..];
-                s = &s[1..];
-                continue;
+            if at(s, at_s) != 0 {
+                (pi, si) = (p, at_s);
+                continue 'call;
             }
-            return 0;
+            return 2;
         }
+    }
+}
 
-        // if escape ('\\'), just compare next character
-        let c = if c == b'\\' {
-            let n = at(p, 0);
-            if n == 0 {
-                // if \ at end, then syntax error
-                return 0;
-            }
-            p = &p[1..];
-            n
-        } else {
-            c
-        };
+/// An open `*` loop of [`recmatch`]: the pattern after the star, the
+/// position it tries now, and whether it is `WILD_STOP_AT_DIR`'s single
+/// star (which stops at the separator).
+#[derive(Clone, Copy)]
+struct Star {
+    p: usize,
+    s: usize,
+    component: bool,
+}
 
-        // just a character--compare it
-        if case(c) == case(at(s, 0)) && at(s, 0) != 0 {
-            s = &s[1..];
-            continue;
-        }
-        // `Case(c) == Case(*s)` with `*s` the terminator: `c` is never 0
-        // here, so this is a mismatch.
-        return 0;
+/// What `WILD_STOP_AT_DIR`'s single `*` answers once its loop has reached
+/// a separator or the end at `si`: the end of the pattern matches the end
+/// of the string; a separator next in the pattern continues the match
+/// there (a tail call: `None`); anything else gives up (2).
+fn after_component(pat: &[u8], s: &[u8], pi: usize, si: usize, sepc: u8) -> Option<i32> {
+    // end of pattern: matched if at end of string, else continue
+    if at(pat, pi) == 0 {
+        return Some(i32::from(at(s, si) == 0));
+    }
+    // continue to match if at sepc in pattern, else give up
+    if at(pat, pi) == sepc || (at(pat, pi) == b'\\' && at(pat, pi + 1) == sepc) {
+        None
+    } else {
+        Some(2)
     }
 }
 

@@ -485,6 +485,21 @@ mod macos {
                 (&["-l", "@", "*tail"], &[], None),
             ],
         );
+        // 16,000 stars: the C recurses once per star; stuffr keeps the
+        // stars on a heap stack (Task 8 fix round 1).
+        let mut cases = cases;
+        let stars = leak("*".repeat(16_000));
+        cases.push(unzip_case(
+            "unzip",
+            vec!["-l", "names.zip", stars],
+            vec![("names.zip", z.clone())],
+        ));
+        let starsx = leak(format!("{}a", "*".repeat(16_000)));
+        cases.push(unzip_case(
+            "unzip",
+            vec!["-lq", "names.zip", starsx],
+            vec![("names.zip", z.clone())],
+        ));
         compare("awkward_names", &cases);
     }
 
@@ -724,6 +739,90 @@ mod macos {
             out.contains("       1  UnkFFFF       1   0% 01-02-2020 03:04 8cdc1683  m65535\n"),
             "{out}"
         );
+
+        // ruling (T8-3): a central header cut short by the end of a short
+        // archive (its `PK\1\2` just before the end record, which sits in the
+        // last 22-25 bytes) reads zeros past the file: under 8 KiB, so
+        // find_ecrec() reads it whole, and `byterec`'s unread bytes are the
+        // C's uninitialised stack.
+        for (n, entry) in [
+            (
+                0usize,
+                Some("       0  Stored        0   0% 00-01-1980 00:00 00000004  \n"),
+            ),
+            (
+                1,
+                Some(" 6488065  Stored        0 100% 00-01-1980 00:00 00000004  \n"),
+            ),
+            (
+                2,
+                Some("1667432450  Stored        0 100% 00-01-1980 00:00 00000004  \n"),
+            ),
+            (3, None),
+        ] {
+            let mut z = b"PK\x01\x02PK\x05\x06".to_vec();
+            for v in [0u16, 0, 1, 1] {
+                z.extend_from_slice(&v.to_le_bytes());
+            }
+            z.extend_from_slice(&4u32.to_le_bytes());
+            z.extend_from_slice(&0u32.to_le_bytes());
+            z.extend_from_slice(&(n as u16).to_le_bytes());
+            z.extend(std::iter::repeat_n(b'c', n));
+            let run = stuffr_unzip(&unzip_case(
+                "unzip",
+                vec!["-v", "p.zip"],
+                vec![("p.zip", z)],
+            ));
+            let comment = if n == 0 {
+                String::new()
+            } else {
+                format!("{}\n", "c".repeat(n))
+            };
+            let want = format!(
+                "Archive:  p.zip\n{comment} Length   Method    Size  Cmpr    Date    Time   CRC-32   Name\n\
+                 --------  ------  ------- ---- ---------- ----- --------  ----\n{}",
+                entry.unwrap_or("")
+            );
+            assert_eq!(
+                (
+                    run.code,
+                    String::from_utf8_lossy(&run.stdout).into_owned(),
+                    run.stderr.as_str()
+                ),
+                (51, want, ""),
+                "comment of {n} bytes"
+            );
+        }
+
+        // ruling (T8-5): a comment block ending in CRs makes the C's CR
+        // loop step past its terminator; what it prints is the block up to
+        // its first NUL with the CRs taken out.
+        let z = zip_with(&[ZipEntrySpec::new(b"a", b"x")], b"ab\r\0xyz\r", b"");
+        let run = stuffr_unzip(&unzip_case(
+            "unzip",
+            vec!["-z", "cr.zip"],
+            vec![("cr.zip", z)],
+        ));
+        assert_eq!(
+            (run.code, &run.stdout[..]),
+            (0, &b"Archive:  cr.zip\nab\n"[..])
+        );
+
+        // ruling (T8-7): a wildcard whose directory part names a real
+        // directory in 1100 bytes: `opendir` refuses it (past PATH_MAX), so
+        // the raw spec is tried; `matchname` keeps its first FILNAMSIZ - 1
+        // bytes, and the `.zip`/`.ZIP` the C appends past the array's end
+        // are kept whole.
+        let dir = format!("d/{}", "./".repeat(549));
+        assert_eq!(dir.len(), 1100);
+        let wild = leak(format!("{dir}*.zip"));
+        let a = zip_with(&[ZipEntrySpec::new(b"a.txt", b"x")], b"", b"");
+        let run = stuffr_unzip(&unzip_case("unzip", vec!["-l", wild], vec![("d/a.zip", a)]));
+        let want = format!(
+            "unzip:  cannot find or open {wild}, {wild}.zip or {}.ZIP.\n\nNo zipfiles found.\n",
+            &wild[..1023]
+        );
+        assert_eq!((run.code, run.stdout.len(), run.stderr), (9, 0, want));
 
         // ruling: dos_to_unix_time()'s `ydays[]` read outside the table for
         // months 0, 14 and 15: month 0 is January, 14 and 15 a whole year on.

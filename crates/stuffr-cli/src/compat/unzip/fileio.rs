@@ -384,9 +384,9 @@ pub(crate) fn do_string(
                         let out = uz.slide[..q].to_vec();
                         uz.info(0, &out);
                         q = 0;
-                        // ruling: Task 11 ports UzpMorePause (`--- Press
-                        // `Q' to quit...`), which only an extracting run
-                        // asks here (`G.extract_flag`; never a listing).
+                        // `if (pause && G.extract_flag)` the C asks
+                        // UzpMorePause (`--- Press `Q' to quit...`) here;
+                        // a listing never does. Task 11 ports it.
                     }
                     i += 1;
                 }
