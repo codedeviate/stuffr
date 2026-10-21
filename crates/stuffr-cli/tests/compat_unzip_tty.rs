@@ -5,7 +5,8 @@
 //! its retries, Review Focus 4's password mixes, the overwrite question
 //! and `[r]ename` at a terminal, `-M`'s pager, the `^S` pause in a comment,
 //! and interrupts (exit 80, the partial file kept, the terminal's echo put
-//! back; funzip, which has no handler, dies of the signal). The rulings only stuffr can show are pinned at the end.
+//! back; funzip, which has no handler, dies of the signal). The rulings
+//! only stuffr can show are pinned at the end.
 //!
 //! Each case's archive is built here, so both sides read the same bytes;
 //! the terminal's mode after each run is compared too.

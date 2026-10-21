@@ -261,7 +261,8 @@ These come from the design specification and are the reason Phase 0 shipped as
 | `0.13.0` | Phase 5's third part — the xz compatibility family (`xz`, `unxz`, `xzcat`, `lzma`, `unlzma`, `lzcat`) behaving as XZ Utils 5.8.4's `xz`, one personality ported from its 0BSD `src/xz/`; stdout, stderr and exit codes byte-identical on both tiers, compressed bytes identical on the `c-backed` tier and compatible on the pure tier; signal cleanup of the partial output (`host.rs`); `install-links` now makes fourteen names; `stuffr-cli` licensed `MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD`, `stuffr-formats` `MIT AND BSD-2-Clause AND 0BSD`. A MINOR because it is a new user-facing surface. |
 | `0.14.0` | Phase 5's fourth part — the zstd compatibility family (`zstd`, `unzstd`, `zstdcat`, `zstdmt`) behaving as zstd 1.5.7's command line tool, one personality ported from its BSD `programs/`; stdout, stderr and exit codes byte-identical on both tiers, frames and dictionaries identical on the `c-backed` tier (`zstd-c`) and compatible on the pure tier, with `--train-cover`, `--adapt` and `--format=lz4` compatible only; SIGINT cleanup answered as zstd answers it; `install-links` now makes eighteen names; `stuffr-formats` licensed `MIT AND BSD-2-Clause AND 0BSD AND BSD-3-Clause` (`LICENSE-zstd`, `LICENSE-zstd-clevels`). A MINOR because it is a new user-facing surface. |
 | `0.15.0` | Phase 5's fifth part — the lz4 compatibility family (`lz4`, `unlz4`, `lz4cat`, `lz4c`) behaving as lz4 1.10.0's command line tool, a clean-room front end (lz4's GPL-2.0-or-later `programs/` was never read) over a new doc-hidden `stuffr::lz4_opts` seam; stdout, stderr and exit codes identical on both tiers, `.lz4` bytes identical on the `c-backed`/`lz4-c` tier (liblz4 1.10.0) and compatible on the pure tier (`lz4_flex`), which also makes zstd's `--format=lz4` byte-identical on the C tier; an interrupt leaves lz4's partial output (no handler, as lz4); `install-links` now makes twenty-two names; `LICENSE-lz4` (liblz4, BSD-2-Clause; expressions unchanged). A MINOR because it is a new user-facing surface. |
-| `0.16.x`/later | The rest of Phase 5 — the remaining compatibility families, one per release (`unzip`/`zipinfo` next; `tar` excluded), each claiming the next open number; polish (completions, man pages) under a separate spec. |
+| `0.16.0` | Phase 5's sixth part — the unzip compatibility family (`unzip`, `zipinfo`, `funzip`; `unzip -Z` is `zipinfo`) behaving as Info-ZIP UnZip 6.00 in two flavours, Apple's `zip-33` tree (a port, `LICENSE-infozip`) and Ubuntu 24.04's `6.0-28ubuntu4.1`, chosen by platform or `STUFFR_UNZIP_FLAVOR`; stdout, stderr, exit codes and extracted trees (modes, times, symlinks, quarantine) identical to the reference in both, over a new doc-hidden `stuffr::infozip` seam; the terminal put back as it was after a prompt, a pager key or an interrupt; funzip answers a failed write; `install-links` now makes twenty-five names; `LICENSE-infozip`, `stuffr-cli` licensed `MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD AND Info-ZIP`. A MINOR because it is a new user-facing surface. |
+| `0.17.x`/later | The rest of Phase 5 — the remaining compatibility families, one per release (`tar` excluded), each claiming the next open number; polish (completions, man pages) under a separate spec. |
 | `1.0.0` | Reserved for feature-complete, not for any single phase — no earlier milestone claims it. |
 
 This table was revised after Phase 1: the original plan put legacy read/write
@@ -1031,7 +1032,8 @@ behaves as another tool (README, "Compatibility links"). bzip2 (`bzip2`,
 `gunzip`, `zcat`, `gzcat`) is the second, in `0.12.0`; xz (`xz`, `unxz`,
 `xzcat`, `lzma`, `unlzma`, `lzcat`) is the third, in `0.13.0`; zstd (`zstd`,
 `unzstd`, `zstdcat`, `zstdmt`) is the fourth, in `0.14.0`; lz4 (`lz4`,
-`unlz4`, `lz4cat`, `lz4c`) is the fifth, in `0.15.0`. **The family's
+`unlz4`, `lz4cat`, `lz4c`) is the fifth, in `0.15.0`; unzip (`unzip`,
+`zipinfo`, `funzip`) is the sixth, in `0.16.0`. **The family's
 own spec decides its byte-identity promise** before any code is written:
 which tier, against which tool and version, byte-identical or compatible
 behaviour only. The planned tiers come from the Phase 5 design's Decision 2,
@@ -1228,6 +1230,18 @@ and is the second family, after GNU gzip, written **clean room**:
   compatible on the pure tier (`lz4_flex`). The module doc of
   `compat/lz4/mod.rs` is the source of truth for the nine deviations; the
   README mirrors it.
+
+**The unzip family** (`compat/unzip/`) is a port of Info-ZIP UnZip 6.00 in
+two flavours, like gzip: Apple's `zip-33` tree is the base and Ubuntu's
+`6.0-28ubuntu4.1` is a set of flavour checks (`flavour.rs`, one function per
+Debian define or patch). Info-ZIP's licence is permissive but asks that an
+altered version be marked, which is why the banner lines name stuffr.
+Each ported function carries a `// port:` comment, each Apple change `//
+apple:`, each Ubuntu difference `// ubuntu:`, and each rule taken from the
+binary `// probe:`. The module doc of `compat/unzip/mod.rs` is the source of
+truth for the nine deviations; the README mirrors it. The shared decoders and
+the crypt keys live in the doc-hidden `stuffr::infozip`. `make
+compat-ubuntu` runs the unzip suites against Ubuntu's unzip in Docker.
 
 **Reference tools.** The bzip2 family is tested against the system
 `/usr/bin/bzip2` and `/usr/bin/bzip2recover`, which are not the same program

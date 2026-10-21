@@ -74,6 +74,10 @@
 //!    exits 80, as unzip does for both. funzip installs no handler, so a
 //!    signal at its password prompt kills it, echo off; stuffr puts the
 //!    mode back first, then dies of the same signal (`host::arm_tty_restore`).
+//! 9. funzip never loses a write failure (T12-4): a failed write to
+//!    standard output is answered `out of space on stdout`, exit 9, on a
+//!    real host too. The C writes through buffered stdio and does not check
+//!    its final `fflush()`, so it loses the data and exits 0.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};

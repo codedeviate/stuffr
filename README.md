@@ -964,11 +964,12 @@ behaves as **bzip2 1.0.8**; invoked as `gzip`, `gunzip`, `zcat` or `gzcat`
 `unlzma` or `lzcat` (from `0.13.0`), as **xz** (XZ Utils 5.8.4); invoked as
 `zstd`, `unzstd`, `zstdcat` or `zstdmt` (from `0.14.0`), as **zstd** (zstd
 1.5.7); invoked as `lz4`, `unlz4`, `lz4cat` or `lz4c` (from `0.15.0`), as
-**lz4** (lz4 1.10.0). In every case that tool's flags, files, exit codes and
-messages, not stuffr's. The binary reads the name from `argv[0]`, the file name only, before parsing
-anything. Any other name, `stuffr` included, runs the stuffr CLI unchanged.
-So does a link you make by hand under a name stuffr does not handle:
-`unzip -> stuffr` runs `stuffr`, not unzip.
+**lz4** (lz4 1.10.0); invoked as `unzip`, `zipinfo` or `funzip` (from
+`0.16.0`), as **Info-ZIP UnZip 6.00**. In every case that tool's flags,
+files, exit codes and messages, not stuffr's. The binary reads the name from
+`argv[0]`, the file name only, before parsing anything. Any other name,
+`stuffr` included, runs the stuffr CLI unchanged. So does a link you make by
+hand under a name stuffr does not handle: `zcat2 -> stuffr` runs `stuffr`.
 
 ### Opting in
 
@@ -976,7 +977,7 @@ So does a link you make by hand under a name stuffr does not handle:
 Homebrew. One verb makes them:
 
 ```sh
-stuffr install-links --dir ~/.local/bin                  # all twenty-two names
+stuffr install-links --dir ~/.local/bin                  # all twenty-five names
 stuffr install-links --dir ~/.local/bin --names bzcat,zcat   # comma-separated subset
 stuffr install-links --dir ~/.local/bin --dry-run        # "would create ...", changes nothing
 stuffr install-links --dir ~/.local/bin --force          # replace what is already there
@@ -1447,11 +1448,76 @@ installs no handler and writes the output file directly, and so does stuffr.
 filename`; with `lz4 -f` and standard output as the target an unrecognised
 input is copied through, as lz4 does.
 
+### The unzip family
+
+`unzip`, `zipinfo` and `funzip`, from `0.16.0`. `unzip -Z` is `zipinfo`, as in
+Info-ZIP: the `-Z` must be the first argument, and the rest is zipinfo's
+command line. They behave as **Info-ZIP UnZip 6.00**, in two flavours, chosen
+as the gzip family chooses its own: Apple's build on macOS and the BSDs (the
+reference is `/usr/bin/unzip`, from Apple's `zip-33` tree), Ubuntu's build
+everywhere else, Windows included (Ubuntu 24.04's `6.0-28ubuntu4.1`, Debian's
+patch series and build options). `STUFFR_UNZIP_FLAVOR=apple` or `ubuntu`
+overrides that; any other value is refused at exit 1 with
+`unzip: STUFFR_UNZIP_FLAVOR must be apple or ubuntu, not 'VALUE'` (the invoked
+name leads the line). `unzip` reads `UNZIP` and `UNZIPOPT`, and `zipinfo` reads `ZIPINFO` and
+`ZIPINFOOPT`, before the command line, as the reference does.
+
+**The promise:**
+
+- **Stdout, stderr and exit codes are those of the flavour's reference**
+  (under `LC_ALL=C`), for every option of `unzip`, `zipinfo` and `funzip`:
+  the listings (`-l`, `-v`, `-z`, `-T`, zipinfo's formats and totals), testing,
+  extraction with its overwrite questions and passwords, the usage screens,
+  `-v`, and the exit codes Info-ZIP defines (0 to 3, 4 to 8, 9 to 11, 50, 51,
+  80 to 82, and 12 under Ubuntu).
+- **Extracted trees are identical:** names, modes, times, symlinks, and on
+  macOS the archive's quarantine attribute. A differential suite runs each
+  case through the real unzip and a stuffr link and compares those streams
+  and the file tree, modes and mtimes.
+- **The intended difference:** the first banner line (below).
+
+**Known deviations:**
+
+1. **SIGPIPE.** The family restores SIGPIPE's default action, as the other
+   families do. Under a parent that ignores SIGPIPE, unzip sees `EPIPE` and
+   stuffr still dies of the signal: the Rust runtime ignores it before
+   `main`, so the inherited disposition cannot be told apart.
+2. **The first banner line** of each program's usage and `-v` names stuffr
+   and says it is altered (Info-ZIP licence, clause 3): `UnZip 6.00 of 20
+   April 2009, by stuffr X.Y.Z (altered; original by Info-ZIP, with
+   modifications by Apple Inc.).` (Ubuntu: `(altered; Debian's build,
+   original by Info-ZIP).`), and likewise for zipinfo and funzip. That line is
+   wider than the pager's 80 columns, so under `-M` it counts as two screen
+   lines and `-Mh` pauses one text line earlier than the reference.
+3. **Pre-existing symlinks.** The Ubuntu flavour also stays beneath the
+   extraction root, as Apple's does.
+4. **The archive being read is never overwritten.**
+5. **`-O` and `-I` (Ubuntu)** convert names through `iconv(3)`. They are
+   unavailable on Windows, where they are parsed as Ubuntu parses them and
+   convert nothing, as a conversion Ubuntu's `iconv_open()` refuses (silently:
+   the names stay as stored).
+6. **Locale-dependent output** is identical under `C`, `C.UTF-8` and
+   `en_US.UTF-8` only.
+7. **Quarantine on macOS.** The Ubuntu flavour also propagates the archive's
+   quarantine attribute there, as Apple's does.
+8. **The terminal.** After a prompt, a pager key or an interrupt, the
+   terminal's mode is put back exactly as it was, where unzip only sets echo
+   again (after an interrupt in the `-M` pager it leaves canonical mode off).
+   A SIGABRT stuffr raises itself (a crash) kills it by the signal; one sent
+   by another process exits 80, as unzip does for both. funzip installs no
+   handler, so a signal at its password prompt kills it, echo off; stuffr puts
+   the mode back first, then dies of the same signal.
+9. **funzip never loses a write failure.** A failed write to standard output
+   is answered `out of space on stdout`, exit 9, on a real host too. funzip
+   writes through buffered stdio and does not check its final `fflush()`, so
+   it loses the data and exits 0.
+
 ### Roadmap
 
 One family per release, each with its own spec stating its byte-identity
 promise: **bzip2 (`0.11.0`), gzip (`0.12.0`), xz/lzma (`0.13.0`), zstd
-(`0.14.0`) and lz4 (`0.15.0`) are done; `unzip`/`zipinfo` are next.**
+(`0.14.0`), lz4 (`0.15.0`) and `unzip`/`zipinfo`/`funzip` (`0.16.0`) are
+done.**
 `tar` is excluded (see [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md)). The planned
 tiers:
 
@@ -1630,8 +1696,8 @@ peeled and stays in the output, as with `unpack`.
 `ARCHIVE` accepts `-` for stdin everywhere. Optional compat symlinks
 argv[0]-dispatch into the same binary, so the tools they are named for drop
 into existing scripts unchanged: `bzip2`, `bunzip2`, `bzcat` and
-`bzip2recover` today, then `gzip`, `xz`, `zstd`, `lz4`, `unzip` and friends, one
-family per release — see [Compatibility links](#compatibility-links).
+`bzip2recover`, `gzip`, `xz`, `zstd`, `lz4` and `unzip` with its siblings
+today, one family per release — see [Compatibility links](#compatibility-links).
 
 ### Two safety defaults that are not negotiable
 
