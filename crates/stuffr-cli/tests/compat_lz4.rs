@@ -167,12 +167,14 @@ mod unix {
             "dict2" => b"completely different dictionary content 0123456789\n".repeat(20),
             "dict_b.lz4" => {
                 // The reference reads a dictionary only from a file.
-                let path =
-                    std::env::temp_dir().join(format!("stuffr-lz4-dict-{}", std::process::id()));
+                // Removed on drop, a panic inside `made` included.
+                let dir = ScratchDir::at(
+                    std::env::temp_dir().join(format!("stuffr-lz4-dict-{}", std::process::id())),
+                );
+                fs::create_dir_all(&*dir).unwrap();
+                let path = dir.join("dict");
                 fs::write(&path, fx("dict")).unwrap();
-                let frame = made(&["-c", "-q", "-D", path.to_str().unwrap()], &text());
-                let _ = fs::remove_file(&path);
-                frame
+                made(&["-c", "-q", "-D", path.to_str().unwrap()], &text())
             }
             "bad_bcrc2.lz4" => flipped(blocks(), 30),
             "empty.lz4" => made(&["-c", "-q"], b""),
@@ -249,15 +251,17 @@ mod unix {
             "nocrc.lz4" => made(&["-c", "-q", "--no-crc"], &text()),
             "big_blocks.lz4" => made(&["-c", "-q", "-B7", "--content-size"], &text()),
             "dict_cs.lz4" => {
-                let path =
-                    std::env::temp_dir().join(format!("stuffr-lz4-dictcs-{}", std::process::id()));
+                // Removed on drop, a panic inside `made` included.
+                let dir = ScratchDir::at(
+                    std::env::temp_dir().join(format!("stuffr-lz4-dictcs-{}", std::process::id())),
+                );
+                fs::create_dir_all(&*dir).unwrap();
+                let path = dir.join("dict");
                 fs::write(&path, fx("dict")).unwrap();
-                let frame = made(
+                made(
                     &["-c", "-q", "--content-size", "-D", path.to_str().unwrap()],
                     &text(),
-                );
-                let _ = fs::remove_file(&path);
-                frame
+                )
             }
             "cs_twice.lz4" => cat(&[&fx("cs.lz4"), &fx("cs.lz4")]),
             "cs_then_plain.lz4" => cat(&[&fx("cs.lz4"), &good()]),
