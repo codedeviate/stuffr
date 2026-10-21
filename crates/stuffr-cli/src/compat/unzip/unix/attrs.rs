@@ -175,7 +175,7 @@ pub(crate) fn get_extattribs(uz: &Uz, ex: &Ex) -> (IzTimes, Option<[u64; 2]>) {
     let mut z = IzTimes::default();
     let mut ug = [0u64; 2];
     let dos = uz.lrec.last_mod_dos_datetime;
-    // ubuntu: -DIZ_HAVE_UXUIDGID (`flavour::iz_have_uxuidgid`, Task 13): the
+    // ubuntu: -DIZ_HAVE_UXUIDGID (`flavour::iz_have_uxuidgid`): the
     // scan reads the owner (and a `ux` block then drops earlier times),
     // whether or not `-X` asks for it, as the C passes `z_uidgid` always.
     let owner = flavour::iz_have_uxuidgid(uz.flavour).then_some((&mut ug, uz.flavour));
@@ -395,7 +395,7 @@ pub(crate) fn set_symlnk_attribs(uz: &mut Uz, s: &SlinkEntry) -> i32 {
             &[u.as_bytes(), g.as_bytes(), &shown, &err],
         );
     }
-    // ubuntu: -DNO_LCHMOD (`flavour::no_lchmod`, Task 13)
+    // ubuntu: -DNO_LCHMOD (`flavour::no_lchmod`)
     if !flavour::no_lchmod(uz.flavour)
         && let Err(e) = dir.lchmod(&name, filtattr(uz, s.attr))
     {

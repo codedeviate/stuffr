@@ -442,8 +442,15 @@ pub(crate) fn filtattr(uz: &Uz, perms: u32) -> u32 {
 /// bytes dropped (unless `-^`), a VMS version removed (unless `-V`), and
 /// `.` and `..` as a last component become `_` and `__`. A directory entry
 /// is made here and answers `MPN_CREATED_DIR` (or `MPN_INF_SKIP` when it
-/// existed). `pinfo` is the entry's `G.pInfo` (its `file_attr` may change).
-pub(crate) fn mapname(uz: &mut Uz, pinfo: &mut super::super::extract::Info, renamed: bool) -> i32 {
+/// existed). `pinfo` is the entry's `G.pInfo` (its `file_attr` may change),
+/// `extra_field` its local extra field (`G.extra_field`), which the Ubuntu
+/// flavour's `-F` reads.
+pub(crate) fn mapname(
+    uz: &mut Uz,
+    pinfo: &mut super::super::extract::Info,
+    extra_field: Option<&[u8]>,
+    renamed: bool,
+) -> i32 {
     let mut killed_ddot = false; // is set when skipping "../" pathcomp
     let mut error = MPN_OK;
 
@@ -463,6 +470,13 @@ pub(crate) fn mapname(uz: &mut Uz, pinfo: &mut super::super::extract::Info, rena
 
     let mut pathcomp: Vec<u8> = Vec::new(); // initialize translation buffer
     let mut lastsemi: Option<usize> = None;
+    // ubuntu: -DACORN_FTYPE_NFS: `lastcomma` points into the C's
+    // `pathcomp[]` and is not reset between components, so the filetype
+    // check can read what an earlier component left there; `image` is that
+    // array as the C writes it (every byte put, every terminator).
+    let acorn = flavour::acorn_ftype_nfs(uz.flavour);
+    let mut lastcomma: Option<usize> = None;
+    let mut image: Vec<u8> = Vec::new();
     let cp = if uz.o.jflag {
         // junking directories
         match filename.iter().rposition(|&b| b == b'/') {
@@ -477,12 +491,15 @@ pub(crate) fn mapname(uz: &mut Uz, pinfo: &mut super::super::extract::Info, rena
         match workch {
             b'/' => {
                 // can assume -j flag not given
+                poke(&mut image, pathcomp.len(), 0);
                 if pathcomp == b"." {
                     // don't bother appending "./" to the path
                     pathcomp.clear();
+                    poke(&mut image, 0, 0);
                 } else if uz.o.ddotflag == 0 && pathcomp == b".." {
                     // "../" dir traversal detected, skip over it
                     pathcomp.clear();
+                    poke(&mut image, 0, 0);
                     killed_ddot = true; // set "show message" flag
                 }
                 // when path component is not empty, append it now
@@ -498,10 +515,16 @@ pub(crate) fn mapname(uz: &mut Uz, pinfo: &mut super::super::extract::Info, rena
             b';' => {
                 // VMS version (or DEC-20 attrib?)
                 lastsemi = Some(pathcomp.len());
-                pathcomp.push(b';'); // keep for now; remove VMS ";##"
+                // keep for now; remove VMS ";##"
+                put(&mut pathcomp, &mut image, b';');
             }
-            // ubuntu: -DACORN_FTYPE_NFS keeps a ',' for the NFS filetype
-            // here (`flavour::acorn_ftype_nfs`, Task 13).
+            // ubuntu: -DACORN_FTYPE_NFS
+            b',' if acorn => {
+                // NFS filetype extension
+                lastcomma = Some(pathcomp.len());
+                // keep for now; may need to remove later, if requested
+                put(&mut pathcomp, &mut image, b',');
+            }
             _ => {
                 // disable control character filter when requested, else
                 // allow 8-bit characters (e.g. UTF-8) in filenames:
@@ -509,7 +532,7 @@ pub(crate) fn mapname(uz: &mut Uz, pinfo: &mut super::super::extract::Info, rena
                     || fileio::is_print(uz, workch)
                     || (128..=254).contains(&workch)
                 {
-                    pathcomp.push(workch);
+                    put(&mut pathcomp, &mut image, workch);
                 }
             }
         }
@@ -570,6 +593,8 @@ pub(crate) fn mapname(uz: &mut Uz, pinfo: &mut super::super::extract::Info, rena
         return (error & !MPN_MASK) | MPN_INF_SKIP;
     }
 
+    poke(&mut image, pathcomp.len(), 0); // done with pathcomp:  terminate it
+
     // if not saving them, remove VMS version numbers (appended ";###")
     if !uz.o.v_flag
         && let Some(semi) = lastsemi
@@ -577,6 +602,7 @@ pub(crate) fn mapname(uz: &mut Uz, pinfo: &mut super::super::extract::Info, rena
     {
         // only digits between ';' and end:  nuke
         pathcomp.truncate(semi);
+        poke(&mut image, semi, 0);
     }
 
     // On UNIX (and compatible systems), "." and ".." are reserved for
@@ -584,8 +610,40 @@ pub(crate) fn mapname(uz: &mut Uz, pinfo: &mut super::super::extract::Info, rena
     // reserved one-dot and two-dot names are mapped to "_" and "__".
     if pathcomp == b"." {
         pathcomp = b"_".to_vec();
+        poke(&mut image, 0, b'_');
     } else if pathcomp == b".." {
         pathcomp = b"__".to_vec();
+        for (i, &c) in b"__\0".iter().enumerate() {
+            poke(&mut image, i, c);
+        }
+    }
+
+    // ubuntu: -DACORN_FTYPE_NFS
+    // translate Acorn filetype information if asked to do so
+    if acorn
+        && uz.o.acorn_nfs_ext
+        && let Some(ef_spark) = extra_field.and_then(get_riscos_exfield)
+    {
+        // file *must* have a RISC OS extra field
+        let ft = fileio::makelong(&ef_spark[8..]);
+        if let Some(comma) = lastcomma {
+            // `isxdigit()` from the comma on, in the C's array
+            let at = |i: usize| image.get(i).copied().unwrap_or(0);
+            let mut pp = comma + 1;
+            while at(pp).is_ascii_hexdigit() {
+                pp += 1;
+            }
+            if pp == comma + 4 && at(pp) == 0 {
+                // nuke
+                pathcomp.truncate(comma);
+                poke(&mut image, comma, 0);
+            }
+        }
+        // ruling: T13-4. `ft & 1<<31` shifts into the sign bit of an `int`
+        // (undefined in C); gcc's answer, the sign bit, is taken: bit 31 of
+        // the load address.
+        let ft = if ft & (1 << 31) == 0 { 0x000F_FD00 } else { ft };
+        pathcomp.extend_from_slice(format!(",{:03x}", (ft >> 8) & 0xFFF).as_bytes());
     }
 
     if pathcomp.is_empty() {
@@ -597,6 +655,52 @@ pub(crate) fn mapname(uz: &mut Uz, pinfo: &mut super::super::extract::Info, rena
     checkdir_append_name(uz, &pathcomp); // returns 1 if truncated: care?
     checkdir_getpath(uz);
     error
+}
+
+/// `*pp++ = c`: `c` put at the end of `pathcomp`, and into the C array
+/// [`mapname`] keeps the image of.
+fn put(pathcomp: &mut Vec<u8>, image: &mut Vec<u8>, c: u8) {
+    poke(image, pathcomp.len(), c);
+    pathcomp.push(c);
+}
+
+/// `pathcomp[i] = c` in the image of the C's array.
+fn poke(image: &mut Vec<u8>, i: usize, c: u8) {
+    if image.len() <= i {
+        image.resize(i + 1, 0);
+    }
+    image[i] = c;
+}
+
+/// process.c's `SPARKID_2`: `"ARC0"`.
+const SPARKID_2: u32 = 0x3043_5241;
+/// unzpriv.h's `EF_SPARK`: David Pilling's Acorn/SparkFS block (`"AC"`).
+const EF_SPARK: u16 = 0x4341;
+
+// port: process.c:getRISCOSexfield
+/// ubuntu: -DACORN_FTYPE_NFS. `getRISCOSexfield()`: the extra field's
+/// first SparkFS block of 20 or 24 bytes whose data starts `ARC0`, from its
+/// header on (`RO_extra_block`: the load address at offset 8), else `None`.
+fn get_riscos_exfield(ef: &[u8]) -> Option<&[u8]> {
+    let mut ef = ef;
+    while ef.len() >= 4 {
+        let eb_id = fileio::makeword(ef);
+        let eb_len = usize::from(fileio::makeword(&ef[2..]));
+        if eb_len > ef.len() - 4 {
+            // discovered some extra field inconsistency!
+            break;
+        }
+        if eb_id == EF_SPARK
+            && (eb_len == 24 || eb_len == 20)
+            && fileio::makelong(&ef[4..]) == SPARKID_2
+        {
+            // a pointer to the valid SPARK filetype ef block
+            return Some(&ef[..4 + eb_len]);
+        }
+        // Skip this extra field block
+        ef = &ef[4 + eb_len..];
+    }
+    None
 }
 
 /// `perror(s)`: `s: <strerror>` and a newline on standard error, straight

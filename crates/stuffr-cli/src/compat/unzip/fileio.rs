@@ -14,7 +14,7 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use super::messages as m;
-use super::{PK_COOL, PK_EOF, PK_OK, PK_WARN, Uz, flavour};
+use super::{PK_COOL, PK_EOF, PK_ERR, PK_OK, PK_WARN, Uz, flavour};
 use crate::compat::host::{Host, InFile};
 
 /// unzpriv.h's `INBUFSIZ` ("larger buffers for real OSes").
@@ -60,6 +60,9 @@ pub(crate) struct PInfo {
     pub vollabel: bool,
     /// `HasUxAtt`: the external attributes' high 16 bits are set.
     pub has_ux_att: bool,
+    /// `GPFIsUTF8` (ubuntu: -DUNICODE_SUPPORT): the central header's
+    /// general-purpose bit 11, "the name and comment are UTF-8".
+    pub gpf_is_utf8: bool,
 }
 
 /// The archive input: `G.zipfd` and `readbuf()`'s buffer state.
@@ -452,8 +455,9 @@ pub(crate) fn read_filename(uz: &mut Uz, length: usize, pinfo: &PInfo, islochdr:
     if length == 0 {
         return PK_COOL;
     }
-    // ubuntu: -DUNICODE_SUPPORT (Task 13) reads the whole name into
-    // `G.filename_full` first, for the Unicode path's checksum.
+    if flavour::unicode_support(uz.flavour) {
+        return read_filename_full(uz, length, pinfo, islochdr);
+    }
     let filnamsiz = uz.filename.len();
     let mut error = PK_OK;
     let mut length = length;
@@ -476,23 +480,7 @@ pub(crate) fn read_filename(uz: &mut Uz, length: usize, pinfo: &PInfo, islochdr:
     // A short read keeps the bytes past it from the earlier name.
     name[length] = 0; // terminate w/zero:  ASCIIZ
 
-    // translate the Zip entry filename coded in host-dependent "extended
-    // ASCII" into the compiler's (system's) internal text code page
-    ext_ascii_to_native(&mut name, pinfo, islochdr);
-
-    if pinfo.lcflag {
-        // replace with lowercase filename
-        strlower(&mut name);
-    }
-
-    if pinfo.vollabel && length > 8 && name[8] == b'.' {
-        // disk label, and 8th char is dot:  remove dot
-        let mut i = 8;
-        while name[i] != 0 {
-            name[i] = name[i + 1];
-            i += 1;
-        }
-    }
+    native_name(&mut name, length, pinfo, islochdr);
     uz.filename = name;
 
     if block_len == 0 {
@@ -509,6 +497,151 @@ pub(crate) fn read_filename(uz: &mut Uz, length: usize, pinfo: &PInfo, islochdr:
     uz.info(0x401, &msg);
     let to = here_plus(uz, block_len);
     seek_zipf(uz, to);
+    error
+}
+
+/// What `do_string(DS_FN)` does to a name once read: the host's code page
+/// converted, lowercased under `lcflag`, a volume label's dot after 8
+/// characters removed.
+fn native_name(name: &mut [u8], length: usize, pinfo: &PInfo, islochdr: bool) {
+    // translate the Zip entry filename coded in host-dependent "extended
+    // ASCII" into the compiler's (system's) internal text code page
+    ext_ascii_to_native(name, pinfo, islochdr);
+
+    if pinfo.lcflag {
+        // replace with lowercase filename
+        strlower(name);
+    }
+
+    if pinfo.vollabel && length > 8 && name[8] == b'.' {
+        // disk label, and 8th char is dot:  remove dot
+        let mut i = 8;
+        while name[i] != 0 {
+            name[i] = name[i + 1];
+            i += 1;
+        }
+    }
+}
+
+// port: fileio.c:do_string
+/// ubuntu: -DUNICODE_SUPPORT. `do_string(DS_FN)`'s Unicode build: the whole
+/// name read into `G.filename_full` (grown to `length + 1` bytes when it is
+/// too small, `FILNAMSIZ` at least), for the Unicode Path checksum, then
+/// its first `FILNAMSIZ - 1` bytes into `G.filename` (`strncpy()`: to the
+/// first NUL, zeros after), with the warning and `PK_WARN` when that cuts
+/// it. Nothing is left to skip, so no `[ ... ]` line.
+/// ruling: T13-7. A grown buffer is `malloc()`ed (its bytes past what a
+/// short read gave are uninitialised); here they are zeros.
+fn read_filename_full(uz: &mut Uz, length: usize, pinfo: &PInfo, islochdr: bool) -> i32 {
+    let filnamsiz = uz.filename.len();
+    let mut error = PK_OK;
+    let mut full = uz.filename_full.take().unwrap_or_default();
+    if full.len() <= length {
+        full = vec![0u8; filnamsiz.max(length + 1)];
+    }
+    let got = readbuf(uz, &mut full[..length]);
+    if got == 0 {
+        uz.filename_full = Some(full);
+        return PK_EOF;
+    }
+    full[length] = 0; // terminate w/zero:  ASCIIZ
+
+    // if needed, chop off end so standard filename is a valid length
+    let mut length = length;
+    if length >= filnamsiz {
+        uz.info(0x401, m::FILENAME_TOO_LONG_TRUNC.as_bytes());
+        error = PK_WARN;
+        length = filnamsiz - 1;
+    }
+    // no excess size
+    let mut name = std::mem::take(&mut uz.filename);
+    strncpy(&mut name, &full, length);
+    name[length] = 0; // terminate w/zero:  ASCIIZ
+    uz.filename_full = Some(full);
+    native_name(&mut name, length, pinfo, islochdr);
+    uz.filename = name;
+    error
+}
+
+/// `strncpy(dst, src, n)`: the C string `src`'s bytes, at most `n`, then
+/// zeros up to `n`.
+fn strncpy(dst: &mut [u8], src: &[u8], n: usize) {
+    let s = c_str(src);
+    let k = s.len().min(n);
+    dst[..k].copy_from_slice(&s[..k]);
+    dst[k..n].fill(0);
+}
+
+// port: fileio.c:do_string
+/// ubuntu: -DUNICODE_SUPPORT. `do_string(EXTRA_FIELD)`'s tail, once the
+/// field `ef` is read (and unless `-UU`): the entry's UTF-8 name, the
+/// stored one when its general-purpose bit 11 is set (`pinfo`, the central
+/// header's), else a Unicode Path block's, replaces `G.filename`: as it
+/// is under a UTF-8 locale (and no `-U`), converted to the locale's
+/// encoding otherwise (`utf8_to_local_string()`), each cut to `FILNAMSIZ -
+/// 1` bytes with a warning (`PK_WARN`). A name that is not UTF-8 is
+/// "Unicode filename corrupt", `PK_ERR`, and the name is left as it was.
+/// Returns the code.
+pub(crate) fn unicode_name(uz: &mut Uz, ef: &[u8], pinfo: &PInfo) -> i32 {
+    use super::process::unicode::{self, UniPath};
+    if uz.o.u_flag >= 2 {
+        return PK_COOL;
+    }
+    let full = uz.filename_full.clone();
+    // check if GPB11 (General Purpuse Bit 11) is set indicating the
+    // standard path and comment are UTF-8
+    let unipath: Option<Vec<u8>> = if pinfo.gpf_is_utf8 {
+        // if GPB11 set then filename_full is untruncated UTF-8
+        full.as_deref().map(|f| c_str(f).to_vec())
+    } else {
+        // Get the Unicode fields if exist
+        match unicode::get_unicode_data(uz, ef, full.as_deref()).1 {
+            UniPath::None => None,
+            // the standard filename field is UTF-8
+            UniPath::Standard => full.as_deref().map(|f| c_str(f).to_vec()),
+            UniPath::Name(n) => Some(n),
+        }
+    };
+    let Some(unipath) = unipath else {
+        return PK_COOL;
+    };
+    let filnamsiz = uz.filename.len();
+    let mut error = PK_COOL;
+    // ubuntu: -DUTF8_MAYBE_NATIVE
+    if uz.native_is_utf8 && !uz.unicode_escape_all {
+        let mut name = std::mem::take(&mut uz.filename);
+        strncpy(&mut name, &unipath, filnamsiz - 1);
+        uz.filename = name;
+        // make sure filename is short enough
+        if unipath.len() >= filnamsiz {
+            uz.filename[filnamsiz - 1] = 0;
+            uz.info(0x401, m::UFILENAME_TOO_LONG_TRUNC.as_bytes());
+            error = PK_WARN;
+        }
+    } else {
+        // ubuntu: -DUNICODE_WCHAR: convert UTF-8 to local character set
+        let escape_all = uz.unicode_escape_all;
+        match unicode::utf8_to_local_string(uz, &unipath, escape_all) {
+            // ubuntu: 28-cve-2022-0529-and-cve-2022-0530.patch: detect
+            // conversion failure, emit message, continue with unconverted
+            // name
+            None => {
+                uz.info(0x401, m::UFILENAME_CORRUPT.as_bytes());
+                error = PK_ERR;
+            }
+            Some(mut fname) => {
+                // make sure filename is short enough
+                if fname.len() >= filnamsiz {
+                    fname.truncate(filnamsiz - 1);
+                    uz.info(0x401, m::UFILENAME_TOO_LONG_TRUNC.as_bytes());
+                    error = PK_WARN;
+                }
+                // replace filename with converted UTF-8: strcpy()
+                uz.filename[..fname.len()].copy_from_slice(&fname);
+                uz.filename[fname.len()] = 0;
+            }
+        }
+    }
     error
 }
 
@@ -578,8 +711,9 @@ fn libc_isprint(c: u8) -> bool {
 /// returned. A control byte becomes `^` and its letter; another byte
 /// `isprint()` refuses becomes `?`; past `size - 4` bytes the text ends in
 /// `...`.
-/// ubuntu: -DNO_WORKING_ISPRINT escapes control bytes only
-/// (`flavour::no_working_isprint`, Task 13).
+/// ubuntu: -DNO_WORKING_ISPRINT escapes control bytes only and leaves
+/// every other byte (DEL and 0x80..0xff too) as it is
+/// (`flavour::no_working_isprint`).
 pub(crate) fn fnfilter_at(uz: &mut Uz, raw: &[u8], at: usize, size: usize) -> Vec<u8> {
     let raw = c_str(raw);
     let working_isprint = !flavour::no_working_isprint(uz.flavour);
@@ -691,6 +825,8 @@ pub(crate) struct Tm {
     pub sec: u32,
     /// `tm_gmtoff`: seconds east of UTC.
     pub gmtoff: i64,
+    /// `tm_isdst > 0`: summer time is in effect.
+    pub isdst: bool,
 }
 
 /// `localtime(&t)`: the local time of `t` (`None` where the C gets
@@ -728,6 +864,7 @@ fn localtime_real(t: i64) -> Option<Tm> {
         min: tm.tm_min as u32,
         sec: tm.tm_sec as u32,
         gmtoff: tm.tm_gmtoff as i64,
+        isdst: tm.tm_isdst > 0,
     })
 }
 
@@ -762,6 +899,7 @@ fn utc(t: i64) -> Tm {
         min: (secs / 60 % 60) as u32,
         sec: (secs % 60) as u32,
         gmtoff: 0,
+        isdst: false,
     }
 }
 
@@ -785,8 +923,13 @@ const YDAYS: [u32; 13] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334,
 /// extra days and month 15 a date in 2090); here month 0 counts no days
 /// before it and months 14 and 15 the whole year (`ydays[12]`, which month
 /// 13 reads).
-/// ubuntu: the Linux build (no `BSD4_4`) adds `timezone` and takes an hour
-/// off under DST instead (Task 13); the two agree in UTC.
+/// ubuntu: the Linux build (no `BSD4_4`: `flavour::dos_time_bsd4_4`)
+/// adds `timezone` (the zone's standard offset, seconds west) and takes a
+/// whole hour off when the result is in summer time; the two agree in UTC
+/// and in whole-hour zones away from the changes. probe: extraction mtimes
+/// under `TZ=EST5EDT,M3.2.0,M11.1.0` (a DOS time in the spring-forward
+/// gap) and `TZ=LHST-10:30LHDT-11,M10.1.0,M4.1.0` (half-hour DST): Ubuntu's
+/// 1583649000 and 1579048200, `BSD4_4`'s 1583652600 and 1579050000.
 pub(crate) fn dos_to_unix_time(uz: &Uz, dosdatetime: u32) -> i64 {
     const YRBASE: i64 = 1970;
     let yr = i64::from((dosdatetime >> 25) & 0x7f) + (1980 - YRBASE);
@@ -824,11 +967,59 @@ pub(crate) fn dos_to_unix_time(uz: &Uz, dosdatetime: u32) -> i64 {
         }
         t
     };
-    m_time = saturate(m_time);
-    if let Some(tm) = localtime(uz, m_time) {
-        m_time -= tm.gmtoff; // sec. EAST of GMT: subtr.
+    if flavour::dos_time_bsd4_4(uz.flavour) {
+        m_time = saturate(m_time);
+        if let Some(tm) = localtime(uz, m_time) {
+            m_time -= tm.gmtoff; // sec. EAST of GMT: subtr.
+        }
+    } else {
+        // ubuntu: !BSD4_4. tzset was already called at start of
+        // process_zipfiles()
+        m_time += timezone(uz); // seconds WEST of GMT:  add
+        // Adjust for local daylight savings (summer) time.
+        m_time = saturate(m_time);
+        if localtime(uz, m_time).is_some_and(|tm| tm.isdst) {
+            m_time -= 60 * 60; // adjust for daylight savings time
+        }
     }
     saturate(m_time)
+}
+
+/// The C library's `timezone` once `tzset()` has run: the local standard
+/// time's offset, seconds WEST of UTC. A sandbox's zone is UTC (R7).
+fn timezone(uz: &Uz) -> i64 {
+    if matches!(uz.host, crate::compat::host::Host::Real) {
+        return timezone_real();
+    }
+    0
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::useless_conversion)] // `c_long` is `i32` on 32-bit Linux
+fn timezone_real() -> i64 {
+    unsafe extern "C" {
+        /// POSIX (XSI) `timezone`, which `tzset()` sets.
+        #[link_name = "timezone"]
+        static c_timezone: libc::c_long;
+    }
+    // SAFETY: `tzset()` takes no arguments and sets `timezone`, which is
+    // then read; the run is single-threaded under `Host::Real`.
+    unsafe {
+        tzset();
+        i64::from(c_timezone)
+    }
+}
+
+/// Off Linux (the Ubuntu flavour elsewhere; nothing is promised there,
+/// deviation 6) the standard offset is read from `localtime()`: the
+/// offset of January 1st or July 1st of 2020 that is not summer time.
+#[cfg(not(target_os = "linux"))]
+fn timezone_real() -> i64 {
+    [1_577_836_800i64, 1_593_561_600]
+        .iter()
+        .filter_map(|&t| localtime_real(t))
+        .find(|tm| !tm.isdst)
+        .map_or(0, |tm| -tm.gmtoff)
 }
 
 // port: fileio.c:UzpMorePause

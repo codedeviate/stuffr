@@ -540,7 +540,15 @@ fn read_extra(uz: &mut Uz, ex: &mut Ex, e: &mut CentralEntry, length: usize, loc
         );
         error = PK_WARN;
     }
-    // ubuntu: -DUNICODE_SUPPORT (Task 13): getUnicodeData() here.
+    // ubuntu: -DUNICODE_SUPPORT (`G.pInfo`: the central header's bit 11,
+    // also for a local field)
+    if flavour::unicode_support(uz.flavour) {
+        let pinfo = if local { ex.pinfo.pinfo } else { e.pinfo };
+        let r = fileio::unicode_name(uz, &field, &pinfo);
+        if r != PK_COOL {
+            error = r;
+        }
+    }
     if !local {
         e.extra = Some(field.clone());
     }
@@ -813,8 +821,29 @@ fn extract_or_test_entrylist(
             error_in_archive = error; // only PK_EOF defined
             continue; // can still try next one
         }
-        // ubuntu: -DUNICODE_SUPPORT compares the local and central bit 11
-        // here (GP11FlagsDiffer, Task 13).
+        // ubuntu: -DUNICODE_SUPPORT
+        if flavour::unicode_support(uz.flavour)
+            && (uz.lrec.general_purpose_bit_flag & (1 << 11) == 1 << 11)
+                != ex.pinfo.pinfo.gpf_is_utf8
+        {
+            if qcond2(uz) {
+                let cname = ex.pinfo.cfilname.clone();
+                let shown = fileio::fnfilter1(uz, &cname);
+                let is_utf8: &[u8] = if ex.pinfo.pinfo.gpf_is_utf8 {
+                    b"1"
+                } else {
+                    b"0"
+                };
+                uz.info_fmt(
+                    0x421,
+                    m::GP11_FLAGS_DIFFER,
+                    &[n.as_bytes(), &shown, is_utf8],
+                );
+            }
+            if error_in_archive < PK_WARN {
+                error_in_archive = PK_WARN;
+            }
+        }
         let pinfo = ex.pinfo.pinfo;
         let error = fileio::read_filename(uz, usize::from(uz.lrec.filename_length), &pinfo, true);
         if error != PK_COOL {
@@ -961,7 +990,7 @@ fn extract_or_test_entrylist(
                 }
 
                 // mapname can create dirs if not freshening or if renamed
-                let error = mapname::mapname(uz, &mut ex.pinfo, renamed);
+                let error = mapname::mapname(uz, &mut ex.pinfo, ex.extra_field.as_deref(), renamed);
                 let errcode = error & !MPN_MASK;
                 if errcode != PK_OK && error_in_archive < errcode {
                     error_in_archive = errcode;

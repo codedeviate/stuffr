@@ -27,6 +27,8 @@ const SHRUNK: u16 = 1;
 const IMPLODED: u16 = 6;
 const DEFLATED: u16 = 8;
 const ENHDEFLATED: u16 = 9;
+/// ubuntu: -DUSE_BZIP2
+const BZIPPED: u16 = 12;
 
 /// `ExtractMsg`'s `%8s`: the verb right-aligned in eight columns.
 fn verb8(v: &[u8]) -> Vec<u8> {
@@ -285,13 +287,158 @@ fn unstore(
     }
 }
 
+/// `UZbunzip2()`'s `DESTROYGLOBALS(); EXIT(PK_MEM3)` (its final loop's
+/// answer to an error it has no case for), as the decoder's code: the
+/// caller ends the run.
+const BZ_EXIT_PK_MEM3: i32 = -PK_MEM3;
+
+// port: extract.c:UZbunzip2
+/// ubuntu: -DUSE_BZIP2. The entry's bzip2 stream decoded as the C drives
+/// libbzip2 (`stuffr::bzip2_stream::RawStream`, one `BZ2_bzDecompress` a
+/// call, R1): straight from the archive's buffer (`G.inptr`, `G.incnt`,
+/// refilled by `fillinbuf()`) into `slide`, flushed each time the window
+/// fills and once more after the input runs out, then after each call of
+/// the final loop. Returns the C's code: 2 for bad data or no data, 3 for
+/// memory, a flush's own, or [`BZ_EXIT_PK_MEM3`].
+///
+/// ruling: T13-2. Two of the C's loops never end once a call can make no
+/// more progress: the first, when a call consumes and produces nothing
+/// while input is still there (a `BZ_SEQUENCE_ERROR` after the stream
+/// ended, its trailing bytes left), and the final one, when the input ran
+/// out before the stream's end (`BZ_OK` for ever). probe: `timeout 10
+/// unzip -t` of a stream cut in half (in one buffer, and across many)
+/// and of a stream followed by 20000 bytes in its entry: killed at 10 s,
+/// `testing: s.txt` printed, nothing more. A call with nothing to consume
+/// and the same window is the same call (libbzip2 is a state machine), so
+/// here such a call ends the decode as running out of data does: 2, the
+/// "invalid compressed data to bunzip" answer (T10-9 and T11-4 rule the
+/// same way on the C's other endless loops). Pinned by
+/// `extract::tests::bzip2_rulings`.
+///
+/// ruling: T13-3. libbz2-rs-sys reads up to 7 bytes ahead of libbzip2
+/// into its 64-bit bit buffer (not across a stream's end), so `next_in`
+/// can run ahead of the C's within a stream. What is decoded, and every
+/// error, is libbzip2's, and so is every answer here but one: a bad magic
+/// whose search (libbzip2 keeps looking for `BZh` + digit) is still
+/// running when the entry's last block is read can reach the final loop
+/// (exit 6) a few calls before or after the C does. Not reproduced.
+fn bunzip2(
+    src: &mut EntrySrc,
+    slide: &mut [u8],
+    flush: &mut dyn FnMut(&[u8]) -> Result<(), i32>,
+) -> Result<(), Stop<i32>> {
+    use stuffr::bzip2_stream::{RawStream, StreamError};
+    // ubuntu: 15-cve-2015-7697.patch
+    if src.zin.incnt <= 0 && src.csize <= 0 {
+        // avoid an infinite loop
+        return Err(Stop::Code(2));
+    }
+    let wsize = WSIZE;
+    let mut next_out = 0usize; // avail_out = wsize - next_out
+    let mut next_in = src.zin.inptr;
+    // ruling: `bstrm.avail_in = G.incnt` of a negative count (a failed
+    // read before the entry) is a huge unsigned length over the buffer's
+    // end; here it is 0.
+    let mut avail_in = src.zin.incnt.max(0) as usize;
+    // BZ2_bzDecompressInit(&bstrm, 0, 0): no allocation can fail here
+    let mut bstrm = RawStream::new();
+    // `err`: the last call's answer, `BZ_OK` (`Ok(false)`) to begin with
+    let mut err: Result<bool, StreamError> = Ok(false);
+
+    let call = |bstrm: &mut RawStream,
+                src: &EntrySrc,
+                slide: &mut [u8],
+                next_in: &mut usize,
+                avail_in: &mut usize,
+                next_out: &mut usize|
+     -> (bool, Result<bool, StreamError>) {
+        let end = (*next_in + *avail_in).min(src.zin.inbuf.len());
+        let input = &src.zin.inbuf[(*next_in).min(end)..end];
+        let (c, p, r) = bstrm.decompress_counted(input, &mut slide[*next_out..wsize]);
+        *next_in += c;
+        *avail_in -= c;
+        *next_out += p;
+        (c > 0 || p > 0, r)
+    };
+
+    while src.csize > 0 {
+        while next_out < wsize {
+            let (progress, r) = call(
+                &mut bstrm,
+                src,
+                slide,
+                &mut next_in,
+                &mut avail_in,
+                &mut next_out,
+            );
+            err = r;
+            match &err {
+                Err(StreamError::Data) => return Err(Stop::Code(2)),
+                Err(StreamError::Memory) => return Err(Stop::Code(3)),
+                // "oops!  (bzip(first loop) err = %d)": a Trace only
+                _ => {}
+            }
+            if src.csize <= 0 {
+                // "END-of-entry-condition" ?
+                break;
+            }
+            if avail_in == 0 {
+                if src.fillinbuf() == 0 {
+                    // no "END-condition" yet, but no more data
+                    return Err(Stop::Code(2));
+                }
+                next_in = src.zin.inptr;
+                avail_in = src.zin.incnt.max(0) as usize;
+            } else if !progress {
+                // ruling: T13-2 (the C calls again for ever)
+                return Err(Stop::Code(2));
+            }
+        }
+        // flush slide[]
+        flush(&slide[..next_out]).map_err(Stop::Flush)?;
+        next_out = 0;
+    }
+
+    // no more input, so loop until we have all output
+    while !matches!(err, Ok(true)) {
+        let (progress, r) = call(
+            &mut bstrm,
+            src,
+            slide,
+            &mut next_in,
+            &mut avail_in,
+            &mut next_out,
+        );
+        err = r;
+        match &err {
+            Err(StreamError::Data) => return Err(Stop::Code(2)),
+            Err(StreamError::Memory) => return Err(Stop::Code(3)),
+            // "oops!  (bzip(final loop) err = %d)"
+            Err(_) => return Err(Stop::Code(BZ_EXIT_PK_MEM3)),
+            Ok(false) if !progress => {
+                // ruling: T13-2 (the C calls again for ever)
+                return Err(Stop::Code(2));
+            }
+            Ok(_) => {}
+        }
+        // final flush of slide[]
+        flush(&slide[..next_out]).map_err(Stop::Flush)?;
+        next_out = 0;
+    }
+
+    src.zin.inptr = next_in;
+    // ubuntu: 25-cve-2019-13232-fix-bug-in-uzbunzip2.patch
+    src.zin.incnt -= next_in as i64; // reset for other routines
+    Ok(())
+}
+
 // port: extract.c:extract_or_test_member
 /// The entry's data decoded by its method (`G.lrec.compression_method`):
-/// stored, shrunk (1), imploded (6), deflated (8) or deflate64 (9), each
-/// announced by its "extracting:"/"inflating:"/... line, each failure by
-/// the C's message. Any other method is "unknown compression method",
-/// `PK_WARN` (`store_info()` has already refused them; Ubuntu's bzip2,
-/// method 12, joins in Task 13). Returns the PK code.
+/// stored, shrunk (1), imploded (6), deflated (8), deflate64 (9) or, in
+/// the Ubuntu flavour, bzip2 (12), each announced by its
+/// "extracting:"/"inflating:"/... line, each failure by the C's message.
+/// Any other method is "unknown compression method", `PK_WARN`
+/// (`store_info()` has already refused them). Returns the PK code.
 pub(crate) fn decode_entry(uz: &mut Uz, ex: &mut Ex) -> i32 {
     let announce = !uz.o.tflag && uz.o.qflag == 0;
     match uz.lrec.compression_method {
@@ -400,6 +547,24 @@ pub(crate) fn decode_entry(uz: &mut Uz, ex: &mut Ex) -> i32 {
                 Ended::Ok | Ended::Length(_) => PK_COOL,
                 Ended::Code(r) if r < PK_DISK => {
                     decoder_failed(uz, r == 3, m::INFLATE);
+                    if r == 3 { PK_MEM3 } else { PK_ERR }
+                }
+                Ended::Code(r) => r,
+            }
+        }
+        // ubuntu: -DUSE_BZIP2
+        BZIPPED if flavour::use_bzip2(uz.flavour) => {
+            if announce {
+                extract_msg(uz, ex, m::VERB_BUNZIPP, false);
+            }
+            match run_decoder(uz, ex, |src, slide, flush, _| bunzip2(src, slide, flush)) {
+                Ended::Ok | Ended::Length(_) => PK_COOL,
+                Ended::Code(BZ_EXIT_PK_MEM3) => {
+                    uz.exit_run(PK_MEM3);
+                    PK_MEM3
+                }
+                Ended::Code(r) if r < PK_DISK => {
+                    decoder_failed(uz, r == 3, m::BUNZIP);
                     if r == 3 { PK_MEM3 } else { PK_ERR }
                 }
                 Ended::Code(r) => r,

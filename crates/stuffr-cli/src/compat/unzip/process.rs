@@ -8,7 +8,8 @@
 //! [`walk_central`] is list.c's loop over the central directory, shared by
 //! the listings; [`selected`] is the include/exclude test every loop makes.
 //! `check_ecrec_zip64()` is `#if 0` in the C and has no port. Apple's
-//! build has no `UNICODE_SUPPORT`, so `getUnicodeData()` is Task 13's.
+//! build has no `UNICODE_SUPPORT`: `getUnicodeData()` and its conversions
+//! are Ubuntu's, in [`unicode`].
 //!
 //! Every count and offset from the archive drives a loop or a seek, never
 //! an allocation: a name, an extra field or a comment is at most 64 KiB.
@@ -659,7 +660,10 @@ pub(crate) fn process_cdir_file_hdr(uz: &mut Uz) -> Result<CentralEntry, i32> {
     // strings (see do_string() function in fileio.c)
     e.pinfo.has_ux_att = e.external_file_attributes & 0xffff_0000 != 0;
 
-    // ubuntu: -DUNICODE_SUPPORT notes general-purpose bit 11 here (Task 13).
+    // ubuntu: -DUNICODE_SUPPORT: remember the state of GPB11 (General
+    // Purpuse Bit 11) which indicates that the standard path and comment
+    // are UTF-8.
+    e.pinfo.gpf_is_utf8 = e.general_purpose_bit_flag & (1 << 11) == 1 << 11;
     // The symlink flag (`G.pInfo->symlink = 0`) starts false in each
     // `extract::Info`.
     Ok(e)
@@ -822,8 +826,14 @@ pub(crate) fn read_extra_field(uz: &mut Uz, e: &mut CentralEntry) -> i32 {
         );
         error = PK_WARN;
     }
-    // ubuntu: -DUNICODE_SUPPORT (Task 13): getUnicodeData() and the UTF-8
-    // name come here, unless `-UU`.
+    // ubuntu: -DUNICODE_SUPPORT
+    if flavour::unicode_support(uz.flavour) {
+        let pinfo = e.pinfo;
+        let r = fileio::unicode_name(uz, &field, &pinfo);
+        if r != PK_COOL {
+            error = r;
+        }
+    }
     e.extra = Some(field);
     error
 }
@@ -920,6 +930,9 @@ pub(crate) fn walk(
                 return error;
             }
         }
+        // ubuntu: -DUNICODE_SUPPORT: the extra field's UTF-8 name, if any,
+        // is the one matched and shown
+        e.filename = fileio::c_str(&uz.filename).to_vec();
 
         let error = each(uz, &e);
         if error != 0 {
@@ -997,7 +1010,7 @@ pub(crate) fn selected(
 /// `ef_is_c` is a central directory's field (an `EF_TIME` block there holds
 /// the modification time only). A 32-bit time with its top bit set is kept
 /// only when the DOS time says 2038 or later (`time_t` is 64-bit).
-/// ubuntu: -DIZ_HAVE_UXUIDGID adds the owner fields (Task 13), and
+/// ubuntu: -DIZ_HAVE_UXUIDGID adds the owner fields, and
 /// 17-restore-unix-timestamps-accurately.patch changes which earlier flags
 /// an `EF_IZUNIX2`/`EF_IZUNIX3` block clears (Task 14). A listing asks for
 /// no owner, so neither shows in one but the patch's.
@@ -1219,6 +1232,7 @@ fn pad8(b: &[u8]) -> Vec<u8> {
 }
 
 mod end;
+pub(crate) mod unicode;
 
 #[cfg(test)]
 mod tests;

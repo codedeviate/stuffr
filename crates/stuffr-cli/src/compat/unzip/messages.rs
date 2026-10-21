@@ -634,6 +634,21 @@ pub(super) const CANNOT_OPEN_ZIPFILE: &str = "error:  cannot open zipfile [ %s ]
 pub(super) const READ_ERROR: &str = "error:  zipfile read error\n";
 /// fileio.c:FilenameTooLongTrunc.
 pub(super) const FILENAME_TOO_LONG_TRUNC: &str = "warning:  filename too long--truncating.\n";
+/// fileio.c:UFilenameTooLongTrunc (ubuntu: -DUNICODE_SUPPORT, its text as
+/// 28-cve-2022-0529-and-cve-2022-0530.patch has it).
+pub(super) const UFILENAME_TOO_LONG_TRUNC: &str =
+    "warning:  Converted Unicode filename too long--truncating.\n";
+/// fileio.c:UFilenameCorrupt (ubuntu: -DUNICODE_SUPPORT,
+/// 28-cve-2022-0529-and-cve-2022-0530.patch).
+pub(super) const UFILENAME_CORRUPT: &str = "error: Unicode filename corrupt.\n";
+/// process.c:UnicodeVersionError (ubuntu: -DUNICODE_SUPPORT).
+pub(super) const UNICODE_VERSION_ERROR: &str = "\nwarning:  Unicode Path version > 1\n";
+/// process.c:UnicodeMismatchError (ubuntu: -DUNICODE_SUPPORT).
+pub(super) const UNICODE_MISMATCH_ERROR: &str = "\nwarning:  Unicode Path checksum invalid\n";
+/// process.c:UFilenameTooLongTrunc (ubuntu: -DUNICODE_SUPPORT,
+/// 28-cve-2022-0529-and-cve-2022-0530.patch): `wide_to_local_string()`'s
+/// escape cut short.
+pub(super) const UFILENAME_TOO_LONG_P1: &str = "warning:  filename too long (P1) -- truncating.\n";
 /// fileio.c:do_string's `"[ %s ]\n"`: what is left of a truncated name.
 pub(super) const TRUNCATED_NAME: &str = "[ %s ]\n";
 /// fileio.c:ExtraFieldCorrupt (apple: fileio.c:183). `%04x` is the block
@@ -1281,6 +1296,9 @@ pub(super) const COMPR_NAMES: [(u16, &str); 17] = [
 pub(super) const FIL_NAM_MSG: &str = "%s:  bad filename length (%s)\n";
 /// extract.c:LvsCFNamMsg.
 pub(super) const LVS_CF_NAM_MSG: &str = "%s:  mismatching \"local\" filename (%s),\n         continuing with \"central\" filename version\n";
+/// extract.c:GP11FlagsDiffer (ubuntu: -DUNICODE_SUPPORT; `%lu`, `%s`, `%d`
+/// formatted by the caller).
+pub(super) const GP11_FLAGS_DIFFER: &str = "file #%s (%s):\n         mismatch between local and central GPF bit 11 (\"UTF-8\"),\n         continuing with central flag (IsUTF8 = %s)\n";
 /// extract.c:WrnStorUCSizCSizDiff.
 pub(super) const WRN_STOR_UCSIZ_CSIZ_DIFF: &str = "%s:  ucsize %s <> csize %s for STORED entry\n         continuing with \"compressed\" size value\n";
 /// extract.c:ExtFieldMsg.
@@ -1367,6 +1385,8 @@ pub(super) const INFLATE: &str = "inflate";
 pub(super) const EXPLODE: &str = "explode";
 /// extract.c:Unshrink.
 pub(super) const UNSHRINK: &str = "unshrink";
+/// extract.c:BUnzip (ubuntu: -DUSE_BZIP2).
+pub(super) const BUNZIP: &str = "bunzip";
 /// extract.c:FileTruncated.
 pub(super) const FILE_TRUNCATED: &str = "warning:  %s is probably truncated\n";
 /// extract.c:FileUnknownCompMethod.
@@ -1384,6 +1404,8 @@ pub(super) const VERB_EXTRACT: &[u8] = b"extract";
 pub(super) const VERB_UNSHRINK: &[u8] = b"unshrink";
 pub(super) const VERB_EXPLOD: &[u8] = b"explod";
 pub(super) const VERB_INFLAT: &[u8] = b"inflat";
+/// extract_or_test_member's BZIPPED verb (ubuntu: -DUSE_BZIP2).
+pub(super) const VERB_BUNZIPP: &[u8] = b"bunzipp";
 /// extract_or_test_member's `nul`, `txt`, `bin`.
 pub(super) const KIND_EMPTY: &[u8] = b"[empty] ";
 pub(super) const KIND_TEXT: &[u8] = b"[text]  ";

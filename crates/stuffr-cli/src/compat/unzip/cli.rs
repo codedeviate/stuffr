@@ -1169,8 +1169,8 @@ fn show_version_info(uz: &mut Uz) {
         ]
         .map(String::from),
     );
-    // ubuntu: -DUNICODE_SUPPORT (`UTF8_MAYBE_NATIVE`: the codeset Task 13
-    // reads from the locale; `other` under `LANG=C`).
+    // ubuntu: -DUNICODE_SUPPORT (`UTF8_MAYBE_NATIVE`: the codeset
+    // `nl_langinfo(CODESET)` names, `UTF-8` or `other`; `fileio::init_locale`).
     if flavour::unicode_support(f) {
         let coding = if uz.native_is_utf8 {
             m::SYS_CH_UTF8

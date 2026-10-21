@@ -52,7 +52,7 @@ impl Drop for Dir {
 }
 
 /// One entry of [`zip`]: name, data as stored, method, flags, external
-/// attributes, made-by host.
+/// attributes, made-by host, extra field (local and central).
 struct E<'a> {
     name: &'a [u8],
     data: Vec<u8>,
@@ -62,6 +62,7 @@ struct E<'a> {
     flags: u16,
     attr: u32,
     host: u8,
+    extra: Vec<u8>,
 }
 
 fn crc(b: &[u8]) -> u32 {
@@ -80,6 +81,7 @@ fn stored<'a>(name: &'a [u8], data: &[u8], attr: u32) -> E<'a> {
         flags: 0,
         attr,
         host: 3,
+        extra: Vec::new(),
     }
 }
 
@@ -109,8 +111,9 @@ fn zip(entries: &[E]) -> Vec<u8> {
         h.extend_from_slice(&(e.data.len() as u32).to_le_bytes());
         h.extend_from_slice(&e.ucsize.to_le_bytes());
         h.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
-        h.extend_from_slice(&0u16.to_le_bytes());
+        h.extend_from_slice(&(e.extra.len() as u16).to_le_bytes());
         h.extend_from_slice(e.name);
+        h.extend_from_slice(&e.extra);
         out.extend_from_slice(&h);
         out.extend_from_slice(&e.data);
         let mut c = b"PK\x01\x02".to_vec();
@@ -123,10 +126,12 @@ fn zip(entries: &[E]) -> Vec<u8> {
         c.extend_from_slice(&(e.data.len() as u32).to_le_bytes());
         c.extend_from_slice(&e.ucsize.to_le_bytes());
         c.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
-        c.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        c.extend_from_slice(&(e.extra.len() as u16).to_le_bytes());
+        c.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
         c.extend_from_slice(&e.attr.to_le_bytes());
         c.extend_from_slice(&off.to_le_bytes());
         c.extend_from_slice(e.name);
+        c.extend_from_slice(&e.extra);
         cd.extend_from_slice(&c);
     }
     let cd_at = out.len() as u32;
@@ -176,6 +181,28 @@ fn bases() -> Vec<Vec<u8>> {
                 method: 9,
                 ..deflated(b"d64.txt", &text)
             },
+            // Ubuntu's build options (Task 13): bzip2, a Unicode Path, a
+            // SparkFS filetype
+            bzipped(b"bz.txt", &text, bzip2(&text)),
+            E {
+                extra: [
+                    &[0x75, 0x70, 12, 0, 1][..],
+                    &crc(b"up.txt").to_le_bytes(),
+                    "\u{fc}p.txt".as_bytes(),
+                ]
+                .concat(),
+                ..stored(b"up.txt", b"up", 0o100644 << 16)
+            },
+            E {
+                extra: [
+                    &[0x41, 0x43, 20, 0][..],
+                    b"ARC0",
+                    &[0, 0xfb, 0xff, 0xff],
+                    &[0; 12],
+                ]
+                .concat(),
+                ..stored(b"typed,abc", b"t", 0o100644 << 16)
+            },
         ]),
     ]
 }
@@ -205,6 +232,8 @@ fn hostile_archives_never_panic_or_leave_the_root() {
         &["-P", "pw", "-o", "a.zip"],
         &["-:", "-o", "-d", "out", "a.zip"],
         &["-f", "a.zip"],
+        &["-Fo", "a.zip"],
+        &["-Uo", "a.zip"],
     ];
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
     for base in bases() {
@@ -475,4 +504,185 @@ fn the_pager_pages_the_usage_to_a_pipe() {
         assert_eq!(out.lines().count(), 21, "{out}");
         assert!(plain.starts_with(&out));
     }
+}
+
+// ---- Ubuntu's build options (Task 13): the rulings, stuffr-only ----
+
+/// `data` compressed by stuffr's bzip2 encoder.
+fn bzip2(data: &[u8]) -> Vec<u8> {
+    let codec = stuffr::registry()
+        .codec(stuffr::FormatId::new("bzip2"))
+        .unwrap();
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Shared {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut sink = codec
+        .encoder(
+            Box::new(Shared(buf.clone())),
+            &stuffr::EncodeOpts::default(),
+        )
+        .unwrap();
+    sink.write_all(data).unwrap();
+    sink.finish().unwrap();
+    buf.lock().unwrap().clone()
+}
+
+/// A method-12 entry of `plain` whose stored bytes are `body`.
+fn bzipped<'a>(name: &'a [u8], plain: &[u8], body: Vec<u8>) -> E<'a> {
+    E {
+        data: body,
+        method: 12,
+        ..stored(name, plain, 0o100644 << 16)
+    }
+}
+
+/// `z` as `a.zip`, run through the sandbox as `unzip args` in flavour `f`:
+/// the exit code, standard output and standard error, and the directory.
+fn sandboxed(f: Flavour, z: &[u8], args: &[&str]) -> (i32, String, String, Dir) {
+    let d = Dir::new("t13");
+    let root = d.0.join("root");
+    std::fs::write(root.join("a.zip"), z).unwrap();
+    let argv: Vec<OsString> = args.iter().map(OsString::from).collect();
+    let (code, out, err, _) = run_in_counted(f, &root, "unzip", &argv, b"", &|_| None);
+    (
+        code,
+        String::from_utf8_lossy(&out).into_owned(),
+        String::from_utf8_lossy(&err).into_owned(),
+        d,
+    )
+}
+
+/// T13-2: where Ubuntu's `UZbunzip2()` calls libbzip2 for ever (a stream
+/// cut short; a stream followed by more bytes in an entry of several
+/// buffers), stuffr ends as running out of data does: "invalid compressed
+/// data to bunzip", exit 2. A whole stream tests OK, and Apple's build has
+/// no bzip2 at all.
+#[test]
+fn bzip2_rulings() {
+    let line = b"bzip2 sample line for stuffr fixtures\n".repeat(200);
+    let mut seed = 13u64;
+    let big: Vec<u8> = (0..120_000).map(|_| next(&mut seed) as u8).collect();
+    let small = bzip2(&line);
+    let large = bzip2(&big);
+    let error = "  error:  invalid compressed data to bunzip\n";
+    for (body, plain) in [
+        (small[..small.len() / 2].to_vec(), &line),
+        (large[..large.len() / 2].to_vec(), &big),
+        ([large.as_slice(), &[0u8; 20000]].concat(), &big),
+    ] {
+        let z = zip(&[bzipped(b"s.txt", plain, body)]);
+        let (code, out, err, _d) = sandboxed(Flavour::Ubuntu, &z, &["-t", "a.zip"]);
+        assert_eq!(code, 2, "{out}{err}");
+        assert!(out.contains(error), "{out}");
+        assert_eq!(err, "");
+    }
+    let z = zip(&[bzipped(b"s.txt", &line, small.clone())]);
+    let (code, out, _, _d) = sandboxed(Flavour::Ubuntu, &z, &["-t", "a.zip"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains("    testing: s.txt                    OK\n"),
+        "{out}"
+    );
+    let (code, out, _, _d) = sandboxed(Flavour::Apple, &z, &["-t", "a.zip"]);
+    assert_eq!(code, 81, "{out}");
+}
+
+/// T13-4: the filetype is the load address's bit 31 (gcc's reading of
+/// `ft & 1<<31`), so `0x80000000` types the name `,000` and `0x7fffff00`
+/// (bit 31 clear) gets the default `,ffd`; without `-F`, or in Apple's
+/// build, names are kept.
+#[test]
+fn acorn_filetype_is_bit_31_of_the_load_address() {
+    let spark = |load: u32| {
+        let mut v = 0x4341u16.to_le_bytes().to_vec();
+        v.extend_from_slice(&20u16.to_le_bytes());
+        v.extend_from_slice(b"ARC0");
+        v.extend_from_slice(&load.to_le_bytes());
+        v.extend_from_slice(&[0; 12]);
+        v
+    };
+    let z = zip(&[
+        E {
+            extra: spark(0x8000_0000),
+            ..stored(b"x", b"x", 0o100644 << 16)
+        },
+        E {
+            extra: spark(0x7fff_ff00),
+            ..stored(b"y", b"y", 0o100644 << 16)
+        },
+    ]);
+    let (code, out, err, d) = sandboxed(Flavour::Ubuntu, &z, &["-F", "a.zip"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let root = d.0.join("root");
+    assert!(root.join("x,000").is_file(), "{out}");
+    assert!(root.join("y,ffd").is_file(), "{out}");
+    for (f, args) in [
+        (Flavour::Ubuntu, &["a.zip"][..]),
+        (Flavour::Apple, &["a.zip"]),
+    ] {
+        let (code, out, err, d) = sandboxed(f, &z, args);
+        assert_eq!(code, 0, "{f:?} {out}{err}");
+        assert!(d.0.join("root/x").is_file(), "{f:?} {out}");
+    }
+    let (code, _, err, _d) = sandboxed(Flavour::Apple, &z, &["-F", "a.zip"]);
+    assert_eq!(code, 10, "{err}");
+}
+
+/// T13-5 and T13-6, the Unicode Path rulings (the sandbox's locale is C):
+/// a block shorter than its five fixed bytes reads zeros past the field
+/// (version 0, so "checksum invalid", here for both blocks); `-U` keeps a
+/// 10-byte `#L` escape whole (where Ubuntu's `strcat` overflows); without
+/// `-U` the patched path cuts it to the buffer, with its warning.
+#[test]
+fn unicode_rulings() {
+    let unipath = |data: &[u8]| {
+        let mut v = 0x7075u16.to_le_bytes().to_vec();
+        v.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        v.extend_from_slice(data);
+        v
+    };
+    let z = zip(&[
+        E {
+            extra: unipath(b""),
+            ..stored(b"s0.txt", b"x", 0o100644 << 16)
+        },
+        E {
+            extra: unipath(b"\x01ab"),
+            ..stored(b"s3.txt", b"x", 0o100644 << 16)
+        },
+    ]);
+    let (code, out, err, _d) = sandboxed(Flavour::Ubuntu, &z, &["-l", "a.zip"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(
+        out.contains("   s0.txt\n") && out.contains("   s3.txt\n"),
+        "{out}"
+    );
+    let invalid = "\nwarning:  Unicode Path checksum invalid\n";
+    assert_eq!(err, format!("{invalid}{invalid}"));
+    // Apple's build has no Unicode support: nothing is said
+    let (code, _, err, _d) = sandboxed(Flavour::Apple, &z, &["-l", "a.zip"]);
+    assert_eq!((code, err.as_str()), (0, ""));
+
+    let mut five = vec![1];
+    five.extend_from_slice(&crc(b"f.txt").to_le_bytes());
+    five.extend_from_slice(b"\xfb\xbf\xbf\xbf\xbf");
+    let z = zip(&[E {
+        extra: unipath(&five),
+        ..stored(b"f.txt", b"x", 0o100644 << 16)
+    }]);
+    let (code, out, err, _d) = sandboxed(Flavour::Ubuntu, &z, &["-U", "-l", "a.zip"]);
+    assert_eq!((code, err.as_str()), (0, ""), "{out}");
+    assert!(out.contains("   #L03ffffff\n"), "{out}");
+    let (code, out, err, _d) = sandboxed(Flavour::Ubuntu, &z, &["-l", "a.zip"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(out.contains("   #L03ffff\n"), "{out}");
+    assert_eq!(err, "warning:  filename too long (P1) -- truncating.\n");
 }

@@ -12,6 +12,21 @@
 //! ones and Task 14 the patch-driven ones. A hook still passing through says
 //! so in its doc. The banner and compile line are the exception: they are
 //! text, recorded from each reference (`// probe:`), so both are exact now.
+//!
+//! Ubuntu's `DEFINES` (`debian/rules`), each where it acts: `ACORN_FTYPE_NFS`
+//! [`acorn_ftype_nfs`], `WILD_STOP_AT_DIR` [`wild_stop_at_dir`],
+//! `UNICODE_SUPPORT`, `UNICODE_WCHAR` and `UTF8_MAYBE_NATIVE`
+//! [`unicode_support`] (with `Uz::native_is_utf8` and
+//! `Uz::unicode_escape_all`), `NO_LCHMOD` [`no_lchmod`],
+//! `DATE_FORMAT=DF_YMD` [`date_format`], `USE_BZIP2` [`use_bzip2`],
+//! `IZ_HAVE_UXUIDGID` [`iz_have_uxuidgid`], `NO_WORKING_ISPRINT`
+//! [`no_working_isprint`]. Two have no hook: `LARGE_FILE_SUPPORT` is in
+//! both builds (`-v` lists it in both, and the port's sizes and offsets are
+//! 64-bit throughout), and `NOMEMCPY` changes only how inflate.c and
+//! explode.c copy a match within the window (a byte loop instead of
+//! `memcpy()` for non-overlapping runs), which writes the same bytes: no
+//! observable effect (Tasks 4 and 5 probed their C drivers built both ways,
+//! identical output).
 
 /// Which reference the family behaves as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,35 +41,33 @@ pub enum Flavour {
 /// `-DUNICODE_SUPPORT` (with `-DUNICODE_WCHAR -DUTF8_MAYBE_NATIVE`), Ubuntu
 /// only: `-U` counts (`uO.U_flag`) instead of being the obsolete inverse of
 /// `-L`, zipinfo accepts `-U`, the usage gains the `-U`/`-UU` line and `-v`
-/// the `UNICODE_SUPPORT` line.
-///
-/// Pass-through until Task 13: Apple's answer (`false`) for both.
-pub(crate) fn unicode_support(_f: Flavour) -> bool {
-    false
+/// the `UNICODE_SUPPORT` line; names are read whole (`G.filename_full`),
+/// general-purpose bit 11 is noted, and an extra field's UTF-8 name (bit
+/// 11's, or the Unicode Path block `0x7075`) replaces the entry's
+/// (`fileio::unicode_name`).
+pub(crate) fn unicode_support(f: Flavour) -> bool {
+    f == Flavour::Ubuntu
 }
 
 /// `-DACORN_FTYPE_NFS`, Ubuntu only: unzip accepts `-F`
-/// (`uO.acorn_nfs_ext`) and `-v` lists `ACORN_FTYPE_NFS`.
-///
-/// Pass-through until Task 13: Apple's answer (`false`) for both.
-pub(crate) fn acorn_ftype_nfs(_f: Flavour) -> bool {
-    false
+/// (`uO.acorn_nfs_ext`), `-v` lists `ACORN_FTYPE_NFS`, and under `-F`
+/// `mapname()` gives a name with a SparkFS block its `,xxx` filetype.
+pub(crate) fn acorn_ftype_nfs(f: Flavour) -> bool {
+    f == Flavour::Ubuntu
 }
 
 /// `-DWILD_STOP_AT_DIR`, Ubuntu only: unzip and zipinfo accept `-W`
-/// (`uO.W_flag`) and `-v` lists `WILD_STOP_AT_DIR`.
-///
-/// Pass-through until Task 13: Apple's answer (`false`) for both.
-pub(crate) fn wild_stop_at_dir(_f: Flavour) -> bool {
-    false
+/// (`uO.W_flag`), `-v` lists `WILD_STOP_AT_DIR`, and under `-W` a `*` or
+/// `?` stops at a `/` (`match()`'s `sepc`).
+pub(crate) fn wild_stop_at_dir(f: Flavour) -> bool {
+    f == Flavour::Ubuntu
 }
 
 /// `-DUSE_BZIP2`, Ubuntu only: `-v` lists `USE_BZIP2` with libbzip2's
-/// version (R1: method 12 under `cfg(feature = "bzip2")`).
-///
-/// Pass-through until Task 13: Apple's answer (`false`) for both.
-pub(crate) fn use_bzip2(_f: Flavour) -> bool {
-    false
+/// version, the build can do version 4.6, and method 12 is decoded
+/// (`extract::member`'s `UZbunzip2()`, over `stuffr::bzip2_stream`, R1).
+pub(crate) fn use_bzip2(f: Flavour) -> bool {
+    f == Flavour::Ubuntu
 }
 
 /// `20-unzip60-alt-iconv-utf8.patch`, Ubuntu only: the usage texts gain the
@@ -127,24 +140,29 @@ pub(crate) enum DateFormat {
     #[allow(dead_code)]
     Dmy,
     /// `DF_YMD`, `91-10-26`.
-    #[allow(dead_code)]
     Ymd,
 }
 
-/// `-DDATE_FORMAT=DF_YMD`, Ubuntu only: dates print year first.
-///
-/// Pass-through until Task 13: Apple's answer (`DF_MDY`) for both.
-pub(crate) fn date_format(_f: Flavour) -> DateFormat {
-    DateFormat::Mdy
+/// `-DDATE_FORMAT=DF_YMD`, Ubuntu only: dates print year first; Apple's
+/// is unix's default, `DF_MDY` (unxcfg.h).
+pub(crate) fn date_format(f: Flavour) -> DateFormat {
+    match f {
+        Flavour::Apple => DateFormat::Mdy,
+        Flavour::Ubuntu => DateFormat::Ymd,
+    }
 }
 
-/// `-DNO_WORKING_ISPRINT`, Ubuntu only: `fnfilter()` escapes control
-/// bytes and leaves every other byte as it is (Apple's `isprint()` makes
-/// a byte it refuses `?`).
-///
-/// Pass-through until Task 13: Apple's answer (`false`) for both.
-pub(crate) fn no_working_isprint(_f: Flavour) -> bool {
-    false
+/// `-DNO_WORKING_ISPRINT`, Ubuntu only: unxcfg.h then leaves
+/// `HAVE_WORKING_ISPRINT` undefined, so `fnfilter()` escapes the bytes
+/// below 32 as `^X` and leaves every other byte as it is, DEL and 0x80 to
+/// 0xff included, in every locale (Apple's `isprint()` makes a byte it
+/// refuses `?`). Nothing else changes: `mapname()` and zipinfo's Mac
+/// type/creator line call `isprint()` themselves.
+/// probe: `unzip -l` and `zipinfo` of `c\x80\xa0\xad\xe9\xff\x7f.txt`
+/// show the bytes raw under `C`, `C.UTF-8`, `en_US.UTF-8`, `en_US.utf8`
+/// and `C.utf8` alike (glibc's `isprint()` refuses all of them in each).
+pub(crate) fn no_working_isprint(f: Flavour) -> bool {
+    f == Flavour::Ubuntu
 }
 
 /// `21-fix-warning-messages-on-big-files.patch`, Ubuntu only:
@@ -174,6 +192,15 @@ pub(crate) fn filnamsiz(f: Flavour) -> usize {
         Flavour::Apple => 1024,
         Flavour::Ubuntu => 4096,
     }
+}
+
+/// fileio.c:dos_to_unix_time()'s `BSD4_4` branch: an MS-DOS time is local
+/// time less `localtime()`'s `tm_gmtoff`. Not a define or a patch but each
+/// reference's platform (macOS's is a BSD4_4 one, Linux's is not), so both
+/// are exact: the Linux build adds `timezone` and takes an hour off in
+/// summer time.
+pub(crate) fn dos_time_bsd4_4(f: Flavour) -> bool {
+    f == Flavour::Apple
 }
 
 // ---- extraction (Task 10) ----
@@ -221,18 +248,16 @@ pub(crate) fn dir_attrib_error_is_max(f: Flavour) -> bool {
 
 /// `-DIZ_HAVE_UXUIDGID`, Ubuntu only: `ef_scan_for_izux()` reads the owner
 /// from `ux`/`Ux`/`UX` blocks, so `-X` can restore it.
-///
-/// Pass-through until Task 13: Apple's answer (`false`) for both.
-pub(crate) fn iz_have_uxuidgid(_f: Flavour) -> bool {
-    false
+pub(crate) fn iz_have_uxuidgid(f: Flavour) -> bool {
+    f == Flavour::Ubuntu
 }
 
-/// `-DNO_LCHMOD`, Ubuntu only: a deferred symlink's mode is not set.
-///
-/// Pass-through until Task 13: Apple's answer (`false`: `lchmod()`) for
-/// both.
-pub(crate) fn no_lchmod(_f: Flavour) -> bool {
-    false
+/// `-DNO_LCHMOD`, Ubuntu only: a deferred symlink's mode is not set
+/// (Apple's build calls `lchmod()`). `NO_LCHOWN` stays undefined, so
+/// `SET_SYMLINK_ATTRIBS` is still on: the times and, under `-X`, the owner
+/// are still set.
+pub(crate) fn no_lchmod(f: Flavour) -> bool {
+    f == Flavour::Ubuntu
 }
 
 /// `14-cve-2015-7696.patch`, Ubuntu only: `decrypt()` gives up on an

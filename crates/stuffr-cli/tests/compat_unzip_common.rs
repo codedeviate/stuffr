@@ -10,8 +10,9 @@
 //!   the table cannot rot;
 //! - `taskN_rows_match_stuffr` runs the rows Task N implements against
 //!   stuffr in that flavour (`assert_same_unzip`) and is `#[ignore = "Task
-//!   N"]` until then. R13: Ubuntu's side of every row waits for Task 13 (its
-//!   build options) or Task 14 (its patches).
+//!   N"]` until then. R13: on Ubuntu a row whose answer needs a patch of its
+//!   series runs under Task 14 instead ([`Row::needs_patch`]); Ubuntu's
+//!   build options are Task 13's, done.
 //!
 //! Every row runs under `LANG=C` and `TZ=UTC` (the harness's defaults);
 //! every archive is built here with `zip_with`, so both references read the
@@ -46,9 +47,12 @@ mod unix {
     /// One probed command and what the reference did (2026-10-20).
     struct Row {
         flavour: Which,
-        /// The task whose differential runs the row on Apple; on Ubuntu a
-        /// `Both` row waits for Task 13 (R13, see [`Row::task_here`]).
+        /// The task whose differential runs the row (on Ubuntu, a `Both`
+        /// row that needs a patch runs under Task 14: [`Row::task_here`]).
         task: u8,
+        /// The Ubuntu patch a `Both` row's answer needs there (R13: Task
+        /// 14's), named for the record.
+        ubuntu_patch: Option<&'static str>,
         label: &'static str,
         name: &'static str,
         args: Vec<&'static str>,
@@ -77,9 +81,15 @@ mod unix {
 
         fn task_here(&self) -> u8 {
             match (self.flavour, own()) {
-                (Which::Both, Which::Ubuntu) => 13,
+                (Which::Both, Which::Ubuntu) if self.ubuntu_patch.is_some() => 14,
                 _ => self.task,
             }
+        }
+
+        /// The row's Ubuntu side needs `patch` (Task 14, R13).
+        fn needs_patch(mut self, patch: &'static str) -> Row {
+            self.ubuntu_patch = Some(patch);
+            self
         }
 
         fn case(&self) -> Case<'_> {
@@ -132,6 +142,7 @@ mod unix {
         Row {
             flavour,
             task,
+            ubuntu_patch: None,
             label,
             name,
             args: args.to_vec(),
@@ -473,7 +484,7 @@ mod unix {
         "      ZIPINFOOPT:  [none]\n",
     );
 
-    /// The end of Ubuntu's `unzip -v` under `LANG=C` (`char coding: other`; other locales are Task 13's).
+    /// The end of Ubuntu's `unzip -v` under `LANG=C` (`char coding: other`; the UTF-8 locales are `compat_unzip_ubuntu::ubuntu_build_rows`').
     const UBUNTU_OPTIONS: &str = concat!(
         "UnZip special compilation options:\n",
         "        ACORN_FTYPE_NFS\n",
@@ -531,10 +542,13 @@ mod unix {
         use Which::*;
         let a = || vec![("a.zip", a_zip())];
         let mut v = Vec::new();
-        // Usage, help, version, a bad option (Task 7; Ubuntu's Task 13).
-        for (who, task, usage, zipinfo, options, banner) in [
+        // Usage, help, version, a bad option (Task 7). On Ubuntu `-v` is its
+        // build options' (Task 13); the usage texts carry the `-O`/`-I`
+        // lines of 20-unzip60-alt-iconv-utf8.patch (Task 14).
+        for (who, task, version_task, usage, zipinfo, options, banner) in [
             (
                 Apple,
+                7,
                 7,
                 APPLE_USAGE,
                 APPLE_ZIPINFO_USAGE,
@@ -543,6 +557,7 @@ mod unix {
             ),
             (
                 Ubuntu,
+                14,
                 13,
                 UBUNTU_USAGE,
                 UBUNTU_ZIPINFO_USAGE,
@@ -563,7 +578,17 @@ mod unix {
                     "",
                 ),
                 row(who, task, "-h", "unzip", &["-h"], vec![], 0, usage, ""),
-                row(who, task, "-v", "unzip", &["-v"], vec![], 0, options, ""),
+                row(
+                    who,
+                    version_task,
+                    "-v",
+                    "unzip",
+                    &["-v"],
+                    vec![],
+                    0,
+                    options,
+                    "",
+                ),
                 row(
                     who,
                     task,
@@ -710,6 +735,7 @@ mod unix {
         // Task 7's probes both references answer alike (2026-10-20).
         let long: &'static str = Box::leak("a".repeat(16225).into_boxed_str());
         v.extend([
+            // Ubuntu's extended help gains the patch's `-I`/`-O` lines.
             row(
                 Both,
                 7,
@@ -720,7 +746,8 @@ mod unix {
                 0,
                 "\nExtended Help for UnZip\n",
                 "",
-            ),
+            )
+            .needs_patch("20-unzip60-alt-iconv-utf8.patch"),
             row(
                 Both,
                 7,
@@ -776,7 +803,8 @@ mod unix {
                 "",
                 "error:  must give decryption password with -P option\n",
             ),
-            // Under -t the message and the usage go to standard output.
+            // Under -t the message and the usage go to standard output
+            // (Ubuntu's usage has the patch's `-O`/`-I` lines).
             row(
                 Both,
                 7,
@@ -787,7 +815,8 @@ mod unix {
                 10,
                 INVALID_OPTIONS,
                 "",
-            ),
+            )
+            .needs_patch("20-unzip60-alt-iconv-utf8.patch"),
             row(
                 Both,
                 7,
@@ -799,7 +828,8 @@ mod unix {
                 INVALID_OPTIONS,
                 "",
             )
-            .env(&[("UNZIP", "-t")]),
+            .env(&[("UNZIP", "-t")])
+            .needs_patch("20-unzip60-alt-iconv-utf8.patch"),
             row(
                 Both,
                 7,
@@ -938,7 +968,7 @@ mod unix {
             ),
         ]);
         // Listing (Task 8): what does not print a date is the same in both
-        // builds (Ubuntu's dates are year first, Task 13).
+        // builds (Ubuntu's dates are year first: `DF_YMD`).
         v.extend([
             row(
                 Both,
@@ -2530,89 +2560,54 @@ mod unix {
         );
     }
 
-    /// Task 7's rows: Apple's (and the `Both` rows) on macOS. R13: Ubuntu's
-    /// side of them is tagged Task 13 (`Row::task_here`), so on Linux this
-    /// test has nothing to run until then, and `task7_ubuntu_rows_match_stuffr`
-    /// says so explicitly.
+    /// Task 7's rows (options, usage, banners, the environment): this
+    /// platform's and the `Both` ones (on Ubuntu, its usage texts are Task
+    /// 14's: the iconv patch's `-O`/`-I` lines).
     #[test]
-    #[cfg_attr(not(target_os = "macos"), ignore = "Task 13 (R13: Ubuntu's side)")]
     fn task7_rows_match_stuffr() {
         differential(7);
     }
 
-    /// Ubuntu's side of Task 7's rows (usage, `-v`, the environment), which
-    /// R13 leaves to Task 13; runs on Linux only.
+    /// Task 8's rows (opening archives, wildcards, listings).
     #[test]
-    #[ignore = "Task 13"]
-    fn task7_ubuntu_rows_match_stuffr() {
-        if own() != Which::Ubuntu {
-            return;
-        }
-        // The usage loop records Ubuntu's rows under Task 13; the `Both`
-        // rows are Task 7's.
-        let rows: Vec<Row> = rows()
-            .into_iter()
-            .filter(|r| {
-                (r.flavour == Which::Ubuntu && r.task == 13)
-                    || (r.flavour == Which::Both && r.task == 7)
-            })
-            .collect();
-        let cases: Vec<Case> = rows.iter().map(Row::case).collect();
-        run_group("task7-ubuntu", &cases, Skipped::none(), &assert_same_unzip);
-    }
-
-    /// Task 8's rows (opening archives, wildcards, listings): Apple's and
-    /// the `Both` rows on macOS; Ubuntu's side waits for Task 13 (R13, its
-    /// dates and `-W`), as `Row::task_here` tags it.
-    #[test]
-    #[cfg_attr(not(target_os = "macos"), ignore = "Task 13 (R13: Ubuntu's side)")]
     fn task8_rows_match_stuffr() {
         differential(8);
     }
 
-    /// Task 9's rows (zipinfo's listings): Apple's and the `Both` rows on
-    /// macOS; Ubuntu's side waits for Task 13 (R13), as `Row::task_here`
-    /// tags it.
+    /// Task 9's rows (zipinfo's listings).
     #[test]
-    #[cfg_attr(not(target_os = "macos"), ignore = "Task 13 (R13: Ubuntu's side)")]
     fn task9_rows_match_stuffr() {
         differential(9);
     }
 
-    /// Task 10's rows (testing and extraction): Apple's and the `Both` rows
-    /// on macOS; Ubuntu's side waits for Task 13 (R13), as `Row::task_here`
-    /// tags it.
+    /// Task 10's rows (testing and extraction).
     #[test]
-    #[cfg_attr(not(target_os = "macos"), ignore = "Task 13 (R13: Ubuntu's side)")]
     fn task10_rows_match_stuffr() {
         differential(10);
     }
 
     /// Task 11's rows (the password prompt, the questions at a terminal,
-    /// `-M`, the `^S` pause): Apple's and the `Both` rows on macOS;
-    /// Ubuntu's side waits for Task 13 (R13), as `Row::task_here` tags it
-    /// (`compat_unzip_tty` runs the same paths against Ubuntu's reference
-    /// now).
+    /// `-M`, the `^S` pause).
     #[test]
-    #[cfg_attr(not(target_os = "macos"), ignore = "Task 13 (R13: Ubuntu's side)")]
     fn task11_rows_match_stuffr() {
         differential(11);
     }
 
-    /// Task 12's rows (funzip): Apple's and the `Both` rows on macOS;
-    /// Ubuntu's side waits for Task 13 (R13), as `Row::task_here` tags it.
+    /// Task 12's rows (funzip).
     #[test]
-    #[cfg_attr(not(target_os = "macos"), ignore = "Task 13 (R13: Ubuntu's side)")]
     fn task12_rows_match_stuffr() {
         differential(12);
     }
 
+    /// Task 13's rows: Ubuntu's `-v` (its build options); the rest of
+    /// Task 13's differential is `compat_unzip_ubuntu::ubuntu_build_rows`.
     #[test]
-    #[ignore = "Task 13"]
     fn task13_rows_match_stuffr() {
         differential(13);
     }
 
+    /// Task 14's rows: Ubuntu's answers that need its patch series (each
+    /// `Both` row names its patch: [`Row::needs_patch`]).
     #[test]
     #[ignore = "Task 14"]
     fn task14_rows_match_stuffr() {

@@ -266,6 +266,9 @@ pub(crate) fn zipinfo(uz: &mut Uz) -> i32 {
                 // The premature return in case of a "fatal" error (PK_EOF)
                 // is delayed until we analyze the extra field contents.
             }
+            // ubuntu: -DUNICODE_SUPPORT: from here on `G.filename` is the
+            // extra field's UTF-8 name, if any
+            e.filename = c_str(&uz.filename).to_vec();
             uz.crec_relative_offset_local_header = e.relative_offset_local_header;
 
             match uz.o.lflag {

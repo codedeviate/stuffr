@@ -650,6 +650,31 @@ impl EntrySrc {
     }
 }
 
+impl EntrySrc {
+    // port: fileio.c:fillinbuf
+    /// `fillinbuf()` (ubuntu: -DUSE_BZIP2): the next block read into the
+    /// buffer, the bytes past the entry hidden, the rest decrypted; the
+    /// count left in it, 0 at the end of the file or after a failed
+    /// `read()` (which stays in `G.incnt`, unreported: `UZbunzip2()` takes
+    /// it as running out of data).
+    pub(crate) fn fillinbuf(&mut self) -> i64 {
+        let n = self.zin.read_at(0, INBUFSIZ);
+        self.zin.incnt = n;
+        if n <= 0 {
+            return 0;
+        }
+        // always starts on a block boundary
+        self.zin.cur_zipfile_bufstart = self.zin.cur_zipfile_bufstart.wrapping_add(INBUFSIZ as i64);
+        self.zin.inptr = 0;
+        defer_leftover_input(&mut self.zin, &mut self.csize); // decrements G.csize
+        if let Some(k) = self.keys.as_mut() {
+            let b = (self.zin.incnt.max(0) as usize).min(self.zin.inbuf.len());
+            k.decrypt(&mut self.zin.inbuf[..b]);
+        }
+        self.zin.incnt
+    }
+}
+
 impl ByteSource for EntrySrc {
     /// `NEXTBYTE`: `(G.incnt-- > 0 ? *G.inptr++ : readbyte())`.
     fn next_byte(&mut self) -> Option<u8> {

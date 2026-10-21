@@ -225,8 +225,8 @@ mod unix {
             piped(vec!["-o", "cs.zip"], cs(), b"xq"),
             piped(vec!["-o", "cs.zip"], cs(), b""),
             // listing and testing never pause
-            // (`-z`: `-l` lists dates, which Ubuntu writes year first: Task 13)
             unzip_case("unzip", vec!["-z", "cs.zip"], cs()),
+            unzip_case("unzip", vec!["-l", "cs.zip"], cs()),
             unzip_case("unzip", vec!["-t", "cs.zip"], cs()),
         ];
         for c in &mut cases[..4] {

@@ -5,8 +5,8 @@
 //! so this suite is its own test binary with one test, which sets it for
 //! each group while nothing else runs.
 //!
-//! macOS compares Apple's flavour with `/usr/bin/unzip`; Ubuntu's side
-//! waits for Task 13 (R13).
+//! This platform's flavour against its reference: Apple's on macOS,
+//! Ubuntu's on Linux (`make compat-ubuntu`).
 
 #[cfg(unix)]
 mod compat_harness;
@@ -16,7 +16,6 @@ mod unix {
     use super::compat_harness::*;
 
     #[test]
-    #[cfg_attr(not(target_os = "macos"), ignore = "Task 13 (R13: Ubuntu's side)")]
     fn dos_attributes_under_several_umasks() {
         let dos = |name: &'static [u8], data: &'static [u8], attr: u32| ZipEntrySpec {
             version_made_by: 0x0014,

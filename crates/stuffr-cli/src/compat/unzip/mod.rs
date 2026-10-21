@@ -210,7 +210,6 @@ pub(crate) struct Uz<'a> {
     /// Apple's `fnfilter()` reads the same fact through `isprint()`.
     pub(crate) native_is_utf8: bool,
     /// `G.unicode_escape_all` (ubuntu: -DUNICODE_WCHAR): `-U` given once.
-    #[allow(dead_code)]
     pub(crate) unicode_escape_all: bool,
     /// `checkdir()`'s state: the extraction root (`G.rootpath`,
     /// `G.rootlen`, Apple's `G.rootdir`: apple: globals.c:164, `-1` at
@@ -275,6 +274,10 @@ pub(crate) struct Uz<'a> {
     /// `G.filename`, `FILNAMSIZ` bytes (`flavour::filnamsiz`): the entry's
     /// name as a C string, the bytes past its NUL left from earlier names.
     pub(crate) filename: Vec<u8>,
+    /// `G.filename_full` (ubuntu: -DUNICODE_SUPPORT): the last name read,
+    /// whole, as a C string, for the Unicode Path checksum; `None` (`NULL`)
+    /// until a name is read. Its length is `G.fnfull_bufsize`.
+    pub(crate) filename_full: Option<Vec<u8>>,
     /// `G.crec.relative_offset_local_header` as zipinfo's loop last left
     /// it (after `getZip64Data()` for a selected entry): `zipinfo()` starts
     /// the next archive's `endprev` at 4 when it is 4.
@@ -343,6 +346,7 @@ impl<'a> Uz<'a> {
             expect_ecrec_offset: 0,
             sig: [0; 4],
             filename: vec![0u8; flavour::filnamsiz(flavour)],
+            filename_full: None,
             crec_relative_offset_local_header: 0,
             height: 0,
             width: 0,
