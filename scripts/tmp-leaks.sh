@@ -31,29 +31,42 @@ tmp_root() {
 	printf '%s\n' "$root"
 }
 
-# Names of the stuffr-* entries directly in $1, one per line.
-list_names() {
-	find "$1" -maxdepth 1 -name 'stuffr-*' 2>/dev/null | while IFS= read -r p; do
-		basename "$p"
-	done | sort
+NL='
+'
+
+# Fails (exit 2, with a message) when $1 exists but cannot be listed. A root
+# that does not exist has nothing in it, which is fine.
+require_listable_root() {
+	if [ -e "$1" ] && { [ ! -d "$1" ] || [ ! -r "$1" ] || [ ! -x "$1" ]; }; then
+		echo "tmp-leaks: temp root is not a readable directory: $1" >&2
+		exit 2
+	fi
 }
 
-# Prints the pid embedded in name $1, or nothing.
+# Names of the stuffr-* entries directly in $1, one per line. Names containing
+# a newline are skipped everywhere (listed, checked, swept): a path list split
+# on newlines would turn them into paths outside the root.
+list_names() {
+	find "$1" -mindepth 1 -maxdepth 1 -name 'stuffr-*' ! -name "*${NL}*" \
+		-exec sh -c 'for p; do basename "$p"; done' sh {} + 2>/dev/null | sort
+}
+
+# Prints the pid embedded in name $1 (its first all-digit field after
+# `stuffr-`), or nothing. Pids below 2 (0 and 1 always answer kill -0) are not
+# pids. Parsed with parameter expansion, so nothing is globbed.
 name_pid() {
 	rest=${1#stuffr-}
-	old_ifs=$IFS
-	IFS=-
-	# shellcheck disable=SC2086
-	set -- $rest
-	IFS=$old_ifs
-	for f in "$@"; do
+	while [ -n "$rest" ]; do
+		f=${rest%%-*}
 		case $f in
 		'' | *[!0-9]*) ;;
 		*)
+			if [ "$f" -lt 2 ] 2>/dev/null; then return; fi
 			printf '%s\n' "$f"
 			return
 			;;
 		esac
+		if [ "$rest" = "$f" ]; then rest=; else rest=${rest#*-}; fi
 	done
 }
 
@@ -69,14 +82,17 @@ name_is_live() {
 
 cmd_snapshot() {
 	[ $# -eq 1 ] || { echo 'usage: tmp-leaks.sh snapshot FILE' >&2; exit 2; }
+	root=$(tmp_root)
+	require_listable_root "$root"
 	mkdir -p "$(dirname "$1")"
-	list_names "$(tmp_root)" >"$1"
+	list_names "$root" >"$1"
 }
 
 cmd_check() {
 	[ $# -eq 1 ] || { echo 'usage: tmp-leaks.sh check FILE' >&2; exit 2; }
 	[ -f "$1" ] || { echo "tmp-leaks: no snapshot at $1" >&2; exit 2; }
 	root=$(tmp_root)
+	require_listable_root "$root"
 	leaks=0
 	names=$(list_names "$root")
 	while IFS= read -r n; do
@@ -96,16 +112,19 @@ EOF2
 
 cmd_sweep() {
 	root=$(tmp_root)
-	[ -d "$root" ] || exit 0
+	[ -e "$root" ] || exit 0
+	require_listable_root "$root"
 	swept=0
-	old=$(find "$root" -maxdepth 1 -name 'stuffr-*' -mtime +0 2>/dev/null)
-	while IFS= read -r p; do
-		[ -n "$p" ] || continue
-		name_is_live "$(basename "$p")" && continue
+	old=$(find "$root" -mindepth 1 -maxdepth 1 -name 'stuffr-*' ! -name "*${NL}*" -mtime +0 \
+		-exec sh -c 'for p; do basename "$p"; done' sh {} + 2>/dev/null)
+	while IFS= read -r n; do
+		case $n in '' | */* | . | ..) continue ;; esac
+		p=$root/$n
+		name_is_live "$n" && continue
 		if [ -L "$p" ]; then
 			rm -f -- "$p" || continue
 		else
-			chmod -R u+rwx -- "$p" 2>/dev/null
+			chmod -R u+rwX -- "$p" 2>/dev/null
 			rm -rf -- "$p"
 			[ -e "$p" ] && continue
 		fi
@@ -130,6 +149,7 @@ two_days_ago() {
 
 cmd_selftest() {
 	self=$0
+	case $self in /*) ;; *) self=$PWD/$self ;; esac
 	base=$(mktemp -d "${TMPDIR:-/tmp}/tmp-leaks-selftest.XXXXXX") || exit 1
 	trap 'chmod -R u+rwx "$base" 2>/dev/null; rm -rf "$base"' EXIT INT TERM
 	root=$base/root
@@ -181,6 +201,51 @@ cmd_selftest() {
 	case $out in
 	*"stuffr-x-$$-1"*) selftest_fail 'check named the live-pid folder' ;;
 	esac
+
+	# --- hostile and awkward names ---
+	# A newline name must not make sweep delete a sibling of the cwd.
+	nl_work=$base/cwd
+	mkdir -p "$nl_work/victim"
+	echo v >"$nl_work/victim/f"
+	nl_name="stuffr-x${NL}victim"
+	mkdir "$root/$nl_name"
+	touch -t "$stamp" "$root/$nl_name"
+	mkdir "$root/stuffr-has space"
+	touch -t "$stamp" "$root/stuffr-has space"
+	out=$(cd "$nl_work" && sh "$self" sweep) || selftest_fail 'sweep with newline name failed'
+	[ "$out" = 'swept 1 stale stuffr-* temp folders' ] || selftest_fail "sweep output with odd names: $out"
+	[ -f "$nl_work/victim/f" ] || selftest_fail 'newline name made sweep delete outside the root'
+	[ -d "$root/$nl_name" ] || selftest_fail 'newline-named entry was not skipped'
+	[ ! -e "$root/stuffr-has space" ] || selftest_fail 'old name with a space survived'
+	rmdir "$root/$nl_name"
+	# pids 0 and 1 are not pids: not live, so a new such folder is a leak.
+	mkdir "$root/stuffr-p0-0-1" "$root/stuffr-p1-1-1"
+	out=$(sh "$self" check "$snap" 2>/dev/null) && selftest_fail 'check ignored pid 0/1 folders'
+	case $out in
+	*stuffr-p0-0-1*stuffr-p1-1-1* | *stuffr-p1-1-1*stuffr-p0-0-1*) ;;
+	*) selftest_fail "check did not name both pid 0/1 folders: $out" ;;
+	esac
+	rmdir "$root/stuffr-p0-0-1" "$root/stuffr-p1-1-1"
+	# A root path with a space, and an unreadable root.
+	spaced="$base/root with space"
+	mkdir "$spaced"
+	STUFFR_TMP_ROOT=$spaced sh "$self" snapshot "$base/snap2" || selftest_fail 'snapshot in spaced root failed'
+	mkdir "$spaced/stuffr-y-999999-1"
+	out=$(STUFFR_TMP_ROOT=$spaced sh "$self" check "$base/snap2" 2>/dev/null)
+	[ $? -eq 1 ] || selftest_fail 'check in spaced root did not exit 1'
+	case $out in
+	*"$spaced/stuffr-y-999999-1"*) ;;
+	*) selftest_fail "spaced root leak not named: $out" ;;
+	esac
+	mkdir "$base/noaccess"
+	chmod 000 "$base/noaccess"
+	if [ ! -r "$base/noaccess" ]; then # skipped when running as root
+		STUFFR_TMP_ROOT=$base/noaccess sh "$self" check "$snap" >/dev/null 2>&1
+		[ $? -eq 2 ] || selftest_fail 'check passed on an unreadable root'
+	fi
+	chmod 755 "$base/noaccess"
+	STUFFR_TMP_ROOT=$base/missing sh "$self" check "$snap" >/dev/null 2>&1 \
+		|| selftest_fail 'check failed on a root that does not exist'
 	echo 'tmp-leaks selftest passed'
 }
 

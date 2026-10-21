@@ -40,7 +40,12 @@ check:
 	$(MAKE) --no-print-directory sweep-tmp; \
 	exit $$s
 
-check-legs: deps-guard fmt-check lint doc leak-snapshot test test-pure leak-check release
+# One recipe, run in order, so `make -j` cannot reorder the snapshot, the tests
+# and the leak check.
+check-legs:
+	@for t in deps-guard fmt-check lint doc leak-snapshot test test-pure leak-check release; do \
+	  $(MAKE) --no-print-directory $$t || exit $$?; \
+	done
 	@echo '✓ all gates passed'
 
 # Temp-folder hygiene. Only direct `stuffr-*` children of the user's temp dir
