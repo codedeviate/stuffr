@@ -397,3 +397,96 @@ fn the_owner_comes_from_ux_blocks() {
     );
     assert_eq!(f & EB_UX2_VALID, 0);
 }
+
+/// `n` stored entries `e00.txt`, `e01.txt`, ... with 40 bytes each and
+/// their real CRC, in one archive.
+fn stored_zip(n: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for i in 0..n {
+        let name = format!("e{i:02}.txt");
+        let data = format!("entry {i:02} of the read-count archive.....\n");
+        assert_eq!(data.len(), 40);
+        let mut crc = flate2::Crc::new();
+        crc.update(data.as_bytes());
+        let off = out.len() as u32;
+        let fixed = |v: &mut Vec<u8>| {
+            v.extend_from_slice(&[0; 6]); // flags, method, time
+            v.extend_from_slice(&0x5021u16.to_le_bytes()); // date
+            v.extend_from_slice(&crc.sum().to_le_bytes());
+            v.extend_from_slice(&40u32.to_le_bytes());
+            v.extend_from_slice(&40u32.to_le_bytes());
+            v.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        };
+        out.extend_from_slice(&LOCAL_HDR_SIG);
+        out.extend_from_slice(&[10, 0]);
+        fixed(&mut out);
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(data.as_bytes());
+        central.extend_from_slice(&CENTRAL_HDR_SIG);
+        central.extend_from_slice(&[30, 3, 10, 0]);
+        fixed(&mut central);
+        central.extend_from_slice(&[0; 8]); // extra, comment, disk, internal
+        central.extend_from_slice(&(0o100644u32 << 16).to_le_bytes());
+        central.extend_from_slice(&off.to_le_bytes());
+        central.extend_from_slice(name.as_bytes());
+    }
+    let (at, len, n) = (out.len() as u32, central.len() as u32, n as u16);
+    out.extend(central);
+    out.extend_from_slice(&END_CENTRAL_SIG);
+    out.extend_from_slice(&[0, 0, 0, 0]);
+    out.extend_from_slice(&n.to_le_bytes());
+    out.extend_from_slice(&n.to_le_bytes());
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&at.to_le_bytes());
+    out.extend_from_slice(&[0, 0]);
+    out
+}
+
+/// A 50-entry archive inside one `INBUFSIZ` block is read in whole passes,
+/// never once per entry: at most 4 × its length in every mode, as the
+/// `compat` fuzz target's read bound measures it (the end-record search,
+/// the directory, the local headers' block, and one to spare). The fuzz
+/// bound (`check_unzip_reads`) allows a per-entry block re-read, so this
+/// is the test that sees a per-entry whole-archive re-read at this size.
+/// Measured on both flavours (6,522 bytes): `-t`, `-p` and extraction read
+/// 19,586 (3 passes), `-l`, `-v` and zipinfo 13,064 (2), funzip 4,096 (its
+/// first entry, one stdio buffer).
+#[test]
+fn a_one_block_archive_is_read_in_passes_not_per_entry() {
+    let zip = stored_zip(50);
+    let len = zip.len() as u64;
+    assert!(
+        len <= crate::compat::unzip::fileio::INBUFSIZ as u64,
+        "{len}"
+    );
+    for flavour in [Flavour::Apple, Flavour::Ubuntu] {
+        for (name, args) in [
+            ("unzip", &["-t", "a.zip"][..]),
+            ("unzip", &["-l", "a.zip"]),
+            ("unzip", &["-v", "a.zip"]),
+            ("unzip", &["-p", "a.zip"]),
+            ("unzip", &["-o", "a.zip"]),
+            ("unzip", &["-o", "a.zip", "e4*"]),
+            ("zipinfo", &["-v", "a.zip"]),
+            ("funzip", &["a.zip"]),
+        ] {
+            let d = Dir::with("passes", &[("a.zip", &zip)]);
+            let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+            let (code, _, err, reads) = run_in_counted(flavour, &d.0, name, &args, b"", &|_| None);
+            let r = reads[&d.0.join("a.zip")];
+            assert!(
+                code == 0 || (name == "funzip" && EXIT_CODES_APPLE.contains(&code)),
+                "{flavour:?} {name} {args:?}: exit {code}\n{}",
+                String::from_utf8_lossy(&err)
+            );
+            assert_eq!(r.opens, 1, "{flavour:?} {name} {args:?}");
+            assert!(
+                r.bytes <= 4 * len,
+                "{flavour:?} {name} {args:?}: read {} of {len}",
+                r.bytes
+            );
+        }
+    }
+}

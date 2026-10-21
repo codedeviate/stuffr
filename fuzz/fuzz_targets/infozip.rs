@@ -256,7 +256,8 @@ fn run_unshrink(data: &[u8]) {
     let mut src = data.iter();
     let r = unshrink(&mut src, &mut window, &mut |c| out.flush(c));
     check_stop("unshrink", &out, &r);
-    check_ratio("unshrink", &out, data.len() as u64, UNSHRINK_RATIO);
+    let read = (data.len() - src.len()) as u64;
+    check_ratio("unshrink", &out, read, UNSHRINK_RATIO);
 }
 
 /// `test_key`, checked against an independent decryption of the header,

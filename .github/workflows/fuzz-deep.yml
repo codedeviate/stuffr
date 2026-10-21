@@ -92,12 +92,14 @@ jobs:
         # `infozip` (0.16.0) gets the same 60 s: its flush callback stops
         # every decoder at 8 MiB of output, so a run is milliseconds, and a
         # timeout means a decoder stopped consuming input or output without
-        # stopping (the "decoding terminates" half of its oracle).
+        # stopping (the "decoding terminates" half of its oracle). Its
+        # `-max_len` admits the largest seed, the 34 KiB deflate64 stream,
+        # as the measured 600 s run had it.
         include:
           - target: compat
             extra: -timeout=60
           - target: infozip
-            extra: -timeout=60
+            extra: -timeout=60 -max_len=40000
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

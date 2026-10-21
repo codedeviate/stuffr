@@ -1255,13 +1255,16 @@ fn unzip_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> 
             let zip = unzip_zip(&[ZipSeed::stored("a.txt", short), second]);
             uz(tool, flavour, &["-t", "a.zip"], a, false, &zip)
         }
-        // A symlink leaving the root, then a file under it: the reference
-        // creates the link and refuses (Apple) or, in stuffr's Ubuntu
-        // flavour, also refuses (deviation 3) to write through it.
+        // A symlink leaving the root, to the directory above the sandbox
+        // (which exists), then a file under it. unzip defers a link to the
+        // archive's end (extract.c's `slink_head`), so `l/` is a real
+        // directory here; a mutation, or a link already in place, is what
+        // reaches the escape the resolve-beneath walk refuses (deviation 3)
+        // and `check_unzip_links` watches for.
         "extract-symlink" => {
-            let mut link = ZipSeed::stored("l", b"../../outside");
+            let mut link = ZipSeed::stored("l", b"../..");
             link.mode = 0o120_777;
-            let zip = unzip_zip(&[link, ZipSeed::stored("l/x.txt", short)]);
+            let zip = unzip_zip(&[link, ZipSeed::stored("l/stuffr-fuzz-escape.txt", short)]);
             uz(tool, flavour, &["a.zip"], a, false, &zip)
         }
         // An entry named `a` over the existing file `a`: the replace
@@ -4604,6 +4607,31 @@ fn the_infozip_seeds_carry_their_shape() {
                 let header: &[u8; 12] = rest[1..13].try_into().unwrap();
                 let keys = crypt::test_key(password, header, rest[0]);
                 assert_eq!(keys.is_some(), !s.contains("wrong"), "{shape}");
+                // The whole one decrypts to a deflate stream of the text,
+                // the cut ones to a prefix of it.
+                let Some(mut keys) = keys else { continue };
+                let mut data = rest[13..].to_vec();
+                keys.decrypt(&mut data);
+                let mut window = vec![0u8; stuffr::infozip::WSIZE];
+                let mut plain = Vec::new();
+                let r = inflate(
+                    &mut data.iter(),
+                    (seed[0] / 6) & 1 == 1,
+                    &mut window,
+                    &mut |c: &[u8]| -> Result<(), ()> {
+                        plain.extend_from_slice(c);
+                        Ok(())
+                    },
+                    &mut |_| {},
+                );
+                let text = compat_text(20_000);
+                if s == "crypt-unzip" {
+                    assert!(r.is_ok(), "{shape}: {r:?}");
+                    assert!(plain == text, "{shape}: {} bytes decoded", plain.len());
+                } else {
+                    assert!(r.is_err(), "{shape}: a cut stream decoded whole");
+                    assert!(text.starts_with(&plain), "{shape}: not a prefix");
+                }
             }
         }
     }

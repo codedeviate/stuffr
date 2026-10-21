@@ -1588,13 +1588,77 @@ const UNZIP_RETRIES: &[&str] = &["", ".zip", ".ZIP"];
 /// each from a block boundary.
 const UNZIP_INBUFSIZ: u64 = 8192;
 
-/// How many central-directory records `bytes` could hold: the
-/// `PK\1\2` signatures in it. unzip processes an entry only from a record
-/// that starts with one (`process_cdir_file_hdr`; anything else is
-/// "expected central file header signature not found"), and each record is
-/// read once per pass.
-fn central_signatures(bytes: &[u8]) -> u64 {
-    bytes.windows(4).filter(|w| *w == b"PK\x01\x02").count() as u64
+/// The central-directory records `bytes` could hold: each `PK\1\2` in it
+/// (unzip processes an entry only from a record that starts with one,
+/// `process_cdir_file_hdr`; anything else is "expected central file header
+/// signature not found"), and what reading each record's entry may cost:
+/// its declared compressed size (the u32 at signature + 20, all ones for a
+/// Zip64 entry), clamped to the file's `len`, plus its local header (30
+/// bytes and the larger of the central record's and the local record's
+/// name and extra lengths, the local one looked for at the record's offset
+/// and at that offset plus the preamble the end record implies, where
+/// unzip's `extra_bytes` puts it), plus `2 × INBUFSIZ` for the blocks either
+/// side. A field cut off by the end of the file counts as `len`.
+fn central_records(bytes: &[u8], len: u64) -> (u64, u64) {
+    let le16 = |at: usize| -> Option<u64> {
+        bytes
+            .get(at..at + 2)
+            .map(|b| u64::from(u16::from_le_bytes([b[0], b[1]])))
+    };
+    let le32 = |at: usize| -> Option<u64> {
+        bytes
+            .get(at..at + 4)
+            .map(|b| u64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+    };
+    // The preamble the last end record implies (`extra_bytes`).
+    let preamble = bytes
+        .windows(4)
+        .rposition(|w| w == b"PK\x05\x06")
+        .and_then(|at| Some((at as u64).saturating_sub(le32(at + 16)? + le32(at + 12)?)))
+        .unwrap_or(0);
+    let local_names = |off: u64| -> u64 {
+        usize::try_from(off)
+            .ok()
+            .and_then(|o| Some(le16(o.checked_add(26)?)? + le16(o.checked_add(28)?)?))
+            .unwrap_or(0)
+    };
+    let (mut count, mut charge) = (0u64, 0u64);
+    for (at, _) in bytes
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| *w == b"PK\x01\x02")
+    {
+        count += 1;
+        let csize = le32(at + 20).unwrap_or(len).min(len);
+        let central = match (le16(at + 28), le16(at + 30)) {
+            (Some(n), Some(e)) => n + e,
+            _ => len,
+        };
+        let local = le32(at + 42).map_or(len, |off| {
+            local_names(off).max(local_names(off.saturating_add(preamble)))
+        });
+        charge += csize + 30 + central.max(local) + 2 * UNZIP_INBUFSIZ;
+    }
+    (count, charge)
+}
+
+/// Every name the central-directory records in `bytes` give (the name
+/// length at signature + 28, the name at + 46, cut by the end of the file):
+/// the names an extraction can create.
+fn central_names(bytes: &[u8]) -> Vec<&[u8]> {
+    bytes
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| *w == b"PK\x01\x02")
+        .filter_map(|(at, _)| {
+            let n = usize::from(u16::from_le_bytes([
+                *bytes.get(at + 28)?,
+                *bytes.get(at + 29)?,
+            ]));
+            let from = at + 46;
+            bytes.get(from..(from + n).min(bytes.len()))
+        })
+        .collect()
 }
 
 /// Every regular file under `dir`, by path, with its contents.
@@ -1650,9 +1714,8 @@ fn make_traversable(dir: &Path) {
 }
 
 /// The symlinks under `dir` (unzip creates them with whatever text the
-/// archive gives, as the references do), and the paths they name, joined
-/// lexically onto the link's directory.
-fn symlinks_under(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
+/// archive gives, as the references do).
+fn symlinks_under(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
     while let Some(d) = pending.pop() {
@@ -1663,10 +1726,8 @@ fn symlinks_under(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
             let Ok(kind) = e.file_type() else { continue };
             if kind.is_dir() {
                 pending.push(e.path());
-            } else if kind.is_symlink()
-                && let Ok(target) = std::fs::read_link(e.path())
-            {
-                out.push((e.path(), d.join(target)));
+            } else if kind.is_symlink() {
+                out.push(e.path());
             }
         }
     }
@@ -1722,10 +1783,8 @@ fn check_unzip_cwd(dir: &Path, name: &str, args: &[&str]) {
 ///   references create a link with whatever text the archive holds, and
 ///   writing THROUGH one is what `compat::unzip`'s resolve-beneath walk
 ///   refuses (both flavours; deviation 3). What the exemption could hide,
-///   a write through such a link, is checked instead: no link's target
-///   exists outside the run's directory as a non-directory modified since
-///   the run began (a directory there, the system temporary directory
-///   above the sandbox, say, changes under other processes too);
+///   a write through such a link, is checked instead, by ctime
+///   (`check_unzip_links`);
 /// - no name the run created appeared in the real working directory
 ///   (`check_unzip_cwd`).
 fn run_unzip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]) {
@@ -1735,11 +1794,6 @@ fn run_unzip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]) {
         unzip::Flavour::Apple
     };
     let before = tree_contents(dir);
-    let payload_sigs = before
-        .values()
-        .map(|b| central_signatures(b))
-        .max()
-        .unwrap_or(0);
     let started = SystemTime::now();
     let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
     let (code, out, err, reads) =
@@ -1747,7 +1801,7 @@ fn run_unzip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]) {
             .expect("a COMPAT_NAMES entry is a compat name");
     let why = || String::from_utf8_lossy(&err).into_owned();
     if std::env::var_os("STUFFR_FUZZ_COMPAT_TRACE").is_some() {
-        eprintln!("compat: {name} {flavour:?} {args:?} -> {code} (signatures {payload_sigs})");
+        eprintln!("compat: {name} {flavour:?} {args:?} -> {code}");
         for (path, r) in &reads {
             eprintln!("compat:   {path:?} {r:?}");
         }
@@ -1761,7 +1815,7 @@ fn run_unzip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]) {
         "{name} ({flavour:?}) {args:?}: exit {code} is not one the reference gives\n{}",
         why()
     );
-    check_unzip_reads(dir, name, flavour, args, payload_sigs, &reads);
+    check_unzip_reads(dir, name, flavour, args, &before, &reads);
     make_traversable(dir);
     let written: u64 = tree_contents(dir)
         .into_iter()
@@ -1774,21 +1828,97 @@ fn run_unzip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]) {
          {OUTPUT_BUDGET}-byte budget",
         out.len()
     );
-    for (link, target) in symlinks_under(dir) {
-        if target.starts_with(dir) && !target.components().any(|c| c.as_os_str() == "..") {
+    check_unzip_links(dir, name, flavour, args, &before, started);
+    check_unzip_cwd(dir, name, args);
+}
+
+/// When a path was last changed, as nanoseconds since the epoch: its
+/// `ctime`, which no `utimes` can set back (stuffr's unzip restores each
+/// entry's archive mtime after writing, so an mtime says nothing) and which
+/// setting times itself moves on.
+fn ctime_ns(meta: &std::fs::Metadata) -> i128 {
+    use std::os::unix::fs::MetadataExt;
+    i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec())
+}
+
+/// Nothing was written through a symlink the run extracted. A link whose
+/// target resolves (`canonicalize`) inside the run's directory is the
+/// containment walk's business and skipped; a dangling one names nothing
+/// that exists. For one resolving outside:
+///
+/// - to a non-directory: that file's ctime is from before the run;
+/// - to a directory: every path an archive name places under the link
+///   (each central-directory name of every case file, cut after a
+///   component equal to the link's own name, the rest joined onto the
+///   target, component by component) is absent or has a ctime from before
+///   the run. The directory's own ctime is not judged: the system's
+///   temporary directory above the sandbox changes under other processes.
+///
+/// A write through a link to an existing outside file or directory is the
+/// escape the resolve-beneath walk (`compat::unzip`'s `unix/beneath.rs`,
+/// both flavours, deviation 3) refuses; the containment walk, which sees
+/// only the sandbox parent, cannot see it.
+fn check_unzip_links(
+    dir: &Path,
+    name: &str,
+    flavour: unzip::Flavour,
+    args: &[&str],
+    before: &BTreeMap<PathBuf, Vec<u8>>,
+    started: SystemTime,
+) {
+    let links = symlinks_under(dir);
+    if links.is_empty() {
+        return;
+    }
+    let Ok(real_dir) = std::fs::canonicalize(dir) else {
+        return;
+    };
+    let started = started
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as i128);
+    let names: Vec<&[u8]> = before.values().flat_map(|b| central_names(b)).collect();
+    let changed = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| ctime_ns(&m) >= started);
+    for link in links {
+        let Ok(target) = std::fs::canonicalize(&link) else {
+            continue;
+        };
+        if target.starts_with(&real_dir) {
             continue;
         }
-        if let Ok(meta) = std::fs::symlink_metadata(&target)
-            && !meta.is_dir()
-        {
-            assert!(
-                meta.modified().is_ok_and(|t| t < started),
-                "{name} ({flavour:?}) {args:?}: {target:?}, named by the extracted link \
-                 {link:?}, changed during the run"
-            );
+        let fail = |p: &Path| {
+            panic!(
+                "{name} ({flavour:?}) {args:?}: {p:?}, outside the run's directory through \
+                 the extracted link {link:?}, changed during the run"
+            )
+        };
+        if !target.is_dir() {
+            if changed(&target) {
+                fail(&target);
+            }
+            continue;
+        }
+        let Some(own) = link.file_name().map(|n| n.as_encoded_bytes().to_vec()) else {
+            continue;
+        };
+        for n in &names {
+            let comps: Vec<&[u8]> = n.split(|b| *b == b'/' || *b == b'\\').collect();
+            for (i, c) in comps.iter().enumerate() {
+                if *c != own.as_slice() {
+                    continue;
+                }
+                let mut p = target.clone();
+                for rest in &comps[i + 1..] {
+                    if rest.is_empty() || *rest == b"." || *rest == b".." {
+                        break;
+                    }
+                    p.push(os_path(rest));
+                    if changed(&p) {
+                        fail(&p);
+                    }
+                }
+            }
         }
     }
-    check_unzip_cwd(dir, name, args);
 }
 
 /// The unzip family's read bound, for every path a run opened: the path's
@@ -1798,26 +1928,30 @@ fn run_unzip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]) {
 /// - at most `3 × m` opens (measured: one per archive the run processes;
 ///   unzip and zipinfo open a name, then its `.zip`/`.ZIP` retry, only when
 ///   it fails to open, which a sandbox's file never does twice);
-/// - at most `(signatures + 4) × (len + 2 × INBUFSIZ) × m` bytes, where
-///   `signatures` counts the `PK\1\2` in the payload (`central_signatures`)
-///   and `len` is the file's largest length at an open. **Not linear, and
-///   no linear bound applies:** Apple's build reads an entry's data once
-///   for every central record naming it (it has no overlap check; Ubuntu's
-///   patch 23 refuses the second, exit 12), and data that decodes to
-///   nothing (deflate's empty stored blocks) costs no output budget, so
-///   one 60 KiB entry named by a thousand records reads 60 MB, as Apple's
-///   `unzip -t` itself does. Per pass, each record is read once and its
-///   entry's data at most whole, from the `INBUFSIZ` block holding its
-///   local header to the block after its end (`+ 2 × INBUFSIZ`); the end
-///   record search, the Zip64 locator and directory, and the directory's
-///   re-read after a "missing bytes" correction are the `+ 4` passes.
-///   funzip reads its operand once, a stream from start to stop.
+/// - at most `(4 × (len + 2 × INBUFSIZ) + records) × m` bytes, where `len`
+///   is the file's largest length at an open and `records` is what
+///   `central_records` charges the file's contents: each `PK\1\2` record
+///   its own declared compressed size (clamped to `len`), its local header
+///   and two blocks. The four passes are the end-record search, the Zip64
+///   locator and directory, the central directory, and its re-read after a
+///   "missing bytes" correction. **Not linear, and no linear bound
+///   applies:** Apple's build reads an entry's data once for every central
+///   record naming it (it has no overlap check; Ubuntu's patch 23 refuses
+///   the second, exit 12), and data that decodes to nothing (deflate's
+///   empty stored blocks) costs no output budget, so one 60 KiB entry named
+///   by a thousand records reads 60 MB, as Apple's `unzip -t` itself does.
+///   But a record is charged only what its entry declares, so a run that
+///   re-read the directory or the archive once per entry would not fit; at
+///   fuzz scale the block slack hides that for a small archive, which
+///   `compat::unzip::process::tests::a_one_block_archive_is_read_in_passes_not_per_entry`
+///   pins instead (50 entries in one block: at most `4 × len`). funzip
+///   reads its operand once, a stream from start to stop.
 ///
 /// Measured over the seeds (0.16.0 Task 15, `STUFFR_FUZZ_COMPAT_TRACE=1`,
 /// both flavours): every run opens its archive once. An archive inside one
 /// block is read whole once per pass: the end-record search, the central
-/// directory, then each local header's block (two entries in one block
-/// share it): 3 passes for `-t`, `-p`, extraction and `-l`/`-v`/zipinfo
+/// directory, then each local header's block (entries in one block share
+/// it): 3 passes for `-t`, `-p`, extraction and `-l`/`-v`/zipinfo
 /// alike (`test-stored` 9,344 of 3,108 bytes, `test-implode` 7,259 of
 /// 2,413, `extract-deflate` 1,994 of 658; zipinfo and `-l` 1,336 of 658,
 /// 2 passes, no entry data). Ubuntu's overlapped refusal stops at 512 of
@@ -1827,7 +1961,7 @@ fn check_unzip_reads(
     name: &str,
     flavour: unzip::Flavour,
     args: &[&str],
-    signatures: u64,
+    before: &BTreeMap<PathBuf, Vec<u8>>,
     reads: &BTreeMap<PathBuf, compat::InputReads>,
 ) {
     for (path, r) in reads {
@@ -1849,11 +1983,23 @@ fn check_unzip_reads(
             "{name} ({flavour:?}) {args:?}: {} opens of {file:?}, which {m} token(s) name",
             r.opens
         );
-        let per_pass = r.len + 2 * UNZIP_INBUFSIZ;
+        // The contents the run opened: the case file under that name (a
+        // case-folding filesystem opens `a.zip` for `a.ZIP`).
+        let contents = before.get(path).or_else(|| {
+            before
+                .iter()
+                .find(|(p, _)| {
+                    p.to_string_lossy()
+                        .eq_ignore_ascii_case(&path.to_string_lossy())
+                })
+                .map(|(_, b)| b)
+        });
+        let (count, records) = contents.map_or((0, 0), |b| central_records(b, r.len));
+        let passes = 4 * (r.len + 2 * UNZIP_INBUFSIZ);
         assert!(
-            r.bytes <= (signatures + 4) * per_pass * m,
+            r.bytes <= (passes + records) * m,
             "{name} ({flavour:?}) {args:?}: read {} bytes of the {}-byte {file:?} \
-             ({signatures} central signatures), which {m} token(s) name",
+             ({count} central records charged {records}), which {m} token(s) name",
             r.bytes,
             r.len
         );
@@ -1902,9 +2048,13 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // The unzip family extracts symlinks with the archive's own text
-    // (`run_unzip` checks nothing was written through one); every other
-    // family creates none.
-    let links: Vec<PathBuf> = symlinks_under(&dir).into_iter().map(|(l, _)| l).collect();
+    // (`check_unzip_links` checks nothing was written through one); every
+    // other family creates none, and is held to every rule.
+    let links: Vec<PathBuf> = if matches!(case.name, "unzip" | "zipinfo" | "funzip") {
+        symlinks_under(&dir)
+    } else {
+        Vec::new()
+    };
     let links: Vec<&Path> = links.iter().map(PathBuf::as_path).collect();
     check_extraction_contained(parent, &dir, &links).expect("compat: contained");
     check_cwd_untouched();
