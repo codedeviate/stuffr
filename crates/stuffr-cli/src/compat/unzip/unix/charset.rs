@@ -192,7 +192,9 @@ mod tests {
     #[test]
     fn iconv_converts_and_refuses_as_glibc_does() {
         let cp866 = iconv(b"UTF-8", b"CP866", b"\x82t", 4096).unwrap();
-        assert_eq!(&cp866[..4], "\u{412}t".as_bytes());
+        // the buffer is zero-filled; the caller reads up to the first NUL
+        let end = cp866.iter().position(|&b| b == 0).unwrap_or(cp866.len());
+        assert_eq!(&cp866[..end], "\u{412}t".as_bytes());
         // output longer than the buffer: E2BIG, the string stays
         assert_eq!(iconv(b"UTF-8", b"CP866", &[0x82; 3000], 4096), None);
         assert_eq!(iconv(b"ANSI_X3.4-1968", b"CP850", b"\x82", 4096), None);
