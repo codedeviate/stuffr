@@ -49,9 +49,11 @@ mod tests;
 
 /// What a decoder reads: unzip's `NEXTBYTE` over `csize` bytes of the entry
 /// (already decrypted). `None` is unzip's EOF (`csize` exhausted, or a read
-/// error the caller remembers and reports itself). Once it has returned
-/// `None` it must keep doing so, as unzip's `readbyte()` does: the decoders'
-/// read-beyond-EOF tolerance relies on it.
+/// error the caller remembers and reports itself). Once
+/// [`next_byte`](Self::next_byte) has returned `None` it must keep doing
+/// so, as unzip's `readbyte()` does: [`explode()`] and [`unshrink()`] read
+/// through it, and their read-beyond-EOF tolerance relies on it. Only
+/// [`next_bits`](Self::next_bits) may give `Some` again after a `None`.
 pub trait ByteSource {
     /// The next byte of the entry, or `None` at unzip's EOF.
     fn next_byte(&mut self) -> Option<u8>;

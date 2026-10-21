@@ -122,8 +122,9 @@ Coverage gaps
    hand-built in Task 5 (plan ruling P5): implode-hand-*.zip above.
  * deflate64 match distance > 32 KiB in deflate64-lorem.zip: verified in
    Task 4 (P6). The longest distance the stream uses is 65521 (counted by
-   the port, `deflate64_fixture`), so it reaches distance codes 30/31 and
-   no hand-built stream was needed.
+   the port, `deflate64_fixture`), so it reaches distance code 31
+   (49153-65536); code 30 (32769-49152) is not shown to be reached, and
+   no hand-built stream was made for it.
  * zip2's deflate64_issue_25.zip was rejected: both references reject it
    (exit 3, "missing 2166816915 bytes in zipfile").
 
