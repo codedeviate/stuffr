@@ -691,6 +691,11 @@ fn main(
         host::arm_interrupt_exit(&host, host::UNZIP_SIGNALS, IZ_CTRLC, m::HANDLER_TEXT);
     let mut uz = Uz::new(host, flavour, env, err);
     uz.native_is_utf8 = fileio::init_locale(&uz.host);
+    // ubuntu: 20-unzip60-alt-iconv-utf8.patch (unzip.c: `#ifdef UNIX
+    // init_conversion_charsets()`, before the options are read)
+    if flavour::iconv_charsets(flavour) {
+        unix::charset::init_conversion_charsets(&mut uz);
+    }
     let code = unzip(&mut uz, argv0, args);
     let _ = uz.out.flush();
     code

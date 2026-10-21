@@ -157,6 +157,15 @@ pub(super) const ZIPINFO_USAGE_LINE3: &str = concat!(
     "  -C  be case-insensitive     -M  page output through built-in \"more\"\n",
     "  -x  exclude filenames that follow from listing\n",
 );
+/// ubuntu: 20-unzip60-alt-iconv-utf8.patch, uz_opts()'s and zi_opts()'s
+/// `-I`/`-O` refusals (no newline: `Info(slide, 0x401, ...)`). A `-O`
+/// whose attached name starts with `-` prints the `-I` text too (the
+/// patch's copy).
+pub(super) const ENCODINGS_NEGATED: &str = "error:  encodings can't be negated";
+pub(super) const ENCODING_SHOULD_FOLLOW_I: &str =
+    "error:  a valid character encoding should follow the -I argument";
+pub(super) const ENCODING_SHOULD_FOLLOW_O: &str =
+    "error:  a valid character encoding should follow the -O argument";
 /// ubuntu: 20-unzip60-alt-iconv-utf8.patch, the end of its Unix
 /// `ZipInfoUsageLine3`.
 pub(super) const ZIPINFO_USAGE_ICONV: &str = concat!(
@@ -236,6 +245,30 @@ pub(super) const ENV_OPTIONS: &str = "\nUnZip and ZipInfo environment options:\n
 pub(super) const NONE: &str = "[none]";
 
 // ---- unzip.c: help_extended() ----
+
+/// ubuntu: 20-unzip60-alt-iconv-utf8.patch's `-hh` entries: each group is
+/// printed after the line of [`HELP_EXTENDED`] it names.
+pub(super) const HELP_EXTENDED_ICONV: &[(&str, &[&str])] = &[
+    (
+        "         standard header.",
+        &["  -I CHARSET  [UNIX] Specify a character encoding for UNIX and other archives."],
+    ),
+    (
+        "         care.",
+        &[
+            "  -O CHARSET  [UNIX] Specify a character encoding for DOS, Windows",
+            "                and OS/2 archives.",
+        ],
+    ),
+    (
+        "  -z  Include archive comment if any in listing.",
+        &[
+            "  -O CHARSET  [UNIX] Specify a character encoding for DOS, Windows",
+            "                and OS/2 archives.",
+            "  -I CHARSET  [UNIX] Specify a character encoding for UNIX and other archives.",
+        ],
+    ),
+];
 
 /// unzip.c:help_extended()'s `text[]`, each element printed with `%s\n`.
 pub(super) const HELP_EXTENDED: &[&str] = &[

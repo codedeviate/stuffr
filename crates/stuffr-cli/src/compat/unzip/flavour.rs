@@ -72,13 +72,14 @@ pub(crate) fn use_bzip2(f: Flavour) -> bool {
 
 /// `20-unzip60-alt-iconv-utf8.patch`, Ubuntu only: the usage texts gain the
 /// `-O CHARSET` and `-I CHARSET` lines (and unzip's a blank line after
-/// them), and unzip and zipinfo accept `-O`/`-I` (`Options::oem_cp`,
-/// `Options::iso_cp`; deviation 5).
-///
-/// Pass-through until Task 14: Apple's answer (`false`) for both. Task 14
-/// also ports the patch's `-O`/`-I` cases in `uz_opts` and `zi_opts`.
-pub(crate) fn iconv_charsets(_f: Flavour) -> bool {
-    false
+/// them), `-hh` its three entries, unzip and zipinfo accept `-O`/`-I`
+/// (`Options::oem_cp`, `Options::iso_cp`), `OEM_CP` defaults from the
+/// locale, and names and comments are converted from them through
+/// `iconv(3)` in place of the OEM 850 table (`unix::charset`,
+/// `fileio::ext_ascii_to_native`; deviation 5). Apple's build has no
+/// `-O`/`-I`: a bad option, the usage and exit 10.
+pub(crate) fn iconv_charsets(f: Flavour) -> bool {
+    f == Flavour::Ubuntu
 }
 
 /// `UnzipUsageLine1`'s first line, unzip's banner (usage and `-v`), R2's

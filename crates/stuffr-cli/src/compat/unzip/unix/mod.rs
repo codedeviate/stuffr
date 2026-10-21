@@ -11,6 +11,7 @@ use super::{Uz, flavour};
 
 pub(crate) mod attrs;
 pub(crate) mod beneath;
+pub(crate) mod charset;
 pub(crate) mod mapname;
 
 /// `do_wild()`'s state (`SYSTEM_SPECIFIC_GLOBALS`: `wild_dir`, `wildname`,

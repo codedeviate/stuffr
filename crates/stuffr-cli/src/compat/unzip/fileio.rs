@@ -14,6 +14,7 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use super::messages as m;
+use super::unix::charset;
 use super::{PK_COOL, PK_EOF, PK_ERR, PK_OK, PK_WARN, Uz, flavour};
 use crate::compat::host::{Host, InFile};
 
@@ -291,14 +292,33 @@ fn here_plus(uz: &Uz, length: usize) -> i64 {
 /// code page 850 (`_OEM_INTERN`, `oem2iso_850`); everything else is ISO
 /// 8859-1 already (`_ISO_INTERN` is `A_TO_N`, nothing on ASCII). In
 /// place, up to the string's NUL.
-/// ubuntu: 20-unzip60-alt-iconv-utf8.patch replaces this conversion (Task
-/// 14; `flavour::iconv_charsets`).
-pub(crate) fn ext_ascii_to_native(s: &mut [u8], p: &PInfo, islochdr: bool) {
+/// ubuntu: 20-unzip60-alt-iconv-utf8.patch makes `_OEM_INTERN` and
+/// `_ISO_INTERN` `oem_intern()` and `iso_intern()`: the string converted
+/// from `OEM_CP` or `ISO_CP` to the locale's character set through
+/// `iconv(3)` (`unix::charset`), or left as it is (no table); and every
+/// Windows NT archive is OEM, whatever its version. On success the
+/// string's buffer is rewritten as `strncpy(string, buf, FILNAMSIZ)` does:
+/// the converted text, then zeros up to `FILNAMSIZ` bytes.
+pub(crate) fn ext_ascii_to_native(uz: &Uz, s: &mut [u8], p: &PInfo, islochdr: bool) {
+    let ubuntu = flavour::iconv_charsets(uz.flavour);
     let oem = (p.hostnum == FS_FAT_
         && !((islochdr || p.has_ux_att)
             && (p.hostver == 25 || p.hostver == 26 || p.hostver == 40)))
         || p.hostnum == FS_HPFS_
-        || (p.hostnum == FS_NTFS_ && p.hostver == 50);
+        // ubuntu: 20-unzip60-alt-iconv-utf8.patch (`/* && (hostver) == 50 */`)
+        || (p.hostnum == FS_NTFS_ && (ubuntu || p.hostver == 50));
+    if ubuntu {
+        // ubuntu: 20-unzip60-alt-iconv-utf8.patch
+        let from = if oem { &uz.o.oem_cp } else { &uz.o.iso_cp };
+        let buflen = flavour::filnamsiz(uz.flavour);
+        if let Some(out) = charset::charset_to_intern(&uz.host, s, from, buflen) {
+            let n = s.len().min(buflen);
+            s[..n].fill(0);
+            let k = out.len().min(n);
+            s[..k].copy_from_slice(&out[..k]);
+        }
+        return;
+    }
     if oem {
         for b in s.iter_mut() {
             if *b == 0 {
@@ -376,7 +396,12 @@ pub(crate) fn do_string(
                 if option == DoString::Displ8
                     && let Some(p) = pinfo
                 {
-                    ext_ascii_to_native(&mut text, p, false);
+                    // `G.outbuf` is longer than `FILNAMSIZ`: the converted
+                    // text is a C string in it
+                    let mut buf = text.clone();
+                    buf.resize((text.len() + 1).max(flavour::filnamsiz(uz.flavour)), 0);
+                    ext_ascii_to_native(uz, &mut buf, p, false);
+                    text = c_str(&buf).to_vec();
                 }
                 // ASCII, filter out ANSI escape sequences and handle ^S
                 let mut q = 0usize;
@@ -480,7 +505,7 @@ pub(crate) fn read_filename(uz: &mut Uz, length: usize, pinfo: &PInfo, islochdr:
     // A short read keeps the bytes past it from the earlier name.
     name[length] = 0; // terminate w/zero:  ASCIIZ
 
-    native_name(&mut name, length, pinfo, islochdr);
+    native_name(uz, &mut name, length, pinfo, islochdr);
     uz.filename = name;
 
     if block_len == 0 {
@@ -503,10 +528,10 @@ pub(crate) fn read_filename(uz: &mut Uz, length: usize, pinfo: &PInfo, islochdr:
 /// What `do_string(DS_FN)` does to a name once read: the host's code page
 /// converted, lowercased under `lcflag`, a volume label's dot after 8
 /// characters removed.
-fn native_name(name: &mut [u8], length: usize, pinfo: &PInfo, islochdr: bool) {
+fn native_name(uz: &Uz, name: &mut [u8], length: usize, pinfo: &PInfo, islochdr: bool) {
     // translate the Zip entry filename coded in host-dependent "extended
     // ASCII" into the compiler's (system's) internal text code page
-    ext_ascii_to_native(name, pinfo, islochdr);
+    ext_ascii_to_native(uz, name, pinfo, islochdr);
 
     if pinfo.lcflag {
         // replace with lowercase filename
@@ -558,7 +583,7 @@ fn read_filename_full(uz: &mut Uz, length: usize, pinfo: &PInfo, islochdr: bool)
     strncpy(&mut name, &full, length);
     name[length] = 0; // terminate w/zero:  ASCIIZ
     uz.filename_full = Some(full);
-    native_name(&mut name, length, pinfo, islochdr);
+    native_name(uz, &mut name, length, pinfo, islochdr);
     uz.filename = name;
     error
 }

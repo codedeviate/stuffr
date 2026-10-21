@@ -685,9 +685,10 @@ mod linux {
         ]
         .iter()
         .map(|a| case("unzip", a, &files, &[]))
+        // zipinfo has no `-F`: its usage, with the `-O`/`-I` lines of
+        // 20-unzip60-alt-iconv-utf8.patch
+        .chain([case("zipinfo", &["-F", "acorn.zip"], &files, &[])])
         .collect();
-        // (zipinfo has no `-F`: its usage, whose `-O`/`-I` lines are
-        // 20-unzip60-alt-iconv-utf8.patch's, Task 14)
         check("Acorn filetypes", &cases);
 
         // -W
@@ -1195,6 +1196,68 @@ mod linux {
         v
     }
 
+    /// An entry made on `host` (its version 2.0, or `ver`), MS-DOS
+    /// attributes only.
+    fn dos_entry<'a>(name: &'a [u8], host: u16, ver: u16) -> ZipEntrySpec<'a> {
+        ZipEntrySpec {
+            version_made_by: (host << 8) | ver,
+            external_attr: 0x20,
+            ..ZipEntrySpec::new(name, b"1")
+        }
+    }
+
+    /// 20-unzip60-alt-iconv-utf8.patch's inputs: names with high bytes from
+    /// MS-DOS (2.0, and PKZIP 2.5, whose local name is ISO), Windows NT (2.0
+    /// and 5.0: the patch makes every NT version OEM), OS/2 and Unix; a name
+    /// whose conversion overflows `FILNAMSIZ` (left as stored) and one that
+    /// just fits; a name that is not UTF-8; a directory; comments.
+    fn iconv_zips() -> Vec<(&'static str, Vec<u8>)> {
+        let long = vec![0x82u8; 3000];
+        let mid = vec![0x82u8; 2000];
+        let dir = ZipEntrySpec {
+            external_attr: 0x10,
+            ..dos_entry(b"d\x82r/", 0, 20)
+        };
+        vec![
+            (
+                "dos.zip",
+                zip_with(
+                    &[
+                        dos_entry(b"\x82t\xe9.txt", 0, 20),
+                        dos_entry(b"\x8e\x99\x9a.txt", 11, 20),
+                        dos_entry(b"\x8e\x99\x9a5.txt", 11, 50),
+                        ZipEntrySpec::new(b"\xe9plain.txt", b"4"),
+                        dos_entry(b"\x80\x81hpfs.txt", 6, 20),
+                        dos_entry(b"pk25\x82.txt", 0, 25),
+                    ],
+                    b"caf\x82 archive comment",
+                    b"",
+                ),
+            ),
+            ("long.zip", zip_with(&[dos_entry(&long, 0, 20)], b"", b"")),
+            ("mid.zip", zip_with(&[dos_entry(&mid, 0, 20)], b"", b"")),
+            (
+                "unix.zip",
+                zip_with(
+                    &[
+                        ZipEntrySpec::new(b"\xc0\xc1\xe9.txt", b"1"),
+                        ZipEntrySpec::new(b"plain.txt", b"2"),
+                    ],
+                    b"",
+                    b"",
+                ),
+            ),
+            (
+                "bad.zip",
+                zip_with(&[dos_entry(b"bad\xc3(.txt", 0, 20)], b"", b""),
+            ),
+            (
+                "dir.zip",
+                zip_with(&[dir, dos_entry(b"d\x82r/f\x82.txt", 0, 20)], b"", b""),
+            ),
+        ]
+    }
+
     /// Ubuntu's patch series (Task 14), against its binary, one group per
     /// patch or set of patches. The probes behind each are in
     /// `.claude/rules/compat.md`, "Task 14 probes".
@@ -1246,5 +1309,76 @@ mod linux {
             cases.push(case("unzip", args, &files, &[]));
         }
         check("CVE-2019-13232", &cases);
+
+        // 20-unzip60-alt-iconv-utf8: -O/-I, the default OEM_CP per locale
+        let files = iconv_zips();
+        let mut cases = Vec::new();
+        for env in PROMISED.iter().chain(&LOCALES[6..]) {
+            for args in [
+                &["-l", "dos.zip"][..],
+                &["-O", "CP866", "-l", "dos.zip"],
+                &["-O", "CP437", "-l", "dos.zip"],
+                &["-O", "cp1251", "-v", "dos.zip"],
+                &["-I", "ISO-8859-5", "-l", "unix.zip"],
+                &["-l", "unix.zip"],
+                &["-O", "UTF-8", "-l", "bad.zip"],
+                &["-O", "UTF-16", "-l", "dos.zip"],
+                &["-O", "CP866", "-l", "long.zip"],
+                &["-O", "CP866", "-l", "mid.zip"],
+                &["-O", "CP866", "-z", "dos.zip"],
+                &["-O", "CP866", "dos.zip"],
+                &["-O", "CP866", "-t", "dos.zip"],
+                &["-O", "CP866", "dir.zip"],
+                &["-O", "CP866", "-I", "ISO-8859-5", "-l", "dos.zip"],
+                &["-O", "CP866", "-O", "CP437", "-l", "dos.zip"],
+                &["-OCP866", "-l", "dos.zip"],
+                &["-lOCP866", "dos.zip"],
+                &["-OCP866q", "-l", "dos.zip"],
+                &["-O", "", "-l", "dos.zip"],
+                &["-O", "BOGUS", "-l", "dos.zip"],
+                &["-O", "CP866xxxxxxxxxxxxxxxxxxx", "-l", "dos.zip"],
+                &["-O", "CP866xxxxxxxxxxxxxxxxxxxxxxxx", "-l", "dos.zip"],
+                &["-x", "-O", "CP866", "dos.zip"],
+                &["-Z", "-O", "CP866", "dos.zip"],
+            ] {
+                cases.push(case("unzip", args, &files, env));
+            }
+            for args in [
+                &["-O", "CP866", "dos.zip"][..],
+                &["dos.zip"],
+                &["-I", "ISO-8859-5", "-1", "unix.zip"],
+                &["-O", "CP866", "-v", "dos.zip"],
+                &["-1O", "CP866", "dos.zip"],
+            ] {
+                cases.push(case("zipinfo", args, &files, env));
+            }
+            let mut c = case("unzip", &["-l", "dos.zip"], &files, env);
+            c.env.push(("UNZIP", "-OCP866"));
+            cases.push(c);
+        }
+        for args in [
+            &["-O"][..],
+            &["-O", "-l", "dos.zip"],
+            &["-O-l", "dos.zip"],
+            &["-I"],
+            &["-I", "-l", "dos.zip"],
+            &["-I-", "dos.zip"],
+            &["--O", "CP866", "-l", "dos.zip"],
+            &["--I", "CP866", "-l", "dos.zip"],
+            &["-t", "-O"],
+            &["-hh"],
+        ] {
+            cases.push(case("unzip", args, &files, &[]));
+        }
+        for args in [
+            &["-O"][..],
+            &["-O", "-1", "dos.zip"],
+            &["--O", "x", "dos.zip"],
+            &["-I-x", "dos.zip"],
+            &[],
+        ] {
+            cases.push(case("zipinfo", args, &files, &[]));
+        }
+        check("20-unzip60-alt-iconv-utf8", &cases);
     }
 }

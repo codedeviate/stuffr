@@ -2721,7 +2721,6 @@ mod unix {
     /// Task 14's rows: Ubuntu's answers that need its patch series (each
     /// `Both` row names its patch: [`Row::needs_patch`]).
     #[test]
-    #[ignore = "Task 14"]
     fn task14_rows_match_stuffr() {
         differential(14);
     }

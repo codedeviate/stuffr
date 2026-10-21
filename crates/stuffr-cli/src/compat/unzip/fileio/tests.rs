@@ -167,31 +167,56 @@ fn makeint64_leaves_out_byte_5_as_upstream_does() {
 
 #[test]
 fn oem_names_are_code_page_850() {
-    let dos = PInfo {
-        hostnum: FS_FAT_,
-        hostver: 20,
-        ..PInfo::default()
-    };
-    let mut s = *b"caf\x82\0\x82";
-    ext_ascii_to_native(&mut s, &dos, false);
-    // Converted up to the NUL only.
-    assert_eq!(&s, b"caf\xe9\0\x82");
-    // PKZIP 2.5 with Unix attributes: already ISO 8859-1.
-    let pk25 = PInfo {
-        hostver: 25,
-        has_ux_att: true,
-        ..dos
-    };
-    let mut s = *b"\x82";
-    ext_ascii_to_native(&mut s, &pk25, false);
-    assert_eq!(&s, b"\x82");
-    let unix = PInfo {
-        hostnum: 3,
-        ..PInfo::default()
-    };
-    let mut s = *b"\x82";
-    ext_ascii_to_native(&mut s, &unix, false);
-    assert_eq!(&s, b"\x82");
+    with_uz(|uz| {
+        let dos = PInfo {
+            hostnum: FS_FAT_,
+            hostver: 20,
+            ..PInfo::default()
+        };
+        let mut s = *b"caf\x82\0\x82";
+        ext_ascii_to_native(uz, &mut s, &dos, false);
+        // Converted up to the NUL only.
+        assert_eq!(&s, b"caf\xe9\0\x82");
+        // PKZIP 2.5 with Unix attributes: already ISO 8859-1.
+        let pk25 = PInfo {
+            hostver: 25,
+            has_ux_att: true,
+            ..dos
+        };
+        let mut s = *b"\x82";
+        ext_ascii_to_native(uz, &mut s, &pk25, false);
+        assert_eq!(&s, b"\x82");
+        let unix = PInfo {
+            hostnum: 3,
+            ..PInfo::default()
+        };
+        let mut s = *b"\x82";
+        ext_ascii_to_native(uz, &mut s, &unix, false);
+        assert_eq!(&s, b"\x82");
+    });
+}
+
+/// ruling: T14-4. The Ubuntu flavour has no OEM table (20-unzip60-alt-
+/// iconv-utf8.patch): a sandbox converts nothing, a Windows NT name of any
+/// version included.
+#[test]
+fn ubuntu_names_stay_as_stored_in_a_sandbox() {
+    let env = |_: &str| None;
+    let mut err: Vec<u8> = Vec::new();
+    let mut uz = Uz::new(sandbox(), Flavour::Ubuntu, &env, &mut err);
+    crate::compat::unzip::unix::charset::init_conversion_charsets(&mut uz);
+    assert!(uz.o.oem_cp.is_empty());
+    uz.o.oem_cp = b"CP866".to_vec();
+    for (hostnum, hostver) in [(FS_FAT_, 20), (FS_NTFS_, 20), (FS_NTFS_, 50)] {
+        let p = PInfo {
+            hostnum,
+            hostver,
+            ..PInfo::default()
+        };
+        let mut s = *b"caf\x82\0\x82";
+        ext_ascii_to_native(&uz, &mut s, &p, false);
+        assert_eq!(&s, b"caf\x82\0\x82");
+    }
 }
 
 /// ruling: T11-5. The first password prompt names the archive and the

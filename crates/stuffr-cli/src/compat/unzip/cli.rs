@@ -18,6 +18,7 @@ use std::ffi::OsString;
 
 use super::flavour;
 use super::messages::{self as m, printf};
+use super::unix::charset;
 use super::{MSG_STDERR, PK_COOL, PK_OK, PK_PARAM, Uz};
 
 /// What the command line asks for once it has parsed: the archive operand,
@@ -119,11 +120,13 @@ pub(crate) struct Options {
     /// when standard output is not a terminal).
     pub m_flag: bool,
     /// `-I CHARSET` (Ubuntu's `20-unzip60-alt-iconv-utf8.patch`): `ISO_CP`,
-    /// the encoding of names from Unix and other archives (Task 14).
-    pub iso_cp: Option<Vec<u8>>,
+    /// the encoding of names from Unix and other archives, as a C string
+    /// of at most `MAX_CP_NAME` bytes (empty: no conversion).
+    pub iso_cp: Vec<u8>,
     /// `-O CHARSET` (the same patch): `OEM_CP`, the encoding of names from
-    /// DOS, Windows and OS/2 archives (Task 14).
-    pub oem_cp: Option<Vec<u8>>,
+    /// DOS, Windows and OS/2 archives (its default guessed from the locale:
+    /// `unix::charset::init_conversion_charsets`).
+    pub oem_cp: Vec<u8>,
 }
 
 impl Options {
@@ -563,6 +566,13 @@ fn uz_opts(uz: &mut Uz, argv: &[Vec<u8>]) -> Result<usize, i32> {
                         showhelp = if arg.get(s) == Some(&b'h') { 2 } else { 1 };
                     }
                 }
+                // ubuntu: 20-unzip60-alt-iconv-utf8.patch
+                b'I' | b'O' if flavour::iconv_charsets(f) => {
+                    let rest = &arg[s..];
+                    charset_option(uz, c == b'O', negative, rest, argv, &mut p, &mut argc)?;
+                    // No params straight after charset name
+                    s = arg.len();
+                }
                 b'j' => {
                     // junk pathnames/directory structure
                     if negative != 0 {
@@ -973,6 +983,13 @@ fn zi_opts(uz: &mut Uz, argv: &[Vec<u8>]) -> Result<usize, i32> {
                         }
                     }
                 }
+                // ubuntu: 20-unzip60-alt-iconv-utf8.patch
+                b'I' | b'O' if flavour::iconv_charsets(f) => {
+                    let rest = &arg[s..];
+                    charset_option(uz, c == b'O', negative, rest, argv, &mut p, &mut argc)?;
+                    // No params straight after charset name
+                    s = arg.len();
+                }
                 b'T' => {
                     // use (sortable) decimal time format
                     if negative != 0 {
@@ -1123,11 +1140,75 @@ pub(crate) fn usage(uz: &mut Uz, error: bool) -> i32 {
 /// `unzip -hh`: the extended help, to standard output. Each line is printed
 /// with `"%s\n"`, so its text is not a format (`%%` stays two bytes).
 fn help_extended(uz: &mut Uz) {
+    let iconv = flavour::iconv_charsets(uz.flavour);
     for line in m::HELP_EXTENDED {
         let mut l = line.as_bytes().to_vec();
         l.push(b'\n');
         uz.info(0, &l);
+        // ubuntu: 20-unzip60-alt-iconv-utf8.patch
+        if iconv && let Some((_, more)) = m::HELP_EXTENDED_ICONV.iter().find(|(a, _)| a == line) {
+            for extra in *more {
+                let mut l = extra.as_bytes().to_vec();
+                l.push(b'\n');
+                uz.info(0, &l);
+            }
+        }
     }
+}
+
+// port: unzip.c:uz_opts, zipinfo.c:zi_opts (ubuntu: 20-unzip60-alt-iconv-
+// utf8.patch's `case ('I')` and `case ('O')`)
+/// `-I CHARSET` / `-O CHARSET` (`oem`): the name is the rest of the
+/// argument (`-Icharset`; none may start with `-`) or the next argument
+/// (which must not start with `-`), kept as `strncpy()` keeps it
+/// (`charset::cp_name`); either way the rest of the argument is used up.
+/// `Err(PK_PARAM)`, after the patch's message, when negated or missing.
+/// ruling: T14-7. `-I ''` makes the C's `while(*(++s));` step past the
+/// empty string's NUL (undefined behaviour); its defined effect, an empty
+/// `ISO_CP` (no conversion) and nothing more of that argument, is kept.
+fn charset_option(
+    uz: &mut Uz,
+    oem: bool,
+    negative: i32,
+    rest: &[u8],
+    argv: &[Vec<u8>],
+    p: &mut usize,
+    argc: &mut i64,
+) -> Result<(), i32> {
+    if negative != 0 {
+        uz.info(0x401, m::ENCODINGS_NEGATED.as_bytes());
+        return Err(PK_PARAM);
+    }
+    let name = if !rest.is_empty() {
+        // Handle the -Icharset case. Assume that charsets can't start with
+        // a dash to spot arguments misuse.
+        if rest[0] == b'-' {
+            uz.info(0x401, m::ENCODING_SHOULD_FOLLOW_I.as_bytes());
+            return Err(PK_PARAM);
+        }
+        rest.to_vec()
+    } else {
+        // -I charset
+        *p += 1;
+        *argc -= 1;
+        if !(*argc > 0 && argv.get(*p).is_some_and(|a| a.first() != Some(&b'-'))) {
+            let msg = if oem {
+                m::ENCODING_SHOULD_FOLLOW_O
+            } else {
+                m::ENCODING_SHOULD_FOLLOW_I
+            };
+            uz.info(0x401, msg.as_bytes());
+            return Err(PK_PARAM);
+        }
+        argv[*p].clone()
+    };
+    let cp = charset::cp_name(&name);
+    if oem {
+        uz.o.oem_cp = cp;
+    } else {
+        uz.o.iso_cp = cp;
+    }
+    Ok(())
 }
 
 // port: unzip.c:show_version_info
