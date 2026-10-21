@@ -8,7 +8,10 @@
 #   tmp-leaks.sh selftest        run all of the above in a fake temp dir
 #
 # Scope: only direct children of the user's temp directory named `stuffr-*`.
-# `STUFFR_TMP_ROOT` replaces that directory and exists for the self-test only.
+# The directory follows Rust's `std::env::temp_dir()`, which is what the tests
+# use: `$TMPDIR` when set and non-empty, else (macOS) the per-user temp dir,
+# else `/tmp`. It must be absolute. `STUFFR_TMP_ROOT` replaces it and exists
+# for the self-test only.
 # Symlinks are never followed: a `stuffr-*` link is removed as a link.
 #
 # A name's pid is its first all-digit `-`-separated field after `stuffr-`
@@ -21,13 +24,22 @@ set -u
 tmp_root() {
 	if [ -n "${STUFFR_TMP_ROOT:-}" ]; then
 		root=$STUFFR_TMP_ROOT
+	elif [ -n "${TMPDIR:-}" ]; then
+		root=$TMPDIR
 	elif [ "$(uname -s)" = Darwin ] && d=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null) && [ -n "$d" ]; then
 		root=$d
 	else
-		root=${TMPDIR:-/tmp}
+		root=/tmp
 	fi
 	# Strip trailing slashes, but keep a bare "/".
 	while [ "${root%/}" != "$root" ] && [ "$root" != / ]; do root=${root%/}; done
+	case $root in
+	/*) ;;
+	*)
+		echo "tmp-leaks: temp root is not an absolute path: $root" >&2
+		exit 2
+		;;
+	esac
 	printf '%s\n' "$root"
 }
 
@@ -47,7 +59,7 @@ require_listable_root() {
 # a newline are skipped everywhere (listed, checked, swept): a path list split
 # on newlines would turn them into paths outside the root.
 list_names() {
-	find "$1" -mindepth 1 -maxdepth 1 -name 'stuffr-*' ! -name "*${NL}*" \
+	find "$1/" -mindepth 1 -maxdepth 1 -name 'stuffr-*' ! -name "*${NL}*" \
 		-exec sh -c 'for p; do basename "$p"; done' sh {} + 2>/dev/null | sort
 }
 
@@ -82,7 +94,7 @@ name_is_live() {
 
 cmd_snapshot() {
 	[ $# -eq 1 ] || { echo 'usage: tmp-leaks.sh snapshot FILE' >&2; exit 2; }
-	root=$(tmp_root)
+	root=$(tmp_root) || exit 2
 	require_listable_root "$root"
 	mkdir -p "$(dirname "$1")"
 	list_names "$root" >"$1"
@@ -91,7 +103,7 @@ cmd_snapshot() {
 cmd_check() {
 	[ $# -eq 1 ] || { echo 'usage: tmp-leaks.sh check FILE' >&2; exit 2; }
 	[ -f "$1" ] || { echo "tmp-leaks: no snapshot at $1" >&2; exit 2; }
-	root=$(tmp_root)
+	root=$(tmp_root) || exit 2
 	require_listable_root "$root"
 	leaks=0
 	names=$(list_names "$root")
@@ -111,11 +123,11 @@ EOF2
 }
 
 cmd_sweep() {
-	root=$(tmp_root)
+	root=$(tmp_root) || exit 2
 	[ -e "$root" ] || exit 0
 	require_listable_root "$root"
 	swept=0
-	old=$(find "$root" -mindepth 1 -maxdepth 1 -name 'stuffr-*' ! -name "*${NL}*" -mtime +0 \
+	old=$(find "$root/" -mindepth 1 -maxdepth 1 -name 'stuffr-*' ! -name "*${NL}*" -mtime +0 \
 		-exec sh -c 'for p; do basename "$p"; done' sh {} + 2>/dev/null)
 	while IFS= read -r n; do
 		case $n in '' | */* | . | ..) continue ;; esac
@@ -151,7 +163,7 @@ cmd_selftest() {
 	self=$0
 	case $self in /*) ;; *) self=$PWD/$self ;; esac
 	base=$(mktemp -d "${TMPDIR:-/tmp}/tmp-leaks-selftest.XXXXXX") || exit 1
-	trap 'chmod -R u+rwx "$base" 2>/dev/null; rm -rf "$base"' EXIT INT TERM
+	trap 'chmod -R u+rwX "$base" 2>/dev/null; rm -rf "$base"' EXIT INT TERM
 	root=$base/root
 	outside=$base/outside
 	mkdir -p "$root" "$outside"
@@ -246,6 +258,65 @@ cmd_selftest() {
 	chmod 755 "$base/noaccess"
 	STUFFR_TMP_ROOT=$base/missing sh "$self" check "$snap" >/dev/null 2>&1 \
 		|| selftest_fail 'check failed on a root that does not exist'
+
+	# --- which pid a name carries ---
+	# A fresh root and an empty snapshot: every stuffr-* in it is new.
+	r2=$base/names
+	mkdir "$r2"
+	: >"$base/empty.snap"
+	# The pid is the first all-digit field and must be followed by `-`: a pid
+	# before `.ext` is not read, so that folder counts as a leak even though
+	# the pid is alive.
+	mkdir "$r2/stuffr-k-$$-rest" "$r2/stuffr-k-$$.bin" \
+		"$r2/stuffr-k-$$-999999" "$r2/stuffr-k-999999-$$"
+	out=$(STUFFR_TMP_ROOT=$r2 sh "$self" check "$base/empty.snap" 2>/dev/null)
+	[ $? -eq 1 ] || selftest_fail 'check exit was not 1 for the pid-position cases'
+	case $out in
+	*"stuffr-k-$$-rest"*) selftest_fail 'a pid-first name was reported' ;;
+	esac
+	case $out in
+	*"stuffr-k-$$-999999"*) selftest_fail 'a name with a live first pid and a later number was reported' ;;
+	esac
+	case $out in
+	*"stuffr-k-$$.bin"*) ;;
+	*) selftest_fail "a name with its pid before an extension was not reported: $out" ;;
+	esac
+	case $out in
+	*"stuffr-k-999999-$$"*) ;;
+	*) selftest_fail "the first all-digit field was not taken as the pid: $out" ;;
+	esac
+
+	# --- which directory is the temp root ---
+	# TMPDIR (the root Rust's temp_dir() uses) wins over the per-user directory
+	# getconf reports on macOS.
+	tdir=$base/tmpdir
+	mkdir "$tdir"
+	env -u STUFFR_TMP_ROOT TMPDIR="$tdir" sh "$self" snapshot "$base/tmpdir.snap" \
+		|| selftest_fail 'snapshot under TMPDIR failed'
+	mkdir "$tdir/stuffr-t-999999-1"
+	out=$(env -u STUFFR_TMP_ROOT TMPDIR="$tdir" sh "$self" check "$base/tmpdir.snap" 2>/dev/null)
+	[ $? -eq 1 ] || selftest_fail 'check did not look in TMPDIR'
+	case $out in
+	*"$tdir/stuffr-t-999999-1"*) ;;
+	*) selftest_fail "TMPDIR leak not named: $out" ;;
+	esac
+	# A root that is not absolute is refused, however it is given.
+	STUFFR_TMP_ROOT=relative/dir sh "$self" snapshot "$base/rel.snap" >/dev/null 2>&1
+	[ $? -eq 2 ] || selftest_fail 'a relative STUFFR_TMP_ROOT was accepted'
+	env -u STUFFR_TMP_ROOT TMPDIR=relative/dir sh "$self" sweep >/dev/null 2>&1
+	[ $? -eq 2 ] || selftest_fail 'a relative TMPDIR was accepted'
+	# A root that is itself a symlink is listed through, not skipped.
+	ln -s "$r2" "$base/rootlink"
+	out=$(STUFFR_TMP_ROOT=$base/rootlink sh "$self" check "$base/empty.snap" 2>/dev/null)
+	[ $? -eq 1 ] || selftest_fail 'check passed on a symlinked root holding leaks'
+	case $out in
+	*"stuffr-k-999999-$$"*) ;;
+	*) selftest_fail "symlinked root leak not named: $out" ;;
+	esac
+	touch -t "$stamp" "$r2/stuffr-k-999999-$$"
+	out=$(STUFFR_TMP_ROOT=$base/rootlink sh "$self" sweep) || selftest_fail 'sweep on a symlinked root failed'
+	[ "$out" = 'swept 1 stale stuffr-* temp folders' ] || selftest_fail "sweep on a symlinked root said: $out"
+	[ ! -e "$r2/stuffr-k-999999-$$" ] || selftest_fail 'sweep did not remove through a symlinked root'
 	echo 'tmp-leaks selftest passed'
 }
 

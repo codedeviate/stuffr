@@ -8,10 +8,11 @@ CARGO ?= cargo
 
 # Two modes. DAYTIME (the default) holds back: fewer test threads, a lower
 # libFuzzer RSS ceiling, and the same thread limit inside the Docker run, so
-# the gate stays gentle on a machine that is also running Docker and IDEs.
+# there is a margin left on a machine that is also running Docker and IDEs.
 # OVERNIGHT is `FULL=1` (any value but empty or 0): every core, libFuzzer's
 # default ceiling, as before. `FULL=0` is daytime.
-# Both modes run exactly the same tests; only concurrency differs. CI passes
+# Both modes run exactly the same tests; only concurrency (and the fuzz memory
+# cap, which also sets libFuzzer's malloc limit) differs. CI passes
 # FULL=1. TEST_THREADS is the daytime count (chosen by measurement, see
 # CONTRIBUTING.md "What the gate costs"); it is ignored under FULL=1.
 FULL ?=
@@ -24,7 +25,7 @@ TEST_THREAD_ARGS =
 FUZZ_RSS_ARGS =
 endif
 
-.PHONY: help check lint-latest deps-guard fmt fmt-check lint doc test test-pure release miri hooks clean fuzz-corpus fuzz compat-ubuntu sweep-tmp leak-snapshot leak-check tmp-leaks-selftest
+.PHONY: help check check-legs lint-latest deps-guard fmt fmt-check lint doc test test-pure release miri hooks clean fuzz-corpus fuzz compat-ubuntu sweep-tmp leak-snapshot leak-check tmp-leaks-selftest
 
 help:
 	@echo 'stuffr development targets:'
@@ -57,8 +58,14 @@ help:
 # The legs run in a sub-make so `sweep-tmp` runs whether they passed or failed;
 # `check` then exits with the legs' status. The leak snapshot is taken just
 # before `test` and checked after `test-pure`.
+#
+# The leak snapshot is a fresh file per `check` run (mktemp, removed at the
+# end), so two gates in one checkout cannot overwrite each other's.
 check:
-	@$(MAKE) --no-print-directory check-legs; s=$$?; \
+	@mkdir -p target; \
+	snap=$$(mktemp target/tmp-leaks.snapshot.XXXXXX) || exit 1; \
+	$(MAKE) --no-print-directory check-legs LEAK_SNAPSHOT="$$snap"; s=$$?; \
+	rm -f "$$snap"; \
 	$(MAKE) --no-print-directory sweep-tmp; \
 	exit $$s
 
@@ -72,7 +79,8 @@ check-legs:
 
 # Temp-folder hygiene. Only direct `stuffr-*` children of the user's temp dir
 # are ever considered; see scripts/tmp-leaks.sh. The snapshot lives in target/,
-# not the temp dir, so a concurrent gate cannot collide with it.
+# not the temp dir; `check` passes its own unique path (see above), and this
+# default serves a hand-run `make leak-snapshot leak-check`.
 LEAK_SNAPSHOT ?= target/tmp-leaks.snapshot
 
 sweep-tmp:
