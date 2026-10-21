@@ -6,11 +6,15 @@
 
 CARGO ?= cargo
 
-.PHONY: help check lint-latest deps-guard fmt fmt-check lint doc test test-pure release miri hooks clean fuzz-corpus fuzz compat-ubuntu
+.PHONY: help check lint-latest deps-guard fmt fmt-check lint doc test test-pure release miri hooks clean fuzz-corpus fuzz compat-ubuntu sweep-tmp leak-snapshot leak-check tmp-leaks-selftest
 
 help:
 	@echo 'stuffr development targets:'
 	@echo '  make check    fmt, lint, test, release build — the full gate'
+	@echo '                (always ends by sweeping stale stuffr-* temp folders)'
+	@echo '  make sweep-tmp  remove stuffr-* temp folders older than a day (live pids kept)'
+	@echo '  make leak-check  fail on stuffr-* temp folders made since the last leak-snapshot'
+	@echo '  make tmp-leaks-selftest  self-test of scripts/tmp-leaks.sh'
 	@echo '  make fmt      format the workspace, and fuzz/ (excluded from it)'
 	@echo '  make lint     clippy, all targets and features, warnings denied'
 	@echo '                (the workspace, and fuzz/ --locked)'
@@ -27,8 +31,34 @@ help:
 	@echo '                (not in check; COMPAT_UBUNTU_ARGS=... is passed to the tests)'
 
 # Ordered so the cheapest gate fails first.
-check: deps-guard fmt-check lint doc test test-pure release
+#
+# The legs run in a sub-make so `sweep-tmp` runs whether they passed or failed;
+# `check` then exits with the legs' status. The leak snapshot is taken just
+# before `test` and checked after `test-pure`.
+check:
+	@$(MAKE) --no-print-directory check-legs; s=$$?; \
+	$(MAKE) --no-print-directory sweep-tmp; \
+	exit $$s
+
+check-legs: deps-guard fmt-check lint doc leak-snapshot test test-pure leak-check release
 	@echo '✓ all gates passed'
+
+# Temp-folder hygiene. Only direct `stuffr-*` children of the user's temp dir
+# are ever considered; see scripts/tmp-leaks.sh. The snapshot lives in target/,
+# not the temp dir, so a concurrent gate cannot collide with it.
+LEAK_SNAPSHOT ?= target/tmp-leaks.snapshot
+
+sweep-tmp:
+	@sh scripts/tmp-leaks.sh sweep
+
+leak-snapshot:
+	@sh scripts/tmp-leaks.sh snapshot $(LEAK_SNAPSHOT)
+
+leak-check:
+	@sh scripts/tmp-leaks.sh check $(LEAK_SNAPSHOT)
+
+tmp-leaks-selftest:
+	@sh scripts/tmp-leaks.sh selftest
 
 # Warns, never fails, when `target/debug/deps` has grown large enough to slow
 # the gate. On macOS the dev profile's default `split-debuginfo=unpacked`
