@@ -40,6 +40,9 @@ const CREC_SIZE: usize = 42;
 const ECREC_SIZE: usize = 18;
 const ECLOC64_SIZE: usize = 16;
 const ECREC64_SIZE: usize = 52;
+/// unzpriv.h's `ECREC64_LENGTH`: where the Zip64 end record's own length
+/// (of what follows that field) sits, after the signature.
+const ECREC64_LENGTH: usize = 4;
 
 /// unzpriv.h's `NUM_HOSTS`.
 const NUM_HOSTS: u8 = 31;
@@ -94,6 +97,15 @@ pub(crate) struct Ecrec {
     pub have_ecr64: bool,
     /// Some field needed the Zip64 record's value.
     pub is_zip64_archive: bool,
+    /// `ec_start`, `ec_end` (ubuntu: 24-cve-2019-13232-do-not-raise-alert-
+    /// for-misplaced-central-directory.patch): the end record's span, the
+    /// Zip64 locator before it included.
+    pub ec_start: u64,
+    pub ec_end: u64,
+    /// `ec64_start`, `ec64_end` (the same patch): the Zip64 end record's
+    /// span, when `have_ecr64`.
+    pub ec64_start: u64,
+    pub ec64_end: u64,
 }
 
 /// `G.lrec`: the last local file header read (`local_file_hdr`).
@@ -746,6 +758,8 @@ pub(crate) fn get_zip64_data(uz: &mut Uz, e: &mut CentralEntry, ef: &[u8]) -> i3
     const Z64FLGS: u64 = 0xffff;
     const Z64FLGL: u64 = 0xffff_ffff;
     let f = uz.flavour;
+    // ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch
+    uz.zip64 = false;
     let mut ef = ef;
     while ef.len() >= EB_HEADSIZE {
         let eb_id = fileio::makeword(ef);

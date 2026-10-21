@@ -879,6 +879,322 @@ mod linux {
         ]
     }
 
+    /// The bytes `zip_with` stores for `e`.
+    fn body_of(e: &ZipEntrySpec) -> Vec<u8> {
+        match e.stored_data {
+            Some(b) => b.to_vec(),
+            None if e.method == 8 => deflate_raw(e.data),
+            None => e.data.to_vec(),
+        }
+    }
+
+    /// `e`'s local header and data as `zip_with` writes them (a bit-3
+    /// entry's CRC and sizes zero), without its data descriptor.
+    fn local_bytes(e: &ZipEntrySpec) -> Vec<u8> {
+        let body = body_of(e);
+        let dd = e.flags & 8 != 0;
+        let (crc, cs, us) = if dd {
+            (0, 0, 0)
+        } else {
+            (crc32(e.data), body.len() as u32, e.data.len() as u32)
+        };
+        let (time, date) = ((e.dos_time & 0xffff) as u16, (e.dos_time >> 16) as u16);
+        let mut o = b"PK\x03\x04".to_vec();
+        for v in [20u16, e.flags, e.method, time, date] {
+            o.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [crc, cs, us] {
+            o.extend_from_slice(&v.to_le_bytes());
+        }
+        o.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
+        o.extend_from_slice(&(e.extra.len() as u16).to_le_bytes());
+        o.extend_from_slice(e.name);
+        o.extend_from_slice(e.extra);
+        o.extend(body);
+        o
+    }
+
+    /// `e`'s data descriptor: signed (`PK\7\8` first) or not.
+    fn descriptor(e: &ZipEntrySpec, signed: bool) -> Vec<u8> {
+        let mut d = if signed {
+            b"PK\x07\x08".to_vec()
+        } else {
+            Vec::new()
+        };
+        for v in [crc32(e.data), body_of(e).len() as u32, e.data.len() as u32] {
+            d.extend_from_slice(&v.to_le_bytes());
+        }
+        d
+    }
+
+    /// A hand-laid archive (patches 22-24): local entries in order, central
+    /// records pointing anywhere, the directory where `put_central` puts it
+    /// (after the entries by default), then the end record.
+    #[derive(Default)]
+    struct Raw {
+        out: Vec<u8>,
+        central: Vec<u8>,
+        n: u16,
+        /// Where the directory was put, and its length.
+        cd: Option<(u32, u32)>,
+    }
+
+    impl Raw {
+        /// `e` and `tail` (its descriptor, if any) at the end; its offset.
+        fn local(&mut self, e: &ZipEntrySpec, tail: &[u8]) -> u32 {
+            let at = self.out.len() as u32;
+            self.out.extend(local_bytes(e));
+            self.out.extend_from_slice(tail);
+            at
+        }
+
+        /// A central record for `e` pointing at `offset`.
+        fn central(&mut self, e: &ZipEntrySpec, offset: u32) {
+            let (time, date) = ((e.dos_time & 0xffff) as u16, (e.dos_time >> 16) as u16);
+            let c = &mut self.central;
+            c.extend_from_slice(b"PK\x01\x02");
+            for v in [e.version_made_by, 20, e.flags, e.method, time, date] {
+                c.extend_from_slice(&v.to_le_bytes());
+            }
+            for v in [crc32(e.data), body_of(e).len() as u32, e.data.len() as u32] {
+                c.extend_from_slice(&v.to_le_bytes());
+            }
+            for v in [e.name.len() as u16, e.extra.len() as u16, 0, 0, 0] {
+                c.extend_from_slice(&v.to_le_bytes());
+            }
+            c.extend_from_slice(&e.external_attr.to_le_bytes());
+            c.extend_from_slice(&offset.to_le_bytes());
+            c.extend_from_slice(e.name);
+            c.extend_from_slice(e.extra);
+            self.n += 1;
+        }
+
+        /// The central directory written here, ahead of what follows.
+        fn put_central(&mut self) {
+            let c = std::mem::take(&mut self.central);
+            self.cd = Some((self.out.len() as u32, c.len() as u32));
+            self.out.extend(c);
+        }
+
+        /// The archive, its directory after the entries unless already put.
+        fn finish(mut self) -> Vec<u8> {
+            if self.cd.is_none() {
+                self.put_central();
+            }
+            let (cd_at, cd_len) = self.cd.unwrap_or_default();
+            let mut z = self.out;
+            z.extend(end_record(self.n, cd_len, cd_at));
+            z
+        }
+    }
+
+    /// A classic end record.
+    fn end_record(n: u16, cd_len: u32, cd_at: u32) -> Vec<u8> {
+        let mut e = b"PK\x05\x06".to_vec();
+        for v in [0u16, 0, n, n] {
+            e.extend_from_slice(&v.to_le_bytes());
+        }
+        e.extend_from_slice(&cd_len.to_le_bytes());
+        e.extend_from_slice(&cd_at.to_le_bytes());
+        e.extend_from_slice(&0u16.to_le_bytes());
+        e
+    }
+
+    /// `v` written little-endian at `z[at..at + 4]`.
+    fn put_u32(z: &mut [u8], at: usize, v: u32) {
+        z[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// A Zip64 archive of one entry (and a second central record pointing
+    /// at `second`, if given): its Zip64 end record and locator (`disks` in
+    /// the locator's total), then a classic end record whose counts and
+    /// directory fields defer to them.
+    fn zip64_zip(disks: u32, second: Option<u32>) -> Vec<u8> {
+        let a = ZipEntrySpec::new(b"a.txt", b"hello\n");
+        let mut r = Raw::default();
+        r.local(&a, b"");
+        r.central(&a, 0);
+        if let Some(off) = second {
+            r.central(&ZipEntrySpec::new(b"z.txt", b"x"), off);
+        }
+        let n = u64::from(r.n);
+        let cd_at = r.out.len() as u64;
+        let cd_len = r.central.len() as u64;
+        r.put_central();
+        let mut z = r.out;
+        let rec_at = z.len() as u64;
+        z.extend_from_slice(b"PK\x06\x06");
+        z.extend_from_slice(&44u64.to_le_bytes());
+        for v in [0x031eu16, 45] {
+            z.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [0u32, 0] {
+            z.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [n, n, cd_len, cd_at] {
+            z.extend_from_slice(&v.to_le_bytes());
+        }
+        z.extend_from_slice(b"PK\x06\x07");
+        z.extend_from_slice(&0u32.to_le_bytes());
+        z.extend_from_slice(&rec_at.to_le_bytes());
+        z.extend_from_slice(&disks.to_le_bytes());
+        z.extend_from_slice(b"PK\x05\x06");
+        for v in [0u16, 0, 0xffff, 0xffff] {
+            z.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [0xffff_ffffu32, 0xffff_ffff] {
+            z.extend_from_slice(&v.to_le_bytes());
+        }
+        z.extend_from_slice(&0u16.to_le_bytes());
+        z
+    }
+
+    /// The shapes of CVE-2019-13232's patches (22-24): overlapped entries
+    /// (David Fifield's construction at a small size, both directory
+    /// orders; entries sharing one local header; entries pointing into the
+    /// directory or the end records; an entry running into the directory),
+    /// what must not be one (a preamble, a misplaced directory, data
+    /// descriptors signed and unsigned), descriptors missing (23's skip
+    /// then reads the next entry's header), an empty directory, a deflate
+    /// stream that reads past its entry (22), and Zip64 end records.
+    fn bomb_zips() -> Vec<(&'static str, Vec<u8>)> {
+        let plain = ZipEntrySpec::new;
+        let mut v = Vec::new();
+
+        // Fifield: an entry whose stored data is another entry
+        let inner = plain(b"b.txt", b"inner data\n");
+        let quoted = local_bytes(&inner);
+        let outer = plain(b"a.txt", &quoted);
+        let inner_at = 30 + outer.name.len() as u32;
+        for (name, first_outer) in [("fifield.zip", true), ("fifield2.zip", false)] {
+            let mut r = Raw::default();
+            r.local(&outer, b"");
+            if first_outer {
+                r.central(&outer, 0);
+                r.central(&inner, inner_at);
+            } else {
+                r.central(&inner, inner_at);
+                r.central(&outer, 0);
+            }
+            v.push((name, r.finish()));
+        }
+        // the full shape: each stored entry quotes the next one's header
+        let kernel = vec![b'K'; 64];
+        let names: [&[u8]; 4] = [b"k0.txt", b"k1.txt", b"k2.txt", b"k3.txt"];
+        let mut blobs = vec![local_bytes(&plain(names[3], &kernel))];
+        for i in (0..3).rev() {
+            let quote = local_bytes(&ZipEntrySpec::new(names[i], &blobs[0]));
+            blobs.insert(0, quote);
+        }
+        let mut r = Raw {
+            out: blobs[0].clone(),
+            ..Raw::default()
+        };
+        let mut at = 0u32;
+        for (i, name) in names.into_iter().enumerate() {
+            let data: &[u8] = if i == 3 { &kernel } else { &blobs[i + 1] };
+            r.central(&plain(name, data), at);
+            at += 30 + name.len() as u32;
+        }
+        v.push(("fifield_full.zip", r.finish()));
+        // three entries sharing one deflated local header
+        let a5 = vec![b'A'; 5000];
+        let shared = ZipEntrySpec {
+            method: 8,
+            ..plain(b"f0.txt", &a5)
+        };
+        let mut r = Raw::default();
+        r.local(&shared, b"");
+        for name in [b"f0.txt", b"f1.txt", b"f2.txt"] {
+            r.central(&ZipEntrySpec { name, ..shared }, 0);
+        }
+        v.push(("shared.zip", r.finish()));
+        // entries pointing into the directory and into the end record
+        let a = plain(b"a.txt", b"hello\n");
+        let c = plain(b"c.txt", b"x");
+        let la = local_bytes(&a).len() as u32;
+        let cd_len = 2 * 46 + 10;
+        for (name, target) in [("into_cd.zip", la), ("into_eocd.zip", la + cd_len)] {
+            let mut r = Raw::default();
+            r.local(&a, b"");
+            r.central(&a, 0);
+            r.central(&c, target);
+            v.push((name, r.finish()));
+        }
+        // an entry whose stored size runs into the directory
+        let mut z = zip_with(&[a], b"", b"");
+        put_u32(&mut z, 18, 40);
+        put_u32(&mut z, la as usize + 20, 40);
+        v.push(("runs_into_cd.zip", z));
+        // the directory between the entries (24: not a bomb)
+        let b = plain(b"b.txt", b"second\n");
+        let mut r = Raw::default();
+        r.local(&a, b"");
+        r.central(&a, 0);
+        r.central(&b, la + cd_len);
+        r.put_central();
+        r.local(&b, b"");
+        v.push(("cdmid.zip", r.finish()));
+        // an empty directory claimed by the end record
+        let mut z = zip_with(&[a], b"", b"");
+        let eocd = z.len() - 22;
+        put_u32(&mut z, eocd + 12, 0);
+        v.push(("cdsize0.zip", z));
+        v.push(("pre.zip", zip_with(&[a, b], b"", b"#!/bin/sh\nexit 0\n")));
+        // data descriptors
+        let s = ZipEntrySpec { flags: 8, ..a };
+        let hello = b"hello hello hello\n";
+        let d = ZipEntrySpec {
+            method: 8,
+            flags: 8,
+            ..plain(b"a.txt", hello)
+        };
+        for (name, first, tail) in [
+            ("dd_sig.zip", s, descriptor(&s, true)),
+            ("dd_nosig.zip", s, descriptor(&s, false)),
+            ("dd_none.zip", s, Vec::new()),
+            ("dd_defl.zip", d, descriptor(&d, true)),
+            ("dd_defl_none.zip", d, Vec::new()),
+        ] {
+            let mut r = Raw::default();
+            let at = r.local(&first, &tail);
+            r.central(&first, at);
+            let bat = r.local(&b, b"");
+            r.central(&b, bat);
+            v.push((name, r.finish()));
+        }
+        let mut r = Raw::default();
+        r.local(&a, b"");
+        r.central(&a, 0);
+        let sb = ZipEntrySpec { flags: 8, ..b };
+        let bat = r.local(&sb, b"");
+        r.central(&sb, bat);
+        v.push(("dd_none_last.zip", r.finish()));
+        // 22: a deflate stream cut in half, then entries in the same buffer
+        let text = b"hello world ".repeat(20);
+        let full = deflate_raw(&text);
+        let cut = full[..full.len() / 2].to_vec();
+        let over = ZipEntrySpec {
+            method: 8,
+            stored_data: Some(&cut),
+            ..plain(b"a.txt", &text)
+        };
+        let three = plain(b"c.txt", b"three\n");
+        v.push(("overread.zip", zip_with(&[over, b, three], b"", b"")));
+        let over_dd = ZipEntrySpec { flags: 8, ..over };
+        let mut r = Raw::default();
+        r.local(&over_dd, &descriptor(&over_dd, true));
+        r.central(&over_dd, 0);
+        let bat = r.local(&b, b"");
+        r.central(&b, bat);
+        v.push(("overread_dd.zip", r.finish()));
+        // Zip64 end records: their spans start the cover
+        v.push(("z64rec.zip", zip64_zip(1, None)));
+        let z64_hit = la + 2 * 46 + 10;
+        v.push(("z64rec_hit.zip", zip64_zip(1, Some(z64_hit))));
+        v
+    }
+
     /// Ubuntu's patch series (Task 14), against its binary, one group per
     /// patch or set of patches. The probes behind each are in
     /// `.claude/rules/compat.md`, "Task 14 probes".
@@ -908,5 +1224,27 @@ mod linux {
             cases.push(case("zipinfo", &args, &files, &[]));
         }
         check("CVE fixes", &cases);
+
+        // 22, 23, 24: CVE-2019-13232
+        let files = bomb_zips();
+        let mut cases = Vec::new();
+        for (z, _) in &files {
+            for op in [&["-t"][..], &["-tq"], &[], &["-p"], &["-l"]] {
+                let mut args = op.to_vec();
+                args.push(z);
+                cases.push(case("unzip", &args, &files, &[]));
+            }
+        }
+        for args in [
+            &["fifield.zip", "b.txt"][..],
+            &["-t", "pre.zip", "a.txt"],
+            &["-t", "fifield2.zip", "-x", "b.txt"],
+            &["-t", "*.zip"],
+            &["-qt", "*.zip"],
+            &["-t", "f*.zip"],
+        ] {
+            cases.push(case("unzip", args, &files, &[]));
+        }
+        check("CVE-2019-13232", &cases);
     }
 }

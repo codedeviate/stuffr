@@ -286,19 +286,30 @@ pub(crate) fn cve_2014_9636_stored_size(f: Flavour) -> bool {
     f == Flavour::Ubuntu
 }
 
+/// `23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch` with
+/// `24-cve-2019-13232-do-not-raise-alert-for-misplaced-central-
+/// directory.patch`, Ubuntu only: testing or extracting keeps a list of the
+/// spans covered so far (the central directory, a preamble, the end
+/// records, then each entry from its local header to where its reading
+/// stopped, `extract::cover`); an entry starting inside one, or ending over
+/// one, prints "invalid zip file with overlapped components (possible zip
+/// bomb)" and ends the archive, `PK_BOMB` (12). Apple has no bomb check.
+pub(crate) fn detects_overlapped_entries(f: Flavour) -> bool {
+    f == Flavour::Ubuntu
+}
+
 /// `23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch`, Ubuntu
-/// only: entries whose data overlap end the run (`PK_BOMB`).
-///
-/// Pass-through until Task 14: Apple's answer (`false`) for both.
-pub(crate) fn detects_overlapped_entries(_f: Flavour) -> bool {
-    false
+/// only: after an entry with general-purpose bit 3 is tested or extracted,
+/// its data descriptor is read past (12 bytes, 4 more when it is signed,
+/// 8 more under `G.zip64`); fewer bytes left is `PK_ERR`, silently.
+pub(crate) fn skips_data_descriptor(f: Flavour) -> bool {
+    f == Flavour::Ubuntu
 }
 
 /// `22-cve-2019-13232-fix-bug-in-undefer-input.patch`, Ubuntu only:
 /// `undefer_input()` clamps a negative `G.csize` (a decoder read past the
-/// entry) to 0 before giving the buffer back.
-///
-/// Pass-through until Task 14: Apple's answer (`false`) for both.
-pub(crate) fn cve_2019_13232_undefer_input(_f: Flavour) -> bool {
-    false
+/// entry) to 0 before giving the buffer back; Apple's moves `G.inptr` past
+/// the hidden bytes by that much.
+pub(crate) fn cve_2019_13232_undefer_input(f: Flavour) -> bool {
+    f == Flavour::Ubuntu
 }

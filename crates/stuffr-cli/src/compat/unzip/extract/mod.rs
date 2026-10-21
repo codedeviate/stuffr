@@ -25,17 +25,22 @@ use super::unix::mapname::{
 };
 use super::{PK_BADERR, PK_COOL, PK_EOF, PK_ERR, PK_FIND, PK_OK, PK_WARN, Uz, flavour};
 
+mod cover;
 mod crypt;
 mod extra;
 mod member;
 pub(crate) mod output;
 
 /// unzip.h's codes this file returns.
+pub(crate) const PK_MEM: i32 = 4;
 pub(crate) const PK_MEM2: i32 = 5;
 pub(crate) const PK_MEM3: i32 = 6;
 pub(crate) const PK_DISK: i32 = 50;
 pub(crate) const IZ_UNSUP: i32 = 81;
 pub(crate) const IZ_BADPWD: i32 = 82;
+/// unzip.h's `PK_BOMB` (ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-
+/// entries.patch): likely zip bomb.
+pub(crate) const PK_BOMB: i32 = 12;
 
 /// unzpriv.h's `DIR_BLKSIZ` (not `SMALL_MEM`): entries per block.
 const DIR_BLKSIZ: usize = 16384;
@@ -121,6 +126,9 @@ pub(crate) struct Ex {
     pub(crate) reported_backslash: bool,
     /// The keys decrypting the entry (`G.keys`), set by `decrypt()`.
     pub(crate) keys: Option<stuffr::infozip::crypt::Keys>,
+    /// `G.cover` (ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-
+    /// entries.patch): the spans tested or extracted so far.
+    pub(crate) cover: cover::Cover,
 }
 
 impl Ex {
@@ -142,6 +150,7 @@ impl Ex {
             disk_full: 0,
             reported_backslash: false,
             keys: None,
+            cover: cover::Cover::default(),
         }
     }
 }
@@ -195,6 +204,21 @@ pub(crate) fn extract_or_test_files(uz: &mut Uz) -> i32 {
     }
 
     let mut ex = Ex::new();
+
+    // ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch,
+    // 24-cve-2019-13232-do-not-raise-alert-for-misplaced-central-
+    // directory.patch: one more: initialize cover structure for bomb
+    // detection. Start with spans that cover any extra bytes at the start,
+    // the central directory, the end of central directory record (including
+    // the Zip64 end of central directory locator, if present), and the Zip64
+    // end of central directory record, if present.
+    if flavour::detects_overlapped_entries(uz.flavour) {
+        let error = cover_init(uz, &mut ex.cover);
+        if error != PK_COOL {
+            return error;
+        }
+    }
+
     uz.newzip = true;
     ex.reported_backslash = false;
 
@@ -349,7 +373,9 @@ pub(crate) fn extract_or_test_files(uz: &mut Uz) -> i32 {
                 error_in_archive = error;
             }
             // ...and keep going (unless disk full or user break)
-            if ex.disk_full > 1 || uz.abort.is_some() {
+            // ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch
+            // (or a bomb)
+            if ex.disk_full > 1 || uz.abort.is_some() || error == PK_BOMB {
                 // clear reached_end to signal premature stop ...
                 reached_end = false;
                 // ... and cancel scanning the central directory
@@ -556,6 +582,33 @@ fn read_extra(uz: &mut Uz, ex: &mut Ex, e: &mut CentralEntry, length: usize, loc
     error
 }
 
+/// ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch and
+/// 24-cve-2019-13232-do-not-raise-alert-for-misplaced-central-
+/// directory.patch: the cover list started as `extract_or_test_files()`
+/// starts it: the central directory (a span that cannot be added is "not
+/// enough memory", `PK_MEM`: an empty directory), then any preamble, the
+/// Zip64 end record and the end record (overlapping ones are `PK_BOMB`).
+/// The C's `zoff_t + zusz_t` sums are unsigned, then read as `bound_t`.
+fn cover_init(uz: &mut Uz, cover: &mut cover::Cover) -> i32 {
+    cover.clear();
+    let extra = uz.zin.extra_bytes as u64;
+    let cd = extra.wrapping_add(uz.ecrec.offset_start_central_directory);
+    let cd_end = cd.wrapping_add(uz.ecrec.size_central_directory);
+    if cover.add(cd as i64, cd_end as i64) != 0 {
+        uz.info(0x401, m::NOT_ENOUGH_MEM_COVER.as_bytes());
+        return PK_MEM;
+    }
+    let e = uz.ecrec;
+    if (uz.zin.extra_bytes != 0 && cover.add(0, uz.zin.extra_bytes) != 0)
+        || (e.have_ecr64 && cover.add(e.ec64_start as i64, e.ec64_end as i64) != 0)
+        || cover.add(e.ec_start as i64, e.ec_end as i64) != 0
+    {
+        uz.info(0x401, m::OVERLAPPED_COMPONENTS.as_bytes());
+        return PK_BOMB;
+    }
+    PK_COOL
+}
+
 /// unzpriv.h's `UNZVERS_SUPPORT`: 4.5 (4.6 with `USE_BZIP2`).
 fn unzvers_support(uz: &Uz) -> u8 {
     if flavour::use_bzip2(uz.flavour) {
@@ -701,10 +754,7 @@ fn extract_or_test_entrylist(
     error_in_archive: i32,
 ) -> i32 {
     let mut error_in_archive = error_in_archive;
-    // ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch
-    // checks each entry's span against the ones before it here
-    // (`flavour::detects_overlapped_entries`, Task 14).
-    let _ = flavour::detects_overlapped_entries(uz.flavour);
+    let bombs = flavour::detects_overlapped_entries(uz.flavour);
     'entries_next: for info in list.iter_mut() {
         *pfilnum += 1;
         ex.pinfo = info.clone();
@@ -714,6 +764,11 @@ fn extract_or_test_entrylist(
         // backward), skip to the target position and reset readbuf().
         let inbufsiz = fileio::INBUFSIZ as i64;
         let mut request = ex.pinfo.offset.wrapping_add(uz.zin.extra_bytes);
+        // ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch
+        if bombs && ex.cover.within(request) {
+            uz.info(0x401, m::OVERLAPPED_COMPONENTS.as_bytes());
+            return PK_BOMB;
+        }
         let mut inbuf_offset = request.wrapping_rem(inbufsiz);
         let mut bufstart = request.wrapping_sub(inbuf_offset);
         let n = pfilnum.to_string();
@@ -1143,6 +1198,22 @@ fn extract_or_test_entrylist(
             }
             if ex.disk_full > 1 || uz.abort.is_some() {
                 return error_in_archive; // (unless disk full)
+            }
+        }
+        // ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch
+        if bombs {
+            let end = uz
+                .zin
+                .cur_zipfile_bufstart
+                .wrapping_add(uz.zin.inptr as i64);
+            let error = ex.cover.add(request, end);
+            if error < 0 {
+                uz.info(0x401, m::NOT_ENOUGH_MEM_COVER.as_bytes());
+                return PK_MEM;
+            }
+            if error != 0 {
+                uz.info(0x401, m::OVERLAPPED_COMPONENTS.as_bytes());
+                return PK_BOMB;
             }
         }
     } // end for-loop (i:  files in current block)

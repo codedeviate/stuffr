@@ -1393,6 +1393,12 @@ pub(super) const FILE_TRUNCATED: &str = "warning:  %s is probably truncated\n";
 pub(super) const FILE_UNKNOWN_COMP_METHOD: &str = "%s:  unknown compression method\n";
 /// extract.c:BadCRC (`%08lx` twice, formatted by the caller).
 pub(super) const BAD_CRC: &str = " bad CRC %s  (should be %s)\n";
+/// extract.c:NotEnoughMemCover (ubuntu: 23-cve-2019-13232-zip-bomb-with-
+/// overlapped-entries.patch).
+pub(super) const NOT_ENOUGH_MEM_COVER: &str = "error: not enough memory for bomb detection\n";
+/// extract.c:OverlappedComponents (the same patch).
+pub(super) const OVERLAPPED_COMPONENTS: &str =
+    "error: invalid zip file with overlapped components (possible zip bomb)\n";
 /// extract_or_test_member's `"%-22s "` (the name padded by the caller).
 pub(super) const NAME_22: &str = "%s ";
 /// extract_or_test_member's and TestExtraField's `" OK\n"`.

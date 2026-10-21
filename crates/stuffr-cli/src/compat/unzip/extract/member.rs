@@ -191,7 +191,47 @@ pub(crate) fn extract_or_test_member(uz: &mut Uz, ex: &mut Ex) -> i32 {
         // GRR:  is stdout reset to text mode yet?
         uz.info(0, b"\n");
     }
+
+    // ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch
+    if flavour::skips_data_descriptor(uz.flavour) && uz.lrec.general_purpose_bit_flag & 8 != 0 {
+        error = skip_data_descriptor(uz, error);
+    }
     error
+}
+
+/// ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch: skip
+/// over data descriptor (harder than it sounds, due to signature
+/// ambiguity). `PK_ERR` when the archive ends first, else `error`.
+fn skip_data_descriptor(uz: &mut Uz, error: i32) -> i32 {
+    const SIG: u32 = 0x0807_4b50;
+    const LOW: u64 = 0xffff_ffff;
+    let mut buf = [0u8; 12];
+    let mut shy = 12 - fileio::readbuf(uz, &mut buf);
+    let word = |at: usize| {
+        if shy != 0 {
+            0
+        } else {
+            fileio::makelong(&buf[at..])
+        }
+    };
+    let (crc, clen, ulen) = (word(0), word(4), word(8)); // ulen: or high clen if ZIP64
+    let l = uz.lrec;
+    let ulen_field = if uz.zip64 { l.csize >> 32 } else { l.ucsize };
+    // if not SIG, no signature / if not SIG, have signature, by turns
+    if crc == SIG
+        && (l.crc32 != SIG
+            || (clen == SIG
+                && ((l.csize & LOW) != u64::from(SIG)
+                    || (ulen == SIG && ulen_field != u64::from(SIG)))))
+    {
+        // skip four more bytes to account for signature
+        shy += 4 - fileio::readbuf(uz, &mut buf[..4]);
+    }
+    if uz.zip64 {
+        // skip eight more for ZIP64
+        shy += 8 - fileio::readbuf(uz, &mut buf[..8]);
+    }
+    if shy != 0 { PK_ERR } else { error }
 }
 
 /// The decoder run: `uz.slide` and the archive input taken out of `Uz`

@@ -264,6 +264,12 @@ pub(crate) struct Uz<'a> {
     pub(crate) lrec: process::Lrec,
     /// `G.csize`: the entry's compressed bytes left (a C `zoff_t`).
     pub(crate) csize: i64,
+    /// `G.zip64` (ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-
+    /// entries.patch): cleared by each `getZip64Data()` and set by a Unicode
+    /// Path block that `getUnicodeData()` takes (where the patch's hunk
+    /// landed), never by a Zip64 block; `extract_or_test_member()`'s data
+    /// descriptor skip reads it.
+    pub(crate) zip64: bool,
     /// `G.real_ecrec_offset`: where the end record was found.
     pub(crate) real_ecrec_offset: i64,
     /// `G.expect_ecrec_offset`: where the directory says it should be.
@@ -342,6 +348,7 @@ impl<'a> Uz<'a> {
             ecrec: process::Ecrec::default(),
             lrec: process::Lrec::default(),
             csize: 0,
+            zip64: false,
             real_ecrec_offset: 0,
             expect_ecrec_offset: 0,
             sig: [0; 4],

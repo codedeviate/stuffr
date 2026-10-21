@@ -121,6 +121,10 @@ pub(crate) fn get_unicode_data(uz: &mut Uz, ef: &[u8], full: Option<&[u8]>) -> (
                     UniPath::Name(name)
                 }
             };
+            // ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-
+            // entries.patch (its `G.zip64 = TRUE` hunk landed here, in
+            // getUnicodeData(), not in getZip64Data())
+            uz.zip64 = true;
         }
         // Skip this extra field block
         ef = &ef[4 + eb_len..];

@@ -360,6 +360,50 @@ mod unix {
         z
     }
 
+    /// A Zip64 archive of one stored entry: its Zip64 end record and
+    /// locator, then a classic end record whose counts and directory fields
+    /// defer to them (so `is_zip64_archive` is set).
+    fn zip64_zip() -> Vec<u8> {
+        let one = zip_with(&[ZipEntrySpec::new(b"a.txt", b"hello\n")], b"", b"");
+        let eocd = one.len() - 22;
+        let word = |at: usize| u32::from_le_bytes(one[at..at + 4].try_into().unwrap()) as u64;
+        let (cd_len, cd_at) = (word(eocd + 12), word(eocd + 16));
+        let mut z = one[..eocd].to_vec();
+        let rec_at = z.len() as u64;
+        z.extend_from_slice(b"PK\x06\x06");
+        z.extend_from_slice(&44u64.to_le_bytes());
+        for v in [0x031eu16, 45] {
+            z.extend_from_slice(&v.to_le_bytes());
+        }
+        z.extend_from_slice(&[0; 8]);
+        for v in [1u64, 1, cd_len, cd_at] {
+            z.extend_from_slice(&v.to_le_bytes());
+        }
+        z.extend_from_slice(b"PK\x06\x07");
+        z.extend_from_slice(&0u32.to_le_bytes());
+        z.extend_from_slice(&rec_at.to_le_bytes());
+        z.extend_from_slice(&1u32.to_le_bytes());
+        z.extend_from_slice(b"PK\x05\x06");
+        for v in [0u16, 0, 0xffff, 0xffff] {
+            z.extend_from_slice(&v.to_le_bytes());
+        }
+        z.extend_from_slice(&[0xff; 8]);
+        z.extend_from_slice(&0u16.to_le_bytes());
+        z
+    }
+
+    /// A plain archive with 20 bytes between its directory and its end
+    /// record ("extra bytes", then "didn't find end-of-central-dir
+    /// signature at end of central dir").
+    fn gap_zip() -> Vec<u8> {
+        let one = zip_with(&[ZipEntrySpec::new(b"a.txt", b"hello\n")], b"", b"");
+        let eocd = one.len() - 22;
+        let mut z = one[..eocd].to_vec();
+        z.extend_from_slice(&[b'#'; 20]);
+        z.extend_from_slice(&one[eocd..]);
+        z
+    }
+
     // ---- the table ----
 
     /// Apple's `unzip` usage after its banner line (`unzip`, `-h`; stderr for a bad option).
@@ -1908,6 +1952,74 @@ mod unix {
                     "error: invalid zip file with overlapped components (possible zip bomb)\n",
                 ),
                 "",
+            ),
+        ]);
+        // ruling T14-3: `have_ecr64` and `is_zip64_archive` outlive their
+        // archive (find_ecrec() never clears them), so a plain archive
+        // after a Zip64 one in the same run loses its "didn't find
+        // end-of-central-dir signature" note (both references); on Ubuntu
+        // the stale Zip64 spans also start the next archive's cover.
+        let stale = || {
+            // named so that the plain archive follows the Zip64 one in
+            // readdir order, on APFS and on the image's overlayfs alike
+            // (probe: `ls -f` there)
+            vec![("gb.zip", gap_zip()), ("z2.zip", zip64_zip())]
+        };
+        let gap_warning = |z: &str| {
+            format!(
+                concat!(
+                    "warning [{z}]:  20 extra bytes at beginning or within zipfile\n",
+                    "  (attempting to process anyway)\n",
+                    "error [{z}]:  reported length of central directory is\n",
+                    "  -20 bytes too long (Atari STZip zipfile?  J.H.Holm ZIPSPLIT 1.1\n",
+                    "  zipfile?).  Compensating...\n",
+                ),
+                z = z
+            )
+        };
+        let stale_l = Box::leak(
+            format!(
+                "{}\n1 archive was successfully processed.\n1 archive had fatal errors.\n",
+                gap_warning("gb.zip")
+            )
+            .into_boxed_str(),
+        );
+        v.extend([
+            row(
+                Apple,
+                14,
+                "stale Zip64 flags",
+                "unzip",
+                &["-t", "*.zip"],
+                stale(),
+                2,
+                "No errors detected in compressed data of gb.zip.\n",
+                "",
+            ),
+            row(
+                Ubuntu,
+                14,
+                "stale Zip64 flags",
+                "unzip",
+                &["-t", "*.zip"],
+                stale(),
+                12,
+                concat!(
+                    "  zipfile?).  Compensating...\n",
+                    "error: invalid zip file with overlapped components (possible zip bomb)\n",
+                ),
+                "",
+            ),
+            row(
+                Both,
+                14,
+                "stale Zip64 flags, -l",
+                "unzip",
+                &["-l", "*.zip"],
+                stale(),
+                2,
+                "",
+                stale_l,
             ),
         ]);
         // funzip (Task 12): the first entry or a gzip member, from standard

@@ -6,7 +6,7 @@
 use super::super::fileio::{self, DoString, readbuf};
 use super::super::messages as m;
 use super::super::{PK_COOL, PK_EOF, PK_ERR, PK_WARN, Uz, flavour};
-use super::{ECLOC64_SIZE, ECREC_SIZE, ECREC64_SIZE, Ecrec};
+use super::{ECLOC64_SIZE, ECREC_SIZE, ECREC64_LENGTH, ECREC64_SIZE, Ecrec};
 use super::{END_CENTLOC64_SIG, END_CENTRAL_SIG, END_CENTRAL64_SIG};
 
 // port: process.c:rec_find
@@ -201,7 +201,12 @@ fn find_ecrec64(uz: &mut Uz) -> i32 {
     // Now, we are (almost) sure that we have a Zip64 archive.
     uz.ecrec.have_ecr64 = true;
     // ubuntu: 24-cve-2019-13232-do-not-raise-alert-for-misplaced-central-
-    // directory.patch records the Zip64 record's span here (Task 14).
+    // directory.patch
+    uz.ecrec.ec_start = uz.ecrec.ec_start.wrapping_sub((ECLOC64_SIZE + 4) as u64);
+    uz.ecrec.ec64_start = ecrec64_start_offset;
+    uz.ecrec.ec64_end = ecrec64_start_offset
+        .wrapping_add(12)
+        .wrapping_add(fileio::makeint64(f, &byterec[ECREC64_LENGTH..]));
 
     // Update the "end-of-central-dir offset" for later checks.
     uz.real_ecrec_offset = ecrec64_start_offset as i64;
@@ -307,11 +312,24 @@ pub(super) fn find_ecrec(uz: &mut Uz, searchlen: i64) -> i32 {
         size_central_directory: long(12),
         offset_start_central_directory: long(16),
         zipfile_comment_length: fileio::makeword(&byterec[20..]),
-        have_ecr64: false,
-        is_zip64_archive: false,
+        // ruling: T14-3. find_ecrec() never clears `have_ecr64` or
+        // `is_zip64_archive` (only find_ecrec64() sets them): after a Zip64
+        // archive they stay set for every later archive of the run, as do
+        // the Zip64 record's spans. probe: Ubuntu's `unzip -qt '*.zip'`
+        // over a Zip64 archive, then a plain one: "overlapped components"
+        // for the plain one (its cover starts with the stale span).
+        have_ecr64: uz.ecrec.have_ecr64,
+        is_zip64_archive: uz.ecrec.is_zip64_archive,
+        ec64_start: uz.ecrec.ec64_start,
+        ec64_end: uz.ecrec.ec64_end,
+        // ubuntu: 24-cve-2019-13232-do-not-raise-alert-for-misplaced-
+        // central-directory.patch (in both flavours: only the Ubuntu
+        // flavour's bomb detection reads them)
+        ec_start: uz.real_ecrec_offset as u64,
+        ec_end: (uz.real_ecrec_offset as u64)
+            .wrapping_add(22)
+            .wrapping_add(u64::from(fileio::makeword(&byterec[20..]))),
     };
-    // ubuntu: 24-cve-2019-13232-do-not-raise-alert-for-misplaced-central-
-    // directory.patch records the record's span here (Task 14).
 
     // Now, we have to read the archive comment, BEFORE the file pointer is
     // moved away backwards to seek for a Zip64 ECLOC64 structure.
