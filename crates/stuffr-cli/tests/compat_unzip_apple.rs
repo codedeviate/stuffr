@@ -501,6 +501,71 @@ mod macos {
         compare("zip64_and_many_entries", &cases);
     }
 
+    /// A Zip64 archive of one stored entry: its Zip64 end record and
+    /// locator, then a classic end record whose counts and directory fields
+    /// defer to them (so `is_zip64_archive` is set).
+    fn zip64_zip() -> Vec<u8> {
+        let one = zip_with(&[ZipEntrySpec::new(b"a.txt", b"hello\n")], b"", b"");
+        let eocd = one.len() - 22;
+        let word = |at: usize| u32::from_le_bytes(one[at..at + 4].try_into().unwrap()) as u64;
+        let (cd_len, cd_at) = (word(eocd + 12), word(eocd + 16));
+        let mut z = one[..eocd].to_vec();
+        let rec_at = z.len() as u64;
+        z.extend_from_slice(b"PK\x06\x06");
+        z.extend_from_slice(&44u64.to_le_bytes());
+        for v in [0x031eu16, 45] {
+            z.extend_from_slice(&v.to_le_bytes());
+        }
+        z.extend_from_slice(&[0; 8]);
+        for v in [1u64, 1, cd_len, cd_at] {
+            z.extend_from_slice(&v.to_le_bytes());
+        }
+        z.extend_from_slice(b"PK\x06\x07");
+        z.extend_from_slice(&0u32.to_le_bytes());
+        z.extend_from_slice(&rec_at.to_le_bytes());
+        z.extend_from_slice(&1u32.to_le_bytes());
+        z.extend_from_slice(b"PK\x05\x06");
+        for v in [0u16, 0, 0xffff, 0xffff] {
+            z.extend_from_slice(&v.to_le_bytes());
+        }
+        z.extend_from_slice(&[0xff; 8]);
+        z.extend_from_slice(&0u16.to_le_bytes());
+        z
+    }
+
+    /// A plain archive with 20 bytes between its directory and its end
+    /// record ("extra bytes", then "didn't find end-of-central-dir
+    /// signature at end of central dir").
+    fn gap_zip() -> Vec<u8> {
+        let one = zip_with(&[ZipEntrySpec::new(b"a.txt", b"hello\n")], b"", b"");
+        let eocd = one.len() - 22;
+        let mut z = one[..eocd].to_vec();
+        z.extend_from_slice(&[b'#'; 20]);
+        z.extend_from_slice(&one[eocd..]);
+        z
+    }
+
+    /// ruling: T14-3. find_ecrec() never clears `have_ecr64` and
+    /// `is_zip64_archive`, so in a wildcard run a plain archive after a
+    /// Zip64 one loses its "didn't find end-of-central-dir signature at
+    /// end of central dir" note. A differential (both sides read the
+    /// directory in the same order); APFS lists `z2.zip` before `gb.zip`,
+    /// so the reference is checked to show the effect.
+    #[test]
+    fn zip64_flags_outlive_their_archive() {
+        let files = vec![("gb.zip", gap_zip()), ("z2.zip", zip64_zip())];
+        let cases: Vec<Case> = [&["-t", "*.zip"][..], &["-l", "*.zip"], &["-v", "*.zip"]]
+            .iter()
+            .map(|a| unzip_case("unzip", a.to_vec(), files.clone()))
+            .collect();
+        if let Some(r) = unzip_reference(&cases[0]) {
+            let out = String::from_utf8_lossy(&r.stdout);
+            assert!(out.starts_with("Archive:  z2.zip\n"), "{out}");
+            assert!(!out.contains("note:"), "{out}");
+        }
+        compare("zip64_flags_outlive_their_archive", &cases);
+    }
+
     /// Review Focus 5, the listing half: names that differ only in case
     /// (and `-C`), control bytes and a newline (`^J`), escape sequences,
     /// high bytes under `C` and a UTF-8 locale, `../`, `/`, an empty name,

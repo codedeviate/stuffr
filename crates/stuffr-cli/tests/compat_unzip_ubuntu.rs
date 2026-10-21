@@ -1189,8 +1189,13 @@ mod linux {
         let bat = r.local(&b, b"");
         r.central(&b, bat);
         v.push(("overread_dd.zip", r.finish()));
-        // Zip64 end records: their spans start the cover
+        // Zip64 end records: their spans start the cover (and stay set for
+        // a later archive of a wildcard run, ruling T14-3: a plain archive
+        // with 20 bytes before its end record, "gb.zip")
         v.push(("z64rec.zip", zip64_zip(1, None)));
+        let one = zip_with(&[a], b"", b"");
+        let eocd = one.len() - 22;
+        v.push(("gb.zip", [&one[..eocd], &[b'#'; 20], &one[eocd..]].concat()));
         let z64_hit = la + 2 * 46 + 10;
         v.push(("z64rec_hit.zip", zip64_zip(1, Some(z64_hit))));
         v
