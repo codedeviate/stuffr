@@ -112,3 +112,15 @@ path = "fuzz_targets/compat.rs"
 test = false
 doc = false
 bench = false
+
+# 0.16.0 Task 15. Info-ZIP UnZip 6.0's own decoders (`stuffr::infozip`:
+# inflate and deflate64, explode, unshrink, and crypt's test_key with
+# decryption) fed raw streams, each held to its own maximum expansion and a
+# refused flush. Seventh target; `compat` reaches the same decoders only
+# through a whole archive.
+[[bin]]
+name = "infozip"
+path = "fuzz_targets/infozip.rs"
+test = false
+doc = false
+bench = false

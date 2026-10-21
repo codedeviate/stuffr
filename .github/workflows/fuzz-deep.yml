@@ -75,21 +75,28 @@ jobs:
     # that gap, not the schedule trigger's own default behaviour. It covers
     # the `push: tags` trigger too, which a fork gets for free by pushing any
     # `v*` tag of its own; that one would otherwise burn a fork's runner
-    # minutes on six 20-minute jobs without being asked.
+    # minutes on seven 20-minute jobs without being asked.
     if: github.repository == 'codedeviate/stuffr'
     strategy:
       fail-fast: false
       matrix:
-        target: [codec, container, chain, roundtrip, salvage, compat]
+        target: [codec, container, chain, roundtrip, salvage, compat, infozip]
         # Extra libFuzzer flags for one target. `compat` gets a per-input
         # timeout: a bzip2 stream of a few dozen bytes decodes to tens of
         # MB, and `run_in`'s 8 MiB budget is what bounds that work (decode
         # under `-t` included). 60 s is far past any bounded input, so a
         # timeout here means that bound regressed, reported as a finding
-        # rather than as a job that hangs to its limit. The other targets
-        # keep libFuzzer's default.
+        # rather than as a job that hangs to its limit. The other targets,
+        # but `infozip` below, keep libFuzzer's default.
+        #
+        # `infozip` (0.16.0) gets the same 60 s: its flush callback stops
+        # every decoder at 8 MiB of output, so a run is milliseconds, and a
+        # timeout means a decoder stopped consuming input or output without
+        # stopping (the "decoding terminates" half of its oracle).
         include:
           - target: compat
+            extra: -timeout=60
+          - target: infozip
             extra: -timeout=60
     steps:
       - uses: actions/checkout@v4
@@ -117,7 +124,7 @@ jobs:
         run: cargo install cargo-fuzz --version 0.13.2 --locked
       # Generated, not committed (`fuzz/.gitignore`'s `/corpus`) — regenerated
       # fresh for every scheduled run, exactly as ci.yml's smoke job does.
-      # This step seeds ALL SIX matrix entries, `salvage` included. It said
+      # This step seeds ALL SEVEN matrix entries, `salvage` included. It said
       # otherwise ("`salvage` ... has no seed generator, so its matrix entry
       # below runs from an empty corpus directory") from Salvage Stage 1 Task
       # 8 until Stage 2 Task 8, and it was false from the moment that task's
@@ -206,6 +213,12 @@ jobs:
              the tool's set, a write outside the run's directory, or
              bzip2recover reading or writing past its bounds. See the header
              of fuzz/fuzz_targets/compat.rs.
+
+             An `infozip` input is a selector byte (`% 6`: inflate,
+             deflate64, explode, unshrink, or test_key + decrypt two ways)
+             and the raw stream; see the header of
+             fuzz/fuzz_targets/infozip.rs for each layout and for the ratio
+             bounds its panics name.
 
           5. Crash artifacts are kept for 30 days. Copy the input out of the
              artifact before then, or the finding is lost with it.

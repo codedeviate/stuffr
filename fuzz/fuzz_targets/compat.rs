@@ -4,9 +4,10 @@
 //! Apple/BSD), the xz family (0.13.0 Task 9: `xz`, `unxz`, `xzcat`,
 //! `lzma`, `unlzma`, `lzcat`) and the zstd family (0.14.0 Task 10: `zstd`,
 //! `unzstd`, `zstdcat`, `zstdmt`) and the lz4 family (0.15.0 Task 8:
-//! `lz4`, `unlz4`, `lz4cat`, `lz4c`) and the unzip family's command line
-//! (0.16.0 Task 7: `unzip`, `zipinfo`, `funzip`), through
-//! `stuffr_cli::compat::run_in_counted` and `bzip2recover::recover`.
+//! `lz4`, `unlz4`, `lz4cat`, `lz4c`) and the unzip family (0.16.0 Tasks 7
+//! and 15: `unzip`, `zipinfo`, `funzip`, each as Apple's and as Ubuntu's),
+//! through `stuffr_cli::compat::run_in_counted` and
+//! `bzip2recover::recover`.
 //!
 //! The only fuzz coverage of `stuffr::bzip2_stream::StreamReader`, the
 //! libbzip2-shaped decoder only the compat layer reaches, and of the gzip
@@ -28,7 +29,8 @@
 //! An input is `[tool][argc][token; argc][file mask] ++ payload`, decoded by
 //! `stuffr_core::testing::decode_compat_case` (whose tables are the wire
 //! format of the seeds `crates/stuffr/tests/fuzz_corpus.rs` writes). The
-//! tool byte also picks the gzip flavour, `(byte / names) & 1` (R7). Each
+//! tool byte also picks the gzip and unzip flavours, `(byte / names) & 1`
+//! (R7: 0 GNU or Ubuntu, 1 BSD or Apple). Each
 //! file the mask names is created holding the payload; with the mask's stdin
 //! bit, standard input carries it too. The xz family's five files take a
 //! second mask byte, there only when the argument-count byte is past 8
@@ -106,6 +108,14 @@
 //!   budget. The lz4 family's tokens bring `a.lz4`, the sixteenth
 //!   `COMPAT_FILES` entry, which takes a third mask byte (present when the
 //!   argument-count byte is at least 18); `-D` takes `d.dict`.
+//! - the unzip family exits with one of its flavour's reference codes
+//!   (`unzip::EXIT_CODES_APPLE`, `unzip::EXIT_CODES_UBUNTU`), reads each
+//!   archive within `check_unzip_reads`' bound (not linear: Apple's build
+//!   reads an entry once per central record naming it), keeps the output
+//!   budget over the whole extracted tree, writes nothing through the
+//!   symlinks it extracts, and puts no name in the real working directory
+//!   (`run_unzip`). Its tokens bring `a.zip` and `b.zip`, the seventeenth
+//!   and eighteenth `COMPAT_FILES` entries, on the third mask byte.
 //!
 //! **Memory under the xz names (Ruling P7).** libFuzzer's RSS limit
 //! (2 GiB by default) is the bound, and each verb stays inside it by a
@@ -1570,26 +1580,284 @@ fn run_lz4(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
     check_budget(dir, name, args, &out, &before);
 }
 
-/// The unzip family (0.16.0 Task 7: the command line only), through
-/// `compat::run_in_counted` in this build's default flavour (Task 15 takes
-/// the flavour from the name byte and adds the archive oracles): no panic,
-/// and the exit is one of that flavour's (`unzip::EXIT_CODES_APPLE`,
-/// `unzip::EXIT_CODES_UBUNTU`).
-fn run_unzip(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
-    let flavour = unzip::default_flavour();
+/// The suffixes unzip and zipinfo retry an archive name with when it does
+/// not open as given (`do_wild`: `name`, `name.zip`, `name.ZIP`).
+const UNZIP_RETRIES: &[&str] = &["", ".zip", ".ZIP"];
+
+/// `INBUFSIZ` (unzpriv.h): unzip reads its archive in blocks of this size,
+/// each from a block boundary.
+const UNZIP_INBUFSIZ: u64 = 8192;
+
+/// How many central-directory records `bytes` could hold: the
+/// `PK\1\2` signatures in it. unzip processes an entry only from a record
+/// that starts with one (`process_cdir_file_hdr`; anything else is
+/// "expected central file header signature not found"), and each record is
+/// read once per pass.
+fn central_signatures(bytes: &[u8]) -> u64 {
+    bytes.windows(4).filter(|w| *w == b"PK\x01\x02").count() as u64
+}
+
+/// Every regular file under `dir`, by path, with its contents.
+fn tree_contents(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(d) = pending.pop() {
+        let Ok(listing) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in listing.flatten() {
+            let Ok(kind) = e.file_type() else { continue };
+            if kind.is_dir() {
+                pending.push(e.path());
+            } else if kind.is_file()
+                && let Ok(bytes) = std::fs::read(e.path())
+            {
+                out.insert(e.path(), bytes);
+            }
+        }
+    }
+    out
+}
+
+/// Gives every directory under `dir` its owner's read, write and search
+/// bits back, and every file its owner's read bit: an archive may set a
+/// directory to 0o000 (unzip applies directory modes at the end), which
+/// the containment walk could not read and the end of the iteration could
+/// not remove, and a file to 0o000, which the budget could not count.
+/// Symlinks are not followed.
+fn make_traversable(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let set = |p: &Path, bits: u32| {
+        if let Ok(meta) = std::fs::symlink_metadata(p) {
+            let mode = meta.permissions().mode() | bits;
+            let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode));
+        }
+    };
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(d) = pending.pop() {
+        set(&d, 0o700);
+        let Ok(listing) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in listing.flatten() {
+            match e.file_type() {
+                Ok(k) if k.is_dir() => pending.push(e.path()),
+                Ok(k) if k.is_file() => set(&e.path(), 0o400),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// The symlinks under `dir` (unzip creates them with whatever text the
+/// archive gives, as the references do), and the paths they name, joined
+/// lexically onto the link's directory.
+fn symlinks_under(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let mut out = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(d) = pending.pop() {
+        let Ok(listing) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in listing.flatten() {
+            let Ok(kind) = e.file_type() else { continue };
+            if kind.is_dir() {
+                pending.push(e.path());
+            } else if kind.is_symlink()
+                && let Ok(target) = std::fs::read_link(e.path())
+            {
+                out.push((e.path(), d.join(target)));
+            }
+        }
+    }
+    out
+}
+
+/// Every top-level name in the real working directory before the first
+/// run (taken at the top of every iteration, so before any run), for
+/// `check_unzip_cwd`.
+fn cwd_names_before() -> &'static std::collections::BTreeSet<OsString> {
+    static NAMES: OnceLock<std::collections::BTreeSet<OsString>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        let cwd = &cwd_before().0;
+        std::fs::read_dir(cwd)
+            .map(|l| l.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default()
+    })
+}
+
+/// unzip writes names the archive chooses, which `could_be_written` (the
+/// real working directory's snapshot filter) does not know: no name the
+/// run created at the top of its directory may also have appeared in the
+/// real working directory since the first run.
+fn check_unzip_cwd(dir: &Path, name: &str, args: &[&str]) {
+    let before = cwd_names_before();
+    let cwd = &cwd_before().0;
+    let Ok(listing) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in listing.flatten() {
+        let n = e.file_name();
+        assert!(
+            before.contains(&n) || cwd.join(&n).symlink_metadata().is_err(),
+            "{name} {args:?}: {n:?} appeared in the real working directory {cwd:?}"
+        );
+    }
+}
+
+/// The unzip family (0.16.0) through `compat::run_in_counted`, as the
+/// flavour the name byte gives (R7: 0 Ubuntu, 1 Apple, the same side as
+/// gzip's GNU and BSD). Asserted:
+///
+/// - the exit is one the flavour's reference gives
+///   (`unzip::EXIT_CODES_APPLE`, `unzip::EXIT_CODES_UBUNTU`: 12, `PK_BOMB`,
+///   is Ubuntu's alone); stuffr's own 3-7 never appear with their meanings,
+///   and a panic is a crash;
+/// - the read bound (`check_unzip_reads`);
+/// - standard output plus every new or changed file anywhere under the
+///   run's directory stays within the 8 MiB budget (an extracted tree is
+///   deeper than the other families' outputs);
+/// - containment (in `fuzz_target!`, after `make_traversable`), with the
+///   symlinks unzip extracted exempt from the "resolves inside" rules: the
+///   references create a link with whatever text the archive holds, and
+///   writing THROUGH one is what `compat::unzip`'s resolve-beneath walk
+///   refuses (both flavours; deviation 3). What the exemption could hide,
+///   a write through such a link, is checked instead: no link's target
+///   exists outside the run's directory as a non-directory modified since
+///   the run began (a directory there, the system temporary directory
+///   above the sandbox, say, changes under other processes too);
+/// - no name the run created appeared in the real working directory
+///   (`check_unzip_cwd`).
+fn run_unzip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]) {
+    let flavour = if flavour == 0 {
+        unzip::Flavour::Ubuntu
+    } else {
+        unzip::Flavour::Apple
+    };
+    let before = tree_contents(dir);
+    let payload_sigs = before
+        .values()
+        .map(|b| central_signatures(b))
+        .max()
+        .unwrap_or(0);
+    let started = SystemTime::now();
     let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
-    let (code, _out, err, _reads) =
+    let (code, out, err, reads) =
         compat::run_in_counted(dir, name, os_args, stdin, Flavour::Gnu, flavour)
             .expect("a COMPAT_NAMES entry is a compat name");
+    let why = || String::from_utf8_lossy(&err).into_owned();
+    if std::env::var_os("STUFFR_FUZZ_COMPAT_TRACE").is_some() {
+        eprintln!("compat: {name} {flavour:?} {args:?} -> {code} (signatures {payload_sigs})");
+        for (path, r) in &reads {
+            eprintln!("compat:   {path:?} {r:?}");
+        }
+    }
     let codes = match flavour {
         unzip::Flavour::Apple => unzip::EXIT_CODES_APPLE,
         unzip::Flavour::Ubuntu => unzip::EXIT_CODES_UBUNTU,
     };
     assert!(
         codes.contains(&code),
-        "{name}: exit {code} is not one the {flavour:?} reference gives\n{}",
-        String::from_utf8_lossy(&err)
+        "{name} ({flavour:?}) {args:?}: exit {code} is not one the reference gives\n{}",
+        why()
     );
+    check_unzip_reads(dir, name, flavour, args, payload_sigs, &reads);
+    make_traversable(dir);
+    let written: u64 = tree_contents(dir)
+        .into_iter()
+        .filter(|(p, bytes)| before.get(p) != Some(bytes))
+        .map(|(_, bytes)| bytes.len() as u64)
+        .sum();
+    assert!(
+        out.len() as u64 + written <= OUTPUT_BUDGET,
+        "{name} ({flavour:?}) {args:?}: {} bytes to stdout and {written} to files, past the \
+         {OUTPUT_BUDGET}-byte budget",
+        out.len()
+    );
+    for (link, target) in symlinks_under(dir) {
+        if target.starts_with(dir) && !target.components().any(|c| c.as_os_str() == "..") {
+            continue;
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(&target)
+            && !meta.is_dir()
+        {
+            assert!(
+                meta.modified().is_ok_and(|t| t < started),
+                "{name} ({flavour:?}) {args:?}: {target:?}, named by the extracted link \
+                 {link:?}, changed during the run"
+            );
+        }
+    }
+    check_unzip_cwd(dir, name, args);
+}
+
+/// The unzip family's read bound, for every path a run opened: the path's
+/// file name is a token plus one of `UNZIP_RETRIES` (`m` such tokens; a
+/// path no token names must not be opened at all), and then
+///
+/// - at most `3 × m` opens (measured: one per archive the run processes;
+///   unzip and zipinfo open a name, then its `.zip`/`.ZIP` retry, only when
+///   it fails to open, which a sandbox's file never does twice);
+/// - at most `(signatures + 4) × (len + 2 × INBUFSIZ) × m` bytes, where
+///   `signatures` counts the `PK\1\2` in the payload (`central_signatures`)
+///   and `len` is the file's largest length at an open. **Not linear, and
+///   no linear bound applies:** Apple's build reads an entry's data once
+///   for every central record naming it (it has no overlap check; Ubuntu's
+///   patch 23 refuses the second, exit 12), and data that decodes to
+///   nothing (deflate's empty stored blocks) costs no output budget, so
+///   one 60 KiB entry named by a thousand records reads 60 MB, as Apple's
+///   `unzip -t` itself does. Per pass, each record is read once and its
+///   entry's data at most whole, from the `INBUFSIZ` block holding its
+///   local header to the block after its end (`+ 2 × INBUFSIZ`); the end
+///   record search, the Zip64 locator and directory, and the directory's
+///   re-read after a "missing bytes" correction are the `+ 4` passes.
+///   funzip reads its operand once, a stream from start to stop.
+///
+/// Measured over the seeds (0.16.0 Task 15, `STUFFR_FUZZ_COMPAT_TRACE=1`,
+/// both flavours): every run opens its archive once. An archive inside one
+/// block is read whole once per pass: the end-record search, the central
+/// directory, then each local header's block (two entries in one block
+/// share it): 3 passes for `-t`, `-p`, extraction and `-l`/`-v`/zipinfo
+/// alike (`test-stored` 9,344 of 3,108 bytes, `test-implode` 7,259 of
+/// 2,413, `extract-deflate` 1,994 of 658; zipinfo and `-l` 1,336 of 658,
+/// 2 passes, no entry data). Ubuntu's overlapped refusal stops at 512 of
+/// 246. funzip reads its file operand once (658 of 658).
+fn check_unzip_reads(
+    dir: &Path,
+    name: &str,
+    flavour: unzip::Flavour,
+    args: &[&str],
+    signatures: u64,
+    reads: &BTreeMap<PathBuf, compat::InputReads>,
+) {
+    for (path, r) in reads {
+        let file = path
+            .strip_prefix(dir)
+            .ok()
+            .and_then(|p| p.to_str())
+            .unwrap_or_else(|| panic!("{name} ({flavour:?}): opened {path:?}, outside {dir:?}"));
+        let m = args
+            .iter()
+            .filter(|t| {
+                UNZIP_RETRIES.iter().any(|s| {
+                    file == format!("{t}{s}") || file.eq_ignore_ascii_case(&format!("{t}{s}"))
+                })
+            })
+            .count() as u64;
+        assert!(
+            r.opens <= 3 * m,
+            "{name} ({flavour:?}) {args:?}: {} opens of {file:?}, which {m} token(s) name",
+            r.opens
+        );
+        let per_pass = r.len + 2 * UNZIP_INBUFSIZ;
+        assert!(
+            r.bytes <= (signatures + 4) * per_pass * m,
+            "{name} ({flavour:?}) {args:?}: read {} bytes of the {}-byte {file:?} \
+             ({signatures} central signatures), which {m} token(s) name",
+            r.bytes,
+            r.len
+        );
+    }
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -1600,6 +1868,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     cwd_before();
+    cwd_names_before();
     let parent = sandbox();
     let _ = std::fs::remove_dir_all(parent);
     std::fs::create_dir_all(parent).expect("create the sandbox parent");
@@ -1626,11 +1895,18 @@ fuzz_target!(|data: &[u8]| {
         "bzip2" | "bunzip2" | "bzcat" => run_bzip2(&dir, case.name, &case.args, stdin),
         "zstd" | "unzstd" | "zstdcat" | "zstdmt" => run_zstd(&dir, case.name, &case.args, stdin),
         "lz4" | "unlz4" | "lz4cat" | "lz4c" => run_lz4(&dir, case.name, &case.args, stdin),
-        "unzip" | "zipinfo" | "funzip" => run_unzip(&dir, case.name, &case.args, stdin),
+        "unzip" | "zipinfo" | "funzip" => {
+            run_unzip(&dir, case.name, case.flavour, &case.args, stdin)
+        }
         other => unreachable!("{other} is in COMPAT_NAMES but has no arm here"),
     }
 
-    check_extraction_contained(parent, &dir, &[]).expect("compat: contained");
+    // The unzip family extracts symlinks with the archive's own text
+    // (`run_unzip` checks nothing was written through one); every other
+    // family creates none.
+    let links: Vec<PathBuf> = symlinks_under(&dir).into_iter().map(|(l, _)| l).collect();
+    let links: Vec<&Path> = links.iter().map(PathBuf::as_path).collect();
+    check_extraction_contained(parent, &dir, &links).expect("compat: contained");
     check_cwd_untouched();
     std::fs::remove_dir_all(parent).expect("remove the sandbox parent");
 });

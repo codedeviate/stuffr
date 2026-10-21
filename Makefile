@@ -21,8 +21,8 @@ help:
 	@echo '  make miri     Miri over the two unsafe regions (tar.rs, ar.rs)'
 	@echo '  make hooks    install the commit-msg hook (once per clone)'
 	@echo '  make clean    remove build artefacts'
-	@echo '  make fuzz-corpus  (re)generate fuzz/corpus/{codec,container,chain,roundtrip,salvage,compat}'
-	@echo '  make fuzz     short, seeded smoke pass over the six targets (mirrors CI)'
+	@echo '  make fuzz-corpus  (re)generate fuzz/corpus/{codec,container,chain,roundtrip,salvage,compat,infozip}'
+	@echo '  make fuzz     short, seeded smoke pass over the seven targets (mirrors CI)'
 	@echo '  make compat-ubuntu  the unzip suites against Ubuntu 24.04 unzip, in Docker'
 	@echo '                (not in check; COMPAT_UBUNTU_ARGS=... is passed to the tests)'
 
@@ -294,7 +294,7 @@ miri:
 # than asking once.
 FUZZ_RUNS = 2000
 FUZZ_SEED = 1
-# All six targets are seeded. `salvage` was the exception until the Salvage
+# All seven targets are seeded. `salvage` was the exception until the Salvage
 # Stage 1 final fix wave, and the measurement is worth keeping: unseeded, it
 # plateaued at `cov: 217` after 100,000 runs, and the binary's own
 # `salvage --list` over all 64 accumulated corpus inputs produced not one
@@ -320,7 +320,7 @@ FUZZ_SEED = 1
 # see CONTRIBUTING.md's `STUFFR_FUZZ_SALVAGE_TRACE` recipe.
 fuzz: fuzz-corpus
 	@status=0; \
-	for target in codec container chain roundtrip salvage compat; do \
+	for target in codec container chain roundtrip salvage compat infozip; do \
 	  corpus=$$(find fuzz/corpus/$$target -type f 2>/dev/null | wc -l | tr -d ' '); \
 	  runs=$$((corpus + $(FUZZ_RUNS))); \
 	  cmd="cargo +nightly fuzz run $$target -- -runs=$$runs -seed=$(FUZZ_SEED)"; \
@@ -352,7 +352,7 @@ hooks:
 	@echo '✓ commit-msg hook active (core.hooksPath = .githooks)'
 
 # Regenerates fuzz/fuzz-run seed corpus under
-# fuzz/corpus/{codec,container,chain,roundtrip,salvage,compat}.
+# fuzz/corpus/{codec,container,chain,roundtrip,salvage,compat,infozip}.
 #
 # NOT part of `check`: this WRITES real files under `fuzz/corpus/`, which is
 # generated and gitignored (`fuzz/.gitignore`'s `/corpus`) rather than
@@ -401,14 +401,14 @@ fuzz-corpus:
 	  echo "  (a cargo test filter that matches nothing exits 0; this is the guard that turns that into a failure)" >&2; \
 	  exit 1; \
 	fi; \
-	for target in codec container chain roundtrip salvage compat; do \
+	for target in codec container chain roundtrip salvage compat infozip; do \
 	  dir=fuzz/corpus/$$target; \
 	  if [ -z "$$(find $$dir -type f -size +0c 2>/dev/null | head -1)" ]; then \
 	    echo "make fuzz-corpus: $$dir holds no non-empty seed after a run the generator reported as passing" >&2; \
 	    exit 1; \
 	  fi; \
 	done; \
-	echo "✓ corpus regenerated ($$ran generator test(s) ran; all six target corpora non-empty)"
+	echo "✓ corpus regenerated ($$ran generator test(s) ran; all seven target corpora non-empty)"
 
 # The unzip family's Ubuntu oracle (0.16.0, ruling R10): apt's unzip
 # 6.0-28ubuntu4.1 on ubuntu:24.04, which only CI's ubuntu-latest otherwise has.

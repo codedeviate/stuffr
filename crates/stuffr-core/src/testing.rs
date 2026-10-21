@@ -139,8 +139,9 @@ pub const SALVAGE_FUZZ_MAX_ENTRY: u64 = 256 * 1024;
 
 /// The `compat` fuzz target's tool selector: byte `n % COMPAT_NAMES.len()`
 /// names the compatibility tool a case runs as, and `(n / len) & 1` the
-/// gzip flavour (0 GNU, 1 BSD; R7 of 0.12.0). Only the gzip names read the
-/// flavour. Every seed the 0.11.0 generator wrote has a name byte below 4,
+/// flavour: the gzip family's (0 GNU, 1 BSD; R7 of 0.12.0) and, since
+/// 0.16.0, the unzip family's (0 Ubuntu, 1 Apple: the same side as gzip's).
+/// Only those two families read it. Every seed the 0.11.0 generator wrote has a name byte below 4,
 /// so it decodes to the same tool, as GNU (`old_seeds_decode_unchanged`).
 ///
 /// **Appending a name moves every flavour-1 byte**: `index + len` names a
@@ -205,12 +206,17 @@ pub const COMPAT_NAMES: &[&str] = &[
 /// no earlier generator wrote such a byte). lz4's `-D` takes `d.dict`:
 /// there is no second dictionary file, because a seventeenth bit would
 /// need a fourth byte for nothing a dictionary's contents add.
+///
+/// The unzip family's two (0.16.0) take bits 17 and 18 of that third byte:
+/// `a.zip`, and `b.zip` for a second archive (unzip's wildcard and
+/// several-archive paths, zipinfo's `-Z` over two).
 pub const COMPAT_FILES: &[&str] = &[
     "a", "a.bz2", "a.tbz2", "a.out", // 0.11.0
     "a.gz", "a.tgz", "a.z", // 0.12.0: the gzip family
     "a.xz", "a.txz", "a.lzma", "a.tlz", "a.lz", // 0.13.0: the xz family
     "a.zst", "a.tzst", "d.dict", // 0.14.0: the zstd family
     "a.lz4",  // 0.15.0: the lz4 family (a third mask byte; its dictionary is `d.dict`)
+    "a.zip", "b.zip", // 0.16.0: the unzip family (third mask byte, bits 17 and 18)
 ];
 
 /// The `compat` target's argument vocabulary: byte `n % len` is one argument.
@@ -397,6 +403,20 @@ pub const COMPAT_TOKENS: &[&str] = &[
     "-hc",
     "-y",
     "a.lz4",
+    // 0.16.0: the unzip family (`-l -v -t -c -n -d -x -a -L -q` are above;
+    // `-P`, `-d`, `-x`, `-O` and `-I` take the next token as their value).
+    "-p",
+    "-o",
+    "-P",
+    "-Z",
+    "-j",
+    "-C",
+    "-X",
+    "-O",
+    "-I",
+    "-M",
+    "a.zip",
+    "b.zip",
 ];
 
 /// The largest input the `compat` target runs. Here, not in the target, so
@@ -443,7 +463,8 @@ const FIRST_WIDER_FILE: usize = 15;
 pub struct CompatCase<'a> {
     /// The tool, from [`COMPAT_NAMES`].
     pub name: &'static str,
-    /// The gzip flavour, 0 GNU or 1 BSD (R7); the other families ignore it.
+    /// The flavour (R7): gzip's 0 GNU or 1 BSD, unzip's 0 Ubuntu or 1
+    /// Apple; the other families ignore it.
     pub flavour: u8,
     /// The arguments after `argv[0]`, from [`COMPAT_TOKENS`].
     pub args: Vec<&'static str>,
@@ -2071,7 +2092,8 @@ mod tests {
     /// of `2 × (COMPAT_MAX_ARGS + 1)`, which no earlier generator wrote.
     fn seeds_of_0_14_decode_unchanged() {
         const OLD_NAMES: usize = 18;
-        const OLD_TOKENS: usize = COMPAT_TOKENS.len() - 16;
+        // The 0.14 table's length (0.15.0 appended 16 tokens, 0.16.0 12).
+        const OLD_TOKENS: usize = 139;
         const OLD_FILES: usize = 15;
         assert_eq!(COMPAT_NAMES[OLD_NAMES - 1], "zstdmt");
         assert_eq!(COMPAT_TOKENS[OLD_TOKENS - 1], "a.tzst");
@@ -2126,7 +2148,6 @@ mod tests {
     #[test]
     fn lz4_files_take_new_bits() {
         assert_eq!(COMPAT_FILES[15], "a.lz4");
-        assert_eq!(COMPAT_FILES.len(), 16);
         let k = COMPAT_TOKENS.iter().position(|t| *t == "-k").unwrap() as u8;
         let f = COMPAT_TOKENS.iter().position(|t| *t == "a.lz4").unwrap() as u8;
         let seed = encode_compat_case("lz4", 0, &["-k", "a.lz4"], &["a.lz4"], false, b"p");
@@ -2174,6 +2195,44 @@ mod tests {
             "a.lz4",
         ] {
             assert!(COMPAT_TOKENS.contains(&t), "{t}");
+        }
+        assert!(COMPAT_FILES.iter().all(|f| COMPAT_TOKENS.contains(f)));
+        assert!(COMPAT_TOKENS.len() <= 256);
+    }
+
+    /// 0.16.0: the unzip family's `a.zip` and `b.zip` are the seventeenth
+    /// and eighteenth files, bits 17 and 18 of the third mask byte, which no
+    /// earlier generator set: every 0.15 seed decodes as it did.
+    #[test]
+    fn zip_files_take_bits_17_and_18() {
+        assert_eq!(&COMPAT_FILES[16..], ["a.zip", "b.zip"]);
+        let t = |s: &str| COMPAT_TOKENS.iter().position(|t| *t == s).unwrap() as u8;
+        let argc = 2 * (COMPAT_MAX_ARGS as u8 + 1) + 2;
+        for (file, top) in [("a.zip", 1u8 << 1), ("b.zip", 1 << 2)] {
+            let seed = encode_compat_case("unzip", 1, &["-t", file], &[file], false, b"p");
+            assert_eq!(seed, [22 + 25, argc, t("-t"), t(file), 0, 0, top, b'p']);
+            let case = decode_compat_case(&seed).unwrap();
+            assert_eq!((case.name, case.flavour), ("unzip", 1));
+            assert_eq!(case.args, ["-t", file]);
+            assert_eq!(case.files, [file]);
+            assert!(!case.stdin);
+        }
+        // An lz4 seed of 0.15.0 (`a.lz4` alone in the third byte) decodes
+        // unchanged.
+        let old = [18, 18 + 1, t("-d"), 0, 0, 1, b'x'];
+        let case = decode_compat_case(&old).unwrap();
+        assert_eq!(case.files, ["a.lz4"]);
+        assert_eq!(case.args, ["-d"]);
+        assert_eq!(
+            encode_compat_case("lz4", 0, &["-d"], &["a.lz4"], false, b"x"),
+            old
+        );
+        // Every token the unzip family brought, and every file is a token.
+        for tok in [
+            "-l", "-v", "-t", "-p", "-c", "-o", "-n", "-P", "-d", "-x", "-Z", "-j", "-a", "-C",
+            "-L", "-X", "-q", "-O", "-I", "-M", "a.zip", "b.zip",
+        ] {
+            assert!(COMPAT_TOKENS.contains(&tok), "{tok}");
         }
         assert!(COMPAT_FILES.iter().all(|f| COMPAT_TOKENS.contains(f)));
         assert!(COMPAT_TOKENS.len() <= 256);

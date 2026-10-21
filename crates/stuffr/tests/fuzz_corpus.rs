@@ -52,6 +52,11 @@
 //!   every other shape its `zip` index — looked up, never a literal `0`, so
 //!   appending a slot cannot silently re-point an existing seed.
 //!
+//! - `infozip.rs` (0.16.0 Task 15) reads a leading selector byte whose
+//!   value `% 6` picks one of `stuffr::infozip`'s decoders (inflate,
+//!   deflate64, explode, unshrink, or `test_key` + decrypt as unzip or as
+//!   funzip does it) and feeds it the REST. See [`INFOZIP_SHAPES`].
+//!
 //! Phase 3b added three READ-ONLY slots (`lha`, `arj` and, at the time,
 //! `compress`) and Phase 3c a fourth container (`arc`), none of which this
 //! generator could build the way every other slot's seed is built — there
@@ -620,6 +625,7 @@ pub struct CorpusCounts {
     pub roundtrip: usize,
     pub salvage: usize,
     pub compat: usize,
+    pub infozip: usize,
 }
 
 // ---------------------------------------------------------------------
@@ -951,13 +957,579 @@ const COMPAT_SHAPES: &[&str] = &[
     "lz4cat-two-undecodable",
     "lz4-multiple-test-undecodable",
     // 0.16.0 Task 7: the unzip family's names, one seed each, for its
-    // command line (usage, the version screen, funzip's password); Task 15
-    // adds the archive shapes.
-    "unzip-help",
-    "unzip-version",
-    "zipinfo-help",
-    "funzip-stdin-password",
+    // command line (usage, the version screen, funzip's password). The
+    // unzip family names its flavour second (`unzip-apple-…`,
+    // `unzip-ubuntu-…`; R7's 1 and 0), as the gzip family does.
+    "unzip-apple-help",
+    "unzip-ubuntu-version",
+    "zipinfo-apple-help",
+    "funzip-ubuntu-stdin-password",
+    // 0.16.0 Task 15: one archive per method (stored, deflate, implode,
+    // shrink, bzip2, traditional encryption), a damaged one, the
+    // overlapped-components bomb, a symlink leaving the root, the replace
+    // question, `-d`, two archives, the listings, and funzip's inputs.
+    "unzip-apple-test-stored",
+    "unzip-ubuntu-test-stored",
+    "unzip-apple-extract-deflate",
+    "unzip-ubuntu-extract-deflate",
+    "unzip-ubuntu-pipe-deflate",
+    "unzip-apple-list-deflate",
+    "unzip-apple-test-implode",
+    "unzip-ubuntu-test-implode",
+    "unzip-ubuntu-extract-implode",
+    "unzip-apple-test-shrink",
+    "unzip-ubuntu-test-shrink",
+    "unzip-apple-test-bzip2",
+    "unzip-ubuntu-test-bzip2",
+    "unzip-apple-test-encrypted",
+    "unzip-ubuntu-test-encrypted",
+    "unzip-apple-test-damaged",
+    "unzip-ubuntu-test-damaged",
+    "unzip-apple-test-overlapped",
+    "unzip-ubuntu-test-overlapped",
+    "unzip-apple-extract-symlink",
+    "unzip-ubuntu-extract-symlink",
+    "unzip-apple-replace-prompt",
+    "unzip-ubuntu-replace-prompt",
+    "unzip-ubuntu-exdir",
+    "unzip-apple-two-archives",
+    "unzip-ubuntu-list-zipinfo-mode",
+    "zipinfo-apple-list",
+    "zipinfo-ubuntu-list",
+    "funzip-apple-stdin-gzip",
+    "funzip-ubuntu-stdin-gzip",
+    "funzip-apple-file-zip",
+    "funzip-ubuntu-stdin-encrypted-cut",
 ];
+
+// ---------------------------------------------------------------------
+// The unzip family's `compat` seeds and the `infozip` target's (0.16.0
+// Task 15).
+// ---------------------------------------------------------------------
+
+/// A committed Info-ZIP method fixture, `crates/stuffr-formats/tests/data/
+/// infozip/<name>` (its README has each one's origin and licence). The
+/// directory is excluded from the published `stuffr-formats` crate, but the
+/// corpus is generated from the repository, where it is always present: a
+/// missing file is a broken checkout, and panics.
+fn infozip_fixture(name: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../stuffr-formats/tests/data/infozip")
+        .join(name);
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// The first local entry of a fixture zip: its general-purpose flags, its
+/// uncompressed size and its data (by the local header's compressed size,
+/// which every fixture fills in).
+fn first_local_entry(zip: &[u8]) -> (u16, u32, &[u8]) {
+    assert_eq!(&zip[..4], b"PK\x03\x04", "not a local header");
+    let le16 = |at: usize| u16::from_le_bytes([zip[at], zip[at + 1]]);
+    let le32 = |at: usize| u32::from_le_bytes(zip[at..at + 4].try_into().unwrap());
+    let at = 30 + usize::from(le16(26)) + usize::from(le16(28));
+    (le16(6), le32(22), &zip[at..at + le32(18) as usize])
+}
+
+/// One entry of a hand-built archive (`unzip_zip`).
+struct ZipSeed {
+    name: &'static str,
+    /// Version needed to extract (`10`, `20`, `46` for bzip2).
+    version: u16,
+    flags: u16,
+    method: u16,
+    crc: u32,
+    /// The uncompressed size the headers declare.
+    ucsize: u32,
+    /// The entry's data as stored (compressed, and encrypted when flag 1).
+    data: Vec<u8>,
+    /// The Unix mode in the external attributes' high half (made by Unix
+    /// 3.0), `0o100644` for a file.
+    mode: u32,
+    /// Where the central record says the local header is, when not where
+    /// it was written (the overlapped-entries bomb).
+    offset: Option<u32>,
+}
+
+impl ZipSeed {
+    /// A stored (method 0) file entry holding `plain`.
+    fn stored(name: &'static str, plain: &[u8]) -> ZipSeed {
+        ZipSeed {
+            name,
+            version: 10,
+            flags: 0,
+            method: 0,
+            crc: crc32(plain),
+            ucsize: plain.len() as u32,
+            data: plain.to_vec(),
+            mode: 0o100_644,
+            offset: None,
+        }
+    }
+
+    /// A deflated (method 8) file entry holding `plain`, through this
+    /// build's raw deflate encoder.
+    fn deflated(work: &Path, name: &'static str, plain: &[u8]) -> stuffr_core::Result<ZipSeed> {
+        Ok(ZipSeed {
+            version: 20,
+            method: 8,
+            data: encoded(work, plain, "deflate", None)?,
+            ..ZipSeed::stored(name, plain)
+        })
+    }
+}
+
+/// An archive of `entries`: local headers and data in order, then the
+/// central directory and the end record, every field as `ZipSeed` says.
+/// Times are 2020-01-01 00:00 (DOS).
+fn unzip_zip(entries: &[ZipSeed]) -> Vec<u8> {
+    const DOS_TIME: u16 = 0;
+    const DOS_DATE: u16 = (40 << 9) | (1 << 5) | 1;
+    let mut out = Vec::new();
+    let mut offsets = Vec::new();
+    for e in entries {
+        offsets.push(out.len() as u32);
+        out.extend_from_slice(b"PK\x03\x04");
+        for v in [e.version, e.flags, e.method, DOS_TIME, DOS_DATE] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [e.crc, e.data.len() as u32, e.ucsize] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(e.name.as_bytes());
+        out.extend_from_slice(&e.data);
+    }
+    let cd_start = out.len() as u32;
+    for (e, &at) in entries.iter().zip(&offsets) {
+        out.extend_from_slice(b"PK\x01\x02");
+        for v in [0x031e, e.version, e.flags, e.method, DOS_TIME, DOS_DATE] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [e.crc, e.data.len() as u32, e.ucsize] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        // name, extra, comment lengths; disk; internal attributes
+        for v in [e.name.len() as u16, 0, 0, 0, 0] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&(e.mode << 16).to_le_bytes());
+        out.extend_from_slice(&e.offset.unwrap_or(at).to_le_bytes());
+        out.extend_from_slice(e.name.as_bytes());
+    }
+    let cd_size = out.len() as u32 - cd_start;
+    out.extend_from_slice(b"PK\x05\x06");
+    let n = entries.len() as u16;
+    for v in [0, 0, n, n] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(&cd_size.to_le_bytes());
+    out.extend_from_slice(&cd_start.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
+
+/// Traditional PKWARE encryption of `plain` under `password`: the 12-byte
+/// header (eleven fixed bytes, then `check`), then the data. Built on
+/// `stuffr::infozip::crypt::Keys`, which only decrypts: the key stream
+/// byte for the next position is what decrypting a 0 gives on a copy of
+/// the keys, and decrypting the ciphertext then moves the keys on by the
+/// plain byte, as encrypting does.
+fn zipcrypto(password: &[u8], check: u8, plain: &[u8]) -> Vec<u8> {
+    let mut keys = stuffr::infozip::crypt::Keys::new(password);
+    let mut header = *b"stuffr-seed\0";
+    header[11] = check;
+    header
+        .iter()
+        .chain(plain)
+        .map(|&p| {
+            let c = p ^ keys.clone().decrypt_byte(0);
+            assert_eq!(keys.decrypt_byte(c), p);
+            c
+        })
+        .collect()
+}
+
+/// An unzip-family case as `flavour` (0 Ubuntu, 1 Apple: R7's second
+/// half, the same side as gzip's GNU and BSD).
+fn uz(
+    name: &str,
+    flavour: u8,
+    args: &[&str],
+    files: &[&str],
+    stdin: bool,
+    payload: &[u8],
+) -> Vec<u8> {
+    encode_compat_case(name, flavour, args, files, stdin, payload)
+}
+
+/// The `compat` seed for an unzip-family `shape` (`<tool>-<apple|ubuntu>-
+/// <case>`), or `None` for another family's.
+fn unzip_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> {
+    let mut parts = shape.splitn(3, '-');
+    let (Some(tool), Some(flavour), Some(case)) = (parts.next(), parts.next(), parts.next()) else {
+        return Ok(None);
+    };
+    let flavour = match (tool, flavour) {
+        ("unzip" | "zipinfo" | "funzip", "ubuntu") => 0,
+        ("unzip" | "zipinfo" | "funzip", "apple") => 1,
+        _ => return Ok(None),
+    };
+    let text = compat_text(3000);
+    let short = b"a short stuffr seed entry\n";
+    let deflated = unzip_zip(&[
+        ZipSeed::deflated(work, "d/a.txt", &text)?,
+        ZipSeed::stored("b.txt", short),
+    ]);
+    let a = &["a.zip"][..];
+    let seed = match case {
+        // Task 7's command-line seeds.
+        "help" => uz(tool, flavour, &["-h"], &[], false, b""),
+        "version" => uz(tool, flavour, &["-v"], &[], false, b""),
+        "stdin-password" => uz(tool, flavour, &["-x"], &[], true, &text),
+        // One archive per method: stored, deflate, implode, shrink, bzip2.
+        "test-stored" => uz(
+            tool,
+            flavour,
+            &["-t", "a.zip"],
+            a,
+            false,
+            &unzip_zip(&[ZipSeed::stored("a.txt", &text)]),
+        ),
+        "extract-deflate" => uz(tool, flavour, &["-o", "a.zip"], a, false, &deflated),
+        "pipe-deflate" => uz(tool, flavour, &["-p", "a.zip"], a, false, &deflated),
+        "list-deflate" => uz(tool, flavour, &["-v", "a.zip"], a, false, &deflated),
+        "test-implode" => uz(
+            tool,
+            flavour,
+            &["-t", "a.zip"],
+            a,
+            false,
+            &infozip_fixture("implode-hand-8k-3trees.zip"),
+        ),
+        "extract-implode" => uz(
+            tool,
+            flavour,
+            &["-j", "a.zip"],
+            a,
+            false,
+            &infozip_fixture("implode-4k-2trees.zip"),
+        ),
+        "test-shrink" => uz(
+            tool,
+            flavour,
+            &["-t", "a.zip"],
+            a,
+            false,
+            &infozip_fixture("shrink-commons.zip"),
+        ),
+        "test-bzip2" => uz(
+            tool,
+            flavour,
+            &["-t", "a.zip"],
+            a,
+            false,
+            &infozip_fixture("bzip2.zip"),
+        ),
+        // An encrypted entry (traditional encryption, password `a`, the
+        // CRC's high byte as the check byte) beside a plain one.
+        "test-encrypted" => {
+            let mut e = ZipSeed::deflated(work, "e.txt", &text)?;
+            e.flags = 1;
+            e.data = zipcrypto(b"a", (e.crc >> 24) as u8, &e.data);
+            let zip = unzip_zip(&[e, ZipSeed::stored("b.txt", short)]);
+            uz(tool, flavour, &["-P", "a", "-t", "a.zip"], a, false, &zip)
+        }
+        // A byte flipped inside the deflated data.
+        "test-damaged" => {
+            let mut e = ZipSeed::deflated(work, "a.txt", &text)?;
+            let mid = e.data.len() / 2;
+            e.data[mid] ^= 0x55;
+            uz(tool, flavour, &["-t", "a.zip"], a, false, &unzip_zip(&[e]))
+        }
+        // Two central records naming one local header: Ubuntu's
+        // overlapped-components refusal (exit 12), Apple tests it twice.
+        "test-overlapped" => {
+            let mut second = ZipSeed::stored("a.txt", short);
+            second.offset = Some(0);
+            let zip = unzip_zip(&[ZipSeed::stored("a.txt", short), second]);
+            uz(tool, flavour, &["-t", "a.zip"], a, false, &zip)
+        }
+        // A symlink leaving the root, then a file under it: the reference
+        // creates the link and refuses (Apple) or, in stuffr's Ubuntu
+        // flavour, also refuses (deviation 3) to write through it.
+        "extract-symlink" => {
+            let mut link = ZipSeed::stored("l", b"../../outside");
+            link.mode = 0o120_777;
+            let zip = unzip_zip(&[link, ZipSeed::stored("l/x.txt", short)]);
+            uz(tool, flavour, &["a.zip"], a, false, &zip)
+        }
+        // An entry named `a` over the existing file `a`: the replace
+        // question, answered from standard input (the payload: `P`).
+        "replace-prompt" => {
+            let zip = unzip_zip(&[ZipSeed::stored("a", short)]);
+            uz(tool, flavour, &["a.zip"], &["a", "a.zip"], true, &zip)
+        }
+        // Into a directory unzip makes, `-d .x`.
+        "exdir" => uz(tool, flavour, &["-d", ".x", "a.zip"], a, false, &deflated),
+        // Two archives, the second a name pattern for the first.
+        "two-archives" => uz(
+            tool,
+            flavour,
+            &["-l", "a.zip", "b.zip"],
+            &["a.zip", "b.zip"],
+            false,
+            &deflated,
+        ),
+        // zipinfo's long and verbose listings.
+        "list" => uz(tool, flavour, &["-v", "a.zip"], a, false, &deflated),
+        "list-zipinfo-mode" => uz(tool, flavour, &["-Z", "-l", "a.zip"], a, false, &deflated),
+        // funzip: a gzip member on standard input, and a zip by name.
+        "stdin-gzip" => uz(
+            tool,
+            flavour,
+            &[],
+            &[],
+            true,
+            &gzip_member(work, &text, FNAME)?,
+        ),
+        "file-zip" => uz(tool, flavour, &["a.zip"], a, false, &deflated),
+        // An encrypted entry cut short, password `a` (`-a`: funzip takes a
+        // first argument starting with `-` as the password).
+        "stdin-encrypted-cut" => {
+            let mut e = ZipSeed::deflated(work, "e.txt", &text)?;
+            e.flags = 1;
+            e.data = zipcrypto(b"a", (e.crc >> 24) as u8, &e.data);
+            let zip = unzip_zip(&[e]);
+            uz(tool, flavour, &["-a"], &[], true, &cut(&zip, 90))
+        }
+        other => unreachable!("COMPAT_SHAPES lists an unhandled unzip shape {other:?}"),
+    };
+    Ok(Some(seed))
+}
+
+/// The `infozip` target's seeds: `[selector] ++ stream`, the selector
+/// `% 6` picking the decoder (see `fuzz/fuzz_targets/infozip.rs`). Real
+/// streams from this build's deflate encoder and the committed Info-ZIP
+/// fixtures, hand-built worst cases (the bombs whose figures the target's
+/// ratio bounds record) and damaged copies.
+const INFOZIP_SHAPES: &[&str] = &[
+    "inflate-stored",
+    "inflate-default",
+    "inflate-damaged",
+    "inflate-bomb",
+    "inflate-incomplete-l-tree",
+    "inflate64-lorem",
+    "inflate64-bomb",
+    "explode-4k-2trees",
+    "explode-8k-3trees",
+    "explode-hand-4k-3trees",
+    "explode-hand-8k-2trees",
+    "explode-short-ucsize",
+    "unshrink-commons",
+    "unshrink-full-table",
+    "unshrink-chain",
+    "crypt-unzip",
+    "crypt-unzip-wrong-check",
+    "crypt-funzip-cut",
+    "crypt-funzip64-cut",
+];
+
+/// Deflate's bits, least significant first, with Huffman codes most
+/// significant bit first (RFC 1951 §3.1.1).
+#[derive(Default)]
+struct Bits {
+    out: Vec<u8>,
+    acc: u64,
+    n: u32,
+}
+
+impl Bits {
+    /// `v`'s low `n` bits, least significant first.
+    fn put(&mut self, v: u64, n: u32) {
+        for i in 0..n {
+            self.acc |= ((v >> i) & 1) << self.n;
+            self.n += 1;
+            if self.n == 8 {
+                self.out.push(self.acc as u8);
+                self.acc = 0;
+                self.n = 0;
+            }
+        }
+    }
+
+    /// A Huffman code of `len` bits, most significant first.
+    fn code(&mut self, code: u32, len: u32) {
+        for i in (0..len).rev() {
+            self.put(u64::from((code >> i) & 1), 1);
+        }
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        if self.n > 0 {
+            self.out.push(self.acc as u8);
+        }
+        self.out
+    }
+}
+
+/// A final dynamic block's header for literal/length code lengths `lit`
+/// (286 of them) and distance code lengths `dist`, sent with a code-length
+/// code giving 0, 1, 2 and 18 two bits each (canonical codes 00, 01, 10,
+/// 11), runs of 11 or more zeros as 18.
+fn dynamic_header(bits: &mut Bits, lit: &[u8; 286], dist: &[u8]) {
+    const ORDER: [usize; 19] = [
+        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+    ];
+    bits.put(1, 1); // BFINAL
+    bits.put(2, 2); // BTYPE: dynamic
+    bits.put(286 - 257, 5);
+    bits.put(dist.len() as u64 - 1, 5);
+    bits.put(18 - 4, 4); // up to code-length symbol 1, ORDER's 18th
+    for &sym in &ORDER[..18] {
+        let len = if matches!(sym, 0 | 1 | 2 | 18) { 2 } else { 0 };
+        bits.put(len, 3);
+    }
+    let cl = |bits: &mut Bits, sym: u8| {
+        let code = match sym {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            _ => 3,
+        };
+        bits.code(code, 2);
+    };
+    let lengths: Vec<u8> = lit.iter().chain(dist).copied().collect();
+    let mut i = 0;
+    while i < lengths.len() {
+        let zeros = lengths[i..].iter().take_while(|&&l| l == 0).count();
+        if zeros >= 11 {
+            let run = zeros.min(138);
+            cl(bits, 18);
+            bits.put(run as u64 - 11, 7);
+            i += run;
+        } else {
+            cl(bits, lengths[i]);
+            i += 1;
+        }
+    }
+}
+
+/// The deflate bomb: a dynamic block whose literal/length tree is only
+/// end-of-block and 285 (one bit each) and whose distance tree is one
+/// 1-bit code, then `matches` copies of length 258 at distance 1 (deflate64:
+/// 285's 16 extra bits all ones, 65,538 bytes each), then end-of-block.
+fn deflate_bomb(matches: usize, deflate64: bool) -> Vec<u8> {
+    let mut lit = [0u8; 286];
+    lit[256] = 1;
+    lit[285] = 1;
+    let mut bits = Bits::default();
+    dynamic_header(&mut bits, &lit, &[1]);
+    for _ in 0..matches {
+        bits.code(1, 1); // 285
+        if deflate64 {
+            bits.put(0xffff, 16);
+        }
+        bits.code(0, 1); // distance code 0: distance 1
+    }
+    bits.code(0, 1); // end of block
+    bits.finish()
+}
+
+/// A dynamic block whose literal/length tree is incomplete (end-of-block
+/// and 285 at two bits each): inflate's `(incomplete l-tree)  ` message,
+/// then its code 1.
+fn deflate_incomplete_l_tree() -> Vec<u8> {
+    let mut lit = [0u8; 286];
+    lit[256] = 2;
+    lit[285] = 2;
+    let mut bits = Bits::default();
+    dynamic_header(&mut bits, &lit, &[1]);
+    bits.code(0, 2);
+    bits.finish()
+}
+
+/// A shrink (LZW) stream of `codes` KwKwK codes after a first literal `a`:
+/// each names the next free code, so each writes one byte more than the
+/// last (the longest output a code table can build), with the escape
+/// `256, 1` raising the code size before the first code that needs it.
+fn unshrink_chain(codes: u32) -> Vec<u8> {
+    let mut bits = Bits::default();
+    let mut size = 9;
+    bits.put(u64::from(b'a'), size);
+    for code in 257..257 + codes {
+        if code >= 1 << size {
+            bits.put(256, size);
+            bits.put(1, size);
+            size += 1;
+        }
+        bits.put(u64::from(code), size);
+    }
+    bits.finish()
+}
+
+/// The `infozip` seed for `shape`.
+fn infozip_seed(work: &Path, shape: &str) -> stuffr_core::Result<Vec<u8>> {
+    let text = compat_text(20_000);
+    let with = |selector: u8, rest: &[u8]| {
+        let mut v = vec![selector];
+        v.extend_from_slice(rest);
+        v
+    };
+    let explode_seed = |zip: &[u8]| {
+        let (flags, ucsize, data) = first_local_entry(zip);
+        let mut v = vec![2, flags as u8];
+        v.extend_from_slice(&ucsize.to_le_bytes()[..3]);
+        v.extend_from_slice(data);
+        v
+    };
+    // `[4|5][n][password][check][header] ++ data`, encrypted under `a`.
+    let crypt_seed = |selector: u8, check_ok: bool, data: &[u8], cut_at: Option<usize>| {
+        let enc = zipcrypto(b"a", 0x5a, data);
+        let mut v = vec![selector, 1, b'a', if check_ok { 0x5a } else { 0xa5 }];
+        let enc = cut_at.map_or(&enc[..], |n| &enc[..n.min(enc.len())]);
+        v.extend_from_slice(enc);
+        v
+    };
+    let deflated = encoded(work, &text, "deflate", None)?;
+    Ok(match shape {
+        "inflate-stored" => with(0, &encoded(work, &text, "deflate", Some(0))?),
+        "inflate-default" => with(0, &deflated),
+        "inflate-damaged" => with(0, &damaged(&deflated)),
+        "inflate-bomb" => with(0, &deflate_bomb(16_384, false)),
+        "inflate-incomplete-l-tree" => with(0, &deflate_incomplete_l_tree()),
+        "inflate64-lorem" => with(
+            1,
+            first_local_entry(&infozip_fixture("deflate64-lorem.zip")).2,
+        ),
+        "inflate64-bomb" => with(1, &deflate_bomb(100, true)),
+        "explode-4k-2trees" => explode_seed(&infozip_fixture("implode-4k-2trees.zip")),
+        "explode-8k-3trees" => explode_seed(&infozip_fixture("implode-8k-3trees.zip")),
+        "explode-hand-4k-3trees" => explode_seed(&infozip_fixture("implode-hand-4k-3trees.zip")),
+        "explode-hand-8k-2trees" => explode_seed(&infozip_fixture("implode-hand-8k-2trees.zip")),
+        // A ucsize of 50 for 2299 bytes of data: explode's return 5.
+        "explode-short-ucsize" => {
+            let mut v = explode_seed(&infozip_fixture("implode-hand-8k-3trees.zip"));
+            v[2..5].copy_from_slice(&[50, 0, 0]);
+            v
+        }
+        "unshrink-commons" => with(
+            3,
+            first_local_entry(&infozip_fixture("shrink-commons.zip")).2,
+        ),
+        "unshrink-full-table" => with(
+            3,
+            first_local_entry(&infozip_fixture("shrink-full-table.zip")).2,
+        ),
+        "unshrink-chain" => with(3, &unshrink_chain(3_800)),
+        "crypt-unzip" => crypt_seed(4, true, &deflated, None),
+        "crypt-unzip-wrong-check" => crypt_seed(4, false, &deflated, None),
+        // Cut inside the data: funzip's `NEXTBYTE` gives values past it.
+        "crypt-funzip-cut" => crypt_seed(5, true, &deflated, Some(70)),
+        "crypt-funzip64-cut" => crypt_seed(5 + 6, true, &deflated, Some(90)),
+        other => unreachable!("INFOZIP_SHAPES lists an unhandled shape {other:?}"),
+    })
+}
 
 /// `plain` as one zstd frame, through this build's encoder (weak on the
 /// pure tier, so asked for explicitly).
@@ -1687,6 +2259,9 @@ fn compat_seed(work: &Path, shape: &str) -> stuffr_core::Result<Vec<u8>> {
     if let Some(seed) = lz4_seed(work, shape)? {
         return Ok(seed);
     }
+    if let Some(seed) = unzip_seed(work, shape)? {
+        return Ok(seed);
+    }
     let text = compat_text(4000);
     let valid = bzip2_of(work, &text, 9)?;
     Ok(match shape {
@@ -1743,10 +2318,6 @@ fn compat_seed(work: &Path, shape: &str) -> stuffr_core::Result<Vec<u8>> {
             e("bzip2recover", &["a.bz2"], &["a.bz2"], false, &bytes)
         }
         "bzip2recover-usage" => e("bzip2recover", &[], &[], false, b""),
-        "unzip-help" => e("unzip", &["-h"], &[], false, b""),
-        "unzip-version" => e("unzip", &["-v"], &[], false, b""),
-        "zipinfo-help" => e("zipinfo", &["-h"], &[], false, b""),
-        "funzip-stdin-password" => e("funzip", &["-x"], &[], true, &text),
         other => unreachable!("COMPAT_SHAPES lists an unhandled shape {other:?}"),
     })
 }
@@ -2725,7 +3296,9 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
     let roundtrip_dir = root.join("roundtrip");
     let salvage_dir = root.join("salvage");
     let compat_dir = root.join("compat");
+    let infozip_dir = root.join("infozip");
     std::fs::create_dir_all(&compat_dir)?;
+    std::fs::create_dir_all(&infozip_dir)?;
     std::fs::create_dir_all(&codec_dir)?;
     std::fs::create_dir_all(&container_dir)?;
     std::fs::create_dir_all(&chain_dir)?;
@@ -3183,6 +3756,15 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
         compat_count += 1;
     }
 
+    // --- infozip/ ------------------------------------------------------
+    // One `[selector] ++ stream` per `INFOZIP_SHAPES` entry.
+    let mut infozip_count = 0usize;
+    for shape in INFOZIP_SHAPES {
+        let seed = infozip_seed(work.path(), shape)?;
+        std::fs::write(infozip_dir.join(format!("{shape}.seed")), &seed)?;
+        infozip_count += 1;
+    }
+
     Ok(CorpusCounts {
         codec: codec_count,
         container: container_count,
@@ -3190,6 +3772,7 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
         roundtrip: roundtrip_count,
         salvage: salvage_count,
         compat: compat_count,
+        infozip: infozip_count,
     })
 }
 
@@ -3215,6 +3798,7 @@ fn the_generated_corpus_has_exactly_one_seed_per_registered_slot() {
     let expected_roundtrip = writable_codec_slots().len() + writable_container_slots().len();
     let expected_salvage = SALVAGE_SHAPES.len();
     let expected_compat = COMPAT_SHAPES.len();
+    let expected_infozip = INFOZIP_SHAPES.len();
 
     for (target, got, expected) in [
         ("codec", counts.codec, expected_codec),
@@ -3223,6 +3807,7 @@ fn the_generated_corpus_has_exactly_one_seed_per_registered_slot() {
         ("roundtrip", counts.roundtrip, expected_roundtrip),
         ("salvage", counts.salvage, expected_salvage),
         ("compat", counts.compat, expected_compat),
+        ("infozip", counts.infozip, expected_infozip),
     ] {
         assert!(
             expected > 0,
@@ -3780,11 +4365,14 @@ fn every_compat_seed_decodes_fits_and_carries_its_shape() {
             "{shape} decodes as the wrong tool"
         );
         let gzip_family = matches!(case.name, "gzip" | "gunzip" | "zcat" | "gzcat");
+        let unzip_family = matches!(case.name, "unzip" | "zipinfo" | "funzip");
         let flavour = match shape.split('-').nth(1) {
             Some("bsd") if gzip_family => 1,
             Some("gnu") if gzip_family => 0,
+            Some("apple") if unzip_family => 1,
+            Some("ubuntu") if unzip_family => 0,
             _ => {
-                assert!(!gzip_family, "{shape} names no flavour");
+                assert!(!gzip_family && !unzip_family, "{shape} names no flavour");
                 0
             }
         };
@@ -3889,7 +4477,134 @@ fn generate_corpus_writes_the_real_seed_corpus() {
             && counts.chain > 0
             && counts.roundtrip > 0
             && counts.salvage > 0
-            && counts.compat > 0,
+            && counts.compat > 0
+            && counts.infozip > 0,
         "wrote an empty corpus for at least one target: {counts:?}"
     );
+}
+
+/// Runs one decoder over `src` with a fresh zeroed window: the bytes it
+/// wrote, its result, and inflate's messages.
+fn infozip_run(
+    run: impl FnOnce(
+        &mut [u8],
+        &mut dyn FnMut(&[u8]) -> Result<(), ()>,
+        &mut dyn FnMut(&'static str),
+    ) -> Result<(), stuffr::infozip::Stop<()>>,
+) -> (
+    u64,
+    Result<(), stuffr::infozip::Stop<()>>,
+    Vec<&'static str>,
+) {
+    let mut window = vec![0u8; stuffr::infozip::WSIZE];
+    let mut total = 0u64;
+    let mut messages = Vec::new();
+    let r = run(
+        &mut window,
+        &mut |c| {
+            total += c.len() as u64;
+            Ok(())
+        },
+        &mut |m| messages.push(m),
+    );
+    (total, r, messages)
+}
+
+/// Every `infozip` seed selects the decoder its shape names, and the
+/// hand-built ones decode as they claim: the bombs and the KwKwK chain to
+/// the sizes the target's ratio bounds record (`INFLATE_RATIO`,
+/// `INFLATE64_RATIO`, `UNSHRINK_RATIO` in `fuzz/fuzz_targets/infozip.rs`),
+/// the incomplete tree to its message and code 1, the real streams whole,
+/// and the encrypted ones to a matching or refused header.
+#[test]
+fn the_infozip_seeds_carry_their_shape() {
+    use stuffr::infozip::{Stop, crypt, explode, inflate, unshrink};
+    let work = tempfile::tempdir().unwrap();
+    for shape in INFOZIP_SHAPES {
+        let seed = infozip_seed(work.path(), shape).unwrap();
+        let selector = seed[0] % 6;
+        let expected = match shape.split('-').next().unwrap() {
+            "inflate" => 0,
+            "inflate64" => 1,
+            "explode" => 2,
+            "unshrink" => 3,
+            "crypt" if shape.starts_with("crypt-unzip") => 4,
+            "crypt" => 5,
+            other => panic!("{shape}: no decoder named {other}"),
+        };
+        assert_eq!(selector, expected, "{shape} selects the wrong decoder");
+        let rest = &seed[1..];
+        let ratio = |total: u64| total as f64 / rest.len() as f64;
+        match *shape {
+            "inflate-bomb" | "inflate64-bomb" => {
+                let d64 = selector == 1;
+                let (total, r, _) = infozip_run(|w, f, m| inflate(&mut rest.iter(), d64, w, f, m));
+                assert!(r.is_ok(), "{shape}: {r:?}");
+                let want = if d64 { 100 * 65_538 } else { 16_384 * 258 };
+                assert_eq!(total, want, "{shape}");
+                eprintln!(
+                    "{shape}: {total} bytes from {} = {:.1} per byte",
+                    rest.len(),
+                    ratio(total)
+                );
+            }
+            "inflate-incomplete-l-tree" => {
+                let (_, r, messages) =
+                    infozip_run(|w, f, m| inflate(&mut rest.iter(), false, w, f, m));
+                assert!(matches!(r, Err(Stop::Code(1))), "{r:?}");
+                assert_eq!(messages, [stuffr::infozip::INCOMPLETE_L_TREE]);
+            }
+            "inflate-stored" | "inflate-default" | "inflate64-lorem" => {
+                let (total, r, _) =
+                    infozip_run(|w, f, m| inflate(&mut rest.iter(), selector == 1, w, f, m));
+                assert!(r.is_ok(), "{shape}: {r:?}");
+                let want = if selector == 1 { 144_060 } else { 20_000 };
+                assert_eq!(total, want, "{shape}");
+            }
+            // Anything but a panic: where a flipped byte stops deflate is
+            // the encoder's business.
+            "inflate-damaged" => {
+                let _ = infozip_run(|w, f, m| inflate(&mut rest.iter(), false, w, f, m));
+            }
+            "unshrink-chain" => {
+                let (total, r, _) = infozip_run(|w, f, _| unshrink(&mut rest.iter(), w, f));
+                assert!(r.is_ok(), "{shape}: {r:?}");
+                // `a`, then codes writing 2, 3, ..., 3801 bytes.
+                assert_eq!(total, 1 + (2..=3_801u64).sum::<u64>(), "{shape}");
+                eprintln!(
+                    "{shape}: {total} bytes from {} = {:.1} per byte",
+                    rest.len(),
+                    ratio(total)
+                );
+            }
+            "unshrink-commons" | "unshrink-full-table" => {
+                let (total, r, _) = infozip_run(|w, f, _| unshrink(&mut rest.iter(), w, f));
+                assert!(r.is_ok(), "{shape}: {r:?}");
+                assert!(total > 0, "{shape}");
+            }
+            s if s.starts_with("explode-") => {
+                let flags = u16::from(rest[0]);
+                let ucsize = u64::from(u32::from_le_bytes([rest[1], rest[2], rest[3], 0]));
+                let (total, r, _) =
+                    infozip_run(|w, f, _| explode(&mut rest[4..].iter(), flags, ucsize, w, f));
+                if s == "explode-short-ucsize" {
+                    assert!(matches!(r, Err(Stop::Length { .. })), "{shape}: {r:?}");
+                } else {
+                    assert!(r.is_ok(), "{shape}: {r:?}");
+                }
+                assert!(
+                    (ucsize..=ucsize + 320).contains(&total),
+                    "{shape}: {total} of {ucsize}"
+                );
+            }
+            s => {
+                assert!(s.starts_with("crypt-"), "{shape}");
+                let (n, rest) = rest.split_first().unwrap();
+                let (password, rest) = rest.split_at(usize::from(n % 17));
+                let header: &[u8; 12] = rest[1..13].try_into().unwrap();
+                let keys = crypt::test_key(password, header, rest[0]);
+                assert_eq!(keys.is_some(), !s.contains("wrong"), "{shape}");
+            }
+        }
+    }
 }
