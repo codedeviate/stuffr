@@ -14,16 +14,16 @@
 //! macOS and the BSDs, Ubuntu 24.04's `6.0-28ubuntu4.1` elsewhere
 //! ([`default_flavour`]), or as `STUFFR_UNZIP_FLAVOR` (`apple`, `ubuntu`)
 //! says; [`run`] reads it once, and anything else in it is refused, exit 1,
-//! in stuffr's own words. Ubuntu's build options and patches are flavour
-//! checks at the points they change behaviour (R13: filled by Tasks 13 and
-//! 14; until then those checks give Apple's answer).
+//! in stuffr's own words. Ubuntu's build options (its `-D` DEFINES) and
+//! its patch series are flavour checks at the points they change
+//! behaviour (R13), each marked `// ubuntu:`.
 //!
 //! **G becomes `Uz`** (R5): Info-ZIP's global `G` (and its `uO`
 //! options) is one value per run, holding the host, the flavour, the
 //! options and the state, so a sandboxed run ([`run_in_counted`]) touches
 //! nothing of the process.
 //!
-//! **Built so far** (0.16.0 Tasks 7 to 12): the names, the flavour, the
+//! **What is here:** the names, the flavour, the
 //! command line (`unzip.c`'s `unzip()` front half and `uz_opts()`,
 //! `zipinfo.c`'s `zi_opts()`, `envargs.c`), the usage screens, `-hh`, the
 //! `-v` screen and funzip's usage (Task 7); opening archives, wildcard
@@ -38,7 +38,9 @@
 //! terminal (`ttyio.rs`: `getp()` on `/dev/tty`, `zgetch()`,
 //! `screensize()`; `fileio.rs`: `UzpPassword()`, `UzpMorePause()`; `-M`'s
 //! line counting in `Uz::print_raw`; crypt.c's retries; the interrupt
-//! handler, exit 80: Task 11); funzip (`funzip.rs`: funzip.c, Task 12).
+//! handler, exit 80: Task 11); funzip (`funzip.rs`: funzip.c, Task 12);
+//! Ubuntu's build options and patch series as flavour checks throughout
+//! (Tasks 13 and 14; `process/unicode.rs` is Ubuntu's alone).
 
 //! Known deviations (the source of truth; the README and the spec mirror
 //! this list):
@@ -56,7 +58,9 @@
 //!    `-M` it counts as two screen lines and `-Mh` pauses one text line
 //!    earlier than the reference (P26).
 //! 3. Pre-existing symlinks: the Ubuntu flavour also stays beneath the
-//!    extraction root, as Apple's does.
+//!    extraction root, as Apple's does. On unix only: off unix (Windows)
+//!    the walk (`unix/beneath.rs`'s `imp_std`) follows symlinks, so
+//!    neither flavour is contained there.
 //! 4. The archive being read is never overwritten.
 //! 5. `-O`/`-I` (Ubuntu) convert names through `iconv(3)`; they are
 //!    unavailable on Windows, where they are parsed as Ubuntu parses them
@@ -78,6 +82,21 @@
 //!    standard output is answered `out of space on stdout`, exit 9, on a
 //!    real host too. The C writes through buffered stdio and does not check
 //!    its final `fflush()`, so it loses the data and exits 0.
+//! 10. Undefined behaviour and endless loops are not reproduced. Where a
+//!     reference's behaviour is undefined, or never ends, stuffr gives a
+//!     defined answer instead. Ubuntu's bzip2 decoding loops for ever on a
+//!     truncated entry; stuffr answers as for bad bzip2 data, exit 2
+//!     (T13-2). Apple's `-:` on a `../` directory entry changes the
+//!     directory above the extraction root; stuffr refuses (T10-10). After
+//!     a failed create Apple writes through the previous entry's closed
+//!     stream; stuffr says "cannot create" and goes on (T10-11). At the end
+//!     of input the C asks for a new name for ever at the rename prompt,
+//!     and waits for ever at the `-M` pager's; stuffr takes `[N]one` and
+//!     stops pausing (T10-9, T11-4). Buffer overflows are answered in both
+//!     flavours with the forms of Ubuntu's CVE fixes: a method above 999
+//!     is `Unk` and four hex digits (`Unk03E8`), and a password prompt
+//!     whose names are too long is "Enter password: " (T11-5). The full
+//!     set is in the code's `// ruling:` comments.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -184,9 +203,8 @@ pub(crate) fn flavour_from(value: Option<OsString>) -> Result<Flavour, OsString>
 }
 
 /// One run's state: Info-ZIP's `G` (globals.h `Uz_Globs`) with its `uO`
-/// ([`cli::Options`]), R5. Tasks 8–14 add the archive state; what is here is
-/// what the command line and the message layer need, and the window the
-/// decoders will share.
+/// ([`cli::Options`]), R5: the command line, the message layer, the
+/// archive and entry state, and the window the decoders share.
 pub(crate) struct Uz<'a> {
     /// The process, or a sandbox's stand-ins for it.
     pub(crate) host: Host,

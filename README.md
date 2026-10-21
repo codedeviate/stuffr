@@ -1470,8 +1470,9 @@ name leads the line). `unzip` reads `UNZIP` and `UNZIPOPT`, and `zipinfo` reads 
   extraction with its overwrite questions and passwords, the usage screens,
   `-v`, and the exit codes Info-ZIP defines (0 to 3, 4 to 8, 9 to 11, 50, 51,
   80 to 82, and 12 under Ubuntu).
-- **Extracted trees are identical:** names, modes, times, symlinks, and on
-  macOS the archive's quarantine attribute. A differential suite runs each
+- **Extracted trees are identical wherever the reference's behaviour is
+  defined** (deviation 10): names, modes, times, symlinks, and on macOS the
+  archive's quarantine attribute. A differential suite runs each
   case through the real unzip and a stuffr link and compares those streams
   and the file tree, modes and mtimes.
 - **The intended difference:** the first banner line (below).
@@ -1490,7 +1491,9 @@ name leads the line). `unzip` reads `UNZIP` and `UNZIPOPT`, and `zipinfo` reads 
    wider than the pager's 80 columns, so under `-M` it counts as two screen
    lines and `-Mh` pauses one text line earlier than the reference.
 3. **Pre-existing symlinks.** The Ubuntu flavour also stays beneath the
-   extraction root, as Apple's does.
+   extraction root, as Apple's does. On unix only: off unix (Windows) the
+   walk (`unix/beneath.rs`'s `imp_std`) follows symlinks, so neither flavour
+   is contained there.
 4. **The archive being read is never overwritten.**
 5. **`-O` and `-I` (Ubuntu)** convert names through `iconv(3)`. They are
    unavailable on Windows, where they are parsed as Ubuntu parses them and
@@ -1511,6 +1514,20 @@ name leads the line). `unzip` reads `UNZIP` and `UNZIPOPT`, and `zipinfo` reads 
    is answered `out of space on stdout`, exit 9, on a real host too. funzip
    writes through buffered stdio and does not check its final `fflush()`, so
    it loses the data and exits 0.
+10. **Undefined behaviour and endless loops are not reproduced.** Where a
+    reference's behaviour is undefined, or never ends, stuffr gives a defined
+    answer instead. Ubuntu's bzip2 decoding loops for ever on a truncated
+    entry; stuffr answers as for bad bzip2 data, exit 2 (T13-2). Apple's `-:`
+    on a `../` directory entry changes the directory above the extraction
+    root; stuffr refuses (T10-10). After a failed create Apple writes through
+    the previous entry's closed stream; stuffr says "cannot create" and goes
+    on (T10-11). At the end of input the C asks for a new name for ever at the
+    rename prompt, and waits for ever at the `-M` pager's; stuffr takes
+    `[N]one` and stops pausing (T10-9, T11-4). Buffer overflows are answered
+    in both flavours with the forms of Ubuntu's CVE fixes: a method above 999
+    is `Unk` and four hex digits (`Unk03E8`), and a password prompt whose
+    names are too long is "Enter password: " (T11-5). The full set is in the
+    code's `// ruling:` comments.
 
 ### Roadmap
 
