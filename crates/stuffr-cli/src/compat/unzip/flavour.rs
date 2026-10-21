@@ -260,22 +260,30 @@ pub(crate) fn no_lchmod(f: Flavour) -> bool {
     f == Flavour::Ubuntu
 }
 
-/// `14-cve-2015-7696.patch`, Ubuntu only: `decrypt()` gives up on an
-/// encryption header cut short (`PK_ERR`, "unable to get password").
-///
-/// Pass-through until Task 14: Apple's answer (`false`: the missing bytes
-/// read as `EOF`'s 0xff) for both.
-pub(crate) fn cve_2015_7696_short_header(_f: Flavour) -> bool {
-    false
+/// `14-cve-2015-7696.patch`, Ubuntu only: `decrypt()` gives up at the
+/// first `EOF` of an encryption header cut short (`PK_ERR`, "unable to get
+/// password"), returning before `undefer_input()`, so the input stays
+/// deferred for the next entry (Apple reads the missing bytes as `EOF`'s
+/// 0xff and goes on).
+pub(crate) fn cve_2015_7696_short_header(f: Flavour) -> bool {
+    f == Flavour::Ubuntu
 }
 
 /// `16-fix-integer-underflow-csiz-decrypted.patch`, Ubuntu only: an
 /// encrypted stored entry shorter than its header is refused before its
-/// sizes are compared.
-///
-/// Pass-through until Task 14: Apple's answer (`false`) for both.
-pub(crate) fn csize_below_header_refused(_f: Flavour) -> bool {
-    false
+/// sizes are compared ("invalid compressed data to inflate"), and the rest
+/// of its block of entries with it (`return PK_ERR` from
+/// `extract_or_test_entrylist()`); Apple's size wraps.
+pub(crate) fn csize_below_header_refused(f: Flavour) -> bool {
+    f == Flavour::Ubuntu
+}
+
+/// `12-cve-2014-9636-test-compr-eb.patch`, Ubuntu only: a stored extra
+/// block's data is its size less the method, CRC and size words
+/// (`EB_CMPRHEADLEN` included); Apple's own form of the check
+/// (extract.c:2307) leaves the 6-byte compression header in.
+pub(crate) fn cve_2014_9636_stored_size(f: Flavour) -> bool {
+    f == Flavour::Ubuntu
 }
 
 /// `23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch`, Ubuntu

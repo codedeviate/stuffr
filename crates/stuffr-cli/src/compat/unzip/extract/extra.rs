@@ -13,6 +13,7 @@ use std::cell::RefCell;
 use stuffr::infozip::{self, Stop};
 
 use super::super::fileio::{self, c_str};
+use super::super::flavour;
 use super::super::messages as m;
 use super::super::{PK_COOL, PK_OK, PK_WARN, Uz};
 use super::{PK_ERR, PK_MEM3, pad22};
@@ -217,7 +218,14 @@ fn test_compr_eb(uz: &mut Uz, eb: &[u8], eb_size: usize, compr_offset: usize) ->
     }
     // For STORE method, compressed and uncompressed sizes must agree.
     let eb_compr_method = fileio::makeword(&eb[EB_HEADSIZE + compr_offset..]);
-    if eb_compr_method == STORED && (eb_size - compr_offset) as u64 != eb_ucsize {
+    // apple: extract.c:2307 counts the 6-byte compression header as data;
+    // ubuntu: 12-cve-2014-9636-test-compr-eb.patch does not.
+    let stored_len = if flavour::cve_2014_9636_stored_size(uz.flavour) {
+        (eb_size - compr_offset - EB_CMPRHEADLEN) as u64
+    } else {
+        (eb_size - compr_offset) as u64
+    };
+    if eb_compr_method == STORED && stored_len != eb_ucsize {
         return PK_ERR;
     }
     memextract(

@@ -55,15 +55,24 @@ pub(crate) fn decrypt_entry(uz: &mut Uz, ex: &mut Ex, passwrd: Option<&[u8]>) ->
     };
     output::defer_leftover_input(&mut src.zin, &mut src.csize);
     let mut h = [0u8; RAND_HEAD_LEN];
-    let mut short = false;
     for b in h.iter_mut() {
         // `b = NEXTBYTE; h[n] = (uch)b`: EOF is 0xff
         *b = match src.next_byte() {
             Some(c) => c,
-            None => {
-                short = true;
-                0xff
+            // ubuntu: 14-cve-2015-7696.patch: quit early if compressed size
+            // < HEAD_LEN, before `undefer_input()`: the input is left
+            // deferred (`G.incnt` 0, the leftover hidden), as the C leaves
+            // it for the next entry.
+            None if flavour::cve_2015_7696_short_header(uz.flavour) => {
+                uz.zin = std::mem::take(&mut src.zin);
+                uz.csize = src.csize;
+                output::finish_read(uz, src.read_error);
+                if uz.abort.is_some() {
+                    return super::super::PK_BADERR;
+                }
+                return PK_ERR;
             }
+            None => 0xff,
         };
     }
     output::undefer_input(uz, &mut src.zin, &mut src.csize);
@@ -72,11 +81,6 @@ pub(crate) fn decrypt_entry(uz: &mut Uz, ex: &mut Ex, passwrd: Option<&[u8]>) ->
     output::finish_read(uz, src.read_error);
     if uz.abort.is_some() {
         return super::super::PK_BADERR;
-    }
-    // ubuntu: 14-cve-2015-7696.patch (`flavour::cve_2015_7696_short_header`,
-    // Task 14): quit early if compressed size < HEAD_LEN.
-    if short && flavour::cve_2015_7696_short_header(uz.flavour) {
-        return PK_ERR;
     }
 
     if uz.newzip {

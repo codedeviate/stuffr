@@ -768,4 +768,145 @@ mod linux {
         .collect();
         check("owners and symlinks", &cases);
     }
+
+    // ---- the patch series (Task 14) ----
+
+    /// An OS/2 EA block (`0x0009`) whose stored data is `n` bytes and whose
+    /// uncompressed size says `ucsize`: 12-cve-2014-9636 wants them equal.
+    fn os2_ea(n: usize, ucsize: u32) -> Vec<u8> {
+        let d = vec![b'E'; n];
+        let mut eb = ucsize.to_le_bytes().to_vec();
+        eb.extend_from_slice(&0u16.to_le_bytes());
+        eb.extend_from_slice(&crc32(&d).to_le_bytes());
+        eb.extend_from_slice(&d);
+        block(0x0009, &eb)
+    }
+
+    /// An encrypted entry whose body is `len` bytes: shorter than the
+    /// 12-byte encryption header for 14-cve-2015-7696 (deflated) and
+    /// 16-fix-integer-underflow-csiz-decrypted (stored).
+    fn short_crypt(name: &[u8], method: u16, len: usize) -> ZipEntrySpec<'_> {
+        const BODY: &[u8] = &[0x11; 12];
+        ZipEntrySpec {
+            method,
+            flags: 1,
+            stored_data: Some(&BODY[..len]),
+            ..ZipEntrySpec::new(name, b"ab")
+        }
+    }
+
+    /// The CVE fixes' own triggers (09, 10, 11, 12, 14, 16, 18, 19), each
+    /// followed by plain entries so what the fix leaves for the next entry
+    /// shows too.
+    fn cve_zips() -> Vec<(&'static str, Vec<u8>)> {
+        let plain = |name: &'static [u8], data: &'static [u8]| ZipEntrySpec::new(name, data);
+        let (ea_ok, ea_apple, ea_bad, ea_zero) = (
+            os2_ea(10, 10),
+            os2_ea(10, 16),
+            os2_ea(10, 30),
+            os2_ea(10, 0),
+        );
+        let vms_short = block(0x000c, &[1, 2]);
+        let vms_bad = block(0x000c, &[1, 2, 3, 4, 5, 6]);
+        let z64_short = block(0x0001, &[1, 2, 3, 4]);
+        let ea = |extra: &[u8]| {
+            zip_with(
+                &[ZipEntrySpec {
+                    extra,
+                    ..ZipEntrySpec::new(b"a.txt", b"hi\n")
+                }],
+                b"",
+                b"",
+            )
+        };
+        let z64 = ZipEntrySpec {
+            extra: &z64_short,
+            ..ZipEntrySpec::new(b"z.txt", b"x")
+        };
+        let methods = zip_with(
+            &[
+                ZipEntrySpec {
+                    method: 1000,
+                    ..plain(b"m.txt", b"x")
+                },
+                ZipEntrySpec {
+                    method: 65535,
+                    ..plain(b"n.txt", b"y")
+                },
+                ZipEntrySpec {
+                    method: 999,
+                    ..plain(b"o.txt", b"z")
+                },
+            ],
+            b"",
+            b"",
+        );
+        let crypt = |first: ZipEntrySpec| {
+            zip_with(
+                &[
+                    first,
+                    plain(b"b.txt", b"bye\n"),
+                    plain(b"c.txt", b"three\n"),
+                ],
+                b"",
+                b"",
+            )
+        };
+        vec![
+            ("ea_ok.zip", ea(&ea_ok)),
+            ("ea_apple.zip", ea(&ea_apple)),
+            ("ea_bad.zip", ea(&ea_bad)),
+            ("ea_zero.zip", ea(&ea_zero)),
+            ("vms_short.zip", ea(&vms_short)),
+            ("vms_bad.zip", ea(&vms_bad)),
+            (
+                "z64_short.zip",
+                zip_with(&[z64, plain(b"b.txt", b"b")], b"", b""),
+            ),
+            ("methods.zip", methods),
+            ("crypt_defl.zip", crypt(short_crypt(b"a.txt", 8, 5))),
+            ("crypt_stor.zip", crypt(short_crypt(b"a.txt", 0, 5))),
+            ("crypt_stor0.zip", crypt(short_crypt(b"a.txt", 0, 0))),
+            ("crypt_stor11.zip", crypt(short_crypt(b"a.txt", 0, 11))),
+            (
+                "crypt_last.zip",
+                zip_with(
+                    &[plain(b"b.txt", b"bye\n"), short_crypt(b"a.txt", 8, 5)],
+                    b"",
+                    b"",
+                ),
+            ),
+        ]
+    }
+
+    /// Ubuntu's patch series (Task 14), against its binary, one group per
+    /// patch or set of patches. The probes behind each are in
+    /// `.claude/rules/compat.md`, "Task 14 probes".
+    #[test]
+    fn ubuntu_patch_rows() {
+        // 09, 10, 11, 12, 14, 16, 18, 19: the CVE fixes' triggers
+        let files = cve_zips();
+        let mut cases = Vec::new();
+        for (z, _) in &files {
+            for op in [
+                &["-t"][..],
+                &["-tq"],
+                &[],
+                &["-l"],
+                &["-v"],
+                &["-Z"],
+                &["-P", "x", "-t"],
+            ] {
+                let mut args = op.to_vec();
+                args.push(z);
+                cases.push(case("unzip", &args, &files, &[]));
+            }
+        }
+        for op in [&["-m"][..], &["-v"]] {
+            let mut args = op.to_vec();
+            args.push("methods.zip");
+            cases.push(case("zipinfo", &args, &files, &[]));
+        }
+        check("CVE fixes", &cases);
+    }
 }

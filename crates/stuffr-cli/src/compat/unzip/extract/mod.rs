@@ -898,10 +898,17 @@ fn extract_or_test_entrylist(
         if uz.lrec.compression_method == 0 {
             let mut csiz_decrypted = uz.lrec.csize;
             if ex.pinfo.encrypted {
-                // ubuntu: 16-fix-integer-underflow-csiz-decrypted.patch
-                // refuses a size under 12 here
-                // (`flavour::csize_below_header_refused`, Task 14).
-                let _ = flavour::csize_below_header_refused(uz.flavour);
+                // ubuntu: 16-fix-integer-underflow-csiz-decrypted.patch:
+                // handle the error now to prevent unsigned overflow (the
+                // rest of this block of entries is dropped with it)
+                if flavour::csize_below_header_refused(uz.flavour) && csiz_decrypted < 12 {
+                    uz.info_fmt(
+                        0x401,
+                        m::ERR_UNZIP_NO_FILE,
+                        &[m::INVALID_COMPR_DATA.as_bytes(), m::INFLATE.as_bytes()],
+                    );
+                    return PK_ERR;
+                }
                 csiz_decrypted = csiz_decrypted.wrapping_sub(12);
             }
             if uz.lrec.ucsize != csiz_decrypted {
