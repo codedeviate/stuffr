@@ -9,13 +9,14 @@ CARGO ?= cargo
 # Two modes. DAYTIME (the default) holds back: fewer test threads, a lower
 # libFuzzer RSS ceiling, and the same thread limit inside the Docker run, so
 # the gate stays gentle on a machine that is also running Docker and IDEs.
-# OVERNIGHT is `FULL=1`: every core, libFuzzer's default ceiling, as before.
+# OVERNIGHT is `FULL=1` (any value but empty or 0): every core, libFuzzer's
+# default ceiling, as before. `FULL=0` is daytime.
 # Both modes run exactly the same tests; only concurrency differs. CI passes
 # FULL=1. TEST_THREADS is the daytime count (chosen by measurement, see
 # CONTRIBUTING.md "What the gate costs"); it is ignored under FULL=1.
 FULL ?=
 TEST_THREADS ?= 4
-ifeq ($(strip $(FULL)),)
+ifeq ($(filter-out 0,$(strip $(FULL))),)
 TEST_THREAD_ARGS = -- --test-threads=$(TEST_THREADS)
 FUZZ_RSS_ARGS = -rss_limit_mb=1024
 else
@@ -29,6 +30,10 @@ help:
 	@echo 'stuffr development targets:'
 	@echo '  make check    fmt, lint, test, release build — the full gate'
 	@echo '                (always ends by sweeping stale stuffr-* temp folders)'
+	@echo '                Modes: daytime by default ($(TEST_THREADS) test threads, fuzz -rss_limit_mb=1024,'
+	@echo '                the same thread limit in compat-ubuntu); FULL=1 (any value but'
+	@echo '                empty or 0) lifts the limits: every core, libFuzzer default ceiling'
+	@echo '  make check FULL=1  overnight mode (also works with test, test-pure, fuzz, compat-ubuntu)'
 	@echo '  make sweep-tmp  remove stuffr-* temp folders older than a day (live pids kept)'
 	@echo '  make leak-check  fail on stuffr-* temp folders made since the last leak-snapshot'
 	@echo '  make tmp-leaks-selftest  self-test of scripts/tmp-leaks.sh'
@@ -36,10 +41,6 @@ help:
 	@echo '  make lint     clippy, all targets and features, warnings denied'
 	@echo '                (the workspace, and fuzz/ --locked)'
 	@echo '  make lint-latest  clippy on the newest installed stable (own target dir)'
-	@echo '                daytime by default: $(TEST_THREADS) test threads, fuzz -rss_limit_mb=1024,'
-	@echo '                and the same thread limit in compat-ubuntu'
-	@echo '  make check FULL=1  overnight mode: every core, libFuzzer default ceiling'
-	@echo '                (FULL=1 also works with test, test-pure, fuzz, compat-ubuntu)'
 	@echo '  make test     full test suite with all features'
 	@echo '  make test-pure  the default (pure) tier, where no C backend wins'
 	@echo '  make release  optimised build, plus the no-default-features check'
@@ -482,12 +483,15 @@ fuzz-corpus:
 COMPAT_UBUNTU_IMAGE ?= stuffr-ubuntu-24.04
 COMPAT_UBUNTU_ARGS ?=
 # Daytime mode also limits the container's test threads (it ignores the
-# host's environment); FULL=1 lifts it. User args follow, so they can override.
-ifeq ($(strip $(FULL)),)
+# host's environment); FULL=1 lifts it. If COMPAT_UBUNTU_ARGS already carries
+# its own --test-threads, the daytime one is omitted (libtest rejects or
+# ignores a repeated option), so the user's value is the only one.
+ifeq ($(filter-out 0,$(strip $(FULL))),)
 COMPAT_UBUNTU_THREADS = --test-threads=$(TEST_THREADS)
 else
 COMPAT_UBUNTU_THREADS =
 endif
+COMPAT_UBUNTU_ALL_ARGS = $(if $(findstring --test-threads,$(COMPAT_UBUNTU_ARGS)),,$(COMPAT_UBUNTU_THREADS)) $(COMPAT_UBUNTU_ARGS)
 COMPAT_UBUNTU_RUN = docker run --rm -e CI=1 \
 	  -v "$(CURDIR)":/src:ro \
 	  -v stuffr-ubuntu-cargo-registry:/home/oracle/.cargo/registry \
@@ -499,10 +503,10 @@ compat-ubuntu:
 	  --build-arg RUST_TOOLCHAIN=$$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml) \
 	  -t $(COMPAT_UBUNTU_IMAGE) tests/docker/ubuntu-24.04
 	$(COMPAT_UBUNTU_RUN) \
-	  cargo test --locked -p stuffr-cli --lib compat::unzip -- $(COMPAT_UBUNTU_THREADS) $(COMPAT_UBUNTU_ARGS)
+	  cargo test --locked -p stuffr-cli --lib compat::unzip -- $(COMPAT_UBUNTU_ALL_ARGS)
 	$(COMPAT_UBUNTU_RUN) \
 	  cargo test --locked -p stuffr-cli --test compat_unzip_ubuntu --test compat_unzip_common --test compat_unzip_safety \
-	    --test compat_unzip_tty --test compat_unzip_umask --test compat_unzip_harness_selftest -- $(COMPAT_UBUNTU_THREADS) $(COMPAT_UBUNTU_ARGS)
+	    --test compat_unzip_tty --test compat_unzip_umask --test compat_unzip_harness_selftest -- $(COMPAT_UBUNTU_ALL_ARGS)
 
 clean:
 	$(CARGO) clean

@@ -87,9 +87,15 @@ Apple Silicon Mac right after `cargo clean`: **166 s** for the whole gate,
 3196 tests across both legs. Real test EXECUTION inside that is **96 s**
 (summed from libtest's own `finished in` figures).
 
+The figures differ by what they time: 166 s above is a clean build including
+compilation (2026-10-06, 3196 tests), while the table below is a whole gate
+with prebuilt test binaries on a larger suite (5798 tests), so 366 s is not
+comparable to it.
+
 **Two modes (0.16.1).** `make check` is the daytime mode by default: it
-runs libtest with `--test-threads=4` (`TEST_THREADS`), so it is gentle on a
-laptop that is also running Docker and an IDE. `make check FULL=1` is the
+runs libtest with `--test-threads=4` (`TEST_THREADS`), as a margin for a
+busy machine that is also running Docker and an IDE (a precaution, not a
+measured gain). `make check FULL=1` (any value but empty or 0) is the
 overnight mode: every core, as before. `make fuzz` adds
 `-rss_limit_mb=1024` in daytime (libFuzzer's default of 2048 under
 `FULL=1`), and `make compat-ubuntu` passes the same `--test-threads` into the
@@ -111,8 +117,9 @@ columns as "no pressure difference", not as a ranking):
 | `TEST_THREADS=6` | 363 s | 5402 / 5402 / 5370 | 5798 |
 
 Four threads cost about 3% of wall time over `FULL=1`; two cost 26%. The
-choice of 4 is a tie-break (see the task report): no row grew swap, so
-swap could not separate them.
+choice of 4 is a tie-break: swap was
+already near its cap and did not grow in any mode, so swap could not
+separate them.
 
 **If the gate takes far longer, look at `target/debug/deps` first.** On
 macOS the dev profile's default `split-debuginfo=unpacked` leaves every
