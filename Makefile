@@ -419,20 +419,25 @@ fuzz-corpus:
 # volumes, so runs are incremental and the host's `target/` is never written.
 # Runs as the image's unprivileged user (root ignores modes). Not part of
 # `check`: Docker is not a gate dependency. `COMPAT_UBUNTU_ARGS` goes after
-# `--` (a test name filter, `--nocapture`). `docker volume rm
+# `--` (a test name filter, `--nocapture`). The lib unit tests of
+# `compat::unzip` run first (P42): the Linux-only ones run nowhere else.
+# `docker volume rm
 # stuffr-ubuntu-target stuffr-ubuntu-cargo-registry` starts clean.
 COMPAT_UBUNTU_IMAGE ?= stuffr-ubuntu-24.04
 COMPAT_UBUNTU_ARGS ?=
+COMPAT_UBUNTU_RUN = docker run --rm -e CI=1 \
+	  -v "$(CURDIR)":/src:ro \
+	  -v stuffr-ubuntu-cargo-registry:/home/oracle/.cargo/registry \
+	  -v stuffr-ubuntu-target:/target \
+	  $(COMPAT_UBUNTU_IMAGE)
 
 compat-ubuntu:
 	docker build --quiet \
 	  --build-arg RUST_TOOLCHAIN=$$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml) \
 	  -t $(COMPAT_UBUNTU_IMAGE) tests/docker/ubuntu-24.04
-	docker run --rm -e CI=1 \
-	  -v "$(CURDIR)":/src:ro \
-	  -v stuffr-ubuntu-cargo-registry:/home/oracle/.cargo/registry \
-	  -v stuffr-ubuntu-target:/target \
-	  $(COMPAT_UBUNTU_IMAGE) \
+	$(COMPAT_UBUNTU_RUN) \
+	  cargo test --locked -p stuffr-cli --lib compat::unzip -- $(COMPAT_UBUNTU_ARGS)
+	$(COMPAT_UBUNTU_RUN) \
 	  cargo test --locked -p stuffr-cli --test compat_unzip_ubuntu --test compat_unzip_common --test compat_unzip_safety \
 	    --test compat_unzip_tty --test compat_unzip_umask --test compat_unzip_harness_selftest -- $(COMPAT_UBUNTU_ARGS)
 
