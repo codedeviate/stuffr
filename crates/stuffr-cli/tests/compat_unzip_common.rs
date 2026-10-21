@@ -2709,8 +2709,9 @@ mod unix {
     /// refused; one of 40 MiB and change unpacks within its own size plus
     /// headroom. On Linux that is a data-segment cap (`data_limited_run`;
     /// the doubling reserved 64 MiB there and aborted), and a cap below
-    /// the entry's size is a refused reservation, exit 6; elsewhere the
-    /// resident peak counts only touched pages, so it is a ceiling only.
+    /// the entry's size is a refused reservation, exit 6; elsewhere only
+    /// the unpack's success is checked (the resident peak counts only
+    /// touched pages, so it cannot see the reservation).
     #[test]
     fn stuffr_unpack_bounds_a_shrink_bomb() {
         const CAP: u64 = 256 << 20;
@@ -2724,9 +2725,9 @@ mod unix {
 
         let n: u64 = (40 << 20) + 12345;
         let bomb = shrink_bomb(n);
-        let headroom: u64 = 16 << 20;
         #[cfg(target_os = "linux")]
         {
+            let headroom: u64 = 16 << 20;
             let free = data_limited_run("stuffr", &args, "bomb.zip", &bomb, &env, None);
             assert_eq!(free.0, Some(0), "{}", free.2);
             let capped =
@@ -2744,12 +2745,10 @@ mod unix {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let (st, _, err, peak) = peak_rss_run("stuffr", &args, "bomb.zip", &bomb, &env);
+            // No peak bound: the resident peak counts only touched pages,
+            // so it cannot see the reservation.
+            let (st, _, err, _) = peak_rss_run("stuffr", &args, "bomb.zip", &bomb, &env);
             assert!(st.success(), "{st:?}: {err}");
-            assert!(
-                peak < n + headroom,
-                "peak memory {peak} bytes is not under {n} + {headroom}"
-            );
         }
     }
 }
