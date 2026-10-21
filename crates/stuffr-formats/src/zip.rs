@@ -145,7 +145,13 @@
 //! decoded whole in memory (declared sizes capped at
 //! `MAX_LEGACY_ENTRY_BYTES`, exit 6), and its CRC-32 checked; a decode
 //! failure or a CRC mismatch is `Error::Corrupt` (exit 5). On a forward-only
-//! pipe they stay refused, and salvage does not decode them.
+//! pipe they stay refused, and salvage does not decode them. **A shrink or
+//! implode entry whose mode says symlink is read as a regular file holding
+//! its target as contents**, as every entry is from a pipe: the legacy path
+//! never upgrades the kind, and no fidelity note names it (`FidelityReport`
+//! has no downgrade vocabulary for one entry). `unpack` therefore writes a
+//! file, never a link; `a_legacy_symlink_entry_reads_as_a_regular_file`
+//! pins it.
 
 use std::cell::RefCell;
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
@@ -1401,7 +1407,13 @@ impl LegacyMethod {
 /// an entry is decoded whole into memory; this bounds that. Checked against
 /// the DECLARED sizes before anything is allocated, so past it is
 /// `Error::ResourceLimit` (exit 6), as with `MAX_SYMLINK_TARGET_LEN`.
-const MAX_LEGACY_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
+///
+/// Both buffers are then reserved exactly (`try_reserve_exact`) at their
+/// declared sizes and never grow, so an entry holds at most its compressed
+/// plus its uncompressed size, each under this ceiling; a refused
+/// reservation is exit 6 too. A shrink stream of about 110 KB reaches
+/// 256 MiB, so this is the whole bound on what one entry can cost.
+const MAX_LEGACY_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
 
 impl ZipIndexed {
     /// `Some` when entry `index` is stored with method 1 or 6 and is not
@@ -1510,7 +1522,25 @@ impl Read for LegacyPayload {
 fn decode_legacy_entry(p: &LegacyParams, handle: &mut SeekAdapter) -> io::Result<Vec<u8>> {
     let bad =
         |why: String| io::Error::new(ErrorKind::InvalidData, format!("entry `{}`: {why}", p.name));
-    let mut packed = Vec::new();
+    // Exact reservations at the declared sizes (each under
+    // `MAX_LEGACY_ENTRY_BYTES`, checked when the entry was made): neither
+    // buffer grows, so a doubling never reserves past the ceiling.
+    let reserve = |n: u64, what: &str| -> io::Result<Vec<u8>> {
+        let mut v = Vec::new();
+        v.try_reserve_exact(n as usize).map_err(|_| {
+            io::Error::new(
+                ErrorKind::OutOfMemory,
+                format!(
+                    "entry `{}`: cannot allocate {n} bytes for its {what} {} data, \
+                     which is decoded in memory",
+                    p.name,
+                    p.method.name()
+                ),
+            )
+        })?;
+        Ok(v)
+    };
+    let mut packed = reserve(p.csize, "compressed")?;
     handle.seek(SeekFrom::Start(p.data_start))?;
     handle.by_ref().take(p.csize).read_to_end(&mut packed)?;
     if packed.len() as u64 != p.csize {
@@ -1524,7 +1554,9 @@ fn decode_legacy_entry(p: &LegacyParams, handle: &mut SeekAdapter) -> io::Result
     } else {
         0
     };
-    let data = decode_legacy(p.method, flags, &packed, p.usize_).map_err(bad)?;
+    let out = reserve(p.usize_, "uncompressed")?;
+    let data = decode_legacy(p.method, flags, &packed, p.usize_, out).map_err(bad)?;
+    drop(packed);
     let mut crc = flate2::Crc::new();
     crc.update(&data);
     if crc.sum() != p.crc {
@@ -1553,15 +1585,16 @@ fn local_header_flags<R: Read + Seek>(r: &mut R, header_start: u64) -> io::Resul
 }
 
 /// Runs `infozip`'s decoder over `packed`, producing exactly `declared`
-/// bytes. `Err` is a sentence for `Error::Corrupt`.
+/// bytes into `out` (empty, reserved for `declared` bytes by the caller, so
+/// it never reallocates). `Err` is a sentence for `Error::Corrupt`.
 fn decode_legacy(
     method: LegacyMethod,
     flags: u16,
     packed: &[u8],
     declared: u64,
+    mut out: Vec<u8>,
 ) -> std::result::Result<Vec<u8>, String> {
     use crate::infozip::{Stop, WSIZE, explode, unshrink};
-    let mut out: Vec<u8> = Vec::new();
     let mut window = vec![0u8; WSIZE];
     let mut src = packed.iter();
     let mut flush = |chunk: &[u8]| -> std::result::Result<(), ()> {
@@ -2740,6 +2773,75 @@ mod tests {
         let err = read_indexed(&bytes).expect_err("a bad crc must be refused");
         assert!(matches!(err, Error::Corrupt(_)), "{err:?}");
         assert_eq!(err.exit_code(), 5);
+    }
+
+    /// I1: a shrink or implode entry declaring more than
+    /// `MAX_LEGACY_ENTRY_BYTES` is refused when the entry is made, before
+    /// anything is allocated or decoded: exit 6.
+    #[test]
+    fn a_legacy_entry_past_the_ceiling_is_exit_6() {
+        let Some(mut bytes) = infozip_fixture("shrink-full-table.zip") else {
+            return;
+        };
+        let over = (MAX_LEGACY_ENTRY_BYTES + 1) as u32;
+        let cd = bytes
+            .windows(4)
+            .position(|w| w == b"PK\x01\x02")
+            .expect("central directory");
+        for at in [22, cd + 24] {
+            bytes[at..at + 4].copy_from_slice(&over.to_le_bytes());
+        }
+        let mut ar = open_seekable(&bytes);
+        let Err(err) = ar.next_entry() else {
+            panic!("an entry past the ceiling was made");
+        };
+        assert!(matches!(err, Error::ResourceLimit(_)), "{err:?}");
+        assert_eq!(err.exit_code(), 6);
+        assert!(err.to_string().contains("ceiling"), "{err}");
+    }
+
+    /// I1: the decoded buffer is the caller's exact reservation and never
+    /// grows: its capacity is the declared size, not a doubling past it.
+    #[test]
+    fn legacy_output_never_grows_past_its_declared_size() {
+        let Some(bytes) = infozip_fixture("shrink-full-table.zip") else {
+            return;
+        };
+        assert_eq!(bytes[..4], SIG_LOCAL_HEADER);
+        let csize = u32::from_le_bytes(bytes[18..22].try_into().unwrap()) as usize;
+        let usize_ = u64::from(u32::from_le_bytes(bytes[22..26].try_into().unwrap()));
+        let at = 30 + usize::from(le16(&bytes[26..28])) + usize::from(le16(&bytes[28..30]));
+        let mut out = Vec::new();
+        out.try_reserve_exact(usize_ as usize).unwrap();
+        let data = decode_legacy(LegacyMethod::Shrink, 0, &bytes[at..at + csize], usize_, out)
+            .expect("decodes");
+        assert_eq!(data.len() as u64, usize_);
+        assert_eq!(data.capacity() as u64, usize_);
+    }
+
+    /// M6: a shrink entry whose central header says symlink (`S_IFLNK`,
+    /// made on Unix) is read as a regular file holding its decoded bytes,
+    /// with no warning: the module doc states this downgrade.
+    #[test]
+    fn a_legacy_symlink_entry_reads_as_a_regular_file() {
+        let Some(mut bytes) = infozip_fixture("shrink-commons.zip") else {
+            return;
+        };
+        let cd = bytes
+            .windows(4)
+            .position(|w| w == b"PK\x01\x02")
+            .expect("central directory");
+        bytes[cd + 5] = 3; // made on Unix
+        bytes[cd + 38..cd + 42].copy_from_slice(&(0o120_777u32 << 16).to_le_bytes());
+        let mut ar = open_seekable(&bytes);
+        let mut e = ar.next_entry().unwrap().expect("an entry");
+        assert_eq!(e.meta().kind, EntryKind::File);
+        assert_eq!(e.meta().mode.map(|m| m & 0o170_000), Some(0o120_000));
+        let mut data = Vec::new();
+        e.reader().read_to_end(&mut data).unwrap();
+        assert_eq!(data.len(), 76);
+        drop(e);
+        assert!(!ar.fidelity().has_warnings(), "{:?}", ar.fidelity());
     }
 
     /// A flipped payload byte in an imploded entry never exits 1.

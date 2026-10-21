@@ -2612,4 +2612,144 @@ mod unix {
     fn task14_rows_match_stuffr() {
         differential(14);
     }
+
+    /// A shrink (method 1) stream of `n` zero bytes, at about 2400 to 1:
+    /// one literal, four code-size escapes to 13 bits, a chain of codes
+    /// each one zero longer than the last (all KwKwK), then the chain's
+    /// longest code over and over, with a partial clear (`256, 2`) each
+    /// time the table fills (it frees only the leaves those repeats add).
+    fn shrink_zeros(n: u64) -> Vec<u8> {
+        const CHAIN: u64 = 3967;
+        let (mut out, mut acc, mut nbits) = (Vec::new(), 0u64, 0u32);
+        let mut put = |v: u64, width: u32| {
+            acc |= v << nbits;
+            nbits += width;
+            while nbits >= 8 {
+                out.push(acc as u8);
+                acc >>= 8;
+                nbits -= 8;
+            }
+        };
+        assert!(n > 0);
+        put(0, 9);
+        let mut left = n - 1;
+        for width in 9..13 {
+            put(256, width);
+            put(1, width);
+        }
+        let (mut next, mut len) = (257u64, 2u64);
+        while next < 257 + CHAIN && left >= len {
+            put(next, 13);
+            left -= len;
+            next += 1;
+            len += 1;
+        }
+        let (top, top_len) = (next - 1, len - 1);
+        let mut free = 8192 - next;
+        while left > 0 {
+            if free == 0 {
+                put(256, 13);
+                put(2, 13);
+                free = 8192 - next;
+            }
+            let (code, l) = if left >= top_len {
+                (top, top_len)
+            } else if left >= 2 {
+                (257 + left - 2, left)
+            } else {
+                (0, 1)
+            };
+            put(code, 13);
+            left -= l;
+            free -= 1;
+        }
+        put(0, 7);
+        out
+    }
+
+    /// A one-entry zip of `n` zero bytes shrunk by [`shrink_zeros`], its
+    /// CRC-32 and sizes the real ones.
+    fn shrink_bomb(n: u64) -> Vec<u8> {
+        let packed = shrink_zeros(n);
+        let mut crc = flate2::Crc::new();
+        let zeros = vec![0u8; 1 << 20];
+        let mut left = n;
+        while left > 0 {
+            let k = left.min(zeros.len() as u64) as usize;
+            crc.update(&zeros[..k]);
+            left -= k as u64;
+        }
+        let mut v = zip_with(
+            &[ZipEntrySpec {
+                method: 1,
+                stored_data: Some(&packed),
+                ..ZipEntrySpec::new(b"zeros", b"")
+            }],
+            b"",
+            b"",
+        );
+        // The CRC-32 and uncompressed size, local (14, 22) and central
+        // (16, 24) header.
+        let cd = v.windows(4).rposition(|w| w == b"PK\x01\x02").unwrap();
+        for (at, val) in [
+            (14, crc.sum()),
+            (22, n as u32),
+            (cd + 16, crc.sum()),
+            (cd + 24, n as u32),
+        ] {
+            v[at..at + 4].copy_from_slice(&val.to_le_bytes());
+        }
+        v
+    }
+
+    /// I1: `stuffr unpack` decodes a shrink or implode entry whole in
+    /// memory, so its declared size is bounded (256 MiB, exit 6 past it,
+    /// before any decode) and its buffer is reserved exactly, never grown
+    /// by doubling. A 110 KB bomb declaring one byte past the ceiling is
+    /// refused; one of 40 MiB and change unpacks within its own size plus
+    /// headroom. On Linux that is a data-segment cap (`data_limited_run`;
+    /// the doubling reserved 64 MiB there and aborted), and a cap below
+    /// the entry's size is a refused reservation, exit 6; elsewhere the
+    /// resident peak counts only touched pages, so it is a ceiling only.
+    #[test]
+    fn stuffr_unpack_bounds_a_shrink_bomb() {
+        const CAP: u64 = 256 << 20;
+        let over = shrink_bomb(CAP + 1);
+        assert!(over.len() < 200_000, "{} bytes", over.len());
+        let env = [("LC_ALL", "C")];
+        let args = ["unpack", "bomb.zip", "-C", "out"];
+        let (st, _, err, _) = peak_rss_run("stuffr", &args, "bomb.zip", &over, &env);
+        assert_eq!(st.code(), Some(6), "{err}");
+        assert!(err.contains("ceiling"), "{err}");
+
+        let n: u64 = (40 << 20) + 12345;
+        let bomb = shrink_bomb(n);
+        let headroom: u64 = 16 << 20;
+        #[cfg(target_os = "linux")]
+        {
+            let free = data_limited_run("stuffr", &args, "bomb.zip", &bomb, &env, None);
+            assert_eq!(free.0, Some(0), "{}", free.2);
+            let capped =
+                data_limited_run("stuffr", &args, "bomb.zip", &bomb, &env, Some(n + headroom));
+            assert_eq!(
+                capped, free,
+                "under a data limit of {n} + {headroom} bytes stuffr answers differently"
+            );
+            // Below the entry's own size the reservation is refused: exit 6,
+            // never an allocator abort.
+            let (code, _, err) =
+                data_limited_run("stuffr", &args, "bomb.zip", &bomb, &env, Some(24 << 20));
+            assert_eq!(code, Some(6), "{err}");
+            assert!(err.contains("cannot allocate"), "{err}");
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let (st, _, err, peak) = peak_rss_run("stuffr", &args, "bomb.zip", &bomb, &env);
+            assert!(st.success(), "{st:?}: {err}");
+            assert!(
+                peak < n + headroom,
+                "peak memory {peak} bytes is not under {n} + {headroom}"
+            );
+        }
+    }
 }
