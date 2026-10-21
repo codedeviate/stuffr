@@ -56,7 +56,9 @@
 //!    Debian's build, original by Info-ZIP).`), and likewise for zipinfo
 //!    and funzip. That line is wider than the pager's 80 columns, so under
 //!    `-M` it counts as two screen lines and `-Mh` pauses one text line
-//!    earlier than the reference (P26).
+//!    earlier than the reference (P26). `-v`'s `Compiled with` line is the
+//!    recorded reference build's (Apple: this release's macOS build), so
+//!    other macOS builds print a different one.
 //! 3. Pre-existing symlinks: the Ubuntu flavour also stays beneath the
 //!    extraction root, as Apple's does. On unix only: off unix (Windows)
 //!    the walk (`unix/beneath.rs`'s `imp_std`) follows symlinks, so
@@ -827,6 +829,15 @@ mod tests {
                 "ZipInfo 3.00 of 20 April 2009, by stuffr {v} (altered; Debian's build, \
                  original by Greg Roelofs and the Info-ZIP group).\n"
             )),
+            "{out}"
+        );
+        // deviation 2: the Apple line is the recorded build's, pinned exactly
+        let (_, out, _) = run(Flavour::Apple, "unzip", &["-v"]);
+        assert!(
+            out.contains(
+                "\nCompiled with gcc Apple LLVM 21.0.0 (clang-2100.3.31.1) [+internal-os] \
+                 for Unix Mac OS X on Aug  8 2026.\n\n"
+            ),
             "{out}"
         );
         let (_, out, _) = run(Flavour::Ubuntu, "unzip", &["-v"]);

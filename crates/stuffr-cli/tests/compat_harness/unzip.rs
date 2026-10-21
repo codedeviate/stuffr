@@ -475,6 +475,37 @@ fn mask_unzip_banners(text: &[u8], ours: Option<&str>) -> Vec<u8> {
     out
 }
 
+/// P41: the one `Compiled with ... on <date>.` line of `-v`, which names
+/// the compiler and date of the Apple build, becomes `<compiled-with>`.
+/// Another macOS ships another build; everything else stays compared.
+fn mask_compiled_with(text: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    for line in text.split_inclusive(|&b| b == b'\n') {
+        let (body, nl) = match line.strip_suffix(b"\n") {
+            Some(b) => (b, &b"\n"[..]),
+            None => (line, &b""[..]),
+        };
+        let s = String::from_utf8_lossy(body);
+        let hit = s.starts_with("Compiled with ")
+            && s.ends_with('.')
+            && s.rfind(" on ").is_some_and(|i| i > "Compiled with ".len());
+        out.extend_from_slice(if hit { b"<compiled-with>" } else { body });
+        out.extend_from_slice(nl);
+    }
+    out
+}
+
+/// [`mask_unzip_banners`], then, for the Apple flavour only, P41's mask of
+/// the `Compiled with` line.
+fn mask_unzip_output(text: &[u8], ours: Option<&str>, apple: bool) -> Vec<u8> {
+    let masked = mask_unzip_banners(text, ours);
+    if apple {
+        mask_compiled_with(&masked)
+    } else {
+        masked
+    }
+}
+
 fn node_kind(n: &UnzipNode) -> &'static str {
     match n {
         UnzipNode::File { .. } => "file",
@@ -496,9 +527,10 @@ pub fn unzip_differences(c: &Case, r: &UnzipRun, s: &UnzipRun) -> Vec<String> {
             r.code, s.code
         ));
     }
+    let apple = c.unzip_flavour == Some("apple");
     let (ro, so) = (
-        mask_unzip_banners(&r.stdout, None),
-        mask_unzip_banners(&s.stdout, c.unzip_flavour),
+        mask_unzip_output(&r.stdout, None, apple),
+        mask_unzip_output(&s.stdout, c.unzip_flavour, apple),
     );
     if ro != so {
         d.push(format!(
@@ -509,8 +541,8 @@ pub fn unzip_differences(c: &Case, r: &UnzipRun, s: &UnzipRun) -> Vec<String> {
         ));
     }
     let (re, se) = (
-        mask_unzip_banners(r.stderr.as_bytes(), None),
-        mask_unzip_banners(s.stderr.as_bytes(), c.unzip_flavour),
+        mask_unzip_output(r.stderr.as_bytes(), None, apple),
+        mask_unzip_output(s.stderr.as_bytes(), c.unzip_flavour, apple),
     );
     if re != se {
         d.push(format!(

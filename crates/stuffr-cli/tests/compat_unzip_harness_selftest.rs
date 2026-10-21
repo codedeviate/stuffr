@@ -180,6 +180,35 @@ mod unix {
         );
     }
 
+    /// P41: Apple's `Compiled with ... on <date>.` line is masked on both
+    /// sides, for the Apple flavour only; every other line still differs.
+    #[test]
+    fn apple_compile_line_is_masked_across_builds() {
+        let run = |line: &str, extra: &str| UnzipRun {
+            code: 0,
+            stdout: format!("a\n{line}\n\nb{extra}\n").into_bytes(),
+            stderr: String::new(),
+            tree: Default::default(),
+            start: now_secs(),
+            tty_mode: None,
+        };
+        let a = "Compiled with gcc Apple LLVM 21.0.0 (clang-2100.0.123.2) [+internal-os] \
+                 for Unix Mac OS X on Jul 31 2026.";
+        let b = "Compiled with gcc Apple LLVM 21.0.0 (clang-2100.3.31.1) [+internal-os] \
+                 for Unix Mac OS X on Aug  8 2026.";
+        let mut c = unzip_case("unzip", vec![], vec![]);
+        c.unzip_flavour = Some("apple");
+        assert!(unzip_differences(&c, &run(a, ""), &run(b, "")).is_empty());
+        // only that line: another line, or a line not shaped so, differs
+        assert_eq!(unzip_differences(&c, &run(a, ""), &run(b, "x")).len(), 1);
+        assert_eq!(
+            unzip_differences(&c, &run(a, ""), &run("Compiled with x", "")).len(),
+            1
+        );
+        c.unzip_flavour = Some("ubuntu");
+        assert_eq!(unzip_differences(&c, &run(a, ""), &run(b, "")).len(), 1);
+    }
+
     #[test]
     fn banners_are_masked_only_when_each_side_prints_its_own() {
         let apple = "UnZip 6.00 of 20 April 2009, by Info-ZIP, with modifications by Apple Inc.\n";
