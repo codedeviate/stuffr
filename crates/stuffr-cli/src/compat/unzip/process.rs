@@ -1057,10 +1057,11 @@ fn read_ux3_value(f: flavour::Flavour, b: &[u8], size: usize) -> Option<u64> {
 /// [`ef_scan_for_izux`] with `-DIZ_HAVE_UXUIDGID`'s owner: `owner`, when
 /// given (the build reads owners: `flavour::iz_have_uxuidgid`), takes the
 /// UID and GID of a `Ux` block of exactly 4 bytes, a `ux` block of version 1
-/// (which then also drops earlier times), or a full `UX` block, and the
-/// flags gain [`EB_UX2_VALID`]. Ubuntu builds with the patched
+/// (which, without 17-restore-unix-timestamps-accurately.patch, also drops
+/// earlier times), or a full `UX` block, and the flags gain
+/// [`EB_UX2_VALID`]. Ubuntu builds with the patched
 /// (05-fix-uid-gid-handling.patch) form of the `ux` reading, which is what
-/// is ported.
+/// is ported. `f` is the flavour (`makeint64()`'s and patch 17's).
 /// ruling: T10-12. A `ux` block whose UID/GID sizes run past the block makes
 /// the C read past it; here the owner is then not taken. A size other than
 /// 2, 4 or 8 leaves the C's (uninitialised) value: 0 here.

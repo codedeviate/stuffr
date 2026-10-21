@@ -10,7 +10,8 @@
 //! `stuffr::infozip`, the CRC); after the last block it makes the deferred
 //! symlinks and sets the made directories' attributes, deepest first.
 //! `crypt.rs` is crypt.c's `decrypt()`; `extra.rs` is `TestExtraField()`,
-//! `test_compr_eb()` and `memextract()`.
+//! `test_compr_eb()` and `memextract()`; `cover.rs` is Ubuntu's bomb
+//! detection (23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch).
 //!
 //! Every count from the archive drives a loop, never an allocation beyond a
 //! field's width: a block holds at most `DIR_BLKSIZ` entries, each a name
