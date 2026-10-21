@@ -325,10 +325,8 @@ mod tests {
             let mut padded = packed.clone();
             padded.extend(std::iter::repeat_n(0u8, pad_len));
 
-            let path = std::env::temp_dir().join(format!(
-                "stuffr-gzip-trailing-pad-{pad_len}-{}.gz",
-                std::process::id()
-            ));
+            let path_tmp = crate::test_tmp::Tmp::new("gzip", &format!("trailing-pad-{pad_len}.gz"));
+            let path = path_tmp.path().to_path_buf();
             std::fs::write(&path, &padded).unwrap();
 
             if let Some(gzip_bin) = &gzip_bin {
@@ -361,8 +359,6 @@ mod tests {
                     "pad_len={pad_len}: python gzip module must recover the real data"
                 );
             }
-
-            let _ = std::fs::remove_file(&path);
         }
     }
 

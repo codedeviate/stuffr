@@ -1197,10 +1197,8 @@ mod tests {
         tag: usize,
         extra_args: &[&str],
     ) -> Vec<u8> {
-        let in_path = std::env::temp_dir().join(format!(
-            "stuffr-compress-z-{tag}-{}.txt",
-            std::process::id()
-        ));
+        let in_tmp = crate::test_tmp::Tmp::new("compress-z", &format!("{tag}.txt"));
+        let in_path = in_tmp.path().to_path_buf();
         std::fs::write(&in_path, payload).unwrap();
         let out = std::process::Command::new(compress_bin)
             .args(extra_args)
@@ -1213,7 +1211,6 @@ mod tests {
             "tag {tag}: system compress {extra_args:?} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let _ = std::fs::remove_file(&in_path);
         out.stdout
     }
 
@@ -1223,8 +1220,8 @@ mod tests {
     /// temp file keeps its `.Z` suffix because both `uncompress`
     /// implementations refuse a name without one even under `-c`.
     fn system_uncompress(uncompress_bin: &std::path::Path, packed: &[u8], tag: usize) -> Vec<u8> {
-        let in_path =
-            std::env::temp_dir().join(format!("stuffr-compress-z-{tag}-{}.Z", std::process::id()));
+        let in_tmp = crate::test_tmp::Tmp::new("compress-z", &format!("{tag}.Z"));
+        let in_path = in_tmp.path().to_path_buf();
         std::fs::write(&in_path, packed).unwrap();
         let out = std::process::Command::new(uncompress_bin)
             .arg("-c")
@@ -1236,7 +1233,6 @@ mod tests {
             "tag {tag}: system uncompress rejected a synthesised stream: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let _ = std::fs::remove_file(&in_path);
         out.stdout
     }
 

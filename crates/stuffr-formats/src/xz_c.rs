@@ -909,10 +909,11 @@ mod tests {
         sink.finish().unwrap();
         let packed = buf.contents();
 
-        // The pid makes the name this run's own, which is how the leak check
+        // `stuffr-<kind>-<pid>-<rest>`: the pid, read as the first all-digit
+        // field, makes the name this run's own, which is how the leak check
         // tells a live run's files from a stale one.
         let path = std::env::temp_dir().join(format!(
-            "stuffr-xz-c-parallel-interop-{}.xz",
+            "stuffr-xz-c-{}-parallel-interop.xz",
             std::process::id()
         ));
         // Removed when the test ends, a failed assertion's unwind included.

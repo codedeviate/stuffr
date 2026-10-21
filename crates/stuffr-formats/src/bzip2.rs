@@ -543,10 +543,9 @@ mod tests {
             let mut padded = packed.clone();
             padded.extend(std::iter::repeat_n(0u8, pad_len));
 
-            let path = std::env::temp_dir().join(format!(
-                "stuffr-bzip2-trailing-pad-{pad_len}-{}.bz2",
-                std::process::id()
-            ));
+            let path_tmp =
+                crate::test_tmp::Tmp::new("bzip2", &format!("trailing-pad-{pad_len}.bz2"));
+            let path = path_tmp.path().to_path_buf();
             std::fs::write(&path, &padded).unwrap();
 
             if let Some(bzip2_bin) = &bzip2_bin {
@@ -579,8 +578,6 @@ mod tests {
                     "pad_len={pad_len}: python bz2 module must recover the real data"
                 );
             }
-
-            let _ = std::fs::remove_file(&path);
         }
     }
 

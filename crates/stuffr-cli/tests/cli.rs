@@ -3366,7 +3366,7 @@ fn an_absolute_entry_path_is_refused() {
     let evil = dir.join("abs.tar");
     // PID-qualified: a shared, fixed /tmp name left behind by one failing run
     // would make every later run fail for the wrong reason.
-    let escape = std::env::temp_dir().join(format!("stuffr-abs-escape-{}.txt", std::process::id()));
+    let escape = std::env::temp_dir().join(format!("stuffr-abs-{}-escape.txt", std::process::id()));
     let _ = std::fs::remove_file(&escape);
     write_raw_tar(&evil, &[Raw::File(escape.to_str().unwrap(), b"pwned")]);
 

@@ -2094,8 +2094,8 @@ mod tests {
             (&long_name, b"deep"),
         ]);
 
-        let path =
-            std::env::temp_dir().join(format!("stuffr-tar-crossimpl-{}.tar", std::process::id()));
+        let path_tmp = crate::test_tmp::Tmp::new("tar", "crossimpl.tar");
+        let path = path_tmp.path().to_path_buf();
         std::fs::write(&path, &bytes).unwrap();
 
         let listed = std::process::Command::new(&tar_bin)
@@ -2126,8 +2126,6 @@ mod tests {
             .unwrap();
         assert!(cat.status.success(), "system tar could not extract a.txt");
         assert_eq!(cat.stdout, b"alpha");
-
-        let _ = std::fs::remove_file(&path);
     }
 
     /// The end-of-archive marker, which `tar`'s own reader never inspects:

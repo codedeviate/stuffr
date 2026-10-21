@@ -14,7 +14,7 @@ pub struct Scratch(pub PathBuf, #[allow(dead_code)] tempfile::TempDir);
 impl Scratch {
     pub fn new(tag: &str) -> Self {
         let dir = tempfile::Builder::new()
-            .prefix(&format!("stuffr-salvage-{tag}-"))
+            .prefix(&format!("stuffr-salvage-{}-{tag}-", std::process::id()))
             .tempdir()
             .unwrap();
         Scratch(dir.path().to_path_buf(), dir)

@@ -2080,8 +2080,8 @@ mod tests {
             (path_name, b"deep"),
             (&long_name, b"deep"),
         ]);
-        let path =
-            std::env::temp_dir().join(format!("stuffr-ar-crossimpl-{}.a", std::process::id()));
+        let path_tmp = crate::test_tmp::Tmp::new("ar", "crossimpl.a");
+        let path = path_tmp.path().to_path_buf();
         std::fs::write(&path, &bytes).unwrap();
 
         let listed = std::process::Command::new(&ar_bin)
@@ -2119,8 +2119,6 @@ mod tests {
             .unwrap();
         assert!(printed.status.success(), "system ar could not print a.txt");
         assert_eq!(printed.stdout, b"alpha");
-
-        let _ = std::fs::remove_file(&path);
     }
 
     /// The arbiter in the other direction, mirroring `tar.rs`'s own
@@ -2135,6 +2133,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("stuffr-ar-reverse-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        let _dir_guard = crate::test_tmp::Tmp(dir.clone());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), b"alpha").unwrap();
         std::fs::write(dir.join("b.bin"), vec![0xABu8; 5000]).unwrap();
@@ -2177,8 +2176,6 @@ mod tests {
         };
         assert_eq!(&find("a.txt").1[..], b"alpha");
         assert_eq!(find("b.bin").1, vec![0xABu8; 5000]);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The empty-archive case specifically: the system tool cannot WRITE one
@@ -2189,10 +2186,8 @@ mod tests {
         let ar_bin = require_bin("ar");
 
         let bytes = build_ar(&[]);
-        let path = std::env::temp_dir().join(format!(
-            "stuffr-ar-crossimpl-empty-{}.a",
-            std::process::id()
-        ));
+        let path_tmp = crate::test_tmp::Tmp::new("ar", "crossimpl-empty.a");
+        let path = path_tmp.path().to_path_buf();
         std::fs::write(&path, &bytes).unwrap();
 
         let listed = std::process::Command::new(&ar_bin)
@@ -2210,8 +2205,6 @@ mod tests {
             "an empty archive must list zero members: {:?}",
             String::from_utf8_lossy(&listed.stdout)
         );
-
-        let _ = std::fs::remove_file(&path);
     }
 
     /// `require_bin` is what makes a missing reference tool a loud failure
@@ -2645,6 +2638,7 @@ mod tests {
         let cc = require_bin("cc");
         let dir = std::env::temp_dir().join(format!("stuffr-ar-gnu-symdef-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        let _dir_guard = crate::test_tmp::Tmp(dir.clone());
         std::fs::create_dir_all(&dir).unwrap();
         for (name, body) in [
             ("f", "int f(void){return 1;}\n"),
@@ -2688,7 +2682,6 @@ mod tests {
             );
             assert!(got[i].1.is_some(), "{obj} carries a real mode");
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Hand-built twins of the GNU shape: both inline symbol-table names

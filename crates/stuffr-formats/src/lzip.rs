@@ -1906,7 +1906,8 @@ mod tests {
         sink.finish().unwrap();
         let packed = buf.contents();
 
-        let path = std::env::temp_dir().join("stuffr-lzip-interop-parallel.lz");
+        let path_tmp = crate::test_tmp::Tmp::new("lzip", "interop-parallel.lz");
+        let path = path_tmp.path().to_path_buf();
         std::fs::write(&path, &packed).unwrap();
 
         let test = std::process::Command::new(&lzip)
@@ -1934,8 +1935,6 @@ mod tests {
             cat.stdout, plain,
             "system lzip decoded our parallel output to different bytes"
         );
-
-        let _ = std::fs::remove_file(&path);
     }
 
     /// The write direction: a member THIS codec writes must be accepted and
@@ -1945,7 +1944,8 @@ mod tests {
         let lzip = require_lzip();
         let plain = b"interop payload, written by this codec ".repeat(4096);
         let packed = compress(&plain);
-        let path = std::env::temp_dir().join("stuffr-lzip-interop-ours.lz");
+        let path_tmp = crate::test_tmp::Tmp::new("lzip", "interop-ours.lz");
+        let path = path_tmp.path().to_path_buf();
         std::fs::write(&path, &packed).unwrap();
 
         let test = std::process::Command::new(&lzip)
@@ -1973,8 +1973,6 @@ mod tests {
             cat.stdout, plain,
             "system lzip decoded our output to different bytes"
         );
-
-        let _ = std::fs::remove_file(&path);
     }
 
     /// The read direction: a member the REFERENCE tool writes must be
@@ -1983,7 +1981,8 @@ mod tests {
     fn this_codec_decodes_what_the_system_lzip_tool_writes() {
         let lzip = require_lzip();
         let plain = b"the system lzip tool wrote this, lzma-rust2 must read it back ".repeat(4096);
-        let src_path = std::env::temp_dir().join("stuffr-lzip-interop-theirs-src.bin");
+        let src_path_tmp = crate::test_tmp::Tmp::new("lzip", "interop-theirs-src.bin");
+        let src_path = src_path_tmp.path().to_path_buf();
         std::fs::write(&src_path, &plain).unwrap();
 
         let out = std::process::Command::new(&lzip)
@@ -2001,7 +2000,6 @@ mod tests {
         );
 
         assert_eq!(decompress(out.stdout), plain);
-        let _ = std::fs::remove_file(&src_path);
     }
 
     /// The multi-member case, checked against the reference tool directly —
@@ -2018,8 +2016,8 @@ mod tests {
         let second = b"second member, written by the reference tool ".repeat(2048);
 
         let compress_with_reference = |plain: &[u8], tag: &str| -> Vec<u8> {
-            let src_path =
-                std::env::temp_dir().join(format!("stuffr-lzip-interop-multi-{tag}.bin"));
+            let src_tmp = crate::test_tmp::Tmp::new("lzip", &format!("interop-multi-{tag}.bin"));
+            let src_path = src_tmp.path().to_path_buf();
             std::fs::write(&src_path, plain).unwrap();
             let out = std::process::Command::new(&lzip)
                 .arg("-9")
@@ -2034,14 +2032,14 @@ mod tests {
                 "system lzip failed to compress: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            let _ = std::fs::remove_file(&src_path);
             out.stdout
         };
 
         let mut both = compress_with_reference(&first, "a");
         both.extend_from_slice(&compress_with_reference(&second, "b"));
 
-        let both_path = std::env::temp_dir().join("stuffr-lzip-interop-multi-both.lz");
+        let both_path_tmp = crate::test_tmp::Tmp::new("lzip", "interop-multi-both.lz");
+        let both_path = both_path_tmp.path().to_path_buf();
         std::fs::write(&both_path, &both).unwrap();
         let reference_cat = std::process::Command::new(&lzip)
             .arg("-dc")
@@ -2067,8 +2065,6 @@ mod tests {
             "this codec must agree with `lzip -dc` on the two-member concatenation — not just \
              the first member's bytes"
         );
-
-        let _ = std::fs::remove_file(&both_path);
     }
 
     // --- Review Round 1, Finding 2: the reference tool decides the expected
@@ -2081,18 +2077,15 @@ mod tests {
     /// accepted them (exit 0) — the verdict every case below is graded
     /// against, not this codec's own expectation of what `lzip.h` says.
     fn reference_accepts(lzip: &std::path::Path, bytes: &[u8]) -> bool {
-        let path = std::env::temp_dir().join(format!(
-            "stuffr-lzip-trailing-probe-{}-{}.lz",
-            std::process::id(),
-            bytes.len()
-        ));
+        let path_tmp =
+            crate::test_tmp::Tmp::new("lzip", &format!("trailing-probe-{}.lz", bytes.len()));
+        let path = path_tmp.path().to_path_buf();
         std::fs::write(&path, bytes).unwrap();
         let out = std::process::Command::new(lzip)
             .arg("-t")
             .arg(&path)
             .output()
             .unwrap();
-        let _ = std::fs::remove_file(&path);
         out.status.success()
     }
 
@@ -2344,7 +2337,8 @@ mod tests {
     #[test]
     fn a_real_small_file_shrinks_its_declared_dictionary() {
         let lzip = require_lzip();
-        let src_path = std::env::temp_dir().join("stuffr-lzip-preflight-shrink-src.bin");
+        let src_path_tmp = crate::test_tmp::Tmp::new("lzip", "preflight-shrink-src.bin");
+        let src_path = src_path_tmp.path().to_path_buf();
         std::fs::write(&src_path, b"hello world").unwrap();
         let out = std::process::Command::new(&lzip)
             .arg("-9")
@@ -2361,7 +2355,6 @@ mod tests {
             "byte 5 of a real small-input member must reflect the shrunk dictionary, not \
              preset 6's full 8 MiB"
         );
-        let _ = std::fs::remove_file(&src_path);
     }
 
     /// `None` on a prefix too short to contain even the magic, and on a
@@ -2468,7 +2461,8 @@ mod tests {
         let mut packed = compress(b"hello world");
         packed[5] = 0x1d; // declares 1 << 29 = 512 MiB
 
-        let path = std::env::temp_dir().join("stuffr-lzip-preflight-crafted.lz");
+        let path_tmp = crate::test_tmp::Tmp::new("lzip", "preflight-crafted.lz");
+        let path = path_tmp.path().to_path_buf();
         std::fs::write(&path, &packed).unwrap();
 
         let test = std::process::Command::new(&lzip)
@@ -2508,8 +2502,6 @@ mod tests {
             "a legitimate, reference-tool-accepted file refused on a resource policy must be \
              ResourceLimit, never Corrupt: {err}"
         );
-
-        let _ = std::fs::remove_file(&path);
     }
 
     // --- Every member's dictionary, not just the first (Phase 3b) — see

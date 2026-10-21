@@ -1055,7 +1055,8 @@ mod tests {
         };
         let plain = b"interop payload ".repeat(4096);
         let packed = encode_with(&Xz, &plain);
-        let path = std::env::temp_dir().join("stuffr-xz-pure-interop.xz");
+        let tmp = crate::test_tmp::Tmp::new("xz-pure", "interop.xz");
+        let path = tmp.path().to_path_buf();
         std::fs::write(&path, &packed).unwrap();
         let out = std::process::Command::new(&xz)
             .arg("-dc")
@@ -1071,7 +1072,6 @@ mod tests {
             out.stdout, plain,
             "system xz decoded our output to different bytes"
         );
-        let _ = std::fs::remove_file(&path);
     }
 
     /// The other interop direction: a `.xz` the SYSTEM tool wrote must be
@@ -1083,8 +1083,10 @@ mod tests {
             return;
         };
         let plain = b"the system tool wrote this, lzma-rust2 must read it back ".repeat(4096);
-        let src_path = std::env::temp_dir().join("stuffr-xz-pure-interop-src.bin");
-        let xz_path = std::env::temp_dir().join("stuffr-xz-pure-interop-src.bin.xz");
+        let src_tmp = crate::test_tmp::Tmp::new("xz-pure", "interop-src.bin");
+        let xz_tmp = crate::test_tmp::Tmp::new("xz-pure", "interop-src.bin.xz");
+        let src_path = src_tmp.path().to_path_buf();
+        let xz_path = xz_tmp.path().to_path_buf();
         std::fs::write(&src_path, &plain).unwrap();
         let out = std::process::Command::new(&xz)
             .arg("-9")
@@ -1106,8 +1108,6 @@ mod tests {
             plain,
             "this codec must decode the system tool's own output byte-for-byte"
         );
-        let _ = std::fs::remove_file(&src_path);
-        let _ = std::fs::remove_file(&xz_path);
     }
 
     /// Property 8 checks this generically; this pins it to the codec so a
@@ -1801,7 +1801,8 @@ mod tests {
         let Some(xz) = which_xz() else {
             return;
         };
-        let src_path = std::env::temp_dir().join("stuffr-xz-pure-preflight-src.bin");
+        let src_tmp = crate::test_tmp::Tmp::new("xz-pure", "preflight-src.bin");
+        let src_path = src_tmp.path().to_path_buf();
         std::fs::write(&src_path, b"a").unwrap();
         let out = std::process::Command::new(&xz)
             .arg("-9")
@@ -1818,7 +1819,8 @@ mod tests {
         );
         let packed = out.stdout;
 
-        let xz_path = std::env::temp_dir().join("stuffr-xz-pure-preflight-src.bin.xz");
+        let xz_tmp = crate::test_tmp::Tmp::new("xz-pure", "preflight-src.bin.xz");
+        let xz_path = xz_tmp.path().to_path_buf();
         std::fs::write(&xz_path, &packed).unwrap();
         let reference = std::process::Command::new(&xz)
             .arg("-dc")
@@ -1849,9 +1851,6 @@ mod tests {
             "a legitimate, reference-tool-accepted file refused on a resource policy must be \
              ResourceLimit, never Corrupt: {err}"
         );
-
-        let _ = std::fs::remove_file(&src_path);
-        let _ = std::fs::remove_file(&xz_path);
     }
 
     /// Phase 3a's `codec` fuzz target, run 1: a **117-byte** input (one

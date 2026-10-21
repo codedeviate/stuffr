@@ -3867,6 +3867,7 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
+        let _dir_guard = crate::test_tmp::Tmp(dir.clone());
         let tree = dir.join("tree");
         std::fs::create_dir_all(&tree).unwrap();
         let contents: [(&str, &[u8]); 3] = [
@@ -3954,7 +3955,6 @@ mod tests {
             assert_eq!(written[0], (b"2nd line\n".to_vec(), true), "{writer}");
             assert_eq!(written[1], (b"third\n".to_vec(), true), "{writer}");
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -------------------------------------------------------------------
@@ -4021,6 +4021,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("stuffr-tar-salvage-writers-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        let _dir_guard = crate::test_tmp::Tmp(dir.clone());
         let tree = dir.join("tree");
         let long = "l".repeat(130);
         std::fs::create_dir_all(tree.join("sub")).unwrap();
@@ -4108,7 +4109,6 @@ mod tests {
                 assert_eq!(&written[at], &(data.clone(), true), "{writer}: {name}");
             }
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -------------------------------------------------------------------

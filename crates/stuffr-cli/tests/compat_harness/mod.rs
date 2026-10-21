@@ -2477,12 +2477,13 @@ fn peak_rss_run_into<T: Send>(
     sink: impl FnOnce(std::process::ChildStdout) -> T + Send,
 ) -> (std::process::ExitStatus, T, String, u64) {
     static N: AtomicUsize = AtomicUsize::new(0);
-    let dir = std::env::temp_dir().join(format!(
+    // Removed when this returns, a failed `unwrap` or a panicking `sink`
+    // included.
+    let dir = ScratchDir::at(std::env::temp_dir().join(format!(
         "stuffr-rss-{}-{}",
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = fs::remove_dir_all(&dir);
+    )));
     fs::create_dir_all(dir.join("bin")).unwrap();
     let link = dir.join("bin").join(name);
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
@@ -2490,7 +2491,7 @@ fn peak_rss_run_into<T: Send>(
     let mut child = spawn(
         Command::new(&link)
             .args(args)
-            .current_dir(&dir)
+            .current_dir(&*dir)
             .env_clear()
             .envs(env.iter().copied())
             .stdin(Stdio::null())
@@ -2515,7 +2516,7 @@ fn peak_rss_run_into<T: Send>(
         let (st, peak) = wait_with_maxrss(child);
         (st, reader.join().unwrap(), err_reader.join().unwrap(), peak)
     });
-    let _ = fs::remove_dir_all(&dir);
+    drop(dir);
     #[cfg(not(target_os = "linux"))]
     eprintln!("peak child RSS: {:.1} MiB", peak as f64 / 1048576.0);
     (st, got, err, peak)

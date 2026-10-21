@@ -693,10 +693,8 @@ mod tests {
         };
 
         let plain = b"reference-written frame payload, repeated for a real block. ".repeat(200);
-        let src_path = std::env::temp_dir().join(format!(
-            "stuffr-lz4-header-cut-src-{}.bin",
-            std::process::id()
-        ));
+        let src_tmp = crate::test_tmp::Tmp::new("lz4", "header-cut-src.bin");
+        let src_path = src_tmp.path().to_path_buf();
         std::fs::write(&src_path, &plain).unwrap();
 
         // Three frames, each written by the reference CLI, concatenated —
@@ -718,7 +716,6 @@ mod tests {
             );
             frame_bytes.extend_from_slice(&out.stdout);
         }
-        let _ = std::fs::remove_file(&src_path);
 
         // Sanity: this codec must read the reference's own 3-frame file
         // whole, or the cuts below would prove nothing.
@@ -784,10 +781,8 @@ mod tests {
         };
 
         let plain = b"skippable-frame regression payload, repeated for a real block. ".repeat(50);
-        let src_path = std::env::temp_dir().join(format!(
-            "stuffr-lz4-skippable-src-{}.bin",
-            std::process::id()
-        ));
+        let src_tmp = crate::test_tmp::Tmp::new("lz4", "skippable-src.bin");
+        let src_path = src_tmp.path().to_path_buf();
         std::fs::write(&src_path, &plain).unwrap();
         let out = std::process::Command::new(&lz4)
             .arg("-z")
@@ -801,7 +796,6 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         let real_frame = out.stdout;
-        let _ = std::fs::remove_file(&src_path);
 
         let skip = skippable_frame(b"arbitrary skippable payload, not lz4 data at all");
 
@@ -826,10 +820,9 @@ mod tests {
         for (name, file_bytes, expected) in cases {
             // Reference arbiter: this file must be one the reference itself
             // reads whole, or the case proves nothing about our own gap.
-            let check_path = std::env::temp_dir().join(format!(
-                "stuffr-lz4-skippable-check-{name}-{}.lz4",
-                std::process::id()
-            ));
+            let check_tmp =
+                crate::test_tmp::Tmp::new("lz4", &format!("skippable-check-{name}.lz4"));
+            let check_path = check_tmp.path().to_path_buf();
             std::fs::write(&check_path, file_bytes).unwrap();
             let ref_out = std::process::Command::new(&lz4)
                 .arg("-d")
@@ -837,7 +830,6 @@ mod tests {
                 .arg(&check_path)
                 .output()
                 .unwrap();
-            let _ = std::fs::remove_file(&check_path);
             assert!(
                 ref_out.status.success() && ref_out.stdout == *expected,
                 "sanity ({name}): reference lz4 must decode this file whole for the case to \

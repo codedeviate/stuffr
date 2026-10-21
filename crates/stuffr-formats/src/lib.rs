@@ -6,6 +6,54 @@
 
 use stuffr_core::Registry;
 
+/// A scratch path in the temp dir that is removed when the guard drops, a
+/// failed assertion's unwind included (`scripts/tmp-leaks.sh` fails the gate on
+/// anything a test leaves behind).
+///
+/// Names follow the leak check's rule, `stuffr-<kind>-<pid>-<rest>`: the pid is
+/// the first all-digit field, so neither `kind` nor anything before the pid may
+/// be all digits, and the pid must be followed by `-`, not by `.ext`.
+#[cfg(test)]
+#[allow(dead_code)] // which tests use it depends on the enabled features
+pub(crate) mod test_tmp {
+    use std::path::{Path, PathBuf};
+
+    pub(crate) struct Tmp(pub(crate) PathBuf);
+
+    impl Tmp {
+        /// `$TMPDIR/stuffr-<kind>-<pid>-<rest>`, with anything already there removed.
+        pub(crate) fn new(kind: &str, rest: &str) -> Tmp {
+            let t =
+                Tmp(std::env::temp_dir()
+                    .join(format!("stuffr-{kind}-{}-{rest}", std::process::id())));
+            t.remove();
+            t
+        }
+
+        pub(crate) fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn remove(&self) {
+            match std::fs::symlink_metadata(&self.0) {
+                Ok(m) if m.is_dir() => {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&self.0);
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            self.remove();
+        }
+    }
+}
+
 /// A recording allocator, for the one test-only question no reader-shaped
 /// mock in this crate can answer: **did a buffer get sized from a header
 /// field before anything refused it?**
