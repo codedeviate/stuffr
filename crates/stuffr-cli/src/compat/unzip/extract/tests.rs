@@ -587,10 +587,9 @@ fn bzip2_rulings() {
     let z = zip(&[bzipped(b"s.txt", &line, small.clone())]);
     let (code, out, _, _d) = sandboxed(Flavour::Ubuntu, &z, &["-t", "a.zip"]);
     assert_eq!(code, 0, "{out}");
-    assert!(
-        out.contains("    testing: s.txt                    OK\n"),
-        "{out}"
-    );
+    // `"%8sing: %-22s  %s%s"` then `" OK"`
+    let ok = format!("{:>8}ing: {:<23}  OK\n", "test", "s.txt");
+    assert!(out.contains(&ok), "{out}");
     let (code, out, _, _d) = sandboxed(Flavour::Apple, &z, &["-t", "a.zip"]);
     assert_eq!(code, 81, "{out}");
 }
@@ -661,8 +660,10 @@ fn unicode_rulings() {
     ]);
     let (code, out, err, _d) = sandboxed(Flavour::Ubuntu, &z, &["-l", "a.zip"]);
     assert_eq!(code, 0, "{out}{err}");
+    // the listing's name column: three blanks, then the name
+    let named = |n: &str| format!("{:3}{n}\n", "");
     assert!(
-        out.contains("   s0.txt\n") && out.contains("   s3.txt\n"),
+        out.contains(&named("s0.txt")) && out.contains(&named("s3.txt")),
         "{out}"
     );
     let invalid = "\nwarning:  Unicode Path checksum invalid\n";
@@ -680,9 +681,9 @@ fn unicode_rulings() {
     }]);
     let (code, out, err, _d) = sandboxed(Flavour::Ubuntu, &z, &["-U", "-l", "a.zip"]);
     assert_eq!((code, err.as_str()), (0, ""), "{out}");
-    assert!(out.contains("   #L03ffffff\n"), "{out}");
+    assert!(out.contains(&named("#L03ffffff")), "{out}");
     let (code, out, err, _d) = sandboxed(Flavour::Ubuntu, &z, &["-l", "a.zip"]);
     assert_eq!(code, 0, "{out}{err}");
-    assert!(out.contains("   #L03ffff\n"), "{out}");
+    assert!(out.contains(&named("#L03ffff")), "{out}");
     assert_eq!(err, "warning:  filename too long (P1) -- truncating.\n");
 }
