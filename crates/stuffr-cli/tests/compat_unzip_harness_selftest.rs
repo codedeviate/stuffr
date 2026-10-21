@@ -406,4 +406,77 @@ mod unix {
         let out = String::from_utf8_lossy(&r.stdout).into_owned();
         assert!(out.ends_with("member\n"), "{out}");
     }
+
+    /// Builds `<root>/work/ro/x` with `ro` at 0o555, and `<root>/work/link`
+    /// pointing at `outside`.
+    fn read_only_tree_with_link(root: &Path, outside: &Path) {
+        fs::create_dir_all(root.join("work/ro")).unwrap();
+        fs::write(root.join("work/ro/x"), b"x").unwrap();
+        chmod(&root.join("work/ro"), 0o555);
+        symlink(outside, root.join("work/link")).unwrap();
+    }
+
+    fn mode_of(p: &Path) -> u32 {
+        fs::metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[test]
+    fn scratch_guards_remove_read_only_trees_and_survive_panics() {
+        let pid = std::process::id();
+        let a = std::env::temp_dir().join(format!("stuffr-guard-{pid}-a"));
+        let path = {
+            let d = ScratchDir::at(a.clone());
+            fs::create_dir_all(d.join("work/ro")).unwrap();
+            fs::write(d.join("work/ro/x"), b"x").unwrap();
+            chmod(&d.join("work/ro"), 0o555);
+            d.to_path_buf()
+        };
+        assert!(!path.exists(), "ScratchDir left {}", path.display());
+
+        let a2 = a.clone();
+        let r = std::panic::catch_unwind(move || {
+            let d = ScratchDir::at(a2);
+            fs::create_dir_all(d.join("work/ro")).unwrap();
+            fs::write(d.join("work/ro/x"), b"x").unwrap();
+            chmod(&d.join("work/ro"), 0o555);
+            panic!("test body panics after creating the tree");
+        });
+        assert!(r.is_err());
+        assert!(!a.exists(), "unwound ScratchDir left {}", a.display());
+
+        let root = {
+            let s = Scratch::new();
+            chmod(&s.0.join("work"), 0o755);
+            fs::create_dir_all(s.0.join("work/ro")).unwrap();
+            fs::write(s.0.join("work/ro/x"), b"x").unwrap();
+            chmod(&s.0.join("work/ro"), 0o555);
+            s.0.clone()
+        };
+        assert!(!root.exists(), "Scratch left {}", root.display());
+    }
+
+    #[test]
+    fn scratch_guards_do_not_follow_symlinks_out_of_the_tree() {
+        let pid = std::process::id();
+        let outside =
+            ScratchDir::at(std::env::temp_dir().join(format!("stuffr-guard-{pid}-outside")));
+        fs::create_dir_all(&*outside).unwrap();
+        chmod(&outside, 0o555);
+
+        let d = ScratchDir::at(std::env::temp_dir().join(format!("stuffr-guard-{pid}-link-d")));
+        read_only_tree_with_link(&d, &outside);
+        let dp = d.to_path_buf();
+        drop(d);
+        assert!(!dp.exists());
+        assert!(outside.exists(), "guard followed the link and removed it");
+        assert_eq!(mode_of(&outside), 0o555, "guard changed the outside mode");
+
+        let s = Scratch::new();
+        let sp = s.0.clone();
+        read_only_tree_with_link(&sp, &outside);
+        drop(s);
+        assert!(!sp.exists());
+        assert!(outside.exists());
+        assert_eq!(mode_of(&outside), 0o555);
+    }
 }

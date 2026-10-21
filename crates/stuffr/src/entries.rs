@@ -6196,6 +6196,7 @@ mod scratch_dir {
 
         /// Restores user rwx on directories (never following symlinks, and
         /// leaving files alone), then removes the tree.
+        // keep in sync with tests/common/mod.rs
         fn remove(p: &Path) {
             #[cfg(unix)]
             fn writable(p: &Path) {

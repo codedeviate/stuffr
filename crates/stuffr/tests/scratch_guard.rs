@@ -34,3 +34,23 @@ fn scratch_guard_removes_read_only_trees_and_survives_panics() {
     assert!(r.is_err());
     assert!(!p2.exists(), "unwound guard left {}", p2.display());
 }
+
+#[cfg(unix)]
+#[test]
+fn scratch_guard_does_not_follow_symlinks_out_of_the_tree() {
+    use std::os::unix::fs::PermissionsExt;
+    let pid = std::process::id();
+    let outside = ScratchDir::create(&format!("stuffr-guard-{pid}-outside"));
+    std::fs::set_permissions(&*outside, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let d = ScratchDir::create(&format!("stuffr-guard-{pid}-link"));
+    make_read_only_tree(&d);
+    std::os::unix::fs::symlink(&*outside, d.join("link")).unwrap();
+    let dp = d.to_path_buf();
+    drop(d);
+
+    assert!(!dp.exists());
+    assert!(outside.exists(), "guard followed the link and removed it");
+    let mode = std::fs::metadata(&*outside).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o555, "guard changed the outside directory's mode");
+}

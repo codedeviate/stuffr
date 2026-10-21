@@ -2311,6 +2311,14 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
+        // Removed when the test ends, a failed assertion's unwind included.
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
         let archive = dir.join("written.lzh");
         std::fs::write(&archive, &bytes).expect("write archive");
 

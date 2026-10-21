@@ -170,14 +170,66 @@ fn fixture_zip_with_data_descriptors(entries: &[(&str, &[u8])]) -> Vec<u8> {
 
 /// A private scratch directory for this test binary's process, so parallel
 /// `cargo test` runs (and repeat runs) never collide.
-fn scratch(name: &str) -> PathBuf {
+///
+/// Removes its tree on drop, a panicking test's unwind included, restoring
+/// write permission on directories first.
+struct Scratch(PathBuf);
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for Scratch {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        remove_tree(&self.0);
+    }
+}
+
+/// Restores user rwx on every directory under `p`, never following symlinks.
+#[cfg(unix)]
+fn make_dirs_writable(p: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::symlink_metadata(p) else {
+        return;
+    };
+    if !meta.is_dir() {
+        return;
+    }
+    let mut perms = meta.permissions();
+    perms.set_mode(perms.mode() | 0o700);
+    let _ = std::fs::set_permissions(p, perms);
+    if let Ok(rd) = std::fs::read_dir(p) {
+        for e in rd.flatten() {
+            make_dirs_writable(&e.path());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn make_dirs_writable(_p: &Path) {}
+
+fn remove_tree(p: &Path) {
+    make_dirs_writable(p);
+    let _ = std::fs::remove_dir_all(p);
+}
+
+fn scratch(name: &str) -> Scratch {
     let dir = std::env::temp_dir().join(format!(
         "stuffr-zip-on-a-pipe-{}-{name}",
         std::process::id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    remove_tree(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    dir
+    Scratch(dir)
 }
 
 fn write_temp_zip(dir: &Path, bytes: &[u8]) -> PathBuf {

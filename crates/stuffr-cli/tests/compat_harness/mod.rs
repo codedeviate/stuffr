@@ -824,21 +824,28 @@ fn lz4_kind_mismatch(reference: &[u8], ours: &[u8]) -> Option<String> {
 /// not run in the case's directory). A file the case does not list (one its
 /// setup makes) is not passed, and the reference then says why it cannot
 /// decode.
-fn lz4_decode_args(c: &Case) -> Vec<String> {
+///
+/// The scratch file lives in a [`ScratchDir`] the caller keeps alive until the
+/// reference has run.
+fn lz4_decode_args(c: &Case) -> (Vec<String>, Option<ScratchDir>) {
     let named = lz4_dictionary_name(c);
     let mut v = Vec::new();
+    let mut guard = None;
     if let Some((_, bytes)) = named.and_then(|n| c.files.iter().find(|(f, _)| *f == n)) {
         static N: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
+        let dir = ScratchDir::at(std::env::temp_dir().join(format!(
             "stuffr-lz4-dict-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
-        ));
+        )));
+        fs::create_dir_all(&*dir).expect("create the dictionary's scratch dir");
+        let path = dir.join("dict");
         fs::write(&path, bytes).expect("write the dictionary for the reference");
         v.push("-D".to_owned());
         v.push(path.display().to_string());
+        guard = Some(dir);
     }
-    v
+    (v, guard)
 }
 
 /// How compressed output is judged when its bytes are not promised
@@ -1009,7 +1016,7 @@ impl Drop for Registered {
 pub struct ScratchDir(PathBuf);
 impl ScratchDir {
     pub fn at(path: PathBuf) -> Self {
-        let _ = fs::remove_dir_all(&path);
+        remove_tree(&path);
         ScratchDir(path)
     }
 }
@@ -1026,27 +1033,56 @@ impl AsRef<Path> for ScratchDir {
 }
 impl Drop for ScratchDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        remove_tree(&self.0);
     }
 }
 
-struct Scratch(PathBuf);
+/// Restores user rwx on every directory under `p`, without following
+/// symlinks. Read-only files are left alone: only directories block removal.
+fn make_dirs_writable(p: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = fs::symlink_metadata(p) else {
+        return;
+    };
+    if !meta.is_dir() {
+        return;
+    }
+    let mut perms = meta.permissions();
+    perms.set_mode(perms.mode() | 0o700);
+    let _ = fs::set_permissions(p, perms);
+    if let Ok(rd) = fs::read_dir(p) {
+        for e in rd.flatten() {
+            make_dirs_writable(&e.path());
+        }
+    }
+}
+
+/// Removes the tree at `p`, read-only directories (`work/ro/x.txt` with `ro`
+/// at 0o555) included.
+fn remove_tree(p: &Path) {
+    make_dirs_writable(p);
+    let _ = fs::remove_dir_all(p);
+}
+
+/// A per-case scratch tree (`stuffr-harness-<pid>-<n>`) that removes itself,
+/// read-only directories included, when dropped.
+pub struct Scratch(pub PathBuf);
 impl Scratch {
-    fn new() -> Self {
+    pub fn new() -> Self {
         static N: AtomicUsize = AtomicUsize::new(0);
         let d = std::env::temp_dir().join(format!(
             "stuffr-harness-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
-        let _ = fs::remove_dir_all(&d);
+        remove_tree(&d);
         fs::create_dir_all(d.join("work")).unwrap();
         Scratch(d)
     }
 }
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        remove_tree(&self.0);
     }
 }
 
@@ -1677,11 +1713,11 @@ pub fn ref_decompress_with(rt: &Roundtrip, data: &[u8]) -> Result<Vec<u8>, Strin
 /// Decompress for case `c`: as [`ref_decompress_with`], with the reference
 /// told the stream format (and raw filter chain) `c` compressed with.
 pub fn ref_decompress_case(c: &Case, data: &[u8]) -> Result<Vec<u8>, String> {
-    let extra = match c.roundtrip {
-        Roundtrip::Xz { .. } => xz_decode_args(c),
-        Roundtrip::Zstd { .. } => zstd_decode_args(c),
+    let (extra, _dict_guard) = match c.roundtrip {
+        Roundtrip::Xz { .. } => (xz_decode_args(c), None),
+        Roundtrip::Zstd { .. } => (zstd_decode_args(c), None),
         Roundtrip::Lz4 { .. } => lz4_decode_args(c),
-        _ => Vec::new(),
+        _ => (Vec::new(), None),
     };
     ref_decompress_args(&c.roundtrip, &extra, data)
 }

@@ -71,6 +71,7 @@ impl Drop for Scratch {
         // A symlink is removed as a file, never followed.
         match std::fs::symlink_metadata(&self.0) {
             Ok(m) if m.is_dir() => {
+                make_dirs_writable(&self.0);
                 let _ = std::fs::remove_dir_all(&self.0);
             }
             Ok(_) => {
@@ -80,6 +81,30 @@ impl Drop for Scratch {
         }
     }
 }
+
+/// Restores user rwx on every directory under `p` (never following symlinks),
+/// so a test that panics while a directory is read-only still cleans up.
+#[cfg(unix)]
+fn make_dirs_writable(p: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::symlink_metadata(p) else {
+        return;
+    };
+    if !meta.is_dir() {
+        return;
+    }
+    let mut perms = meta.permissions();
+    perms.set_mode(perms.mode() | 0o700);
+    let _ = std::fs::set_permissions(p, perms);
+    if let Ok(rd) = std::fs::read_dir(p) {
+        for e in rd.flatten() {
+            make_dirs_writable(&e.path());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn make_dirs_writable(_p: &Path) {}
 
 fn tmp(name: &str) -> Scratch {
     let mut p = std::env::temp_dir();

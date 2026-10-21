@@ -909,7 +909,20 @@ mod tests {
         sink.finish().unwrap();
         let packed = buf.contents();
 
-        let path = std::env::temp_dir().join("stuffr-xz-c-parallel-interop.xz");
+        // The pid makes the name this run's own, which is how the leak check
+        // tells a live run's files from a stale one.
+        let path = std::env::temp_dir().join(format!(
+            "stuffr-xz-c-parallel-interop-{}.xz",
+            std::process::id()
+        ));
+        // Removed when the test ends, a failed assertion's unwind included.
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(path.clone());
         std::fs::write(&path, &packed).unwrap();
 
         let test_status = std::process::Command::new(&xz)
