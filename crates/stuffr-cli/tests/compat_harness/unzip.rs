@@ -883,3 +883,41 @@ pub fn extra_block(id: u16, data: &[u8]) -> Vec<u8> {
     v.extend_from_slice(data);
     v
 }
+
+/// A wildcard run's standard output (`-t`: every message is there) cut at
+/// each `Archive:  NAME` line: the archives in the order the run took them
+/// (readdir's, which differs between file systems), each with its text.
+pub fn archive_blocks(out: &str) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = Vec::new();
+    for line in out.split_inclusive('\n') {
+        if let Some(name) = line.strip_prefix("Archive:  ") {
+            v.push((name.trim_end().to_string(), String::new()));
+        } else if let Some((_, text)) = v.last_mut() {
+            text.push_str(line);
+        }
+    }
+    v
+}
+
+/// Ruling T14-3's archives: plain ones (`g*.zip`, 20 bytes before the end
+/// record) and Zip64 ones (`z*.zip`), interleaved, so that in most readdir
+/// orders some plain archive follows a Zip64 one.
+pub fn stale_zip64_names() -> [&'static str; 6] {
+    ["g1.zip", "z1.zip", "g2.zip", "z2.zip", "g3.zip", "z3.zip"]
+}
+
+/// For each plain archive of a `-t '*.zip'` run's output: whether a Zip64
+/// archive came before it in the run (ruling T14-3: the flags are then
+/// stale), and its text.
+pub fn stale_blocks(out: &str) -> Vec<(bool, String)> {
+    let mut seen_zip64 = false;
+    let mut v = Vec::new();
+    for (name, text) in archive_blocks(out) {
+        if name.starts_with('z') {
+            seen_zip64 = true;
+        } else {
+            v.push((seen_zip64, text));
+        }
+    }
+    v
+}

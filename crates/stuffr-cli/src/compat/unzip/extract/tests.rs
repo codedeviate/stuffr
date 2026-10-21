@@ -63,6 +63,8 @@ struct E<'a> {
     attr: u32,
     host: u8,
     extra: Vec<u8>,
+    /// Bytes after the data (a data descriptor), before the next entry.
+    tail: Vec<u8>,
 }
 
 fn crc(b: &[u8]) -> u32 {
@@ -82,6 +84,7 @@ fn stored<'a>(name: &'a [u8], data: &[u8], attr: u32) -> E<'a> {
         attr,
         host: 3,
         extra: Vec::new(),
+        tail: Vec::new(),
     }
 }
 
@@ -116,6 +119,7 @@ fn zip(entries: &[E]) -> Vec<u8> {
         h.extend_from_slice(&e.extra);
         out.extend_from_slice(&h);
         out.extend_from_slice(&e.data);
+        out.extend_from_slice(&e.tail);
         let mut c = b"PK\x01\x02".to_vec();
         c.extend_from_slice(&[30, e.host]);
         c.extend_from_slice(&20u16.to_le_bytes());
@@ -686,4 +690,43 @@ fn unicode_rulings() {
     assert_eq!(code, 0, "{out}{err}");
     assert!(out.contains(&named("#L03ffff")), "{out}");
     assert_eq!(err, "warning:  filename too long (P1) -- truncating.\n");
+}
+
+/// ruling: T14-2 (ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-
+/// entries.patch). `G.zip64` is set by a Unicode Path block that
+/// getUnicodeData() takes, so after a bit-3 entry with one the descriptor
+/// skip reads 8 more bytes: here into the next local header, which then
+/// starts inside the cover (exit 12). Without the block, or as Apple, the
+/// same archive tests clean.
+#[test]
+fn a_taken_unicode_path_makes_the_descriptor_skip_zip64() {
+    let data = b"hello\n";
+    let mut dd = b"PK\x07\x08".to_vec();
+    for v in [crc(data), data.len() as u32, data.len() as u32] {
+        dd.extend_from_slice(&v.to_le_bytes());
+    }
+    let mut up = 0x7075u16.to_le_bytes().to_vec();
+    up.extend_from_slice(&10u16.to_le_bytes());
+    up.push(1);
+    up.extend_from_slice(&crc(b"a.txt").to_le_bytes());
+    up.extend_from_slice(b"a.txt");
+    let first = |extra: Vec<u8>| E {
+        flags: 8,
+        extra,
+        tail: dd.clone(),
+        ..stored(b"a.txt", data, 0o100644 << 16)
+    };
+    let with = zip(&[first(up), stored(b"b.txt", b"bye\n", 0o100644 << 16)]);
+    let without = zip(&[
+        first(Vec::new()),
+        stored(b"b.txt", b"bye\n", 0o100644 << 16),
+    ]);
+    let overlapped = "error: invalid zip file with overlapped components (possible zip bomb)\n";
+    let (code, out, err, _d) = sandboxed(Flavour::Ubuntu, &with, &["-t", "a.zip"]);
+    assert_eq!(code, 12, "{out}{err}");
+    assert!(out.ends_with(overlapped), "{out}");
+    for (f, z) in [(Flavour::Ubuntu, &without), (Flavour::Apple, &with)] {
+        let (code, out, err, _d) = sandboxed(f, z, &["-t", "a.zip"]);
+        assert_eq!(code, 0, "{f:?}: {out}{err}");
+    }
 }

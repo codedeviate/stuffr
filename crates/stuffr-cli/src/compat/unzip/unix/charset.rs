@@ -11,9 +11,12 @@
 //! ruling: T14-4. Under `Host::Sandbox` (the fuzz target) the locale is C
 //! and no codeset is asked of the system: no default `OEM_CP` is guessed and
 //! nothing is converted, `-O`/`-I` or not, so a sandbox run never depends on
-//! the host's iconv tables. That is what Ubuntu's own build answers under C
-//! for any name that is not plain ASCII (CP850 to `ANSI_X3.4-1968` fails, and
-//! a failed conversion leaves the name as stored).
+//! the host's iconv tables. With the default `OEM_CP` (CP850) and no `-I`,
+//! that is what Ubuntu's own build answers under C: CP850 to
+//! `ANSI_X3.4-1968` fails for any byte above 0x7f, and leaves an ASCII name
+//! as it is. With `-O`/`-I` naming a set that is not an ASCII superset
+//! (`CP037`, `UTF-16`) Ubuntu converts even under C, and the sandbox does
+//! not.
 //! ruling: T14-5. Off unix (Windows) there is no `iconv(3)`: the options
 //! are parsed as Ubuntu parses them and every conversion answers as one
 //! Ubuntu cannot make, silently and leaving the name as stored (the patch
@@ -26,7 +29,8 @@ pub(crate) const MAX_CP_NAME: usize = 25;
 
 /// unix.c's `dos_charset_map`: the locale's character set (compared
 /// ignoring case) and the code page DOS, Windows and OS/2 archives are
-/// taken to use there.
+/// taken to use there. Data, never printed: it lives here rather than in
+/// `messages.rs` (which holds the family's output text).
 const DOS_CHARSET_MAP: &[(&[u8], &[u8])] = &[
     (b"ANSI_X3.4-1968", b"CP850"),
     (b"ISO-8859-1", b"CP850"),

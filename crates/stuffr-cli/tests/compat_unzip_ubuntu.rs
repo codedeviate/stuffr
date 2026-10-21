@@ -1171,6 +1171,27 @@ mod linux {
         let bat = r.local(&sb, b"");
         r.central(&sb, bat);
         v.push(("dd_none_last.zip", r.finish()));
+        // T14-2: a taken Unicode Path block sets `G.zip64`, so the skip
+        // after a signed descriptor reads 8 more bytes, into the next
+        // entry's header (an overlap); a block whose checksum fails is not
+        // taken, and the skip reads the descriptor only
+        for (name, crc_of) in [
+            ("dd_unipath.zip", &b"a.txt"[..]),
+            ("dd_unipath_bad.zip", b"x"),
+        ] {
+            let up = unipath(crc_of, b"a.txt", 1);
+            let e = ZipEntrySpec {
+                flags: 8,
+                extra: &up,
+                ..a
+            };
+            let mut r = Raw::default();
+            let at = r.local(&e, &descriptor(&e, true));
+            r.central(&e, at);
+            let bat = r.local(&b, b"");
+            r.central(&b, bat);
+            v.push((name, r.finish()));
+        }
         // 22: a deflate stream cut in half, then entries in the same buffer
         let text = b"hello world ".repeat(20);
         let full = deflate_raw(&text);
@@ -1360,6 +1381,47 @@ mod linux {
         z
     }
 
+    /// ruling: T14-3. find_ecrec() never clears `have_ecr64`, so in a
+    /// wildcard run the Zip64 end record's spans of an earlier archive start
+    /// a later plain archive's cover: "overlapped components" (exit 12) in
+    /// place of its tests and its "didn't find end-of-central-dir signature"
+    /// note. A differential, and the reference checked archive by archive
+    /// in whatever order its readdir gave (ext4 reads a one-block directory
+    /// in hash order, with a per-file-system seed; unzip takes one archive
+    /// operand, so no run fixes the order).
+    #[test]
+    fn zip64_flags_outlive_their_archive() {
+        let a = ZipEntrySpec::new(b"a.txt", b"hello\n");
+        let one = zip_with(&[a], b"", b"");
+        let eocd = one.len() - 22;
+        let gap = [&one[..eocd], &[b'#'; 20], &one[eocd..]].concat();
+        let files: Vec<(&str, Vec<u8>)> = stale_zip64_names()
+            .into_iter()
+            .map(|n| {
+                let z = if n.starts_with('z') {
+                    zip64_zip(1, None)
+                } else {
+                    gap.clone()
+                };
+                (n, z)
+            })
+            .collect();
+        let cases: Vec<Case> = [&["-t", "*.zip"][..], &["-l", "*.zip"], &["*.zip"]]
+            .iter()
+            .map(|a| case("unzip", a, &files, &[]))
+            .collect();
+        if let Some(r) = unzip_reference(&cases[0]) {
+            let out = String::from_utf8_lossy(&r.stdout);
+            let blocks = stale_blocks(&out);
+            assert_eq!(blocks.len(), 3, "{out}");
+            for (stale, text) in blocks {
+                assert_eq!(text.contains("overlapped components"), stale, "{out}");
+                assert_eq!(text.contains("note:"), !stale, "{out}");
+            }
+        }
+        check("zip64_flags_outlive_their_archive", &cases);
+    }
+
     /// Ubuntu's patch series (Task 14), against its binary, one group per
     /// patch or set of patches. The probes behind each are in
     /// `.claude/rules/compat.md`, "Task 14 probes".
@@ -1411,6 +1473,12 @@ mod linux {
             cases.push(case("unzip", args, &files, &[]));
         }
         check("CVE-2019-13232", &cases);
+        // T14-2 is exercised: Ubuntu's own answers
+        for (z, code) in [("dd_unipath.zip", 12), ("dd_unipath_bad.zip", 0)] {
+            if let Some(r) = unzip_reference(&case("unzip", &["-t", z], &files, &[])) {
+                assert_eq!(r.code, code, "{z}: {}", String::from_utf8_lossy(&r.stdout));
+            }
+        }
 
         // 20-unzip60-alt-iconv-utf8: -O/-I, the default OEM_CP per locale
         let files = iconv_zips();

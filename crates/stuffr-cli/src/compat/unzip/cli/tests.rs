@@ -25,6 +25,11 @@ struct Run {
 /// Parse `args` in UnZip mode (`zipinfo` false) or ZipInfo mode, as Apple's
 /// flavour, with `env` the whole environment.
 fn parse(zipinfo: bool, args: &[&str], env: &[(&str, &str)]) -> Run {
+    parse_as(Flavour::Apple, zipinfo, args, env)
+}
+
+/// [`parse`] as flavour `f`.
+fn parse_as(f: Flavour, zipinfo: bool, args: &[&str], env: &[(&str, &str)]) -> Run {
     let stdout = Arc::new(Mutex::new(Vec::new()));
     let host = Host::Sandbox(Sandbox {
         dir: std::env::temp_dir(),
@@ -41,7 +46,7 @@ fn parse(zipinfo: bool, args: &[&str], env: &[(&str, &str)]) -> Run {
     let mut err = Vec::new();
     let args: Vec<OsString> = args.iter().map(OsString::from).collect();
     let (parsed, o, extract_flag, noargs) = {
-        let mut uz = Uz::new(host, Flavour::Apple, &lookup, &mut err);
+        let mut uz = Uz::new(host, f, &lookup, &mut err);
         let parsed = if zipinfo {
             parse_zipinfo(&mut uz, &args)
         } else {
@@ -464,4 +469,45 @@ fn funzip_takes_a_password_then_a_file() {
     );
     let got = a(&["-"]);
     assert_eq!((got.password.as_deref(), got.input), (Some(&b""[..]), None));
+}
+
+/// ubuntu: 20-unzip60-alt-iconv-utf8.patch's `-I`/`-O`, attached or as the
+/// next argument, kept to 25 bytes, the rest of the argument used up.
+/// ruling: T14-7. `-I ''` is an empty `ISO_CP` and the next argument is an
+/// option again (the C's `while(*(++s));` past the empty string's NUL is
+/// not reproduced). Apple has no such options.
+#[test]
+fn charsets_are_taken_as_ubuntu_takes_them() {
+    let ubuntu = |zipinfo: bool, args: &[&str]| parse_as(Flavour::Ubuntu, zipinfo, args, &[]);
+    let r = ubuntu(false, &["-I", "", "-l", "a.zip"]);
+    assert_eq!(ok(&r).archive, "a.zip");
+    assert_eq!((r.o.iso_cp.as_slice(), r.o.vflag), (&b""[..], 1));
+    let r = ubuntu(false, &["-OCP866q", "-I", "ISO-8859-5", "-l", "a.zip"]);
+    assert_eq!(ok(&r).archive, "a.zip");
+    assert_eq!(r.o.oem_cp, b"CP866q");
+    assert_eq!(r.o.iso_cp, b"ISO-8859-5");
+    let long = "x".repeat(30);
+    let r = ubuntu(true, &["-1O", &long, "a.zip"]);
+    assert_eq!(ok(&r).archive, "a.zip");
+    assert_eq!(r.o.oem_cp, vec![b'x'; 25]);
+    for (args, msg) in [
+        (
+            &["-O"][..],
+            "error:  a valid character encoding should follow the -O argument",
+        ),
+        (
+            &["-O-l", "a.zip"],
+            "error:  a valid character encoding should follow the -I argument",
+        ),
+        (&["--I", "x", "a.zip"], "error:  encodings can't be negated"),
+    ] {
+        let r = ubuntu(false, args);
+        assert_eq!(
+            (&r.parsed.as_ref().err(), r.err.as_str()),
+            (&Some(&10), msg),
+            "{args:?}"
+        );
+    }
+    let r = unzip(&["-I", "x", "a.zip"]);
+    assert_eq!(r.parsed.as_ref().err(), Some(&10));
 }

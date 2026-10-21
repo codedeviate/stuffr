@@ -549,19 +549,36 @@ mod macos {
     /// `is_zip64_archive`, so in a wildcard run a plain archive after a
     /// Zip64 one loses its "didn't find end-of-central-dir signature at
     /// end of central dir" note. A differential (both sides read the
-    /// directory in the same order); APFS lists `z2.zip` before `gb.zip`,
-    /// so the reference is checked to show the effect.
+    /// directory in the same order), and the reference checked archive by
+    /// archive in whatever order its readdir gave: the note exactly where
+    /// no Zip64 archive came first. (unzip takes one archive operand and
+    /// expands a wildcard in readdir order, so no run fixes the order.)
     #[test]
     fn zip64_flags_outlive_their_archive() {
-        let files = vec![("gb.zip", gap_zip()), ("z2.zip", zip64_zip())];
+        let files: Vec<(&str, Vec<u8>)> = stale_zip64_names()
+            .into_iter()
+            .map(|n| {
+                (
+                    n,
+                    if n.starts_with('z') {
+                        zip64_zip()
+                    } else {
+                        gap_zip()
+                    },
+                )
+            })
+            .collect();
         let cases: Vec<Case> = [&["-t", "*.zip"][..], &["-l", "*.zip"], &["-v", "*.zip"]]
             .iter()
             .map(|a| unzip_case("unzip", a.to_vec(), files.clone()))
             .collect();
         if let Some(r) = unzip_reference(&cases[0]) {
             let out = String::from_utf8_lossy(&r.stdout);
-            assert!(out.starts_with("Archive:  z2.zip\n"), "{out}");
-            assert!(!out.contains("note:"), "{out}");
+            let blocks = stale_blocks(&out);
+            assert_eq!(blocks.len(), 3, "{out}");
+            for (stale, text) in blocks {
+                assert_eq!(text.contains("note:"), !stale, "{out}");
+            }
         }
         compare("zip64_flags_outlive_their_archive", &cases);
     }

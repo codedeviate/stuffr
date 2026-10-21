@@ -8,11 +8,11 @@
 //! - `recorded_rows_hold_on_the_reference` (always on) runs every row of
 //!   this platform's flavour on the reference and checks the recording, so
 //!   the table cannot rot;
-//! - `taskN_rows_match_stuffr` runs the rows Task N implements against
-//!   stuffr in that flavour (`assert_same_unzip`) and is `#[ignore = "Task
-//!   N"]` until then. R13: on Ubuntu a row whose answer needs a patch of its
-//!   series runs under Task 14 instead ([`Row::needs_patch`]); Ubuntu's
-//!   build options are Task 13's, done.
+//! - `taskN_rows_match_stuffr` runs the rows Task N implemented against
+//!   stuffr in that flavour (`assert_same_unzip`); every task's runs now,
+//!   none is ignored. R13: on Ubuntu a row whose answer needs a patch of its
+//!   series runs under Task 14 ([`Row::needs_patch`]); Ubuntu's build
+//!   options are Task 13's.
 //!
 //! Every row runs under `LANG=C` and `TZ=UTC` (the harness's defaults);
 //! every archive is built here with `zip_with`, so both references read the
