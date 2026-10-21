@@ -381,7 +381,7 @@ read list.
 > `bzip2_stream::RawStream` gains `decompress_counted`. A seventh fuzz
 > target, `infozip`, covers the new decoders. `LICENSE-infozip` (the
 > Info-ZIP licence) joins both crates' licence expressions.
-> **2948** tests under `--all-features`, **2834** on the default tier —
+> **2951** tests under `--all-features`, **2837** on the default tier —
 > measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
 > Two user-visible changes on archives that already exist. First, `salvage
