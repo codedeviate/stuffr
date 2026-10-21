@@ -1659,7 +1659,7 @@ mod unix {
         run_group("compress_terminals", &cases, Skipped::none(), &one);
     }
 
-    /// Review Focus 2: 48 MiB compressed with the host's default worker
+    /// Review Focus 2: 32 MiB compressed with the host's default worker
     /// count (R3), `-T1` and `zstdmt`: the C tier's bytes are the
     /// reference's; and a 2-worker run equals a 3-worker run.
     ///
@@ -1669,7 +1669,10 @@ mod unix {
     /// unloaded): it compresses 8 MiB.
     #[test]
     fn default_threading_matches_on_a_large_input() {
-        let size = if EXACT { 48 << 20 } else { 8 << 20 };
+        // 0.16.1: 32 MiB, was 48: still four 8 MiB jobs at level 3 (job log =
+        // window log 21 + 2), a job for every worker up to the default's cap
+        // of 4, so -T2/-T3 and the default still split it.
+        let size = if EXACT { 32 << 20 } else { 8 << 20 };
         let big = super::compat_harness::text(size, 93);
         let cases = vec![
             with_files("zstd", &["-q", "-c", "big"], vec![("big", big.clone())]),
@@ -1681,6 +1684,8 @@ mod unix {
             with_files("zstdmt", &["-q", "-c", "big"], vec![("big", big.clone())]),
         ];
         check("default_threading_matches_on_a_large_input", &cases);
+        // Their three copies of the input are not needed for the -T2/-T3 runs.
+        drop(cases);
         if !EXACT {
             return;
         }
@@ -2201,7 +2206,7 @@ mod unix {
         let _serial = interrupt_lock();
         let Some(dir) = zstd_dir() else { return };
         let tag = std::process::id();
-        let input = |mib: usize| big_input(mib).to_vec();
+        let input = big_input;
         let ref_dir =
             ScratchDir::at(std::env::temp_dir().join(format!("stuffr-zstd-int-ref-{tag}")));
         let our_dir = ScratchDir::at(std::env::temp_dir().join(format!("stuffr-zstd-int-{tag}")));

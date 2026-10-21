@@ -287,3 +287,22 @@ mod unix {
         );
     }
 }
+
+/// The interrupt tests' inputs: `big_input` is the 4 MiB block repeated
+/// and cut to size, and the streamed `stored_gzip_of_big` is exactly
+/// `stored_gzip` over it (5 MiB crosses a repeat inside a stored block).
+#[cfg(unix)]
+#[test]
+fn big_inputs_are_the_block_repeated_and_stream_identically() {
+    use compat_harness::interrupt::{big_input, stored_gzip, stored_gzip_of_big};
+    let five = big_input(5);
+    assert_eq!(five.len(), 5 << 20);
+    assert_eq!(five[..1 << 20], five[4 << 20..]);
+    assert_eq!(big_input(4)[..], five[..4 << 20]);
+    for mib in [0, 1, 5] {
+        assert!(
+            stored_gzip_of_big(mib) == stored_gzip(&big_input(mib)),
+            "{mib} MiB"
+        );
+    }
+}

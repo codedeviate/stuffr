@@ -348,7 +348,7 @@ mod unix {
         let reference = Path::new(dir).join("unzip");
         let stuffr = Path::new(env!("CARGO_BIN_EXE_stuffr"));
         let flavour = platform_unzip_flavour();
-        let input = |mib: usize| interrupt::stored_zip(b"big.bin", interrupt::big_input(mib));
+        let input = |mib: usize| interrupt::stored_zip(b"big.bin", &interrupt::big_input(mib));
         let scratch =
             std::env::temp_dir().join(format!("stuffr-unzip-intr-{}", std::process::id()));
         let (mut ran, mut hung) = (0, 0);

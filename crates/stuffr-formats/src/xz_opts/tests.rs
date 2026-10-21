@@ -1355,21 +1355,53 @@ mod pure_tier {
         assert!(matches!(e.flush(&mut out), Err(XzError::Prog)));
     }
 
+    /// `b"tiny input"` as preset 9 writes it in `format`, made by the
+    /// preset-0 encoder with the header's dictionary raised to preset 9's.
+    /// The bytes are preset 9's own (compared 2026-10-21: only the
+    /// dictionary field differs, and in `.xz` the Block Header CRC32), but
+    /// preset 9's match finder for its 64 MiB dictionary took this test to
+    /// about 680 MiB, and a decoder refusing at the header reads no more.
+    fn tiny_input_at_preset_9(format: Format) -> Vec<u8> {
+        let (zero, nine) = (
+            Lzma::preset(0, false).unwrap(),
+            Lzma::preset(9, false).unwrap(),
+        );
+        let filter = match format {
+            Format::Lzma => Filter::Lzma1(zero.clone()),
+            _ => Filter::Lzma2(zero.clone()),
+        };
+        let o = EncodeOptions {
+            format,
+            filters: vec![filter],
+            ..EncodeOptions::default()
+        };
+        let mut v = encode(&o, b"tiny input", 100).unwrap();
+        if let Format::Lzma = format {
+            // Properties byte, then the dictionary size (LE), at 1..5.
+            assert_eq!(v[1..5], zero.dict_size.to_le_bytes());
+            v[1..5].copy_from_slice(&nine.dict_size.to_le_bytes());
+        } else {
+            // Stream Header (12 bytes), then a 12-byte Block Header: size,
+            // flags, the LZMA2 filter (ID 0x21, one property byte at 16: a
+            // power-of-two dictionary 2^n is 2 * (n - 12)), padding, CRC32.
+            let byte = |d: u32| (2 * (d.trailing_zeros() - 12)) as u8;
+            assert!(zero.dict_size.is_power_of_two() && nine.dict_size.is_power_of_two());
+            assert_eq!((v[12], v[14], v[16]), (2, 0x21, byte(zero.dict_size)));
+            v[16] = byte(nine.dict_size);
+            let crc = crate::xz_opts::check::crc32(&v[12..20], 0);
+            v[20..24].copy_from_slice(&crc.to_le_bytes());
+        }
+        v
+    }
+
     /// As the C tier's `decoder_reports_memlimit`: `.xz` says 32 KiB
     /// (liblzma's threaded decoder, at any thread count, before any Block
     /// ran), `.lzma` the dictionary.
     #[test]
     fn decoder_reports_memlimit() {
         let nine = Lzma::preset(9, false).unwrap();
-        let packed = encode(
-            &EncodeOptions {
-                filters: vec![Filter::Lzma2(nine.clone())],
-                ..EncodeOptions::default()
-            },
-            b"tiny input",
-            100,
-        )
-        .unwrap();
+        // Preset 9's bytes without preset 9's encoder (see the helper).
+        let packed = tiny_input_at_preset_9(Format::Xz);
         for threads in [1, 2] {
             let o = DecodeOptions {
                 memlimit: 1 << 20,
@@ -1400,16 +1432,7 @@ mod pure_tier {
             }
             other => panic!("auto: {other:?}"),
         }
-        let lzma = encode(
-            &EncodeOptions {
-                format: Format::Lzma,
-                filters: vec![Filter::Lzma1(nine)],
-                ..EncodeOptions::default()
-            },
-            b"tiny input",
-            100,
-        )
-        .unwrap();
+        let lzma = tiny_input_at_preset_9(Format::Lzma);
         let o = DecodeOptions {
             format: Format::Lzma,
             memlimit: 1 << 20,

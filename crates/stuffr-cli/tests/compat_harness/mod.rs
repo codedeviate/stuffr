@@ -2422,10 +2422,28 @@ pub fn decoder_peak_rss(
     plain: &[u8],
     env: &[(&str, &str)],
 ) -> u64 {
-    let (st, got, err, peak) = peak_rss_run(name, &[file], file, input, env);
+    // The output is compared as it arrives, never held: at 128 MiB, holding
+    // it was most of the test process's own memory.
+    let (st, same, err, peak) = peak_rss_run_into(name, &[file], file, input, env, |mut out| {
+        let mut buf = vec![0u8; 1 << 16];
+        let mut at = 0;
+        let mut same = true;
+        loop {
+            match out.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    same &= plain.get(at..at + n) == Some(&buf[..n]);
+                    at += n;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => panic!("reading the decoded output: {e}"),
+            }
+        }
+        same && at == plain.len()
+    });
     assert!(st.success(), "{st:?}: {err}");
     assert_eq!(err, "");
-    assert!(got == plain, "decoded output differs");
+    assert!(same, "decoded output differs");
     peak
 }
 
@@ -2441,6 +2459,23 @@ pub fn peak_rss_run(
     input: &[u8],
     env: &[(&str, &str)],
 ) -> (std::process::ExitStatus, Vec<u8>, String, u64) {
+    peak_rss_run_into(name, args, file, input, env, |mut out| {
+        let mut v = Vec::new();
+        out.read_to_end(&mut v).unwrap();
+        v
+    })
+}
+
+/// [`peak_rss_run`], with standard output handed to `sink` (on its own
+/// thread, while the run lasts) instead of collected.
+fn peak_rss_run_into<T: Send>(
+    name: &str,
+    args: &[&str],
+    file: &str,
+    input: &[u8],
+    env: &[(&str, &str)],
+    sink: impl FnOnce(std::process::ChildStdout) -> T + Send,
+) -> (std::process::ExitStatus, T, String, u64) {
     static N: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "stuffr-rss-{}-{}",
@@ -2463,26 +2498,23 @@ pub fn peak_rss_run(
             .stderr(Stdio::piped()),
     )
     .unwrap();
-    let mut out = child.stdout.take().unwrap();
-    let reader = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        out.read_to_end(&mut v).unwrap();
-        v
-    });
+    let out = child.stdout.take().unwrap();
     let mut errs = child.stderr.take().unwrap();
-    let err_reader = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = errs.read_to_string(&mut s);
-        s
+    let (st, got, err, peak) = std::thread::scope(|s| {
+        let reader = s.spawn(move || sink(out));
+        let err_reader = s.spawn(move || {
+            let mut s = String::new();
+            let _ = errs.read_to_string(&mut s);
+            s
+        });
+        #[cfg(target_os = "linux")]
+        let peak = linux_rss_anon_peak(&mut child);
+        #[cfg(target_os = "linux")]
+        let st = child.wait().unwrap();
+        #[cfg(not(target_os = "linux"))]
+        let (st, peak) = wait_with_maxrss(child);
+        (st, reader.join().unwrap(), err_reader.join().unwrap(), peak)
     });
-    #[cfg(target_os = "linux")]
-    let peak = linux_rss_anon_peak(&mut child);
-    #[cfg(target_os = "linux")]
-    let st = child.wait().unwrap();
-    #[cfg(not(target_os = "linux"))]
-    let (st, peak) = wait_with_maxrss(child);
-    let got = reader.join().unwrap();
-    let err = err_reader.join().unwrap();
     let _ = fs::remove_dir_all(&dir);
     #[cfg(not(target_os = "linux"))]
     eprintln!("peak child RSS: {:.1} MiB", peak as f64 / 1048576.0);
@@ -3299,12 +3331,14 @@ pub fn filter_through(exe: &str, args: &[&str], data: &[u8]) -> Option<Vec<u8>> 
     )
     .unwrap();
     let mut si = child.stdin.take().unwrap();
-    let d = data.to_vec();
-    let w = std::thread::spawn(move || {
-        let _ = si.write_all(&d);
+    // The writer borrows `data` (a scoped thread): a copy of a 128 MiB
+    // input was the largest single allocation of some suites.
+    let out = std::thread::scope(|s| {
+        s.spawn(move || {
+            let _ = si.write_all(data);
+        });
+        child.wait_with_output().unwrap()
     });
-    let out = child.wait_with_output().unwrap();
-    w.join().unwrap();
     assert!(out.status.success(), "{exe} {args:?}");
     Some(out.stdout)
 }

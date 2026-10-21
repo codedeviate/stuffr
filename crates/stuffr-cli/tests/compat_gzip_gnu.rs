@@ -2620,7 +2620,7 @@ mod interrupts {
     }
 
     fn plain(m: usize) -> Vec<u8> {
-        big_input(m).to_vec()
+        big_input(m)
     }
 
     #[test]
@@ -2680,7 +2680,7 @@ mod interrupts {
     #[test]
     fn gnu_gunzip_removes_its_partial_output_on_int() {
         let _serial = interrupt_lock();
-        let gz = |m: usize| stored_gzip(big_input(fast_size(m)));
+        let gz = |m: usize| stored_gzip_of_big(fast_size(m));
         for mine in [true, false] {
             let Some(r) = run(
                 mine,

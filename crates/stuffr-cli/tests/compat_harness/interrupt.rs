@@ -34,23 +34,73 @@ pub enum Inherit {
     IgnoreInt,
 }
 
-/// A shared incompressible input of `mib` MiB, built once per process: one
-/// random 4 MiB block repeated. The repeat distance is far beyond gzip's
-/// 32 KiB window and bzip2's 900 KB blocks, so it stays incompressible to
-/// both, and building it costs a fraction of 256 MiB of `random()` in a
-/// debug build.
-pub fn big_input(mib: usize) -> &'static [u8] {
-    static BIG: OnceLock<Vec<u8>> = OnceLock::new();
-    const BLOCK: usize = 4 << 20;
-    let v = BIG.get_or_init(|| {
-        let block = super::random(BLOCK, 0x5157_0013);
-        let mut v = Vec::with_capacity(256 << 20);
-        while v.len() < 256 << 20 {
-            v.extend_from_slice(&block);
+/// The random 4 MiB block [`big_input`] repeats, built once per process.
+fn big_block() -> &'static [u8] {
+    static BLOCK: OnceLock<Vec<u8>> = OnceLock::new();
+    BLOCK.get_or_init(|| super::random(4 << 20, 0x5157_0013))
+}
+
+/// The pieces of [`big_input`]`(mib)` in order: the block, repeated, the
+/// last one cut to fit. Lets a caller stream the input instead of holding it.
+fn big_pieces(mib: usize) -> impl Iterator<Item = &'static [u8]> {
+    let block = big_block();
+    let mut left = mib << 20;
+    std::iter::from_fn(move || {
+        let n = left.min(block.len());
+        left -= n;
+        (n > 0).then(|| &block[..n])
+    })
+}
+
+/// An incompressible input of `mib` MiB (up to 256): one random 4 MiB block
+/// repeated. The repeat distance is far beyond gzip's 32 KiB window and
+/// bzip2's 900 KB blocks, so it stays incompressible to both, and building
+/// it costs a fraction of `mib` MiB of `random()` in a debug build.
+///
+/// 0.16.1: built at the size asked for. It used to be one shared 256 MiB
+/// buffer that every caller copied from, so an interrupt test held 256 MiB
+/// on top of its input whatever size it used.
+pub fn big_input(mib: usize) -> Vec<u8> {
+    assert!(mib <= 256, "big_input holds at most 256 MiB, not {mib}");
+    let mut v = Vec::with_capacity(mib << 20);
+    for piece in big_pieces(mib) {
+        v.extend_from_slice(piece);
+    }
+    v
+}
+
+/// `exe args` (the reference, a filter) over [`big_input`]`(mib)` streamed
+/// to its standard input, so only the output is ever held; `None` where
+/// [`super::require_reference`] skips the reference.
+pub fn big_input_through(exe: &str, args: &[&str], mib: usize) -> Option<Vec<u8>> {
+    use std::io::Write;
+    if !super::require_reference(Path::new(exe)) {
+        return None;
+    }
+    let mut child = super::spawn(
+        Command::new(exe)
+            .args(args)
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped()),
+    )
+    .unwrap();
+    let mut si = child.stdin.take().unwrap();
+    let writer = std::thread::spawn(move || {
+        for piece in big_pieces(mib) {
+            if si.write_all(piece).is_err() {
+                break;
+            }
         }
-        v
     });
-    &v[..mib << 20]
+    // Sized for an incompressible input plus framing, so the buffer is not
+    // doubled past it while it grows.
+    let mut out = Vec::with_capacity((mib << 20) + (mib << 10) + 4096);
+    child.stdout.take().unwrap().read_to_end(&mut out).unwrap();
+    let status = child.wait().unwrap();
+    writer.join().unwrap();
+    assert!(status.success(), "{exe} {args:?}");
+    Some(out)
 }
 
 /// How long a signalled child gets to exit before it counts as hung, when the
@@ -288,10 +338,51 @@ pub fn killed_by(r: &Interrupted, sig: i32) -> bool {
     r.status.signal() == Some(sig)
 }
 
+/// [`stored_gzip`] of [`big_input`]`(mib)`, built without holding the
+/// input: the gzip file alone is held.
+pub fn stored_gzip_of_big(mib: usize) -> Vec<u8> {
+    // A stored block (65535 bytes) is far shorter than the 4 MiB block, so
+    // each one is cut from at most two neighbouring repeats of it.
+    let block = big_block();
+    let len = mib << 20;
+    let mut crc = flate2::Crc::new();
+    let mut v = Vec::with_capacity(stored_gzip_len(len));
+    v.extend_from_slice(&[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3]);
+    if len == 0 {
+        v.extend_from_slice(&[1, 0, 0, 0xff, 0xff]);
+    }
+    let mut at = 0;
+    while at < len {
+        let n = (len - at).min(65535);
+        v.push(u8::from(at + n == len));
+        v.extend_from_slice(&(n as u16).to_le_bytes());
+        v.extend_from_slice(&(!(n as u16)).to_le_bytes());
+        let mut done = 0;
+        while done < n {
+            let off = (at + done) % block.len();
+            let piece = &block[off..block.len().min(off + n - done)];
+            crc.update(piece);
+            v.extend_from_slice(piece);
+            done += piece.len();
+        }
+        at += n;
+    }
+    v.extend_from_slice(&crc.sum().to_le_bytes());
+    v.extend_from_slice(&(len as u32).to_le_bytes());
+    v
+}
+
+/// The size of [`stored_gzip`] over `n` bytes: header, five bytes per
+/// stored block (one block even when empty), trailer.
+fn stored_gzip_len(n: usize) -> usize {
+    10 + 5 * n.div_ceil(65535).max(1) + n + 8
+}
+
 /// A gzip file holding `data` as stored deflate blocks: valid, fast to
 /// make, and as large as its input, so a run over it lasts.
 pub fn stored_gzip(data: &[u8]) -> Vec<u8> {
-    let mut v = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+    let mut v = Vec::with_capacity(stored_gzip_len(data.len()));
+    v.extend_from_slice(&[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3]);
     let mut chunks = data.chunks(65535).peekable();
     if chunks.peek().is_none() {
         v.extend_from_slice(&[1, 0, 0, 0xff, 0xff]);

@@ -1376,7 +1376,7 @@ mod interrupts {
     }
 
     fn plain(m: usize) -> Vec<u8> {
-        big_input(m).to_vec()
+        big_input(m)
     }
 
     /// One interrupted compression of `a` (ours or the reference's).

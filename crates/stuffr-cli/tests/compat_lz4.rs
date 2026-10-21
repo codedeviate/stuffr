@@ -3696,7 +3696,7 @@ mod unix {
             std::env::temp_dir().join(format!("stuffr-lz4cat-pipe-{}", std::process::id())),
         );
         fs::create_dir_all(&*work).unwrap();
-        let big = big_input(48).to_vec();
+        let big = big_input(48);
         fs::write(work.join("big"), &big).unwrap();
         fs::write(work.join("big.lz4"), made(&["-1", "-q", "-c"], &big)).unwrap();
         let stuffr = Path::new(env!("CARGO_BIN_EXE_stuffr"));
@@ -4159,8 +4159,11 @@ mod unix {
             ScratchDir::at(std::env::temp_dir().join(format!("stuffr-lz4-int-ref-{tag}")));
         let our_dir = ScratchDir::at(std::env::temp_dir().join(format!("stuffr-lz4-int-{tag}")));
         let stuffr = Path::new(env!("CARGO_BIN_EXE_stuffr"));
-        let plain = |mib: usize| big_input(mib).to_vec();
-        let packed = |mib: usize| made(&["-1", "-q", "-c"], big_input(fast_size(mib)));
+        let plain = big_input;
+        let packed = |mib: usize| {
+            big_input_through(ref_lz4(), &["-1", "-q", "-c"], fast_size(mib))
+                .expect("the reference could not run lz4 -1")
+        };
         type Job<'a> = (
             &'a str,
             &'a [&'a str],
@@ -4261,7 +4264,7 @@ mod unix {
             std::env::temp_dir().join(format!("stuffr-lz4-pipe-{}", std::process::id())),
         );
         fs::create_dir_all(&*work).unwrap();
-        let big = big_input(48).to_vec();
+        let big = big_input(48);
         fs::write(work.join("big"), &big).unwrap();
         fs::write(work.join("big.lz4"), made(&["-1", "-q", "-c"], &big)).unwrap();
         let run = |exe: &Path, name: &str, args: &[&str]| -> (std::process::ExitStatus, String) {

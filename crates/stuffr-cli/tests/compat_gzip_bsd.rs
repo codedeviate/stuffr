@@ -2284,8 +2284,8 @@ mod interrupts {
     #[test]
     fn apple_gzip_removes_its_partial_output_on_int() {
         let _serial = interrupt_lock();
-        let plain = |m: usize| big_input(m).to_vec();
-        let gz = |m: usize| stored_gzip(big_input(fast_size(m)));
+        let plain = big_input;
+        let gz = |m: usize| stored_gzip_of_big(fast_size(m));
         for mine in [true, false] {
             type Make<'a> = &'a dyn Fn(usize) -> Vec<u8>;
             let cases: [(&[&str], &str, Make, &str); 2] = [
@@ -2318,7 +2318,7 @@ mod interrupts {
     #[test]
     fn apple_gzip_leaves_its_partial_output_on_term() {
         let _serial = interrupt_lock();
-        let plain = |m: usize| big_input(m).to_vec();
+        let plain = big_input;
         for mine in [true, false] {
             let Some(r) = run(
                 mine,
