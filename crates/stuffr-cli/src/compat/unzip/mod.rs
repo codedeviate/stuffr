@@ -59,7 +59,9 @@
 //!    extraction root, as Apple's does.
 //! 4. The archive being read is never overwritten.
 //! 5. `-O`/`-I` (Ubuntu) convert names through `iconv(3)`; they are
-//!    unavailable on Windows.
+//!    unavailable on Windows, where they are parsed as Ubuntu parses them
+//!    and convert nothing, as a conversion Ubuntu's `iconv_open()` refuses
+//!    (silently: the names stay as stored; ruling T14-5).
 //! 6. Locale-dependent output is identical under `C`, `C.UTF-8` and
 //!    `en_US.UTF-8` only.
 //! 7. On macOS the Ubuntu flavour also propagates the archive's quarantine

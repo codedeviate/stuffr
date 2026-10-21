@@ -121,8 +121,13 @@ fn entry_date(uz: &Uz, e: &CentralEntry) -> [u64; 5] {
     let mut z_utime = IzTimes::default();
     let t = match &e.extra {
         Some(ef)
-            if process::ef_scan_for_izux(ef, true, e.last_mod_dos_datetime, Some(&mut z_utime))
-                & EB_UT_FL_MTIME
+            if process::ef_scan_for_izux(
+                uz.flavour,
+                ef,
+                true,
+                e.last_mod_dos_datetime,
+                Some(&mut z_utime),
+            ) & EB_UT_FL_MTIME
                 != 0 =>
         {
             fileio::localtime(uz, z_utime.mtime)
@@ -296,8 +301,13 @@ pub(crate) fn get_time_stamp(uz: &mut Uz, last_modtime: &mut i64, nmember: &mut 
             let mut z_utime = IzTimes::default();
             let ut = match &e.extra {
                 Some(ef) => {
-                    process::ef_scan_for_izux(ef, true, e.last_mod_dos_datetime, Some(&mut z_utime))
-                        & EB_UT_FL_MTIME
+                    process::ef_scan_for_izux(
+                        uz.flavour,
+                        ef,
+                        true,
+                        e.last_mod_dos_datetime,
+                        Some(&mut z_utime),
+                    ) & EB_UT_FL_MTIME
                         != 0
                 }
                 None => false,

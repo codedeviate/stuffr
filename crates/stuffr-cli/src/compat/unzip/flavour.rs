@@ -27,6 +27,56 @@
 //! `memcpy()` for non-overlapping runs), which writes the same bytes: no
 //! observable effect (Tasks 4 and 5 probed their C drivers built both ways,
 //! identical output).
+//!
+//! Ubuntu's patch series (`debian/patches/series`), in its order, each
+//! where it acts (`// ubuntu: <patch>` at the site) or why it has none:
+//! - `01-manpages-in-section-1-not-in-section-1l`: man pages only.
+//! - `02-this-is-debian-unzip`: the banner, [`unzip_banner`] and
+//!   [`unzip_banner_rest`] (deviation 2's form of it).
+//! - `03-include-unistd-for-kfreebsd`: a build fix (an `#include`); Apple's
+//!   tree has it too.
+//! - `04-handle-pkware-verification-bit`, `06-initialize-the-symlink-flag`,
+//!   `07-increase-size-of-cfactorstr`, `08-allow-greater-hostver-values`,
+//!   `09-cve-2014-8139-crc-overflow`, `10-cve-2014-8140-test-compr-eb`,
+//!   `11-cve-2014-8141-getzip64data`: already in Apple's tree in the same
+//!   form, so ported for both flavours by Tasks 8-10 (`process.rs`,
+//!   `list.rs`, `zipinfo/short.rs`, `extract/extra.rs`).
+//! - `05-fix-uid-gid-handling`: code only `IZ_HAVE_UXUIDGID` builds, ported
+//!   in its patched form (`process::ef_scan_for_izux_owner`).
+//! - `12-cve-2014-9636-test-compr-eb`: [`cve_2014_9636_stored_size`].
+//! - `13-remove-build-date`: [`compiled_with`].
+//! - `14-cve-2015-7696`: [`cve_2015_7696_short_header`].
+//! - `15-cve-2015-7697`, `25-cve-2019-13232-fix-bug-in-uzbunzip2`: in
+//!   `UZbunzip2()`, which only Ubuntu builds (`extract::member::bunzip2`,
+//!   Task 13).
+//! - `16-fix-integer-underflow-csiz-decrypted`: [`csize_below_header_refused`].
+//! - `17-restore-unix-timestamps-accurately`: [`izunix_keeps_times`].
+//! - `18-cve-2014-9913-unzip-buffer-overflow`,
+//!   `19-cve-2016-9844-zipinfo-buffer-overflow`: both flavours print the
+//!   patched form, Apple's being undefined behaviour (rulings T8-1, T9-2).
+//! - `20-unzip60-alt-iconv-utf8`: [`iconv_charsets`] (`-O`/`-I`,
+//!   `unix::charset`, deviation 5).
+//! - `20-cve-2018-1000035-unzip-buffer-overflow`: the password prompt's
+//!   length check (`fileio::passw_prompt`, ruling T11-5).
+//! - `21-fix-warning-messages-on-big-files`: [`makeint64_reads_byte_5`].
+//! - `22-cve-2019-13232-fix-bug-in-undefer-input`:
+//!   [`cve_2019_13232_undefer_input`].
+//! - `23-cve-2019-13232-zip-bomb-with-overlapped-entries`:
+//!   [`detects_overlapped_entries`] (`extract::cover`, `PK_BOMB`) and
+//!   [`skips_data_descriptor`].
+//! - `24-cve-2019-13232-do-not-raise-alert-for-misplaced-central-directory`:
+//!   the end records' spans (`process::Ecrec::ec_start` and its siblings),
+//!   read by [`detects_overlapped_entries`]'s cover.
+//! - `26-cve-2019-13232-fix-bug-in-uzinflate`: in `UZinflate()`, the
+//!   `USE_ZLIB` path Ubuntu does not build (its `DEFINES` have no
+//!   `USE_ZLIB`): no effect.
+//! - `27-zipgrep-avoid-test-errors`: the `zipgrep` script only, which this
+//!   family does not provide.
+//! - `28-cve-2022-0529-and-cve-2022-0530`, `CVE-2021-4217`: code only
+//!   `UNICODE_SUPPORT` builds, ported in its patched form
+//!   (`process::unicode`, `fileio::unicode_name`, Task 13).
+//! - `handle_windows_zip64`: [`handle_windows_zip64`].
+//! - `29-fix-troff-warning`: man pages only.
 
 /// Which reference the family behaves as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,22 +216,27 @@ pub(crate) fn no_working_isprint(f: Flavour) -> bool {
     f == Flavour::Ubuntu
 }
 
+/// `17-restore-unix-timestamps-accurately.patch`, Ubuntu only: an
+/// `EF_IZUNIX2` (`Ux`) block no longer drops the times an earlier
+/// `EF_IZUNIX`/`EF_PKUNIX` (`UX`) block gave, and an `EF_IZUNIX3` (`ux`)
+/// block no longer drops a `UT` block's: each now clears only an earlier
+/// block's owner (`flags &= 0x0ff`, where upstream's cleared `~0x0ff`).
+pub(crate) fn izunix_keeps_times(f: Flavour) -> bool {
+    f == Flavour::Ubuntu
+}
+
 /// `21-fix-warning-messages-on-big-files.patch`, Ubuntu only:
 /// `makeint64()` reads byte 5 of a 64-bit field, which upstream's (and
 /// Apple's) leaves out.
-///
-/// Pass-through until Task 14: Apple's answer (`false`) for both.
-pub(crate) fn makeint64_reads_byte_5(_f: Flavour) -> bool {
-    false
+pub(crate) fn makeint64_reads_byte_5(f: Flavour) -> bool {
+    f == Flavour::Ubuntu
 }
 
 /// `handle_windows_zip64.patch`, Ubuntu only: `find_ecrec64()` takes a
 /// Zip64 locator whose disk count is 0 (as Windows writes it) as no
 /// contradiction of the classic record's disk number.
-///
-/// Pass-through until Task 14: Apple's answer (`false`) for both.
-pub(crate) fn handle_windows_zip64(_f: Flavour) -> bool {
-    false
+pub(crate) fn handle_windows_zip64(f: Flavour) -> bool {
+    f == Flavour::Ubuntu
 }
 
 /// unzpriv.h's `FILNAMSIZ`, the platform's `PATH_MAX`: the longest name

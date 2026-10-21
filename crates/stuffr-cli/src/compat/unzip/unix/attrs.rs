@@ -178,11 +178,16 @@ pub(crate) fn get_extattribs(uz: &Uz, ex: &Ex) -> (IzTimes, Option<[u64; 2]>) {
     // ubuntu: -DIZ_HAVE_UXUIDGID (`flavour::iz_have_uxuidgid`): the
     // scan reads the owner (and a `ux` block then drops earlier times),
     // whether or not `-X` asks for it, as the C passes `z_uidgid` always.
-    let owner = flavour::iz_have_uxuidgid(uz.flavour).then_some((&mut ug, uz.flavour));
+    let owner = flavour::iz_have_uxuidgid(uz.flavour).then_some(&mut ug);
     let flags = match ex.extra_field.as_deref() {
-        Some(ef) => {
-            super::super::process::ef_scan_for_izux_owner(ef, false, dos, Some(&mut z), owner)
-        }
+        Some(ef) => super::super::process::ef_scan_for_izux_owner(
+            uz.flavour,
+            ef,
+            false,
+            dos,
+            Some(&mut z),
+            owner,
+        ),
         None => 0,
     };
     if flags & EB_UT_FL_MTIME == 0 {

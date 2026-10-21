@@ -463,10 +463,10 @@ pub(super) fn zi_time(uz: &Uz, datetimez: u32, modtimez: Option<i64>, clock: Clo
 
 /// The entry's `UT` modification time from its central extra field, if it
 /// has one (`ef_scan_for_izux(..., 1, ...) & EB_UT_FL_MTIME`).
-pub(super) fn ut_mtime(e: &CentralEntry) -> Option<i64> {
+pub(super) fn ut_mtime(f: super::Flavour, e: &CentralEntry) -> Option<i64> {
     let ef = e.extra.as_deref()?;
     let mut z_utime = process::IzTimes::default();
-    let flags = process::ef_scan_for_izux(ef, true, e.last_mod_dos_datetime, Some(&mut z_utime));
+    let flags = process::ef_scan_for_izux(f, ef, true, e.last_mod_dos_datetime, Some(&mut z_utime));
     (flags & process::EB_UT_FL_MTIME != 0).then_some(z_utime.mtime)
 }
 

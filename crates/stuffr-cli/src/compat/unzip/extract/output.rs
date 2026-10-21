@@ -123,8 +123,13 @@ pub(crate) fn check_for_newer(uz: &mut Uz, ex: &Ex, filename: &[u8]) -> i32 {
     let st_mtime = mtime_of(&st);
     let mut z = IzTimes::default();
     let ut = ex.extra_field.as_deref().is_some_and(|ef| {
-        process::ef_scan_for_izux(ef, false, uz.lrec.last_mod_dos_datetime, Some(&mut z))
-            & EB_UT_FL_MTIME
+        process::ef_scan_for_izux(
+            uz.flavour,
+            ef,
+            false,
+            uz.lrec.last_mod_dos_datetime,
+            Some(&mut z),
+        ) & EB_UT_FL_MTIME
             != 0
     });
     let (existing, archive) = if ut {

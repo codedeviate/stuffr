@@ -224,34 +224,101 @@ fn unix_times_from_the_extra_field() {
     };
     let mut z = IzTimes::default();
     // Central: the modification time only.
-    let f = ef_scan_for_izux(&ut(7, &[1_600_000_000, 2, 3]), true, 0, Some(&mut z));
+    let f = ef_scan_for_izux(
+        Flavour::Apple,
+        &ut(7, &[1_600_000_000, 2, 3]),
+        true,
+        0,
+        Some(&mut z),
+    );
     assert_eq!((f, z.mtime, z.atime), (7, 1_600_000_000, 0));
     // Local: all three.
     let mut z = IzTimes::default();
-    let f = ef_scan_for_izux(&ut(7, &[1_600_000_000, 2, 3]), false, 0, Some(&mut z));
+    let f = ef_scan_for_izux(
+        Flavour::Apple,
+        &ut(7, &[1_600_000_000, 2, 3]),
+        false,
+        0,
+        Some(&mut z),
+    );
     assert_eq!((f, z.mtime, z.atime, z.ctime), (7, 1_600_000_000, 2, 3));
     // The top bit set: kept only when the DOS time says 2038 or later.
     let mut z = IzTimes::default();
     assert_eq!(
-        ef_scan_for_izux(&ut(1, &[0x9000_0000]), true, 0, Some(&mut z)),
+        ef_scan_for_izux(
+            Flavour::Apple,
+            &ut(1, &[0x9000_0000]),
+            true,
+            0,
+            Some(&mut z)
+        ),
         0
     );
-    let f = ef_scan_for_izux(&ut(1, &[0x9000_0000]), true, 0x7500_0000, Some(&mut z));
+    let f = ef_scan_for_izux(
+        Flavour::Apple,
+        &ut(1, &[0x9000_0000]),
+        true,
+        0x7500_0000,
+        Some(&mut z),
+    );
     assert_eq!((f, z.mtime), (1, 0x9000_0000));
     // A time that is not there.
-    assert_eq!(ef_scan_for_izux(&ut(1, &[]), true, 0, Some(&mut z)), 0);
+    assert_eq!(
+        ef_scan_for_izux(Flavour::Apple, &ut(1, &[]), true, 0, Some(&mut z)),
+        0
+    );
     // An old IZUNIX block after an EF_TIME one is ignored; before it, the
     // EF_TIME block's flags replace its own.
     let ux = |m: u32, a: u32| [&b"UX\x08\x00"[..], &a.to_le_bytes(), &m.to_le_bytes()].concat();
     let mut z = IzTimes::default();
     let both = [ut(1, &[100]), ux(200, 300)].concat();
-    assert_eq!(ef_scan_for_izux(&both, true, 0, Some(&mut z)), 1);
+    assert_eq!(
+        ef_scan_for_izux(Flavour::Apple, &both, true, 0, Some(&mut z)),
+        1
+    );
     assert_eq!(z.mtime, 100);
     let mut z = IzTimes::default();
-    assert_eq!(ef_scan_for_izux(&ux(200, 300), true, 0, Some(&mut z)), 3);
+    assert_eq!(
+        ef_scan_for_izux(Flavour::Apple, &ux(200, 300), true, 0, Some(&mut z)),
+        3
+    );
     assert_eq!((z.mtime, z.atime), (200, 300));
     // No storage asked for: nothing.
-    assert_eq!(ef_scan_for_izux(&ut(1, &[5]), true, 0, None), 0);
+    assert_eq!(
+        ef_scan_for_izux(Flavour::Apple, &ut(1, &[5]), true, 0, None),
+        0
+    );
+
+    // 17-restore-unix-timestamps-accurately.patch: a `Ux` block after an
+    // old `UX` one drops its times on Apple (upstream), not on Ubuntu; a
+    // `ux` block after a `UT` one drops the times only where the owner is
+    // read (Ubuntu's IZ_HAVE_UXUIDGID without the patch).
+    let ux2 = b"Ux\x04\x00\xe8\x03\xe8\x03";
+    let old_then_ux2 = [&ux(200, 300)[..], ux2].concat();
+    let mut z = IzTimes::default();
+    assert_eq!(
+        ef_scan_for_izux(Flavour::Apple, &old_then_ux2, true, 0, Some(&mut z)),
+        0
+    );
+    let mut z = IzTimes::default();
+    assert_eq!(
+        ef_scan_for_izux(Flavour::Ubuntu, &old_then_ux2, true, 0, Some(&mut z)),
+        3
+    );
+    assert_eq!((z.mtime, z.atime), (200, 300));
+    let ux3 = b"ux\x0b\x00\x01\x04\xe8\x03\x00\x00\x04\xe8\x03\x00\x00";
+    let ut_then_ux3 = [&ut(1, &[100])[..], ux3].concat();
+    let mut ug = [0u64; 2];
+    let mut z = IzTimes::default();
+    let f = ef_scan_for_izux_owner(
+        Flavour::Ubuntu,
+        &ut_then_ux3,
+        false,
+        0,
+        Some(&mut z),
+        Some(&mut ug),
+    );
+    assert_eq!((f, z.mtime, ug), (1 | EB_UX2_VALID, 100, [1000, 1000]));
 }
 
 #[test]
@@ -287,7 +354,6 @@ fn includes_and_excludes() {
 /// without an owner to fill.
 #[test]
 fn the_owner_comes_from_ux_blocks() {
-    use super::super::Flavour;
     let block = |id: u16, data: &[u8]| {
         let mut v = id.to_le_bytes().to_vec();
         v.extend_from_slice(&(data.len() as u16).to_le_bytes());
@@ -297,7 +363,7 @@ fn the_owner_comes_from_ux_blocks() {
     let scan = |ef: &[u8]| {
         let mut z = IzTimes::default();
         let mut ug = [7u64, 7];
-        let f = ef_scan_for_izux_owner(ef, false, 0, Some(&mut z), Some((&mut ug, Flavour::Apple)));
+        let f = ef_scan_for_izux_owner(Flavour::Apple, ef, false, 0, Some(&mut z), Some(&mut ug));
         (f & EB_UX2_VALID != 0, ug)
     };
     assert_eq!(
@@ -322,6 +388,12 @@ fn the_owner_comes_from_ux_blocks() {
     ux.extend_from_slice(&[0xe8, 3, 0xf4, 1]);
     assert_eq!(scan(&block(0x5855, &ux)), (true, [1000, 500]));
     let mut z = IzTimes::default();
-    let f = ef_scan_for_izux(&block(0x7855, &[0xe8, 3, 0xf4, 1]), false, 0, Some(&mut z));
+    let f = ef_scan_for_izux(
+        Flavour::Apple,
+        &block(0x7855, &[0xe8, 3, 0xf4, 1]),
+        false,
+        0,
+        Some(&mut z),
+    );
     assert_eq!(f & EB_UX2_VALID, 0);
 }

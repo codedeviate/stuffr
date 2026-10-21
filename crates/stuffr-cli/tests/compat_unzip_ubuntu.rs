@@ -1258,6 +1258,103 @@ mod linux {
         ]
     }
 
+    /// 17-restore-unix-timestamps-accurately's inputs: `UT`, `ux`, `Ux` and
+    /// old `UX` blocks in each order, locally and in the central directory.
+    fn times_zip() -> Vec<u8> {
+        let ut = block(
+            0x5455,
+            &[&[1u8][..], &1_500_000_000u32.to_le_bytes()].concat(),
+        );
+        let ux3 = block(
+            0x7875,
+            &[
+                &[1u8, 4][..],
+                &1000u32.to_le_bytes(),
+                &[4],
+                &1000u32.to_le_bytes(),
+            ]
+            .concat(),
+        );
+        let ux2 = block(
+            0x7855,
+            &[&1000u16.to_le_bytes()[..], &1000u16.to_le_bytes()].concat(),
+        );
+        let old = |owner: bool| {
+            let mut d = [
+                1_400_000_000u32.to_le_bytes(),
+                1_300_000_000u32.to_le_bytes(),
+            ]
+            .concat();
+            if owner {
+                d.extend_from_slice(&[0xe8, 3, 0xe8, 3]);
+            }
+            block(0x5855, &d)
+        };
+        let (old_full, old_short) = (old(true), old(false));
+        let cat = |a: &[u8], b: &[u8]| [a, b].concat();
+        let blocks = [
+            cat(&ut, &ux3),
+            cat(&ux3, &ut),
+            cat(&old_full, &ux2),
+            cat(&old_full, &ux3),
+            cat(&ux2, &old_full),
+            cat(&ut, &ux2),
+            old_full.clone(),
+            cat(&old_short, &ux3),
+            cat(&ux3, &ux2),
+            cat(&ux2, &ux3),
+        ];
+        let names: [&[u8]; 10] = [
+            b"ut_ux.txt",
+            b"ux_ut.txt",
+            b"old_Ux.txt",
+            b"old_ux.txt",
+            b"Ux_old.txt",
+            b"ut_Ux.txt",
+            b"old.txt",
+            b"oldshort_ux.txt",
+            b"ux_Ux.txt",
+            b"Ux_ux.txt",
+        ];
+        let entries: Vec<ZipEntrySpec> = names
+            .iter()
+            .zip(&blocks)
+            .map(|(n, b)| with_extra(n, b"1", b))
+            .collect();
+        zip_with(&entries, b"", b"")
+    }
+
+    /// 21-fix-warning-messages-on-big-files's inputs: Zip64 sizes with byte
+    /// 5 set, in the local and the central header alike.
+    fn byte5_zip() -> Vec<u8> {
+        let sizes =
+            |us: u64, cs: u64| block(0x0001, &[us.to_le_bytes(), cs.to_le_bytes()].concat());
+        let (a, b) = (
+            sizes(0x0000_0100_0000_0001, 1),
+            sizes(1, 0x0000_0300_0000_0001),
+        );
+        let mut z = zip_with(
+            &[
+                with_extra(b"a.txt", b"x", &a),
+                with_extra(b"b.txt", b"y", &b),
+            ],
+            b"",
+            b"",
+        );
+        // the classic fields defer to the extra field: ucsize of a, both of b
+        let la = 30 + 5 + a.len() + 1;
+        put_u32(&mut z, 22, 0xffff_ffff);
+        put_u32(&mut z, la + 18, 0xffff_ffff);
+        put_u32(&mut z, la + 22, 0xffff_ffff);
+        let eocd = z.len() - 22;
+        let cd = u32::from_le_bytes(z[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        put_u32(&mut z, cd + 24, 0xffff_ffff);
+        let cb = cd + 46 + 5 + a.len();
+        put_u32(&mut z, cb + 20, 0xffff_ffff);
+        put_u32(&mut z, cb + 24, 0xffff_ffff);
+        z
+    }
+
     /// Ubuntu's patch series (Task 14), against its binary, one group per
     /// patch or set of patches. The probes behind each are in
     /// `.claude/rules/compat.md`, "Task 14 probes".
@@ -1380,5 +1477,45 @@ mod linux {
             cases.push(case("zipinfo", args, &files, &[]));
         }
         check("20-unzip60-alt-iconv-utf8", &cases);
+
+        // the rest: 17 (times), 21 (byte 5), handle_windows_zip64 (a Zip64
+        // locator counting 0 disks), and 04 and 08 (in Apple's tree too)
+        let pkw = |iattr_bit: bool| ZipEntrySpec {
+            version_made_by: 0x0014,
+            external_attr: 0x00ab_0021,
+            ..ZipEntrySpec::new(if iattr_bit { b"v.txt" } else { b"w.txt" }, b"x")
+        };
+        let mut pkw_zip = zip_with(&[pkw(true), pkw(false)], b"", b"");
+        let eocd = pkw_zip.len() - 22;
+        let cd = u32::from_le_bytes(pkw_zip[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        pkw_zip[cd + 36] = 4; // internal attributes bit 2: PKWARE verification
+        let big_ver = ZipEntrySpec {
+            version_made_by: 0x03ff,
+            ..ZipEntrySpec::new(b"v255.txt", b"x")
+        };
+        let files = vec![
+            ("times.zip", times_zip()),
+            ("byte5.zip", byte5_zip()),
+            ("z64_d0.zip", zip64_zip(0, None)),
+            ("z64_d1.zip", zip64_zip(1, None)),
+            ("z64_d2.zip", zip64_zip(2, None)),
+            ("pkw.zip", pkw_zip),
+            ("ver.zip", zip_with(&[big_ver], b"", b"")),
+        ];
+        let mut cases = Vec::new();
+        for (z, _) in &files {
+            for op in [&["-l"][..], &["-v"], &["-t"], &[], &["-X"]] {
+                let mut args = op.to_vec();
+                args.push(z);
+                cases.push(case("unzip", &args, &files, &[]));
+            }
+            for op in [&["-l"][..], &["-v"], &["-T"]] {
+                let mut args = op.to_vec();
+                args.push(z);
+                cases.push(case("zipinfo", &args, &files, &[]));
+            }
+        }
+        cases.push(case("unzip", &["-T", "times.zip"], &files, &[]));
+        check("17, 21, handle_windows_zip64, 04, 08", &cases);
     }
 }

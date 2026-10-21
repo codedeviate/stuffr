@@ -412,7 +412,7 @@ pub(super) fn zi_short(uz: &mut Uz, e: &CentralEntry) -> i32 {
 
     // For printing of date & time, the C reuses `attribs` (16 bytes,
     // enough for every format here).
-    let z_modtim = super::ut_mtime(e);
+    let z_modtim = super::ut_mtime(uz.flavour, e);
     let time = zi_time(uz, e.last_mod_dos_datetime, z_modtim, Clock::Local);
     uz.info_fmt(0, m::ZI_SHORT_TAIL, &[&methbuf, &time]);
     fileio::fnprint(uz);

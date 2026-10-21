@@ -122,7 +122,7 @@ pub(super) fn zi_long(
     let dos = e.last_mod_dos_datetime;
     let t = zi_time(uz, dos, None, Clock::Local);
     uz.info_fmt(0, m::FILE_MOD_DATE, &[&t]);
-    if let Some(mtime) = ut_mtime(e) {
+    if let Some(mtime) = ut_mtime(uz.flavour, e) {
         // signal "show local time"
         let t = zi_time(uz, dos, Some(mtime), Clock::Local);
         uz.info_fmt(0, m::UT_FILE_MOD_DATE, &[&t, m::LOCAL_TIME.as_bytes()]);

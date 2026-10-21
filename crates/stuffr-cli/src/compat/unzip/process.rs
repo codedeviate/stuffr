@@ -1026,15 +1026,17 @@ pub(crate) fn selected(
 /// only when the DOS time says 2038 or later (`time_t` is 64-bit).
 /// ubuntu: -DIZ_HAVE_UXUIDGID adds the owner fields, and
 /// 17-restore-unix-timestamps-accurately.patch changes which earlier flags
-/// an `EF_IZUNIX2`/`EF_IZUNIX3` block clears (Task 14). A listing asks for
-/// no owner, so neither shows in one but the patch's.
+/// an `EF_IZUNIX2`/`EF_IZUNIX3` block clears
+/// (`flavour::izunix_keeps_times`). A listing asks for no owner, so only
+/// the patch shows in one.
 pub(crate) fn ef_scan_for_izux(
+    f: flavour::Flavour,
     ef: &[u8],
     ef_is_c: bool,
     dos_mdatetime: u32,
     z_utim: Option<&mut IzTimes>,
 ) -> u32 {
-    ef_scan_for_izux_owner(ef, ef_is_c, dos_mdatetime, z_utim, None)
+    ef_scan_for_izux_owner(f, ef, ef_is_c, dos_mdatetime, z_utim, None)
 }
 
 /// unzpriv.h's `EB_UX2_VALID`: [`ef_scan_for_izux_owner`] found the owner.
@@ -1063,12 +1065,15 @@ fn read_ux3_value(f: flavour::Flavour, b: &[u8], size: usize) -> Option<u64> {
 /// the C read past it; here the owner is then not taken. A size other than
 /// 2, 4 or 8 leaves the C's (uninitialised) value: 0 here.
 pub(crate) fn ef_scan_for_izux_owner(
+    f: flavour::Flavour,
     ef: &[u8],
     ef_is_c: bool,
     dos_mdatetime: u32,
     z_utim: Option<&mut IzTimes>,
-    mut owner: Option<(&mut [u64; 2], flavour::Flavour)>,
+    mut owner: Option<&mut [u64; 2]>,
 ) -> u32 {
+    // ubuntu: 17-restore-unix-timestamps-accurately.patch
+    let keeps_times = flavour::izunix_keeps_times(f);
     let mut flags: u32 = 0;
     let mut have_new_type_eb = 0;
     let mut ut_zip_unzip_compatible = false;
@@ -1153,14 +1158,23 @@ pub(crate) fn ef_scan_for_izux_owner(
                 }
             }
             EF_IZUNIX2 => {
-                if have_new_type_eb == 0 {
+                if keeps_times {
+                    // ubuntu: 17-restore-unix-timestamps-accurately.patch
+                    if have_new_type_eb == 0 {
+                        have_new_type_eb = 1;
+                    }
+                    if have_new_type_eb <= 1 {
+                        // Ignore any prior (EF_IZUNIX/EF_PKUNIX) UID/GID.
+                        flags &= 0x0ff;
+                    }
+                } else if have_new_type_eb == 0 {
                     flags &= !0x0ff; // ignore any previous IZUNIX field
                     have_new_type_eb = 1;
                 }
                 // IZUNIX3 overrides IZUNIX2 e.f. block !
                 if have_new_type_eb <= 1
                     && eb_len == EB_UX2_MINLEN
-                    && let Some((ug, _)) = owner.as_mut()
+                    && let Some(ug) = owner.as_mut()
                 {
                     ug[0] = u64::from(fileio::makeword(data));
                     ug[1] = u64::from(fileio::makeword(&data[2..]));
@@ -1170,13 +1184,21 @@ pub(crate) fn ef_scan_for_izux_owner(
             EF_IZUNIX3 => {
                 // new 3rd generation Unix ef
                 have_new_type_eb = 2;
+                if keeps_times {
+                    // ubuntu: 17-restore-unix-timestamps-accurately.patch:
+                    // ignore any prior EF_IZUNIX/EF_PKUNIX/EF_IZUNIX2
+                    // UID/GID.
+                    flags &= 0x0ff;
+                }
                 if eb_len >= EB_UX3_MINLEN
                     && data[0] == 1
-                    && let Some((ug, f)) = owner.as_mut()
+                    && let Some(ug) = owner.as_mut()
                 {
                     // only know about version 1
                     let uid_size = usize::from(data[1]);
-                    flags &= !0x0ff; // ignore any previous UNIX field
+                    if !keeps_times {
+                        flags &= !0x0ff; // ignore any previous UNIX field
+                    }
                     let gid_at = uid_size + 2;
                     if let Some(&gid_size) = data.get(gid_at) {
                         let gid_size = usize::from(gid_size);
@@ -1184,8 +1206,8 @@ pub(crate) fn ef_scan_for_izux_owner(
                         let gid = data.get(gid_at + 1..gid_at + 1 + gid_size);
                         if let (Some(u), Some(g)) = (uid, gid)
                             && let (Some(u), Some(g)) = (
-                                read_ux3_value(*f, &pad8(u), uid_size),
-                                read_ux3_value(*f, &pad8(g), gid_size),
+                                read_ux3_value(f, &pad8(u), uid_size),
+                                read_ux3_value(f, &pad8(g), gid_size),
                             )
                         {
                             ug[0] = u;
@@ -1220,7 +1242,7 @@ pub(crate) fn ef_scan_for_izux_owner(
                         z_utim.atime = i_time;
                     }
                     if eb_len >= EB_UX_FULLSIZE
-                        && let Some((ug, _)) = owner.as_mut()
+                        && let Some(ug) = owner.as_mut()
                     {
                         ug[0] = u64::from(fileio::makeword(&data[EB_UX_UID..]));
                         ug[1] = u64::from(fileio::makeword(&data[EB_UX_GID..]));
