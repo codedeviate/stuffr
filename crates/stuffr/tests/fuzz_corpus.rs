@@ -3176,6 +3176,23 @@ fn empty_target_cpio_seed() -> Vec<u8> {
     c
 }
 
+/// A zip whose first entry is the DIRECTORY `sample/`, stored with legacy
+/// `method` (1 shrink, 6 implode) and declaring 32 MiB it never delivers,
+/// then a stored file (0.16.0 deep fuzz, `container`: `entry "sample/"
+/// declared 33554432 bytes but produced 0`). The legacy path must list it
+/// as the normal path does and refuse the missing bytes on read, exit 5.
+fn legacy_dir_zip_seed(method: u16) -> Vec<u8> {
+    let dir = ZipSeed {
+        method,
+        crc: 0,
+        ucsize: 0x0200_0000,
+        data: Vec::new(),
+        mode: 0o040_755,
+        ..ZipSeed::stored("sample/", b"")
+    };
+    unzip_zip(&[dir, ZipSeed::stored("sample/hello.txt", b"hello\n")])
+}
+
 /// Path-conflict tars (0.10.1): each archive contradicts itself on disk, the
 /// shapes `place_entry` turns into named skips and the `container` target's
 /// extract leg checks. `(file stem, bytes)`.
@@ -3280,6 +3297,16 @@ fn extra_container_seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
             empty_target_cpio_seed(),
         ),
         ("tar-escaped-names", "tar", escaped_name_tar_seed()),
+        (
+            "zip-shrink-dir-declared-size",
+            "zip",
+            legacy_dir_zip_seed(1),
+        ),
+        (
+            "zip-implode-dir-declared-size",
+            "zip",
+            legacy_dir_zip_seed(6),
+        ),
     ]
     .into_iter()
     .chain(
@@ -3888,6 +3915,23 @@ fn the_link_and_escape_seeds_read_as_what_they_claim() {
         "{esc:?}"
     );
     assert!(esc.iter().any(|m| m.name.contains('\0')), "{esc:?}");
+}
+
+/// The legacy-directory seeds (0.16.0 deep fuzz) list their directory as a
+/// directory of its declared size, under the legacy method's codec.
+#[test]
+fn the_legacy_directory_seeds_read_as_what_they_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    for (method, codec) in [(1, "shrink"), (6, "implode")] {
+        let p = dir.path().join(format!("{codec}.zip"));
+        std::fs::write(&p, legacy_dir_zip_seed(method)).unwrap();
+        let metas = entries::list(Input::Path(p), 0, None).unwrap().0;
+        assert_eq!(metas.len(), 2, "{metas:?}");
+        assert_eq!(metas[0].name, "sample/");
+        assert_eq!(metas[0].kind, stuffr_core::EntryKind::Dir);
+        assert_eq!(metas[0].size, Some(0x0200_0000));
+        assert_eq!(metas[0].codec, Some(FormatId::new(codec)));
+    }
 }
 
 /// Writes the REAL seed corpus the fuzz targets read from, under

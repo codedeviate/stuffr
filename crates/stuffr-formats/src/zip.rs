@@ -145,7 +145,9 @@
 //! decoded whole in memory (declared sizes capped at
 //! `MAX_LEGACY_ENTRY_BYTES`, exit 6), and its CRC-32 checked; a decode
 //! failure or a CRC mismatch is `Error::Corrupt` (exit 5). On a forward-only
-//! pipe they stay refused, and salvage does not decode them. **A shrink or
+//! pipe they stay refused, and salvage does not decode them. A directory
+//! entry is never decoded: it lists with its declared size, and a size it
+//! does not deliver is exit 5 on read, as for every other method. **A shrink or
 //! implode entry whose mode says symlink is read as a regular file holding
 //! its target as contents**, as every entry is from a pipe: the legacy path
 //! never upgrades the kind, and no fidelity note names it (`FidelityReport`
@@ -1464,8 +1466,13 @@ impl ZipIndexed {
             };
             (meta, params)
         };
+        // A directory has no payload to decode, but keeps its declared size
+        // and the normal path's length check: a directory declaring bytes it
+        // never delivers is refused on read (exit 5), as `entry_at`'s
+        // `EntryPayload` refuses it for every other method.
         if meta.kind == EntryKind::Dir {
-            return Ok(Entry::new(meta, Box::new(io::empty())));
+            let payload = EntryPayload::new(io::empty(), meta.size, &meta.name);
+            return Ok(Entry::new(meta, Box::new(payload)));
         }
         for (what, n) in [
             ("compressed", params.csize),
@@ -5309,5 +5316,68 @@ z.close()\n";
     #[should_panic(expected = "no reference `this-binary-does-not-exist-xyz` tool found on PATH")]
     fn require_bin_panics_rather_than_skips_silently() {
         require_bin("this-binary-does-not-exist-xyz");
+    }
+
+    /// `hand_built_zip`'s one entry, re-stored with `method` in both its
+    /// local and its central header (the payload is left as given).
+    fn hand_built_with_method(name: &str, declared: u32, method: u16) -> Vec<u8> {
+        let mut bytes = hand_built_zip(name, 0, 0, declared, b"");
+        let cd = 30 + name.len();
+        bytes[8..10].copy_from_slice(&method.to_le_bytes());
+        bytes[cd + 10..cd + 12].copy_from_slice(&method.to_le_bytes());
+        bytes
+    }
+
+    /// What the first entry of `bytes` lists as, and what reading its
+    /// payload gives: the bytes, or the error's exit code.
+    fn list_and_read_first(bytes: &[u8]) -> (EntryMeta, std::result::Result<usize, i32>) {
+        let mut ar = open_seekable(bytes);
+        let mut e = ar.next_entry().unwrap().expect("an entry");
+        let meta = e.meta().clone();
+        let mut data = Vec::new();
+        let read = e
+            .reader()
+            .read_to_end(&mut data)
+            .map_err(|err| Error::from_decode_io(err).exit_code());
+        (meta, read)
+    }
+
+    /// 0.16.0 deep fuzz (`container`, `entry "sample/" declared 33554432
+    /// bytes but produced 0`): a shrink or implode DIRECTORY entry declaring
+    /// a size. The normal path lists it as a `Dir` of its declared size and
+    /// refuses the missing payload on read (exit 5); the legacy path must
+    /// agree on all three, for any declared size, rather than hand back an
+    /// empty reader under a size it never delivers.
+    #[test]
+    fn a_legacy_directory_entry_lists_and_reads_as_the_normal_path_does() {
+        for declared in [0x0200_0000u32, 1, 0] {
+            let (stored, stored_read) =
+                list_and_read_first(&hand_built_with_method("sample/", declared, 0));
+            assert_eq!(stored.kind, EntryKind::Dir);
+            assert_eq!(stored.size, Some(u64::from(declared)));
+            assert_eq!(stored_read, if declared == 0 { Ok(0) } else { Err(5) });
+            for method in [1u16, 6] {
+                let (legacy, legacy_read) =
+                    list_and_read_first(&hand_built_with_method("sample/", declared, method));
+                let what = format!("method {method}, declared {declared}");
+                assert_eq!(legacy.kind, stored.kind, "{what}");
+                assert_eq!(legacy.size, stored.size, "{what}");
+                assert_eq!(legacy_read, stored_read, "{what}");
+            }
+        }
+    }
+
+    /// A shrink or implode FILE entry that decodes to fewer bytes than it
+    /// declares is refused on read (exit 5), never a short success:
+    /// `decode_legacy` compares the decoded length with the declared one
+    /// exactly, before the CRC-32.
+    #[test]
+    fn a_short_legacy_file_entry_is_corrupt() {
+        for method in [1u16, 6] {
+            let (meta, read) = list_and_read_first(&hand_built_with_method("f.txt", 10, method));
+            assert_eq!(meta.kind, EntryKind::File);
+            assert_eq!(meta.size, Some(10));
+            assert_eq!(read, Err(5), "method {method}");
+        }
     }
 }
