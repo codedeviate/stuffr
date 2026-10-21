@@ -3678,8 +3678,9 @@ mod unix {
     /// Review Focus 1: `lz4cat big.lz4 | head` and `lz4 -c big | head` end
     /// stuffr by SIGPIPE with nothing said. The reference races here (its
     /// writing thread and the signal; probed 2026-10-16): it dies by
-    /// SIGPIPE, sometimes after printing its write error, and under load it
-    /// sometimes exits with that error instead (`Error 38` / `Error 70`).
+    /// SIGPIPE, sometimes after printing its write error or a start of it,
+    /// and under load it sometimes exits with that error instead (`Error
+    /// 38` / `Error 70`).
     /// Each of those is accepted from the reference; stuffr's answer is the
     /// first, always.
     #[test]
@@ -3710,8 +3711,10 @@ mod unix {
         ] {
             let (theirs, their_err) = closed_pipe(&reference, name, args, &work);
             let code = msg[6..8].parse::<i32>().unwrap();
-            let raced = theirs.signal() == Some(libc::SIGPIPE)
-                && (their_err.is_empty() || their_err == msg);
+            // Killed by SIGPIPE, the reference may have printed nothing,
+            // the whole message or any start of it (it can die mid-write:
+            // `msg` without its trailing " \n").
+            let raced = theirs.signal() == Some(libc::SIGPIPE) && msg.starts_with(&*their_err);
             let answered = theirs.code() == Some(code) && their_err == msg;
             assert!(
                 raced || answered,
