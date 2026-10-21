@@ -1794,7 +1794,7 @@ fn run_unzip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]) {
         unzip::Flavour::Apple
     };
     let before = tree_contents(dir);
-    let started = SystemTime::now();
+    let floor = ctime_floor(dir);
     let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
     let (code, out, err, reads) =
         compat::run_in_counted(dir, name, os_args, stdin, Flavour::Gnu, flavour)
@@ -1828,8 +1828,25 @@ fn run_unzip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]) {
          {OUTPUT_BUDGET}-byte budget",
         out.len()
     );
-    check_unzip_links(dir, name, flavour, args, &before, started);
+    check_unzip_links(dir, name, flavour, args, &before, floor);
     check_unzip_cwd(dir, name, args);
+}
+
+/// The ctime floor of a run: the ctime of a stamp file created (and
+/// removed) in the sandbox parent just before it. A ctime from the
+/// filesystem's own clock, not `SystemTime::now()`: Linux stamps ctime from
+/// the coarse clock (`current_time`), so a write within one tick of a
+/// fine-grained `now()` reads as before it (1,995 of 2,000 writes on
+/// overlayfs, 1,989 on tmpfs, measured in Docker; 0 on APFS). Compared with
+/// `>=`, a write in the stamp's own tick still counts. `i128::MIN` (judge
+/// everything) if the stamp cannot be made.
+fn ctime_floor(dir: &Path) -> i128 {
+    let stamp = dir.with_file_name(".ctime-stamp");
+    let floor = std::fs::write(&stamp, b"")
+        .and_then(|()| std::fs::symlink_metadata(&stamp))
+        .map_or(i128::MIN, |m| ctime_ns(&m));
+    let _ = std::fs::remove_file(&stamp);
+    floor
 }
 
 /// When a path was last changed, as nanoseconds since the epoch: its
@@ -1854,6 +1871,8 @@ fn ctime_ns(meta: &std::fs::Metadata) -> i128 {
 ///   the run. The directory's own ctime is not judged: the system's
 ///   temporary directory above the sandbox changes under other processes.
 ///
+/// "Before the run" is `ctime_floor`'s stamp, from the filesystem's clock.
+///
 /// A write through a link to an existing outside file or directory is the
 /// escape the resolve-beneath walk (`compat::unzip`'s `unix/beneath.rs`,
 /// both flavours, deviation 3) refuses; the containment walk, which sees
@@ -1864,7 +1883,7 @@ fn check_unzip_links(
     flavour: unzip::Flavour,
     args: &[&str],
     before: &BTreeMap<PathBuf, Vec<u8>>,
-    started: SystemTime,
+    floor: i128,
 ) {
     let links = symlinks_under(dir);
     if links.is_empty() {
@@ -1873,11 +1892,17 @@ fn check_unzip_links(
     let Ok(real_dir) = std::fs::canonicalize(dir) else {
         return;
     };
-    let started = started
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as i128);
     let names: Vec<&[u8]> = before.values().flat_map(|b| central_names(b)).collect();
-    let changed = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| ctime_ns(&m) >= started);
+    // Only regular files and directories: a device's ctime (`/dev/tty`,
+    // `/dev/fd/N`) moves with use, not with a write through the link. And
+    // never the run's directory, its ancestors or anything inside it (`m ->
+    // ..` with a name `m/run` builds the run's directory itself), which
+    // the run changes by right and the containment walk judges.
+    let changed = |p: &Path| {
+        !(real_dir.starts_with(p) || p.starts_with(&real_dir))
+            && std::fs::symlink_metadata(p)
+                .is_ok_and(|m| (m.is_file() || m.is_dir()) && ctime_ns(&m) >= floor)
+    };
     for link in links {
         let Ok(target) = std::fs::canonicalize(&link) else {
             continue;

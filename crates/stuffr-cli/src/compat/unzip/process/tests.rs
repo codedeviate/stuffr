@@ -476,11 +476,21 @@ fn a_one_block_archive_is_read_in_passes_not_per_entry() {
             let args: Vec<OsString> = args.iter().map(OsString::from).collect();
             let (code, _, err, reads) = run_in_counted(flavour, &d.0, name, &args, b"", &|_| None);
             let r = reads[&d.0.join("a.zip")];
-            assert!(
-                code == 0 || (name == "funzip" && EXIT_CODES_APPLE.contains(&code)),
-                "{flavour:?} {name} {args:?}: exit {code}\n{}",
+            // Every mode exits 0 on this valid archive, funzip too: it
+            // writes the first entry and warns about the rest (measured,
+            // both flavours).
+            assert_eq!(
+                code,
+                0,
+                "{flavour:?} {name} {args:?}\n{}",
                 String::from_utf8_lossy(&err)
             );
+            if name == "funzip" {
+                assert_eq!(
+                    err, b"funzip warning: zipfile has more than one entry--rest ignored\n",
+                    "{flavour:?}"
+                );
+            }
             assert_eq!(r.opens, 1, "{flavour:?} {name} {args:?}");
             assert!(
                 r.bytes <= 4 * len,
