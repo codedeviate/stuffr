@@ -100,7 +100,11 @@ overnight mode: every core, as before. `make fuzz` adds
 `-rss_limit_mb=1024` in daytime (libFuzzer's default of 2048 under
 `FULL=1`), and `make compat-ubuntu` passes the same `--test-threads` into the
 container (it does not see the host's environment). Both modes run exactly
-the same tests: only concurrency differs. CI passes `FULL=1` to `make check`.
+the same tests: only concurrency (and the fuzz memory cap, which also sets
+libFuzzer's malloc limit to the same figure) differs. Daytime's
+`--test-threads` overrides a `RUST_TEST_THREADS` you have set, because the
+command-line option beats the environment; `FULL=1` passes no option, so it
+honours `RUST_TEST_THREADS`. CI passes `FULL=1` to `make check`.
 The `msrv` and `c-backed` jobs call `cargo test` directly, not through the
 Makefile, so they are already unlimited.
 
@@ -166,6 +170,39 @@ For the record, the slowest actual TEST is
 leg. That cost is deliberate and documented (an exhaustive 128-byte sweep
 over a pure-Rust codec in an unoptimised profile); it is not the thing to
 chase.
+
+### Temp folders: the leak check and the sweep
+
+Tests make scratch folders named `stuffr-*` in the temp directory, and a test
+that is killed or panics past its guard can leave one behind. Two things in
+`make check` deal with that (`scripts/tmp-leaks.sh`; `make tmp-leaks-selftest`
+tests the script itself).
+
+- **`leak-check` fails the gate.** `check` records the `stuffr-*` names
+  before the tests (`leak-snapshot`) and compares after both tiers. A name
+  that is new and whose pid is not a live process is a leak, reported as
+  `leaked temp folder: /path/stuffr-<kind>-<pid>-...`. Read it as: some test
+  of that kind, run by that pid, did not remove its scratch. Find the
+  creator with `grep -rn '"stuffr-<kind>' crates`, put the path under a
+  removing guard (`ScratchDir`, or a small `Drop` type), and delete the
+  folder by hand. A folder whose pid is alive belongs to another running
+  gate or fuzz run and is ignored.
+- **The sweep.** `check` always ends with `sweep-tmp` (also `make
+  sweep-tmp` by hand), which removes `stuffr-*` entries more than a day old
+  whose pid is not alive, and prints `swept N stale stuffr-* temp folders`
+  when it removed any. Symlinks are removed as links, never followed.
+
+Both use the same temp directory Rust's `std::env::temp_dir()` gives the
+tests: `$TMPDIR` when set and non-empty, else the per-user temp directory on
+macOS, else `/tmp`. It must be an absolute path.
+
+**Naming new scratch paths.** Use `stuffr-<kind>-<pid>-<rest>`. The pid is the
+first all-digit `-`-separated field, so the kind and anything before the pid
+must not be all digits, and the pid must be followed by `-`, not by `.ext`
+(`stuffr-lz4-1234-skippable-src.bin`, not `stuffr-lz4-skippable-1234.bin`).
+A name with no readable pid is never treated as live, so it is reported at
+once if it is left behind. A number such as a padding length goes after the
+pid, never before it.
 
 ## Commit messages
 

@@ -1670,8 +1670,9 @@ mod unix {
     #[test]
     fn default_threading_matches_on_a_large_input() {
         // 0.16.1: 32 MiB, was 48: still four 8 MiB jobs at level 3 (job log =
-        // window log 21 + 2), a job for every worker up to the default's cap
-        // of 4, so -T2/-T3 and the default still split it.
+        // window log 21 + 2). That is a job for every worker up to the
+        // default's cap of 4, so -T2 splits it into 4 jobs over 2 workers and
+        // -T3 into 4 jobs over 3 workers (it was 6 jobs over 3 at 48 MiB).
         let size = if EXACT { 32 << 20 } else { 8 << 20 };
         let big = super::compat_harness::text(size, 93);
         let cases = vec![

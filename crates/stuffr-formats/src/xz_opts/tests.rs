@@ -1357,10 +1357,11 @@ mod pure_tier {
 
     /// `b"tiny input"` as preset 9 writes it in `format`, made by the
     /// preset-0 encoder with the header's dictionary raised to preset 9's.
-    /// The bytes are preset 9's own (compared 2026-10-21: only the
-    /// dictionary field differs, and in `.xz` the Block Header CRC32), but
-    /// preset 9's match finder for its 64 MiB dictionary took this test to
-    /// about 680 MiB, and a decoder refusing at the header reads no more.
+    /// Only the header is preset 9's: the dictionary field and, in `.xz`, the
+    /// Block Header CRC32 (compared 2026-10-21 against what the preset-9
+    /// encoder writes). The rest is preset 0's. Preset 9's match finder for
+    /// its 64 MiB dictionary took this test to about 680 MiB, and a decoder
+    /// refusing at the header reads no more.
     fn tiny_input_at_preset_9(format: Format) -> Vec<u8> {
         let (zero, nine) = (
             Lzma::preset(0, false).unwrap(),
@@ -1400,7 +1401,7 @@ mod pure_tier {
     #[test]
     fn decoder_reports_memlimit() {
         let nine = Lzma::preset(9, false).unwrap();
-        // Preset 9's bytes without preset 9's encoder (see the helper).
+        // Preset 9's header without preset 9's encoder (see the helper).
         let packed = tiny_input_at_preset_9(Format::Xz);
         for threads in [1, 2] {
             let o = DecodeOptions {

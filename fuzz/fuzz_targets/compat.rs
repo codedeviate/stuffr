@@ -117,9 +117,11 @@
 //!   (`run_unzip`). Its tokens bring `a.zip` and `b.zip`, the seventeenth
 //!   and eighteenth `COMPAT_FILES` entries, on the third mask byte.
 //!
-//! **Memory under the xz names (Ruling P7).** libFuzzer's RSS limit
-//! (2 GiB by default) is the bound, and each verb stays inside it by a
-//! limit stuffr applies or by the token table:
+//! **Memory under the xz names (Ruling P7).** libFuzzer's RSS limit is the
+//! bound: 1 GiB in a daytime `make fuzz`, which passes `-rss_limit_mb=1024`
+//! (that flag also sets `-malloc_limit_mb` to the same figure), and the
+//! 2 GiB default under `FULL=1`. Each verb stays inside it by a limit
+//! stuffr applies or by the token table:
 //!
 //! - compress: the most memory a case can ask for is a preset's, `-9`/`-9e`
 //!   (a 64 MiB dictionary, about 674 MiB per encoder reserved); no token
@@ -127,7 +129,12 @@
 //!   more than the sandbox's two threads (`Hardware::SANDBOX`, R3). The
 //!   encoder's tables are allocated untouched and an input is at most
 //!   64 KiB, so only what the input reaches becomes resident: the seeds,
-//!   `-T0 -9` among them, peak at 296 MB.
+//!   `-T0 -9` among them, peak at 296 MB. That is why the 1 GiB daytime
+//!   limit still fits: two `-9` encoders reserve about 1348 MiB, but the
+//!   limit counts resident memory, not reserved, and 296 MB is well under
+//!   it. The malloc limit applies to one allocation, and no single one can
+//!   exceed the 674 MiB a whole encoder reserves. All seven targets passed
+//!   a daytime `make fuzz` at 1024.
 //! - decompress and test: the sandbox caps the decoder's memory limit at
 //!   256 MiB (`SANDBOX_DECODER_CAP`) whatever `--memlimit*` says, single-
 //!   and multi-threaded, so a header declaring a larger dictionary is
