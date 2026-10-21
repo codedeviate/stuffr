@@ -335,19 +335,35 @@ impl RawStream {
         input: &[u8],
         out: &mut [u8],
     ) -> std::result::Result<(usize, usize, bool), StreamError> {
+        let (consumed, produced, ret) = self.decompress_counted(input, out);
+        ret.map(|ended| (consumed, produced, ended))
+    }
+
+    /// One `BZ2_bzDecompress` call as [`decompress`](Self::decompress), with
+    /// what it consumed and produced reported whatever it returned:
+    /// `(consumed, produced, Ok(stream_ended) or the error)`. libbzip2
+    /// moves `next_in` and `next_out` on an error too, and a caller that
+    /// goes on after one (Info-ZIP unzip's `UZbunzip2()` does after a bad
+    /// magic) reads on from there.
+    pub fn decompress_counted(
+        &mut self,
+        input: &[u8],
+        out: &mut [u8],
+    ) -> (usize, usize, std::result::Result<bool, StreamError>) {
         use bzip2::Status;
         let (in0, out0) = (self.d.total_in(), self.d.total_out());
         let ret = self.d.decompress(input, out);
         let consumed = (self.d.total_in() - in0) as usize;
         let produced = (self.d.total_out() - out0) as usize;
-        match ret {
+        let ret = match ret {
             Err(bzip2::Error::DataMagic) => Err(StreamError::Magic),
             Err(bzip2::Error::Data) => Err(StreamError::Data),
             Err(_) => Err(StreamError::Unexpected),
             Ok(Status::MemNeeded) => Err(StreamError::Memory),
-            Ok(Status::StreamEnd) => Ok((consumed, produced, true)),
-            Ok(_) => Ok((consumed, produced, false)),
-        }
+            Ok(Status::StreamEnd) => Ok(true),
+            Ok(_) => Ok(false),
+        };
+        (consumed, produced, ret)
     }
 }
 
@@ -408,6 +424,21 @@ mod tests {
             raw.decompress(b"BZx9junk", &mut out),
             Err(StreamError::Magic)
         ));
+    }
+
+    /// `decompress_counted` reports what an erroring call consumed: a bad
+    /// magic is found at its third byte, which has been read (libbz2-rs-sys
+    /// reads up to 7 bytes ahead into its 64-bit bit buffer where C
+    /// libbzip2 reads a byte at a time, so the count is at least 3), and
+    /// nothing comes out.
+    #[test]
+    fn raw_stream_counts_what_an_erroring_call_consumed() {
+        let mut raw = RawStream::new();
+        let mut out = [0u8; 64];
+        let (c, p, r) = raw.decompress_counted(b"BZx9junk", &mut out);
+        assert!((3..=8).contains(&c), "consumed {c}");
+        assert_eq!(p, 0);
+        assert!(matches!(r, Err(StreamError::Magic)));
     }
 
     #[test]
