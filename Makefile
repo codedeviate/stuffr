@@ -6,6 +6,23 @@
 
 CARGO ?= cargo
 
+# Two modes. DAYTIME (the default) holds back: fewer test threads, a lower
+# libFuzzer RSS ceiling, and the same thread limit inside the Docker run, so
+# the gate stays gentle on a machine that is also running Docker and IDEs.
+# OVERNIGHT is `FULL=1`: every core, libFuzzer's default ceiling, as before.
+# Both modes run exactly the same tests; only concurrency differs. CI passes
+# FULL=1. TEST_THREADS is the daytime count (chosen by measurement, see
+# CONTRIBUTING.md "What the gate costs"); it is ignored under FULL=1.
+FULL ?=
+TEST_THREADS ?= 4
+ifeq ($(strip $(FULL)),)
+TEST_THREAD_ARGS = -- --test-threads=$(TEST_THREADS)
+FUZZ_RSS_ARGS = -rss_limit_mb=1024
+else
+TEST_THREAD_ARGS =
+FUZZ_RSS_ARGS =
+endif
+
 .PHONY: help check lint-latest deps-guard fmt fmt-check lint doc test test-pure release miri hooks clean fuzz-corpus fuzz compat-ubuntu sweep-tmp leak-snapshot leak-check tmp-leaks-selftest
 
 help:
@@ -19,6 +36,10 @@ help:
 	@echo '  make lint     clippy, all targets and features, warnings denied'
 	@echo '                (the workspace, and fuzz/ --locked)'
 	@echo '  make lint-latest  clippy on the newest installed stable (own target dir)'
+	@echo '                daytime by default: $(TEST_THREADS) test threads, fuzz -rss_limit_mb=1024,'
+	@echo '                and the same thread limit in compat-ubuntu'
+	@echo '  make check FULL=1  overnight mode: every core, libFuzzer default ceiling'
+	@echo '                (FULL=1 also works with test, test-pure, fuzz, compat-ubuntu)'
 	@echo '  make test     full test suite with all features'
 	@echo '  make test-pure  the default (pure) tier, where no C backend wins'
 	@echo '  make release  optimised build, plus the no-default-features check'
@@ -129,7 +150,7 @@ doc:
 	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --workspace --no-deps --all-features
 
 test:
-	$(CARGO) test --workspace --all-features
+	$(CARGO) test --workspace --all-features $(TEST_THREAD_ARGS)
 
 # Not redundant with `test`. Where a format has both a C and a pure backend,
 # registration is mutually exclusive and the C one wins, so `--all-features`
@@ -142,7 +163,7 @@ test:
 # different test set, not a subset: `test` covers the C backends, this covers
 # the pure selection, and neither contains the other.
 test-pure:
-	$(CARGO) test --workspace
+	$(CARGO) test --workspace $(TEST_THREAD_ARGS)
 
 # Clippy on the newest installed `stable`, with the gate's exact arguments, in
 # its own target dir so the pinned toolchain's cache is untouched. CI's
@@ -358,7 +379,7 @@ fuzz: fuzz-corpus
 	for target in codec container chain roundtrip salvage compat infozip; do \
 	  corpus=$$(find fuzz/corpus/$$target -type f 2>/dev/null | wc -l | tr -d ' '); \
 	  runs=$$((corpus + $(FUZZ_RUNS))); \
-	  cmd="cargo +nightly fuzz run $$target -- -runs=$$runs -seed=$(FUZZ_SEED)"; \
+	  cmd="cargo +nightly fuzz run $$target -- $(FUZZ_RSS_ARGS) -runs=$$runs -seed=$(FUZZ_SEED)"; \
 	  echo "==> $$cmd"; \
 	  tmp=$$(mktemp); \
 	  if ! $$cmd >"$$tmp" 2>&1; then \
@@ -460,6 +481,13 @@ fuzz-corpus:
 # stuffr-ubuntu-target stuffr-ubuntu-cargo-registry` starts clean.
 COMPAT_UBUNTU_IMAGE ?= stuffr-ubuntu-24.04
 COMPAT_UBUNTU_ARGS ?=
+# Daytime mode also limits the container's test threads (it ignores the
+# host's environment); FULL=1 lifts it. User args follow, so they can override.
+ifeq ($(strip $(FULL)),)
+COMPAT_UBUNTU_THREADS = --test-threads=$(TEST_THREADS)
+else
+COMPAT_UBUNTU_THREADS =
+endif
 COMPAT_UBUNTU_RUN = docker run --rm -e CI=1 \
 	  -v "$(CURDIR)":/src:ro \
 	  -v stuffr-ubuntu-cargo-registry:/home/oracle/.cargo/registry \
@@ -471,10 +499,10 @@ compat-ubuntu:
 	  --build-arg RUST_TOOLCHAIN=$$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml) \
 	  -t $(COMPAT_UBUNTU_IMAGE) tests/docker/ubuntu-24.04
 	$(COMPAT_UBUNTU_RUN) \
-	  cargo test --locked -p stuffr-cli --lib compat::unzip -- $(COMPAT_UBUNTU_ARGS)
+	  cargo test --locked -p stuffr-cli --lib compat::unzip -- $(COMPAT_UBUNTU_THREADS) $(COMPAT_UBUNTU_ARGS)
 	$(COMPAT_UBUNTU_RUN) \
 	  cargo test --locked -p stuffr-cli --test compat_unzip_ubuntu --test compat_unzip_common --test compat_unzip_safety \
-	    --test compat_unzip_tty --test compat_unzip_umask --test compat_unzip_harness_selftest -- $(COMPAT_UBUNTU_ARGS)
+	    --test compat_unzip_tty --test compat_unzip_umask --test compat_unzip_harness_selftest -- $(COMPAT_UBUNTU_THREADS) $(COMPAT_UBUNTU_ARGS)
 
 clean:
 	$(CARGO) clean

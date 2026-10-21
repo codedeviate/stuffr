@@ -87,6 +87,33 @@ Apple Silicon Mac right after `cargo clean`: **166 s** for the whole gate,
 3196 tests across both legs. Real test EXECUTION inside that is **96 s**
 (summed from libtest's own `finished in` figures).
 
+**Two modes (0.16.1).** `make check` is the daytime mode by default: it
+runs libtest with `--test-threads=4` (`TEST_THREADS`), so it is gentle on a
+laptop that is also running Docker and an IDE. `make check FULL=1` is the
+overnight mode: every core, as before. `make fuzz` adds
+`-rss_limit_mb=1024` in daytime (libFuzzer's default of 2048 under
+`FULL=1`), and `make compat-ubuntu` passes the same `--test-threads` into the
+container (it does not see the host's environment). Both modes run exactly
+the same tests: only concurrency differs. CI passes `FULL=1` to `make check`.
+The `msrv` and `c-backed` jobs call `cargo test` directly, not through the
+Makefile, so they are already unlimited.
+
+Measured 2026-10-21 on a 12-core, 18 GiB Apple Silicon Mac with Docker
+running, one full `make check` per row, back to back, warm build (swap was
+already near full, 6144 MiB total, so it could not grow much; read the swap
+columns as "no pressure difference", not as a ranking):
+
+| mode | wall | swap used: start / peak / end (MiB) | tests passed |
+|---|---|---|---|
+| `FULL=1` (12 threads) | 366 s | 5594 / 5594 / 5554 | 5798 |
+| `TEST_THREADS=2` | 460 s | 5554 / 5554 / 5482 | 5798 |
+| `TEST_THREADS=4` (default) | 376 s | 5474 / 5474 / 5402 | 5798 |
+| `TEST_THREADS=6` | 363 s | 5402 / 5402 / 5370 | 5798 |
+
+Four threads cost about 3% of wall time over `FULL=1`; two cost 26%. The
+choice of 4 is a tie-break (see the task report): no row grew swap, so
+swap could not separate them.
+
 **If the gate takes far longer, look at `target/debug/deps` first.** On
 macOS the dev profile's default `split-debuginfo=unpacked` leaves every
 build's `*.rcgu.o` object files beside the binaries, and cargo never prunes

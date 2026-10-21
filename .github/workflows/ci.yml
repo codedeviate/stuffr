@@ -113,7 +113,9 @@ jobs:
       #
       #   cargo +stable clippy --workspace --all-targets --all-features \
       #     --target x86_64-unknown-linux-gnu -- -D warnings
-      - run: make check
+      # FULL=1: the overnight mode, every core. Without it `make check` runs
+      # the gentler daytime mode (fewer test threads) meant for a laptop.
+      - run: make check FULL=1
 
   msrv:
     name: msrv (1.88)
