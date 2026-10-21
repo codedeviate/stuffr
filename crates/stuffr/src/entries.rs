@@ -6177,7 +6177,73 @@ impl Read for EntryPayload<'_> {
 }
 
 #[cfg(test)]
+mod scratch_dir {
+    use std::path::{Path, PathBuf};
+
+    /// A scratch directory that removes its tree when dropped, a panicking
+    /// test's unwind included, after restoring user write permission on
+    /// every directory under it. Derefs to the directory's path.
+    #[derive(Debug)]
+    pub(super) struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        pub(super) fn create(name: &str) -> Self {
+            let p = std::env::temp_dir().join(name);
+            Self::remove(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            ScratchDir(p)
+        }
+
+        /// Restores user rwx on directories (never following symlinks, and
+        /// leaving files alone), then removes the tree.
+        fn remove(p: &Path) {
+            #[cfg(unix)]
+            fn writable(p: &Path) {
+                use std::os::unix::fs::PermissionsExt;
+                let Ok(meta) = std::fs::symlink_metadata(p) else {
+                    return;
+                };
+                if !meta.is_dir() {
+                    return;
+                }
+                let mut perms = meta.permissions();
+                perms.set_mode(perms.mode() | 0o700);
+                let _ = std::fs::set_permissions(p, perms);
+                if let Ok(rd) = std::fs::read_dir(p) {
+                    for e in rd.flatten() {
+                        writable(&e.path());
+                    }
+                }
+            }
+            #[cfg(unix)]
+            writable(p);
+            let _ = std::fs::remove_dir_all(p);
+        }
+    }
+
+    impl std::ops::Deref for ScratchDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for ScratchDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            Self::remove(&self.0);
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::scratch_dir::ScratchDir;
     use super::*;
     use stuffr_core::{DEFAULT_MAX_RATIO, ReaderSource};
 
@@ -7214,12 +7280,8 @@ mod tests {
     }
 
     /// A fresh scratch directory for the hard-link unit tests below.
-    fn link_scratch(tag: &str) -> PathBuf {
-        let p =
-            std::env::temp_dir().join(format!("stuffr-entries-link-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    fn link_scratch(tag: &str) -> ScratchDir {
+        ScratchDir::create(&format!("stuffr-entries-link-{}-{tag}", std::process::id()))
     }
 
     fn link_meta(name: &str, target: &str) -> EntryMeta {
@@ -7528,7 +7590,7 @@ mod tests {
         let id = identity(&dest.join("t")).unwrap();
         assert_eq!(made.at.len(), 10_001);
         assert_eq!(made.spelled.len(), 1, "hard links are not indexed");
-        let key = (id.0, id.1, dest.clone(), fold_key("t"));
+        let key = (id.0, id.1, dest.to_path_buf(), fold_key("t"));
         assert_eq!(made.spelled[&key].len(), 1);
         // A lookup for a path that is not recorded exactly (it is a hard
         // link, so its own record is a Hardlink) finds no spelling.
@@ -7545,7 +7607,7 @@ mod tests {
         std::fs::write(dest.join("T"), b"x").unwrap();
         let mut made = MadeByRun::default();
         let id = identity(&dest.join("T")).unwrap();
-        let key = (id.0, id.1, dest.clone(), fold_key("t"));
+        let key = (id.0, id.1, dest.to_path_buf(), fold_key("t"));
         for n in ["Ta", "TA", "tA", "T"] {
             let p = dest.join(n);
             made.at.insert(
@@ -9697,6 +9759,7 @@ mod salvage_strict_tests {
 /// asserted is what lands in an archive, read back through `cat`.
 #[cfg(all(test, feature = "tar"))]
 mod convert_tests {
+    use super::scratch_dir::ScratchDir;
     use super::*;
 
     /// Entries as `(meta, payload)`, yielded in order.
@@ -9741,28 +9804,27 @@ mod convert_tests {
         }
     }
 
-    fn scratch() -> PathBuf {
+    fn scratch() -> ScratchDir {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let p = std::env::temp_dir().join(format!(
+        ScratchDir::create(&format!(
             "stuffr-convert-unit-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        p
+        ))
     }
 
     /// Converts `entries` into a tar at a fresh path under `budget` and
-    /// `spill`, returning the tar's path on success.
+    /// `spill`, returning the tar's path on success, with the guard that
+    /// removes it when dropped.
     fn convert(
         entries: Vec<(EntryMeta, Vec<u8>)>,
         budget: &mut ArchiveBudget,
         spill: &SpillPolicy,
-    ) -> Result<PathBuf> {
+    ) -> Result<(ScratchDir, PathBuf)> {
         let tar = FormatId::new("tar");
         let kind = crate::registry().require_container_writer(tar).unwrap();
-        let out = scratch().join("out.tar");
+        let dir = scratch();
+        let out = dir.join("out.tar");
         let file = std::fs::File::create(&out).unwrap();
         let mut archive = kind
             .create(PlainSink::new(Box::new(file)), &CreateOpts::default())
@@ -9778,7 +9840,7 @@ mod convert_tests {
             &mut LinkCache::new(CachePolicy::Off),
         )?;
         finish_target(archive)?;
-        Ok(out)
+        Ok((dir, out))
     }
 
     fn budget() -> ArchiveBudget {
@@ -9805,7 +9867,7 @@ mod convert_tests {
     #[test]
     fn an_entry_with_no_declared_size_is_buffered() {
         let big = bytes(64 * 1024);
-        let tar = convert(
+        let (_dir, tar) = convert(
             vec![
                 (file("unsized.bin", None), big.clone()),
                 (file("after.txt", Some(5)), b"after".to_vec()),
@@ -9832,7 +9894,7 @@ mod convert_tests {
     #[test]
     fn an_entry_past_the_memory_cap_spills_to_a_temp_file() {
         let big = bytes(64 * 1024);
-        let tar = convert(
+        let (_dir, tar) = convert(
             vec![(file("unsized.bin", None), big.clone())],
             &mut budget(),
             &SpillPolicy::Temp {

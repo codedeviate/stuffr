@@ -21,15 +21,14 @@ use stuffr::entries::{self, ExtractOpts, Selection};
 use stuffr::ops::{Input, Output};
 use stuffr::{EntryKind, EntryMeta, Error, Fidelity, FormatId};
 
+mod common;
+use common::ScratchDir;
+
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
-fn tmp_dir() -> PathBuf {
+fn tmp_dir() -> ScratchDir {
     let n = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-    let mut p = std::env::temp_dir();
-    p.push(format!("stuffr-extract-{}-{}", std::process::id(), n));
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).unwrap();
-    p
+    ScratchDir::create(&format!("stuffr-extract-{}-{}", std::process::id(), n))
 }
 
 /// One entry to write into a fixture archive.
@@ -1536,7 +1535,12 @@ fn an_over_long_final_name_under_a_new_parent_is_skipped_by_every_arm() {
 /// [`repeated_links_in_a_large_directory_stay_linear`] and its timed
 /// reproducer both extract (under `--force`).
 #[cfg(unix)]
-fn extract_many_repeated_links() -> (PathBuf, stuffr::ops::Outcome, std::time::Duration) {
+fn extract_many_repeated_links() -> (
+    ScratchDir,
+    PathBuf,
+    stuffr::ops::Outcome,
+    std::time::Duration,
+) {
     let root = tmp_dir();
     let names: Vec<String> = (0..2000).map(|i| format!("f{i}")).collect();
     let mut fixtures: Vec<Fixture<'_>> = names.iter().map(|n| file(n, b"x")).collect();
@@ -1547,7 +1551,7 @@ fn extract_many_repeated_links() -> (PathBuf, stuffr::ops::Outcome, std::time::D
 
     let started = std::time::Instant::now();
     let outcome = extract_with(&archive, &dest, true).unwrap();
-    (dest, outcome, started.elapsed())
+    (root, dest, outcome, started.elapsed())
 }
 
 /// Fix round 2, M3: 2,000 repeated `a -> b` entries under `--force`, beside
@@ -1559,7 +1563,7 @@ fn extract_many_repeated_links() -> (PathBuf, stuffr::ops::Outcome, std::time::D
 #[cfg(unix)]
 #[test]
 fn repeated_links_in_a_large_directory_stay_linear() {
-    let (dest, outcome, _) = extract_many_repeated_links();
+    let (_root, dest, outcome, _) = extract_many_repeated_links();
     assert!(
         outcome.fidelity.warnings.is_empty(),
         "{:?}",
@@ -1581,7 +1585,7 @@ fn repeated_links_in_a_large_directory_stay_linear() {
 #[test]
 #[ignore = "wall-clock bound; run on demand, not in the gate"]
 fn repeated_links_timing_reproducer() {
-    let (_, outcome, took) = extract_many_repeated_links();
+    let (_root, _, outcome, took) = extract_many_repeated_links();
     eprintln!("repeated_links_timing_reproducer: {took:?}");
     assert!(outcome.fidelity.warnings.is_empty());
     assert!(took < std::time::Duration::from_secs(5), "{took:?}");

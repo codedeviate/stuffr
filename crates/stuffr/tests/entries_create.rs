@@ -14,22 +14,20 @@
 //!    `Rung::Exact` with an empty list it carried before Phase 2c.
 #![cfg(feature = "tar")]
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use stuffr::entries;
 use stuffr::ops::{CompressOpts, Input, Output};
 use stuffr::{EntryKind, Fidelity, FormatId};
 
+mod common;
+use common::ScratchDir;
+
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
-fn tmp_dir() -> PathBuf {
+fn tmp_dir() -> ScratchDir {
     let n = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-    let mut p = std::env::temp_dir();
-    p.push(format!("stuffr-create-{}-{}", std::process::id(), n));
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).unwrap();
-    p
+    ScratchDir::create(&format!("stuffr-create-{}-{}", std::process::id(), n))
 }
 
 fn tar() -> FormatId {

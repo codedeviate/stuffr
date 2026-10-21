@@ -16,15 +16,14 @@ use stuffr::entries::{self, ExtractOpts, Selection};
 use stuffr::ops::Input;
 use stuffr::{EntryKind, EntryMeta, Error, FormatId};
 
+mod common;
+use common::ScratchDir;
+
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
-fn tmp_dir() -> PathBuf {
+fn tmp_dir() -> ScratchDir {
     let n = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-    let mut p = std::env::temp_dir();
-    p.push(format!("stuffr-extract-cpio-{}-{}", std::process::id(), n));
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).unwrap();
-    p
+    ScratchDir::create(&format!("stuffr-extract-cpio-{}-{}", std::process::id(), n))
 }
 
 /// Writes `entries` into a real `.cpio`, through the container API — the
