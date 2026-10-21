@@ -1239,7 +1239,7 @@ altered version be marked, which is why the banner lines name stuffr.
 Each ported function carries a `// port:` comment, each Apple change `//
 apple:`, each Ubuntu difference `// ubuntu:`, and each rule taken from the
 binary `// probe:`. The module doc of `compat/unzip/mod.rs` is the source of
-truth for the nine deviations; the README mirrors it. The shared decoders and
+truth for the ten deviations; the README mirrors it. The shared decoders and
 the crypt keys live in the doc-hidden `stuffr::infozip`. `make
 compat-ubuntu` runs the unzip suites against Ubuntu's unzip in Docker.
 

@@ -366,6 +366,24 @@ read list.
 > **2745** tests under `--all-features`, **2631** on the default tier —
 > measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
+> `0.16.0` is a MINOR that adds the unzip compatibility family: `unzip`
+> (and `unzip -Z`), `zipinfo` and `funzip`, ported from Info-ZIP UnZip 6.0
+> in two flavours — Apple's `/usr/bin/unzip` on macOS and the BSDs,
+> Ubuntu's `6.0-28ubuntu4.1` elsewhere, or as `STUFFR_UNZIP_FLAVOR` says.
+> stdout, stderr, exit codes and extracted trees (bytes, modes, times,
+> symlinks, quarantine) are identical wherever the reference's behaviour is
+> defined, on both tiers; the ten stated deviations are listed under "The
+> unzip family". Every extraction write stays beneath its root, in both
+> flavours. New decoders ported from Info-ZIP (inflate and deflate64,
+> explode, unshrink, traditional PKWARE decryption) also let `stuffr unpack`
+> read shrink and implode entries. `install-links` now makes twenty-five
+> names. Library API, all `#[doc(hidden)]`: `stuffr::infozip` is added, and
+> `bzip2_stream::RawStream` gains `decompress_counted`. A seventh fuzz
+> target, `infozip`, covers the new decoders. `LICENSE-infozip` (the
+> Info-ZIP licence) joins both crates' licence expressions.
+> **2948** tests under `--all-features`, **2834** on the default tier —
+> measured from this bump's own `make check`, `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
@@ -1489,7 +1507,9 @@ name leads the line). `unzip` reads `UNZIP` and `UNZIPOPT`, and `zipinfo` reads 
    modifications by Apple Inc.).` (Ubuntu: `(altered; Debian's build,
    original by Info-ZIP).`), and likewise for zipinfo and funzip. That line is
    wider than the pager's 80 columns, so under `-M` it counts as two screen
-   lines and `-Mh` pauses one text line earlier than the reference.
+   lines and `-Mh` pauses one text line earlier than the reference. `-v`'s
+   `Compiled with` line is the recorded reference build's (Apple: this
+   release's macOS build), so other macOS builds print a different one.
 3. **Pre-existing symlinks.** The Ubuntu flavour also stays beneath the
    extraction root, as Apple's does. On unix only: off unix (Windows) the
    walk (`unix/beneath.rs`'s `imp_std`) follows symlinks, so neither flavour
