@@ -9,6 +9,7 @@
 //! fuzz target all drive the same compatibility families (`bzip2` and
 //! friends) and `install-links`.
 
+pub mod bench;
 pub mod cli;
 pub mod compat;
 pub mod size;
