@@ -396,6 +396,19 @@ read list.
 > **2957** tests under `--all-features`, **2843** on the default tier —
 > measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
+> `0.17.0` is a MINOR that adds `stuffr bench`: compress your own files
+> with every codec this build can write and compare compressed size, ratio,
+> compression time and decompression time, then read the winners —
+> smallest, fastest to compress, fastest to decompress, and the best
+> balance of all three. Only codec work is timed (one stated exception: an
+> output too large for memory is written to disk), every format runs under
+> the same conditions (one thread unless `--threads`), and the input line
+> states them. `--levels` sweeps each codec's levels, `--per-file`
+> compresses each file on its own, `--repeat N` reports medians, and
+> `--json`, `--csv` and `--table-only` feed other programs. No library
+> change. **3027** tests under `--all-features`, **2913** on the default
+> tier — measured from this bump's own `make check`, `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
