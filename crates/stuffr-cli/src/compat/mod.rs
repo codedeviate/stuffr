@@ -18,8 +18,14 @@ pub mod unzip;
 pub mod xz;
 pub mod zstd;
 
+#[cfg(test)]
+pub(crate) use host::ARM_TEST_LOCK;
 #[doc(hidden)]
 pub use host::InputReads;
+#[cfg(all(test, unix))]
+pub(crate) use host::armed_path;
+/// The armed-temporary entry point `stuffr bench` shares with the families.
+pub(crate) use host::{CleanupGuard, create_armed};
 
 /// What [`run_in_counted`] returns: the exit code, standard output,
 /// standard error, and the inputs opened with what was read from each.

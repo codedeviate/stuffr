@@ -864,13 +864,7 @@ extern "C" fn on_stop_signal(_sig: libc::c_int) {
 /// `.stuffr-{family}-{pid}-{n}.tmp`; a name already taken moves on to the
 /// next `n`.
 pub(crate) fn create_temp(dir: &Path, family: &str) -> io::Result<(PathBuf, File)> {
-    let mut opts = File::options();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
+    let opts = private_new_file();
     for n in 0u32.. {
         let tmp = dir.join(format!(".stuffr-{family}-{}-{n}.tmp", std::process::id()));
         match opts.open(&tmp) {
@@ -881,6 +875,62 @@ pub(crate) fn create_temp(dir: &Path, family: &str) -> io::Result<(PathBuf, File
     }
     unreachable!("the loop returns")
 }
+
+/// Write-only, `create_new`, mode 0600 on unix: how every temporary here is
+/// opened.
+fn private_new_file() -> fs::OpenOptions {
+    let mut opts = File::options();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts
+}
+
+/// The signals that remove an armed temporary outside the compatibility
+/// families (`stuffr bench`'s compressed output): the three that end a run
+/// from the terminal or the system. SIGPIPE stays ignored (the native CLI
+/// answers a closed pipe itself), so it is not listed.
+#[cfg(unix)]
+const TEMP_SIGNALS: Signals = &[libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+#[cfg(not(unix))]
+const TEMP_SIGNALS: Signals = &[];
+
+/// Create `path` (write-only, `create_new`, mode 0600) and arm its removal
+/// on SIGINT, SIGTERM and SIGHUP, which then kill the process as
+/// [`arm_cleanup`] describes; the signals are held back between the create
+/// and the arm, as in [`create_temp_armed`]. For a stuffr temporary that is
+/// no compatibility family's output, so it takes no host or signal set: the
+/// host is the process itself. The caller names the file and removes it;
+/// dropping the guard only disarms.
+pub(crate) fn create_armed(path: &Path) -> io::Result<(File, CleanupGuard)> {
+    held_back(TEMP_SIGNALS, || {
+        private_new_file()
+            .open(path)
+            .map(|f| (f, arm_cleanup(&Host::Real, path, TEMP_SIGNALS)))
+    })
+}
+
+/// The path the cleanup handler would remove now, if one is armed.
+#[cfg(all(test, unix))]
+pub(crate) fn armed_path() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    if !ARMED.load(Ordering::Acquire) {
+        return None;
+    }
+    // SAFETY: `ARMED` true means the slot holds a NUL-terminated path; the
+    // tests that arm hold `ARM_TEST_LOCK`, so nothing rewrites it meanwhile.
+    let slot = unsafe { &*SLOT.0.get() };
+    let len = slot.iter().position(|&b| b == 0)?;
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&slot[..len])))
+}
+
+/// Held by every lib test that arms the cleanup in the test process itself
+/// (not in a forked child): the slot is process-wide, one arm at a time.
+#[cfg(test)]
+pub(crate) static ARM_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// `create_temp` and `arm_cleanup` with `signals` held back between them,
 /// so no signal can find the new temporary unarmed (GNU gzip blocks its
@@ -1898,6 +1948,7 @@ mod tests {
     #[test]
     fn arm_then_drop_disarms() {
         use std::os::unix::ffi::OsStrExt;
+        let _lock = ARM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch("arm");
         let file = dir.join("partial.xz");
         fs::write(&file, b"partial").unwrap();
