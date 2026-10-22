@@ -892,6 +892,10 @@ const COMPAT_SHAPES: &[&str] = &[
     "zstd-list-skippable-max",
     "zstd-list-cut",
     "zstd-list-gzip",
+    // 0.16.1 deep fuzz: a skippable frame ending one byte short of the end,
+    // so the header read meets the end of the file and the walk seeks back
+    // into the bytes it read (re-read once: 17 bytes of a 16-byte file).
+    "zstd-list-skippable-near-end",
     // The lz4 family (0.15.0 Task 3): one argument-surface seed per name,
     // so every name has a seed; Task 8 adds the coder's shapes.
     "lz4-help",
@@ -2066,6 +2070,11 @@ fn zstd_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> {
             false,
             &encoded(work, &text, "gzip", None)?,
         ),
+        "list-skippable-near-end" => {
+            let mut v = zstd_skippable(15, &[0; 7], None);
+            v.push(0xff);
+            z(&["-l", "a.zst"], &["a.zst"], false, &v)
+        }
         other => unreachable!("COMPAT_SHAPES lists an unhandled zstd shape {other:?}"),
     }))
 }

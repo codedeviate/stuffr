@@ -68,43 +68,91 @@ enum InfoError {
 /// of file flag, `fseek` and `ftell`. Reads go through a buffer, as stdio's
 /// `FILE*` does: an unbuffered walk of a file of many small blocks was
 /// 12-15x slower (0.14.0 review).
+///
+/// The buffer is this type's own, not a `BufReader`: a `BufReader` empties
+/// itself before asking the source for more, so a header read that met the
+/// end of the file lost its bytes, and the walk's seek back into them
+/// (`start + header_size`, `start + 8 + size`) read them again from the
+/// file (deep fuzz, 0.16.1: 17 bytes of a 16-byte file). Here the buffer is
+/// only appended to; when full it keeps its last [`FRAMEHEADERSIZE_MAX`]
+/// bytes, which every backward seek of the walk lands in. No byte is read
+/// from the source twice.
 struct Stream<'a, R: Read + Seek> {
-    inner: io::BufReader<&'a mut R>,
+    src: &'a mut R,
+    /// `buf[..filled]` holds the file's bytes from offset `base`; the
+    /// source's position is `base + filled`.
+    buf: Box<[u8]>,
+    base: u64,
+    filled: usize,
     pos: u64,
     eof: bool,
 }
 
-impl<R: Read + Seek> Stream<'_, R> {
+impl<'a, R: Read + Seek> Stream<'a, R> {
+    fn new(src: &'a mut R) -> Self {
+        Stream {
+            src,
+            buf: vec![0; 64 << 10].into_boxed_slice(),
+            base: 0,
+            filled: 0,
+            pos: 0,
+            eof: false,
+        }
+    }
+
+    /// More bytes from the source at `base + filled`, appended; a full
+    /// buffer first keeps only its tail. `Ok(0)` at the end of the file
+    /// leaves the buffered bytes as they were.
+    fn fill(&mut self) -> io::Result<usize> {
+        if self.filled == self.buf.len() {
+            let keep = FRAMEHEADERSIZE_MAX.min(self.filled);
+            self.buf.copy_within(self.filled - keep..self.filled, 0);
+            self.base += (self.filled - keep) as u64;
+            self.filled = keep;
+        }
+        let n = self.src.read(&mut self.buf[self.filled..])?;
+        self.filled += n;
+        Ok(n)
+    }
+
     /// `fread(buf, 1, buf.len(), f)`: the bytes read. A short read sets
     /// `eof` when the file ended (not when it failed).
     fn read(&mut self, buf: &mut [u8]) -> usize {
         let mut got = 0;
         while got < buf.len() {
-            match self.inner.read(&mut buf[got..]) {
+            // `pos` lies in `base..=base + filled` (`seek_to` keeps it so).
+            let at = usize::try_from(self.pos - self.base).unwrap_or(usize::MAX);
+            if at < self.filled {
+                let n = (self.filled - at).min(buf.len() - got);
+                buf[got..got + n].copy_from_slice(&self.buf[at..at + n]);
+                got += n;
+                self.pos += n as u64;
+                continue;
+            }
+            match self.fill() {
                 Ok(0) => {
                     self.eof = true;
                     break;
                 }
-                Ok(n) => got += n,
+                Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => break,
             }
         }
-        self.pos += got as u64;
         got
     }
 
     /// `fseek(f, to, SEEK_SET)`; clears the end of file flag. Seeking past
-    /// the end succeeds, as on a regular file.
+    /// the end succeeds, as on a regular file. A target inside the buffer
+    /// moves only the position.
     fn seek_to(&mut self, to: u64) -> bool {
-        // A relative seek keeps the buffer when the target lies inside it.
-        let by = i128::from(to) - i128::from(self.pos);
-        let ok = match i64::try_from(by) {
-            Ok(by) => self.inner.seek_relative(by).is_ok(),
-            Err(_) => self.inner.seek(SeekFrom::Start(to)).is_ok(),
-        };
-        if !ok {
-            return false;
+        let end = self.base + self.filled as u64;
+        if to < self.base || to > end {
+            if self.src.seek(SeekFrom::Start(to)).is_err() {
+                return false;
+            }
+            self.base = to;
+            self.filled = 0;
         }
         self.pos = to;
         self.eof = false;
@@ -135,11 +183,7 @@ fn analyze_frames<R: Read + Seek>(
     err: &mut dyn Write,
 ) -> InfoError {
     use InfoError::{FrameError, NotZstd, Success, Truncated};
-    let mut s = Stream {
-        inner: io::BufReader::with_capacity(64 << 10, src),
-        pos: 0,
-        eof: false,
-    };
+    let mut s = Stream::new(src);
     // Declared once, as in C: a short read leaves the rest as it was.
     let mut header = [0u8; FRAMEHEADERSIZE_MAX];
     loop {
@@ -629,6 +673,59 @@ mod tests {
         assert_eq!(st, InfoError::Success);
         assert_eq!(info.frames, 2000);
         assert!(src.reads < 200, "{} reads", src.reads);
+    }
+
+    /// `-l` reads no byte of a file twice, even where a header read meets
+    /// the end of the file and the walk then seeks back into those bytes
+    /// (deep-fuzz `compat`, 0.16.1: a skippable frame one byte short of
+    /// the end read 17 bytes of a 16-byte file).
+    #[test]
+    fn the_frame_walk_never_rereads_a_byte() {
+        struct Counting<R> {
+            inner: R,
+            bytes: usize,
+        }
+        impl<R: Read> Read for Counting<R> {
+            fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+                let n = self.inner.read(b)?;
+                self.bytes += n;
+                Ok(n)
+            }
+        }
+        impl<R: Seek> Seek for Counting<R> {
+            fn seek(&mut self, p: SeekFrom) -> io::Result<u64> {
+                self.inner.seek(p)
+            }
+        }
+        let small = hand(0x20, None, &[], &[2], &block(0, true, 2, b"ab"), &[]);
+        let mut tail_skip = skip(7);
+        tail_skip.push(0xff);
+        let mut two = hand(0x20, None, &[], &[200], &block(1, true, 200, b"x"), &[]);
+        two.extend(&small);
+        let mut long = skip(64 << 10);
+        long.extend(&small);
+        for (what, file) in [
+            ("a skippable frame one byte short of the end", tail_skip),
+            ("a one-frame file shorter than a header read", small.clone()),
+            ("a short last frame", two),
+            ("a short frame past the buffer's first fill", long),
+        ] {
+            let mut info = Info {
+                compressed: file.len() as u64,
+                ..Info::default()
+            };
+            let mut src = Counting {
+                inner: Cursor::new(&file),
+                bytes: 0,
+            };
+            analyze_frames(&mut info, &mut src, &Display::new(2), &mut Vec::new());
+            assert!(
+                src.bytes <= file.len(),
+                "{what}: read {} bytes of {}",
+                src.bytes,
+                file.len()
+            );
+        }
     }
 
     #[test]
