@@ -18,33 +18,40 @@ use stuffr::{Error, FormatKind};
 
 use crate::cli::BenchArgs;
 use levels::{benchable_codecs, levels_of};
-use measure::{Input, Mode, Plan, RealClock, load_input, measure, warm};
+use measure::{Input, Mode, Plan, RealClock, governor_for, load_input, measure, warm};
 use report::Conditions;
 use score::Row;
 
-/// The usage refusal for a debug build, printed verbatim.
-const DEBUG_REFUSAL: &str =
+/// The refusal `main` prints, verbatim, for [`Ran::RefusedDebugBuild`] (exit
+/// 2). Not an `Error::Usage`, whose display would prefix "usage error:".
+pub const DEBUG_REFUSAL: &str =
     "stuffr: bench: timings from a debug build are meaningless; build with --release";
+
+/// How a [`run`] that raised no error ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ran {
+    /// The rows ran and the report reached stdout.
+    Measured,
+    /// The arguments were valid, but this is a debug build, so nothing was
+    /// timed, written or created.
+    RefusedDebugBuild,
+}
 
 /// Runs `stuffr bench`. Usage problems are `Error::Usage` (exit 2); a format
 /// that fails is a failed row, never an error here.
-pub fn run(args: BenchArgs) -> stuffr::Result<()> {
+pub fn run(args: BenchArgs) -> stuffr::Result<Ran> {
     let paths = expand_inputs(&args.inputs)?;
     let codecs = chosen_codecs(&args.formats)?;
     let memory_limit = match &args.memory_limit {
         Some(s) => crate::size::parse_size(s).map_err(Error::Usage)?,
         None => stuffr::default_memory_limit(),
     };
-    // After validation, so a debug build still reports usage errors. Exits
-    // here rather than returning `Error::Usage`, whose display would prefix
-    // the message with "usage error:"; nothing has been written or created
-    // yet, so there is nothing to clean up.
+    // After validation, so a debug build still reports usage errors.
     if cfg!(debug_assertions) {
-        eprintln!("{DEBUG_REFUSAL}");
-        std::process::exit(2);
+        return Ok(Ran::RefusedDebugBuild);
     }
 
-    let input = load_input(&paths, memory_limit)?;
+    let (input, bytes_in) = load_input(&paths, memory_limit)?;
     warm(&input)?;
     let plan = Plan {
         mode: if args.per_file {
@@ -77,9 +84,11 @@ pub fn run(args: BenchArgs) -> stuffr::Result<()> {
 
     let conditions = Conditions {
         files: paths.len(),
-        bytes_in: total_bytes(&input)?,
+        bytes_in,
         mode: plan.mode,
         threads: plan.threads,
+        // The budget every row's encoder is given; no governor is one.
+        workers: governor_for(&plan).map_or(1, |g| g.workers()),
         repeat: plan.repeat,
         // zstd is the codec whose tier decides benchability: its pure-Rust
         // encoder is the weak fallback, so only the C tier benchmarks it.
@@ -101,7 +110,7 @@ pub fn run(args: BenchArgs) -> stuffr::Result<()> {
         report::human(&conditions, &rows, &mut out)?;
     }
     out.flush()?;
-    Ok(())
+    Ok(Ran::Measured)
 }
 
 /// The row-count progress meter on stderr: `[k/N] <format> <level>` before
@@ -191,8 +200,17 @@ fn why_not_benchable(name: &str) -> &'static str {
         .into_iter()
         .find(|r| r.id.as_str() == name);
     match row {
-        Some(r) if r.kind == FormatKind::Container => "container",
-        Some(r) if !r.write => "read-only",
+        Some(r) => why_not(r.kind, r.write),
+        None => why_not(FormatKind::Codec, true),
+    }
+}
+
+/// The reason, from the matrix facts: a container, a codec that cannot
+/// write, or (`benchable_codecs`' remaining filter) a weak encoder.
+fn why_not(kind: FormatKind, write: bool) -> &'static str {
+    match (kind, write) {
+        (FormatKind::Container, _) => "container",
+        (_, false) => "read-only",
         _ => "weak fallback encoder",
     }
 }
@@ -252,20 +270,6 @@ fn no_match(op: &str) -> Error {
 fn directory_error(path: &Path) -> Error {
     let p = path.display();
     Error::Usage(format!("{p} is a directory; name its files (e.g. {p}/*)"))
-}
-
-/// The input's total size in bytes.
-fn total_bytes(input: &Input) -> io::Result<u64> {
-    Ok(match input {
-        Input::Memory(parts) => parts.iter().map(|p| p.len() as u64).sum(),
-        Input::Files(paths) => {
-            let mut n = 0u64;
-            for p in paths {
-                n = n.saturating_add(std::fs::metadata(p)?.len());
-            }
-            n
-        }
-    })
 }
 
 #[cfg(test)]
@@ -412,13 +416,13 @@ mod tests {
     }
 
     #[test]
-    fn a_read_only_format_says_so() {
-        let ro = stuffr::registry()
-            .matrix()
-            .into_iter()
-            .find(|r| r.kind == FormatKind::Codec && !r.write);
-        if let Some(r) = ro {
-            assert_eq!(why_not_benchable(r.id.as_str()), "read-only");
-        }
+    fn the_reason_follows_the_matrix_facts() {
+        // No codec in today's builds is read-only, so the classifier is
+        // tested on the facts rather than on a registered format.
+        assert_eq!(why_not(FormatKind::Container, true), "container");
+        assert_eq!(why_not(FormatKind::Container, false), "container");
+        assert_eq!(why_not(FormatKind::Codec, false), "read-only");
+        assert_eq!(why_not(FormatKind::Codec, true), "weak fallback encoder");
+        assert_eq!(why_not_benchable("tar"), "container");
     }
 }

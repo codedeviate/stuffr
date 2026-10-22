@@ -19,7 +19,10 @@ pub struct Conditions {
     pub files: usize,
     pub bytes_in: u64,
     pub mode: Mode,
+    /// `--threads` as given.
     pub threads: Option<usize>,
+    /// The worker budget that setting resolved to (1 without `--threads`).
+    pub workers: usize,
     pub repeat: u32,
     pub tier: &'static str,
     pub streamed: bool,
@@ -68,11 +71,12 @@ fn name_of(row: &Row) -> String {
     }
 }
 
-fn threads_text(threads: Option<usize>) -> String {
+/// The resolved worker budget; `(auto)` when `--threads 0` chose it.
+fn threads_text(threads: Option<usize>, workers: usize) -> String {
+    let unit = if workers == 1 { "thread" } else { "threads" };
     match threads {
-        None | Some(1) => "1 thread".into(),
-        Some(0) => "auto threads".into(),
-        Some(n) => format!("{n} threads"),
+        Some(0) => format!("{workers} {unit} (auto)"),
+        _ => format!("{workers} {unit}"),
     }
 }
 
@@ -87,7 +91,7 @@ fn input_line(c: &Conditions) -> String {
         "input: {} {files}, {} · {mode} · {} · {} · {} {runs}{}",
         c.files,
         size_text(c.bytes_in),
-        threads_text(c.threads),
+        threads_text(c.threads, c.workers),
         c.tier,
         c.repeat,
         if c.streamed {
@@ -259,6 +263,7 @@ pub fn json(c: &Conditions, rows: &[Row], out: &mut dyn Write) -> io::Result<()>
             "bytes_in": c.bytes_in,
             "mode": match c.mode { Mode::OneStream => "one-stream", Mode::PerFile => "per-file" },
             "threads": c.threads,
+            "workers": c.workers,
             "repeat": c.repeat,
             "tier": c.tier,
             "streamed": c.streamed,
@@ -349,6 +354,7 @@ mod tests {
             bytes_in: 412 * MIB,
             mode: Mode::OneStream,
             threads: None,
+            workers: 1,
             repeat: 1,
             tier: "pure",
             streamed: false,
@@ -430,6 +436,24 @@ mod tests {
         let got = render(|o| human(&cond(), &rows, o));
         assert!(got.ends_with("\nno format succeeded\n"), "{got}");
         assert!(!got.contains("smallest"));
+    }
+
+    #[test]
+    fn the_input_line_shows_the_resolved_worker_count() {
+        assert_eq!(threads_text(None, 1), "1 thread");
+        assert_eq!(threads_text(Some(1), 1), "1 thread");
+        assert_eq!(threads_text(Some(4), 4), "4 threads");
+        assert_eq!(threads_text(Some(0), 8), "8 threads (auto)");
+        let c = Conditions {
+            threads: Some(0),
+            workers: 8,
+            ..cond()
+        };
+        assert!(input_line(&c).contains(" · 8 threads (auto) · "));
+        let j = render(|o| json(&c, &[], o));
+        let v: Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(v["conditions"]["threads"], 0);
+        assert_eq!(v["conditions"]["workers"], 8);
     }
 
     #[test]

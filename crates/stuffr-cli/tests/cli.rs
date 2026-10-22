@@ -15750,7 +15750,11 @@ fn bench_refuses_a_debug_build() {
     std::fs::write(&f, b"hello bench\n").unwrap();
     let (code, err) = bench_err(&["bench", f.to_str().unwrap()]);
     assert_eq!(code, Some(2), "{err}");
-    assert!(err.contains("build with --release"), "{err}");
+    assert_eq!(
+        err,
+        "stuffr: bench: timings from a debug build are meaningless; build with --release\n"
+    );
+    assert!(!err.contains("usage error"), "{err}");
 }
 
 #[test]

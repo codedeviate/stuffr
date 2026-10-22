@@ -1305,12 +1305,14 @@ BENCHMARKING FORMATS ON YOUR OWN DATA
       code. Timings from a debug build mean nothing, so bench refuses to
       run in one (exit 2): build with --release.
 
-  stuffr bench --levels --formats zstd,xz access.log
+  stuffr bench --levels --formats xz,brotli access.log
       --formats limits the run to the named formats; a container, a
       read-only format or one this build only has a weak fallback encoder
-      for is refused (exit 2) with the reason. --levels runs every level of
-      each format instead of the default only; lz4 and snappy have no
-      levels and keep their one row.
+      for is refused (exit 2) with the reason. zstd can be benchmarked only
+      in a --features c-backed build: the pure tier's zstd encoder is a
+      weak fallback. --levels runs every level of each format instead of
+      the default only; lz4 and snappy have no levels and keep their one
+      row.
 
   stuffr bench --per-file a.log b.log
       --per-file compresses each file as its own stream and sums the
@@ -1490,8 +1492,9 @@ PARALLEL ENCODE FLAGS
       count already granted produces. Passing --threads 0 asks stuffr to
       auto-detect a worker count
       instead, trading that byte-for-byte reproducibility for speed.
-      --threads exists only on pack; multi-threaded decode is out of scope
-      for this phase, and unpack/cat refuse the flag outright rather than
+      --threads is an encode flag (pack, convert, bench); multi-threaded
+      decode is out of scope for this phase, and unpack/cat refuse the flag
+      outright rather than
       silently accepting and ignoring it — see
       "threads_is_not_offered_on_decode_subcommands" if you want the
       enforcement in test form.

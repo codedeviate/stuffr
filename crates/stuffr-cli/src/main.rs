@@ -674,7 +674,21 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             Ok(())
         }
         Command::Formats => print_formats(),
-        Command::Bench(args) => stuffr_cli::bench::run(args),
+        Command::Bench(args) => {
+            use stuffr_cli::bench::{DEBUG_REFUSAL, Ran};
+            match stuffr_cli::bench::run(args)? {
+                Ran::Measured => Ok(()),
+                // Exit 2 with the refusal verbatim, not through `Error`,
+                // whose usage display would prefix "usage error:". Nothing
+                // has reached stdout and no temp file exists, so exiting
+                // here skips nothing (as `Salvage` below exits with its
+                // bucket code).
+                Ran::RefusedDebugBuild => {
+                    eprintln!("{DEBUG_REFUSAL}");
+                    std::process::exit(2)
+                }
+            }
+        }
         Command::InstallLinks {
             dir,
             names,

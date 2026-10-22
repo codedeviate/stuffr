@@ -98,16 +98,21 @@ pub struct Plan {
 /// Loads `paths` into memory when their total size is at most half of
 /// `memory_limit`, leaving room for the compressed copy; otherwise the input
 /// is streamed from the files.
-pub fn load_input(paths: &[PathBuf], memory_limit: u64) -> io::Result<Input> {
+///
+/// Also returns the input's size, measured here once: the bytes read into
+/// memory, or the files' sizes when streamed. It is the ratio's denominator,
+/// so a file still growing while the rows run does not change it.
+pub fn load_input(paths: &[PathBuf], memory_limit: u64) -> io::Result<(Input, u64)> {
     let mut total = 0u64;
     for p in paths {
         total = total.saturating_add(fs::metadata(p)?.len());
     }
     if total > memory_limit / 2 {
-        return Ok(Input::Files(paths.to_vec()));
+        return Ok((Input::Files(paths.to_vec()), total));
     }
-    let parts = paths.iter().map(fs::read).collect::<io::Result<_>>()?;
-    Ok(Input::Memory(parts))
+    let parts: Vec<Vec<u8>> = paths.iter().map(fs::read).collect::<io::Result<_>>()?;
+    let read = parts.iter().map(|b| b.len() as u64).sum();
+    Ok((Input::Memory(parts), read))
 }
 
 /// One untimed read of every file, so the first timed run does not pay for
@@ -667,7 +672,7 @@ mod tests {
         let s = Scratch::new();
         // Two chunks: 64 KiB, then 36 KiB.
         let paths = vec![s.file("a", &text(100 * 1024, 6))];
-        let files = load_input(&paths, 0).unwrap();
+        let files = load_input(&paths, 0).unwrap().0;
         let mut clock = FakeClock(0);
         let m = ok(measure(
             "gzip",
@@ -781,10 +786,10 @@ mod tests {
         let s = Scratch::new();
         let (a, b) = (text(32 * 1024, 2), text(32 * 1024, 9));
         let paths = vec![s.file("a", &a), s.file("b", &b)];
-        let files = load_input(&paths, 0).unwrap();
+        let files = load_input(&paths, 0).unwrap().0;
         assert!(matches!(files, Input::Files(_)));
         warm(&files).unwrap();
-        let memory = load_input(&paths, 1 << 30).unwrap();
+        let memory = load_input(&paths, 1 << 30).unwrap().0;
         assert!(matches!(memory, Input::Memory(_)));
         for mode in [Mode::OneStream, Mode::PerFile] {
             let p = plan(mode, 1);
@@ -803,7 +808,7 @@ mod tests {
         let _lock = armed_lock();
         let s = Scratch::new();
         let paths = vec![s.file("a", &text(16 * 1024, 4))];
-        let files = load_input(&paths, 0).unwrap();
+        let files = load_input(&paths, 0).unwrap().0;
         run("gzip", &files, &plan(Mode::OneStream, 2));
         assert_eq!(bench_temps(), Vec::<String>::new());
     }
@@ -863,8 +868,8 @@ mod tests {
         let _lock = armed_lock();
         let s = Scratch::new();
         let paths = vec![s.file("a", &text(8 * 1024, 5)), s.file("b", &text(4096, 8))];
-        let files = load_input(&paths, 0).unwrap();
-        let memory = load_input(&paths, 1 << 30).unwrap();
+        let files = load_input(&paths, 0).unwrap().0;
+        let memory = load_input(&paths, 1 << 30).unwrap().0;
         for mode in [Mode::OneStream, Mode::PerFile] {
             for codec in crate::bench::levels::benchable_codecs() {
                 for input in [&files, &memory] {
@@ -879,9 +884,14 @@ mod tests {
         let s = Scratch::new();
         let paths = vec![s.file("a", &[1; 100]), s.file("b", &[2; 100])];
         match load_input(&paths, 400).unwrap() {
-            Input::Memory(parts) => assert_eq!(parts, vec![vec![1; 100], vec![2; 100]]),
-            Input::Files(_) => panic!("200 bytes fit in 400 / 2"),
+            (Input::Memory(parts), 200) => {
+                assert_eq!(parts, vec![vec![1; 100], vec![2; 100]])
+            }
+            other => panic!("200 bytes fit in 400 / 2: {other:?}"),
         }
-        assert!(matches!(load_input(&paths, 399).unwrap(), Input::Files(_)));
+        assert!(matches!(
+            load_input(&paths, 399).unwrap(),
+            (Input::Files(_), 200)
+        ));
     }
 }
