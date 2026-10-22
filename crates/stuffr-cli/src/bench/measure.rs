@@ -15,9 +15,18 @@
 //! `finish`); decompression is still one region, the decoder's own reads of
 //! the compressed temp file being part of decoding.
 //!
-//! Both destinations have the same shape: a 64 KiB `BufWriter` over a `Vec`
-//! in memory, or over the temp file when streamed, so a codec that writes in
-//! small pieces pays the same in either mode.
+//! The compressed output stays in memory whenever its worst case (input +
+//! 1/8 + 1 KiB, the same test for every codec) fits under half of
+//! `--memory-limit`, streamed input included; only past that does it go to
+//! one temp file. Both destinations have the same shape: a 64 KiB
+//! `BufWriter` over a pre-reserved `Vec`, or over the temp file, so a codec
+//! that writes in small pieces pays the same either way. Decoding reads the
+//! same shape back: the `Vec` as a seekable, sized source, or the temp file
+//! through a 64 KiB `BufReader`, so a decoder that reads a byte at a time
+//! (LZW's) costs a memory copy per byte, not a system call.
+//!
+//! Each file's length is taken once, when the input is loaded; every later
+//! read stops there, so a file still being written is benched as it was.
 //!
 //! bench ignores STUFFR_THREADS; threads come only from --threads.
 //!
@@ -27,14 +36,14 @@
 //! one. In memory there are no such gaps.
 
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use stuffr::ops::{CompressOpts, resolved_budget};
-use stuffr::source::{FileSource, SeekRead, Source, SourceCaps};
+use stuffr::source::{GuardedSeek, SeekRead, Source, SourceCaps};
 use stuffr::{Codec, DecodeOpts, EncodeOpts, Error, FormatKind, Governor};
 
 use super::score::{Measured, Outcome};
@@ -74,7 +83,22 @@ impl Clock for RealClock {
 #[derive(Debug)]
 pub enum Input {
     Memory(Vec<Vec<u8>>),
-    Files(Vec<PathBuf>),
+    Files(Vec<Snapshot>),
+}
+
+/// A streamed file and its length when the input was loaded: every read of
+/// it stops at `len`, so bytes appended later are never benched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Snapshot {
+    pub path: PathBuf,
+    pub len: u64,
+}
+
+impl Snapshot {
+    /// The file, opened and limited to its loaded length.
+    fn open(&self) -> io::Result<io::Take<File>> {
+        Ok(File::open(&self.path)?.take(self.len))
+    }
 }
 
 /// One stream of the files concatenated, or one stream per file.
@@ -101,16 +125,28 @@ pub struct Plan {
 ///
 /// Also returns the input's size, measured here once: the bytes read into
 /// memory, or the files' sizes when streamed. It is the ratio's denominator,
-/// so a file still growing while the rows run does not change it.
+/// and each file's length is snapshotted with it (reads stop there), so a
+/// file still growing while the rows run changes neither.
 pub fn load_input(paths: &[PathBuf], memory_limit: u64) -> io::Result<(Input, u64)> {
     let mut total = 0u64;
+    let mut snaps = Vec::with_capacity(paths.len());
     for p in paths {
-        total = total.saturating_add(fs::metadata(p)?.len());
+        let len = fs::metadata(p)?.len();
+        total = total.saturating_add(len);
+        snaps.push(Snapshot {
+            path: p.clone(),
+            len,
+        });
     }
     if total > memory_limit / 2 {
-        return Ok((Input::Files(paths.to_vec()), total));
+        return Ok((Input::Files(snaps), total));
     }
-    let parts: Vec<Vec<u8>> = paths.iter().map(fs::read).collect::<io::Result<_>>()?;
+    let mut parts = Vec::with_capacity(snaps.len());
+    for s in &snaps {
+        let mut buf = Vec::with_capacity(usize::try_from(s.len).unwrap_or(0));
+        s.open()?.read_to_end(&mut buf)?;
+        parts.push(buf);
+    }
     let read = parts.iter().map(|b| b.len() as u64).sum();
     Ok((Input::Memory(parts), read))
 }
@@ -118,10 +154,10 @@ pub fn load_input(paths: &[PathBuf], memory_limit: u64) -> io::Result<(Input, u6
 /// One untimed read of every file, so the first timed run does not pay for
 /// a cold cache. Nothing to do for input already in memory.
 pub fn warm(input: &Input) -> io::Result<()> {
-    if let Input::Files(paths) = input {
+    if let Input::Files(files) = input {
         let mut buf = vec![0u8; CHUNK];
-        for p in paths {
-            let mut f = File::open(p)?;
+        for s in files {
+            let mut f = s.open()?;
             while read_some(&mut f, &mut buf)? > 0 {}
         }
     }
@@ -148,15 +184,57 @@ pub fn measure(
 #[derive(Clone, Copy)]
 enum Part<'a> {
     Memory(&'a [u8]),
-    File(&'a Path),
+    File(&'a Snapshot),
 }
 
 impl Part<'_> {
-    fn len(&self) -> io::Result<u64> {
+    /// The length the input was loaded at, never re-read from the file.
+    fn len(&self) -> u64 {
         match self {
-            Part::Memory(b) => Ok(b.len() as u64),
-            Part::File(p) => Ok(fs::metadata(p)?.len()),
+            Part::Memory(b) => b.len() as u64,
+            Part::File(s) => s.len,
         }
+    }
+}
+
+/// Where one stream's compressed output goes. The same for every codec, so
+/// no format writes to disk while another writes to memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dest {
+    Memory,
+    TempFile,
+}
+
+/// Memory whenever the worst-case output of `input_len` bytes (+ 1/8 +
+/// 1 KiB) fits under half of `memory_limit`, whether the input itself is in
+/// memory or streamed; the temp file only past that.
+fn destination(input_len: u64, memory_limit: u64) -> Dest {
+    // Small test inputs always fit; this is how the tests reach the temp
+    // file with a memory limit the decoders can still work under.
+    #[cfg(test)]
+    if tests::FORCE_DISK.with(std::cell::Cell::get) {
+        return Dest::TempFile;
+    }
+    let worst = input_len.saturating_add(input_len / 8).saturating_add(1024);
+    if worst <= memory_limit / 2 {
+        Dest::Memory
+    } else {
+        Dest::TempFile
+    }
+}
+
+/// The capacity reserved for `codec`'s output in memory, large enough that
+/// the `Vec` never reallocates inside a timed region. LZW (`compress`)
+/// writes no code wider than 16 bits and every code stands for at least one
+/// input byte, so it never writes more than two bytes per input byte (plus
+/// its 3-byte header and the padding at each code-width step); every other
+/// codec stays within 1/8 + 1 KiB, which
+/// `the_reserved_room_holds_incompressible_output` measures. Reserved pages
+/// a codec never writes are never touched.
+fn output_room(codec: &str, input_len: u64) -> u64 {
+    match codec {
+        "compress" => input_len.saturating_mul(2).saturating_add(1024),
+        _ => input_len.saturating_add(input_len / 8).saturating_add(1024),
     }
 }
 
@@ -190,15 +268,20 @@ fn run(
 
     let parts: Vec<Part<'_>> = match input {
         Input::Memory(bufs) => bufs.iter().map(|b| Part::Memory(b)).collect(),
-        Input::Files(paths) => paths.iter().map(|p| Part::File(p)).collect(),
+        Input::Files(files) => files.iter().map(Part::File).collect(),
     };
     let groups: Vec<&[Part<'_>]> = match plan.mode {
         Mode::OneStream => vec![&parts[..]],
         Mode::PerFile => parts.chunks(1).collect(),
     };
-    let temp = match input {
-        Input::Memory(_) => None,
-        Input::Files(_) => Some(TempOut::create()?.0),
+    let group_len = |g: &[Part<'_>]| g.iter().map(Part::len).sum::<u64>();
+    let temp = if groups
+        .iter()
+        .any(|g| destination(group_len(g), plan.memory_limit) == Dest::TempFile)
+    {
+        Some(TempOut::create()?.0)
+    } else {
+        None
     };
 
     let mut buf = vec![0u8; CHUNK];
@@ -208,11 +291,11 @@ fn run(
     for _ in 0..plan.repeat.max(1) {
         let (mut out, mut c_ns, mut d_ns) = (0u64, 0u64, 0u64);
         for group in &groups {
-            let expected = group
-                .iter()
-                .try_fold(0u64, |n, p| Ok::<_, io::Error>(n + p.len()?))?;
+            let expected = group_len(group);
             let job = Job {
+                name: id.as_str(),
                 codec: codec.as_ref(),
+                dest: destination(expected, plan.memory_limit),
                 encode: &encode,
                 decode: &decode,
                 temp: temp.as_ref(),
@@ -255,7 +338,9 @@ fn median(mut v: Vec<u64>) -> u64 {
 
 /// Everything one stream's round trip needs.
 struct Job<'a> {
+    name: &'a str,
     codec: &'a dyn Codec,
+    dest: Dest,
     encode: &'a EncodeOpts,
     decode: &'a DecodeOpts,
     temp: Option<&'a TempOut>,
@@ -271,11 +356,13 @@ impl Job<'_> {
         expected: u64,
         clock: &mut dyn Clock,
     ) -> stuffr::Result<Measured> {
-        let (bytes_out, compress_ns, src) = match self.temp {
-            None => {
+        let (bytes_out, compress_ns, src) = match (self.dest, self.temp) {
+            (Dest::Memory, _) | (Dest::TempFile, None) => {
                 // Room for incompressible output, so the outer Vec does not
-                // reallocate inside the region.
-                let room = expected.saturating_add(expected / 8).saturating_add(1024);
+                // reallocate inside the region. (`TempFile` always comes
+                // with a temp file; `run` creates one whenever any group
+                // needs it.)
+                let room = output_room(self.name, expected);
                 let shared = SharedVec::with_capacity(usize::try_from(room).unwrap_or(0));
                 let dst = BufWriter::with_capacity(CHUNK, shared.clone());
                 let ns = self.compress(group, Box::new(dst), clock)?;
@@ -283,19 +370,17 @@ impl Job<'_> {
                 let len = bytes.len() as u64;
                 (len, ns, Box::new(MemSource::new(bytes)) as Box<dyn Source>)
             }
-            Some(temp) => {
+            (Dest::TempFile, Some(temp)) => {
                 let file = File::options()
                     .write(true)
                     .truncate(true)
                     .open(temp.path())?;
                 let dst = BufWriter::with_capacity(CHUNK, file);
                 let ns = self.compress(group, Box::new(dst), clock)?;
-                let src = FileSource::open(temp.path())?;
-                (
-                    src.caps().len.unwrap_or(0),
-                    ns,
-                    Box::new(src) as Box<dyn Source>,
-                )
+                let file = File::open(temp.path())?;
+                let len = file.metadata()?.len();
+                let src = temp_source(GuardedSeek::new(file), len);
+                (len, ns, Box::new(src) as Box<dyn Source>)
             }
         };
         let (decoded, decompress_ns) = decode(self.codec, self.decode, src, self.buf, clock)?;
@@ -342,20 +427,32 @@ impl Job<'_> {
         let mut files = Vec::with_capacity(group.len());
         // Not in memory, so every part is a file: an input is one or the other.
         for p in group {
-            if let Part::File(path) = p {
-                files.push(File::open(path)?);
+            if let Part::File(snap) = p {
+                files.push((snap, snap.open()?));
             }
         }
         let t0 = clock.now();
         let mut sink = self.codec.encoder(dst, self.encode)?;
         let t1 = clock.now();
         let mut ns = t1.saturating_sub(t0);
-        for f in &mut files {
+        for (snap, f) in &mut files {
+            let mut read = 0u64;
             loop {
                 let n = read_some(f, self.buf)?;
                 if n == 0 {
+                    if read < snap.len {
+                        return Err(Error::Io(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!(
+                                "{} shrank to {read} bytes from {} while bench ran",
+                                snap.path.display(),
+                                snap.len
+                            ),
+                        )));
+                    }
                     break;
                 }
+                read += n as u64;
                 let t0 = clock.now();
                 sink.write_all(&self.buf[..n])?;
                 let t1 = clock.now();
@@ -414,6 +511,11 @@ impl SharedVec {
         Self(Arc::new(Mutex::new(Vec::with_capacity(n))))
     }
 
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).capacity()
+    }
+
     fn take(&self) -> Vec<u8> {
         std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()))
     }
@@ -433,7 +535,7 @@ impl Write for SharedVec {
     }
 }
 
-/// Compressed bytes in memory, as seekable and sized as the `FileSource`
+/// Compressed bytes in memory, as seekable and sized as the [`BufSource`]
 /// over the temp file, so a decoder sees the same capabilities either way.
 struct MemSource {
     cursor: Cursor<Vec<u8>>,
@@ -475,6 +577,50 @@ impl Source for MemSource {
     }
 }
 
+/// The temp file's compressed bytes as the decoder reads them: through a
+/// 64 KiB buffer, so a decoder reading a byte at a time pays a memory copy
+/// per byte, as it does from [`MemSource`], not a system call. Seekable and
+/// sized like `MemSource`.
+fn temp_source<R: Read + Seek + Send>(inner: R, len: u64) -> BufSource<R> {
+    BufSource {
+        inner: BufReader::with_capacity(CHUNK, inner),
+        len,
+    }
+}
+
+struct BufSource<R> {
+    inner: BufReader<R>,
+    len: u64,
+}
+
+impl<R: Read> Read for BufSource<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl<R: Seek> Seek for BufSource<R> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+impl<R: Read + Seek + Send> Source for BufSource<R> {
+    fn caps(&self) -> SourceCaps {
+        SourceCaps {
+            seekable: true,
+            len: Some(self.len),
+        }
+    }
+
+    fn as_seek(&mut self) -> Option<&mut dyn SeekRead> {
+        Some(self)
+    }
+}
+
+/// The next temp file's `<n>`; also how the tests see whether a run made one.
+static TEMP_SEQ: AtomicU32 = AtomicU32::new(0);
+
 /// The streamed run's compressed output, `stuffr-bench-<pid>-<n>` in the
 /// temp directory: armed for removal on SIGINT, SIGTERM and SIGHUP while it
 /// lives, removed when it drops (a panic included).
@@ -487,11 +633,10 @@ struct TempOut {
 
 impl TempOut {
     fn create() -> io::Result<(Self, File)> {
-        static N: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir();
         let mut tries = 0;
         loop {
-            let n = N.fetch_add(1, Ordering::Relaxed);
+            let n = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
             let path = dir.join(format!("stuffr-bench-{}-{n}", std::process::id()));
             match create_armed(&path) {
                 Ok((file, armed)) => {
@@ -607,6 +752,40 @@ mod tests {
             threads: None,
             memory_limit: 1 << 30,
         }
+    }
+
+    thread_local! {
+        /// Set by `on_disk`: every output goes to the temp file.
+        pub(super) static FORCE_DISK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Runs `f` with every compressed output sent to the temp file.
+    fn on_disk<T>(f: impl FnOnce() -> T) -> T {
+        FORCE_DISK.with(|d| d.set(true));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        FORCE_DISK.with(|d| d.set(false));
+        r.unwrap_or_else(|e| std::panic::resume_unwind(e))
+    }
+
+    /// The temp files created while `f` ran. Hold `armed_lock`: every test
+    /// that can create one does.
+    fn temps_made(f: impl FnOnce()) -> u32 {
+        let before = TEMP_SEQ.load(Ordering::Relaxed);
+        f();
+        TEMP_SEQ.load(Ordering::Relaxed) - before
+    }
+
+    /// Deterministic noise no codec can shrink.
+    fn noise(len: usize) -> Vec<u8> {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect()
     }
 
     fn ok(o: Outcome) -> Measured {
@@ -794,11 +973,10 @@ mod tests {
         for mode in [Mode::OneStream, Mode::PerFile] {
             let p = plan(mode, 1);
             for codec in ["gzip", "xz", "lz4"] {
-                assert_eq!(
-                    run(codec, &files, &p).bytes_out,
-                    run(codec, &memory, &p).bytes_out,
-                    "{codec}"
-                );
+                let want = run(codec, &memory, &p).bytes_out;
+                assert_eq!(run(codec, &files, &p).bytes_out, want, "{codec}");
+                let disk = on_disk(|| run(codec, &files, &p)).bytes_out;
+                assert_eq!(disk, want, "{codec} via the temp file");
             }
         }
     }
@@ -809,7 +987,10 @@ mod tests {
         let s = Scratch::new();
         let paths = vec![s.file("a", &text(16 * 1024, 4))];
         let files = load_input(&paths, 0).unwrap().0;
-        run("gzip", &files, &plan(Mode::OneStream, 2));
+        let made = temps_made(|| {
+            on_disk(|| run("gzip", &files, &plan(Mode::OneStream, 2)));
+        });
+        assert_eq!(made, 1);
         assert_eq!(bench_temps(), Vec::<String>::new());
     }
 
@@ -874,7 +1055,193 @@ mod tests {
             for codec in crate::bench::levels::benchable_codecs() {
                 for input in [&files, &memory] {
                     run(codec, input, &plan(mode, 1));
+                    on_disk(|| run(codec, input, &plan(mode, 1)));
                 }
+            }
+        }
+    }
+
+    /// Counts the reads that reach the wrapped reader.
+    struct CountReads<R> {
+        inner: R,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<R: Read> Read for CountReads<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.inner.read(buf)
+        }
+    }
+
+    impl<R: Seek> Seek for CountReads<R> {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    /// LZW's decoder reads one byte per call. Through the temp file's
+    /// source those calls must not each reach the file (one system call
+    /// per compressed byte made streamed decoding 17-34x slower than the
+    /// same decode from memory).
+    #[test]
+    fn the_temp_file_is_read_in_large_pieces_by_a_byte_reader() {
+        let input = text(64 * 1024, 4);
+        let codec = stuffr::registry()
+            .codec(stuffr::FormatId::new("compress"))
+            .expect("compress is in every default build");
+        let out = SharedVec::with_capacity(0);
+        let mut sink = codec
+            .encoder(Box::new(out.clone()), &EncodeOpts::default())
+            .unwrap();
+        sink.write_all(&input).unwrap();
+        sink.finish().unwrap();
+        let bytes = out.take();
+        let len = bytes.len() as u64;
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let file = CountReads {
+            inner: Cursor::new(bytes),
+            reads: reads.clone(),
+        };
+        let src = temp_source(file, len);
+        // The shape `MemSource` gives the in-memory path.
+        assert_eq!(
+            src.caps(),
+            SourceCaps {
+                seekable: true,
+                len: Some(len)
+            }
+        );
+        let mut buf = vec![0u8; CHUNK];
+        let (decoded, _) = decode(
+            codec.as_ref(),
+            &DecodeOpts::default(),
+            Box::new(src),
+            &mut buf,
+            &mut FakeClock(0),
+        )
+        .unwrap();
+        assert_eq!(decoded, input.len() as u64);
+        let reads = reads.load(Ordering::Relaxed);
+        assert!(
+            reads as u64 <= len / CHUNK as u64 + 4,
+            "{reads} reads reached the file for {len} compressed bytes"
+        );
+    }
+
+    #[test]
+    fn the_output_goes_to_memory_whenever_its_worst_case_fits() {
+        // 0 bytes in: worst case 1 KiB, which fits under 2048 / 2.
+        assert_eq!(destination(0, 2048), Dest::Memory);
+        assert_eq!(destination(0, 2047), Dest::TempFile);
+        // 8000 + 1000 + 1024.
+        assert_eq!(destination(8000, 2 * 10_024), Dest::Memory);
+        assert_eq!(destination(8000, 2 * 10_024 - 1), Dest::TempFile);
+        assert_eq!(destination(u64::MAX, u64::MAX), Dest::TempFile);
+    }
+
+    /// Streamed input whose output fits stays off the disk; only output
+    /// past the limit makes a temp file.
+    #[test]
+    fn streamed_input_compresses_to_memory_when_the_output_fits() {
+        let _lock = armed_lock();
+        let s = Scratch::new();
+        let (a, b) = (text(16 * 1024, 1), text(16 * 1024, 2));
+        let paths = vec![s.file("a", &a), s.file("b", &b)];
+        // 32 KiB is over 40000 / 2, so the input is streamed; each file's
+        // worst case (16384 + 2048 + 1024) fits under it, the pair's not.
+        let limit = 40_000;
+        let files = load_input(&paths, limit).unwrap().0;
+        assert!(matches!(files, Input::Files(_)));
+        let memory = Input::Memory(vec![a, b]);
+        for (mode, want_temps) in [(Mode::PerFile, 0), (Mode::OneStream, 1)] {
+            let p = Plan {
+                memory_limit: limit,
+                ..plan(mode, 1)
+            };
+            let mut got = None;
+            let made = temps_made(|| got = Some(run("gzip", &files, &p)));
+            assert_eq!(made, want_temps, "{mode:?}");
+            let want = run("gzip", &memory, &plan(mode, 1)).bytes_out;
+            assert_eq!(got.unwrap().bytes_out, want, "{mode:?}");
+        }
+    }
+
+    /// In-memory input whose output does not fit goes to the temp file too,
+    /// for every codec alike.
+    #[test]
+    fn memory_input_past_the_output_limit_uses_the_temp_file() {
+        let _lock = armed_lock();
+        let input = Input::Memory(vec![text(16 * 1024, 5)]);
+        // The input fits under 32768 / 2; its worst case does not.
+        let p = Plan {
+            memory_limit: 32 * 1024,
+            ..plan(Mode::OneStream, 1)
+        };
+        for codec in ["gzip", "compress"] {
+            let made = temps_made(|| {
+                run(codec, &input, &p);
+            });
+            assert_eq!(made, 1, "{codec}");
+        }
+    }
+
+    /// The reserved `Vec` must not reallocate inside a timed region, even
+    /// on input no codec can shrink, at any level.
+    #[test]
+    fn the_reserved_room_holds_incompressible_output() {
+        let input = noise(64 * 1024);
+        let reg = stuffr::registry();
+        for name in crate::bench::levels::benchable_codecs() {
+            let codec = reg.codec(stuffr::FormatId::new(name)).unwrap();
+            let sweep = crate::bench::levels::levels_of(name).unwrap().sweep;
+            let levels: Vec<Option<i32>> = if sweep.is_empty() {
+                vec![None]
+            } else {
+                sweep.iter().map(|&l| Some(l)).collect()
+            };
+            for level in levels {
+                let room = output_room(name, input.len() as u64) as usize;
+                let shared = SharedVec::with_capacity(room);
+                let cap = shared.capacity();
+                let dst = BufWriter::with_capacity(CHUNK, shared.clone());
+                let opts = EncodeOpts {
+                    level,
+                    ..Default::default()
+                };
+                let mut sink = codec.encoder(Box::new(dst), &opts).unwrap();
+                sink.write_all(&input).unwrap();
+                sink.finish().unwrap();
+                assert_eq!(shared.capacity(), cap, "{name} {level:?} reallocated");
+                assert!(shared.take().len() <= room, "{name} {level:?}");
+            }
+        }
+    }
+
+    /// A log still being written: the rows bench it as it was at load.
+    #[test]
+    fn a_file_that_grows_after_load_is_benched_at_its_loaded_length() {
+        let _lock = armed_lock();
+        let s = Scratch::new();
+        let original = text(40 * 1024, 3);
+        let path = s.file("grow.log", &original);
+        let (files, bytes_in) = load_input(std::slice::from_ref(&path), 0).unwrap();
+        assert!(matches!(files, Input::Files(_)));
+        assert_eq!(bytes_in, original.len() as u64);
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&text(10 * 1024, 9)).unwrap();
+        drop(f);
+        let snapshot = Input::Memory(vec![original]);
+        for mode in [Mode::OneStream, Mode::PerFile] {
+            let p = plan(mode, 1);
+            for codec in ["gzip", "compress"] {
+                // Ok: the round trip gave back exactly the loaded length.
+                let grown = run(codec, &files, &p);
+                assert_eq!(
+                    grown.bytes_out,
+                    run(codec, &snapshot, &p).bytes_out,
+                    "{codec}: the appended bytes were benched"
+                );
             }
         }
     }
