@@ -21,11 +21,13 @@ pub enum Outcome {
 }
 
 /// One line of the table. `level` is `None` for codecs without levels
-/// (lz4, snappy).
+/// (lz4, snappy). `backend` is `"c"` or `"pure"`: which implementation of
+/// the format this build ran (`levels::backend_of`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
     pub format: &'static str,
     pub level: Option<i32>,
+    pub backend: &'static str,
     pub outcome: Outcome,
 }
 
@@ -114,6 +116,7 @@ mod tests {
         Row {
             format: "x",
             level: Some(1),
+            backend: "pure",
             outcome: Outcome::Ok(Measured {
                 bytes_out,
                 compress_ns,
@@ -126,6 +129,7 @@ mod tests {
         Row {
             format: "x",
             level: None,
+            backend: "pure",
             outcome: Outcome::Failed("boom".into()),
         }
     }
@@ -181,6 +185,16 @@ mod tests {
         assert_eq!(winners(&rows).balance, Some(1));
     }
 
+    /// Equal mean scores reached by different metrics: the later row wins
+    /// on its smaller output, where "earlier row" alone would pick the first.
+    #[test]
+    fn a_balance_tie_goes_to_the_smaller_output() {
+        let rows = vec![ok(100, 10, 40), ok(50, 20, 40)];
+        let s = balance_scores(&rows);
+        assert_eq!(s[0], s[1], "a real tie");
+        assert_eq!(winners(&rows).balance, Some(1));
+    }
+
     #[test]
     fn ties_on_everything_go_to_the_earlier_row() {
         let rows = vec![ok(7, 7, 7), ok(7, 7, 7)];
@@ -203,6 +217,8 @@ mod tests {
         for s in balance_scores(&rows) {
             assert!(s.expect("a score").is_finite());
         }
+        // Best in every column, a zero counting as 1 on both sides.
+        assert_eq!(balance_scores(&rows)[1], Some(1.0));
         let w = winners(&rows);
         assert_eq!(w.smallest, Some(1));
         assert_eq!(w.fastest_compress, Some(1));

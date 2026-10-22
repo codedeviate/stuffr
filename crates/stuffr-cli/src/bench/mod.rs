@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use stuffr::{Error, FormatKind};
 
 use crate::cli::BenchArgs;
-use levels::{benchable_codecs, levels_of};
+use levels::{backend_of, benchable_codecs, levels_of};
 use measure::{Input, Mode, Plan, RealClock, governor_for, load_input, measure, warm};
 use report::Conditions;
 use score::Row;
@@ -77,6 +77,7 @@ pub fn run(args: BenchArgs) -> stuffr::Result<Ran> {
         rows.push(Row {
             format: p.format,
             level: p.label,
+            backend: backend_of(p.format),
             outcome,
         });
     }
@@ -90,20 +91,13 @@ pub fn run(args: BenchArgs) -> stuffr::Result<Ran> {
         // The budget every row's encoder is given; no governor is one.
         workers: governor_for(&plan).map_or(1, |g| g.workers()),
         repeat: plan.repeat,
-        // zstd is the codec whose tier decides benchability: its pure-Rust
-        // encoder is the weak fallback, so only the C tier benchmarks it.
-        tier: if cfg!(feature = "zstd-c") {
-            "c-backed"
-        } else {
-            "pure"
-        },
         streamed: matches!(input, Input::Files(_)),
     };
     let mut out = io::stdout().lock();
     if args.json {
         report::json(&conditions, &rows, &mut out)?;
     } else if args.csv {
-        report::csv(&rows, conditions.bytes_in, &mut out)?;
+        report::csv(&conditions, &rows, &mut out)?;
     } else if args.table_only {
         report::table_only(&rows, conditions.bytes_in, &mut out)?;
     } else {

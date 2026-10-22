@@ -1,4 +1,4 @@
-input: 3 files, 412.0 MiB · one stream · 1 thread · pure · 1 run
+input: 3 files, 412.0 MiB · one stream · 1 compress thread · pure · 1 run
 
 format  level       size  ratio  compress  decompress
 zstd        3   40.0 MiB  10.3x    900 ms      300 ms

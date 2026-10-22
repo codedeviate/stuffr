@@ -52,6 +52,26 @@ pub fn levels_of(format: &str) -> Option<Levels> {
     })
 }
 
+/// Which implementation of `codec` this build benches: `"c"` (a C library)
+/// or `"pure"` (Rust). Only zstd, xz and lzma have a C tier among the
+/// registry's codecs. `zlib-c` and `lz4-c` do not count: they serve the
+/// `gzip` and `lz4` compatibility links, while the gzip, zlib, deflate and
+/// lz4 codecs bench runs stay on flate2's miniz_oxide and on lz4_flex in
+/// every build. lzma's C tier is stuffr's `lzma-c`, which this crate turns
+/// on only through `c-backed` (and `full`, which names it).
+pub fn backend_of(codec: &str) -> &'static str {
+    const C_TIER: [(&str, bool); 3] = [
+        ("zstd", cfg!(feature = "zstd-c")),
+        ("xz", cfg!(feature = "xz-c")),
+        ("lzma", cfg!(feature = "c-backed")),
+    ];
+    if C_TIER.iter().any(|&(name, on)| on && name == codec) {
+        "c"
+    } else {
+        "pure"
+    }
+}
+
 /// Every codec that can be benchmarked: a codec that writes and whose
 /// encoder is not the weak pure-tier one, in capability-matrix order.
 pub fn benchable_codecs() -> Vec<&'static str> {
@@ -153,12 +173,38 @@ mod tests {
     }
 
     #[test]
-    fn the_weak_zstd_is_not_benchable() {
-        let weak = stuffr::registry()
+    fn no_weak_encoder_is_benchable() {
+        let reg = stuffr::registry();
+        let benchable = benchable_codecs();
+        for row in reg.matrix() {
+            if reg.codec(row.id).is_some_and(|c| c.caps().weak_encoder) {
+                assert!(
+                    !benchable.contains(&row.id.as_str()),
+                    "{} has a weak encoder",
+                    row.id.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_backend_follows_the_build() {
+        // The pure zstd encoder is the weak one: a pure zstd is never
+        // benched, so a benched zstd is the C one.
+        let zstd_weak = stuffr::registry()
             .codec(FormatId::new("zstd"))
             .is_some_and(|c| c.caps().weak_encoder);
-        if weak {
-            assert!(!benchable_codecs().contains(&"zstd"));
+        assert_eq!(backend_of("zstd") == "c", cfg!(feature = "zstd-c"));
+        if cfg!(feature = "zstd-c") {
+            assert!(!zstd_weak);
+        }
+        assert_eq!(backend_of("xz") == "c", cfg!(feature = "xz-c"));
+        assert_eq!(backend_of("lzma") == "c", cfg!(feature = "c-backed"));
+        // Pure in every build, `zlib-c` and `lz4-c` included.
+        for name in [
+            "gzip", "zlib", "deflate", "lz4", "bzip2", "brotli", "snappy", "lzip", "compress",
+        ] {
+            assert_eq!(backend_of(name), "pure", "{name}");
         }
     }
 

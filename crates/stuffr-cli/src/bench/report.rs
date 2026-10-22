@@ -13,7 +13,8 @@ use super::measure::Mode;
 use super::score::{Measured, Outcome, Row, balance_scores, winners};
 
 /// The conditions the run was made under, shown on the input line and in
-/// JSON. `tier` is `"pure"` or `"c-backed"`.
+/// JSON and CSV. The backend is per row (`Row::backend`), not here: one
+/// build can bench some codecs through C and others in pure Rust.
 #[derive(Clone, Debug)]
 pub struct Conditions {
     pub files: usize,
@@ -24,7 +25,6 @@ pub struct Conditions {
     /// The worker budget that setting resolved to (1 without `--threads`).
     pub workers: usize,
     pub repeat: u32,
-    pub tier: &'static str,
     pub streamed: bool,
 }
 
@@ -35,14 +35,23 @@ const LABEL: usize = 21;
 
 const HEADER: [&str; 6] = ["format", "level", "size", "ratio", "compress", "decompress"];
 
+/// `512 B`, else one decimal of the largest unit up to GiB. The unit is
+/// chosen on the rounded value, so 1023.96 KiB reads `1.0 MiB`, never
+/// `1024.0 KiB`.
 fn size_text(bytes: u64) -> String {
-    const UNITS: [(u64, &str); 3] = [(1 << 30, "GiB"), (1 << 20, "MiB"), (1 << 10, "KiB")];
-    for (unit, name) in UNITS {
-        if bytes >= unit {
-            return format!("{:.1} {name}", bytes as f64 / unit as f64);
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    const UNITS: [&str; 3] = ["KiB", "MiB", "GiB"];
+    let mut tenths = 0u128;
+    for (i, name) in UNITS.iter().enumerate() {
+        let unit = 1u128 << (10 * (i + 1));
+        tenths = (u128::from(bytes) * 10 + unit / 2) / unit;
+        if tenths < 10_240 || i == UNITS.len() - 1 {
+            return format!("{}.{} {name}", tenths / 10, tenths % 10);
         }
     }
-    format!("{bytes} B")
+    unreachable!("the last unit always returns ({tenths})")
 }
 
 /// `bytes_in / bytes_out`, `None` when either is 0.
@@ -54,14 +63,64 @@ fn ratio_text(bytes_in: u64, bytes_out: u64) -> String {
     ratio_of(bytes_in, bytes_out).map_or_else(|| "-".into(), |r| format!("{r:.1}x"))
 }
 
-/// `850 ms` below one second, otherwise `0.9 s`-style with one decimal
-/// (rounded half up, in integers, so 1.25 s reads `1.3 s`).
+/// `0.4 ms` below 10 ms, `850 ms` below one second, otherwise `1.3 s`:
+/// rounded half up, in integers, and each form chosen on its rounded value,
+/// so 9.96 ms reads `10 ms` and 999.6 ms reads `1.0 s`.
 fn time_text(ns: u64) -> String {
-    if ns < 1_000_000_000 {
-        return format!("{} ms", (ns + 500_000) / 1_000_000);
+    let ns = u128::from(ns);
+    let tenth_ms = (ns + 50_000) / 100_000;
+    if tenth_ms < 100 {
+        return format!("{}.{} ms", tenth_ms / 10, tenth_ms % 10);
+    }
+    let ms = (ns + 500_000) / 1_000_000;
+    if ms < 1000 {
+        return format!("{ms} ms");
     }
     let tenths = (ns + 50_000_000) / 100_000_000;
     format!("{}.{} s", tenths / 10, tenths % 10)
+}
+
+/// A failure reason fit for one table line: its first line, any other
+/// control character escaped, and `…` when lines were dropped. JSON and CSV
+/// keep the whole text.
+fn one_line(why: &str) -> String {
+    let mut lines = why.lines();
+    let first = lines.next().unwrap_or("");
+    let mut out = String::with_capacity(first.len());
+    for c in first.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    if lines.next().is_some() {
+        out.push_str(" …");
+    }
+    out
+}
+
+/// The input line's backend: `pure` when every row ran in pure Rust, else
+/// `C: ` and the codecs that ran through a C library, in table order.
+fn backend_text(rows: &[Row]) -> String {
+    let mut c: Vec<&str> = Vec::new();
+    for r in rows.iter().filter(|r| r.backend == "c") {
+        if !c.contains(&r.format) {
+            c.push(r.format);
+        }
+    }
+    if c.is_empty() {
+        "pure".into()
+    } else {
+        format!("C: {}", c.join(", "))
+    }
+}
+
+fn mode_name(mode: Mode) -> &'static str {
+    match mode {
+        Mode::OneStream => "one-stream",
+        Mode::PerFile => "per-file",
+    }
 }
 
 fn name_of(row: &Row) -> String {
@@ -71,16 +130,21 @@ fn name_of(row: &Row) -> String {
     }
 }
 
-/// The resolved worker budget; `(auto)` when `--threads 0` chose it.
+/// The resolved compression worker budget; `(auto)` when `--threads 0`
+/// chose it. Decompression is always single-threaded.
 fn threads_text(threads: Option<usize>, workers: usize) -> String {
-    let unit = if workers == 1 { "thread" } else { "threads" };
+    let unit = if workers == 1 {
+        "compress thread"
+    } else {
+        "compress threads"
+    };
     match threads {
         Some(0) => format!("{workers} {unit} (auto)"),
         _ => format!("{workers} {unit}"),
     }
 }
 
-fn input_line(c: &Conditions) -> String {
+fn input_line(c: &Conditions, rows: &[Row]) -> String {
     let mode = match c.mode {
         Mode::OneStream => "one stream",
         Mode::PerFile => "per file",
@@ -92,7 +156,7 @@ fn input_line(c: &Conditions) -> String {
         c.files,
         size_text(c.bytes_in),
         threads_text(c.threads, c.workers),
-        c.tier,
+        backend_text(rows),
         c.repeat,
         if c.streamed {
             ", streamed from disk"
@@ -121,7 +185,7 @@ fn table_lines(rows: &[Row], bytes_in: u64) -> Vec<String> {
             }
             Outcome::Failed(why) => {
                 cells.push(vec![row.format.into(), level]);
-                failures.push(Some(format!("failed: {why}")));
+                failures.push(Some(format!("failed: {}", one_line(why))));
             }
         }
     }
@@ -168,7 +232,7 @@ fn measured(row: &Row) -> Option<&Measured> {
 
 /// The input line, the table and the winners block.
 pub fn human(c: &Conditions, rows: &[Row], out: &mut dyn Write) -> io::Result<()> {
-    writeln!(out, "{}", input_line(c))?;
+    writeln!(out, "{}", input_line(c, rows))?;
     writeln!(out)?;
     write_table(rows, c.bytes_in, out)?;
     writeln!(out)?;
@@ -243,14 +307,14 @@ pub fn json(c: &Conditions, rows: &[Row], out: &mut dyn Write) -> io::Result<()>
         .zip(&scores)
         .map(|(r, score)| match &r.outcome {
             Outcome::Ok(m) => json!({
-                "format": r.format, "level": r.level, "ok": true,
+                "format": r.format, "level": r.level, "backend": r.backend, "ok": true,
                 "bytes_out": m.bytes_out,
                 "ratio": finite(ratio_of(c.bytes_in, m.bytes_out)),
                 "compress_ns": m.compress_ns, "decompress_ns": m.decompress_ns,
                 "balance": finite(*score), "error": null,
             }),
             Outcome::Failed(why) => json!({
-                "format": r.format, "level": r.level, "ok": false,
+                "format": r.format, "level": r.level, "backend": r.backend, "ok": false,
                 "bytes_out": null, "ratio": null,
                 "compress_ns": null, "decompress_ns": null,
                 "balance": null, "error": why,
@@ -261,11 +325,10 @@ pub fn json(c: &Conditions, rows: &[Row], out: &mut dyn Write) -> io::Result<()>
         "conditions": {
             "files": c.files,
             "bytes_in": c.bytes_in,
-            "mode": match c.mode { Mode::OneStream => "one-stream", Mode::PerFile => "per-file" },
+            "mode": mode_name(c.mode),
             "threads": c.threads,
             "workers": c.workers,
             "repeat": c.repeat,
-            "tier": c.tier,
             "streamed": c.streamed,
         },
         "rows": jrows,
@@ -287,12 +350,25 @@ fn csv_field(s: &str) -> String {
     }
 }
 
-/// Header plus one line per row; empty fields stand for none.
-pub fn csv(rows: &[Row], bytes_in: u64, out: &mut dyn Write) -> io::Result<()> {
+/// Header plus one line per row; empty fields stand for none. The run's
+/// conditions follow the measurements on every line, and the row's backend
+/// last.
+pub fn csv(c: &Conditions, rows: &[Row], out: &mut dyn Write) -> io::Result<()> {
     writeln!(
         out,
-        "format,level,ok,bytes_in,bytes_out,ratio,compress_ns,decompress_ns,balance,error"
+        "format,level,ok,bytes_in,bytes_out,ratio,compress_ns,decompress_ns,balance,error,\
+         files,mode,threads,workers,repeat,streamed,backend"
     )?;
+    let bytes_in = c.bytes_in;
+    let threads = c.threads.map_or(String::new(), |t| t.to_string());
+    let conditions = format!(
+        "{},{},{threads},{},{},{}",
+        c.files,
+        mode_name(c.mode),
+        c.workers,
+        c.repeat,
+        c.streamed
+    );
     for (r, score) in rows.iter().zip(balance_scores(rows)) {
         let level = r.level.map_or(String::new(), |l| l.to_string());
         match &r.outcome {
@@ -302,15 +378,16 @@ pub fn csv(rows: &[Row], bytes_in: u64, out: &mut dyn Write) -> io::Result<()> {
                 let bal = score.map_or(String::new(), |x| x.to_string());
                 writeln!(
                     out,
-                    "{},{level},true,{bytes_in},{},{ratio},{},{},{bal},",
-                    r.format, m.bytes_out, m.compress_ns, m.decompress_ns
+                    "{},{level},true,{bytes_in},{},{ratio},{},{},{bal},,{conditions},{}",
+                    r.format, m.bytes_out, m.compress_ns, m.decompress_ns, r.backend
                 )?;
             }
             Outcome::Failed(why) => writeln!(
                 out,
-                "{},{level},false,{bytes_in},,,,,,{}",
+                "{},{level},false,{bytes_in},,,,,,{},{conditions},{}",
                 r.format,
-                csv_field(why)
+                csv_field(why),
+                r.backend
             )?,
         }
     }
@@ -327,6 +404,7 @@ mod tests {
         Row {
             format,
             level,
+            backend: "pure",
             outcome: Outcome::Ok(Measured {
                 bytes_out: out,
                 compress_ns: c_ms * 1_000_000,
@@ -343,6 +421,7 @@ mod tests {
             Row {
                 format: "bzip2",
                 level: Some(9),
+                backend: "pure",
                 outcome: Outcome::Failed("no c tier".into()),
             },
         ]
@@ -356,7 +435,6 @@ mod tests {
             threads: None,
             workers: 1,
             repeat: 1,
-            tier: "pure",
             streamed: false,
         }
     }
@@ -388,7 +466,9 @@ mod tests {
     fn json_parses_and_carries_conditions() {
         let got = render(|o| json(&cond(), &rows(), o));
         let v: Value = serde_json::from_str(&got).unwrap();
-        assert_eq!(v["conditions"]["tier"], "pure");
+        assert_eq!(v["conditions"]["mode"], "one-stream");
+        assert!(v["conditions"]["tier"].is_null(), "the backend is per row");
+        assert_eq!(v["rows"][0]["backend"], "pure");
         assert_eq!(v["rows"].as_array().unwrap().len(), 4);
         assert_eq!(v["winners"]["smallest"]["format"], "xz");
         assert_eq!(v["rows"][3]["ok"], false);
@@ -401,17 +481,23 @@ mod tests {
         let rows = vec![Row {
             format: "xz",
             level: Some(6),
+            backend: "c",
             outcome: Outcome::Failed("bad, \"very\" bad".into()),
         }];
-        let got = render(|o| csv(&rows, 10, o));
+        let c = Conditions {
+            bytes_in: 10,
+            ..cond()
+        };
+        let got = render(|o| csv(&c, &rows, o));
         let mut lines = got.lines();
         assert_eq!(
             lines.next().unwrap(),
-            "format,level,ok,bytes_in,bytes_out,ratio,compress_ns,decompress_ns,balance,error"
+            "format,level,ok,bytes_in,bytes_out,ratio,compress_ns,decompress_ns,balance,error,\
+             files,mode,threads,workers,repeat,streamed,backend"
         );
         assert_eq!(
             lines.next().unwrap(),
-            "xz,6,false,10,,,,,,\"bad, \"\"very\"\" bad\""
+            "xz,6,false,10,,,,,,\"bad, \"\"very\"\" bad\",3,one-stream,,1,1,false,c"
         );
     }
 
@@ -431,6 +517,7 @@ mod tests {
         let rows = vec![Row {
             format: "xz",
             level: Some(1),
+            backend: "pure",
             outcome: Outcome::Failed("x".into()),
         }];
         let got = render(|o| human(&cond(), &rows, o));
@@ -440,16 +527,16 @@ mod tests {
 
     #[test]
     fn the_input_line_shows_the_resolved_worker_count() {
-        assert_eq!(threads_text(None, 1), "1 thread");
-        assert_eq!(threads_text(Some(1), 1), "1 thread");
-        assert_eq!(threads_text(Some(4), 4), "4 threads");
-        assert_eq!(threads_text(Some(0), 8), "8 threads (auto)");
+        assert_eq!(threads_text(None, 1), "1 compress thread");
+        assert_eq!(threads_text(Some(1), 1), "1 compress thread");
+        assert_eq!(threads_text(Some(4), 4), "4 compress threads");
+        assert_eq!(threads_text(Some(0), 8), "8 compress threads (auto)");
         let c = Conditions {
             threads: Some(0),
             workers: 8,
             ..cond()
         };
-        assert!(input_line(&c).contains(" · 8 threads (auto) · "));
+        assert!(input_line(&c, &rows()).contains(" · 8 compress threads (auto) · "));
         let j = render(|o| json(&c, &[], o));
         let v: Value = serde_json::from_str(&j).unwrap();
         assert_eq!(v["conditions"]["threads"], 0);
@@ -461,5 +548,123 @@ mod tests {
         assert_eq!(time_text(850_000_000), "850 ms");
         assert_eq!(time_text(1_250_000_000), "1.3 s");
         assert_eq!(time_text(900_000_000), "900 ms");
+    }
+
+    #[test]
+    fn csv_carries_the_conditions_and_each_rows_backend() {
+        let mut rows = rows();
+        rows[0].backend = "c";
+        let c = Conditions {
+            mode: Mode::PerFile,
+            threads: Some(0),
+            workers: 8,
+            repeat: 5,
+            streamed: true,
+            ..cond()
+        };
+        let got = render(|o| csv(&c, &rows, o));
+        let lines: Vec<&str> = got.lines().collect();
+        let header: Vec<&str> = lines[0].split(',').collect();
+        assert_eq!(header.len(), 17);
+        assert_eq!(
+            &header[..10],
+            &[
+                "format",
+                "level",
+                "ok",
+                "bytes_in",
+                "bytes_out",
+                "ratio",
+                "compress_ns",
+                "decompress_ns",
+                "balance",
+                "error"
+            ]
+        );
+        for line in &lines[1..] {
+            let f: Vec<&str> = line.split(',').collect();
+            assert_eq!(f.len(), 17, "{line}");
+            assert_eq!(
+                &f[10..16],
+                &["3", "per-file", "0", "8", "5", "true"],
+                "{line}"
+            );
+        }
+        assert!(lines[1].starts_with("zstd,3,true,"), "{}", lines[1]);
+        assert!(lines[1].ends_with(",c"), "{}", lines[1]);
+        assert!(lines[2].ends_with(",pure"), "{}", lines[2]);
+        // No --threads: an empty field, not 0.
+        let got = render(|o| csv(&cond(), &rows, o));
+        assert!(
+            got.lines()
+                .nth(1)
+                .unwrap()
+                .contains(",3,one-stream,,1,1,false,")
+        );
+    }
+
+    #[test]
+    fn the_input_line_names_the_c_backed_codecs() {
+        let mut rows = rows();
+        assert!(input_line(&cond(), &rows).contains(" · pure · "));
+        rows[0].backend = "c";
+        rows[1].backend = "c";
+        rows.push(ok("zstd", Some(19), MIB, 1, 1));
+        rows.last_mut().unwrap().backend = "c";
+        let line = input_line(&cond(), &rows);
+        assert!(line.contains(" · C: zstd, lz4 · "), "{line}");
+        let j = render(|o| json(&cond(), &rows, o));
+        let v: Value = serde_json::from_str(&j).unwrap();
+        let backends: Vec<&str> = v["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["backend"].as_str().unwrap())
+            .collect();
+        assert_eq!(backends, ["c", "c", "pure", "pure", "c"]);
+    }
+
+    #[test]
+    fn a_multi_line_failure_keeps_to_one_table_line() {
+        let mut rows = rows();
+        rows[3].outcome = Outcome::Failed("first\nsecond\tthird\u{1b}[31m".into());
+        let table = render(|o| table_only(&rows, 412 * MIB, o));
+        assert_eq!(table.lines().count(), 5, "{table}");
+        let last = table.lines().last().unwrap();
+        assert!(last.ends_with("failed: first …"), "{last}");
+        rows[3].outcome = Outcome::Failed("tab\there\u{1b}[31m".into());
+        let table = render(|o| table_only(&rows, 412 * MIB, o));
+        let last = table.lines().last().unwrap();
+        assert!(last.ends_with("failed: tab\\there\\u{1b}[31m"), "{last}");
+        // JSON and CSV keep the whole text.
+        let j = render(|o| json(&cond(), &rows, o));
+        let v: Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(v["rows"][3]["error"], "tab\there\u{1b}[31m");
+    }
+
+    #[test]
+    fn times_under_10_ms_keep_a_decimal_and_edges_round_up_a_unit() {
+        assert_eq!(time_text(40_000), "0.0 ms");
+        assert_eq!(time_text(400_000), "0.4 ms");
+        assert_eq!(time_text(9_940_000), "9.9 ms");
+        // 9.96 ms rounds to 10.0, so it takes the whole-ms form.
+        assert_eq!(time_text(9_960_000), "10 ms");
+        assert_eq!(time_text(10_000_000), "10 ms");
+        // 999.6 ms rounds to 1000 ms: a second.
+        assert_eq!(time_text(999_600_000), "1.0 s");
+        assert_eq!(time_text(999_400_000), "999 ms");
+        assert_eq!(time_text(59_950_000_000), "60.0 s");
+    }
+
+    #[test]
+    fn sizes_round_up_a_unit_at_the_edge() {
+        assert_eq!(size_text(1023), "1023 B");
+        assert_eq!(size_text(1024), "1.0 KiB");
+        // 1023.96 KiB and MiB print as 1024.0 of the unit below otherwise.
+        assert_eq!(size_text(1_048_535), "1.0 MiB");
+        assert_eq!(size_text((1023.96 * MIB as f64) as u64), "1.0 GiB");
+        assert_eq!(size_text((1023.9 * MIB as f64) as u64), "1023.9 MiB");
+        assert_eq!(size_text(2 << 30), "2.0 GiB");
+        assert_eq!(size_text(412 * MIB), "412.0 MiB");
     }
 }
