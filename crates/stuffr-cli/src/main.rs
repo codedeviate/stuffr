@@ -9,6 +9,7 @@ use stuffr::entries::{self, ConvertOpts, ExtractOpts, SalvageOpts, Selection};
 use stuffr::ops::{self, CompressOpts, DecompressOpts, Input, Output, RecompressOpts};
 use stuffr::{Chain, FormatId};
 use stuffr_cli::cli::{Cli, Command};
+use stuffr_cli::format_by_name;
 
 /// The `--examples` page. A static asset rather than an inline literal so it
 /// reads (and diffs) like the terminal page it is, not like Rust source.
@@ -70,6 +71,8 @@ fn main() -> ExitCode {
 /// `Cat`, `Info`, `Formats` and `List` never write anywhere else — `List`
 /// prints one line per entry (or a JSON array) straight to stdout, the same
 /// early-closing-reader shape as `Cat` (e.g. `stuffr list big.tar | head`).
+/// `Bench` prints its table, JSON or CSV to stdout and nothing else there
+/// (`stuffr bench --csv a.log | head -3`).
 /// `Pack`, `Unpack` and `Convert` write to stdout only when `-o -` was passed
 /// explicitly (`Convert` also takes it as its second positional); every other
 /// destination is a real file, where a `BrokenPipe`
@@ -77,9 +80,11 @@ fn main() -> ExitCode {
 /// swallowed (see `run`).
 fn destination_is_stdout(cmd: &Command) -> bool {
     match cmd {
-        Command::Cat { .. } | Command::Info { .. } | Command::Formats | Command::List { .. } => {
-            true
-        }
+        Command::Cat { .. }
+        | Command::Info { .. }
+        | Command::Formats
+        | Command::List { .. }
+        | Command::Bench(_) => true,
         // Only the `--list` row-per-record report is the "big data to
         // stdout" shape `Cat`/`List` are; the default summary line goes to
         // stderr the same way `unpack`/`test` print theirs.
@@ -669,6 +674,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             Ok(())
         }
         Command::Formats => print_formats(),
+        Command::Bench(args) => stuffr_cli::bench::run(args),
         Command::InstallLinks {
             dir,
             names,
@@ -2179,36 +2185,6 @@ fn selection_of(patterns: Vec<String>, index: Vec<usize>) -> stuffr::Result<Sele
                 .into(),
         )),
     }
-}
-
-/// Resolves a `--format` name against the registry.
-///
-/// `FormatId` holds a `&'static str` so the registry can be built from
-/// constants without allocation, but a flag value arrives at runtime as a
-/// `String`. Rather than leak it to reach `'static`, look it up: the registry
-/// already holds the `'static` id, and an unknown name gets a real error
-/// naming what this build does have.
-fn format_by_name(name: &str) -> stuffr::Result<FormatId> {
-    stuffr::registry()
-        .matrix()
-        .into_iter()
-        .find(|r| r.id.as_str() == name)
-        .map(|r| r.id)
-        .ok_or_else(|| {
-            let known: Vec<&str> = stuffr::registry()
-                .matrix()
-                .iter()
-                .map(|r| r.id.as_str())
-                .collect();
-            stuffr::Error::Usage(format!(
-                "unknown format `{name}`; this build has: {}",
-                if known.is_empty() {
-                    "none".to_string()
-                } else {
-                    known.join(", ")
-                }
-            ))
-        })
 }
 
 /// Resolves `salvage --format` against the set of container formats salvage

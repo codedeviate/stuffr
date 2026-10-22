@@ -7,7 +7,7 @@
 //! owns everything that isn't the argument shape: parsing, dispatch, and the
 //! examples text itself.
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
@@ -269,6 +269,15 @@ pub enum Command {
     },
     /// List the formats this build contains.
     Formats,
+    /// Compare compression formats on your own files: size, ratio, and
+    /// compress and decompress time for each one.
+    ///
+    /// Every format runs under the same conditions: the same input (all in
+    /// memory, or all streamed from disk when it is over half of
+    /// --memory-limit), the same thread setting, and one untimed warm-up
+    /// read first. Only codec work is timed. A format that fails is a row
+    /// marked failed, not an exit code. Timings need a release build.
+    Bench(BenchArgs),
     /// Create compatibility symlinks (`bzip2`, `bunzip2`, `bzcat`,
     /// `bzip2recover`) to this binary in a directory. Opt-in, never automatic.
     InstallLinks {
@@ -442,4 +451,54 @@ pub enum Command {
         #[arg(long)]
         format: Option<String>,
     },
+}
+
+/// The arguments of `stuffr bench`.
+#[derive(Args, Debug)]
+pub struct BenchArgs {
+    /// Files to benchmark, or quoted glob patterns (`'logs/*.log'`).
+    ///
+    /// A path that exists is used as is; one that does not and contains
+    /// `*`, `?` or `[` is expanded, its matches sorted. A directory is
+    /// refused: name its files instead.
+    #[arg(required = true, num_args = 1.., value_name = "INPUTS")]
+    pub inputs: Vec<String>,
+    /// Only these formats, comma-separated or repeated. Default: every codec
+    /// this build can write with its real encoder.
+    #[arg(long, value_name = "FORMAT", value_delimiter = ',')]
+    pub formats: Vec<String>,
+    /// Run every level of each format instead of its default level only.
+    #[arg(long)]
+    pub levels: bool,
+    /// Compress each file as its own stream instead of all of them as one.
+    #[arg(long)]
+    pub per_file: bool,
+    /// Encode with N worker threads. 0 means auto-detect.
+    ///
+    /// OMITTING this flag is not the same as passing 0: without it, stuffr
+    /// encodes single-threaded, so the same input always produces the same
+    /// bytes on any machine. Multi-threaded xz and zstd split the input
+    /// per worker, so their output depends on the worker count. bench
+    /// ignores STUFFR_THREADS: threads come only from this flag.
+    #[arg(long)]
+    pub threads: Option<usize>,
+    /// Cap the memory stuffr will ask for, e.g. 512M or 2G.
+    ///
+    /// Input over half of it is streamed from disk rather than held in
+    /// memory. Defaults to 25% of available RAM, honouring cgroup limits.
+    #[arg(long, value_name = "SIZE")]
+    pub memory_limit: Option<String>,
+    /// Time each row N times and report the medians.
+    #[arg(long, value_name = "N", default_value_t = 1,
+          value_parser = clap::value_parser!(u32).range(1..))]
+    pub repeat: u32,
+    /// Emit one machine-readable JSON object instead of the table.
+    #[arg(long, conflicts_with = "csv")]
+    pub json: bool,
+    /// Emit CSV, one line per row, instead of the table.
+    #[arg(long)]
+    pub csv: bool,
+    /// Print the table alone: no input line, no winners, no progress.
+    #[arg(short = 'q', long)]
+    pub table_only: bool,
 }

@@ -93,6 +93,9 @@ zoo = ["stuffr/zoo"]
 stuffr = { path = "../stuffr", version = "0.16.1", features = ["serde"] }
 clap = { workspace = true }
 serde_json = "1"
+# `stuffr bench 'logs/*.log'`: expands a quoted pattern the shell left alone.
+# Maintained by rust-lang, no dependencies of its own.
+glob = "0.3"
 # The gzip compatibility family's member layer: raw deflate/inflate and CRC32.
 # Already in every build's graph through stuffr-formats; the backend is never
 # changed here (no zlib/zlib-ng/zlib-rs feature anywhere).

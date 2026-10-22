@@ -1288,6 +1288,57 @@ WHAT THIS BUILD CAN DO
       SALVAGE reads weak for: tar, cpio, ar.
 
 
+BENCHMARKING FORMATS ON YOUR OWN DATA
+
+  stuffr bench access.log*
+      Compresses and decompresses the files with every codec this build can
+      write with its real encoder, at each one's default level, and prints
+      one row per format: compressed size, ratio, compress time and
+      decompress time. Below the table it names the smallest, the fastest
+      to compress, the fastest to decompress and the best balance of the
+      three. The files are one stream, as `cat access.log* | stuffr pack`
+      would see them. A quoted pattern (`'logs/*.log'`) is expanded by
+      stuffr itself, sorted; no match is exit 2, and so is a directory
+      (name its files: `logs/*`). Every format runs under the same
+      conditions, with one untimed warm-up read first, and only codec work
+      is timed. A format that fails is a row marked failed, never an exit
+      code. Timings from a debug build mean nothing, so bench refuses to
+      run in one (exit 2): build with --release.
+
+  stuffr bench --levels --formats zstd,xz access.log
+      --formats limits the run to the named formats; a container, a
+      read-only format or one this build only has a weak fallback encoder
+      for is refused (exit 2) with the reason. --levels runs every level of
+      each format instead of the default only; lz4 and snappy have no
+      levels and keep their one row.
+
+  stuffr bench --per-file a.log b.log
+      --per-file compresses each file as its own stream and sums the
+      results, which is what a format pays when files are stored apart.
+
+  stuffr bench --threads 4 big.log
+      --threads works as on pack: omitted means single-threaded, 0 means
+      auto-detect. bench ignores STUFFR_THREADS; threads come only from
+      this flag, so every format gets the same setting.
+
+  stuffr bench --memory-limit 1G big.log
+      --memory-limit caps what stuffr asks for. Input over half of it is
+      streamed from disk instead of held in memory, for every format alike,
+      and the input line says "streamed from disk".
+
+  stuffr bench --repeat 5 access.log
+      --repeat N times each row N times and reports the medians.
+
+  stuffr bench --json access.log | jq .winners
+  stuffr bench --csv access.log > bench.csv
+      --json prints one object (conditions, rows with scores, winners);
+      --csv one line per row. They cannot be combined.
+
+  stuffr bench --table-only access.log
+      --table-only (-q) prints the table alone: no input line, no winners
+      and no progress line on stderr.
+
+
 COMPATIBILITY LINKS (INSTALL-LINKS)
 
   stuffr install-links --dir ~/.local/bin

@@ -15731,3 +15731,87 @@ fn unpack_of_a_piped_implode_zip_is_exit_3_and_names_the_way_out() {
     );
     assert!(!err.contains("cannot decompress"), "{err}");
 }
+
+// `stuffr bench`. The binary under test is a debug build, where bench
+// refuses to time anything, so these cover the usage errors (which are
+// checked first) and the refusal itself.
+
+fn bench_err(args: &[&str]) -> (Option<i32>, String) {
+    let out = run_output(args);
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn bench_refuses_a_debug_build() {
+    let f = tmp("bench-refuse.txt");
+    std::fs::write(&f, b"hello bench\n").unwrap();
+    let (code, err) = bench_err(&["bench", f.to_str().unwrap()]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("build with --release"), "{err}");
+}
+
+#[test]
+fn bench_with_no_match_is_a_usage_error() {
+    let dir = tmp_dir();
+    let pattern = format!("{}/nomatch*.log", dir.display());
+    let (code, err) = bench_err(&["bench", &pattern]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("no input matched"), "{err}");
+}
+
+#[test]
+fn bench_on_a_missing_path_is_a_usage_error() {
+    let dir = tmp_dir();
+    let missing = dir.join("absent.log");
+    let (code, err) = bench_err(&["bench", missing.to_str().unwrap()]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("no input matched"), "{err}");
+}
+
+#[test]
+fn bench_on_a_directory_is_a_usage_error() {
+    let dir = tmp_dir();
+    let (code, err) = bench_err(&["bench", dir.to_str().unwrap()]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("is a directory"), "{err}");
+}
+
+#[test]
+fn bench_rejects_json_with_csv() {
+    let f = tmp("bench-json-csv.txt");
+    std::fs::write(&f, b"x").unwrap();
+    let (code, err) = bench_err(&["bench", "--json", "--csv", f.to_str().unwrap()]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("cannot be used with"), "{err}");
+}
+
+#[test]
+fn bench_rejects_an_unknown_format() {
+    let f = tmp("bench-unknown.txt");
+    std::fs::write(&f, b"x").unwrap();
+    let (code, err) = bench_err(&["bench", "--formats", "nosuch", f.to_str().unwrap()]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("unknown format `nosuch`"), "{err}");
+}
+
+#[test]
+fn bench_rejects_a_container_format() {
+    let f = tmp("bench-container.txt");
+    std::fs::write(&f, b"x").unwrap();
+    let (code, err) = bench_err(&["bench", "--formats", "tar", f.to_str().unwrap()]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("cannot be benchmarked"), "{err}");
+    assert!(err.contains("container"), "{err}");
+}
+
+#[test]
+fn bench_rejects_a_zero_repeat() {
+    let f = tmp("bench-repeat.txt");
+    std::fs::write(&f, b"x").unwrap();
+    let (code, err) = bench_err(&["bench", "--repeat", "0", f.to_str().unwrap()]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("--repeat"), "{err}");
+}

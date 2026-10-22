@@ -13,3 +13,34 @@ pub mod bench;
 pub mod cli;
 pub mod compat;
 pub mod size;
+
+/// Resolves a `--format` name against the registry. Shared by
+/// `main`'s verbs and `stuffr bench`.
+///
+/// `FormatId` holds a `&'static str` so the registry can be built from
+/// constants without allocation, but a flag value arrives at runtime as a
+/// `String`. Rather than leak it to reach `'static`, look it up: the registry
+/// already holds the `'static` id, and an unknown name gets a real error
+/// naming what this build does have.
+pub fn format_by_name(name: &str) -> stuffr::Result<stuffr::FormatId> {
+    stuffr::registry()
+        .matrix()
+        .into_iter()
+        .find(|r| r.id.as_str() == name)
+        .map(|r| r.id)
+        .ok_or_else(|| {
+            let known: Vec<&str> = stuffr::registry()
+                .matrix()
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect();
+            stuffr::Error::Usage(format!(
+                "unknown format `{name}`; this build has: {}",
+                if known.is_empty() {
+                    "none".to_string()
+                } else {
+                    known.join(", ")
+                }
+            ))
+        })
+}

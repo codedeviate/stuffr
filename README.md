@@ -1729,6 +1729,7 @@ stuffr test     ARCHIVE                    # integrity check, no extraction
 stuffr salvage  ARCHIVE [-C dir | -o FILE | --list] [--index N...]  # zip/arc/zoo/lha/arj/tar/cpio/ar; scan position, not list's index
 stuffr convert  IN -o OUT                  # change codec or container (.tgz -> .zip)
 stuffr install-links --dir ~/.local/bin    # opt-in compat symlinks, never automatic
+stuffr bench    FILES... [--formats F,G] [--levels]  # compare codecs on your own data
 ```
 
 `convert` changes a format without unpacking to disk. When the container is
@@ -1747,6 +1748,29 @@ argv[0]-dispatch into the same binary, so the tools they are named for drop
 into existing scripts unchanged: `bzip2`, `bunzip2`, `bzcat` and
 `bzip2recover`, `gzip`, `xz`, `zstd`, `lz4` and `unzip` with its siblings
 today, one family per release — see [Compatibility links](#compatibility-links).
+
+### `stuffr bench`
+
+`bench` compares codecs on your own files instead of a published corpus:
+
+```
+stuffr bench access.log*                       # every benchable codec, default levels
+stuffr bench --levels --formats zstd,xz a.log  # every level of two formats
+stuffr bench --per-file a.log b.log            # each file its own stream
+stuffr bench --json access.log | jq .winners   # or --csv; --table-only (-q) for the table alone
+```
+
+Each row gives the compressed size, the ratio and the compress and
+decompress times; below the table come the smallest, the fastest each way
+and the best balance. Every format runs under the same conditions: the same
+input (in memory, or streamed from disk when it is over half of
+`--memory-limit`), the same `--threads` setting (bench ignores
+`STUFFR_THREADS`), and one untimed warm-up read first. Only codec work is
+timed, and `--repeat N` reports the median of N runs. Benchable means a codec
+this build writes with its real encoder: on the pure tier that leaves zstd
+out (its encoder there is the weak fallback); `--features c-backed` puts it
+back. A format that fails is a row marked failed, not an exit code. Timings
+need a release build; a debug build refuses with exit 2.
 
 ### Two safety defaults that are not negotiable
 
