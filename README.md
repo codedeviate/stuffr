@@ -384,14 +384,16 @@ read list.
 > **2951** tests under `--all-features`, **2837** on the default tier —
 > measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
-> `0.16.1` is a PATCH with no library or CLI change: it makes `make check`
-> easier on a shared machine. The gate runs 4 test threads by default;
+> `0.16.1` is a PATCH. One fix: `zstd -l` could read a byte of its input
+> twice when a short frame sat at the end of the file (since `0.15.1`;
+> output was never affected). The rest makes `make check` easier on a
+> shared machine, with no library change. The gate runs 4 test threads by default;
 > `make check FULL=1` lifts that, `make fuzz`'s 1 GiB memory cap and the
 > Docker thread limit. The heaviest tests use far less memory (the largest
 > fell from about 1.7 GB). No test leaves a `stuffr-*` folder in the temp
 > directory any more, even after a panic or a read-only tree; the gate fails
 > on a new leak and sweeps folders older than a day (`make sweep-tmp`).
-> **2956** tests under `--all-features`, **2842** on the default tier —
+> **2957** tests under `--all-features`, **2843** on the default tier —
 > measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
 > Two user-visible changes on archives that already exist. First, `salvage
