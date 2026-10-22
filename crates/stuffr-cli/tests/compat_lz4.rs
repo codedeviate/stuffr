@@ -3761,6 +3761,9 @@ mod unix {
                 vec![b(), bad(), c4()],
             ),
             lz4_case("lz4", &["-m", "-d", "lg.lz4", "b.lz4"], vec![lg(), b()]),
+            // 0.17.0 fuzz smoke: one name twice, decoded by its suffix.
+            lz4_case("lz4", &["-m", "-1", "lg.lz4", "lg.lz4"], vec![lg()]),
+            lz4_case("lz4", &["-m", "lg.lz4", "lg.lz4"], vec![lg()]),
             lz4_case(
                 "lz4",
                 &["-m", "-d", "--rm", "lg.lz4", "b.lz4"],

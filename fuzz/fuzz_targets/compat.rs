@@ -1236,37 +1236,58 @@ fn lz4_lists(args: &[&str]) -> bool {
 /// Whether an lz4 run takes several inputs (`-m`, `-r`, `--multiple`,
 /// `--list`, `lz4cat`), and whether it decodes or tests (the last of `-d`,
 /// `-t`, `-z`, `--list` and their long forms wins; `unlz4` and `lz4cat`
-/// start as decoders), `--list` not counting as one.
+/// start as decoders), `--list` not counting as one. With none of them
+/// given, the first input decides, as `compat::lz4::cli::op_for` does: a
+/// name ending in `.lz4` decodes, standard input and any other name
+/// compress (lz4.1: ".lz4 extension implies --decompress by default").
+/// Missing that rule was the 0.17.0 fuzz smoke's `lz4 -m -1 a.lz4 a.lz4`
+/// over a legacy frame with a tail: the first input's undecodable tail is
+/// hidden at the `-m` level 1 and only the second's `a already exists; not
+/// overwritten` shows, so lz4 1.10.0 exits 2 over one line (probed with
+/// the case's files), a decode's bound and not a compress's equality.
 fn lz4_shape(name: &str, args: &[&str]) -> (bool, bool) {
     let mut several = name == "lz4cat";
-    let mut decodes = matches!(name, "unlz4" | "lz4cat");
+    let mut mode: Option<bool> = matches!(name, "unlz4" | "lz4cat").then_some(true);
+    let mut first: Option<&str> = None;
+    let mut ended = false;
     let mut it = args.iter();
     while let Some(&a) = it.next() {
+        if ended {
+            first.get_or_insert(a);
+            continue;
+        }
         match a {
-            "--" => break,
+            "--" => ended = true,
             "-D" => {
                 it.next();
+            }
+            "-" => {
+                first.get_or_insert(a);
             }
             "--multiple" => several = true,
             "--list" => {
                 several = true;
-                decodes = false;
+                mode = Some(false);
             }
-            "--decompress" | "--uncompress" | "--test" => decodes = true,
-            "--compress" => decodes = false,
+            "--decompress" | "--uncompress" | "--test" => mode = Some(true),
+            "--compress" => mode = Some(false),
             _ if a.starts_with('-') && !a.starts_with("--") => {
                 for ch in a[1..].chars() {
                     match ch {
                         'm' | 'r' => several = true,
-                        'd' | 't' => decodes = true,
-                        'z' => decodes = false,
+                        'd' | 't' => mode = Some(true),
+                        'z' => mode = Some(false),
                         _ => {}
                     }
                 }
             }
+            _ if !a.starts_with('-') => {
+                first.get_or_insert(a);
+            }
             _ => {}
         }
     }
+    let decodes = mode.unwrap_or_else(|| first.is_some_and(|f| f.ends_with(".lz4")));
     (several, decodes)
 }
 
@@ -1403,9 +1424,10 @@ fn lz4_failure_lines(stderr: &[u8]) -> u64 {
 ///   several inputs (`-m`, `-r`, `--list`, `lz4cat`), the count of inputs
 ///   that failed, at most the number of inputs named, and never fewer than
 ///   the failure lines on stderr (`lz4_failure_lines`); equal to them, but
-///   for a decode or test (`-d`, `-t`, `unlz4`, `lz4cat`; not `--list`) at a
-///   display level of 2 or below (`-m`, `-r` and `lz4cat` bring the default
-///   2 down to 1), where lz4 itself hides `Stream followed by undecodable
+///   for a decode or test (`-d`, `-t`, `unlz4`, `lz4cat`, or a first input
+///   ending in `.lz4` with no mode given; not `--list`) at a display level
+///   of 2 or below (`-m`, `-r` and `lz4cat` bring the default 2 down to
+///   1), where lz4 itself hides `Stream followed by undecodable
 ///   data` and only the bound holds. Under `-qq` the other lines are hidden
 ///   too, so the case is re-run with enough `-q` removed to show them
 ///   (never at `-v`: that turns declined prompts into reads of stdin).

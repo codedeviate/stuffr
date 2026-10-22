@@ -960,6 +960,11 @@ const COMPAT_SHAPES: &[&str] = &[
     "lz4-multiple-declined-prompt",
     "lz4cat-two-undecodable",
     "lz4-multiple-test-undecodable",
+    // 0.17.0 fuzz smoke: `-m` over a repeated `.lz4` operand, no `-d`. The
+    // suffix makes it a decode, so the first input's undecodable tail is
+    // hidden at level 1 and only the second's "not overwritten" shows:
+    // exit 2 over one line, as the reference gives.
+    "lz4-multiple-auto-undecodable",
     // 0.16.0 Task 7: the unzip family's names, one seed each, for its
     // command line (usage, the version screen, funzip's password). The
     // unzip family names its flavour second (`unzip-apple-…`,
@@ -1831,6 +1836,12 @@ fn lz4_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> {
         ),
         "multiple-test-undecodable" => z(
             &["-m", "-t", "a.lz4", "a.lz4"],
+            &["a.lz4"],
+            false,
+            &cat(&[&lz4_legacy_frame(&text), b"XYZW1234"]),
+        ),
+        "multiple-auto-undecodable" => z(
+            &["-m", "-1", "a.lz4", "a.lz4"],
             &["a.lz4"],
             false,
             &cat(&[&lz4_legacy_frame(&text), b"XYZW1234"]),
