@@ -1,6 +1,7 @@
 //! The timing harness for `stuffr bench`: one format at one level, run over
 //! the user's input, compressed and decompressed, with only codec work
-//! inside a timed region.
+//! inside a timed region, except the temp file's writes when the output is
+//! too large to keep in memory (below).
 //!
 //! A compression region holds encoder creation, `write_all` of the input
 //! and `Sink::finish` (which consumes the sink, so its teardown is inside
@@ -16,9 +17,11 @@
 //! the compressed temp file being part of decoding.
 //!
 //! The compressed output stays in memory whenever its worst case (input +
-//! 1/8 + 1 KiB, the same test for every codec) fits under half of
-//! `--memory-limit`, streamed input included; only past that does it go to
-//! one temp file. Both destinations have the same shape: a 64 KiB
+//! 1/8 + 1 KiB, the same test for every codec) fits under the memory left
+//! for it: half of `--memory-limit` when the input is held in memory, all
+//! of it when the input is streamed. Only past that does it go to one temp
+//! file, and then its writes (to the page cache, through the 64 KiB
+//! buffer) fall inside the compression regions. Both destinations have the same shape: a 64 KiB
 //! `BufWriter` over a pre-reserved `Vec`, or over the temp file, so a codec
 //! that writes in small pieces pays the same either way. Decoding reads the
 //! same shape back: the `Vec` as a seekable, sized source, or the temp file
@@ -206,20 +209,28 @@ enum Dest {
 }
 
 /// Memory whenever the worst-case output of `input_len` bytes (+ 1/8 +
-/// 1 KiB) fits under half of `memory_limit`, whether the input itself is in
-/// memory or streamed; the temp file only past that.
-fn destination(input_len: u64, memory_limit: u64) -> Dest {
+/// 1 KiB) fits in the memory left for it: half of `memory_limit` beside
+/// input held in memory, all of it when the input is `streamed` (it holds
+/// no copy of the input). The temp file only past that.
+fn destination(input_len: u64, memory_limit: u64, streamed: bool) -> Dest {
     // Small test inputs always fit; this is how the tests reach the temp
     // file with a memory limit the decoders can still work under.
     #[cfg(test)]
     if tests::FORCE_DISK.with(std::cell::Cell::get) {
         return Dest::TempFile;
     }
-    let worst = input_len.saturating_add(input_len / 8).saturating_add(1024);
-    if worst <= memory_limit / 2 {
-        Dest::Memory
+    // Checked, not saturating: a worst case past u64 never fits.
+    let worst = input_len
+        .checked_add(input_len / 8)
+        .and_then(|n| n.checked_add(1024));
+    let budget = if streamed {
+        memory_limit
     } else {
-        Dest::TempFile
+        memory_limit / 2
+    };
+    match worst {
+        Some(w) if w <= budget => Dest::Memory,
+        _ => Dest::TempFile,
     }
 }
 
@@ -275,10 +286,9 @@ fn run(
         Mode::PerFile => parts.chunks(1).collect(),
     };
     let group_len = |g: &[Part<'_>]| g.iter().map(Part::len).sum::<u64>();
-    let temp = if groups
-        .iter()
-        .any(|g| destination(group_len(g), plan.memory_limit) == Dest::TempFile)
-    {
+    let streamed = matches!(input, Input::Files(_));
+    let dest = |g: &[Part<'_>]| destination(group_len(g), plan.memory_limit, streamed);
+    let temp = if groups.iter().any(|g| dest(g) == Dest::TempFile) {
         Some(TempOut::create()?.0)
     } else {
         None
@@ -295,7 +305,7 @@ fn run(
             let job = Job {
                 name: id.as_str(),
                 codec: codec.as_ref(),
-                dest: destination(expected, plan.memory_limit),
+                dest: dest(group),
                 encode: &encode,
                 decode: &decode,
                 temp: temp.as_ref(),
@@ -1132,36 +1142,47 @@ mod tests {
     #[test]
     fn the_output_goes_to_memory_whenever_its_worst_case_fits() {
         // 0 bytes in: worst case 1 KiB, which fits under 2048 / 2.
-        assert_eq!(destination(0, 2048), Dest::Memory);
-        assert_eq!(destination(0, 2047), Dest::TempFile);
+        // Beside input in memory: half the limit.
+        assert_eq!(destination(0, 2048, false), Dest::Memory);
+        assert_eq!(destination(0, 2047, false), Dest::TempFile);
         // 8000 + 1000 + 1024.
-        assert_eq!(destination(8000, 2 * 10_024), Dest::Memory);
-        assert_eq!(destination(8000, 2 * 10_024 - 1), Dest::TempFile);
-        assert_eq!(destination(u64::MAX, u64::MAX), Dest::TempFile);
+        assert_eq!(destination(8000, 2 * 10_024, false), Dest::Memory);
+        assert_eq!(destination(8000, 2 * 10_024 - 1, false), Dest::TempFile);
+        assert_eq!(destination(u64::MAX, u64::MAX, false), Dest::TempFile);
+        // Streamed input holds no copy: the whole limit.
+        assert_eq!(destination(8000, 10_024, true), Dest::Memory);
+        assert_eq!(destination(8000, 10_023, true), Dest::TempFile);
+        assert_eq!(destination(u64::MAX, u64::MAX, true), Dest::TempFile);
     }
 
-    /// Streamed input whose output fits stays off the disk; only output
-    /// past the limit makes a temp file.
+    /// Streamed input whose output fits in the whole limit stays off the
+    /// disk, one stream included; only output past the limit makes a temp
+    /// file.
     #[test]
     fn streamed_input_compresses_to_memory_when_the_output_fits() {
         let _lock = armed_lock();
         let s = Scratch::new();
         let (a, b) = (text(16 * 1024, 1), text(16 * 1024, 2));
         let paths = vec![s.file("a", &a), s.file("b", &b)];
-        // 32 KiB is over 40000 / 2, so the input is streamed; each file's
-        // worst case (16384 + 2048 + 1024) fits under it, the pair's not.
-        let limit = 40_000;
-        let files = load_input(&paths, limit).unwrap().0;
+        // 32 KiB is over 40000 / 2, so the input is streamed. One stream's
+        // worst case (32768 + 4096 + 1024 = 37888) fits under 40000, not
+        // under 37887; each file's (19456) fits under either.
+        let files = load_input(&paths, 40_000).unwrap().0;
         assert!(matches!(files, Input::Files(_)));
         let memory = Input::Memory(vec![a, b]);
-        for (mode, want_temps) in [(Mode::PerFile, 0), (Mode::OneStream, 1)] {
+        for (mode, limit, want_temps) in [
+            (Mode::PerFile, 40_000, 0),
+            (Mode::OneStream, 40_000, 0),
+            (Mode::OneStream, 37_888, 0),
+            (Mode::OneStream, 37_887, 1),
+        ] {
             let p = Plan {
                 memory_limit: limit,
                 ..plan(mode, 1)
             };
             let mut got = None;
             let made = temps_made(|| got = Some(run("gzip", &files, &p)));
-            assert_eq!(made, want_temps, "{mode:?}");
+            assert_eq!(made, want_temps, "{mode:?} at {limit}");
             let want = run("gzip", &memory, &plan(mode, 1)).bytes_out;
             assert_eq!(got.unwrap().bytes_out, want, "{mode:?}");
         }

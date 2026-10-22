@@ -1304,7 +1304,8 @@ BENCHMARKING FORMATS ON YOUR OWN DATA
       file's size is taken once at the start, so a log still being written
       is benched as it was then. Every format runs under the same
       conditions, with one untimed warm-up read first, and only codec work
-      is timed. The input line names the codecs that ran through a C
+      is timed (except the temp file's writes, when the output is too
+      large for memory). The input line names the codecs that ran through a C
       library ("C: zstd, xz"), or says "pure". A format that fails is a
       row marked failed, never an exit code. Timings from a debug build
       mean nothing, so bench refuses to run in one (exit 2): build with
@@ -1333,8 +1334,10 @@ BENCHMARKING FORMATS ON YOUR OWN DATA
       --memory-limit caps what stuffr asks for. Input over half of it is
       streamed from disk instead of held in memory, for every format alike,
       and the input line says "streamed from disk". The compressed output
-      stays in memory unless its worst case is over half of it; only then
-      does it go to one temp file, again for every format alike.
+      stays in memory unless its worst case is over half of the limit
+      (input in memory) or the whole limit (input streamed); only then
+      does it go to one temp file, again for every format alike, and its
+      writes count in the compress time.
 
   stuffr bench --repeat 5 access.log
       --repeat N times each row N times and reports the medians.

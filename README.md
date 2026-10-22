@@ -1765,11 +1765,13 @@ decompress times; below the table come the smallest, the fastest each way
 and the best balance. Every format runs under the same conditions: the same
 input (in memory, or streamed from disk when it is over half of
 `--memory-limit`), the same compressed-output destination (memory unless its
-worst case is over half of `--memory-limit`, then one temp file), the same
+worst case is over the limit's room for it, half of `--memory-limit` beside
+in-memory input and all of it for streamed input, then one temp file), the same
 `--threads` setting for compression (bench ignores `STUFFR_THREADS`;
 decompression is always single-threaded), and one untimed warm-up read
 first. Each file's size is taken once at the start, so a log still being
-written is benched as it was then. Only codec work is timed, and `--repeat N`
+written is benched as it was then. Only codec work is timed (except the temp
+file's writes, when the output needs one), and `--repeat N`
 reports the median of N runs. The input line names the codecs that ran
 through a C library (`C: zstd, xz`), or says `pure`. Benchable means a codec
 this build writes with its real encoder: zstd can be benchmarked only in a
