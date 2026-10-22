@@ -460,7 +460,8 @@ pub struct BenchArgs {
     ///
     /// A path that exists is used as is; one that does not and contains
     /// `*`, `?` or `[` is expanded, its matches sorted. A directory is
-    /// refused: name its files instead.
+    /// refused: name its files instead. So is a pipe or device: bench needs
+    /// each file's size, so write a pipe to a file first.
     #[arg(required = true, num_args = 1.., value_name = "INPUTS")]
     pub inputs: Vec<String>,
     /// Only these formats, comma-separated or repeated. Default: every codec
@@ -473,13 +474,15 @@ pub struct BenchArgs {
     /// Compress each file as its own stream instead of all of them as one.
     #[arg(long)]
     pub per_file: bool,
-    /// Encode with N worker threads. 0 means auto-detect.
+    /// Compress with N worker threads. 0 means auto-detect.
     ///
-    /// OMITTING this flag is not the same as passing 0: without it, stuffr
-    /// encodes single-threaded, so the same input always produces the same
-    /// bytes on any machine. Multi-threaded xz and zstd split the input
-    /// per worker, so their output depends on the worker count. bench
-    /// ignores STUFFR_THREADS: threads come only from this flag.
+    /// Threads apply to compression only: decompression is always timed
+    /// single-threaded. OMITTING this flag is not the same as passing 0:
+    /// without it, stuffr compresses single-threaded, so the same input
+    /// always produces the same bytes on any machine. Multi-threaded xz and
+    /// zstd split the input per worker, so their output depends on the
+    /// worker count. bench ignores STUFFR_THREADS: threads come only from
+    /// this flag.
     #[arg(long)]
     pub threads: Option<usize>,
     /// Cap the memory stuffr will ask for, e.g. 512M or 2G.
@@ -499,6 +502,6 @@ pub struct BenchArgs {
     #[arg(long)]
     pub csv: bool,
     /// Print the table alone: no input line, no winners, no progress.
-    #[arg(short = 'q', long)]
+    #[arg(short = 'q', long, conflicts_with_all = ["json", "csv"])]
     pub table_only: bool,
 }

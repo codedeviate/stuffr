@@ -223,7 +223,9 @@ fn has_glob_chars(s: &str) -> bool {
 /// missing one with glob characters is expanded (sorted, dot files only
 /// when the pattern spells the dot, as a shell does). Directories a pattern
 /// matches are passed over; one named outright, or the only kind of match a
-/// pattern has, is refused.
+/// pattern has, is refused. A FIFO, device or socket, named or matched, is
+/// refused from its metadata (it is never opened): bench needs each file's
+/// size up front. A symlink counts as what it points to.
 fn expand_inputs(operands: &[String]) -> stuffr::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for op in operands {
@@ -232,7 +234,7 @@ fn expand_inputs(operands: &[String]) -> stuffr::Result<Vec<PathBuf>> {
             if path.is_dir() {
                 return Err(directory_error(path));
             }
-            files.push(path.to_path_buf());
+            files.push(regular(path)?);
             continue;
         }
         if !has_glob_chars(op) {
@@ -251,7 +253,7 @@ fn expand_inputs(operands: &[String]) -> stuffr::Result<Vec<PathBuf>> {
             if m.is_dir() {
                 first_dir.get_or_insert(m);
             } else {
-                found.push(m);
+                found.push(regular(&m)?);
             }
         }
         if found.is_empty() {
@@ -261,6 +263,18 @@ fn expand_inputs(operands: &[String]) -> stuffr::Result<Vec<PathBuf>> {
         files.extend(found);
     }
     Ok(files)
+}
+
+/// `path` if it is (or links to) a regular file, else the usage error.
+fn regular(path: &Path) -> stuffr::Result<PathBuf> {
+    if std::fs::metadata(path)?.is_file() {
+        Ok(path.to_path_buf())
+    } else {
+        Err(Error::Usage(format!(
+            "{} is not a regular file; bench needs files whose size it can read",
+            path.display()
+        )))
+    }
 }
 
 fn no_match(op: &str) -> Error {
@@ -390,6 +404,19 @@ mod tests {
             format!("{dir} is a directory; name its files (e.g. {dir}/*)")
         );
         assert!(usage(expand_inputs(&[s.s("lo*")])).contains("is a directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_device_is_refused_and_a_symlink_to_a_file_is_not() {
+        let s = Scratch::new();
+        let want = "/dev/null is not a regular file; bench needs files whose size it can read";
+        assert_eq!(usage(expand_inputs(&["/dev/null".into()])), want);
+        assert_eq!(usage(expand_inputs(&["/dev/nul?".into()])), want);
+        let target = s.file("real.log");
+        let link = s.0.join("link.log");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(expand_inputs(&[s.s("link.log")]).unwrap(), vec![link]);
     }
 
     #[test]

@@ -15819,3 +15819,41 @@ fn bench_rejects_a_zero_repeat() {
     assert_eq!(code, Some(2), "{err}");
     assert!(err.contains("--repeat"), "{err}");
 }
+
+/// A FIFO is refused from its metadata, never opened: opening one with no
+/// writer would block bench for ever.
+#[cfg(unix)]
+#[test]
+fn bench_refuses_a_fifo_named_or_matched() {
+    let dir = tmp_dir();
+    let fifo = dir.join("pipe.log");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let want = format!(
+        "{} is not a regular file; bench needs files whose size it can read",
+        fifo.display()
+    );
+    let (code, err) = bench_err(&["bench", fifo.to_str().unwrap()]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains(&want), "{err}");
+    let pattern = format!("{}/*.log", dir.display());
+    let (code, err) = bench_err(&["bench", &pattern]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains(&want), "{err}");
+}
+
+#[test]
+fn bench_table_only_conflicts_with_json_and_csv() {
+    let f = tmp("bench-q-json.txt");
+    std::fs::write(&f, b"x").unwrap();
+    for machine in ["--json", "--csv"] {
+        for q in ["-q", "--table-only"] {
+            let (code, err) = bench_err(&["bench", q, machine, f.to_str().unwrap()]);
+            assert_eq!(code, Some(2), "{q} {machine}: {err}");
+            assert!(err.contains("cannot be used with"), "{q} {machine}: {err}");
+        }
+    }
+}
