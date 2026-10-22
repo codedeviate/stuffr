@@ -233,7 +233,7 @@ fn run(
 /// no `--threads` means single-threaded whatever `STUFFR_THREADS` says
 /// (`resolved_budget` would read it). With a CLI value the variable is
 /// already ignored: `resolve_workers` takes the CLI value first.
-fn governor_for(plan: &Plan) -> Option<Arc<Governor>> {
+pub fn governor_for(plan: &Plan) -> Option<Arc<Governor>> {
     let t = plan.threads?;
     resolved_budget(&CompressOpts {
         threads: Some(t),
