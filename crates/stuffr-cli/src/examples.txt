@@ -1299,18 +1299,23 @@ BENCHMARKING FORMATS ON YOUR OWN DATA
       three. The files are one stream, as `cat access.log* | stuffr pack`
       would see them. A quoted pattern (`'logs/*.log'`) is expanded by
       stuffr itself, sorted; no match is exit 2, and so is a directory
-      (name its files: `logs/*`). Every format runs under the same
+      (name its files: `logs/*`). A pipe or device is exit 2 as well:
+      bench needs each file's size, so write a pipe to a file first. Each
+      file's size is taken once at the start, so a log still being written
+      is benched as it was then. Every format runs under the same
       conditions, with one untimed warm-up read first, and only codec work
-      is timed. A format that fails is a row marked failed, never an exit
-      code. Timings from a debug build mean nothing, so bench refuses to
-      run in one (exit 2): build with --release.
+      is timed. The input line names the codecs that ran through a C
+      library ("C: zstd, xz"), or says "pure". A format that fails is a
+      row marked failed, never an exit code. Timings from a debug build
+      mean nothing, so bench refuses to run in one (exit 2): build with
+      --release.
 
   stuffr bench --levels --formats xz,brotli access.log
       --formats limits the run to the named formats; a container, a
       read-only format or one this build only has a weak fallback encoder
       for is refused (exit 2) with the reason. zstd can be benchmarked only
-      in a --features c-backed build: the pure tier's zstd encoder is a
-      weak fallback. --levels runs every level of each format instead of
+      in a build with the zstd-c feature (part of c-backed, and in the
+      Homebrew build): the pure tier's zstd encoder is a weak fallback. --levels runs every level of each format instead of
       the default only; lz4 and snappy have no levels and keep their one
       row.
 
@@ -1319,22 +1324,28 @@ BENCHMARKING FORMATS ON YOUR OWN DATA
       results, which is what a format pays when files are stored apart.
 
   stuffr bench --threads 4 big.log
-      --threads works as on pack: omitted means single-threaded, 0 means
-      auto-detect. bench ignores STUFFR_THREADS; threads come only from
-      this flag, so every format gets the same setting.
+      --threads sets the compression threads, as on pack: omitted means
+      single-threaded, 0 means auto-detect. Decompression is always timed
+      single-threaded. bench ignores STUFFR_THREADS; threads come only
+      from this flag, so every format gets the same setting.
 
   stuffr bench --memory-limit 1G big.log
       --memory-limit caps what stuffr asks for. Input over half of it is
       streamed from disk instead of held in memory, for every format alike,
-      and the input line says "streamed from disk".
+      and the input line says "streamed from disk". The compressed output
+      stays in memory unless its worst case is over half of it; only then
+      does it go to one temp file, again for every format alike.
 
   stuffr bench --repeat 5 access.log
       --repeat N times each row N times and reports the medians.
 
   stuffr bench --json access.log | jq .winners
   stuffr bench --csv access.log > bench.csv
-      --json prints one object (conditions, rows with scores, winners);
-      --csv one line per row. They cannot be combined.
+      --json prints one object (conditions, rows with scores and each
+      row's backend, winners); --csv one line per row, the run's
+      conditions and the row's backend after the measurements. The README
+      documents both schemas. They cannot be combined, nor used with
+      --table-only.
 
   stuffr bench --table-only access.log
       --table-only (-q) prints the table alone: no input line, no winners

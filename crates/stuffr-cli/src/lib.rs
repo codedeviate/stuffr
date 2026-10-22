@@ -7,7 +7,17 @@
 //! list of flag names) keeps the assertion honest as the surface grows.
 //! [`compat`] is here so that `main`, the integration tests and the `compat`
 //! fuzz target all drive the same compatibility families (`bzip2` and
-//! friends) and `install-links`.
+//! friends) and `install-links`. [`bench`](mod@bench) is here so its
+//! harness, scoring and renderers can be tested with injected times: the CLI
+//! tests run a debug binary, where `stuffr bench` refuses to time anything.
+//! [`format_by_name`] is the `--format`/`--formats` lookup `main` and
+//! `bench` share.
+//!
+//! None of this is a stable API; it is the binary's own code, kept public
+//! for those callers. `bench` and `format_by_name` stay documented, as
+//! `cli`, `compat` and `size` are, rather than `#[doc(hidden)]`: this
+//! crate's docs are the binary's internals docs, and hiding two of its
+//! modules would only make them harder to find.
 
 pub mod bench;
 pub mod cli;

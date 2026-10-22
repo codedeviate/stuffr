@@ -1764,13 +1764,37 @@ Each row gives the compressed size, the ratio and the compress and
 decompress times; below the table come the smallest, the fastest each way
 and the best balance. Every format runs under the same conditions: the same
 input (in memory, or streamed from disk when it is over half of
-`--memory-limit`), the same `--threads` setting (bench ignores
-`STUFFR_THREADS`), and one untimed warm-up read first. Only codec work is
-timed, and `--repeat N` reports the median of N runs. Benchable means a codec
+`--memory-limit`), the same compressed-output destination (memory unless its
+worst case is over half of `--memory-limit`, then one temp file), the same
+`--threads` setting for compression (bench ignores `STUFFR_THREADS`;
+decompression is always single-threaded), and one untimed warm-up read
+first. Each file's size is taken once at the start, so a log still being
+written is benched as it was then. Only codec work is timed, and `--repeat N`
+reports the median of N runs. The input line names the codecs that ran
+through a C library (`C: zstd, xz`), or says `pure`. Benchable means a codec
 this build writes with its real encoder: zstd can be benchmarked only in a
-`--features c-backed` build, because the pure tier's zstd encoder is a weak
-fallback. A format that fails is a row marked failed, not an exit code. Timings
-need a release build; a debug build refuses with exit 2.
+build with the `zstd-c` feature (part of `c-backed`, and in the Homebrew
+build), because the pure tier's zstd encoder is a weak fallback. Inputs must
+be regular files (or links to them): a pipe or device is refused with exit 2,
+so to bench a pipe, write it to a file first. A format that fails is a row
+marked failed, not an exit code. Timings need a release build; a debug build
+refuses with exit 2.
+
+`--json` prints one object. `conditions` holds `files`, `bytes_in`, `mode`
+(`one-stream` or `per-file`), `threads` (`--threads` as given, `null` when
+omitted), `workers` (the compression threads that resolved to), `repeat` and
+`streamed`. Each of `rows` holds `format`, `level` (`null` for lz4 and
+snappy), `backend` (`c` or `pure`), `ok`, `bytes_out`, `ratio` (input bytes
+÷ `bytes_out`), `compress_ns`, `decompress_ns` (medians, nanoseconds),
+`balance` (the mean of the three `best / value` scores, relative to this
+run) and `error`; a failed row has `ok: false`, its reason in `error` and
+`null` in every measurement, and a ratio that cannot be computed (0 bytes)
+is `null`. `winners` names `smallest`, `fastest_compress`,
+`fastest_decompress` and `balance` as `{format, level}`, or `null` when no
+row succeeded. `--csv` has the columns `format, level, ok, bytes_in,
+bytes_out, ratio, compress_ns, decompress_ns, balance, error, files, mode,
+threads, workers, repeat, streamed, backend`, in that order, with the same
+units; an empty field stands for `null`.
 
 ### Two safety defaults that are not negotiable
 

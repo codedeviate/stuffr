@@ -212,6 +212,9 @@ question rather than an omission:
 
 - Progress bars and ETA, suppressed when not a TTY
 - Shell completions (bash, zsh, fish) and generated man pages
+- **Peak memory in `stuffr bench`** — a per-format column, since `xz`/`lzma`
+  dictionaries make it a real cost; it needs a process per format to measure
+  and would take no part in the balance, so the first version left it out.
 - `--verify-sha256` and manifest emission on pack
 - Better `stuffr info` output: entropy estimate, "this is already compressed, don't
   bother" advice
