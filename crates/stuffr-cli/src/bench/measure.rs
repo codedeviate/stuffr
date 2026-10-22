@@ -14,6 +14,17 @@
 //! the sum of several regions (encoder creation, each chunk's `write_all`,
 //! `finish`); decompression is still one region, the decoder's own reads of
 //! the compressed temp file being part of decoding.
+//!
+//! Both destinations have the same shape: a 64 KiB `BufWriter` over a `Vec`
+//! in memory, or over the temp file when streamed, so a codec that writes in
+//! small pieces pays the same in either mode.
+//!
+//! bench ignores STUFFR_THREADS; threads come only from --threads.
+//!
+//! With streamed input and `--threads` above 1, a multi-threaded encoder's
+//! workers keep running during the untimed input reads between regions, so
+//! its compression time can be under-reported against a single-threaded
+//! one. In memory there are no such gaps.
 
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
@@ -24,7 +35,7 @@ use std::time::Instant;
 
 use stuffr::ops::{CompressOpts, resolved_budget};
 use stuffr::source::{FileSource, SeekRead, Source, SourceCaps};
-use stuffr::{Codec, DecodeOpts, EncodeOpts, Error, FormatKind};
+use stuffr::{Codec, DecodeOpts, EncodeOpts, Error, FormatKind, Governor};
 
 use super::score::{Measured, Outcome};
 use crate::compat::{CleanupGuard, create_armed};
@@ -161,15 +172,9 @@ fn run(
     let codec = reg.require_encoder(id)?;
     reg.require_decoder(id)?;
 
-    // The thread mapping `pack --threads` uses.
-    let governor = resolved_budget(&CompressOpts {
-        threads: plan.threads,
-        memory_limit: Some(plan.memory_limit),
-        ..Default::default()
-    });
     let encode = EncodeOpts {
         level,
-        governor,
+        governor: governor_for(plan),
         ..Default::default()
     };
     codec.check_encode_opts(&encode)?;
@@ -224,6 +229,19 @@ fn run(
     })
 }
 
+/// The encode governor for `plan`: `pack --threads`'s mapping, except that
+/// no `--threads` means single-threaded whatever `STUFFR_THREADS` says
+/// (`resolved_budget` would read it). With a CLI value the variable is
+/// already ignored: `resolve_workers` takes the CLI value first.
+fn governor_for(plan: &Plan) -> Option<Arc<Governor>> {
+    let t = plan.threads?;
+    resolved_budget(&CompressOpts {
+        threads: Some(t),
+        memory_limit: Some(plan.memory_limit),
+        ..Default::default()
+    })
+}
+
 /// The middle value; the lower of the two middles for an even count.
 fn median(mut v: Vec<u64>) -> u64 {
     v.sort_unstable();
@@ -250,8 +268,12 @@ impl Job<'_> {
     ) -> stuffr::Result<Measured> {
         let (bytes_out, compress_ns, src) = match self.temp {
             None => {
-                let shared = SharedVec::with_capacity(usize::try_from(expected).unwrap_or(0));
-                let ns = self.compress(group, Box::new(shared.clone()), clock)?;
+                // Room for incompressible output, so the outer Vec does not
+                // reallocate inside the region.
+                let room = expected.saturating_add(expected / 8).saturating_add(1024);
+                let shared = SharedVec::with_capacity(usize::try_from(room).unwrap_or(0));
+                let dst = BufWriter::with_capacity(CHUNK, shared.clone());
+                let ns = self.compress(group, Box::new(dst), clock)?;
                 let bytes = shared.take();
                 let len = bytes.len() as u64;
                 (len, ns, Box::new(MemSource::new(bytes)) as Box<dyn Source>)
@@ -631,6 +653,48 @@ mod tests {
             both.bytes_out, stream.bytes_out,
             "per-file is not one stream"
         );
+        // One compression and one decompression region per file, summed.
+        assert_eq!(both.compress_ns, 20);
+        assert_eq!(both.decompress_ns, 20);
+    }
+
+    /// Streamed: compression is encoder creation, one region per input
+    /// chunk's `write_all` (each 64 KiB read falls between them) and
+    /// `finish`; decompression is one region.
+    #[test]
+    fn a_streamed_run_times_each_write_and_not_the_reads() {
+        let _lock = armed_lock();
+        let s = Scratch::new();
+        // Two chunks: 64 KiB, then 36 KiB.
+        let paths = vec![s.file("a", &text(100 * 1024, 6))];
+        let files = load_input(&paths, 0).unwrap();
+        let mut clock = FakeClock(0);
+        let m = ok(measure(
+            "gzip",
+            None,
+            &files,
+            &plan(Mode::OneStream, 1),
+            &mut clock,
+        ));
+        let regions = 1 + 2 + 1;
+        assert_eq!(m.compress_ns, 10 * regions);
+        assert_eq!(m.decompress_ns, 10);
+        assert_eq!(clock.0, 10 * 2 * (regions + 1), "no other clock reads");
+    }
+
+    #[test]
+    fn no_threads_means_no_governor() {
+        // Pinned structurally rather than by exporting STUFFR_THREADS: the
+        // lib tests share one environment (edition 2024 `set_var` is
+        // unsafe for exactly that reason), and `governor_for` returns
+        // before `resolved_budget`, the only reader of the variable, is
+        // called.
+        assert!(governor_for(&plan(Mode::OneStream, 1)).is_none());
+        let two = Plan {
+            threads: Some(2),
+            ..plan(Mode::OneStream, 1)
+        };
+        assert!(governor_for(&two).is_some());
     }
 
     #[test]
@@ -798,10 +862,15 @@ mod tests {
     fn every_benchable_codec_round_trips_in_both_modes() {
         let _lock = armed_lock();
         let s = Scratch::new();
-        let paths = vec![s.file("a", &text(8 * 1024, 5))];
+        let paths = vec![s.file("a", &text(8 * 1024, 5)), s.file("b", &text(4096, 8))];
         let files = load_input(&paths, 0).unwrap();
-        for codec in crate::bench::levels::benchable_codecs() {
-            run(codec, &files, &plan(Mode::OneStream, 1));
+        let memory = load_input(&paths, 1 << 30).unwrap();
+        for mode in [Mode::OneStream, Mode::PerFile] {
+            for codec in crate::bench::levels::benchable_codecs() {
+                for input in [&files, &memory] {
+                    run(codec, input, &plan(mode, 1));
+                }
+            }
         }
     }
 

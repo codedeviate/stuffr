@@ -2035,6 +2035,33 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// `create_armed`'s temporary is removed by each of its signals, and
+    /// the process dies of that signal.
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_removes_the_create_armed_file() {
+        let dir = scratch("create-armed");
+        for &sig in TEMP_SIGNALS {
+            let file = dir.join(format!("bench-{sig}"));
+            let status = in_child(|| {
+                default_dispositions();
+                ARMED.store(false, Ordering::SeqCst);
+                if let Ok((_file, _guard)) = create_armed(&file) {
+                    // SAFETY: raise is async-signal-safe; the handler unlinks
+                    // the armed path and re-raises at SIG_DFL.
+                    unsafe { libc::raise(sig) };
+                }
+            });
+            assert!(
+                libc::WIFSIGNALED(status),
+                "signal {sig}: the child exited (status {status:#x})"
+            );
+            assert_eq!(libc::WTERMSIG(status), sig);
+            assert!(!file.exists(), "signal {sig}: the temporary survived");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// The calling thread's current signal mask.
     #[cfg(unix)]
     fn current_mask() -> libc::sigset_t {
