@@ -433,7 +433,7 @@ read list.
 > makes twenty-seven names. `LICENSE-compress-bsd` (Apple's BSD-3-Clause
 > notice) and `LICENSE-ncompress` (the Unlicense) join `stuffr-cli`, whose
 > licence expression gains `Unlicense`.
-> **XXXX** tests under `--all-features`, **YYYY** on the default tier —
+> **3133** tests under `--all-features`, **3019** on the default tier —
 > measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
 > Two user-visible changes on archives that already exist. First, `salvage
