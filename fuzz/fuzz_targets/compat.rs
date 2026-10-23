@@ -5,9 +5,10 @@
 //! `lzma`, `unlzma`, `lzcat`) and the zstd family (0.14.0 Task 10: `zstd`,
 //! `unzstd`, `zstdcat`, `zstdmt`) and the lz4 family (0.15.0 Task 8:
 //! `lz4`, `unlz4`, `lz4cat`, `lz4c`) and the unzip family (0.16.0 Tasks 7
-//! and 15: `unzip`, `zipinfo`, `funzip`, each as Apple's and as Ubuntu's),
-//! through `stuffr_cli::compat::run_in_counted` and
-//! `bzip2recover::recover`.
+//! and 15: `unzip`, `zipinfo`, `funzip`, each as Apple's and as Ubuntu's)
+//! and the compress family (0.18.0: `compress`, `uncompress`, each as
+//! Apple's and as ncompress), through `stuffr_cli::compat::run_in_counted`
+//! and `bzip2recover::recover`.
 //!
 //! The only fuzz coverage of `stuffr::bzip2_stream::StreamReader`, the
 //! libbzip2-shaped decoder only the compat layer reaches, and of the gzip
@@ -30,7 +31,9 @@
 //! `stuffr_core::testing::decode_compat_case` (whose tables are the wire
 //! format of the seeds `crates/stuffr/tests/fuzz_corpus.rs` writes). The
 //! tool byte also picks the gzip and unzip flavours, `(byte / names) & 1`
-//! (R7: 0 GNU or Ubuntu, 1 BSD or Apple). Each
+//! (R7: 0 GNU or Ubuntu, 1 BSD or Apple), and the compress family's: 0 the
+//! platform's default (`compress::default_flavour`: Apple on macOS and the
+//! BSDs, ncompress elsewhere), 1 the other one. Each
 //! file the mask names is created holding the payload; with the mask's stdin
 //! bit, standard input carries it too. The xz family's five files take a
 //! second mask byte, there only when the argument-count byte is past 8
@@ -116,6 +119,10 @@
 //!   symlinks it extracts, and puts no name in the real working directory
 //!   (`run_unzip`). Its tokens bring `a.zip` and `b.zip`, the seventeenth
 //!   and eighteenth `COMPAT_FILES` entries, on the third mask byte.
+//! - the compress family, for now (ruling D2 of 0.18.0), keeps only the
+//!   rules every family keeps: the 8 MiB output budget (`run_compress`),
+//!   containment and the untouched working directory. Its own oracle
+//!   (exit set, read bound, leftovers) is 0.18.0 Task 4's.
 //!
 //! **Memory under the xz names (Ruling P7).** libFuzzer's RSS limit is the
 //! bound: 1 GiB in a daytime `make fuzz`, which passes `-rss_limit_mb=1024`
@@ -169,7 +176,7 @@ use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use libfuzzer_sys::fuzz_target;
-use stuffr_cli::compat::{self, bzip2recover, gzip::Flavour, unzip};
+use stuffr_cli::compat::{self, bzip2recover, compress, gzip::Flavour, unzip};
 use stuffr_core::testing::{
     COMPAT_FILES, COMPAT_FUZZ_MAX_INPUT, COMPAT_TOKENS, check_extraction_contained,
     check_scan_is_linear, decode_compat_case,
@@ -485,9 +492,16 @@ fn run_gzip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8], pa
         Flavour::Bsd
     };
     let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
-    let (code, _out, err, reads) =
-        compat::run_in_counted(dir, name, os_args, stdin, flavour, unzip::default_flavour())
-            .expect("a COMPAT_NAMES entry is a compat name");
+    let (code, _out, err, reads) = compat::run_in_counted(
+        dir,
+        name,
+        os_args,
+        stdin,
+        flavour,
+        unzip::default_flavour(),
+        compress::default_flavour(),
+    )
+    .expect("a COMPAT_NAMES entry is a compat name");
     let why = || String::from_utf8_lossy(&err).into_owned();
     if std::env::var_os("STUFFR_FUZZ_COMPAT_TRACE").is_some() {
         eprintln!("compat: {name} {flavour:?} {args:?} -> {code}");
@@ -750,6 +764,7 @@ fn run_xz(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
         stdin,
         Flavour::Gnu,
         unzip::default_flavour(),
+        compress::default_flavour(),
     )
     .expect("a COMPAT_NAMES entry is a compat name");
     let why = || String::from_utf8_lossy(&err).into_owned();
@@ -1105,6 +1120,7 @@ fn run_zstd(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
         stdin,
         Flavour::Gnu,
         unzip::default_flavour(),
+        compress::default_flavour(),
     )
     .expect("a COMPAT_NAMES entry is a compat name");
     let why = || String::from_utf8_lossy(&err).into_owned();
@@ -1471,6 +1487,7 @@ fn run_lz4(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
         stdin,
         Flavour::Gnu,
         unzip::default_flavour(),
+        compress::default_flavour(),
     )
     .expect("a COMPAT_NAMES entry is a compat name");
     let why = || String::from_utf8_lossy(&err).into_owned();
@@ -1553,6 +1570,7 @@ fn run_lz4(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
                 loud_stdin,
                 Flavour::Gnu,
                 unzip::default_flavour(),
+                compress::default_flavour(),
             )
             .expect("a COMPAT_NAMES entry is a compat name");
             assert_eq!(
@@ -1843,9 +1861,16 @@ fn run_unzip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]) {
     let before = tree_contents(dir);
     let floor = ctime_floor(dir);
     let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
-    let (code, out, err, reads) =
-        compat::run_in_counted(dir, name, os_args, stdin, Flavour::Gnu, flavour)
-            .expect("a COMPAT_NAMES entry is a compat name");
+    let (code, out, err, reads) = compat::run_in_counted(
+        dir,
+        name,
+        os_args,
+        stdin,
+        Flavour::Gnu,
+        flavour,
+        compress::default_flavour(),
+    )
+    .expect("a COMPAT_NAMES entry is a compat name");
     let why = || String::from_utf8_lossy(&err).into_owned();
     if std::env::var_os("STUFFR_FUZZ_COMPAT_TRACE").is_some() {
         eprintln!("compat: {name} {flavour:?} {args:?} -> {code}");
@@ -2078,6 +2103,40 @@ fn check_unzip_reads(
     }
 }
 
+/// The compress family (0.18.0), through `compat::run_in_counted`, as the
+/// flavour the name byte gives: `(byte / names) & 1`, 0 the platform's
+/// default (`compress::default_flavour`: Apple on macOS and the BSDs,
+/// ncompress elsewhere), 1 the other one. Ruling D2 of 0.18.0: only the
+/// checks every family gets for now, the output budget here and
+/// containment and the real working directory in `fuzz_target!`; Task 4
+/// writes the family's own oracle (exit set, reads, leftovers).
+fn run_compress(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]) {
+    let flavour = match (flavour, compress::default_flavour()) {
+        (0, d) => d,
+        (_, compress::Flavour::Apple) => compress::Flavour::Ncompress,
+        (_, compress::Flavour::Ncompress) => compress::Flavour::Apple,
+    };
+    let before = contents(dir);
+    let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
+    let (code, out, err, _) = compat::run_in_counted(
+        dir,
+        name,
+        os_args,
+        stdin,
+        Flavour::Gnu,
+        unzip::default_flavour(),
+        flavour,
+    )
+    .expect("a COMPAT_NAMES entry is a compat name");
+    if std::env::var_os("STUFFR_FUZZ_COMPAT_TRACE").is_some() {
+        eprintln!(
+            "compat: {name} ({flavour:?}) {args:?} -> {code}: {}",
+            String::from_utf8_lossy(&err)
+        );
+    }
+    check_budget(dir, name, args, &out, &before);
+}
+
 fuzz_target!(|data: &[u8]| {
     if data.len() > COMPAT_FUZZ_MAX_INPUT {
         return;
@@ -2116,6 +2175,7 @@ fuzz_target!(|data: &[u8]| {
         "unzip" | "zipinfo" | "funzip" => {
             run_unzip(&dir, case.name, case.flavour, &case.args, stdin)
         }
+        "compress" | "uncompress" => run_compress(&dir, case.name, case.flavour, &case.args, stdin),
         other => unreachable!("{other} is in COMPAT_NAMES but has no arm here"),
     }
 

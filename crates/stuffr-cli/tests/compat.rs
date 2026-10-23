@@ -36,7 +36,7 @@ mod unix {
     }
 
     const STUFFR: &str = env!("CARGO_BIN_EXE_stuffr");
-    const ALL: [&str; 25] = [
+    const ALL: [&str; 27] = [
         "bzip2",
         "bunzip2",
         "bzcat",
@@ -62,6 +62,8 @@ mod unix {
         "unzip",
         "zipinfo",
         "funzip",
+        "compress",
+        "uncompress",
     ];
 
     /// A scratch directory removed on drop.
@@ -538,7 +540,7 @@ mod unix {
         assert_eq!(std::fs::read_dir(&one.0).unwrap().count(), 2);
     }
 
-    /// The four lz4 names are links like the rest (twenty-five in all), and
+    /// The four lz4 names are links like the rest (twenty-seven in all), and
     /// a link runs as its name: `-h` prints its own name in the usage line
     /// (to standard error, as lz4 does), `lz4c`'s lists the legacy
     /// arguments, and `-V` prints stuffr's banner (spec deviation 1).
@@ -547,7 +549,7 @@ mod unix {
         let s = Scratch::new("lz4");
         let o = il(&s.0, &[]);
         assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-        assert_eq!(std::fs::read_dir(&s.0).unwrap().count(), 25);
+        assert_eq!(std::fs::read_dir(&s.0).unwrap().count(), 27);
         let dir = s.0.canonicalize().unwrap();
         let banner = format!(
             "*** lz4 v1.10.0 64-bit multithread (stuffr {}), by Yann Collet ***\n",
@@ -627,6 +629,46 @@ mod unix {
             assert_eq!(
                 stderr(&o),
                 format!("{n}: STUFFR_UNZIP_FLAVOR must be apple or ubuntu, not 'debian'\n")
+            );
+            assert!(o.stdout.is_empty(), "{n}");
+        }
+    }
+
+    /// The two compress names (0.18.0) make 27 links in all. Each runs as
+    /// its name in the flavour `STUFFR_COMPRESS_FLAVOR` picks (Apple's
+    /// usage line names the program), and any other value of it is refused,
+    /// exit 1, in stuffr's words.
+    #[test]
+    fn install_links_makes_27_names() {
+        use std::os::unix::process::CommandExt;
+        let s = Scratch::new("compress");
+        let o = il(&s.0, &[]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert_eq!(std::fs::read_dir(&s.0).unwrap().count(), 27);
+        let dir = s.0.canonicalize().unwrap();
+        let run = |n: &str, flavor: &str| {
+            let link = dir.join(n);
+            assert_eq!(std::fs::read_link(&link).unwrap(), canon_stuffr(), "{n}");
+            Command::new(&link)
+                .arg0(n)
+                .arg("-x")
+                .env("STUFFR_COMPRESS_FLAVOR", flavor)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap()
+        };
+        for n in ["compress", "uncompress"] {
+            let o = run(n, "apple");
+            assert_eq!(o.status.code(), Some(1), "{n}");
+            assert_eq!(
+                stderr(&o),
+                format!("{n}: illegal option -- x\nusage: {n} [-cfv] [-b bits] [file ...]\n")
+            );
+            let o = run(n, "bsd");
+            assert_eq!(o.status.code(), Some(1), "{n}");
+            assert_eq!(
+                stderr(&o),
+                format!("{n}: STUFFR_COMPRESS_FLAVOR must be apple or ncompress, not 'bsd'\n")
             );
             assert!(o.stdout.is_empty(), "{n}");
         }

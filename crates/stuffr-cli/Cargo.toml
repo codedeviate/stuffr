@@ -21,7 +21,12 @@ rust-version.workspace = true
 # already in the expression) on the `lz4-c` tier: LICENSE-lz4. The unzip
 # family ports Info-ZIP UnZip 6.0's front end (Apple's zip-33 tree and
 # Debian's patches, all under the Info-ZIP licence): LICENSE-infozip.
-license = "MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD AND Info-ZIP"
+# The compress family ports Apple's compress.c and zopen.c (the Regents of
+# the University of California's BSD-3-Clause, already in the expression),
+# whose notices ship as LICENSE-compress-bsd, and its ncompress
+# personality ports ncompress 5.0 (the Unlicense), whose text ships with
+# that personality as LICENSE-ncompress.
+license = "MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD AND Info-ZIP AND Unlicense"
 repository.workspace = true
 keywords = ["compression", "archive", "cli", "unzip", "extract"]
 categories = ["command-line-utilities", "compression"]

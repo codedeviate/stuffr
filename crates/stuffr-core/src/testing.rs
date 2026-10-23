@@ -140,8 +140,10 @@ pub const SALVAGE_FUZZ_MAX_ENTRY: u64 = 256 * 1024;
 /// The `compat` fuzz target's tool selector: byte `n % COMPAT_NAMES.len()`
 /// names the compatibility tool a case runs as, and `(n / len) & 1` the
 /// flavour: the gzip family's (0 GNU, 1 BSD; R7 of 0.12.0) and, since
-/// 0.16.0, the unzip family's (0 Ubuntu, 1 Apple: the same side as gzip's).
-/// Only those two families read it. Every seed the 0.11.0 generator wrote has a name byte below 4,
+/// 0.16.0, the unzip family's (0 Ubuntu, 1 Apple: the same side as gzip's)
+/// and, since 0.18.0, the compress family's (0 the platform's default, 1
+/// the other one). Only those three families read it. Every seed the
+/// 0.11.0 generator wrote has a name byte below 4,
 /// so it decodes to the same tool, as GNU (`old_seeds_decode_unchanged`).
 ///
 /// **Appending a name moves every flavour-1 byte**: `index + len` names a
@@ -178,6 +180,8 @@ pub const COMPAT_NAMES: &[&str] = &[
     "unzip",
     "zipinfo",
     "funzip",
+    "compress",
+    "uncompress",
 ];
 
 /// The files a `compat` case may create in its directory before the run,
@@ -2210,7 +2214,7 @@ mod tests {
         let argc = 2 * (COMPAT_MAX_ARGS as u8 + 1) + 2;
         for (file, top) in [("a.zip", 1u8 << 1), ("b.zip", 1 << 2)] {
             let seed = encode_compat_case("unzip", 1, &["-t", file], &[file], false, b"p");
-            assert_eq!(seed, [22 + 25, argc, t("-t"), t(file), 0, 0, top, b'p']);
+            assert_eq!(seed, [22 + 27, argc, t("-t"), t(file), 0, 0, top, b'p']);
             let case = decode_compat_case(&seed).unwrap();
             assert_eq!((case.name, case.flavour), ("unzip", 1));
             assert_eq!(case.args, ["-t", file]);
@@ -2340,7 +2344,9 @@ mod tests {
     #[test]
     fn flavour_from_name_byte() {
         let len = COMPAT_NAMES.len() as u8;
-        assert_eq!(len, 25);
+        // 0.18.0 appended `compress` and `uncompress`: every flavour-1 byte
+        // moved by two.
+        assert_eq!(len, 27);
         let at = |byte: u8| {
             let seed = [byte, 0, 0];
             let case = decode_compat_case(&seed).unwrap();
@@ -2357,13 +2363,16 @@ mod tests {
         assert_eq!(at(21), ("lz4c", 0));
         assert_eq!(at(22), ("unzip", 0));
         assert_eq!(at(24), ("funzip", 0));
-        assert_eq!(at(25), ("bzip2", 1));
-        assert_eq!(at(29), ("gzip", 1));
-        assert_eq!(at(32), ("gzcat", 1));
-        assert_eq!(at(35), ("xzcat", 1));
-        assert_eq!(at(44), ("unlz4", 1));
-        assert_eq!(at(50), ("bzip2", 0));
-        assert_eq!(at(255), ("gunzip", 0));
+        assert_eq!(at(25), ("compress", 0));
+        assert_eq!(at(26), ("uncompress", 0));
+        assert_eq!(at(27), ("bzip2", 1));
+        assert_eq!(at(31), ("gzip", 1));
+        assert_eq!(at(34), ("gzcat", 1));
+        assert_eq!(at(37), ("xzcat", 1));
+        assert_eq!(at(46), ("unlz4", 1));
+        assert_eq!(at(53), ("uncompress", 1));
+        assert_eq!(at(54), ("bzip2", 0));
+        assert_eq!(at(255), ("unlzma", 1));
         for (i, name) in COMPAT_NAMES.iter().enumerate() {
             for flavour in 0..2u8 {
                 let seed = encode_compat_case(name, flavour, &[], &[], false, b"");

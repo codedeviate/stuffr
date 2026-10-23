@@ -7824,7 +7824,7 @@ fn is_verbatim_reference_messages(path: &std::path::Path) -> bool {
     let parts: Vec<&std::ffi::OsStr> = path.components().map(|c| c.as_os_str()).collect();
     // `src/compat/<family>/messages.rs`, or a family with one personality
     // per reference: `src/compat/<family>/<flavour>/messages.rs` (gzip's
-    // `gnu` and `bsd`).
+    // `gnu` and `bsd`, compress's `apple`).
     matches!(
         parts.as_slice(),
         [.., src, compat, _family, file]
@@ -7951,6 +7951,13 @@ fn no_message_literal_in_the_workspace_carries_a_run_of_collapsed_indentation() 
     )));
     assert!(!is_verbatim_reference_messages(Path::new(
         "crates/stuffr-cli/src/compat/gzip/gnu/x/messages.rs"
+    )));
+    // The compress family's personalities (0.18.0), as gzip's.
+    assert!(is_verbatim_reference_messages(Path::new(
+        "crates/stuffr-cli/src/compat/compress/apple/messages.rs"
+    )));
+    assert!(!is_verbatim_reference_messages(Path::new(
+        "crates/stuffr-cli/src/compat/compress/apple/run.rs"
     )));
 
     // And now the workspace itself.

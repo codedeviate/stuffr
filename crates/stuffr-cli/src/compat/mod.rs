@@ -10,6 +10,7 @@ use std::process::ExitCode;
 
 pub mod bzip2;
 pub mod bzip2recover;
+pub mod compress;
 pub mod gzip;
 mod host;
 pub mod links;
@@ -50,6 +51,9 @@ pub enum Family {
     /// `unzip`, `zipinfo`, `funzip`, in the flavour
     /// [`unzip::default_flavour`] or `STUFFR_UNZIP_FLAVOR` picks.
     Unzip,
+    /// `compress`, `uncompress`, in the flavour
+    /// [`compress::default_flavour`] or `STUFFR_COMPRESS_FLAVOR` picks.
+    Compress,
 }
 
 /// Invoked name to family. The name is matched exactly, after the directory
@@ -80,6 +84,8 @@ const NAMES: &[(&str, Family)] = &[
     ("unzip", Family::Unzip),
     ("zipinfo", Family::Unzip),
     ("funzip", Family::Unzip),
+    ("compress", Family::Compress),
+    ("uncompress", Family::Compress),
 ];
 
 /// Every compatibility name, from the one table `family_for` also reads.
@@ -126,6 +132,7 @@ pub fn dispatch(args: Vec<OsString>) -> Option<ExitCode> {
         Family::Zstd => zstd::run(name, &argv0, rest),
         Family::Lz4 => lz4::run(name, &argv0, rest),
         Family::Unzip => unzip::run(name, &argv0, rest),
+        Family::Compress => compress::run(name, rest),
     })
 }
 
@@ -136,8 +143,8 @@ pub fn dispatch(args: Vec<OsString>) -> Option<ExitCode> {
 /// keeps its disposition. `None` when `name` is not a compatibility name.
 /// The gzip family runs as `gzip_flavour` (the environment's
 /// `STUFFR_GZIP_FLAVOR` is not read); the other families ignore it. The
-/// unzip family runs as [`unzip::default_flavour`] here; pick its flavour
-/// with [`run_in_counted`].
+/// unzip and compress families run as [`unzip::default_flavour`] and
+/// [`compress::default_flavour`] here; pick theirs with [`run_in_counted`].
 /// Same code as [`dispatch`] below the process boundary; for the fuzz
 /// target, not a stable interface.
 #[doc(hidden)]
@@ -155,6 +162,7 @@ pub fn run_in(
         stdin,
         gzip_flavour,
         unzip::default_flavour(),
+        compress::default_flavour(),
     )
     .map(|(code, out, err, _)| (code, out, err))
 }
@@ -166,7 +174,9 @@ pub fn run_in(
 /// with a fixed machine and R9's bounds ([`zstd::run_in_counted`]), and
 /// the lz4 family with a fixed machine ([`lz4::run_in_counted`]). The unzip
 /// family runs as `unzip_flavour` (R7; `STUFFR_UNZIP_FLAVOR` is not read),
-/// as [`unzip::run_in_counted`] describes.
+/// as [`unzip::run_in_counted`] describes, and the compress family as
+/// `compress_flavour` (`STUFFR_COMPRESS_FLAVOR` is not read), counting its
+/// inputs ([`compress::run_in_counted`]).
 #[doc(hidden)]
 pub fn run_in_counted(
     dir: &Path,
@@ -175,6 +185,7 @@ pub fn run_in_counted(
     stdin: &[u8],
     gzip_flavour: gzip::Flavour,
     unzip_flavour: unzip::Flavour,
+    compress_flavour: compress::Flavour,
 ) -> Option<CountedRun> {
     let (family, canonical) = family_for(OsStr::new(name))?;
     Some(match family {
@@ -192,6 +203,9 @@ pub fn run_in_counted(
         Family::Lz4 => lz4::run_in_counted(dir, canonical, &args, stdin, &|_| None),
         Family::Unzip => {
             unzip::run_in_counted(unzip_flavour, dir, canonical, &args, stdin, &|_| None)
+        }
+        Family::Compress => {
+            compress::run_in_counted(compress_flavour, dir, canonical, &args, stdin, &|_| None)
         }
     })
 }
@@ -259,6 +273,10 @@ mod tests {
     /// it.
     const U: unzip::Flavour = unzip::Flavour::Apple;
 
+    /// The compress flavour `run_in_counted` gets; the other families
+    /// ignore it.
+    const C: compress::Flavour = compress::Flavour::Apple;
+
     /// `STUFFR_UNZIP_FLAVOR` selects `apple` or `ubuntu`, unset or empty is
     /// the default, and anything else (another case, a blank) is refused.
     #[test]
@@ -286,7 +304,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let run = |name: &str, f: unzip::Flavour| {
             let (code, out, err, reads) =
-                run_in_counted(&dir, name, vec!["-h".into()], b"", G, f).unwrap();
+                run_in_counted(&dir, name, vec!["-h".into()], b"", G, f, C).unwrap();
             assert!(reads.is_empty(), "{reads:?}");
             (code, String::from_utf8(out).unwrap(), err)
         };
@@ -306,6 +324,40 @@ mod tests {
         let (code, out, _) = run("funzip", U);
         assert!(unzip::EXIT_CODES_APPLE.contains(&code), "exit {code}");
         assert!(!out.contains("fUnZip"), "{out}");
+    }
+
+    /// `run_in_counted` reaches the compress family by both names, in the
+    /// flavour it is given, and counts the inputs it opens.
+    #[test]
+    fn run_in_counted_reaches_the_compress_family() {
+        let dir = std::env::temp_dir().join(format!("stuffr-run-in-z-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), b"hello hello hello hello\n").unwrap();
+        for c in [compress::Flavour::Apple, compress::Flavour::Ncompress] {
+            let (code, _, err, _) =
+                run_in_counted(&dir, "uncompress", vec!["-x".into()], b"", G, U, c).unwrap();
+            assert_eq!(code, 1, "{c:?}");
+            assert!(
+                String::from_utf8_lossy(&err)
+                    .ends_with("usage: uncompress [-cfv] [-b bits] [file ...]\n"),
+                "{c:?}"
+            );
+            let (code, out, err, reads) = run_in_counted(
+                &dir,
+                "compress",
+                vec!["-c".into(), "a".into()],
+                b"",
+                G,
+                U,
+                c,
+            )
+            .unwrap();
+            assert_eq!(code, 0, "{c:?}: {}", String::from_utf8_lossy(&err));
+            assert!(out.starts_with(&[0x1f, 0x9d, 0x90]), "{c:?}");
+            assert_eq!(reads[&dir.join("a")].opens, 1, "{c:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The `compat` fuzz target picks its tool from `COMPAT_NAMES`; a name
@@ -406,7 +458,7 @@ mod tests {
             std::fs::write(dir.join("a"), b"hello hello hello\n").unwrap();
             let args = |a: &[&str]| a.iter().map(OsString::from).collect::<Vec<_>>();
             let (code, _, err, reads) =
-                run_in_counted(&dir, "gzip", args(&["-k", "a"]), b"", flavour, U).unwrap();
+                run_in_counted(&dir, "gzip", args(&["-k", "a"]), b"", flavour, U, C).unwrap();
             assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
             let a = reads[&dir.join("a")];
             assert_eq!((a.opens, a.bytes, a.len), (1, 18, 18), "{flavour:?}");
@@ -415,7 +467,7 @@ mod tests {
             let len = std::fs::metadata(dir.join("a.gz")).unwrap().len();
             for mode in [&["-t", "a.gz", "a.gz"][..], &["-l", "a.gz"]] {
                 let (code, _, err, reads) =
-                    run_in_counted(&dir, "gzip", args(mode), b"", flavour, U).unwrap();
+                    run_in_counted(&dir, "gzip", args(mode), b"", flavour, U, C).unwrap();
                 assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
                 let gz = reads[&dir.join("a.gz")];
                 assert_eq!(gz.opens, mode.len() as u64 - 1, "{flavour:?} {mode:?}");
@@ -423,7 +475,7 @@ mod tests {
                 assert!(gz.bytes > 0 && gz.bytes <= 2 * len * gz.opens, "{gz:?}");
             }
             let (_, _, _, reads) =
-                run_in_counted(&dir, "bzip2", args(&["-k", "a"]), b"", flavour, U).unwrap();
+                run_in_counted(&dir, "bzip2", args(&["-k", "a"]), b"", flavour, U, C).unwrap();
             assert!(reads.is_empty(), "{reads:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -440,7 +492,7 @@ mod tests {
         let args = |a: &[&str]| a.iter().map(OsString::from).collect::<Vec<_>>();
         let run = |a: &[&str]| {
             let (code, _, err, reads) =
-                run_in_counted(&dir, "zstd", args(a), b"", gzip::Flavour::Gnu, U).unwrap();
+                run_in_counted(&dir, "zstd", args(a), b"", gzip::Flavour::Gnu, U, C).unwrap();
             assert_eq!(code, 0, "{a:?}: {}", String::from_utf8_lossy(&err));
             reads
         };
@@ -542,7 +594,9 @@ mod tests {
                 "lz4c",
                 "unzip",
                 "zipinfo",
-                "funzip"
+                "funzip",
+                "compress",
+                "uncompress"
             ]
         );
     }

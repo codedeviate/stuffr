@@ -1014,6 +1014,11 @@ const COMPAT_SHAPES: &[&str] = &[
     "funzip-ubuntu-stdin-gzip",
     "funzip-apple-file-zip",
     "funzip-ubuntu-stdin-encrypted-cut",
+    // The compress family (0.18.0 Task 2): one seed per name, in the
+    // platform's default flavour, so every tool is reached; Task 4 adds
+    // a seed per major flag and flavour.
+    "compress-stdin",
+    "uncompress-stdin",
 ];
 
 // ---------------------------------------------------------------------
@@ -2299,6 +2304,16 @@ fn compat_seed(work: &Path, shape: &str) -> stuffr_core::Result<Vec<u8>> {
     let text = compat_text(4000);
     let valid = bzip2_of(work, &text, 9)?;
     Ok(match shape {
+        "compress-stdin" => e("compress", &[], &[], true, &text),
+        // `AAAA` as Apple's and ncompress's encoders both write it: `A`,
+        // entry 257, `A` in 9-bit codes after the 16-bit header.
+        "uncompress-stdin" => e(
+            "uncompress",
+            &[],
+            &[],
+            true,
+            &[0x1f, 0x9d, 0x90, 0x41, 0x02, 0x06, 0x01],
+        ),
         "bzip2-stdin-to-stdout" => e("bzip2", &[], &[], true, &text),
         "bzip2-keep-file" => e("bzip2", &["-k", "a"], &["a"], false, &text),
         "bzip2-force-verbose-existing-output" => {
