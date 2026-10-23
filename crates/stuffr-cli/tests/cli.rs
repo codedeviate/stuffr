@@ -15775,6 +15775,43 @@ fn bench_on_a_missing_path_is_a_usage_error() {
     assert!(err.contains("no input matched"), "{err}");
 }
 
+#[cfg(unix)]
+#[test]
+fn bench_on_a_dangling_symlink_is_a_usage_error() {
+    let dir = tmp_dir();
+    std::fs::write(dir.join("real.log"), b"x").unwrap();
+    let link = dir.join("dangling.log");
+    std::os::unix::fs::symlink(dir.join("gone.log"), &link).unwrap();
+    let want = format!("{}: cannot read it (", link.display());
+    let (code, err) = bench_err(&["bench", link.to_str().unwrap()]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains(&want), "{err}");
+    let pattern = format!("{}/*.log", dir.display());
+    let (code, err) = bench_err(&["bench", &pattern]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains(&want), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn bench_on_an_unreadable_directory_under_a_pattern_is_a_usage_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp_dir();
+    std::fs::write(dir.join("a.log"), b"x").unwrap();
+    let locked = dir.join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::write(locked.join("b.log"), b"x").unwrap();
+    // `Scratch` restores the permissions when it drops.
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(&locked).is_ok() {
+        return; // root reads it anyway
+    }
+    let pattern = format!("{}/*/*.log", dir.display());
+    let (code, err) = bench_err(&["bench", &pattern]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("locked: cannot read it ("), "{err}");
+}
+
 #[test]
 fn bench_on_a_directory_is_a_usage_error() {
     let dir = tmp_dir();

@@ -58,12 +58,16 @@ pure = ["stuffr/pure"]
 # its integration tests can see it; `c-backed` implies it, and `full` names
 # `c-backed` itself — `stuffr/full` alone would turn on stuffr's `zlib-c` but
 # not this crate's, and the byte suite would silently run the compatible tier.
-c-backed = ["stuffr/c-backed", "zlib-c", "xz-c", "zstd-c", "lz4-c"]
+c-backed = ["stuffr/c-backed", "zlib-c", "xz-c", "lzma-c", "zstd-c", "lz4-c"]
 zlib-c = ["stuffr/zlib-c"]
 # The Apple gzip personality's `unxz` runs over liblzma itself on the C
 # tier (`stuffr::xz_stream`), as Apple's does; elsewhere over the
 # registry's xz decoder.
 xz-c = ["stuffr/xz-c"]
+# The lzma codec's C tier (liblzma's alone-format encoder); a passthrough so
+# `stuffr bench` labels lzma's backend from this crate's own feature, as it
+# does xz's and zstd's.
+lzma-c = ["stuffr/lzma-c"]
 # The zstd family's C tier (libzstd through `stuffr::zstd_opts`); a
 # passthrough so this crate's `cfg(feature = "zstd-c")` and its byte suite
 # see the tier, as `zlib-c` and `xz-c` above.

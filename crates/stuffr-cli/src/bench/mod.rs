@@ -224,7 +224,9 @@ fn expand_inputs(operands: &[String]) -> stuffr::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for op in operands {
         let path = Path::new(op);
-        if path.exists() {
+        // A dangling symlink does not "exist" but is named: it is reported
+        // as unreadable, not as a missing path.
+        if path.exists() || path.symlink_metadata().is_ok() {
             if path.is_dir() {
                 return Err(directory_error(path));
             }
@@ -243,7 +245,7 @@ fn expand_inputs(operands: &[String]) -> stuffr::Result<Vec<PathBuf>> {
         let mut found = Vec::new();
         let mut first_dir = None;
         for m in matches {
-            let m = m.map_err(|e| Error::Io(e.into()))?;
+            let m = m.map_err(|e| unreadable(e.path(), e.error()))?;
             if m.is_dir() {
                 first_dir.get_or_insert(m);
             } else {
@@ -259,9 +261,12 @@ fn expand_inputs(operands: &[String]) -> stuffr::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// `path` if it is (or links to) a regular file, else the usage error.
+/// `path` if it is (or links to) a regular file, else the usage error. A
+/// path whose metadata cannot be read (a dangling symlink, no permission)
+/// is a usage error too.
 fn regular(path: &Path) -> stuffr::Result<PathBuf> {
-    if std::fs::metadata(path)?.is_file() {
+    let meta = std::fs::metadata(path).map_err(|e| unreadable(path, &e))?;
+    if meta.is_file() {
         Ok(path.to_path_buf())
     } else {
         Err(Error::Usage(format!(
@@ -269,6 +274,10 @@ fn regular(path: &Path) -> stuffr::Result<PathBuf> {
             path.display()
         )))
     }
+}
+
+fn unreadable(path: &Path, e: &io::Error) -> Error {
+    Error::Usage(format!("{}: cannot read it ({e})", path.display()))
 }
 
 fn no_match(op: &str) -> Error {
@@ -411,6 +420,58 @@ mod tests {
         let link = s.0.join("link.log");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert_eq!(expand_inputs(&[s.s("link.log")]).unwrap(), vec![link]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_is_a_usage_error() {
+        let s = Scratch::new();
+        s.file("real.log");
+        let link = s.0.join("dangling.log");
+        std::os::unix::fs::symlink(s.0.join("gone.log"), &link).unwrap();
+        let named = usage(expand_inputs(&[s.s("dangling.log")]));
+        assert!(
+            named.starts_with(&format!("{}: cannot read it (", link.display())),
+            "{named}"
+        );
+        // Matched by a pattern, beside a real file.
+        let globbed = usage(expand_inputs(&[s.s("*.log")]));
+        assert!(
+            globbed.starts_with(&format!("{}: cannot read it (", link.display())),
+            "{globbed}"
+        );
+    }
+
+    /// Restores the mode so `Scratch`'s removal can enter the directory.
+    #[cfg(unix)]
+    struct Mode000(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for Mode000 {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_directory_under_a_pattern_is_a_usage_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = Scratch::new();
+        s.file("a.log");
+        let locked = s.0.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("b.log"), b"x").unwrap();
+        let _restore = Mode000(locked.clone());
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads it anyway; there is nothing to test.
+        if fs::read_dir(&locked).is_ok() {
+            return;
+        }
+        let m = usage(expand_inputs(&[s.s("*/*.log")]));
+        assert!(m.contains("locked"), "{m}");
+        assert!(m.contains(": cannot read it ("), "{m}");
     }
 
     #[test]

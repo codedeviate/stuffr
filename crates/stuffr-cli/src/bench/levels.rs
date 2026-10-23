@@ -57,13 +57,13 @@ pub fn levels_of(format: &str) -> Option<Levels> {
 /// registry's codecs. `zlib-c` and `lz4-c` do not count: they serve the
 /// `gzip` and `lz4` compatibility links, while the gzip, zlib, deflate and
 /// lz4 codecs bench runs stay on flate2's miniz_oxide and on lz4_flex in
-/// every build. lzma's C tier is stuffr's `lzma-c`, which this crate turns
-/// on only through `c-backed` (and `full`, which names it).
+/// every build. Each C tier is this crate's own passthrough feature of the
+/// same name (`lzma-c` is on through `c-backed`, as `xz-c` is).
 pub fn backend_of(codec: &str) -> &'static str {
     const C_TIER: [(&str, bool); 3] = [
         ("zstd", cfg!(feature = "zstd-c")),
         ("xz", cfg!(feature = "xz-c")),
-        ("lzma", cfg!(feature = "c-backed")),
+        ("lzma", cfg!(feature = "lzma-c")),
     ];
     if C_TIER.iter().any(|&(name, on)| on && name == codec) {
         "c"
@@ -199,12 +199,23 @@ mod tests {
             assert!(!zstd_weak);
         }
         assert_eq!(backend_of("xz") == "c", cfg!(feature = "xz-c"));
-        assert_eq!(backend_of("lzma") == "c", cfg!(feature = "c-backed"));
+        assert_eq!(backend_of("lzma") == "c", cfg!(feature = "lzma-c"));
         // Pure in every build, `zlib-c` and `lz4-c` included.
         for name in [
             "gzip", "zlib", "deflate", "lz4", "bzip2", "brotli", "snappy", "lzip", "compress",
         ] {
             assert_eq!(backend_of(name), "pure", "{name}");
+        }
+    }
+
+    #[test]
+    fn the_backend_follows_each_codecs_own_feature() {
+        for (codec, on) in [
+            ("zstd", cfg!(feature = "zstd-c")),
+            ("xz", cfg!(feature = "xz-c")),
+            ("lzma", cfg!(feature = "lzma-c")),
+        ] {
+            assert_eq!(backend_of(codec), if on { "c" } else { "pure" }, "{codec}");
         }
     }
 

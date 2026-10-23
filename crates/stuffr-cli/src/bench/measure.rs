@@ -208,27 +208,26 @@ enum Dest {
     TempFile,
 }
 
-/// Memory whenever the worst-case output of `input_len` bytes (+ 1/8 +
-/// 1 KiB) fits in the memory left for it: half of `memory_limit` beside
-/// input held in memory, all of it when the input is `streamed` (it holds
-/// no copy of the input). The temp file only past that.
-fn destination(input_len: u64, memory_limit: u64, streamed: bool) -> Dest {
+/// Memory whenever `codec`'s worst-case output for `input_len` bytes (see
+/// [`output_room`]) fits in the memory left for it: half of `memory_limit`
+/// beside input held in memory, all of it when the input is `streamed` (it
+/// holds no copy of the input). The temp file only past that, so the
+/// reservation never exceeds the budget. Decided per codec, from its own
+/// worst case, and before any timing, so every run of a codec goes the same
+/// way.
+fn destination(codec: &str, input_len: u64, memory_limit: u64, streamed: bool) -> Dest {
     // Small test inputs always fit; this is how the tests reach the temp
     // file with a memory limit the decoders can still work under.
     #[cfg(test)]
     if tests::FORCE_DISK.with(std::cell::Cell::get) {
         return Dest::TempFile;
     }
-    // Checked, not saturating: a worst case past u64 never fits.
-    let worst = input_len
-        .checked_add(input_len / 8)
-        .and_then(|n| n.checked_add(1024));
     let budget = if streamed {
         memory_limit
     } else {
         memory_limit / 2
     };
-    match worst {
+    match output_room(codec, input_len) {
         Some(w) if w <= budget => Dest::Memory,
         _ => Dest::TempFile,
     }
@@ -241,12 +240,14 @@ fn destination(input_len: u64, memory_limit: u64, streamed: bool) -> Dest {
 /// its 3-byte header and the padding at each code-width step); every other
 /// codec stays within 1/8 + 1 KiB, which
 /// `the_reserved_room_holds_incompressible_output` measures. Reserved pages
-/// a codec never writes are never touched.
-fn output_room(codec: &str, input_len: u64) -> u64 {
+/// a codec never writes are never touched. `None`: past `u64`, so it fits
+/// nowhere.
+fn output_room(codec: &str, input_len: u64) -> Option<u64> {
     match codec {
-        "compress" => input_len.saturating_mul(2).saturating_add(1024),
-        _ => input_len.saturating_add(input_len / 8).saturating_add(1024),
+        "compress" => input_len.checked_mul(2),
+        _ => input_len.checked_add(input_len / 8),
     }
+    .and_then(|n| n.checked_add(1024))
 }
 
 fn run(
@@ -287,7 +288,7 @@ fn run(
     };
     let group_len = |g: &[Part<'_>]| g.iter().map(Part::len).sum::<u64>();
     let streamed = matches!(input, Input::Files(_));
-    let dest = |g: &[Part<'_>]| destination(group_len(g), plan.memory_limit, streamed);
+    let dest = |g: &[Part<'_>]| destination(name, group_len(g), plan.memory_limit, streamed);
     let temp = if groups.iter().any(|g| dest(g) == Dest::TempFile) {
         Some(TempOut::create()?.0)
     } else {
@@ -372,7 +373,7 @@ impl Job<'_> {
                 // reallocate inside the region. (`TempFile` always comes
                 // with a temp file; `run` creates one whenever any group
                 // needs it.)
-                let room = output_room(self.name, expected);
+                let room = output_room(self.name, expected).unwrap_or(0);
                 let shared = SharedVec::with_capacity(usize::try_from(room).unwrap_or(0));
                 let dst = BufWriter::with_capacity(CHUNK, shared.clone());
                 let ns = self.compress(group, Box::new(dst), clock)?;
@@ -389,7 +390,7 @@ impl Job<'_> {
                 let ns = self.compress(group, Box::new(dst), clock)?;
                 let file = File::open(temp.path())?;
                 let len = file.metadata()?.len();
-                let src = temp_source(GuardedSeek::new(file), len);
+                let src = temp_source(GuardedSeek::new(counted(file)), len);
                 (len, ns, Box::new(src) as Box<dyn Source>)
             }
         };
@@ -628,6 +629,19 @@ impl<R: Read + Seek + Send> Source for BufSource<R> {
     }
 }
 
+/// The temp file as `temp_source` reads it. Production: the file itself.
+#[cfg(not(test))]
+fn counted(file: File) -> File {
+    file
+}
+
+/// Under test, a file whose reads are counted per thread, so a test sees
+/// how many reach it through the path `measure` takes.
+#[cfg(test)]
+fn counted(file: File) -> tests::CountedFile {
+    tests::CountedFile(file)
+}
+
 /// The next temp file's `<n>`; also how the tests see whether a run made one.
 static TEMP_SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -775,6 +789,27 @@ mod tests {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         FORCE_DISK.with(|d| d.set(false));
         r.unwrap_or_else(|e| std::panic::resume_unwind(e))
+    }
+
+    thread_local! {
+        /// Reads that reached a temp file on this thread (see `counted`).
+        static FILE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The temp file under test: counts each read that reaches it.
+    pub(super) struct CountedFile(pub(super) File);
+
+    impl Read for CountedFile {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            FILE_READS.with(|r| r.set(r.get() + 1));
+            self.0.read(buf)
+        }
+    }
+
+    impl Seek for CountedFile {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.0.seek(pos)
+        }
     }
 
     /// The temp files created while `f` ran. Hold `armed_lock`: every test
@@ -1139,20 +1174,83 @@ mod tests {
         );
     }
 
+    /// The same check through `measure`: LZW reads its input a byte at a
+    /// time, so if the production temp-file path stopped buffering, the
+    /// reads reaching the file would be about one per compressed byte.
+    #[test]
+    fn measure_reads_the_temp_file_in_large_pieces() {
+        let _lock = armed_lock();
+        let input = Input::Memory(vec![text(64 * 1024, 4)]);
+        FILE_READS.with(|r| r.set(0));
+        let m = on_disk(|| run("compress", &input, &plan(Mode::OneStream, 1)));
+        let reads = FILE_READS.with(std::cell::Cell::get) as u64;
+        assert!(m.bytes_out > 4096, "{} compressed bytes", m.bytes_out);
+        assert!(reads > 0, "no read reached the temp file");
+        assert!(
+            reads <= m.bytes_out / CHUNK as u64 + 4,
+            "{reads} reads reached the file for {} compressed bytes",
+            m.bytes_out
+        );
+    }
+
+    /// `compress` can write twice its input; near the limit that must not be
+    /// reserved in memory, over the budget. It goes to the temp file, and
+    /// the codecs whose worst case fits stay in memory.
+    #[test]
+    fn compress_near_the_limit_goes_to_disk_not_over_the_budget() {
+        let _lock = armed_lock();
+        let len = 16 * 1024;
+        let input = Input::Memory(vec![noise(len)]);
+        // The input fits under limit / 2. gzip's worst case (len + len / 8
+        // + 1 KiB = 19456) fits in that half exactly; compress's
+        // (2 * len + 1 KiB = 33792) does not.
+        let p = Plan {
+            memory_limit: 2 * 19_456,
+            ..plan(Mode::OneStream, 1)
+        };
+        for (codec, want) in [("gzip", 0), ("compress", 1)] {
+            let made = temps_made(|| {
+                run(codec, &input, &p);
+            });
+            assert_eq!(made, want, "{codec}");
+        }
+        // Streamed: the whole limit is the budget.
+        for (codec, limit, want) in [("gzip", 19_456, 0), ("compress", 33_791, 1)] {
+            assert_eq!(
+                destination(codec, len as u64, limit, true) == Dest::TempFile,
+                want == 1,
+                "{codec} streamed at {limit}"
+            );
+        }
+        assert_eq!(
+            destination("compress", len as u64, 33_792, true),
+            Dest::Memory
+        );
+    }
+
     #[test]
     fn the_output_goes_to_memory_whenever_its_worst_case_fits() {
         // 0 bytes in: worst case 1 KiB, which fits under 2048 / 2.
         // Beside input in memory: half the limit.
-        assert_eq!(destination(0, 2048, false), Dest::Memory);
-        assert_eq!(destination(0, 2047, false), Dest::TempFile);
+        assert_eq!(destination("gzip", 0, 2048, false), Dest::Memory);
+        assert_eq!(destination("gzip", 0, 2047, false), Dest::TempFile);
         // 8000 + 1000 + 1024.
-        assert_eq!(destination(8000, 2 * 10_024, false), Dest::Memory);
-        assert_eq!(destination(8000, 2 * 10_024 - 1, false), Dest::TempFile);
-        assert_eq!(destination(u64::MAX, u64::MAX, false), Dest::TempFile);
+        assert_eq!(destination("gzip", 8000, 2 * 10_024, false), Dest::Memory);
+        assert_eq!(
+            destination("gzip", 8000, 2 * 10_024 - 1, false),
+            Dest::TempFile
+        );
+        assert_eq!(
+            destination("gzip", u64::MAX, u64::MAX, false),
+            Dest::TempFile
+        );
         // Streamed input holds no copy: the whole limit.
-        assert_eq!(destination(8000, 10_024, true), Dest::Memory);
-        assert_eq!(destination(8000, 10_023, true), Dest::TempFile);
-        assert_eq!(destination(u64::MAX, u64::MAX, true), Dest::TempFile);
+        assert_eq!(destination("gzip", 8000, 10_024, true), Dest::Memory);
+        assert_eq!(destination("gzip", 8000, 10_023, true), Dest::TempFile);
+        assert_eq!(
+            destination("gzip", u64::MAX, u64::MAX, true),
+            Dest::TempFile
+        );
     }
 
     /// Streamed input whose output fits in the whole limit stays off the
@@ -1222,7 +1320,7 @@ mod tests {
                 sweep.iter().map(|&l| Some(l)).collect()
             };
             for level in levels {
-                let room = output_room(name, input.len() as u64) as usize;
+                let room = output_room(name, input.len() as u64).unwrap() as usize;
                 let shared = SharedVec::with_capacity(room);
                 let cap = shared.capacity();
                 let dst = BufWriter::with_capacity(CHUNK, shared.clone());
