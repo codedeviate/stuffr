@@ -1852,7 +1852,7 @@ pub fn ref_decompress_with(rt: &Roundtrip, data: &[u8]) -> Result<Vec<u8>, Strin
 pub fn ref_decompress_case(c: &Case, data: &[u8]) -> Result<Vec<u8>, String> {
     let (extra, _dict_guard) = match c.roundtrip {
         Roundtrip::Xz { .. } => (xz_decode_args(c), None),
-        Roundtrip::Zstd { .. } => (zstd_decode_args(c), None),
+        Roundtrip::Zstd { .. } => zstd_decode_args(c),
         Roundtrip::Lz4 { .. } => lz4_decode_args(c),
         _ => (Vec::new(), None),
     };
@@ -2024,7 +2024,10 @@ fn zstd_kind_mismatch(reference: &[u8], ours: &[u8]) -> Option<String> {
 /// frame written with a large window is not refused for its size. A file the
 /// case does not list (one its setup makes) is not passed, and the reference
 /// then says why it cannot decode.
-fn zstd_decode_args(c: &Case) -> Vec<String> {
+///
+/// The scratch file lives in a [`ScratchDir`] the caller keeps alive until the
+/// reference has run.
+fn zstd_decode_args(c: &Case) -> (Vec<String>, Option<ScratchDir>) {
     let mut named: Option<&str> = None;
     let mut it = c.args.iter();
     while let Some(a) = it.next() {
@@ -2042,17 +2045,16 @@ fn zstd_decode_args(c: &Case) -> Vec<String> {
         }
     }
     let mut v = vec!["--long=31".to_owned()];
+    let mut guard = None;
     if let Some((_, bytes)) = named.and_then(|n| c.files.iter().find(|(f, _)| *f == n)) {
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "stuffr-zstd-dict-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
+        let dir = ScratchDir::unique("zstd-dict");
+        fs::create_dir_all(&*dir).expect("create the dictionary's scratch dir");
+        let path = dir.join("dict");
         fs::write(&path, bytes).expect("write the dictionary for the reference");
         v.push(format!("-D{}", path.display()));
+        guard = Some(dir);
     }
-    v
+    (v, guard)
 }
 
 /// The `--suffix` operand of `args` (`--suffix=X`, `--suffix X`), if any.
