@@ -3,40 +3,45 @@
 //! inside a timed region, except the temp file's writes when the output is
 //! too large to keep in memory (below).
 //!
-//! A compression region holds encoder creation, `write_all` of the input
-//! and `Sink::finish` (which consumes the sink, so its teardown is inside
-//! too). A decompression region holds decoder creation and reading the
+//! Compression's timed regions hold encoder creation, `write_all` of the
+//! input and `Sink::finish` (which consumes the sink, so its teardown is
+//! inside too). Decompression's hold decoder creation and reading the
 //! decoder to its end into a buffer whose bytes are only counted. Building
 //! the destination, opening files, reading streamed input, the temp file's
 //! creation and removal, and dropping the decoder are all outside.
 //!
-//! In memory, each region is one pair of clock reads. Streamed from disk,
-//! the input's reads happen between the encoder's writes, so compression is
-//! the sum of several regions (encoder creation, each chunk's `write_all`,
-//! `finish`); decompression is still one region, the decoder's own reads of
-//! the compressed temp file being part of decoding.
+//! Each phase is the sum of several timed pieces, each one pair of clock
+//! reads. Compression: encoder creation, then one piece per 64 KiB
+//! `write_all` of the input, then `finish`. Decompression: one piece per
+//! 64 KiB the decoder fills, the decoder's creation in the first, its own
+//! reads of the compressed bytes being part of decoding. In memory and
+//! streamed alike; streamed, the input's reads fall between the pieces.
+//! Otherwise nothing runs between them but the progress report, so the
+//! pieces cost every format the same: one pair of clock reads per 64 KiB.
 //!
 //! The compressed output stays in memory whenever its worst case (input +
 //! 1/8 + 1 KiB, the same test for every codec) fits under the memory left
 //! for it: half of `--memory-limit` when the input is held in memory, all
 //! of it when the input is streamed. Only past that does it go to one temp
 //! file, and then its writes (to the page cache, through the 64 KiB
-//! buffer) fall inside the compression regions. Both destinations have the same shape: a 64 KiB
-//! `BufWriter` over a pre-reserved `Vec`, or over the temp file, so a codec
-//! that writes in small pieces pays the same either way. Decoding reads the
-//! same shape back: the `Vec` as a seekable, sized source, or the temp file
-//! through a 64 KiB `BufReader`, so a decoder that reads a byte at a time
-//! (LZW's) costs a memory copy per byte, not a system call.
+//! buffer) fall inside the compression regions. Both destinations have the
+//! same shape: a 64 KiB `BufWriter` over a pre-reserved `Vec`, or over the
+//! temp file, so a codec that writes in small pieces pays the same either
+//! way. Decoding reads the same shape back: the `Vec` as a seekable, sized
+//! source, or the temp file through a 64 KiB `BufReader`, so a decoder that
+//! reads a byte at a time (LZW's) costs a memory copy per byte, not a
+//! system call.
 //!
 //! Each file's length is taken once, when the input is loaded; every later
 //! read stops there, so a file still being written is benched as it was.
 //!
 //! bench ignores STUFFR_THREADS; threads come only from --threads.
 //!
-//! With streamed input and `--threads` above 1, a multi-threaded encoder's
-//! workers keep running during the untimed input reads between regions, so
-//! its compression time can be under-reported against a single-threaded
-//! one. In memory there are no such gaps.
+//! With `--threads` above 1, a multi-threaded encoder's workers keep running
+//! in the untimed gaps between pieces, so its compression time can be
+//! under-reported against a single-threaded one. Streamed, the gaps hold
+//! the input's reads; in memory, only the progress report (a clock read,
+//! and a redraw at most every 100 ms).
 
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
@@ -167,17 +172,33 @@ pub fn warm(input: &Input) -> io::Result<()> {
     Ok(())
 }
 
+/// Which half of a row's round trip a progress report is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    Compress,
+    Decompress,
+}
+
 /// Compresses and decompresses `input` with `codec` at `level` (`None`: the
 /// encoder's own default) under `plan`. Every error, a rejected level
 /// included, is a failed row; nothing panics.
+///
+/// `progress` is called only between timed pieces, never inside one, with
+/// `(phase, done, total)`; `total` is the input's size. Each repeat opens
+/// with exactly one `(Compress, 0, total)`; after it, `Compress` reports
+/// the input bytes the encoder has taken, rising strictly, and `Decompress`
+/// the bytes the decoder has given back, never falling; both end at
+/// `total` and never pass it. With `Mode::PerFile` the two phases take
+/// turns, file by file, each counting on across the files.
 pub fn measure(
     codec: &str,
     level: Option<i32>,
     input: &Input,
     plan: &Plan,
     clock: &mut dyn Clock,
+    progress: &mut dyn FnMut(Phase, u64, u64),
 ) -> Outcome {
-    match run(codec, level, input, plan, clock) {
+    match run(codec, level, input, plan, clock, progress) {
         Ok(m) => Outcome::Ok(m),
         Err(e) => Outcome::Failed(e.to_string()),
     }
@@ -200,8 +221,14 @@ impl Part<'_> {
     }
 }
 
-/// Where one stream's compressed output goes. The same for every codec, so
-/// no format writes to disk while another writes to memory.
+/// A part as compression takes it: its bytes, or its file opened.
+enum Feed<'a> {
+    Memory(&'a [u8]),
+    File(&'a Snapshot, io::Take<File>),
+}
+
+/// Where one stream's compressed output goes. Decided per codec, before any
+/// timing (see [`destination`]), and the same for all of that codec's runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Dest {
     Memory,
@@ -256,6 +283,7 @@ fn run(
     input: &Input,
     plan: &Plan,
     clock: &mut dyn Clock,
+    report: &mut dyn FnMut(Phase, u64, u64),
 ) -> stuffr::Result<Measured> {
     let reg = stuffr::registry();
     let id = reg
@@ -299,7 +327,9 @@ fn run(
     let mut bytes_out = None;
     let mut compress = Vec::new();
     let mut decompress = Vec::new();
+    let mut progress = Progress::new(report, parts.iter().map(Part::len).sum());
     for _ in 0..plan.repeat.max(1) {
+        progress.start();
         let (mut out, mut c_ns, mut d_ns) = (0u64, 0u64, 0u64);
         for group in &groups {
             let expected = group_len(group);
@@ -312,7 +342,7 @@ fn run(
                 temp: temp.as_ref(),
                 buf: &mut buf,
             };
-            let row = job.run(group, expected, clock)?;
+            let row = job.run(group, expected, clock, &mut progress)?;
             out += row.bytes_out;
             c_ns += row.compress_ns;
             d_ns += row.decompress_ns;
@@ -347,6 +377,57 @@ fn median(mut v: Vec<u64>) -> u64 {
     v.get(v.len().saturating_sub(1) / 2).copied().unwrap_or(0)
 }
 
+/// The progress reports of one row, made between timed pieces only (see
+/// [`measure`] for what they promise).
+struct Progress<'a> {
+    report: &'a mut dyn FnMut(Phase, u64, u64),
+    total: u64,
+    fed: u64,
+    decoded: u64,
+}
+
+impl<'a> Progress<'a> {
+    fn new(report: &'a mut dyn FnMut(Phase, u64, u64), total: u64) -> Self {
+        Self {
+            report,
+            total,
+            fed: 0,
+            decoded: 0,
+        }
+    }
+
+    /// A repeat begins: its one `(Compress, 0, total)`.
+    fn start(&mut self) {
+        self.fed = 0;
+        self.decoded = 0;
+        (self.report)(Phase::Compress, 0, self.total);
+    }
+
+    /// The encoder took `n` more input bytes.
+    fn fed(&mut self, n: usize) {
+        let fed = self.fed.saturating_add(n as u64).min(self.total);
+        // Never a second `(Compress, 0, _)`: that opens a repeat.
+        if fed > self.fed {
+            self.fed = fed;
+            (self.report)(Phase::Compress, fed, self.total);
+        }
+    }
+
+    /// The decoder gave back `n` more bytes.
+    fn decoded(&mut self, n: usize) {
+        self.decoded = self.decoded.saturating_add(n as u64).min(self.total);
+        (self.report)(Phase::Decompress, self.decoded, self.total);
+    }
+}
+
+/// One timed piece: `f` between two clock reads, and nothing else.
+fn timed<T>(clock: &mut dyn Clock, f: impl FnOnce() -> T) -> (T, u64) {
+    let t0 = clock.now();
+    let r = f();
+    let t1 = clock.now();
+    (r, t1.saturating_sub(t0))
+}
+
 /// Everything one stream's round trip needs.
 struct Job<'a> {
     name: &'a str,
@@ -366,6 +447,7 @@ impl Job<'_> {
         group: &[Part<'_>],
         expected: u64,
         clock: &mut dyn Clock,
+        progress: &mut Progress<'_>,
     ) -> stuffr::Result<Measured> {
         let (bytes_out, compress_ns, src) = match (self.dest, self.temp) {
             (Dest::Memory, _) | (Dest::TempFile, None) => {
@@ -376,7 +458,7 @@ impl Job<'_> {
                 let room = output_room(self.name, expected).unwrap_or(0);
                 let shared = SharedVec::with_capacity(usize::try_from(room).unwrap_or(0));
                 let dst = BufWriter::with_capacity(CHUNK, shared.clone());
-                let ns = self.compress(group, Box::new(dst), clock)?;
+                let ns = self.compress(group, Box::new(dst), clock, progress)?;
                 let bytes = shared.take();
                 let len = bytes.len() as u64;
                 (len, ns, Box::new(MemSource::new(bytes)) as Box<dyn Source>)
@@ -387,14 +469,15 @@ impl Job<'_> {
                     .truncate(true)
                     .open(temp.path())?;
                 let dst = BufWriter::with_capacity(CHUNK, file);
-                let ns = self.compress(group, Box::new(dst), clock)?;
+                let ns = self.compress(group, Box::new(dst), clock, progress)?;
                 let file = File::open(temp.path())?;
                 let len = file.metadata()?.len();
                 let src = temp_source(GuardedSeek::new(counted(file)), len);
                 (len, ns, Box::new(src) as Box<dyn Source>)
             }
         };
-        let (decoded, decompress_ns) = decode(self.codec, self.decode, src, self.buf, clock)?;
+        let (decoded, decompress_ns) =
+            decode(self.codec, self.decode, src, self.buf, clock, progress)?;
         if decoded != expected {
             return Err(Error::Corrupt(format!(
                 "the round trip gave back {decoded} bytes of {expected}"
@@ -407,99 +490,115 @@ impl Job<'_> {
         })
     }
 
-    /// The compression regions' total. In memory: one region. Streamed: the
-    /// file reads fall between regions.
+    /// The compression pieces' total: encoder creation, one `write_all`
+    /// per 64 KiB of input, `finish`. Streamed, each chunk is read between
+    /// two pieces.
     fn compress(
         &mut self,
         group: &[Part<'_>],
         dst: Box<dyn Write + Send>,
         clock: &mut dyn Clock,
+        progress: &mut Progress<'_>,
     ) -> stuffr::Result<u64> {
-        if let Some(bufs) = group
-            .iter()
-            .map(|p| match p {
-                Part::Memory(b) => Some(*b),
-                Part::File(_) => None,
-            })
-            .collect::<Option<Vec<&[u8]>>>()
-        {
-            let t0 = clock.now();
-            let mut sink = self.codec.encoder(dst, self.encode)?;
-            for b in &bufs {
-                for chunk in b.chunks(CHUNK) {
-                    sink.write_all(chunk)?;
-                }
-            }
-            sink.finish()?;
-            let t1 = clock.now();
-            return Ok(t1.saturating_sub(t0));
-        }
-
-        let mut files = Vec::with_capacity(group.len());
-        // Not in memory, so every part is a file: an input is one or the other.
+        // Files are opened before any timing.
+        let mut feeds = Vec::with_capacity(group.len());
         for p in group {
-            if let Part::File(snap) = p {
-                files.push((snap, snap.open()?));
-            }
+            feeds.push(match p {
+                Part::Memory(b) => Feed::Memory(b),
+                Part::File(snap) => Feed::File(snap, snap.open()?),
+            });
         }
-        let t0 = clock.now();
-        let mut sink = self.codec.encoder(dst, self.encode)?;
-        let t1 = clock.now();
-        let mut ns = t1.saturating_sub(t0);
-        for (snap, f) in &mut files {
-            let mut read = 0u64;
-            loop {
-                let n = read_some(f, self.buf)?;
-                if n == 0 {
-                    if read < snap.len {
-                        return Err(Error::Io(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            format!(
-                                "{} shrank to {read} bytes from {} while bench ran",
-                                snap.path.display(),
-                                snap.len
-                            ),
-                        )));
+        let (sink, mut ns) = timed(clock, || self.codec.encoder(dst, self.encode));
+        let mut sink = sink?;
+        for feed in &mut feeds {
+            match feed {
+                Feed::Memory(b) => {
+                    for chunk in b.chunks(CHUNK) {
+                        let (r, t) = timed(clock, || sink.write_all(chunk));
+                        r?;
+                        ns += t;
+                        progress.fed(chunk.len());
                     }
-                    break;
                 }
-                read += n as u64;
-                let t0 = clock.now();
-                sink.write_all(&self.buf[..n])?;
-                let t1 = clock.now();
-                ns += t1.saturating_sub(t0);
+                Feed::File(snap, f) => {
+                    let mut read = 0u64;
+                    loop {
+                        let n = read_some(f, self.buf)?;
+                        if n == 0 {
+                            if read < snap.len {
+                                return Err(Error::Io(io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    format!(
+                                        "{} shrank to {read} bytes from {} while bench ran",
+                                        snap.path.display(),
+                                        snap.len
+                                    ),
+                                )));
+                            }
+                            break;
+                        }
+                        read += n as u64;
+                        let chunk = &self.buf[..n];
+                        let (r, t) = timed(clock, || sink.write_all(chunk));
+                        r?;
+                        ns += t;
+                        progress.fed(n);
+                    }
+                }
             }
         }
-        let t0 = clock.now();
-        sink.finish()?;
-        let t1 = clock.now();
-        Ok(ns + t1.saturating_sub(t0))
+        let (r, t) = timed(clock, || sink.finish());
+        r?;
+        Ok(ns + t)
     }
 }
 
-/// One region: decoder creation and reading it to its end, the bytes only
-/// counted. Returns the count and the region's length.
+/// Decompression: one piece per 64 KiB the decoder fills (`buf` is
+/// [`CHUNK`] long), the decoder made in the first, until a fill comes back
+/// short at the end; the bytes are only counted. Returns the count and the
+/// pieces' total. The decoder is dropped outside them.
 fn decode(
     codec: &dyn Codec,
     opts: &DecodeOpts,
     src: Box<dyn Source>,
     buf: &mut [u8],
     clock: &mut dyn Clock,
+    progress: &mut Progress<'_>,
 ) -> stuffr::Result<(u64, u64)> {
-    let t0 = clock.now();
-    let mut decoder = codec.decoder(src, opts)?;
+    let (first, mut ns) = timed(clock, || {
+        let mut decoder = codec.decoder(src, opts)?;
+        let n = fill(&mut decoder, buf).map_err(Error::from_decode_io)?;
+        Ok::<_, Error>((decoder, n))
+    });
+    let (mut decoder, mut n) = first?;
     let mut total = 0u64;
     loop {
-        match decoder.read(buf) {
+        total += n as u64;
+        progress.decoded(n);
+        if n < buf.len() {
+            break;
+        }
+        let (r, t) = timed(clock, || fill(&mut decoder, buf));
+        ns += t;
+        n = r.map_err(Error::from_decode_io)?;
+    }
+    drop(decoder);
+    Ok((total, ns))
+}
+
+/// Reads into `buf` until it is full or the reader ends, retrying
+/// `Interrupted`. Short only at the end.
+fn fill(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match r.read(&mut buf[filled..]) {
             Ok(0) => break,
-            Ok(n) => total += n as u64,
+            Ok(n) => filled += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(Error::from_decode_io(e)),
+            Err(e) => return Err(e),
         }
     }
-    let t1 = clock.now();
-    drop(decoder);
-    Ok((total, t1.saturating_sub(t0)))
+    Ok(filled)
 }
 
 /// `read`, retried on `Interrupted`.
@@ -841,7 +940,14 @@ mod tests {
     }
 
     fn run(codec: &str, input: &Input, plan: &Plan) -> Measured {
-        ok(measure(codec, None, input, plan, &mut FakeClock(0)))
+        ok(measure(
+            codec,
+            None,
+            input,
+            plan,
+            &mut FakeClock(0),
+            &mut |_, _, _| {},
+        ))
     }
 
     fn bench_temps() -> Vec<String> {
@@ -882,14 +988,16 @@ mod tests {
             both.bytes_out, stream.bytes_out,
             "per-file is not one stream"
         );
-        // One compression and one decompression region per file, summed.
-        assert_eq!(both.compress_ns, 20);
-        assert_eq!(both.decompress_ns, 20);
+        // Per file: encoder creation, one write (each file is under 64 KiB)
+        // and `finish` to compress, one fill to decompress; summed.
+        assert_eq!(both.compress_ns, 2 * 30);
+        assert_eq!(both.decompress_ns, 2 * 10);
     }
 
     /// Streamed: compression is encoder creation, one region per input
     /// chunk's `write_all` (each 64 KiB read falls between them) and
-    /// `finish`; decompression is one region.
+    /// `finish`; decompression one region per 64 KiB filled, the decoder
+    /// made in the first.
     #[test]
     fn a_streamed_run_times_each_write_and_not_the_reads() {
         let _lock = armed_lock();
@@ -904,11 +1012,14 @@ mod tests {
             &files,
             &plan(Mode::OneStream, 1),
             &mut clock,
+            &mut |_, _, _| {},
         ));
         let regions = 1 + 2 + 1;
+        // 64 KiB, then 36 KiB: the short fill is the end.
+        let fills = 2;
         assert_eq!(m.compress_ns, 10 * regions);
-        assert_eq!(m.decompress_ns, 10);
-        assert_eq!(clock.0, 10 * 2 * (regions + 1), "no other clock reads");
+        assert_eq!(m.decompress_ns, 10 * fills);
+        assert_eq!(clock.0, 10 * 2 * (regions + fills), "no other clock reads");
     }
 
     #[test]
@@ -926,20 +1037,123 @@ mod tests {
         assert!(governor_for(&two).is_some());
     }
 
+    /// In memory, as streamed: encoder creation, one piece per 64 KiB
+    /// `write_all` and `finish`; then one piece per 64 KiB the decoder
+    /// fills, the decoder made in the first. Each piece is exactly two
+    /// clock reads, and there are no others.
     #[test]
-    fn the_fake_clock_times_exactly_one_region_each() {
-        let input = Input::Memory(vec![text(64 * 1024, 3)]);
-        let m = run("gzip", &input, &plan(Mode::OneStream, 1));
-        assert_eq!(m.compress_ns, 10);
-        assert_eq!(m.decompress_ns, 10);
+    fn the_fake_clock_still_times_only_codec_work() {
+        // Three chunks: 64, 64 and 32 KiB.
+        let input = Input::Memory(vec![text(160 * 1024, 3)]);
+        let mut clock = FakeClock(0);
+        let m = ok(measure(
+            "gzip",
+            None,
+            &input,
+            &plan(Mode::OneStream, 1),
+            &mut clock,
+            &mut |_, _, _| {},
+        ));
+        let compress_pieces = 1 + 3 + 1;
+        // 64, 64, then 32 KiB: the short fill is the end.
+        let decompress_pieces = 3;
+        assert_eq!(m.compress_ns, 10 * compress_pieces);
+        assert_eq!(m.decompress_ns, 10 * decompress_pieces);
+        assert_eq!(
+            clock.0,
+            10 * 2 * (compress_pieces + decompress_pieces),
+            "two reads per piece, nothing else"
+        );
+    }
+
+    /// A clock whose reads a progress callback can see: the callback runs
+    /// inside a timed region exactly when the count is odd.
+    struct SeenClock(std::rc::Rc<std::cell::Cell<u64>>);
+
+    impl Clock for SeenClock {
+        fn now(&mut self) -> u64 {
+            let n = self.0.get();
+            self.0.set(n + 1);
+            10 * n
+        }
+    }
+
+    /// Splits `seen` into repeats at each `(Compress, 0, _)`, the one report
+    /// that opens a repeat, and checks each: both phases rise to `total`,
+    /// compression strictly after the opening report.
+    fn check_reports(seen: &[(Phase, u64, u64)], total: u64, repeats: usize, what: &str) {
+        let opens: Vec<usize> = (0..seen.len())
+            .filter(|&i| matches!(seen[i], (Phase::Compress, 0, _)))
+            .collect();
+        assert_eq!(opens.len(), repeats, "{what}: {seen:?}");
+        assert_eq!(opens[0], 0, "{what}: the first report opens a repeat");
+        for (i, &start) in opens.iter().enumerate() {
+            let end = opens.get(i + 1).copied().unwrap_or(seen.len());
+            let one = &seen[start..end];
+            assert!(one.iter().all(|r| r.2 == total), "{what}: {one:?}");
+            let fed: Vec<u64> = one
+                .iter()
+                .filter(|r| r.0 == Phase::Compress)
+                .map(|r| r.1)
+                .collect();
+            let decoded: Vec<u64> = one
+                .iter()
+                .filter(|r| r.0 == Phase::Decompress)
+                .map(|r| r.1)
+                .collect();
+            assert!(fed.windows(2).all(|w| w[0] < w[1]), "{what}: {fed:?}");
+            assert!(
+                decoded.windows(2).all(|w| w[0] <= w[1]),
+                "{what}: {decoded:?}"
+            );
+            assert_eq!(fed.last(), Some(&total), "{what}: compression");
+            assert_eq!(decoded.last(), Some(&total), "{what}: decompression");
+            assert!(fed.len() > 2 && decoded.len() > 1, "{what}: {one:?}");
+        }
+    }
+
+    #[test]
+    fn progress_is_reported_between_pieces_only() {
+        use std::{cell::Cell, rc::Rc};
+        let _lock = armed_lock();
+        let s = Scratch::new();
+        let data = text(160 * 1024, 5);
+        let paths = vec![
+            s.file("a", &data[..100 * 1024]),
+            s.file("b", &data[100 * 1024..]),
+        ];
+        let memory = load_input(&paths, 1 << 30).unwrap().0;
+        let files = load_input(&paths, 0).unwrap().0;
+        for (input, disk, name) in [
+            (&memory, false, "memory"),
+            (&memory, true, "memory, temp file"),
+            (&files, false, "streamed"),
+            (&files, true, "streamed, temp file"),
+        ] {
+            for mode in [Mode::OneStream, Mode::PerFile] {
+                let reads = Rc::new(Cell::new(0));
+                let mut clock = SeenClock(reads.clone());
+                let mut seen = Vec::new();
+                let mut report = |phase, done, total| {
+                    assert_eq!(reads.get() % 2, 0, "a report inside a timed region");
+                    seen.push((phase, done, total));
+                };
+                let p = plan(mode, 2);
+                let mut go = || measure("gzip", None, input, &p, &mut clock, &mut report);
+                let o = if disk { on_disk(go) } else { go() };
+                ok(o);
+                check_reports(&seen, data.len() as u64, 2, &format!("{name} {mode:?}"));
+            }
+        }
     }
 
     #[test]
     fn repeat_reports_the_median() {
         let input = Input::Memory(vec![text(4096, 1)]);
-        // Regions alternate compress, decompress across the three runs.
+        // Per run: encoder creation, one write, `finish`, then one fill.
+        // Compression 30, 10, 20; decompression 7, 5, 9.
         let mut clock = ScriptClock {
-            durations: vec![30, 7, 10, 5, 20, 9],
+            durations: vec![10, 10, 10, 7, 2, 3, 5, 5, 5, 5, 10, 9],
             reads: 0,
             t: 0,
         };
@@ -949,17 +1163,19 @@ mod tests {
             &input,
             &plan(Mode::OneStream, 3),
             &mut clock,
+            &mut |_, _, _| {},
         ));
         assert_eq!(m.compress_ns, 20);
         assert_eq!(m.decompress_ns, 7);
-        assert_eq!(clock.reads, 12, "two reads per region, nothing else");
+        assert_eq!(clock.reads, 24, "two reads per piece, nothing else");
     }
 
     #[test]
     fn an_even_repeat_reports_the_lower_median() {
         let input = Input::Memory(vec![text(4096, 1)]);
         let mut clock = ScriptClock {
-            durations: vec![40, 1, 10, 2, 30, 3, 20, 4],
+            // Compression 40, 10, 30, 20; decompression 1, 2, 3, 4.
+            durations: vec![20, 10, 10, 1, 4, 3, 3, 2, 10, 10, 10, 3, 5, 5, 10, 4],
             reads: 0,
             t: 0,
         };
@@ -969,6 +1185,7 @@ mod tests {
             &input,
             &plan(Mode::OneStream, 4),
             &mut clock,
+            &mut |_, _, _| {},
         ));
         assert_eq!(m.compress_ns, 20);
         assert_eq!(m.decompress_ns, 2);
@@ -984,6 +1201,7 @@ mod tests {
             &input,
             &plan(Mode::OneStream, 1),
             &mut clock,
+            &mut |_, _, _| {},
         ) {
             Outcome::Failed(msg) => assert!(msg.contains("99"), "{msg}"),
             Outcome::Ok(m) => panic!("level 99 accepted: {m:?}"),
@@ -1000,6 +1218,7 @@ mod tests {
             &input,
             &plan(Mode::OneStream, 1),
             &mut FakeClock(0),
+            &mut |_, _, _| {},
         );
         assert!(matches!(o, Outcome::Failed(_)), "{o:?}");
     }
@@ -1164,6 +1383,7 @@ mod tests {
             Box::new(src),
             &mut buf,
             &mut FakeClock(0),
+            &mut Progress::new(&mut |_, _, _| {}, input.len() as u64),
         )
         .unwrap();
         assert_eq!(decoded, input.len() as u64);

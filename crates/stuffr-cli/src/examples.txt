@@ -1307,7 +1307,9 @@ BENCHMARKING FORMATS ON YOUR OWN DATA
       is timed (except the temp file's writes, when the output is too
       large for memory). The input line names the codecs that ran through a C
       library ("C: zstd, xz"), or says "pure". A format that fails is a
-      row marked failed, never an exit code. Timings from a debug build
+      row marked failed, never an exit code. On a terminal, stderr shows
+      a bar for the row being measured, drawn only between timed pieces
+      and cleared before the table. Timings from a debug build
       mean nothing, so bench refuses to run in one (exit 2): build with
       --release.
 

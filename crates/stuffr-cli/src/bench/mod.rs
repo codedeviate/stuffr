@@ -18,7 +18,9 @@ use stuffr::{Error, FormatKind};
 
 use crate::cli::BenchArgs;
 use levels::{backend_of, benchable_codecs, levels_of};
-use measure::{Input, Mode, Plan, RealClock, governor_for, load_input, measure, warm};
+use measure::{
+    Clock, Input, Mode, Phase, Plan, RealClock, governor_for, load_input, measure, warm,
+};
 use report::Conditions;
 use score::Row;
 
@@ -64,16 +66,30 @@ pub fn run(args: BenchArgs) -> stuffr::Result<Ran> {
         memory_limit,
     };
     let planned = plan_rows(&codecs, args.levels);
-    let mut meter = Meter {
-        on: io::stderr().is_terminal() && !(args.json || args.csv || args.table_only),
-        shown: false,
-    };
+    let on = io::stderr().is_terminal() && !(args.json || args.csv || args.table_only);
+    let mut meter = Meter::new(
+        on.then(|| Box::new(io::stderr()) as Box<dyn Write>),
+        Box::new(RealClock::new()),
+        plan.repeat,
+    );
     let mut clock = RealClock::new();
     let mut rows = Vec::with_capacity(planned.len());
     for (k, p) in planned.iter().enumerate() {
-        // Between rows only: `measure` owns every timed region.
-        meter.show(k + 1, planned.len(), p.format, p.label);
-        let outcome = measure(p.format, p.level, &input, &plan, &mut clock);
+        meter.row(RowLabel {
+            k: k + 1,
+            n: planned.len(),
+            format: p.format,
+            level: p.label,
+        });
+        // `measure` reports only between its timed pieces.
+        let outcome = measure(
+            p.format,
+            p.level,
+            &input,
+            &plan,
+            &mut clock,
+            &mut |ph, d, t| meter.progress(ph, d, t),
+        );
         rows.push(Row {
             format: p.format,
             level: p.label,
@@ -107,30 +123,137 @@ pub fn run(args: BenchArgs) -> stuffr::Result<Ran> {
     Ok(Ran::Measured)
 }
 
-/// The row-count progress meter on stderr: `[k/N] <format> <level>` before
-/// each row, cleared before anything reaches stdout.
+/// The least time between two redraws of the bar, in nanoseconds.
+const REDRAW_NS: u64 = 100_000_000;
+
+/// The bar's cells.
+const CELLS: u64 = 20;
+
+/// The spinner after the bar, one frame per redraw.
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// The row a bar line is about.
+#[derive(Clone, Copy, Debug)]
+struct RowLabel {
+    k: usize,
+    n: usize,
+    format: &'static str,
+    level: Option<i32>,
+}
+
+/// The progress meter on stderr: one bar line for the row being measured,
+/// redrawn from `measure`'s reports (which come only between its timed
+/// pieces) at most every [`REDRAW_NS`], and cleared before anything reaches
+/// stdout. `out` is `None` when the meter is off.
 struct Meter {
-    on: bool,
+    out: Option<Box<dyn Write>>,
+    /// Read only between timed pieces, for the throttle.
+    clock: Box<dyn Clock>,
+    repeats: u32,
+    row: Option<RowLabel>,
+    /// The repeat in progress, counted from its opening report.
+    repeat: u32,
+    /// When this row's bar was last drawn; `None` before its first draw.
+    drawn_at: Option<u64>,
+    frame: usize,
     shown: bool,
 }
 
 impl Meter {
-    fn show(&mut self, k: usize, n: usize, format: &str, level: Option<i32>) {
-        if !self.on {
+    fn new(out: Option<Box<dyn Write>>, clock: Box<dyn Clock>, repeats: u32) -> Self {
+        Self {
+            out,
+            clock,
+            repeats: repeats.max(1),
+            row: None,
+            repeat: 0,
+            drawn_at: None,
+            frame: 0,
+            shown: false,
+        }
+    }
+
+    /// The next row; its first report is drawn at once.
+    fn row(&mut self, row: RowLabel) {
+        self.row = Some(row);
+        self.repeat = 0;
+        self.drawn_at = None;
+    }
+
+    /// One report from `measure`. `(Compress, 0, _)` opens a repeat.
+    fn progress(&mut self, phase: Phase, done: u64, total: u64) {
+        let (Some(out), Some(row)) = (self.out.as_mut(), self.row) else {
+            return;
+        };
+        if phase == Phase::Compress && done == 0 {
+            self.repeat = (self.repeat + 1).min(self.repeats);
+        }
+        let now = self.clock.now();
+        if let Some(at) = self.drawn_at
+            && now.saturating_sub(at) < REDRAW_NS
+        {
             return;
         }
-        let level = level.map_or_else(|| "-".to_string(), |l| l.to_string());
+        let repeat = (self.repeats > 1).then_some((self.repeat.max(1), self.repeats));
+        let line = bar_line(&row, phase, repeat, done, total, self.frame);
         // `\x1b[K` after the text clears what a longer previous line left.
-        eprint!("\r[{k}/{n}] {format} {level}\x1b[K");
+        let _ = write!(out, "\r{line}\x1b[K");
+        let _ = out.flush();
+        self.frame = (self.frame + 1) % SPINNER.len();
+        self.drawn_at = Some(now);
         self.shown = true;
     }
 
     fn clear(&mut self) {
-        if self.shown {
-            eprint!("\r\x1b[K");
+        if let Some(out) = self.out.as_mut()
+            && self.shown
+        {
+            let _ = write!(out, "\r\x1b[K");
+            let _ = out.flush();
             self.shown = false;
         }
     }
+}
+
+/// `[k/N] <format> <level>  <phase> ▕<bar>▏<spinner> <pct>%`, `<phase>`
+/// followed by ` r/N` when `repeat` is given. `done` past `total` counts
+/// as `total`; a `total` of 0 is 100%, with nothing divided.
+fn bar_line(
+    row: &RowLabel,
+    phase: Phase,
+    repeat: Option<(u32, u32)>,
+    done: u64,
+    total: u64,
+    frame: usize,
+) -> String {
+    let done = done.min(total);
+    // Widened, so `done * 100` cannot overflow; no division when total is 0.
+    let share = |scale: u64| {
+        if total == 0 {
+            scale
+        } else {
+            u64::try_from(u128::from(done) * u128::from(scale) / u128::from(total)).unwrap_or(scale)
+        }
+    };
+    let cells = share(CELLS);
+    let bar: String = (0..CELLS)
+        .map(|i| if i < cells { '█' } else { '░' })
+        .collect();
+    let RowLabel {
+        k,
+        n,
+        format,
+        level,
+    } = *row;
+    let level = level.map_or_else(|| "-".to_string(), |l| l.to_string());
+    let phase = match phase {
+        Phase::Compress => "compress",
+        Phase::Decompress => "decompress",
+    };
+    let repeat = repeat.map_or_else(String::new, |(r, n)| format!(" {r}/{n}"));
+    let spinner = SPINNER[frame % SPINNER.len()];
+    let pct = share(100);
+    format!("[{k}/{n}] {format} {level}  {phase}{repeat} ▕{bar}▏{spinner} {pct}%")
 }
 
 /// One row to run: `level` is what `measure` gets (`None`: the encoder's
@@ -225,13 +348,22 @@ fn expand_inputs(operands: &[String]) -> stuffr::Result<Vec<PathBuf>> {
     for op in operands {
         let path = Path::new(op);
         // A dangling symlink does not "exist" but is named: it is reported
-        // as unreadable, not as a missing path.
-        if path.exists() || path.symlink_metadata().is_ok() {
-            if path.is_dir() {
-                return Err(directory_error(path));
+        // as unreadable, not as a missing path; so is a named path whose
+        // lookup fails for any reason but its absence (a directory without
+        // search permission on the way). A pattern goes on to the glob,
+        // which reports such a directory itself.
+        match path.symlink_metadata() {
+            Ok(_) => {
+                if path.is_dir() {
+                    return Err(directory_error(path));
+                }
+                files.push(regular(path)?);
+                continue;
             }
-            files.push(regular(path)?);
-            continue;
+            Err(e) if e.kind() != io::ErrorKind::NotFound && !has_glob_chars(op) => {
+                return Err(unreadable(path, &e));
+            }
+            Err(_) => {}
         }
         if !has_glob_chars(op) {
             return Err(no_match(op));
@@ -472,6 +604,177 @@ mod tests {
         let m = usage(expand_inputs(&[s.s("*/*.log")]));
         assert!(m.contains("locked"), "{m}");
         assert!(m.contains(": cannot read it ("), "{m}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_named_path_in_an_unreadable_directory_cannot_be_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = Scratch::new();
+        let locked = s.0.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("b.log"), b"x").unwrap();
+        let _restore = Mode000(locked.clone());
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads it anyway; there is nothing to test.
+        if fs::read_dir(&locked).is_ok() {
+            return;
+        }
+        let named = locked.join("b.log");
+        let m = usage(expand_inputs(&[s.s("locked/b.log")]));
+        assert!(
+            m.starts_with(&format!("{}: cannot read it (", named.display())),
+            "{m}"
+        );
+        // Named by a pattern, the glob reports the directory.
+        let m = usage(expand_inputs(&[s.s("locked/*.log")]));
+        assert!(m.contains(": cannot read it ("), "{m}");
+    }
+
+    /// The bar's text goes here, for the tests to read.
+    #[derive(Clone, Default)]
+    struct Captured(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl Write for Captured {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(b);
+            Ok(b.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        /// Each drawn line, without its `\r` and `\x1b[K`.
+        fn lines(&self) -> Vec<String> {
+            String::from_utf8(self.0.borrow().clone())
+                .unwrap()
+                .split('\r')
+                .map(|l| l.trim_end_matches("\x1b[K").to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        }
+    }
+
+    /// A clock the test moves by hand.
+    struct HandClock(std::rc::Rc<std::cell::Cell<u64>>);
+
+    impl Clock for HandClock {
+        fn now(&mut self) -> u64 {
+            self.0.get()
+        }
+    }
+
+    fn label(k: usize, n: usize, format: &'static str, level: Option<i32>) -> RowLabel {
+        RowLabel {
+            k,
+            n,
+            format,
+            level,
+        }
+    }
+
+    #[test]
+    fn the_bar_renders_blocks_and_a_spinner() {
+        let xz = label(3, 8, "xz", Some(6));
+        assert_eq!(
+            bar_line(&xz, Phase::Compress, None, 0, 1000, 0),
+            "[3/8] xz 6  compress ▕░░░░░░░░░░░░░░░░░░░░▏⠋ 0%"
+        );
+        assert_eq!(
+            bar_line(&xz, Phase::Compress, None, 370, 1000, 1),
+            "[3/8] xz 6  compress ▕███████░░░░░░░░░░░░░▏⠙ 37%"
+        );
+        assert_eq!(
+            bar_line(&xz, Phase::Decompress, Some((2, 3)), 370, 1000, 2),
+            "[3/8] xz 6  decompress 2/3 ▕███████░░░░░░░░░░░░░▏⠹ 37%"
+        );
+        let lz4 = label(8, 8, "lz4", None);
+        assert_eq!(
+            bar_line(&lz4, Phase::Decompress, None, 1000, 1000, 9),
+            "[8/8] lz4 -  decompress ▕████████████████████▏⠏ 100%"
+        );
+        // Past the total is still 100%, never more.
+        assert_eq!(
+            bar_line(&lz4, Phase::Decompress, None, 2000, 1000, 9),
+            "[8/8] lz4 -  decompress ▕████████████████████▏⠏ 100%"
+        );
+        // The spinner wraps after its ten frames.
+        assert_eq!(
+            bar_line(&lz4, Phase::Compress, None, 0, 1, 10),
+            bar_line(&lz4, Phase::Compress, None, 0, 1, 0)
+        );
+
+        // Through the meter: the first report of a row draws at once, the
+        // next ones at most every 100 ms, the spinner one frame per draw.
+        let out = Captured::default();
+        let t = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut meter = Meter::new(
+            Some(Box::new(out.clone())),
+            Box::new(HandClock(t.clone())),
+            3,
+        );
+        meter.row(xz);
+        meter.progress(Phase::Compress, 0, 1000);
+        t.set(REDRAW_NS - 1);
+        meter.progress(Phase::Compress, 370, 1000);
+        t.set(REDRAW_NS);
+        meter.progress(Phase::Compress, 370, 1000);
+        t.set(2 * REDRAW_NS);
+        meter.progress(Phase::Compress, 0, 1000);
+        assert_eq!(
+            out.lines(),
+            vec![
+                "[3/8] xz 6  compress 1/3 ▕░░░░░░░░░░░░░░░░░░░░▏⠋ 0%",
+                "[3/8] xz 6  compress 1/3 ▕███████░░░░░░░░░░░░░▏⠙ 37%",
+                "[3/8] xz 6  compress 2/3 ▕░░░░░░░░░░░░░░░░░░░░▏⠹ 0%",
+            ]
+        );
+        // A new row draws at once, whatever the clock says.
+        meter.row(lz4);
+        meter.progress(Phase::Compress, 0, 1000);
+        assert_eq!(
+            out.lines().last().unwrap(),
+            "[8/8] lz4 -  compress 1/3 ▕░░░░░░░░░░░░░░░░░░░░▏⠸ 0%"
+        );
+        meter.clear();
+        assert!(out.0.borrow().ends_with(b"\r\x1b[K"));
+    }
+
+    #[test]
+    fn an_empty_input_draws_full_and_divides_nothing() {
+        let out = Captured::default();
+        let mut meter = Meter::new(Some(Box::new(out.clone())), Box::new(RealClock::new()), 1);
+        meter.row(label(1, 1, "gzip", Some(6)));
+        let input = Input::Memory(vec![Vec::new()]);
+        let plan = Plan {
+            mode: Mode::OneStream,
+            repeat: 1,
+            threads: None,
+            memory_limit: 1 << 30,
+        };
+        let mut seen = Vec::new();
+        let o = measure(
+            "gzip",
+            None,
+            &input,
+            &plan,
+            &mut RealClock::new(),
+            &mut |ph, d, t| {
+                seen.push((ph, d, t));
+                meter.progress(ph, d, t)
+            },
+        );
+        assert!(matches!(o, score::Outcome::Ok(_)), "{o:?}");
+        assert_eq!(seen.first(), Some(&(Phase::Compress, 0, 0)));
+        assert_eq!(seen.last(), Some(&(Phase::Decompress, 0, 0)));
+        // The row's first report draws at once, full.
+        assert_eq!(
+            out.lines().first().map(String::as_str),
+            Some("[1/1] gzip 6  compress ▕████████████████████▏⠋ 100%")
+        );
     }
 
     #[test]

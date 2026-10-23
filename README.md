@@ -1792,8 +1792,9 @@ build with the `zstd-c` feature (part of `c-backed`, and in the Homebrew
 build), because the pure tier's zstd encoder is a weak fallback. Inputs must
 be regular files (or links to them): a pipe or device is refused with exit 2,
 so to bench a pipe, write it to a file first. A format that fails is a row
-marked failed, not an exit code. Timings need a release build; a debug build
-refuses with exit 2.
+marked failed, not an exit code. On a terminal, stderr shows a bar for the
+row being measured, drawn only between timed pieces and cleared before the
+table. Timings need a release build; a debug build refuses with exit 2.
 
 `--json` prints one object. `conditions` holds `files`, `bytes_in`, `mode`
 (`one-stream` or `per-file`), `threads` (`--threads` as given, `null` when
