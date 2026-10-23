@@ -141,8 +141,9 @@ pub const SALVAGE_FUZZ_MAX_ENTRY: u64 = 256 * 1024;
 /// names the compatibility tool a case runs as, and `(n / len) & 1` the
 /// flavour: the gzip family's (0 GNU, 1 BSD; R7 of 0.12.0) and, since
 /// 0.16.0, the unzip family's (0 Ubuntu, 1 Apple: the same side as gzip's)
-/// and, since 0.18.0, the compress family's (0 the platform's default, 1
-/// the other one). Only those three families read it. Every seed the
+/// and, since 0.18.0, the compress family's (0 ncompress, 1 Apple: absolute
+/// like the others, so an artifact replays the same personality on every
+/// platform). Only those three families read it. Every seed the
 /// 0.11.0 generator wrote has a name byte below 4,
 /// so it decodes to the same tool, as GNU (`old_seeds_decode_unchanged`).
 ///

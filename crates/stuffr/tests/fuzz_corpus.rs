@@ -1014,8 +1014,8 @@ const COMPAT_SHAPES: &[&str] = &[
     "funzip-ubuntu-stdin-gzip",
     "funzip-apple-file-zip",
     "funzip-ubuntu-stdin-encrypted-cut",
-    // The compress family (0.18.0): one seed per name in the platform's
-    // default flavour (Task 2), then `compress-<apple|ncompress>-<case>`
+    // The compress family (0.18.0): one seed per name as ncompress
+    // (flavour byte 0, on every platform), then `compress-<apple|ncompress>-<case>`
     // and `uncompress-<apple|ncompress>-<case>`: a seed per major flag and
     // per flavour, the `-b` widths (9, 12, 16, an out-of-range 17), `-V`
     // and ncompress's own flags.
@@ -2368,20 +2368,9 @@ fn e(name: &str, args: &[&str], files: &[&str], stdin: bool, payload: &[u8]) -> 
     encode_compat_case(name, 0, args, files, stdin, payload)
 }
 
-/// Whether the platform's default compress personality is Apple's (the cfg
-/// of `compress::default_flavour`, which the seeds' flavour byte is
-/// relative to).
-const COMPRESS_APPLE_DEFAULT: bool = cfg!(any(
-    target_vendor = "apple",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly"
-));
-
 /// The compress-family `compat` seeds (0.18.0 Task 4): `<compress|uncompress>-
 /// <apple|ncompress>-<case>`, or `None` for another family's. The flavour
-/// byte is the platform's default (0) or the other one (1), so each
+/// byte is absolute (0 ncompress, 1 Apple, as gzip's 0 GNU / 1 BSD), so each
 /// personality gets its seed on every platform.
 fn compress_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> {
     let mut parts = shape.splitn(3, '-');
@@ -2390,8 +2379,8 @@ fn compress_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>
         return Ok(None);
     };
     let flavour = match (tool, personality) {
-        ("compress" | "uncompress", "apple") => u8::from(!COMPRESS_APPLE_DEFAULT),
-        ("compress" | "uncompress", "ncompress") => u8::from(COMPRESS_APPLE_DEFAULT),
+        ("compress" | "uncompress", "apple") => 1,
+        ("compress" | "uncompress", "ncompress") => 0,
         _ => return Ok(None),
     };
     let z = |name: &str, args: &[&str], files: &[&str], stdin: bool, payload: &[u8]| {
@@ -4651,11 +4640,11 @@ fn every_compat_seed_decodes_fits_and_carries_its_shape() {
             Some("gnu") if gzip_family => 0,
             Some("apple") if unzip_family => 1,
             Some("ubuntu") if unzip_family => 0,
-            // The compress family's byte is 0 for the platform's default
-            // personality and 1 for the other.
-            Some(p @ ("apple" | "ncompress")) if compress_family => {
-                u8::from((p == "apple") != COMPRESS_APPLE_DEFAULT)
-            }
+            // The compress family's byte is absolute too: 0 ncompress,
+            // 1 Apple, whatever the platform (a crash artifact replays the
+            // same personality everywhere).
+            Some("apple") if compress_family => 1,
+            Some("ncompress") if compress_family => 0,
             _ => {
                 assert!(!gzip_family && !unzip_family, "{shape} names no flavour");
                 0
@@ -4678,6 +4667,47 @@ fn every_compat_seed_decodes_fits_and_carries_its_shape() {
             );
         }
     }
+}
+
+/// 0.18.0 (ruling E11): the compress family's flavour byte is absolute, 0
+/// ncompress and 1 Apple (as gzip's 0 GNU / 1 BSD), so a seed or a crash
+/// artifact names the same personality on every platform. Pinned on the
+/// wire bytes, with no platform cfg: each `compress-apple-*` and
+/// `compress-ncompress-*` shape (and the `uncompress-` ones) carries the
+/// byte its name says, the two bare names are ncompress's.
+#[test]
+fn compress_seeds_name_their_personality_on_every_platform() {
+    let work = tempfile::tempdir().unwrap();
+    let (mut apple, mut ncompress) = (0, 0);
+    for shape in COMPAT_SHAPES {
+        let (tool, rest) = shape.split_once('-').unwrap_or((shape, ""));
+        if !matches!(tool, "compress" | "uncompress") {
+            continue;
+        }
+        let want = if rest.starts_with("apple-") {
+            apple += 1;
+            1
+        } else {
+            if rest.starts_with("ncompress-") {
+                ncompress += 1;
+            }
+            0
+        };
+        let seed = compat_seed(work.path(), shape).unwrap();
+        let case = decode_compat_case(&seed).unwrap();
+        assert_eq!(case.flavour, want, "{shape}");
+        // The byte is `(tool byte / names) & 1`, so the seed's first byte
+        // is `index + names * flavour`.
+        assert_eq!(
+            (usize::from(seed[0]) / COMPAT_NAMES.len()) & 1,
+            usize::from(want),
+            "{shape}"
+        );
+    }
+    assert!(
+        apple >= 20 && ncompress >= 20,
+        "{apple} apple, {ncompress} ncompress"
+    );
 }
 
 /// The hand-built inputs are what they claim: the pack seed unpacks to its

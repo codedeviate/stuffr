@@ -31,9 +31,9 @@
 //! `stuffr_core::testing::decode_compat_case` (whose tables are the wire
 //! format of the seeds `crates/stuffr/tests/fuzz_corpus.rs` writes). The
 //! tool byte also picks the gzip and unzip flavours, `(byte / names) & 1`
-//! (R7: 0 GNU or Ubuntu, 1 BSD or Apple), and the compress family's: 0 the
-//! platform's default (`compress::default_flavour`: Apple on macOS and the
-//! BSDs, ncompress elsewhere), 1 the other one. Each
+//! (R7: 0 GNU or Ubuntu, 1 BSD or Apple), and the compress family's: 0
+//! ncompress, 1 Apple (absolute, not relative to the platform's default, so
+//! a crash artifact replays the same personality everywhere). Each
 //! file the mask names is created holding the payload; with the mask's stdin
 //! bit, standard input carries it too. The xz family's five files take a
 //! second mask byte, there only when the argument-count byte is past 8
@@ -2307,10 +2307,10 @@ fn check_compress_stream(
 /// streams); that the bytes are the reference's rests on those suites too.
 #[allow(clippy::too_many_arguments)]
 fn run_compress(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8], payload: &[u8]) {
-    let flavour = match (flavour, compress::default_flavour()) {
-        (0, d) => d,
-        (_, compress::Flavour::Apple) => compress::Flavour::Ncompress,
-        (_, compress::Flavour::Ncompress) => compress::Flavour::Apple,
+    let flavour = if flavour == 0 {
+        compress::Flavour::Ncompress
+    } else {
+        compress::Flavour::Apple
     };
     let before = contents(dir);
     let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
