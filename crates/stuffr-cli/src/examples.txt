@@ -1368,8 +1368,8 @@ COMPATIBILITY LINKS (INSTALL-LINKS)
   stuffr install-links --dir ~/.local/bin
       Creates symlinks named bzip2, bunzip2, bzcat, bzip2recover, gzip,
       gunzip, zcat, gzcat, xz, unxz, xzcat, lzma, unlzma, lzcat, zstd,
-      unzstd, zstdcat, zstdmt, lz4, unlz4, lz4cat, lz4c, unzip, zipinfo
-      and funzip in that directory, each pointing at this stuffr binary.
+      unzstd, zstdcat, zstdmt, lz4, unlz4, lz4cat, lz4c, unzip, zipinfo,
+      funzip, compress and uncompress in that directory, each pointing at this stuffr binary.
       Run under one of those names, the binary behaves as that tool, with
       its flags, messages and exit codes. This is opt-in: nothing creates these links unless you run
       this verb. The directory must exist (exit 2 if not); one that cannot
@@ -1419,6 +1419,14 @@ COMPATIBILITY LINKS (INSTALL-LINKS)
       refused, exit 1). UNZIP and UNZIPOPT (ZIPINFO and ZIPINFOOPT for
       zipinfo) are read before the command line, as unzip reads them. The
       first line of the usage and -v screens names stuffr.
+
+      The compress and uncompress names behave as Apple's compress 487.0.1
+      on macOS and the BSDs and as ncompress 5.0 elsewhere;
+      STUFFR_COMPRESS_FLAVOR=apple or ncompress overrides that (any other
+      value is refused, exit 1). uncompress decompresses, as does compress
+      -d; zcat stays with the gzip names. Stdout, stderr, exit codes and
+      compressed bytes match the real tool wherever its output is a valid
+      stream.
 
   stuffr install-links --dir ~/.local/bin --names bzcat,zcat
       Only the named links; --names takes a comma-separated list. A name that

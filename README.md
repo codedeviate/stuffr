@@ -422,6 +422,20 @@ read list.
 > **3051** tests under `--all-features`, **2937** on the default tier —
 > measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
+> `0.18.0` is a MINOR that adds the compress compatibility family:
+> `compress` and `uncompress`, in two personalities — a port of Apple's
+> `compress` (file_cmds 487.0.1) on macOS and the BSDs, and a port of
+> ncompress 5.0 as Ubuntu's `5.0-1` builds it elsewhere, or as
+> `STUFFR_COMPRESS_FLAVOR=apple|ncompress` says. stdout, stderr, exit codes
+> and compressed bytes are identical to the reference wherever its output is
+> a valid stream, on both tiers; the deviations are listed under "The
+> compress family". `zcat` stays in the gzip family. `install-links` now
+> makes twenty-seven names. `LICENSE-compress-bsd` (Apple's BSD-3-Clause
+> notice) and `LICENSE-ncompress` (the Unlicense) join `stuffr-cli`, whose
+> licence expression gains `Unlicense`.
+> **XXXX** tests under `--all-features`, **YYYY** on the default tier —
+> measured from this bump's own `make check`, `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
@@ -1021,7 +1035,8 @@ behaves as **bzip2 1.0.8**; invoked as `gzip`, `gunzip`, `zcat` or `gzcat`
 `zstd`, `unzstd`, `zstdcat` or `zstdmt` (from `0.14.0`), as **zstd** (zstd
 1.5.7); invoked as `lz4`, `unlz4`, `lz4cat` or `lz4c` (from `0.15.0`), as
 **lz4** (lz4 1.10.0); invoked as `unzip`, `zipinfo` or `funzip` (from
-`0.16.0`), as **Info-ZIP UnZip 6.00**. In every case that tool's flags,
+`0.16.0`), as **Info-ZIP UnZip 6.00**; invoked as `compress` or `uncompress`
+(from `0.18.0`), as **compress**, Apple's 487.0.1 or ncompress 5.0. In every case that tool's flags,
 files, exit codes and messages, not stuffr's. The binary reads the name from
 `argv[0]`, the file name only, before parsing anything. Any other name,
 `stuffr` included, runs the stuffr CLI unchanged. So does a link you make by
@@ -1033,7 +1048,7 @@ hand under a name stuffr does not handle: `zcat2 -> stuffr` runs `stuffr`.
 Homebrew. One verb makes them:
 
 ```sh
-stuffr install-links --dir ~/.local/bin                  # all twenty-five names
+stuffr install-links --dir ~/.local/bin                  # all twenty-seven names
 stuffr install-links --dir ~/.local/bin --names bzcat,zcat   # comma-separated subset
 stuffr install-links --dir ~/.local/bin --dry-run        # "would create ...", changes nothing
 stuffr install-links --dir ~/.local/bin --force          # replace what is already there
@@ -1587,12 +1602,96 @@ name leads the line). `unzip` reads `UNZIP` and `UNZIPOPT`, and `zipinfo` reads 
     names are too long is "Enter password: " (T11-5). The full set is in the
     code's `// ruling:` comments.
 
+### The compress family
+
+`compress` and `uncompress`, from `0.18.0`. Like gzip, compress has two common
+implementations that differ in flags, messages and exit codes, so stuffr
+carries both and picks one:
+
+- **Apple compress** (a port of `file_cmds-487.0.1`'s `compress.c` and
+  `zopen.c`) on macOS and the BSDs.
+- **ncompress** (a port of ncompress 5.0, built as Ubuntu's `5.0-1` builds it)
+  everywhere else, Windows included.
+- **`STUFFR_COMPRESS_FLAVOR=apple|ncompress`** overrides the choice, whatever
+  the platform; unset or empty means the platform's own. Any other value is
+  refused, exit 1, as `NAME: STUFFR_COMPRESS_FLAVOR must be apple or
+  ncompress, not 'VALUE'` (the invoked name leads the line). Neither
+  reference has the variable.
+
+`uncompress` decompresses, and so does `compress -d`; on Linux it behaves as
+ncompress's own `uncompress` (Ubuntu installs that as `uncompress.real`), never
+as gzip's script. `zcat` stays in the gzip family.
+
+**The promise:** stdout, stderr and exit codes are the chosen reference's, and
+so are the compressed bytes wherever the reference's output is a valid stream
+(Apple at every `-b` from 1 to 16; ncompress from 10 to 16, and at 9 until its
+table fills, N1), on both build tiers. Both personalities decode every valid
+stream at maxbits 9 to 16. A differential suite runs each case through the
+real tool and a stuffr link. An input is never lost, including when it is also
+the output.
+
+**Apple deviations:**
+
+- **A1.** A stream whose header asks for fewer than 12 bits is decoded (any
+  maxbits up to 16), Apple's own `-b 1` to `-b 11` output included; Apple's
+  `uncompress` refuses all of them with `Inappropriate file type or format`,
+  exit 1.
+- **A2.** When the output exists and is the input itself (a link to it), Apple
+  opens the output for writing over its own input and the data is lost.
+  stuffr writes the output under a temporary name and renames it over the link
+  when complete, then removes the input as usual: the data survives, exit 0.
+  After a `y` at the prompt without `-f`, a compressed output not smaller than
+  its input is still "no saving", exit 2, and stuffr leaves both files as
+  they were.
+- **A3.** A header and nothing else (`1f 9d 90`, what ncompress writes for an
+  empty input) is a valid stream of no bytes: stuffr writes the empty output,
+  exit 0. Apple refuses it with whatever `errno` was left, exit 1.
+- **A4.** A read error part-way through a `.Z` input: Apple takes it for the
+  end of the stream, publishes the cut-short output and removes the input,
+  exit 0, and the data is lost. stuffr warns (`uncompress: NAME: <strerror>`),
+  exit 1, removes the output and keeps the input.
+- **Smaller points.** The overwrite question's answer is judged by the C
+  locale (`y` or `Y`); undefined behaviour (a table chain longer than 65536
+  entries, an encoder writing past its buffer after a failed write) is not
+  reproduced; a write that fails part-way is reported where stuffr's 64 KiB
+  buffer meets it; off macOS file flags are not copied.
+
+**ncompress deviations:**
+
+- **N1.** At maxbits 9 (`-b 9`, and every value clamped to 9: 0, negative
+  values, 1 to 8, non-numbers, the empty string) ncompress's encoder never
+  widens its codes, so once the table fills its stream is undecodable, by its
+  own `uncompress` too. stuffr writes the valid compress 4.0 stream there: one
+  more 9-bit code, then 10-bit codes. A short input is unchanged.
+- **N2.** `uncompress` decompresses under that name on every platform.
+  Ubuntu's binary does so only as `uncompress.real`; where its usage says
+  `uncompress.real`, stuffr's says `uncompress`.
+- **N4.** `uncompress -f` on a file refused at its header (not in compressed
+  format, or more than 16 bits): ncompress prints the refusal and its exit
+  code, then takes the empty output for a success and removes the input.
+  stuffr prints and exits the same, removes its empty output and keeps the
+  input.
+- **Ubuntu's build everywhere.** On macOS this personality is still Ubuntu's
+  build, not Homebrew's: symbolic-link operands are followed, `-V` lists
+  `FAST, ` and `IBUFSIZ=8192, OBUFSIZ=8192`, and the corrupt-input debug line
+  follows 8192-byte buffers.
+- **Smaller points.** Undefined behaviour is not reproduced (a debug line's
+  byte read before the buffer is `00`; an over-long table chain is `corrupt
+  input`); the signal handler calls `_exit`, so a pending `-r` line is not
+  flushed; off unix there is no mode, owner or time to copy.
+
+**Both personalities:** a reference's behaviour that no correct decoder can
+read back is replaced by a valid stream, and is listed above (N1). A closed
+standard input or output reads or writes `/dev/null`, because the Rust runtime
+reopens it before `main`. The full set is in the code's module docs
+(`crates/stuffr-cli/src/compat/compress/`).
+
 ### Roadmap
 
 One family per release, each with its own spec stating its byte-identity
 promise: **bzip2 (`0.11.0`), gzip (`0.12.0`), xz/lzma (`0.13.0`), zstd
-(`0.14.0`), lz4 (`0.15.0`) and `unzip`/`zipinfo`/`funzip` (`0.16.0`) are
-done.**
+(`0.14.0`), lz4 (`0.15.0`), `unzip`/`zipinfo`/`funzip` (`0.16.0`) and
+`compress`/`uncompress` (`0.18.0`) are done.**
 `tar` is excluded (see [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md)). The planned
 tiers:
 
@@ -1638,8 +1737,15 @@ BSD-2-Clause) is linked; its notice is in
 The unzip family is ported from Info-ZIP UnZip 6.0 (Apple's `zip-33` tree
 and Debian's patches) under the Info-ZIP licence, in
 [`crates/stuffr-cli/LICENSE-infozip`](crates/stuffr-cli/LICENSE-infozip).
+The compress family's Apple personality is ported from Apple's `compress.c` and
+`zopen.c` (`file_cmds`, 4.4BSD's, copyright the Regents of the University of
+California), BSD-3-Clause, in
+[`crates/stuffr-cli/LICENSE-compress-bsd`](crates/stuffr-cli/LICENSE-compress-bsd);
+its ncompress personality is ported from ncompress 5.0's `compress.c`, released
+into the public domain under the Unlicense, in
+[`crates/stuffr-cli/LICENSE-ncompress`](crates/stuffr-cli/LICENSE-ncompress).
 `stuffr-cli`'s licence metadata is therefore
-`MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD AND Info-ZIP`. The GNU
+`MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD AND Info-ZIP AND Unlicense`. The GNU
 personality contains no GNU code: GNU gzip is GPLv3 and its source was never
 read, so that behaviour comes from the manual, `--help`, the NEWS file and
 running the binary.
@@ -1772,8 +1878,8 @@ peeled and stays in the output, as with `unpack`.
 `ARCHIVE` accepts `-` for stdin everywhere. Optional compat symlinks
 argv[0]-dispatch into the same binary, so the tools they are named for drop
 into existing scripts unchanged: `bzip2`, `bunzip2`, `bzcat` and
-`bzip2recover`, `gzip`, `xz`, `zstd`, `lz4` and `unzip` with its siblings
-today, one family per release — see [Compatibility links](#compatibility-links).
+`bzip2recover`, `gzip`, `xz`, `zstd`, `lz4`, `unzip` with its siblings and
+`compress`/`uncompress` today, one family per release — see [Compatibility links](#compatibility-links).
 
 ### `stuffr bench`
 
@@ -2007,11 +2113,17 @@ the same licence) and stays under the **Info-ZIP licence**, version
 Its clause 3 asks that an altered version be plainly marked and never
 presented as an Info-ZIP release, which is why the family's banner lines
 name stuffr and say "altered".
+Since `0.18.0` the compress family is ported too: Apple's `compress.c` and
+`zopen.c` (the Regents of the University of California's BSD-3-Clause, already
+in the expression; notice in
+[`crates/stuffr-cli/LICENSE-compress-bsd`](crates/stuffr-cli/LICENSE-compress-bsd)),
+and ncompress 5.0's `compress.c`, which is in the public domain under the
+**Unlicense** ([`crates/stuffr-cli/LICENSE-ncompress`](crates/stuffr-cli/LICENSE-ncompress)).
 `stuffr-cli`'s full expression is therefore
-**`MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD AND Info-ZIP`**: the
+**`MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD AND Info-ZIP AND Unlicense`**: the
 BSD-2-Clause covers `gzip.c` and the decoders, the BSD-3-Clause covers
 `zuncompress.c`, the University of California's `.Z` reader, and the zstd
-family; the 0BSD covers the xz family; Info-ZIP covers the unzip family. One notice is
+family; the 0BSD covers the xz family; Info-ZIP covers the unzip family; the Unlicense covers the ncompress personality. One notice is
 BSD-style but not word for word the SPDX `BSD-2-Clause` text: the Lzd one in
 `unlz.c`. The full notice ships in `LICENSE-gzip-bsd`, and that file, not the
 SPDX name, is what to read. `stuffr-formats` is
