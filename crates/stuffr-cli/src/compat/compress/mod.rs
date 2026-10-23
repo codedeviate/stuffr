@@ -33,6 +33,8 @@ use super::host::{Host, SANDBOX_OUTPUT_CAP, Sandbox, reset_sigpipe};
 mod apple;
 mod flavour;
 mod ncompress;
+#[cfg(test)]
+mod test_scratch;
 
 pub(crate) use flavour::flavour_from;
 pub use flavour::{Flavour, default_flavour};

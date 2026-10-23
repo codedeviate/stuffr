@@ -126,8 +126,10 @@ mod common {
         // IBUFSIZ (1024 on Homebrew, 8192 on Ubuntu), and the output that
         // reached standard output before the abort is whole OBUFSIZ pieces
         // (29 696 bytes on Homebrew, 24 576 on Ubuntu for the record's
-        // concatenated stream). The line is masked on both sides, and the
-        // two outputs must agree as far as the shorter goes.
+        // concatenated stream). The line is masked on both sides. Both
+        // detect the bad code at the same place, so stuffr's output must be
+        // whole 8192-byte pieces, a prefix of Homebrew's whole 1024-byte
+        // pieces, less than one 8192-byte piece shorter.
         let corrupt = |run: &Run| run.stderr.contains("uncompress: corrupt input\n");
         if corrupt(r) && corrupt(s) {
             for run in [&mut *r, &mut *s] {
@@ -143,10 +145,9 @@ mod common {
                     })
                     .collect();
             }
-            let n = r.stdout.len().min(s.stdout.len());
-            if r.stdout[..n] == s.stdout[..n] {
-                r.stdout.truncate(n);
-                s.stdout.truncate(n);
+            let (rn, sn) = (r.stdout.len(), s.stdout.len());
+            if sn % 8192 == 0 && sn <= rn && rn - sn < 8192 && r.stdout[..sn] == s.stdout[..] {
+                r.stdout.truncate(sn);
             }
         }
     }
@@ -170,12 +171,17 @@ mod common {
     /// `exe args` as a filter: `input` on standard input; exit code,
     /// standard output, standard error.
     pub fn filter(exe: &Path, args: &[&str], input: &[u8]) -> (i32, Vec<u8>, String) {
+        filter_as(exe, FLAVOR.1, args, input)
+    }
+
+    /// [`filter`] with `STUFFR_COMPRESS_FLAVOR` set to `flavour`.
+    fn filter_as(exe: &Path, flavour: &str, args: &[&str], input: &[u8]) -> (i32, Vec<u8>, String) {
         let mut cmd = Command::new(exe);
         cmd.args(args)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("LANG", "C")
-            .env(FLAVOR.0, FLAVOR.1)
+            .env(FLAVOR.0, flavour)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -202,11 +208,20 @@ mod common {
 
     /// stuffr as `compress` (ncompress personality) as a filter.
     pub fn ours(args: &[&str], input: &[u8]) -> (i32, Vec<u8>, String) {
+        ours_as("ncompress", args, input)
+    }
+
+    /// stuffr as `compress` in its Apple personality, as a filter.
+    pub fn ours_apple(args: &[&str], input: &[u8]) -> (i32, Vec<u8>, String) {
+        ours_as("apple", args, input)
+    }
+
+    fn ours_as(flavour: &str, args: &[&str], input: &[u8]) -> (i32, Vec<u8>, String) {
         let d = ScratchDir::unique("ncompress-bin");
         std::fs::create_dir_all(&*d).unwrap();
         let link = d.join("compress");
         std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
-        filter(&link, args, input)
+        filter_as(&link, flavour, args, input)
     }
 
     /// The inputs of the record: `f` (text, compresses), `a` and `b`
@@ -570,6 +585,7 @@ mod differential {
     /// What a terminal standard output shows, without the carriage returns
     /// its driver puts before each newline (ONLCR), which a busy macOS
     /// driver sometimes repeats: the program's bytes are compared exactly.
+    /// Not a Homebrew mask: applied to both sides on every platform.
     fn without_terminal_crs(b: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(b.len());
         for &c in b {
@@ -1175,10 +1191,17 @@ mod deviations {
             let (rc, back, _) = ours(&["-d"], &mine);
             assert_eq!(rc, 0, "{why}");
             assert!(back == *input, "stuffr decodes its own, {why}");
-            // The 9-bit table fills after 255 codes: the streams agree on
-            // every byte before the 256th code.
+            let (rc, back, _) = ours_apple(&["-d"], &mine);
+            assert_eq!(rc, 0, "{why}");
             assert!(
-                first_diff(&theirs, &mine) >= 3 + 255 * 9 / 8,
+                back == *input,
+                "stuffr's Apple personality decodes it, {why}"
+            );
+            // Both write the first 256 codes in 9 bits (the 256th after
+            // entry 511 is the last 9-bit one): the streams agree on every
+            // byte before the 257th code, at bit 24 + 256 * 9.
+            assert!(
+                first_diff(&theirs, &mine) >= 3 + 256 * 9 / 8,
                 "{why}: the streams part at byte {}",
                 first_diff(&theirs, &mine)
             );
@@ -1431,15 +1454,9 @@ mod interrupts {
             std::fs::create_dir_all(&*dir).unwrap();
             std::fs::write(dir.join("big"), big_input(64)).unwrap();
             let (exe, arg0) = exe(mine, "compress");
-            // Nothing new appears in the directory: wait a moment instead,
-            // so the handler `main` installs first is in place (a signal
-            // before it kills by the default action, in either program).
-            let first = std::sync::OnceLock::new();
-            let ready = |_: &str| {
-                first.get_or_init(std::time::Instant::now).elapsed()
-                    > std::time::Duration::from_millis(300)
-            };
-            let Some(r) = interrupt_env(
+            // Ready once compressed bytes arrive: both programs install
+            // their handlers before writing any.
+            let Some(r) = interrupt_once_stdout_has_data(
                 &exe,
                 &arg0,
                 &["-c", "big"],
@@ -1447,7 +1464,6 @@ mod interrupts {
                 ENV,
                 Inherit::Default,
                 libc::SIGTERM,
-                &ready,
             ) else {
                 panic!("mine={mine}: compress -c finished before the signal");
             };

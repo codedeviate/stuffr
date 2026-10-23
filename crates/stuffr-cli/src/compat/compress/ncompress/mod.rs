@@ -86,11 +86,14 @@
 //! - **N1.** At maxbits 9 (`-b 9`, and every value clamped to 9: 0,
 //!   negative values, 1 to 8, non-numbers, the empty string) ncompress's
 //!   encoder writes entry 512 in 9 bits and never widens: once the table
-//!   fills (about 600 bytes of input), its stream is undecodable, by its
-//!   own `uncompress` too. stuffr writes the valid compress 4.0 stream
-//!   there: the table stops at entry 511 and the codes widen to 10 bits,
-//!   which ncompress's decoder reads. The bytes before the table fills are
-//!   ncompress's, so a short input is unchanged.
+//!   fills its stream is undecodable, by its own `uncompress` too (where the
+//!   first bad code falls depends on the input; about 21 500 bytes into the
+//!   record's text). stuffr writes the valid compress 4.0 stream there: the
+//!   table stops at entry 511, one more 9-bit code follows, and the codes
+//!   after it are 10 bits, which ncompress's decoder reads. The bytes
+//!   before the table fills are ncompress's, so a short input is unchanged;
+//!   after it the ratio checks see the 10-bit sizes, so the CLEAR codes
+//!   fall where ncompress's would not.
 //! - **N2.** `uncompress` decompresses under that name on every platform
 //!   (ruling E5). Ubuntu's binary decompresses only as `uncompress.real`
 //!   (Debian's `uncompress-real.patch`; as `uncompress` it compresses), so
@@ -177,30 +180,7 @@ mod tests {
     use crate::compat::compress::{Flavour, run_in_counted};
     use std::ffi::OsString;
 
-    /// A scratch directory removed when dropped, a panicking test's unwind
-    /// included; a name of its own per call.
-    struct Scratch(std::path::PathBuf);
-    impl std::ops::Deref for Scratch {
-        type Target = std::path::Path;
-        fn deref(&self) -> &std::path::Path {
-            &self.0
-        }
-    }
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn scratch(tag: &str) -> Scratch {
-        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let d =
-            std::env::temp_dir().join(format!("stuffr-ncompress-{}-{tag}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        Scratch(d)
-    }
+    use crate::compat::compress::test_scratch::scratch;
 
     fn run(
         d: &std::path::Path,
@@ -381,8 +361,8 @@ mod tests {
         std::fs::write(d.join("dir/a"), text(1000)).unwrap();
         let sub = d.join("dir/sub");
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // The scratch's drop makes `dir/sub` writable again, whatever fails.
         let (code, out, err) = run(&d, "compress", &["-r", "dir"], b"");
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!((code, err.as_str()), (0, ""));
         assert_eq!(out, b"dir/sub unreadable\n");
         assert!(d.join("dir/a.Z").exists());

@@ -1327,7 +1327,8 @@ mod interrupts {
             let dir = ScratchDir::unique("compress-intr-c");
             std::fs::create_dir_all(&*dir).unwrap();
             std::fs::write(dir.join("big"), big_input(64)).unwrap();
-            let Some(r) = interrupt_env(
+            // Ready once compressed bytes arrive: the run is under way.
+            let Some(r) = interrupt_once_stdout_has_data(
                 &exe(mine, "compress"),
                 "compress",
                 &["-c", "big"],
@@ -1335,7 +1336,6 @@ mod interrupts {
                 ENV,
                 Inherit::Default,
                 libc::SIGTERM,
-                &|n| n == "big",
             ) else {
                 panic!("mine={mine}: compress -c finished before the signal");
             };

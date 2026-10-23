@@ -144,27 +144,7 @@ mod tests {
     use crate::compat::compress::{Flavour, run_in_counted};
     use std::ffi::OsString;
 
-    /// A scratch directory removed when dropped, a panicking test's unwind
-    /// included.
-    struct Scratch(std::path::PathBuf);
-    impl std::ops::Deref for Scratch {
-        type Target = std::path::Path;
-        fn deref(&self) -> &std::path::Path {
-            &self.0
-        }
-    }
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn scratch(tag: &str) -> Scratch {
-        let d = std::env::temp_dir().join(format!("stuffr-compress-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        Scratch(d)
-    }
+    use crate::compat::compress::test_scratch::scratch;
 
     fn run(
         d: &std::path::Path,

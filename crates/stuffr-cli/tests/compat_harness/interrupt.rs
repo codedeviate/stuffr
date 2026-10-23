@@ -197,11 +197,65 @@ pub fn interrupt_env(
     sig: i32,
     ready: &dyn Fn(&str) -> bool,
 ) -> Option<Interrupted> {
+    interrupt_when(
+        exe,
+        name,
+        args,
+        dir,
+        env,
+        inherit,
+        sig,
+        Ready::Listing(ready),
+    )
+}
+
+/// [`interrupt_env`] for a run that writes to standard output (`-c`, a
+/// filter) and creates nothing in `dir` to wait on: standard output is a
+/// pipe, and the run counts as ready once its first byte arrives (the rest
+/// is drained on a thread, so the child never blocks on a full pipe). A
+/// program that installs its signal handlers before it writes anything is
+/// then sure to have them in place when the signal lands.
+#[allow(clippy::too_many_arguments)]
+pub fn interrupt_once_stdout_has_data(
+    exe: &Path,
+    name: &str,
+    args: &[&str],
+    dir: &Path,
+    env: &[(&str, &str)],
+    inherit: Inherit,
+    sig: i32,
+) -> Option<Interrupted> {
+    interrupt_when(exe, name, args, dir, env, inherit, sig, Ready::Stdout)
+}
+
+/// When an interrupt run is ready for its signal.
+enum Ready<'a> {
+    /// An entry of the run's directory satisfies the predicate.
+    Listing(&'a dyn Fn(&str) -> bool),
+    /// The run has written to its standard output (a pipe).
+    Stdout,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn interrupt_when(
+    exe: &Path,
+    name: &str,
+    args: &[&str],
+    dir: &Path,
+    env: &[(&str, &str)],
+    inherit: Inherit,
+    sig: i32,
+    ready: Ready,
+) -> Option<Interrupted> {
     let mut cmd = Command::new(exe);
     cmd.arg0(name).args(args).current_dir(dir);
     cmd.envs(env.iter().copied());
+    let stdout = match ready {
+        Ready::Listing(_) => Stdio::null(),
+        Ready::Stdout => Stdio::piped(),
+    };
     cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(stdout)
         .stderr(Stdio::piped());
     // SAFETY: only async-signal-safe calls between fork and exec.
     unsafe {
@@ -219,12 +273,31 @@ pub fn interrupt_env(
     }
     REFERENCE_HUNG.with(|h| h.set(false));
     let mut child = super::spawn(&mut cmd).expect("spawn");
+    // With `Ready::Stdout`: set at the first byte; the thread then drains
+    // standard output to its end.
+    let wrote = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _drain = child.stdout.take().map(|mut out| {
+        let wrote = wrote.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 65536];
+            while let Ok(n) = out.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                wrote.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        })
+    });
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if child.try_wait().unwrap().is_some() {
             return None;
         }
-        if listing(dir).iter().any(|n| ready(n)) {
+        let is_ready = match ready {
+            Ready::Listing(f) => listing(dir).iter().any(|n| f(n)),
+            Ready::Stdout => wrote.load(std::sync::atomic::Ordering::SeqCst),
+        };
+        if is_ready {
             break;
         }
         assert!(
