@@ -419,7 +419,7 @@ read list.
 > marked `*` with a footnote, and JSON/CSV carry `output: memory|disk`. A
 > new `lzma-c` feature labels lzma's backend truthfully. The lz4 fuzz
 > oracle now holds quiet decodes to the loud re-run's failure count.
-> **3050** tests under `--all-features`, **2936** on the default tier —
+> **3051** tests under `--all-features`, **2937** on the default tier —
 > measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
 > Two user-visible changes on archives that already exist. First, `salvage
