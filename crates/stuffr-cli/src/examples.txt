@@ -1306,8 +1306,8 @@ BENCHMARKING FORMATS ON YOUR OWN DATA
       file's size is taken once at the start, so a log still being written
       is benched as it was then. Every format runs under the same
       conditions, with one untimed warm-up read first, and only codec work
-      is timed (except the temp file's writes, when the output is too
-      large for memory). The input line names the codecs that ran through a C
+      is timed (except the temp file's writes, in a row marked * after its
+      compress time). The input line names the codecs that ran through a C
       library ("C: zstd, xz"), or says "pure". A format that fails is a
       row marked failed, never an exit code. On a terminal, stderr shows
       a bar for the row being measured, drawn only between timed pieces
@@ -1337,13 +1337,14 @@ BENCHMARKING FORMATS ON YOUR OWN DATA
   stuffr bench --memory-limit 1G big.log
       --memory-limit caps what stuffr asks for. Input over half of it is
       streamed from disk instead of held in memory, for every format alike,
-      and the input line says "streamed from disk". The compressed output
-      stays in memory unless the largest worst case among the formats run
-      is over half of the limit (input in memory) or the whole limit
-      (input streamed); only then does it go to one temp file, again for
-      every format alike, and its writes count in the compress time.
-      compress can write twice its input, so a run with it goes to the
-      temp file sooner.
+      and the input line says "streamed from disk". Each codec gets the
+      output destination its own worst case allows: memory unless that
+      worst case is over half of the limit (input in memory) or the whole
+      limit (input streamed), then one temp file, whose writes count in
+      that row's compress time. compress can write twice its input, so it
+      reaches the temp file first. A row that went to disk is marked: a *
+      after its compress time, a footnote under the table, and "disk" in
+      the output field of --json and --csv.
 
   stuffr bench --repeat 5 access.log
       --repeat N times each row N times and reports the medians.
@@ -1351,8 +1352,9 @@ BENCHMARKING FORMATS ON YOUR OWN DATA
   stuffr bench --json access.log | jq .winners
   stuffr bench --csv access.log > bench.csv
       --json prints one object (conditions, rows with scores and each
-      row's backend, winners); --csv one line per row, the run's
-      conditions and the row's backend after the measurements. The README
+      row's backend and output, winners); --csv one line per row, the
+      run's conditions, the row's backend and its output (memory or disk)
+      after the measurements. The README
       documents both schemas. They cannot be combined, nor used with
       --table-only.
 

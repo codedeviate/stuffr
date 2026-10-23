@@ -19,21 +19,19 @@
 //! Otherwise nothing runs between them but the progress report, so the
 //! pieces cost every format the same: one pair of clock reads per 64 KiB.
 //!
-//! Where the compressed output goes is decided once for the run, before
-//! any timing, and is the same for every codec: memory whenever the
-//! largest worst case among the run's codecs fits under the memory left
-//! for it, half of `--memory-limit` when the input is held in memory, all
-//! of it when the input is streamed. That worst case is input + 1/8 +
-//! 1 KiB, or 2 x input + 1 KiB when `compress` (LZW) takes part, so a run
-//! with `compress` sends every codec to the temp file exactly when
-//! `compress` would go there. (With `--per-file` each file's stream is
-//! decided by its own size, the same way for every codec.) Only past that
-//! does the output go to one temp file, and then its writes (to the page
-//! cache, through the 64 KiB buffer) fall inside the compression regions.
-//! Both destinations have the same shape: a 64 KiB `BufWriter` over a
-//! pre-reserved `Vec` (each codec's own worst case, never above the run's),
-//! or over the temp file, so a codec that writes in small pieces pays the
-//! same either way. Decoding reads the same shape back: the `Vec` as a seekable, sized
+//! Each codec gets the destination its own worst case allows, decided
+//! before any timing: memory whenever that worst case (input + 1/8 +
+//! 1 KiB, or 2 x input + 1 KiB for `compress`, LZW) fits under the memory
+//! left for it, half of `--memory-limit` when the input is held in memory,
+//! all of it when the input is streamed. Only past that does its output go
+//! to one temp file, and then its writes (to the page cache, through the
+//! 64 KiB buffer) fall inside its compression regions, so a row that went
+//! to disk is marked ([`Measured::on_disk`]; the table's `*`, the `output`
+//! field of JSON and CSV). With `--per-file` each file's stream is decided
+//! by its own size. Both destinations have the same shape: a 64 KiB
+//! `BufWriter` over a pre-reserved `Vec`, or over the temp file, so a codec
+//! that writes in small pieces pays the same either way. Decoding reads the
+//! same shape back: the `Vec` as a seekable, sized
 //! source, or the temp file through a 64 KiB `BufReader`, so a decoder that
 //! reads a byte at a time (LZW's) costs a memory copy per byte, not a
 //! system call.
@@ -137,49 +135,6 @@ pub struct Plan {
     /// As `pack --threads`.
     pub threads: Option<usize>,
     pub memory_limit: u64,
-    /// The largest worst case among the run's codecs: it decides where
-    /// every row's compressed output goes, memory or the temp file, the
-    /// same way for all of them.
-    pub output_bound: OutputBound,
-}
-
-/// How large a codec's compressed output can grow, at worst, past its
-/// input. Ordered, so a run takes the largest among its codecs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum OutputBound {
-    /// Input + 1/8 + 1 KiB: every codec but `compress`.
-    Standard,
-    /// 2 x input + 1 KiB: LZW (`compress`).
-    Lzw,
-}
-
-impl OutputBound {
-    /// `codec`'s own bound.
-    pub fn of(codec: &str) -> Self {
-        if codec == "compress" {
-            Self::Lzw
-        } else {
-            Self::Standard
-        }
-    }
-
-    /// The largest bound among `codecs`; `Standard` for none.
-    pub fn largest<'a>(codecs: impl IntoIterator<Item = &'a str>) -> Self {
-        codecs
-            .into_iter()
-            .map(Self::of)
-            .max()
-            .unwrap_or(Self::Standard)
-    }
-
-    /// The worst-case output for `input_len` bytes; `None` past `u64`.
-    fn room(self, input_len: u64) -> Option<u64> {
-        match self {
-            Self::Lzw => input_len.checked_mul(2),
-            Self::Standard => input_len.checked_add(input_len / 8),
-        }
-        .and_then(|n| n.checked_add(1024))
-    }
 }
 
 /// Loads `paths` into memory when their total size is at most half of
@@ -286,23 +241,23 @@ enum Feed<'a> {
     File(&'a Snapshot, io::Take<File>),
 }
 
-/// Where one stream's compressed output goes. Decided from the run's
-/// [`OutputBound`] before any timing (see [`destination`]), so a stream
-/// goes to the same place for every codec and every repeat.
+/// Where one stream's compressed output goes. Decided per codec, from its
+/// own worst case, before any timing (see [`destination`]), and the same
+/// for all of that codec's repeats. A row with any stream on the temp
+/// file is marked as such ([`Measured::on_disk`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Dest {
     Memory,
     TempFile,
 }
 
-/// Memory whenever the worst-case output under `bound` for `input_len`
-/// bytes fits in the memory left for it: half of `memory_limit` beside
-/// input held in memory, all of it when the input is `streamed` (it holds
-/// no copy of the input). The temp file only past that, so no codec's
-/// reservation ([`output_room`], never above `bound`'s) exceeds the budget.
-/// `bound` is the run's (the largest among its codecs), so every codec's
-/// output goes the same way.
-fn destination(bound: OutputBound, input_len: u64, memory_limit: u64, streamed: bool) -> Dest {
+/// Memory whenever `codec`'s worst-case output for `input_len` bytes (see
+/// [`output_room`]) fits in the memory left for it: half of `memory_limit`
+/// beside input held in memory, all of it when the input is `streamed` (it
+/// holds no copy of the input). The temp file only past that, so the
+/// reservation never exceeds the budget. Each codec gets the destination
+/// its own worst case allows; the row reports which it got.
+fn destination(codec: &str, input_len: u64, memory_limit: u64, streamed: bool) -> Dest {
     // Small test inputs always fit; this is how the tests reach the temp
     // file with a memory limit the decoders can still work under.
     #[cfg(test)]
@@ -314,7 +269,7 @@ fn destination(bound: OutputBound, input_len: u64, memory_limit: u64, streamed: 
     } else {
         memory_limit / 2
     };
-    match bound.room(input_len) {
+    match output_room(codec, input_len) {
         Some(w) if w <= budget => Dest::Memory,
         _ => Dest::TempFile,
     }
@@ -330,7 +285,11 @@ fn destination(bound: OutputBound, input_len: u64, memory_limit: u64, streamed: 
 /// a codec never writes are never touched. `None`: past `u64`, so it fits
 /// nowhere.
 fn output_room(codec: &str, input_len: u64) -> Option<u64> {
-    OutputBound::of(codec).room(input_len)
+    match codec {
+        "compress" => input_len.checked_mul(2),
+        _ => input_len.checked_add(input_len / 8),
+    }
+    .and_then(|n| n.checked_add(1024))
 }
 
 fn run(
@@ -372,10 +331,7 @@ fn run(
     };
     let group_len = |g: &[Part<'_>]| g.iter().map(Part::len).sum::<u64>();
     let streamed = matches!(input, Input::Files(_));
-    // The run's bound, never less than this codec's own: its reservation
-    // must fit wherever it goes.
-    let bound = plan.output_bound.max(OutputBound::of(name));
-    let dest = |g: &[Part<'_>]| destination(bound, group_len(g), plan.memory_limit, streamed);
+    let dest = |g: &[Part<'_>]| destination(name, group_len(g), plan.memory_limit, streamed);
     let temp = if groups.iter().any(|g| dest(g) == Dest::TempFile) {
         Some(TempOut::create()?.0)
     } else {
@@ -384,6 +340,7 @@ fn run(
 
     let mut buf = vec![0u8; CHUNK];
     let mut bytes_out = None;
+    let mut on_disk = false;
     let mut compress = Vec::new();
     let mut decompress = Vec::new();
     let mut progress = Progress::new(report, parts.iter().map(Part::len).sum());
@@ -405,6 +362,7 @@ fn run(
             out += row.bytes_out;
             c_ns += row.compress_ns;
             d_ns += row.decompress_ns;
+            on_disk |= row.on_disk;
         }
         bytes_out.get_or_insert(out);
         compress.push(c_ns);
@@ -414,6 +372,7 @@ fn run(
         bytes_out: bytes_out.unwrap_or(0),
         compress_ns: median(compress),
         decompress_ns: median(decompress),
+        on_disk,
     })
 }
 
@@ -508,6 +467,7 @@ impl Job<'_> {
         clock: &mut dyn Clock,
         progress: &mut Progress<'_>,
     ) -> stuffr::Result<Measured> {
+        let on_disk = matches!((self.dest, self.temp), (Dest::TempFile, Some(_)));
         let (bytes_out, compress_ns, src) = match (self.dest, self.temp) {
             (Dest::Memory, _) | (Dest::TempFile, None) => {
                 // Room for incompressible output, so the outer Vec does not
@@ -546,6 +506,7 @@ impl Job<'_> {
             bytes_out,
             compress_ns,
             decompress_ns,
+            on_disk,
         })
     }
 
@@ -933,7 +894,6 @@ mod tests {
             repeat,
             threads: None,
             memory_limit: 1 << 30,
-            output_bound: OutputBound::Standard,
         }
     }
 
@@ -1474,88 +1434,62 @@ mod tests {
     }
 
     /// `compress` can write twice its input; near the limit that must not be
-    /// reserved in memory, over the budget. A run with `compress` sends
-    /// every codec's output to the temp file exactly when `compress`'s
-    /// would go there, so all its rows share one destination; a run
-    /// without `compress` keeps the others in memory.
+    /// reserved in memory, over the budget. Each codec gets the destination
+    /// its own worst case allows: `compress` goes to the temp file and its
+    /// row says so; `gzip`, whose worst case fits, stays in memory beside it.
     #[test]
-    fn a_run_with_compress_sends_every_codec_where_compress_goes() {
+    fn compress_near_the_limit_goes_to_disk_and_is_marked() {
         let _lock = armed_lock();
         let len = 16 * 1024;
         let input = Input::Memory(vec![noise(len)]);
         // The input (16384) is between limit / 4 and limit / 2. gzip's
         // worst case (len + len / 8 + 1 KiB = 19456) fits in that half
         // exactly; compress's (2 * len + 1 KiB = 33792) does not.
-        let limit = 2 * 19_456;
-        let with_compress = Plan {
-            memory_limit: limit,
-            output_bound: OutputBound::largest(["compress", "gzip"]),
+        let p = Plan {
+            memory_limit: 2 * 19_456,
             ..plan(Mode::OneStream, 1)
         };
-        for codec in ["compress", "gzip"] {
-            let made = temps_made(|| {
-                run(codec, &input, &with_compress);
-            });
-            assert_eq!(made, 1, "{codec} beside compress");
+        for (codec, want_temps, want_disk) in [("compress", 1, true), ("gzip", 0, false)] {
+            let mut m = None;
+            let made = temps_made(|| m = Some(run(codec, &input, &p)));
+            assert_eq!(made, want_temps, "{codec}");
+            assert_eq!(m.unwrap().on_disk, want_disk, "{codec}");
         }
-        let without = Plan {
-            output_bound: OutputBound::largest(["gzip", "xz"]),
-            ..with_compress
-        };
-        assert_eq!(without.output_bound, OutputBound::Standard);
-        let made = temps_made(|| {
-            run("gzip", &input, &without);
-        });
-        assert_eq!(made, 0, "gzip without compress");
-        // A plan that understates compress's bound still keeps its own
-        // reservation within the budget.
-        let made = temps_made(|| {
-            run("compress", &input, &without);
-        });
-        assert_eq!(made, 1, "compress under a Standard plan");
         // Streamed: the whole limit is the budget.
-        let (std, lzw) = (OutputBound::Standard, OutputBound::Lzw);
-        assert_eq!(destination(std, len as u64, 19_456, true), Dest::Memory);
-        assert_eq!(destination(lzw, len as u64, 33_791, true), Dest::TempFile);
-        assert_eq!(destination(lzw, len as u64, 33_792, true), Dest::Memory);
+        for (codec, limit, want) in [("gzip", 19_456, 0), ("compress", 33_791, 1)] {
+            assert_eq!(
+                destination(codec, len as u64, limit, true) == Dest::TempFile,
+                want == 1,
+                "{codec} streamed at {limit}"
+            );
+        }
+        assert_eq!(
+            destination("compress", len as u64, 33_792, true),
+            Dest::Memory
+        );
     }
 
     #[test]
     fn the_output_goes_to_memory_whenever_its_worst_case_fits() {
         // 0 bytes in: worst case 1 KiB, which fits under 2048 / 2.
         // Beside input in memory: half the limit.
-        assert_eq!(
-            destination(OutputBound::Standard, 0, 2048, false),
-            Dest::Memory
-        );
-        assert_eq!(
-            destination(OutputBound::Standard, 0, 2047, false),
-            Dest::TempFile
-        );
+        assert_eq!(destination("gzip", 0, 2048, false), Dest::Memory);
+        assert_eq!(destination("gzip", 0, 2047, false), Dest::TempFile);
         // 8000 + 1000 + 1024.
+        assert_eq!(destination("gzip", 8000, 2 * 10_024, false), Dest::Memory);
         assert_eq!(
-            destination(OutputBound::Standard, 8000, 2 * 10_024, false),
-            Dest::Memory
-        );
-        assert_eq!(
-            destination(OutputBound::Standard, 8000, 2 * 10_024 - 1, false),
+            destination("gzip", 8000, 2 * 10_024 - 1, false),
             Dest::TempFile
         );
         assert_eq!(
-            destination(OutputBound::Standard, u64::MAX, u64::MAX, false),
+            destination("gzip", u64::MAX, u64::MAX, false),
             Dest::TempFile
         );
         // Streamed input holds no copy: the whole limit.
+        assert_eq!(destination("gzip", 8000, 10_024, true), Dest::Memory);
+        assert_eq!(destination("gzip", 8000, 10_023, true), Dest::TempFile);
         assert_eq!(
-            destination(OutputBound::Standard, 8000, 10_024, true),
-            Dest::Memory
-        );
-        assert_eq!(
-            destination(OutputBound::Standard, 8000, 10_023, true),
-            Dest::TempFile
-        );
-        assert_eq!(
-            destination(OutputBound::Standard, u64::MAX, u64::MAX, true),
+            destination("gzip", u64::MAX, u64::MAX, true),
             Dest::TempFile
         );
     }

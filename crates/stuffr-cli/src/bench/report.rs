@@ -166,8 +166,33 @@ fn input_line(c: &Conditions, rows: &[Row]) -> String {
     )
 }
 
+/// The footnote under a table with a marked row.
+const DISK_NOTE: &str = "* output written to a temp file while timed (too large for memory)";
+
+/// The compress-time cell's mark: `*` for a row whose output went to the
+/// temp file, a space for the others when any row is marked (so the
+/// column stays aligned), nothing when none is.
+fn disk_mark(on_disk: bool, any: bool) -> &'static str {
+    match (any, on_disk) {
+        (false, _) => "",
+        (true, true) => "*",
+        (true, false) => " ",
+    }
+}
+
+fn any_on_disk(rows: &[Row]) -> bool {
+    rows.iter().filter_map(measured).any(|m| m.on_disk)
+}
+
+fn output_name(m: &Measured) -> &'static str {
+    if m.on_disk { "disk" } else { "memory" }
+}
+
 fn table_lines(rows: &[Row], bytes_in: u64) -> Vec<String> {
-    let mut cells: Vec<Vec<String>> = vec![HEADER.iter().map(|s| s.to_string()).collect()];
+    let any = any_on_disk(rows);
+    let mut header: Vec<String> = HEADER.iter().map(|s| s.to_string()).collect();
+    header[4].push_str(disk_mark(false, any));
+    let mut cells: Vec<Vec<String>> = vec![header];
     let mut failures: Vec<Option<String>> = vec![None];
     for row in rows {
         let level = row.level.map_or_else(|| "-".into(), |l| l.to_string());
@@ -178,7 +203,7 @@ fn table_lines(rows: &[Row], bytes_in: u64) -> Vec<String> {
                     level,
                     size_text(m.bytes_out),
                     ratio_text(bytes_in, m.bytes_out),
-                    time_text(m.compress_ns),
+                    format!("{}{}", time_text(m.compress_ns), disk_mark(m.on_disk, any)),
                     time_text(m.decompress_ns),
                 ]);
                 failures.push(None);
@@ -216,9 +241,13 @@ fn table_lines(rows: &[Row], bytes_in: u64) -> Vec<String> {
         .collect()
 }
 
+/// The table, then the footnote when a row is marked.
 fn write_table(rows: &[Row], bytes_in: u64, out: &mut dyn Write) -> io::Result<()> {
     for line in table_lines(rows, bytes_in) {
         writeln!(out, "{}", line.trim_end())?;
+    }
+    if any_on_disk(rows) {
+        writeln!(out, "{DISK_NOTE}")?;
     }
     Ok(())
 }
@@ -281,7 +310,7 @@ pub fn human(c: &Conditions, rows: &[Row], out: &mut dyn Write) -> io::Result<()
     )
 }
 
-/// The table alone: header and rows.
+/// The table alone: header, rows and the footnote when a row is marked.
 pub fn table_only(rows: &[Row], bytes_in: u64, out: &mut dyn Write) -> io::Result<()> {
     write_table(rows, bytes_in, out)
 }
@@ -312,12 +341,13 @@ pub fn json(c: &Conditions, rows: &[Row], out: &mut dyn Write) -> io::Result<()>
                 "ratio": finite(ratio_of(c.bytes_in, m.bytes_out)),
                 "compress_ns": m.compress_ns, "decompress_ns": m.decompress_ns,
                 "balance": finite(*score), "error": null,
+                "output": output_name(m),
             }),
             Outcome::Failed(why) => json!({
                 "format": r.format, "level": r.level, "backend": r.backend, "ok": false,
                 "bytes_out": null, "ratio": null,
                 "compress_ns": null, "decompress_ns": null,
-                "balance": null, "error": why,
+                "balance": null, "error": why, "output": null,
             }),
         })
         .collect();
@@ -351,13 +381,14 @@ fn csv_field(s: &str) -> String {
 }
 
 /// Header plus one line per row; empty fields stand for none. The run's
-/// conditions follow the measurements on every line, and the row's backend
-/// last.
+/// conditions follow the measurements on every line, then the row's
+/// backend, and last its `output` (`memory` or `disk`, empty for a failed
+/// row).
 pub fn csv(c: &Conditions, rows: &[Row], out: &mut dyn Write) -> io::Result<()> {
     writeln!(
         out,
         "format,level,ok,bytes_in,bytes_out,ratio,compress_ns,decompress_ns,balance,error,\
-         files,mode,threads,workers,repeat,streamed,backend"
+         files,mode,threads,workers,repeat,streamed,backend,output"
     )?;
     let bytes_in = c.bytes_in;
     let threads = c.threads.map_or(String::new(), |t| t.to_string());
@@ -378,13 +409,18 @@ pub fn csv(c: &Conditions, rows: &[Row], out: &mut dyn Write) -> io::Result<()> 
                 let bal = score.map_or(String::new(), |x| x.to_string());
                 writeln!(
                     out,
-                    "{},{level},true,{bytes_in},{},{ratio},{},{},{bal},,{conditions},{}",
-                    r.format, m.bytes_out, m.compress_ns, m.decompress_ns, r.backend
+                    "{},{level},true,{bytes_in},{},{ratio},{},{},{bal},,{conditions},{},{}",
+                    r.format,
+                    m.bytes_out,
+                    m.compress_ns,
+                    m.decompress_ns,
+                    r.backend,
+                    output_name(m)
                 )?;
             }
             Outcome::Failed(why) => writeln!(
                 out,
-                "{},{level},false,{bytes_in},,,,,,{},{conditions},{}",
+                "{},{level},false,{bytes_in},,,,,,{},{conditions},{},",
                 r.format,
                 csv_field(why),
                 r.backend
@@ -409,6 +445,7 @@ mod tests {
                 bytes_out: out,
                 compress_ns: c_ms * 1_000_000,
                 decompress_ns: d_ms * 1_000_000,
+                on_disk: false,
             }),
         }
     }
@@ -493,11 +530,11 @@ mod tests {
         assert_eq!(
             lines.next().unwrap(),
             "format,level,ok,bytes_in,bytes_out,ratio,compress_ns,decompress_ns,balance,error,\
-             files,mode,threads,workers,repeat,streamed,backend"
+             files,mode,threads,workers,repeat,streamed,backend,output"
         );
         assert_eq!(
             lines.next().unwrap(),
-            "xz,6,false,10,,,,,,\"bad, \"\"very\"\" bad\",3,one-stream,,1,1,false,c"
+            "xz,6,false,10,,,,,,\"bad, \"\"very\"\" bad\",3,one-stream,,1,1,false,c,"
         );
     }
 
@@ -565,7 +602,8 @@ mod tests {
         let got = render(|o| csv(&c, &rows, o));
         let lines: Vec<&str> = got.lines().collect();
         let header: Vec<&str> = lines[0].split(',').collect();
-        assert_eq!(header.len(), 17);
+        assert_eq!(header.len(), 18);
+        assert_eq!(header[17], "output");
         assert_eq!(
             &header[..10],
             &[
@@ -583,7 +621,7 @@ mod tests {
         );
         for line in &lines[1..] {
             let f: Vec<&str> = line.split(',').collect();
-            assert_eq!(f.len(), 17, "{line}");
+            assert_eq!(f.len(), 18, "{line}");
             assert_eq!(
                 &f[10..16],
                 &["3", "per-file", "0", "8", "5", "true"],
@@ -591,8 +629,8 @@ mod tests {
             );
         }
         assert!(lines[1].starts_with("zstd,3,true,"), "{}", lines[1]);
-        assert!(lines[1].ends_with(",c"), "{}", lines[1]);
-        assert!(lines[2].ends_with(",pure"), "{}", lines[2]);
+        assert!(lines[1].ends_with(",c,memory"), "{}", lines[1]);
+        assert!(lines[2].ends_with(",pure,memory"), "{}", lines[2]);
         // No --threads: an empty field, not 0.
         let got = render(|o| csv(&cond(), &rows, o));
         assert!(
@@ -666,5 +704,45 @@ mod tests {
         assert_eq!(size_text((1023.9 * MIB as f64) as u64), "1023.9 MiB");
         assert_eq!(size_text(2 << 30), "2.0 GiB");
         assert_eq!(size_text(412 * MIB), "412.0 MiB");
+    }
+
+    /// `rows()` with xz's output on the temp file.
+    fn marked_rows() -> Vec<Row> {
+        let mut rows = rows();
+        if let Outcome::Ok(m) = &mut rows[2].outcome {
+            m.on_disk = true;
+        }
+        rows
+    }
+
+    #[test]
+    fn a_row_timed_with_disk_output_is_marked_with_a_footnote() {
+        let got = render(|o| human(&cond(), &marked_rows(), o));
+        let want = include_str!("testdata/human-marked.txt");
+        assert_eq!(got, want);
+        let got = render(|o| table_only(&marked_rows(), 412 * MIB, o));
+        let want = include_str!("testdata/table-only-marked.txt");
+        assert_eq!(got, want);
+        // No marked row: no mark column, no footnote.
+        let plain = render(|o| table_only(&rows(), 412 * MIB, o));
+        assert!(!plain.contains('*'), "{plain}");
+    }
+
+    #[test]
+    fn json_and_csv_say_where_each_rows_output_went() {
+        let got = render(|o| json(&cond(), &marked_rows(), o));
+        let v: Value = serde_json::from_str(&got).unwrap();
+        assert_eq!(v["rows"][0]["output"], "memory");
+        assert_eq!(v["rows"][2]["output"], "disk");
+        assert!(v["rows"][3]["output"].is_null(), "a failed row");
+        let got = render(|o| csv(&cond(), &marked_rows(), o));
+        let lines: Vec<&str> = got.lines().collect();
+        assert!(lines[0].ends_with(",backend,output"), "{}", lines[0]);
+        assert!(lines[1].ends_with(",pure,memory"), "{}", lines[1]);
+        assert!(lines[3].ends_with(",pure,disk"), "{}", lines[3]);
+        assert!(lines[4].ends_with(",pure,"), "{}", lines[4]);
+        for line in &lines {
+            assert_eq!(line.split(',').count(), 18, "{line}");
+        }
     }
 }

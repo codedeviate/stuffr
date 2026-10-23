@@ -11,6 +11,9 @@ pub struct Measured {
     pub bytes_out: u64,
     pub compress_ns: u64,
     pub decompress_ns: u64,
+    /// The compressed output went to the temp file, so its writes are
+    /// inside `compress_ns`; the reports mark the row.
+    pub on_disk: bool,
 }
 
 /// The result of one row: measured, or failed with a reason.
@@ -121,6 +124,7 @@ mod tests {
                 bytes_out,
                 compress_ns,
                 decompress_ns,
+                on_disk: false,
             }),
         }
     }

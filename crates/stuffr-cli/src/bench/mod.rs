@@ -19,8 +19,7 @@ use stuffr::{Error, FormatKind};
 use crate::cli::BenchArgs;
 use levels::{backend_of, benchable_codecs, levels_of};
 use measure::{
-    Clock, Input, Mode, OutputBound, Phase, Plan, RealClock, governor_for, load_input, measure,
-    warm,
+    Clock, Input, Mode, Phase, Plan, RealClock, governor_for, load_input, measure, warm,
 };
 use report::Conditions;
 use score::Row;
@@ -65,7 +64,6 @@ pub fn run(args: BenchArgs) -> stuffr::Result<Ran> {
         repeat: args.repeat,
         threads: args.threads,
         memory_limit,
-        output_bound: OutputBound::largest(codecs.iter().copied()),
     };
     let planned = plan_rows(&codecs, args.levels);
     let on = io::stderr().is_terminal() && !(args.json || args.csv || args.table_only);
@@ -845,7 +843,6 @@ mod tests {
             repeat: 1,
             threads: None,
             memory_limit: 1 << 30,
-            output_bound: OutputBound::Standard,
         };
         let mut seen = Vec::new();
         let o = measure(

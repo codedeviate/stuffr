@@ -276,7 +276,8 @@ pub enum Command {
     /// memory, or all streamed from disk when it is over half of
     /// --memory-limit), the same thread setting, and one untimed warm-up
     /// read first. Only codec work is timed, except the temp file's writes
-    /// when the compressed output is too large for memory. A format that fails is a row
+    /// for a codec whose worst-case output is too large for memory; such a
+    /// row is marked. A format that fails is a row
     /// marked failed, not an exit code. Timings need a release build.
     Bench(BenchArgs),
     /// Create compatibility symlinks (`bzip2`, `bunzip2`, `bzcat`,
@@ -489,9 +490,10 @@ pub struct BenchArgs {
     /// Cap the memory stuffr will ask for, e.g. 512M or 2G.
     ///
     /// Input over half of it is streamed from disk rather than held in
-    /// memory. When the largest worst-case output among the formats run is
-    /// too large for the rest, every format's output goes to a temp file,
-    /// whose writes then count in the compress time. Defaults to 25%
+    /// memory. Each codec gets the output destination its own worst case
+    /// allows: a codec whose worst-case output is too large for the rest
+    /// writes to a temp file, whose writes then count in its compress time,
+    /// and its row is marked (`*`; `output: disk`). Defaults to 25%
     /// of available RAM, honouring cgroup limits.
     #[arg(long, value_name = "SIZE")]
     pub memory_limit: Option<String>,

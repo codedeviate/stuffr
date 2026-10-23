@@ -1,0 +1,13 @@
+input: 3 files, 412.0 MiB · one stream · 1 compress thread · pure · 1 run
+
+format  level       size  ratio  compress   decompress
+zstd        3   40.0 MiB  10.3x    900 ms       300 ms
+lz4         -  100.0 MiB   4.1x    600 ms       200 ms
+xz          6   25.0 MiB  16.5x     8.2 s*       1.3 s
+bzip2       9  failed: no c tier
+* output written to a temp file while timed (too large for memory)
+
+smallest:            xz -6       25.0 MiB (16.5x)
+fastest compress:    lz4         600 ms
+fastest decompress:  lz4         200 ms
+best balance:        lz4         4.1x at 600 ms / 200 ms

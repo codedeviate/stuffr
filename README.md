@@ -1777,16 +1777,19 @@ Each row gives the compressed size, the ratio and the compress and
 decompress times; below the table come the smallest, the fastest each way
 and the best balance. Every format runs under the same conditions: the same
 input (in memory, or streamed from disk when it is over half of
-`--memory-limit`), the same compressed-output destination (memory unless the
-largest worst case among the formats run is over the limit's room for it, half
-of `--memory-limit` beside in-memory input and all of it for streamed input,
-then one temp file for every format; `compress` can write twice its input, so
-a run with it goes to the temp file sooner), the same
+`--memory-limit`), the same
 `--threads` setting for compression (bench ignores `STUFFR_THREADS`;
 decompression is always single-threaded), and one untimed warm-up read
-first. Each file's size is taken once at the start, so a log still being
-written is benched as it was then. Only codec work is timed (except the temp
-file's writes, when the output needs one), and `--repeat N`
+first. Each codec gets the compressed-output destination its own worst case
+allows: memory unless that worst case is over the limit's room for it (half of
+`--memory-limit` beside in-memory input, all of it for streamed input), then
+one temp file, whose writes count in that row's compress time. `compress` can
+write twice its input, so it reaches the temp file first. A row that went to
+disk is marked: a `*` after its compress time with a footnote under the table,
+and `output` (`memory` or `disk`) in JSON and CSV. Each file's size is taken
+once at the start, so a log still being written is benched as it was then.
+Only codec work is timed (except the temp file's writes, in a marked row), and
+`--repeat N`
 reports the median of N runs. The input line names the codecs that ran
 through a C library (`C: zstd, xz`), or says `pure`. Benchable means a codec
 this build writes with its real encoder: zstd can be benchmarked only in a
@@ -1807,13 +1810,14 @@ omitted), `workers` (the compression threads that resolved to), `repeat` and
 snappy), `backend` (`c` or `pure`), `ok`, `bytes_out`, `ratio` (input bytes
 ÷ `bytes_out`), `compress_ns`, `decompress_ns` (medians, nanoseconds),
 `balance` (the mean of the three `best / value` scores, relative to this
-run) and `error`; a failed row has `ok: false`, its reason in `error` and
+run), `error` and `output` (`memory`, or `disk` when the compressed output
+went to the temp file while timed; `null` for a failed row); a failed row has `ok: false`, its reason in `error` and
 `null` in every measurement, and a ratio that cannot be computed (0 bytes)
 is `null`. `winners` names `smallest`, `fastest_compress`,
 `fastest_decompress` and `balance` as `{format, level}`, or `null` when no
 row succeeded. `--csv` has the columns `format, level, ok, bytes_in,
 bytes_out, ratio, compress_ns, decompress_ns, balance, error, files, mode,
-threads, workers, repeat, streamed, backend`, in that order, with the same
+threads, workers, repeat, streamed, backend, output`, in that order, with the same
 units; an empty field stands for `null`.
 
 ### Two safety defaults that are not negotiable
