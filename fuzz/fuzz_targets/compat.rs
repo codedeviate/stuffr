@@ -1423,17 +1423,20 @@ fn lz4_failure_lines(stderr: &[u8]) -> u64 {
 ///   which checks every recorded row against the same set), or, over
 ///   several inputs (`-m`, `-r`, `--list`, `lz4cat`), the count of inputs
 ///   that failed, at most the number of inputs named, and never fewer than
-///   the failure lines on stderr (`lz4_failure_lines`); equal to them, but
-///   for a decode or test (`-d`, `-t`, `unlz4`, `lz4cat`, or a first input
-///   ending in `.lz4` with no mode given; not `--list`) at a display level
-///   of 2 or below (`-m`, `-r` and `lz4cat` bring the default 2 down to
-///   1), where lz4 itself hides `Stream followed by undecodable
-///   data` and only the bound holds. Under `-qq` the other lines are hidden
-///   too, so the case is re-run with enough `-q` removed to show them
-///   (never at `-v`: that turns declined prompts into reads of stdin).
-///   Residual cost: a stuffr 3-7 leaking out of a quiet several-input
-///   decode stays masked as a count. stuffr's 3-7 as codes of their own
-///   never appear otherwise, and a panic is a crash;
+///   the failure lines on stderr (`lz4_failure_lines`), and equal to them.
+///   A quiet run hides some lines: `-qq` all of them, and a decode or test
+///   (`-d`, `-t`, `unlz4`, `lz4cat`, or a first input ending in `.lz4` with
+///   no mode given; not `--list`) at a display level of 2 or below (`-m`,
+///   `-r` and `lz4cat` bring the default 2 down to 1) hides `Stream followed
+///   by undecodable data`. Such a run is repeated in a fresh directory, with
+///   enough `-q` removed to show lines at all and `-v -v` added for a
+///   decode, and the exit is held to that loud run's line count (0.17.1
+///   Task 3; before it a hidden run only had to satisfy `failed <= code`,
+///   so a stuffr 3 for 7 passed). At that level no failure line is still
+///   hidden: the others all print at 1 (probed on lz4 1.10.0), and the
+///   loud run's exit must equal the quiet one's. The re-run gets an empty
+///   standard input unless the case reads it, since level 2 turns `a
+///   already exists` into a question read from there;
 /// - read bound per path, with `m` the operands (non-`-D` tokens) that name
 ///   it exactly (lz4 retries no suffix) and `len` its largest length at an
 ///   open: at most `2m + d` opens and `2 × len × m + len × d` bytes, where
@@ -1512,24 +1515,42 @@ fn run_lz4(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
         // lz4 drops its default level 2 to 1 under several inputs, and
         // prints `Stream followed by undecodable data` only at 2 or more.
         let hidden = decodes && lz4_display_level(name, args) <= 2;
-        let failed = if lz4_display_level(name, args) >= 1 {
-            lz4_failure_lines(&err)
-        } else {
-            // `-qq` hides the lines: run the same case again, from the
-            // directory as it was, with enough `-q` removed to show them.
+        let failed = if hidden || lz4_display_level(name, args) < 1 {
+            // The quiet run's stderr misses lines (`-qq` hides all of them,
+            // and a quiet decode hides `Stream followed by undecodable
+            // data`), so run the same case again, from the directory as it
+            // was, loud enough to show them, and hold the exit to that
+            // count. Only quiet runs pay for it.
             let again = dir.with_file_name("again");
             let _ = std::fs::remove_dir_all(&again);
             std::fs::create_dir(&again).expect("create the re-run directory");
             for (n, bytes) in &before {
                 std::fs::write(again.join(n), bytes).expect("copy a case file");
             }
-            let loud = lz4_unquieted(name, args);
+            let mut loud = lz4_unquieted(name, args);
+            if hidden {
+                // `-v -v` takes any several-input level (`-m`'s 1, `lz4cat`'s
+                // 0: it hides the line at `-v` too) to 2, where the
+                // undecodable line shows (probed on lz4 1.10.0: `-m -t
+                // a.lz4 a.lz4` over two undecodable tails is silent and
+                // exits 2; `-v` prints both lines, `lz4cat` needs `-vv`).
+                // Nothing is hidden at 2: the other lines all print at 1.
+                // A level above 2 only adds lines of other forms.
+                loud.splice(0..0, ["-v".to_string(), "-v".to_string()]);
+            }
+            // A level of 2 turns `a already exists` into a question read
+            // from standard input, and a `y` there would overwrite: a
+            // different run than the quiet one, which only refuses. Give
+            // the re-run an empty standard input (a declined question)
+            // unless the case reads standard input as an input.
+            let reads_stdin = inputs == 0 || args.contains(&"-");
+            let loud_stdin: &[u8] = if hidden && !reads_stdin { b"" } else { stdin };
             let os_loud: Vec<OsString> = loud.iter().map(OsString::from).collect();
             let (code2, _, err2, _) = compat::run_in_counted(
                 &again,
                 name,
                 os_loud,
-                stdin,
+                loud_stdin,
                 Flavour::Gnu,
                 unzip::default_flavour(),
             )
@@ -1540,15 +1561,12 @@ fn run_lz4(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
             );
             let _ = std::fs::remove_dir_all(&again);
             lz4_failure_lines(&err2)
+        } else {
+            lz4_failure_lines(&err)
         };
         let code = code as u64;
         assert!(
-            failed <= code,
-            "{name} {args:?}: exit {code} but {failed} failure line(s)\n{}",
-            why()
-        );
-        assert!(
-            hidden || failed == code,
+            failed == code,
             "{name} {args:?}: exit {code} but {failed} failure line(s)\n{}",
             why()
         );

@@ -965,6 +965,11 @@ const COMPAT_SHAPES: &[&str] = &[
     // hidden at level 1 and only the second's "not overwritten" shows:
     // exit 2 over one line, as the reference gives.
     "lz4-multiple-auto-undecodable",
+    // 0.17.1 Task 3: three undecodable tails and an empty standard input
+    // under `-m -t`, all hidden at the `-m` level 1: exit 3 over four
+    // inputs, which only the loud re-run's count of three lines pins (a
+    // `failed <= code` bound let 3 to 7 through, and 4 is within the four).
+    "lz4-multiple-three-undecodable",
     // 0.16.0 Task 7: the unzip family's names, one seed each, for its
     // command line (usage, the version screen, funzip's password). The
     // unzip family names its flavour second (`unzip-apple-…`,
@@ -1842,6 +1847,12 @@ fn lz4_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> {
         ),
         "multiple-auto-undecodable" => z(
             &["-m", "-1", "a.lz4", "a.lz4"],
+            &["a.lz4"],
+            false,
+            &cat(&[&lz4_legacy_frame(&text), b"XYZW1234"]),
+        ),
+        "multiple-three-undecodable" => z(
+            &["-m", "-t", "a.lz4", "a.lz4", "a.lz4", "-"],
             &["a.lz4"],
             false,
             &cat(&[&lz4_legacy_frame(&text), b"XYZW1234"]),
