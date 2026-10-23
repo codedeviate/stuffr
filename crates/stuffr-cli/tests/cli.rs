@@ -15812,6 +15812,50 @@ fn bench_on_an_unreadable_directory_under_a_pattern_is_a_usage_error() {
     assert!(err.contains("locked: cannot read it ("), "{err}");
 }
 
+#[cfg(unix)]
+#[test]
+fn bench_on_a_file_it_cannot_open_is_a_usage_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp_dir();
+    std::fs::write(dir.join("a.log"), b"x").unwrap();
+    let locked = dir.join("locked.log");
+    std::fs::write(&locked, b"secret").unwrap();
+    // `Scratch` restores the permissions when it drops.
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&locked).is_ok() {
+        return; // root opens it anyway
+    }
+    let want = format!("{}: cannot read it (", locked.display());
+    let (code, err) = bench_err(&["bench", "-q", locked.to_str().unwrap()]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains(&want), "{err}");
+    let pattern = format!("{}/*.log", dir.display());
+    let (code, err) = bench_err(&["bench", "-q", &pattern]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains(&want), "{err}");
+}
+
+/// glob drops a literal component it cannot stat; the pattern's literal
+/// prefix is reported instead of "no input matched".
+#[cfg(unix)]
+#[test]
+fn bench_on_a_pattern_under_an_unreadable_directory_names_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp_dir();
+    let locked = dir.join("locked");
+    std::fs::create_dir_all(locked.join("sub")).unwrap();
+    std::fs::write(locked.join("sub/b.log"), b"x").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(&locked).is_ok() {
+        return; // root reads it anyway
+    }
+    let pattern = format!("{}/locked/sub/*.log", dir.display());
+    let (code, err) = bench_err(&["bench", &pattern]);
+    assert_eq!(code, Some(2), "{err}");
+    let want = format!("{}: cannot read it (", locked.join("sub").display());
+    assert!(err.contains(&want), "{err}");
+}
+
 #[test]
 fn bench_on_a_directory_is_a_usage_error() {
     let dir = tmp_dir();

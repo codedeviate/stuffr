@@ -4,7 +4,7 @@
 //! nothing else reads the environment, so this binary holds one test.
 
 use stuffr::ops::{CompressOpts, resolved_budget};
-use stuffr_cli::bench::measure::{Mode, Plan, governor_for};
+use stuffr_cli::bench::measure::{Mode, OutputBound, Plan, governor_for};
 
 #[test]
 fn bench_ignores_stuffr_threads() {
@@ -30,6 +30,7 @@ fn bench_ignores_stuffr_threads() {
         repeat: 1,
         threads: None,
         memory_limit,
+        output_bound: OutputBound::Standard,
     };
     assert!(
         governor_for(&plan).is_none(),

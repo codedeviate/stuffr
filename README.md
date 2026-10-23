@@ -1777,9 +1777,11 @@ Each row gives the compressed size, the ratio and the compress and
 decompress times; below the table come the smallest, the fastest each way
 and the best balance. Every format runs under the same conditions: the same
 input (in memory, or streamed from disk when it is over half of
-`--memory-limit`), the same compressed-output destination (memory unless its
-worst case is over the limit's room for it, half of `--memory-limit` beside
-in-memory input and all of it for streamed input, then one temp file), the same
+`--memory-limit`), the same compressed-output destination (memory unless the
+largest worst case among the formats run is over the limit's room for it, half
+of `--memory-limit` beside in-memory input and all of it for streamed input,
+then one temp file for every format; `compress` can write twice its input, so
+a run with it goes to the temp file sooner), the same
 `--threads` setting for compression (bench ignores `STUFFR_THREADS`;
 decompression is always single-threaded), and one untimed warm-up read
 first. Each file's size is taken once at the start, so a log still being
@@ -1791,7 +1793,9 @@ this build writes with its real encoder: zstd can be benchmarked only in a
 build with the `zstd-c` feature (part of `c-backed`, and in the Homebrew
 build), because the pure tier's zstd encoder is a weak fallback. Inputs must
 be regular files (or links to them): a pipe or device is refused with exit 2,
-so to bench a pipe, write it to a file first. A format that fails is a row
+so to bench a pipe, write it to a file first. No match, a directory, a
+dangling symlink, a directory that cannot be read (named, or on a pattern's
+way) and a file that cannot be read are exit 2 as well, naming the path. A format that fails is a row
 marked failed, not an exit code. On a terminal, stderr shows a bar for the
 row being measured, drawn only between timed pieces and cleared before the
 table. Timings need a release build; a debug build refuses with exit 2.

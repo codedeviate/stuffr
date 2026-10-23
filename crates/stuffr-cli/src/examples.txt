@@ -1300,7 +1300,9 @@ BENCHMARKING FORMATS ON YOUR OWN DATA
       would see them. A quoted pattern (`'logs/*.log'`) is expanded by
       stuffr itself, sorted; no match is exit 2, and so is a directory
       (name its files: `logs/*`). A pipe or device is exit 2 as well:
-      bench needs each file's size, so write a pipe to a file first. Each
+      bench needs each file's size, so write a pipe to a file first. So
+      are a dangling symlink, a directory that cannot be read and a file
+      that cannot be read, each named. Each
       file's size is taken once at the start, so a log still being written
       is benched as it was then. Every format runs under the same
       conditions, with one untimed warm-up read first, and only codec work
@@ -1336,10 +1338,12 @@ BENCHMARKING FORMATS ON YOUR OWN DATA
       --memory-limit caps what stuffr asks for. Input over half of it is
       streamed from disk instead of held in memory, for every format alike,
       and the input line says "streamed from disk". The compressed output
-      stays in memory unless its worst case is over half of the limit
-      (input in memory) or the whole limit (input streamed); only then
-      does it go to one temp file, again for every format alike, and its
-      writes count in the compress time.
+      stays in memory unless the largest worst case among the formats run
+      is over half of the limit (input in memory) or the whole limit
+      (input streamed); only then does it go to one temp file, again for
+      every format alike, and its writes count in the compress time.
+      compress can write twice its input, so a run with it goes to the
+      temp file sooner.
 
   stuffr bench --repeat 5 access.log
       --repeat N times each row N times and reports the medians.

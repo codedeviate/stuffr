@@ -489,8 +489,9 @@ pub struct BenchArgs {
     /// Cap the memory stuffr will ask for, e.g. 512M or 2G.
     ///
     /// Input over half of it is streamed from disk rather than held in
-    /// memory. Compressed output too large for the rest goes to a temp
-    /// file, whose writes then count in the compress time. Defaults to 25%
+    /// memory. When the largest worst-case output among the formats run is
+    /// too large for the rest, every format's output goes to a temp file,
+    /// whose writes then count in the compress time. Defaults to 25%
     /// of available RAM, honouring cgroup limits.
     #[arg(long, value_name = "SIZE")]
     pub memory_limit: Option<String>,

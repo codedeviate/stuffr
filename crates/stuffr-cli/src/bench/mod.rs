@@ -19,7 +19,8 @@ use stuffr::{Error, FormatKind};
 use crate::cli::BenchArgs;
 use levels::{backend_of, benchable_codecs, levels_of};
 use measure::{
-    Clock, Input, Mode, Phase, Plan, RealClock, governor_for, load_input, measure, warm,
+    Clock, Input, Mode, OutputBound, Phase, Plan, RealClock, governor_for, load_input, measure,
+    warm,
 };
 use report::Conditions;
 use score::Row;
@@ -64,6 +65,7 @@ pub fn run(args: BenchArgs) -> stuffr::Result<Ran> {
         repeat: args.repeat,
         threads: args.threads,
         memory_limit,
+        output_bound: OutputBound::largest(codecs.iter().copied()),
     };
     let planned = plan_rows(&codecs, args.levels);
     let on = io::stderr().is_terminal() && !(args.json || args.csv || args.table_only);
@@ -71,6 +73,7 @@ pub fn run(args: BenchArgs) -> stuffr::Result<Ran> {
         on.then(|| Box::new(io::stderr()) as Box<dyn Write>),
         Box::new(RealClock::new()),
         plan.repeat,
+        terminal_width,
     );
     let mut clock = RealClock::new();
     let mut rows = Vec::with_capacity(planned.len());
@@ -157,13 +160,21 @@ struct Meter {
     drawn_at: Option<u64>,
     frame: usize,
     shown: bool,
+    /// The terminal's width in columns, asked at each draw.
+    width: fn() -> usize,
 }
 
 impl Meter {
-    fn new(out: Option<Box<dyn Write>>, clock: Box<dyn Clock>, repeats: u32) -> Self {
+    fn new(
+        out: Option<Box<dyn Write>>,
+        clock: Box<dyn Clock>,
+        repeats: u32,
+        width: fn() -> usize,
+    ) -> Self {
         Self {
             out,
             clock,
+            width,
             repeats: repeats.max(1),
             row: None,
             repeat: 0,
@@ -196,6 +207,10 @@ impl Meter {
         }
         let repeat = (self.repeats > 1).then_some((self.repeat.max(1), self.repeats));
         let line = bar_line(&row, phase, repeat, done, total, self.frame);
+        // One column short of the width: a line that wrapped would leave
+        // its first part behind on the line above at the next redraw, and
+        // one filling the last column leaves some terminals pending a wrap.
+        let line = fit(&line, (self.width)().saturating_sub(1));
         // `\x1b[K` after the text clears what a longer previous line left.
         let _ = write!(out, "\r{line}\x1b[K");
         let _ = out.flush();
@@ -254,6 +269,58 @@ fn bar_line(
     let spinner = SPINNER[frame % SPINNER.len()];
     let pct = share(100);
     format!("[{k}/{n}] {format} {level}  {phase}{repeat} ▕{bar}▏{spinner} {pct}%")
+}
+
+/// stderr's width in columns (`TIOCGWINSZ`); 80 when the ioctl fails or
+/// reports no width.
+#[cfg(unix)]
+fn terminal_width() -> usize {
+    // SAFETY: winsize is plain data, filled by the ioctl.
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: TIOCGWINSZ writes one winsize we own.
+    let ok = unsafe { libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0;
+    if ok && ws.ws_col > 0 {
+        usize::from(ws.ws_col)
+    } else {
+        80
+    }
+}
+
+/// 80 columns: no window-size query off unix.
+#[cfg(not(unix))]
+fn terminal_width() -> usize {
+    80
+}
+
+/// The directories a pattern spells before its first glob character: the
+/// part up to the last `/` before it (`/` itself when that is the first
+/// character). `None` when the glob character is in the first component.
+fn literal_prefix(pattern: &str) -> Option<&Path> {
+    let first_glob = pattern.find(['*', '?', '['])?;
+    let cut = pattern[..first_glob].rfind('/')?;
+    Some(Path::new(&pattern[..cut.max(1)]))
+}
+
+/// The bar line fitted to `cols` columns: whole when it fits; otherwise
+/// the row's label alone (`[k/N] format level`, the bar dropped), itself
+/// cut to `cols` when even that is too wide. Every character [`bar_line`]
+/// draws is one column wide.
+fn fit(line: &str, cols: usize) -> String {
+    if line.chars().count() <= cols {
+        return line.to_string();
+    }
+    // The label ends at the two spaces before the phase.
+    let label = line.split_once("  ").map_or(line, |(l, _)| l);
+    truncate_cols(label, cols).to_string()
+}
+
+/// `s` cut to its first `cols` columns, one per character (never inside
+/// a character's bytes).
+fn truncate_cols(s: &str, cols: usize) -> &str {
+    match s.char_indices().nth(cols) {
+        Some((at, _)) => &s[..at],
+        None => s,
+    }
 }
 
 /// One row to run: `level` is what `measure` gets (`None`: the encoder's
@@ -342,7 +409,9 @@ fn has_glob_chars(s: &str) -> bool {
 /// matches are passed over; one named outright, or the only kind of match a
 /// pattern has, is refused. A FIFO, device or socket, named or matched, is
 /// refused from its metadata (it is never opened): bench needs each file's
-/// size up front. A symlink counts as what it points to.
+/// size up front. A symlink counts as what it points to. A path that
+/// cannot be read, named, matched or on a pattern's literal prefix, is
+/// refused naming it (exit 2), never reported as no match.
 fn expand_inputs(operands: &[String]) -> stuffr::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for op in operands {
@@ -385,7 +454,21 @@ fn expand_inputs(operands: &[String]) -> stuffr::Result<Vec<PathBuf>> {
             }
         }
         if found.is_empty() {
-            return Err(first_dir.map_or_else(|| no_match(op), |d| directory_error(&d)));
+            if let Some(d) = first_dir {
+                return Err(directory_error(&d));
+            }
+            // glob drops a literal directory it cannot stat, so a prefix
+            // under an unreadable directory looks like no match.
+            if let Some(prefix) = literal_prefix(op)
+                && let Err(e) = prefix.symlink_metadata()
+                && !matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                )
+            {
+                return Err(unreadable(prefix, &e));
+            }
+            return Err(no_match(op));
         }
         found.sort();
         files.extend(found);
@@ -395,10 +478,12 @@ fn expand_inputs(operands: &[String]) -> stuffr::Result<Vec<PathBuf>> {
 
 /// `path` if it is (or links to) a regular file, else the usage error. A
 /// path whose metadata cannot be read (a dangling symlink, no permission)
-/// is a usage error too.
+/// is a usage error too, and so is a regular file that cannot be opened
+/// (it is opened once here, and closed, so a debug build reports it too).
 fn regular(path: &Path) -> stuffr::Result<PathBuf> {
     let meta = std::fs::metadata(path).map_err(|e| unreadable(path, &e))?;
     if meta.is_file() {
+        std::fs::File::open(path).map_err(|e| unreadable(path, &e))?;
         Ok(path.to_path_buf())
     } else {
         Err(Error::Usage(format!(
@@ -715,6 +800,7 @@ mod tests {
             Some(Box::new(out.clone())),
             Box::new(HandClock(t.clone())),
             3,
+            || 80,
         );
         meter.row(xz);
         meter.progress(Phase::Compress, 0, 1000);
@@ -746,7 +832,12 @@ mod tests {
     #[test]
     fn an_empty_input_draws_full_and_divides_nothing() {
         let out = Captured::default();
-        let mut meter = Meter::new(Some(Box::new(out.clone())), Box::new(RealClock::new()), 1);
+        let mut meter = Meter::new(
+            Some(Box::new(out.clone())),
+            Box::new(RealClock::new()),
+            1,
+            || 80,
+        );
         meter.row(label(1, 1, "gzip", Some(6)));
         let input = Input::Memory(vec![Vec::new()]);
         let plan = Plan {
@@ -754,6 +845,7 @@ mod tests {
             repeat: 1,
             threads: None,
             memory_limit: 1 << 30,
+            output_bound: OutputBound::Standard,
         };
         let mut seen = Vec::new();
         let o = measure(
@@ -809,5 +901,154 @@ mod tests {
         assert_eq!(why_not(FormatKind::Codec, false), "read-only");
         assert_eq!(why_not(FormatKind::Codec, true), "weak fallback encoder");
         assert_eq!(why_not_benchable("tar"), "container");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_cannot_be_opened_is_a_usage_error_named_or_matched() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = Scratch::new();
+        s.file("a.log");
+        let locked = s.file("locked.log");
+        let _restore = Mode000(locked.clone());
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        // Root opens it anyway; there is nothing to test.
+        if fs::File::open(&locked).is_ok() {
+            return;
+        }
+        let want = format!("{}: cannot read it (", locked.display());
+        let named = usage(expand_inputs(&[s.s("locked.log")]));
+        assert!(named.starts_with(&want), "{named}");
+        let globbed = usage(expand_inputs(&[s.s("*.log")]));
+        assert!(globbed.starts_with(&want), "{globbed}");
+    }
+
+    /// glob drops a literal component it cannot stat, so a pattern under
+    /// an unreadable directory would match nothing; the literal prefix is
+    /// checked instead.
+    #[cfg(unix)]
+    #[test]
+    fn a_pattern_under_an_unreadable_directory_names_the_prefix() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = Scratch::new();
+        let locked = s.0.join("locked");
+        fs::create_dir_all(locked.join("sub")).unwrap();
+        fs::write(locked.join("sub/b.log"), b"x").unwrap();
+        let _restore = Mode000(locked.clone());
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads it anyway; there is nothing to test.
+        if fs::read_dir(&locked).is_ok() {
+            return;
+        }
+        let m = usage(expand_inputs(&[s.s("locked/sub/*.log")]));
+        let prefix = locked.join("sub");
+        assert!(
+            m.starts_with(&format!("{}: cannot read it (", prefix.display())),
+            "{m}"
+        );
+        // A prefix that is simply absent is still no match.
+        let pat = s.s("absent/sub/*.log");
+        assert_eq!(
+            usage(expand_inputs(std::slice::from_ref(&pat))),
+            format!("no input matched {pat}")
+        );
+    }
+
+    #[test]
+    fn the_literal_prefix_stops_before_the_first_glob_component() {
+        assert_eq!(literal_prefix("a/b/*.log"), Some(Path::new("a/b")));
+        assert_eq!(literal_prefix("/x/l?ck/sub/*.log"), Some(Path::new("/x")));
+        assert_eq!(literal_prefix("/*.log"), Some(Path::new("/")));
+        assert_eq!(literal_prefix("*.log"), None);
+        assert_eq!(literal_prefix("a/[b]/c"), Some(Path::new("a")));
+    }
+
+    #[test]
+    fn the_bar_line_is_cut_to_the_terminal_width() {
+        let full = bar_line(
+            &label(3, 8, "xz", Some(6)),
+            Phase::Decompress,
+            Some((2, 3)),
+            370,
+            1000,
+            2,
+        );
+        // 54 columns, all of them one column wide.
+        assert_eq!(full.chars().count(), 54);
+        assert_eq!(fit(&full, 80), full);
+        assert_eq!(fit(&full, 54), full);
+        // Too narrow for the bar: the row's label alone.
+        assert_eq!(fit(&full, 53), "[3/8] xz 6");
+        assert_eq!(fit(&full, 40), "[3/8] xz 6");
+        assert_eq!(fit(&full, 20), "[3/8] xz 6");
+        // Narrower than the label: the label is cut too.
+        assert_eq!(fit(&full, 5), "[3/8]");
+        assert_eq!(fit(&full, 0), "");
+        let long = bar_line(
+            &label(12, 34, "compress", Some(16)),
+            Phase::Compress,
+            None,
+            0,
+            1,
+            0,
+        );
+        assert_eq!(fit(&long, 20), "[12/34] compress 16");
+        assert_eq!(fit(&long, 10), "[12/34] co");
+    }
+
+    #[test]
+    fn truncation_counts_columns_not_bytes() {
+        let line = "ab ▕██░▏⠹ 37%";
+        // Each block, bar end and spinner is three bytes and one column.
+        assert_eq!(truncate_cols(line, 3), "ab ");
+        assert_eq!(truncate_cols(line, 4), "ab ▕");
+        assert_eq!(truncate_cols(line, 6), "ab ▕██");
+        assert_eq!(truncate_cols(line, 9), "ab ▕██░▏⠹");
+        assert_eq!(truncate_cols(line, 100), line);
+        assert_eq!(truncate_cols(line, 0), "");
+    }
+
+    #[test]
+    fn the_meter_draws_within_the_terminal_width() {
+        let out = Captured::default();
+        let mut meter = Meter::new(
+            Some(Box::new(out.clone())),
+            Box::new(HandClock(std::rc::Rc::new(std::cell::Cell::new(0)))),
+            1,
+            || 30,
+        );
+        meter.row(label(3, 8, "xz", Some(6)));
+        meter.progress(Phase::Compress, 0, 1000);
+        // One column kept free, so the cursor never sits past the edge.
+        assert_eq!(out.lines(), vec!["[3/8] xz 6"]);
+    }
+
+    /// A clock that counts its reads.
+    struct CountClock(std::rc::Rc<std::cell::Cell<u32>>);
+
+    impl Clock for CountClock {
+        fn now(&mut self) -> u64 {
+            self.0.set(self.0.get() + 1);
+            0
+        }
+    }
+
+    /// Off (no terminal, or a machine-readable report), the meter neither
+    /// writes nor reads its clock, so it costs a run nothing.
+    #[test]
+    fn a_meter_that_is_off_writes_nothing_and_reads_no_clock() {
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut meter = Meter::new(None, Box::new(CountClock(reads.clone())), 3, || {
+            panic!("an off meter asked for the width")
+        });
+        meter.row(label(1, 2, "gzip", Some(6)));
+        meter.progress(Phase::Compress, 0, 1000);
+        meter.progress(Phase::Compress, 500, 1000);
+        meter.progress(Phase::Decompress, 1000, 1000);
+        meter.row(label(2, 2, "xz", Some(6)));
+        meter.progress(Phase::Compress, 0, 1000);
+        meter.clear();
+        assert_eq!(reads.get(), 0, "an off meter read its clock");
+        assert!(!meter.shown);
     }
 }
