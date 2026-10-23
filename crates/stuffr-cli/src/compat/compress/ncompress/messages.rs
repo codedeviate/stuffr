@@ -148,12 +148,15 @@ pub(super) const COMPRESSION: &str = " Compression: ";
 pub(super) const NEWLINE: &str = "\n";
 
 /// `comprexx`, `utime` failed (then `perror`).
+#[cfg(unix)]
 pub(super) const UTIME_ERROR: &str = "\nutime error (ignored) ";
 
 /// `comprexx`, `chmod` failed (then `perror`).
+#[cfg(unix)]
 pub(super) const CHMOD_ERROR: &str = "\nchmod error (ignored) ";
 
 /// `comprexx`, `chown` failed (then `perror`).
+#[cfg(unix)]
 pub(super) const CHOWN_ERROR: &str = "\nchown error (ignored) ";
 
 /// `comprexx`, neither a directory nor a regular file.

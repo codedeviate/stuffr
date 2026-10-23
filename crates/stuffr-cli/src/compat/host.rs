@@ -12,6 +12,7 @@
 //! checks and wording and calls these helpers.
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::ffi::OsString;
 use std::fs::{self, File, Metadata};
 use std::io::{self, BufRead, BufWriter, Read, Seek, SeekFrom, Write};

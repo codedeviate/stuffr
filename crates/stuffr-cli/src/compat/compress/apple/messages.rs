@@ -75,15 +75,19 @@ pub(super) const STATS_EXPANSION: &str = "%s%% expansion\n";
 // ---- setfile ----
 
 /// `setfile`, `utimensat` failed (`cwarn`).
+#[cfg(unix)]
 pub(super) const UTIMENSAT: &str = "utimensat: %s";
 
 /// `setfile`, `chown` failed other than with `EPERM` (`cwarn`).
+#[cfg(unix)]
 pub(super) const CHOWN: &str = "chown: %s";
 
 /// `setfile`, `chmod` failed other than with `EOPNOTSUPP` (`cwarn`).
+#[cfg(unix)]
 pub(super) const CHMOD: &str = "chmod: %s";
 
 /// `setfile`, `chflags` failed other than with `EOPNOTSUPP` (`cwarn`).
+#[cfg(target_os = "macos")]
 pub(super) const CHFLAGS: &str = "chflags: %s";
 
 // ---- permission ----
