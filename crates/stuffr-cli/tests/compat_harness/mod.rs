@@ -832,12 +832,7 @@ fn lz4_decode_args(c: &Case) -> (Vec<String>, Option<ScratchDir>) {
     let mut v = Vec::new();
     let mut guard = None;
     if let Some((_, bytes)) = named.and_then(|n| c.files.iter().find(|(f, _)| *f == n)) {
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let dir = ScratchDir::at(std::env::temp_dir().join(format!(
-            "stuffr-lz4-dict-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        )));
+        let dir = ScratchDir::unique("lz4-dict");
         fs::create_dir_all(&*dir).expect("create the dictionary's scratch dir");
         let path = dir.join("dict");
         fs::write(&path, bytes).expect("write the dictionary for the reference");
@@ -1018,6 +1013,19 @@ impl ScratchDir {
     pub fn at(path: PathBuf) -> Self {
         remove_tree(&path);
         ScratchDir(path)
+    }
+
+    /// A directory path of its own: `stuffr-<kind>-<pid>-<n>`, `n` counted
+    /// across the process, so two tests (threads) never share one and one
+    /// guard's drop never removes another's tree. The pid stays the first
+    /// all-digit field (`scripts/tmp-leaks.sh`). Not created.
+    pub fn unique(kind: &str) -> Self {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        Self::at(std::env::temp_dir().join(format!(
+            "stuffr-{kind}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        )))
     }
 }
 impl std::ops::Deref for ScratchDir {

@@ -168,9 +168,7 @@ mod unix {
             "dict_b.lz4" => {
                 // The reference reads a dictionary only from a file.
                 // Removed on drop, a panic inside `made` included.
-                let dir = ScratchDir::at(
-                    std::env::temp_dir().join(format!("stuffr-lz4-dict-{}", std::process::id())),
-                );
+                let dir = ScratchDir::unique("lz4-dict");
                 fs::create_dir_all(&*dir).unwrap();
                 let path = dir.join("dict");
                 fs::write(&path, fx("dict")).unwrap();
@@ -252,9 +250,7 @@ mod unix {
             "big_blocks.lz4" => made(&["-c", "-q", "-B7", "--content-size"], &text()),
             "dict_cs.lz4" => {
                 // Removed on drop, a panic inside `made` included.
-                let dir = ScratchDir::at(
-                    std::env::temp_dir().join(format!("stuffr-lz4-dictcs-{}", std::process::id())),
-                );
+                let dir = ScratchDir::unique("lz4-dictcs");
                 fs::create_dir_all(&*dir).unwrap();
                 let path = dir.join("dict");
                 fs::write(&path, fx("dict")).unwrap();
@@ -2860,6 +2856,30 @@ mod unix {
                 );
             }
         }
+    }
+
+    /// The dictionary fixtures write the dictionary to a scratch file the
+    /// reference then reads. Two tests building them at once (as the test
+    /// runner does) must not share the directory: under a fixed per-pid path
+    /// one guard's drop removed the tree under the other's `lz4` spawn
+    /// ("Dictionary error : could not open dictionary file"). Hammer both
+    /// fixtures from two threads and compare with a quiet run.
+    #[test]
+    fn dictionary_fixtures_do_not_share_a_scratch_dir() {
+        if lz4_dir().is_none() {
+            return;
+        }
+        let (b, cs) = (fx("dict_b.lz4"), fx("dict_cs.lz4"));
+        std::thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| {
+                    for _ in 0..150 {
+                        assert_eq!(fx("dict_b.lz4"), b);
+                        assert_eq!(fx("dict_cs.lz4"), cs);
+                    }
+                });
+            }
+        });
     }
 
     #[test]
