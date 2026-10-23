@@ -73,7 +73,9 @@
 //!   opens the output for writing over its own input: the data is lost
 //!   (compress exits 0, uncompress says `Invalid argument`, exit 1).
 //!   stuffr writes such an output under a temporary name
-//!   (`.stuffr-compress-*.tmp`, removed on INT, TERM or HUP) and renames it
+//!   (`.stuffr-compress-*.tmp`, removed on INT, TERM or HUP; QUIT, the
+//!   "leave a core" signal, leaves it behind, as Apple leaves its partial
+//!   output on QUIT, and nothing is lost: ruling E12) and renames it
 //!   over the link when complete, then removes the input as usual: the
 //!   data survives, compressed or decompressed, silently, exit 0 (spec
 //!   anti-goal: an input is never lost; ruling E4). After a `y` at the

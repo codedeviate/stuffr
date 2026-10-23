@@ -103,8 +103,11 @@
 //!   with its exit code (1 or 4), then takes the empty output for a
 //!   success, removing the input. stuffr prints the same, exits the same,
 //!   removes its empty output and keeps the input (ruling E4: an input is
-//!   never lost). An empty `.Z` with `-f` still becomes an empty output, as
-//!   ncompress makes it (nothing is lost).
+//!   never lost). Under `-v` ncompress also prints `g.Z: g.Z: not in
+//!   compressed format` and then ` -- replaced with g` on the next line,
+//!   which is false (the input was refused, nothing replaced `g`): stuffr
+//!   leaves that line out. An empty `.Z` with `-f` still becomes an empty
+//!   output, as ncompress makes it (nothing is lost).
 //! - **Ubuntu's build everywhere (ruling E6).** On macOS this personality
 //!   is still Ubuntu's build, not Homebrew's: symbolic-link operands are
 //!   followed (Homebrew's `-DLSTAT` refuses them, `NAME is not a directory

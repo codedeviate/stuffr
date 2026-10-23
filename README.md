@@ -1036,8 +1036,8 @@ behaves as **bzip2 1.0.8**; invoked as `gzip`, `gunzip`, `zcat` or `gzcat`
 1.5.7); invoked as `lz4`, `unlz4`, `lz4cat` or `lz4c` (from `0.15.0`), as
 **lz4** (lz4 1.10.0); invoked as `unzip`, `zipinfo` or `funzip` (from
 `0.16.0`), as **Info-ZIP UnZip 6.00**; invoked as `compress` or `uncompress`
-(from `0.18.0`), as **compress**, Apple's 487.0.1 or ncompress 5.0. In every case that tool's flags,
-files, exit codes and messages, not stuffr's. The binary reads the name from
+(from `0.18.0`), as **compress**, Apple's 487.0.1 or ncompress 5.0. In every
+case that tool's flags, files, exit codes and messages, not stuffr's. The binary reads the name from
 `argv[0]`, the file name only, before parsing anything. Any other name,
 `stuffr` included, runs the stuffr CLI unchanged. So does a link you make by
 hand under a name stuffr does not handle: `zcat2 -> stuffr` runs `stuffr`.
@@ -1635,12 +1635,15 @@ the output.
 - **A1.** A stream whose header asks for fewer than 12 bits is decoded (any
   maxbits up to 16), Apple's own `-b 1` to `-b 11` output included; Apple's
   `uncompress` refuses all of them with `Inappropriate file type or format`,
-  exit 1.
+  exit 1. Off macOS, where Apple's compress does not exist, that is still the
+  text of a refused header.
 - **A2.** When the output exists and is the input itself (a link to it), Apple
   opens the output for writing over its own input and the data is lost.
   stuffr writes the output under a temporary name and renames it over the link
   when complete, then removes the input as usual: the data survives, exit 0.
-  After a `y` at the prompt without `-f`, a compressed output not smaller than
+  INT, TERM and HUP remove the temporary (`.stuffr-compress-*.tmp`); QUIT
+  leaves it behind, as Apple leaves its partial output on QUIT, and nothing
+  is lost. After a `y` at the prompt without `-f`, a compressed output not smaller than
   its input is still "no saving", exit 2, and stuffr leaves both files as
   they were.
 - **A3.** A header and nothing else (`1f 9d 90`, what ncompress writes for an
@@ -1662,7 +1665,9 @@ the output.
   values, 1 to 8, non-numbers, the empty string) ncompress's encoder never
   widens its codes, so once the table fills its stream is undecodable, by its
   own `uncompress` too. stuffr writes the valid compress 4.0 stream there: one
-  more 9-bit code, then 10-bit codes. A short input is unchanged.
+  more 9-bit code, then 10-bit codes. A short input is unchanged; after the
+  table fills, the ratio checks see the 10-bit sizes, so the CLEAR codes fall
+  where ncompress's would not.
 - **N2.** `uncompress` decompresses under that name on every platform.
   Ubuntu's binary does so only as `uncompress.real`; where its usage says
   `uncompress.real`, stuffr's says `uncompress`.
@@ -1670,7 +1675,10 @@ the output.
   format, or more than 16 bits): ncompress prints the refusal and its exit
   code, then takes the empty output for a success and removes the input.
   stuffr prints and exits the same, removes its empty output and keeps the
-  input.
+  input. Under `-v` ncompress also prints `g.Z: g.Z: not in compressed
+  format` and then ` -- replaced with g` on the next line, which is false;
+  stuffr leaves that line out. An empty `.Z` with `-f` still becomes an empty
+  output, as ncompress makes it.
 - **Ubuntu's build everywhere.** On macOS this personality is still Ubuntu's
   build, not Homebrew's: symbolic-link operands are followed, `-V` lists
   `FAST, ` and `IBUFSIZ=8192, OBUFSIZ=8192`, and the corrupt-input debug line
@@ -1678,7 +1686,9 @@ the output.
 - **Smaller points.** Undefined behaviour is not reproduced (a debug line's
   byte read before the buffer is `00`; an over-long table chain is `corrupt
   input`); the signal handler calls `_exit`, so a pending `-r` line is not
-  flushed; off unix there is no mode, owner or time to copy.
+  flushed; the answer `perror` prints after a question that meets the end of
+  the input is the platform's `strerror(0)`; off unix there is no mode, owner
+  or time to copy.
 
 **Both personalities:** a reference's behaviour that no correct decoder can
 read back is replaced by a valid stream, and is listed above (N1). A closed
@@ -2118,17 +2128,19 @@ Since `0.18.0` the compress family is ported too: Apple's `compress.c` and
 in the expression; notice in
 [`crates/stuffr-cli/LICENSE-compress-bsd`](crates/stuffr-cli/LICENSE-compress-bsd)),
 and ncompress 5.0's `compress.c`, which is in the public domain under the
-**Unlicense** ([`crates/stuffr-cli/LICENSE-ncompress`](crates/stuffr-cli/LICENSE-ncompress)).
+**Unlicense**
+([`crates/stuffr-cli/LICENSE-ncompress`](crates/stuffr-cli/LICENSE-ncompress)).
 `stuffr-cli`'s full expression is therefore
-**`MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD AND Info-ZIP AND Unlicense`**: the
-BSD-2-Clause covers `gzip.c` and the decoders, the BSD-3-Clause covers
+**`MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD AND Info-ZIP AND Unlicense`**:
+the BSD-2-Clause covers `gzip.c` and the decoders, the BSD-3-Clause covers
 `zuncompress.c`, the University of California's `.Z` reader, and the zstd
-family; the 0BSD covers the xz family; Info-ZIP covers the unzip family; the Unlicense covers the ncompress personality. One notice is
+family; the 0BSD covers the xz family; Info-ZIP covers the unzip family; the
+Unlicense covers the ncompress personality. One notice is
 BSD-style but not word for word the SPDX `BSD-2-Clause` text: the Lzd one in
 `unlz.c`. The full notice ships in `LICENSE-gzip-bsd`, and that file, not the
 SPDX name, is what to read. `stuffr-formats` is
-**`MIT AND BSD-2-Clause AND 0BSD AND BSD-3-Clause AND Info-ZIP`**, because its pack
-decoder (`pack.rs`) is a port of FreeBSD's `unpack.c` (Xin LI), whose notice is
+**`MIT AND BSD-2-Clause AND 0BSD AND BSD-3-Clause AND Info-ZIP`**,
+because its pack decoder (`pack.rs`) is a port of FreeBSD's `unpack.c` (Xin LI), whose notice is
 [`crates/stuffr-formats/LICENSE-unpack-bsd`](crates/stuffr-formats/LICENSE-unpack-bsd),
 and since `0.13.0` its liblzma memory-usage formulas and container coders
 (the pure xz tier) are ported from XZ Utils 5.8.4 under 0BSD, notice in
