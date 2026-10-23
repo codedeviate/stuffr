@@ -1,6 +1,9 @@
 # The Ubuntu oracle of the unzip compatibility family (0.16.0, ruling R10):
 # apt's `unzip` 6.0-28ubuntu4.1 on ubuntu:24.04, as CI's ubuntu-latest has it,
-# with a Rust toolchain to build and run the suites beside it.
+# with a Rust toolchain to build and run the suites beside it. Since 0.18.0
+# it also carries apt's ncompress 5.0-1, the compress family's ncompress
+# oracle (`compress` and `uncompress.real`; `ncompress_dir()` requires that
+# version under `CI`).
 #
 # Used by `make compat-ubuntu`, which builds this image and runs
 # `compat_unzip_ubuntu` and `compat_unzip_common` in it with `CI=1`. The
@@ -19,7 +22,7 @@ ARG RUST_TOOLCHAIN=1.95
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      unzip zip build-essential curl ca-certificates locales \
+      unzip zip ncompress build-essential curl ca-certificates locales \
  && sed -i 's/^# *\(en_US.UTF-8 UTF-8\)/\1/' /etc/locale.gen \
  && locale-gen \
  && rm -rf /var/lib/apt/lists/*

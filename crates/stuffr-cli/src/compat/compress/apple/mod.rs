@@ -119,7 +119,7 @@ use std::io::Write;
 
 use crate::compat::host::Host;
 
-mod args;
+pub(super) mod args;
 mod lzw;
 mod messages;
 mod run;

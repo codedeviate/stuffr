@@ -129,8 +129,10 @@ pub(super) fn parse(name: &str, argv0: &[u8], args: &[OsString], err: &mut dyn W
 
 /// `strtol(s, &end, 10)` on LP64: leading white space, an optional sign,
 /// decimal digits; the value saturates at the `long` limits. Returns the
-/// value and the offset of `end`, which is 0 when no digit was read.
-fn strtol(s: &[u8]) -> (i64, usize) {
+/// value and the offset of `end`, which is 0 when no digit was read. The
+/// ncompress personality reads `-b` with it too (glibc's `atoi` is
+/// `(int)strtol(s, NULL, 10)`).
+pub(in crate::compat::compress) fn strtol(s: &[u8]) -> (i64, usize) {
     let mut i = 0;
     while i < s.len() && matches!(s[i], b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r') {
         i += 1;

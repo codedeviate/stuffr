@@ -342,14 +342,23 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let _guard = Guard(dir.clone());
         std::fs::write(dir.join("a"), b"hello hello hello hello\n").unwrap();
-        for c in [compress::Flavour::Apple, compress::Flavour::Ncompress] {
+        for (c, usage) in [
+            (
+                compress::Flavour::Apple,
+                "uncompress: illegal option -- x\nusage: uncompress [-cfv] [-b bits] [file ...]\n",
+            ),
+            (
+                compress::Flavour::Ncompress,
+                "Unknown flag: 'x'; Usage: uncompress [-dfhvcVr] [-b maxbits] [--] [path ...]\n",
+            ),
+        ] {
             let (code, _, err, _) =
                 run_in_counted(&dir, "uncompress", vec!["-x".into()], b"", G, U, c).unwrap();
             assert_eq!(code, 1, "{c:?}");
             assert!(
+                String::from_utf8_lossy(&err).starts_with(usage),
+                "{c:?}: {}",
                 String::from_utf8_lossy(&err)
-                    .ends_with("usage: uncompress [-cfv] [-b bits] [file ...]\n"),
-                "{c:?}"
             );
             let (code, out, err, reads) = run_in_counted(
                 &dir,

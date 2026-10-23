@@ -486,6 +486,9 @@ fuzz-corpus:
 # `check`: Docker is not a gate dependency. `COMPAT_UBUNTU_ARGS` goes after
 # `--` (a test name filter, `--nocapture`). The lib unit tests of
 # `compat::unzip` run first (P42): the Linux-only ones run nowhere else.
+# The compress family's ncompress personality (0.18.0) has its oracle here
+# too, apt's ncompress 5.0-1 (`uncompress.real`): the `compat::compress` lib
+# tests, then `compat_compress_ncompress`, one container for both.
 # `docker volume rm
 # stuffr-ubuntu-target stuffr-ubuntu-cargo-registry` starts clean.
 COMPAT_UBUNTU_IMAGE ?= stuffr-ubuntu-24.04
@@ -515,6 +518,9 @@ compat-ubuntu:
 	$(COMPAT_UBUNTU_RUN) \
 	  cargo test --locked -p stuffr-cli --test compat_unzip_ubuntu --test compat_unzip_common --test compat_unzip_safety \
 	    --test compat_unzip_tty --test compat_unzip_umask --test compat_unzip_harness_selftest -- $(COMPAT_UBUNTU_ALL_ARGS)
+	$(COMPAT_UBUNTU_RUN) sh -c \
+	  'cargo test --locked -p stuffr-cli --lib compat::compress -- $(COMPAT_UBUNTU_ALL_ARGS) \
+	   && cargo test --locked -p stuffr-cli --test compat_compress_ncompress -- $(COMPAT_UBUNTU_ALL_ARGS)'
 
 clean:
 	$(CARGO) clean

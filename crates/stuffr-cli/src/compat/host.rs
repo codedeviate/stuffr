@@ -130,6 +130,10 @@ enum GuardKind {
     /// [`arm_cleanup_exit`]: remove the output and exit 2; dropping the
     /// guard puts SIGINT back to `SIG_DFL` (zstd's `clearHandler`).
     Exit,
+    /// [`create_excl_armed`]: the handler [`install_abort_exit`] installed
+    /// for the whole run removes the output and exits 1; dropping the
+    /// guard only disarms.
+    Abort,
 }
 
 impl Drop for CleanupGuard {
@@ -347,6 +351,103 @@ extern "C" fn on_interrupt_exit(_sig: libc::c_int) {
         libc::write(2, b"\n".as_ptr().cast(), 1);
         libc::_exit(2);
     }
+}
+
+/// ncompress 5.0 (compress.c `main`, measured 2026-10-23, ruling E3 of
+/// 0.18.0): SIGINT, SIGTERM and SIGHUP run `abort_compress`, which removes
+/// the partial output and exits 1; SIGQUIT and the rest keep their default.
+#[cfg(unix)]
+pub(crate) const NCOMPRESS_SIGNALS: Signals = &[libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+#[cfg(not(unix))]
+pub(crate) const NCOMPRESS_SIGNALS: Signals = &[];
+
+/// ncompress 5.0's `main` before its arguments: `signal(SIGINT, SIG_IGN)`,
+/// and `abort_compress` for SIGINT unless that found it ignored already
+/// (`fgnd_flag`, which is the answer: the overwrite question is asked only
+/// in the foreground), then `abort_compress` for SIGTERM and SIGHUP over
+/// whatever they were. The handler ([`on_abort_exit`]) removes the output
+/// [`create_excl_armed`] armed, if any, and exits 1. Installed for the whole
+/// run, as `signal()` installs it (`SA_RESTART`). Under `Host::Sandbox`
+/// nothing is installed and the answer is `true`.
+///
+/// ruling: as T11-6, `_exit` where the C's handler calls `exit()`: the only
+/// stdio output it could flush is a pending `-r` "unreadable" line.
+pub(crate) fn install_abort_exit(host: &Host) -> bool {
+    #[cfg(unix)]
+    {
+        if matches!(host, Host::Sandbox(_)) {
+            return true;
+        }
+        let handler = on_abort_exit as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        // SAFETY: zeroed sigaction structs filled before use (a query passes
+        // a null new action); the handler only makes async-signal-safe calls.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            libc::sigemptyset(&mut action.sa_mask);
+            action.sa_flags = libc::SA_RESTART;
+            action.sa_sigaction = handler;
+            let mut old: libc::sigaction = std::mem::zeroed();
+            let fgnd = libc::sigaction(libc::SIGINT, std::ptr::null(), &mut old) != 0
+                || old.sa_sigaction != libc::SIG_IGN;
+            if fgnd {
+                libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+            }
+            libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
+            libc::sigaction(libc::SIGHUP, &action, std::ptr::null_mut());
+            fgnd
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = host;
+        true
+    }
+}
+
+/// ncompress 5.0's `abort_compress` as a handler: `unlink(ofname)` when an
+/// output is armed (`remove_ofname`), then exit 1. It never allocates or
+/// locks.
+#[cfg(unix)]
+extern "C" fn on_abort_exit(_sig: libc::c_int) {
+    if ARMED.load(Ordering::Acquire) {
+        // SAFETY: `ARMED` true means the slot holds a NUL-terminated path,
+        // written before the Release store this load pairs with; unlink is
+        // async-signal-safe.
+        unsafe { libc::unlink(SLOT.0.get().cast::<libc::c_char>()) };
+    }
+    // SAFETY: _exit is async-signal-safe.
+    unsafe { libc::_exit(1) };
+}
+
+/// ncompress 5.0's `open(ofname, O_WRONLY|O_CREAT|O_EXCL, 0600)`, the new
+/// file armed for [`install_abort_exit`]'s handler (`remove_ofname = 1`),
+/// with [`NCOMPRESS_SIGNALS`] held back between the create and the arm.
+/// Dropping the guard disarms (`remove_ofname = 0`). Under `Host::Sandbox`,
+/// for a path the slot cannot hold, and off unix, nothing is armed.
+pub(crate) fn create_excl_armed(host: &Host, path: &Path) -> io::Result<(File, CleanupGuard)> {
+    held_back(NCOMPRESS_SIGNALS, || {
+        let f = private_new_file().open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let bytes = path.as_os_str().as_bytes();
+            let kind = GuardKind::Abort;
+            if matches!(host, Host::Sandbox(_)) || bytes.len() >= SLOT_LEN || bytes.contains(&0) {
+                return Ok((f, CleanupGuard { armed: false, kind }));
+            }
+            debug_assert!(
+                !ARMED.load(Ordering::Acquire),
+                "create_excl_armed: another output is still armed"
+            );
+            fill_slot(bytes, NCOMPRESS_SIGNALS);
+            Ok((f, CleanupGuard { armed: true, kind }))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = host;
+            Ok((f, CleanupGuard {}))
+        }
+    })
 }
 
 /// Set by `on_interrupt_signal`; read and cleared by [`take_interrupt`].

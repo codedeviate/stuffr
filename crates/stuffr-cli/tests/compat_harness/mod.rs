@@ -557,6 +557,126 @@ pub fn lz4_dir() -> Option<&'static str> {
     }
 }
 
+// ---- ncompress 5.0 (the compress family's ncompress personality) ----
+
+/// The apt package `make compat-ubuntu` and CI's ubuntu-24.04 runners have:
+/// the build the ncompress personality follows on every platform (ruling E6
+/// of 0.18.0).
+pub const UBUNTU_NCOMPRESS_VERSION: &str = "5.0-1";
+
+/// What ncompress 5.0's `-V` prints first, on every build.
+const NCOMPRESS_VERSION_LINE: &str = "Compress version: (N)compress 5.0";
+
+/// `dpkg-query -W -f '${Version}' ncompress`, `None` when there is no such
+/// package (or no dpkg).
+pub fn ubuntu_ncompress_version() -> Option<String> {
+    let out = output(
+        Command::new("dpkg-query")
+            .args(["-W", "-f", "${Version}", "ncompress"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::null()),
+    )
+    .ok()?;
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (out.status.success() && !v.is_empty()).then_some(v)
+}
+
+/// The directory of an ncompress 5.0 reference: `compress`, and beside it
+/// `uncompress` (Homebrew, upstream) or `uncompress.real` (Debian and
+/// Ubuntu, whose `uncompress` is gzip's script; [`ncompress_exe`] picks).
+///
+/// Looked up in this order, the first whose `compress -V` reports 5.0
+/// winning:
+/// 1. `$STUFFR_NCOMPRESS_REFERENCE`, the path of a `compress`;
+/// 2. on macOS, Homebrew's keg, `/opt/homebrew/opt/ncompress/bin`;
+/// 3. on Linux, `/usr/bin` (`apt-get install ncompress`).
+///
+/// Under `CI` on Linux the apt package must also be
+/// [`UBUNTU_NCOMPRESS_VERSION`] (`dpkg-query -W ncompress`), as
+/// [`unzip_dir`] pins unzip's: another build is no oracle. `None` when there
+/// is none: a skip with a note locally, a panic under `CI` (the rule of
+/// [`require_reference`]).
+pub fn ncompress_dir() -> Option<&'static str> {
+    static DIR: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+    let found = DIR.get_or_init(|| {
+        if cfg!(target_os = "linux") && std::env::var_os("CI").is_some() {
+            match ubuntu_ncompress_version() {
+                Some(v) if v == UBUNTU_NCOMPRESS_VERSION => {}
+                Some(v) => {
+                    panic!("CI is set but the apt ncompress is {v}, not {UBUNTU_NCOMPRESS_VERSION}")
+                }
+                None => panic!("CI is set but the apt package ncompress is not installed"),
+            }
+        }
+        let mut candidates = vec![
+            std::env::var_os("STUFFR_NCOMPRESS_REFERENCE")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
+        ];
+        if cfg!(target_os = "macos") {
+            candidates.push(Some(PathBuf::from(
+                "/opt/homebrew/opt/ncompress/bin/compress",
+            )));
+        } else if cfg!(target_os = "linux") {
+            candidates.push(Some(PathBuf::from("/usr/bin/compress")));
+        }
+        for exe in candidates.into_iter().flatten() {
+            let Some(dir) = exe.parent().filter(|_| exe.is_file()) else {
+                continue;
+            };
+            let first = output(
+                Command::new(&exe)
+                    .arg("-V")
+                    .env_clear()
+                    .stdin(Stdio::null()),
+            )
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            });
+            let unc = ["uncompress.real", "uncompress"]
+                .iter()
+                .any(|n| dir.join(n).is_file());
+            if first.as_deref().ok() == Some(NCOMPRESS_VERSION_LINE) && unc {
+                return dir
+                    .to_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("{dir:?} is not UTF-8"));
+            }
+        }
+        Err("no ncompress 5.0 (looked at $STUFFR_NCOMPRESS_REFERENCE, \
+             /opt/homebrew/opt/ncompress/bin on macOS, /usr/bin on Linux)"
+            .to_owned())
+    });
+    match found {
+        Ok(d) => Some(d.as_str()),
+        Err(why) => {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI is set but there is no ncompress reference: {why}"
+            );
+            eprintln!("skipped: {why}");
+            None
+        }
+    }
+}
+
+/// The reference program for the invoked `name` in [`ncompress_dir`]'s
+/// `dir`: `compress`, or for `uncompress` the program that decompresses
+/// under its own name, `uncompress.real` where the distribution renamed it
+/// (Debian's `uncompress-real.patch`), else `uncompress`.
+pub fn ncompress_exe(dir: &str, name: &str) -> PathBuf {
+    let d = Path::new(dir);
+    if name == "uncompress" && d.join("uncompress.real").is_file() {
+        return d.join("uncompress.real");
+    }
+    d.join(name)
+}
+
 /// A `\r`-refreshed progress segment of lz4's display level 2 (probe, 1.10.0,
 /// stderr a file): `\rRead : <n> MiB   ==> <ratio>%   ` while compressing,
 /// `\rDecompressed : <n> MiB  ` while decoding. Returns its length when

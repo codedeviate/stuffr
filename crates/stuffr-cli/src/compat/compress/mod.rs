@@ -7,8 +7,10 @@
 //!   ported from its `compress.c` and `zopen.c` (BSD-3-Clause,
 //!   `LICENSE-compress-bsd`). The module doc of `apple/mod.rs` lists the
 //!   behaviours reproduced and the deviations.
-//! - **ncompress**: ncompress 5.0 as Ubuntu's `5.0-1` builds it. Until
-//!   Task 3 of 0.18.0 ports it, this flavour runs the Apple personality.
+//! - **ncompress** (`ncompress/`): ncompress 5.0 as Ubuntu's `5.0-1`
+//!   builds it, on every platform, ported from its `compress.c` (the
+//!   Unlicense, `LICENSE-ncompress`). The module doc of `ncompress/mod.rs`
+//!   lists the behaviours reproduced and the deviations.
 //!
 //! The flavour is [`default_flavour`] unless `STUFFR_COMPRESS_FLAVOR` says
 //! `apple` or `ncompress`; [`run`] reads the variable once, before any
@@ -30,6 +32,7 @@ use super::host::{Host, SANDBOX_OUTPUT_CAP, Sandbox, reset_sigpipe};
 
 mod apple;
 mod flavour;
+mod ncompress;
 
 pub(crate) use flavour::flavour_from;
 pub use flavour::{Flavour, default_flavour};
@@ -73,8 +76,8 @@ fn main(
     err: &mut dyn Write,
 ) -> u8 {
     match flavour {
-        // Task 3: the ncompress personality replaces this delegation.
-        Flavour::Apple | Flavour::Ncompress => apple::main(name, argv0, args, host, err),
+        Flavour::Apple => apple::main(name, argv0, args, host, err),
+        Flavour::Ncompress => ncompress::main(name, args, host, err),
     }
 }
 
