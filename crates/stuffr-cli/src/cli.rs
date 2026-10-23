@@ -463,7 +463,9 @@ pub struct BenchArgs {
     /// A path that exists is used as is; one that does not and contains
     /// `*`, `?` or `[` is expanded, its matches sorted. A directory is
     /// refused: name its files instead. So is a pipe or device: bench needs
-    /// each file's size, so write a pipe to a file first.
+    /// each file's size, so write a pipe to a file first. A file it cannot
+    /// open, a dangling symlink or an unreadable directory on the way is
+    /// refused too, naming the path.
     #[arg(required = true, num_args = 1.., value_name = "INPUTS")]
     pub inputs: Vec<String>,
     /// Only these formats, comma-separated or repeated. Default: every codec

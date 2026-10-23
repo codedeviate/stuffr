@@ -1528,7 +1528,7 @@ mod tests {
     }
 
     /// In-memory input whose output does not fit goes to the temp file too,
-    /// for every codec alike.
+    /// for each codec whose own worst case is over the budget.
     #[test]
     fn memory_input_past_the_output_limit_uses_the_temp_file() {
         let _lock = armed_lock();
