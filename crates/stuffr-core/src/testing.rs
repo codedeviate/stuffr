@@ -214,6 +214,13 @@ pub const COMPAT_NAMES: &[&str] = &[
 /// The unzip family's two (0.16.0) take bits 17 and 18 of that third byte:
 /// `a.zip`, and `b.zip` for a second archive (unzip's wildcard and
 /// several-archive paths, zipinfo's `-Z` over two).
+///
+/// The compress family's two (0.18.0) take bits 19 and 20: `a.Z`, and `b.Z`
+/// for a second `.Z` operand. They fit the third mask byte (bits 16-23), so
+/// no fourth byte is needed and the argument-count byte's thresholds are
+/// unchanged: every earlier seed decodes as it did. (`a.Z` and `a.z`, the
+/// gzip family's `pack` file, are one file on a case-insensitive file
+/// system.)
 pub const COMPAT_FILES: &[&str] = &[
     "a", "a.bz2", "a.tbz2", "a.out", // 0.11.0
     "a.gz", "a.tgz", "a.z", // 0.12.0: the gzip family
@@ -221,6 +228,7 @@ pub const COMPAT_FILES: &[&str] = &[
     "a.zst", "a.tzst", "d.dict", // 0.14.0: the zstd family
     "a.lz4",  // 0.15.0: the lz4 family (a third mask byte; its dictionary is `d.dict`)
     "a.zip", "b.zip", // 0.16.0: the unzip family (third mask byte, bits 17 and 18)
+    "a.Z", "b.Z", // 0.18.0: the compress family (third mask byte, bits 19 and 20)
 ];
 
 /// The `compat` target's argument vocabulary: byte `n % len` is one argument.
@@ -232,7 +240,7 @@ pub const COMPAT_FILES: &[&str] = &[
 /// `--files0=a`, the list-file forms; then (0.14.0) zstd's flags that no
 /// earlier family has, the dictionary and training options, and the zstd
 /// family's files (`--output-dir-flat=d` names a directory no case
-/// creates). Drawing
+/// creates); then (0.18.0) the compress family's `-b` forms and files. Drawing
 /// arguments from a fixed set, rather than from raw bytes, is what keeps
 /// every operand inside the case's directory: no token is absolute, holds a
 /// `/` or names `..`. Append-only.
@@ -421,6 +429,28 @@ pub const COMPAT_TOKENS: &[&str] = &[
     "-M",
     "a.zip",
     "b.zip",
+    // 0.18.0: the compress family (`-c -d -f -v -V -h -k -n -q -s -r -F`,
+    // `--` and `-` are above). `-b` takes the next token
+    // (`9`, `12`, `16`, `17`) or the rest of its cluster (`-b9`...): 9 is
+    // ncompress's broken width (N1), 16 the default, 17 out of range for
+    // both, 12 the smallest Apple's own decoder reads and 8 below
+    // ncompress's floor. `-R` is ncompress's second spelling of `-r`.
+    "-b",
+    "-b8",
+    "-b9",
+    "-b12",
+    "-b16",
+    "-b17",
+    "9",
+    "12",
+    "16",
+    "17",
+    "-R",
+    "-cf",
+    "-fv",
+    "-vk",
+    "a.Z",
+    "b.Z",
 ];
 
 /// The largest input the `compat` target runs. Here, not in the target, so
@@ -2209,7 +2239,7 @@ mod tests {
     /// earlier generator set: every 0.15 seed decodes as it did.
     #[test]
     fn zip_files_take_bits_17_and_18() {
-        assert_eq!(&COMPAT_FILES[16..], ["a.zip", "b.zip"]);
+        assert_eq!(&COMPAT_FILES[16..18], ["a.zip", "b.zip"]);
         let t = |s: &str| COMPAT_TOKENS.iter().position(|t| *t == s).unwrap() as u8;
         let argc = 2 * (COMPAT_MAX_ARGS as u8 + 1) + 2;
         for (file, top) in [("a.zip", 1u8 << 1), ("b.zip", 1 << 2)] {
@@ -2235,6 +2265,60 @@ mod tests {
         for tok in [
             "-l", "-v", "-t", "-p", "-c", "-o", "-n", "-P", "-d", "-x", "-Z", "-j", "-a", "-C",
             "-L", "-X", "-q", "-O", "-I", "-M", "a.zip", "b.zip",
+        ] {
+            assert!(COMPAT_TOKENS.contains(&tok), "{tok}");
+        }
+        assert!(COMPAT_FILES.iter().all(|f| COMPAT_TOKENS.contains(f)));
+        assert!(COMPAT_TOKENS.len() <= 256);
+    }
+
+    /// 0.18.0: the compress family's `a.Z` and `b.Z` are the nineteenth and
+    /// twentieth files, bits 19 and 20, still in the third mask byte, so no
+    /// fourth byte exists and every earlier seed decodes as it did.
+    #[test]
+    fn dot_z_files_take_bits_19_and_20() {
+        assert_eq!(&COMPAT_FILES[18..], ["a.Z", "b.Z"]);
+        let t = |s: &str| COMPAT_TOKENS.iter().position(|t| *t == s).unwrap() as u8;
+        let argc = 2 * (COMPAT_MAX_ARGS as u8 + 1) + 2;
+        for (file, top) in [("a.Z", 1u8 << 3), ("b.Z", 1 << 4)] {
+            let seed = encode_compat_case("compress", 1, &["-d", file], &[file], false, b"p");
+            assert_eq!(seed, [25 + 27, argc, t("-d"), t(file), 0, 0, top, b'p']);
+            let case = decode_compat_case(&seed).unwrap();
+            assert_eq!((case.name, case.flavour), ("compress", 1));
+            assert_eq!(case.args, ["-d", file]);
+            assert_eq!(case.files, [file]);
+        }
+        // All twenty files and standard input fit three mask bytes, and the
+        // third byte's top three bits stay unused.
+        let all: Vec<&str> = COMPAT_FILES.to_vec();
+        let seed = encode_compat_case("uncompress", 0, &[], &all, true, b"xy");
+        assert_eq!(seed[1], 18);
+        assert_eq!(&seed[2..5], [0xff, 0xff, 0x1f]);
+        assert_eq!(decode_compat_case(&seed).unwrap().files, COMPAT_FILES);
+        // The unzip family's seeds (`a.zip` and `b.zip` in the third byte)
+        // are unchanged, and the wire format is exactly three mask bytes
+        // for every count byte from 18 up.
+        let old = encode_compat_case(
+            "unzip",
+            1,
+            &["-t", "b.zip"],
+            &["a.zip", "b.zip"],
+            false,
+            b"p",
+        );
+        assert_eq!(old[4..7], [0, 0, 0b110]);
+        for argc in [18u8, 27, 36, 189] {
+            let wire = [0, argc, 0xff, 0xff, 0xff, b'z'];
+            let case = decode_compat_case(&wire).unwrap();
+            assert_eq!(case.files, COMPAT_FILES);
+            assert_eq!(case.payload, b"z".as_slice());
+        }
+        // The new tokens are appended after the unzip family's last one.
+        assert_eq!(COMPAT_TOKENS[166], "b.zip");
+        assert_eq!(COMPAT_TOKENS[167], "-b");
+        // Every compress token is in the table, and the table fits a byte.
+        for tok in [
+            "-b", "-b8", "-b9", "-b12", "-b16", "-b17", "9", "12", "16", "17", "-R", "-cf",
         ] {
             assert!(COMPAT_TOKENS.contains(&tok), "{tok}");
         }

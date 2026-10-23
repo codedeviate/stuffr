@@ -1014,11 +1014,93 @@ const COMPAT_SHAPES: &[&str] = &[
     "funzip-ubuntu-stdin-gzip",
     "funzip-apple-file-zip",
     "funzip-ubuntu-stdin-encrypted-cut",
-    // The compress family (0.18.0 Task 2): one seed per name, in the
-    // platform's default flavour, so every tool is reached; Task 4 adds
-    // a seed per major flag and flavour.
+    // The compress family (0.18.0): one seed per name in the platform's
+    // default flavour (Task 2), then `compress-<apple|ncompress>-<case>`
+    // and `uncompress-<apple|ncompress>-<case>`: a seed per major flag and
+    // per flavour, the `-b` widths (9, 12, 16, an out-of-range 17), `-V`
+    // and ncompress's own flags.
     "compress-stdin",
     "uncompress-stdin",
+    // apple
+    "compress-apple-file",
+    "compress-apple-stdout",
+    "compress-apple-force-existing-output",
+    "compress-apple-verbose",
+    "compress-apple-bits-9",
+    "compress-apple-bits-12",
+    "compress-apple-bits-16",
+    "compress-apple-bits-17",
+    "compress-apple-bits-cluster",
+    "compress-apple-version",
+    "compress-apple-stdin",
+    "compress-apple-suffixed-operand",
+    "compress-apple-two-operands",
+    "compress-apple-no-saving",
+    "compress-apple-empty",
+    "compress-apple-bad-flag",
+    "compress-apple-missing-bits",
+    "compress-apple-decompress-flag",
+    "uncompress-apple-file",
+    "uncompress-apple-stdout",
+    "uncompress-apple-force-existing-output",
+    "uncompress-apple-verbose",
+    "uncompress-apple-implied-suffix",
+    "uncompress-apple-maxbits-9",
+    "uncompress-apple-maxbits-12",
+    "uncompress-apple-truncated",
+    "uncompress-apple-damaged",
+    "uncompress-apple-not-compressed",
+    "uncompress-apple-too-many-bits",
+    "uncompress-apple-header-only",
+    "uncompress-apple-stdin-damaged",
+    "uncompress-apple-two-files",
+    "uncompress-apple-empty",
+    // ncompress
+    "compress-ncompress-file",
+    "compress-ncompress-stdout",
+    "compress-ncompress-force-existing-output",
+    "compress-ncompress-verbose",
+    "compress-ncompress-bits-9",
+    "compress-ncompress-bits-12",
+    "compress-ncompress-bits-16",
+    "compress-ncompress-bits-17",
+    "compress-ncompress-bits-cluster",
+    "compress-ncompress-version",
+    "compress-ncompress-stdin",
+    "compress-ncompress-suffixed-operand",
+    "compress-ncompress-two-operands",
+    "compress-ncompress-no-saving",
+    "compress-ncompress-empty",
+    "compress-ncompress-bad-flag",
+    "compress-ncompress-missing-bits",
+    "compress-ncompress-decompress-flag",
+    "uncompress-ncompress-file",
+    "uncompress-ncompress-stdout",
+    "uncompress-ncompress-force-existing-output",
+    "uncompress-ncompress-verbose",
+    "uncompress-ncompress-implied-suffix",
+    "uncompress-ncompress-maxbits-9",
+    "uncompress-ncompress-maxbits-12",
+    "uncompress-ncompress-truncated",
+    "uncompress-ncompress-damaged",
+    "uncompress-ncompress-not-compressed",
+    "uncompress-ncompress-too-many-bits",
+    "uncompress-ncompress-header-only",
+    "uncompress-ncompress-stdin-damaged",
+    "uncompress-ncompress-two-files",
+    "uncompress-ncompress-empty",
+    // ncompress's own flags, and Apple's standard input dash
+    "compress-ncompress-keep",
+    "compress-ncompress-recursive",
+    "compress-ncompress-help",
+    "compress-ncompress-quiet-flags",
+    "compress-ncompress-bits-8",
+    "compress-ncompress-bits-takes-flag",
+    "uncompress-ncompress-keep",
+    "uncompress-ncompress-force-uppercase",
+    "uncompress-ncompress-force-not-compressed",
+    "compress-apple-stdin-dash",
+    "compress-apple-cluster-force",
 ];
 
 // ---------------------------------------------------------------------
@@ -2284,6 +2366,103 @@ fn e(name: &str, args: &[&str], files: &[&str], stdin: bool, payload: &[u8]) -> 
     encode_compat_case(name, 0, args, files, stdin, payload)
 }
 
+/// Whether the platform's default compress personality is Apple's (the cfg
+/// of `compress::default_flavour`, which the seeds' flavour byte is
+/// relative to).
+const COMPRESS_APPLE_DEFAULT: bool = cfg!(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+));
+
+/// The compress-family `compat` seeds (0.18.0 Task 4): `<compress|uncompress>-
+/// <apple|ncompress>-<case>`, or `None` for another family's. The flavour
+/// byte is the platform's default (0) or the other one (1), so each
+/// personality gets its seed on every platform.
+fn compress_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> {
+    let mut parts = shape.splitn(3, '-');
+    let (Some(tool), Some(personality), Some(case)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return Ok(None);
+    };
+    let flavour = match (tool, personality) {
+        ("compress" | "uncompress", "apple") => u8::from(!COMPRESS_APPLE_DEFAULT),
+        ("compress" | "uncompress", "ncompress") => u8::from(COMPRESS_APPLE_DEFAULT),
+        _ => return Ok(None),
+    };
+    let z = |name: &str, args: &[&str], files: &[&str], stdin: bool, payload: &[u8]| {
+        encode_compat_case(name, flavour, args, files, stdin, payload)
+    };
+    let text = compat_text(4000);
+    // Past the point where a 9-bit table fills (about 21 500 bytes of this
+    // text), so `-b 9` reaches ncompress's N1.
+    let long = compat_text(24_000);
+    // Bytes LZW cannot shrink: a counter run through a multiplier.
+    let noise: Vec<u8> = (0u32..300)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let stream = encoded(work, &text, "compress", None)?;
+    // `AAAA` as both encoders write it, under header bytes of 9, 12 and 17
+    // bits (block mode set).
+    let aaaa = |header: u8| [0x1f, 0x9d, header, 0x41, 0x02, 0x06, 0x01];
+    let a = &["a"][..];
+    let az = &["a.Z"][..];
+    let nc = personality == "ncompress";
+    Ok(Some(match (tool, case) {
+        ("compress", "file") => z(tool, a, a, false, &text),
+        ("compress", "stdout") => z(tool, &["-c", "a"], a, false, &text),
+        ("compress", "force-existing-output") => z(tool, &["-f", "a"], &["a", "a.Z"], false, &text),
+        ("compress", "verbose") => z(tool, &["-v", "a"], a, false, &text),
+        ("compress", "bits-9") => z(tool, &["-b", "9", "a"], a, false, &long),
+        ("compress", "bits-12") => z(tool, &["-b", "12", "a"], a, false, &text),
+        ("compress", "bits-16") => z(tool, &["-b", "16", "-c", "a"], a, false, &text),
+        ("compress", "bits-17") => z(tool, &["-b", "17", "a"], a, false, &text),
+        ("compress", "bits-cluster") => z(tool, &["-b12", "-c", "a"], a, false, &text),
+        ("compress", "version") => z(tool, &["-V"], &[], false, b""),
+        ("compress", "stdin") => z(tool, &[], &[], true, &text),
+        ("compress", "suffixed-operand") => z(tool, az, az, false, &text),
+        ("compress", "two-operands") => z(tool, &["a", "a.gz"], &["a", "a.gz"], false, &text),
+        ("compress", "no-saving") => z(tool, &["-v", "a"], a, false, &noise),
+        ("compress", "empty") => z(tool, a, a, false, b""),
+        ("compress", "bad-flag") => z(tool, &["-x"], &[], false, b""),
+        ("compress", "missing-bits") => z(tool, &["-b"], &[], false, b""),
+        ("compress", "decompress-flag") => z(tool, &["-d", "a.Z"], az, false, &stream),
+        ("compress", "keep") if nc => z(tool, &["-k", "a"], a, false, &text),
+        ("compress", "recursive") if nc => z(tool, &["-r", "a"], a, false, &text),
+        ("compress", "help") if nc => z(tool, &["-h"], &[], false, b""),
+        ("compress", "quiet-flags") if nc => z(tool, &["-s", "-n", "-F", "a"], a, false, &text),
+        ("compress", "bits-8") if nc => z(tool, &["-b8", "a"], a, false, &long),
+        ("compress", "bits-takes-flag") if nc => z(tool, &["-b", "-v", "a"], a, false, &text),
+        ("compress", "stdin-dash") if !nc => z(tool, &["-"], &[], true, &text),
+        ("compress", "cluster-force") if !nc => z(tool, &["-cf", "-b12", "a"], a, false, &text),
+        ("uncompress", "file") => z(tool, az, az, false, &stream),
+        ("uncompress", "stdout") => z(tool, &["-c", "a.Z"], az, false, &stream),
+        ("uncompress", "force-existing-output") => {
+            z(tool, &["-f", "a.Z"], &["a", "a.Z"], false, &stream)
+        }
+        ("uncompress", "verbose") => z(tool, &["-v", "a.Z"], az, false, &stream),
+        ("uncompress", "implied-suffix") => z(tool, a, az, false, &stream),
+        ("uncompress", "maxbits-9") => z(tool, az, az, false, &aaaa(0x89)),
+        ("uncompress", "maxbits-12") => z(tool, az, az, false, &aaaa(0x8c)),
+        ("uncompress", "truncated") => z(tool, az, az, false, &cut(&stream, stream.len() - 10)),
+        ("uncompress", "damaged") => z(tool, az, az, false, &damaged(&stream)),
+        ("uncompress", "not-compressed") => z(tool, az, az, false, &text),
+        ("uncompress", "too-many-bits") => z(tool, az, az, false, &aaaa(0x91)),
+        ("uncompress", "header-only") => z(tool, az, az, false, &[0x1f, 0x9d, 0x90]),
+        ("uncompress", "stdin-damaged") => z(tool, &[], &[], true, &damaged(&stream)),
+        ("uncompress", "two-files") => z(tool, &["a.Z", "b.Z"], &["a.Z", "b.Z"], false, &stream),
+        ("uncompress", "empty") => z(tool, az, az, false, b""),
+        ("uncompress", "keep") if nc => z(tool, &["-k", "a.Z"], az, false, &stream),
+        ("uncompress", "force-uppercase") if nc => {
+            z(tool, &["-F", "a.Z"], &["a", "a.Z"], false, &stream)
+        }
+        ("uncompress", "force-not-compressed") if nc => z(tool, &["-f", "a.Z"], az, false, &text),
+        _ => return Ok(None),
+    }))
+}
+
 /// The `compat` seed for `shape`.
 fn compat_seed(work: &Path, shape: &str) -> stuffr_core::Result<Vec<u8>> {
     if let Some(seed) = gzip_seed(work, shape)? {
@@ -2299,6 +2478,9 @@ fn compat_seed(work: &Path, shape: &str) -> stuffr_core::Result<Vec<u8>> {
         return Ok(seed);
     }
     if let Some(seed) = unzip_seed(work, shape)? {
+        return Ok(seed);
+    }
+    if let Some(seed) = compress_seed(work, shape)? {
         return Ok(seed);
     }
     let text = compat_text(4000);
@@ -4459,11 +4641,17 @@ fn every_compat_seed_decodes_fits_and_carries_its_shape() {
         );
         let gzip_family = matches!(case.name, "gzip" | "gunzip" | "zcat" | "gzcat");
         let unzip_family = matches!(case.name, "unzip" | "zipinfo" | "funzip");
+        let compress_family = matches!(case.name, "compress" | "uncompress");
         let flavour = match shape.split('-').nth(1) {
             Some("bsd") if gzip_family => 1,
             Some("gnu") if gzip_family => 0,
             Some("apple") if unzip_family => 1,
             Some("ubuntu") if unzip_family => 0,
+            // The compress family's byte is 0 for the platform's default
+            // personality and 1 for the other.
+            Some(p @ ("apple" | "ncompress")) if compress_family => {
+                u8::from((p == "apple") != COMPRESS_APPLE_DEFAULT)
+            }
             _ => {
                 assert!(!gzip_family && !unzip_family, "{shape} names no flavour");
                 0
@@ -4479,7 +4667,9 @@ fn every_compat_seed_decodes_fits_and_carries_its_shape() {
         }
         if !case.files.is_empty() || case.stdin {
             assert!(
-                !case.payload.is_empty() || shape.ends_with("-empty-file"),
+                !case.payload.is_empty()
+                    || shape.ends_with("-empty-file")
+                    || (compress_family && shape.ends_with("-empty")),
                 "{shape}"
             );
         }

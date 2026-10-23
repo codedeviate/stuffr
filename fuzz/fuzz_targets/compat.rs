@@ -119,10 +119,15 @@
 //!   symlinks it extracts, and puts no name in the real working directory
 //!   (`run_unzip`). Its tokens bring `a.zip` and `b.zip`, the seventeenth
 //!   and eighteenth `COMPAT_FILES` entries, on the third mask byte.
-//! - the compress family, for now (ruling D2 of 0.18.0), keeps only the
-//!   rules every family keeps: the 8 MiB output budget (`run_compress`),
-//!   containment and the untouched working directory. Its own oracle
-//!   (exit set, read bound, leftovers) is 0.18.0 Task 4's.
+//! - the compress family exits with its personality's codes (Apple 0, 1, 2;
+//!   ncompress also 4) and is held to `run_compress`'s oracle, whose doc
+//!   lists every rule: reads, leftovers and temporaries, no partial output
+//!   after a failure, a success that did something, a stderr line for every
+//!   failure, and no input lost (each file a compressing run wrote, and its
+//!   standard output, must be read back to the input by both decoders). Its
+//!   tokens bring `a.Z` and `b.Z`, the nineteenth and twentieth
+//!   `COMPAT_FILES` entries, on the third mask byte (bits 19 and 20), and
+//!   the `-b` forms.
 //!
 //! **Memory under the xz names (Ruling P7).** libFuzzer's RSS limit is the
 //! bound: 1 GiB in a daytime `make fuzz`, which passes `-rss_limit_mb=1024`
@@ -2103,14 +2108,199 @@ fn check_unzip_reads(
     }
 }
 
-/// The compress family (0.18.0), through `compat::run_in_counted`, as the
-/// flavour the name byte gives: `(byte / names) & 1`, 0 the platform's
-/// default (`compress::default_flavour`: Apple on macOS and the BSDs,
-/// ncompress elsewhere), 1 the other one. Ruling D2 of 0.18.0: only the
-/// checks every family gets for now, the output budget here and
-/// containment and the real working directory in `fuzz_target!`; Task 4
-/// writes the family's own oracle (exit set, reads, leftovers).
-fn run_compress(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]) {
+/// The compress family's exit codes: Apple's `compress.c` exits only with
+/// 0, 1 (`exit_val`, every warning) and 2 (`no saving`); ncompress adds 4,
+/// `compressed with N bits, can only handle 16 bits`. Stuffr's own 3-7
+/// must never appear.
+const COMPRESS_EXIT_APPLE: &[i32] = &[0, 1, 2];
+const COMPRESS_EXIT_NCOMPRESS: &[i32] = &[0, 1, 2, 4];
+
+/// What one compress-family command line does, as the personality's own
+/// option loop settles it (`apple/args.rs`, `ncompress/args.rs`): Apple's
+/// getopt `b:cdfv` (no permutation, the first non-option ends the options,
+/// `-` is standard input), ncompress's walk (flags anywhere, `--` ends
+/// them, `-` is nothing, `-b` takes the next token).
+#[derive(Debug, Default)]
+struct CompressShape<'a> {
+    /// The operands, `-` (Apple's standard input) included.
+    operands: Vec<&'a str>,
+    /// `uncompress`, or `-d`.
+    decompress: bool,
+    /// `-c`.
+    cat: bool,
+    /// `-r` or `-R` (ncompress only).
+    recursive: bool,
+    /// The run ends in the option loop (`-V`, `-h`, an unknown flag, `-b`
+    /// without a value, Apple's bad `-b` text): no operand is processed.
+    ends_in_options: bool,
+    /// Standard input is read: no operand, or Apple's `-`.
+    stdin: bool,
+}
+
+fn compress_shape<'a>(
+    flavour: compress::Flavour,
+    name: &str,
+    args: &[&'a str],
+) -> CompressShape<'a> {
+    let mut s = CompressShape {
+        decompress: name == "uncompress",
+        ..CompressShape::default()
+    };
+    match flavour {
+        compress::Flavour::Apple => {
+            let mut i = 0;
+            'options: while let Some(&a) = args.get(i) {
+                if !a.starts_with('-') || a == "-" {
+                    break;
+                }
+                i += 1;
+                if a == "--" {
+                    break;
+                }
+                for (k, c) in a.char_indices().skip(1) {
+                    match c {
+                        'b' => {
+                            if k + 1 == a.len() {
+                                if i >= args.len() {
+                                    s.ends_in_options = true;
+                                    break 'options;
+                                }
+                                i += 1;
+                            }
+                            continue 'options;
+                        }
+                        'c' => s.cat = true,
+                        'd' => s.decompress = true,
+                        'f' | 'v' => {}
+                        _ => {
+                            s.ends_in_options = true;
+                            break 'options;
+                        }
+                    }
+                }
+            }
+            if !s.ends_in_options {
+                s.operands = args[i.min(args.len())..].to_vec();
+                s.stdin = s.operands.is_empty() || s.operands.contains(&"-");
+                s.cat |= s.operands.contains(&"-");
+            }
+        }
+        compress::Flavour::Ncompress => {
+            let mut dashes = false;
+            let mut i = 0;
+            'walk: while let Some(&a) = args.get(i) {
+                if a == "--" {
+                    dashes = true;
+                } else if !dashes && a.starts_with('-') {
+                    for (k, c) in a.char_indices().skip(1) {
+                        match c {
+                            'b' => {
+                                if k + 1 == a.len() {
+                                    if i + 1 >= args.len() {
+                                        s.ends_in_options = true;
+                                        break 'walk;
+                                    }
+                                    i += 1;
+                                }
+                                break;
+                            }
+                            'd' => s.decompress = true,
+                            'c' => s.cat = true,
+                            'r' | 'R' => s.recursive = true,
+                            's' | 'q' | 'v' | 'k' | 'f' | 'F' | 'n' => {}
+                            _ => {
+                                s.ends_in_options = true;
+                                break 'walk;
+                            }
+                        }
+                    }
+                } else {
+                    s.operands.push(a);
+                }
+                i += 1;
+            }
+            if s.ends_in_options {
+                s.operands.clear();
+            } else {
+                s.stdin = s.operands.is_empty();
+            }
+        }
+    }
+    s
+}
+
+/// What `payload` decompresses to under `flavour`'s decoder: standard
+/// input to standard output, no file touched. `None` when the run fails.
+fn compress_decode(dir: &Path, flavour: compress::Flavour, payload: &[u8]) -> Option<Vec<u8>> {
+    let (code, out, _err, _) = compat::run_in_counted(
+        dir,
+        "uncompress",
+        Vec::new(),
+        payload,
+        Flavour::Gnu,
+        unzip::default_flavour(),
+        flavour,
+    )
+    .expect("uncompress is a compat name");
+    (code == 0).then_some(out)
+}
+
+/// `stream` is a `.Z` stream of exactly `plain`: both personalities'
+/// decoders read it back to it (every valid stream is read by both, ruling
+/// E1), whichever one wrote it.
+fn check_compress_stream(
+    dir: &Path,
+    what: &str,
+    name: &str,
+    args: &[&str],
+    stream: &[u8],
+    plain: &[u8],
+) {
+    for decoder in [compress::Flavour::Apple, compress::Flavour::Ncompress] {
+        let back = compress_decode(dir, decoder, stream);
+        assert!(
+            back.as_deref() == Some(plain),
+            "{name} {args:?}: {what} is not a stream of the input: the {decoder:?} decoder \
+             reads {:?} bytes back, the input has {}",
+            back.as_ref().map(Vec::len),
+            plain.len()
+        );
+    }
+}
+
+/// The compress family's oracle (0.18.0), after one run:
+///
+/// - the exit code is the personality's (`COMPRESS_EXIT_*`);
+/// - reads: per operand, a path the run opened is one the operand can name
+///   (the operand, or with `.Z` added when decompressing), opened at most
+///   once and read at most `len` bytes (`check_compress_reads`);
+/// - no `.stuffr-compress-*` temporary survives and no name outside
+///   `could_be_written` appears;
+/// - a failure (exit 1, 2 or 4) of a run with one file operand and no
+///   standard input leaves no new or changed file: Apple unlinks its
+///   output on every failure but a signal (which `Host::Sandbox` cannot
+///   deliver), and ncompress removes it as well (ruling E3 is the signals
+///   only), so a partial `.Z` or a half-decoded file is a defect;
+/// - a success (exit 0) of such a run, without `-c`, changed something:
+///   an output was written or the input consumed. Exempt: a run that ends
+///   in the options, and ncompress's `.Z` operand when compressing (`already
+///   has .Z suffix -- no change`, exit untouched) and `-r` (names skipped
+///   silently);
+/// - every exit 1 or 4 has a stderr line, bar ncompress's silent refusal of
+///   a name without `.Z` when decompressing;
+/// - the input is never lost (spec anti-goal; A2, A4 and N4 are where a
+///   reference does lose it): each operand file the run removed is matched
+///   by one new or changed file holding its data: a compressed output both
+///   decoders read back to the input, or, decompressing, the decoded
+///   bytes. The same holds for every compressed output of a compressing
+///   run, kept or not, and for standard output when one source feeds it;
+/// - standard output plus every new or changed file stays within the 8 MiB
+///   budget (`check_budget`).
+///
+/// Not detected: a partial output in a run with several operands or with
+/// standard input (which operand failed is not known from outside).
+#[allow(clippy::too_many_arguments)]
+fn run_compress(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8], payload: &[u8]) {
     let flavour = match (flavour, compress::default_flavour()) {
         (0, d) => d,
         (_, compress::Flavour::Apple) => compress::Flavour::Ncompress,
@@ -2118,7 +2308,7 @@ fn run_compress(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]
     };
     let before = contents(dir);
     let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
-    let (code, out, err, _) = compat::run_in_counted(
+    let (code, out, err, reads) = compat::run_in_counted(
         dir,
         name,
         os_args,
@@ -2128,13 +2318,173 @@ fn run_compress(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]
         flavour,
     )
     .expect("a COMPAT_NAMES entry is a compat name");
+    let why = String::from_utf8_lossy(&err).into_owned();
     if std::env::var_os("STUFFR_FUZZ_COMPAT_TRACE").is_some() {
-        eprintln!(
-            "compat: {name} ({flavour:?}) {args:?} -> {code}: {}",
-            String::from_utf8_lossy(&err)
+        eprintln!("compat: {name} ({flavour:?}) {args:?} -> {code}: {why}");
+        for (path, r) in &reads {
+            eprintln!("compat:   {path:?} {r:?}");
+        }
+    }
+    let ctx = format!("{name} ({flavour:?}) {args:?}");
+    let exits = match flavour {
+        compress::Flavour::Apple => COMPRESS_EXIT_APPLE,
+        compress::Flavour::Ncompress => COMPRESS_EXIT_NCOMPRESS,
+    };
+    assert!(
+        exits.contains(&code),
+        "{ctx}: exit {code} is not a {flavour:?} compress exit code\n{why}"
+    );
+    let shape = compress_shape(flavour, name, args);
+    check_compress_reads(dir, &ctx, &shape, &reads);
+    check_compress_leftovers(dir, &ctx);
+    check_budget(dir, name, args, &out, &before);
+
+    let after = contents(dir);
+    let fresh = |n: &OsString, bytes: &Vec<u8>| before.get(n) != Some(bytes);
+    let one_file = shape.operands.len() == 1 && !shape.stdin && !shape.ends_in_options;
+    if one_file && code != 0 {
+        for (n, bytes) in &after {
+            assert!(
+                !fresh(n, bytes),
+                "{ctx}: failed (exit {code}) and left {n:?} ({} bytes) new or changed\n{why}",
+                bytes.len()
+            );
+        }
+    }
+    if one_file && code == 0 && !shape.cat {
+        let skipped = flavour == compress::Flavour::Ncompress
+            && (shape.recursive || (!shape.decompress && shape.operands[0].ends_with(".Z")));
+        assert!(
+            skipped || after != before,
+            "{ctx}: exit 0 and nothing written, nothing removed\n{why}"
         );
     }
-    check_budget(dir, name, args, &out, &before);
+    if matches!(code, 1 | 4) {
+        // ncompress refuses a regular file without `.Z` silently when
+        // decompressing (`-v` says why).
+        let silent_ok = flavour == compress::Flavour::Ncompress && shape.decompress;
+        assert!(
+            !err.is_empty() || silent_ok,
+            "{ctx}: failed (exit {code}) with no stderr line"
+        );
+    }
+
+    // The input is never lost.
+    let mut removed: Vec<&OsString> = Vec::new();
+    for o in shape.operands.iter().filter(|o| **o != "-") {
+        let with_z = format!("{o}.Z");
+        let candidates = [
+            Some(*o),
+            (shape.decompress && !o.ends_with(".Z")).then_some(&*with_z),
+        ];
+        for c in candidates.into_iter().flatten() {
+            let key = OsString::from(c);
+            if let Some((k, _)) = before.get_key_value(&key)
+                && !after.contains_key(k)
+                && !removed.contains(&k)
+            {
+                removed.push(k);
+            }
+        }
+    }
+    if !removed.is_empty() {
+        let kept = if shape.decompress {
+            // The decoded bytes, in a new or changed file.
+            let decoded = compress_decode(dir, flavour, payload);
+            after
+                .iter()
+                .filter(|(n, b)| fresh(n, b) && decoded.as_ref() == Some(*b))
+                .count()
+        } else {
+            after
+                .iter()
+                .filter(|(n, b)| {
+                    fresh(n, b)
+                        && [compress::Flavour::Apple, compress::Flavour::Ncompress]
+                            .iter()
+                            .all(|d| compress_decode(dir, *d, b).as_deref() == Some(payload))
+                })
+                .count()
+        };
+        assert!(
+            kept >= removed.len(),
+            "{ctx}: removed {removed:?} but only {kept} new or changed file(s) hold the data\n{why}"
+        );
+    }
+    if !shape.decompress && !shape.ends_in_options {
+        // Every file a compressing run wrote is a stream of its input.
+        for (n, bytes) in after.iter().filter(|(n, b)| fresh(n, b)) {
+            check_compress_stream(dir, &format!("{n:?}"), name, args, bytes, payload);
+        }
+        // Standard output, when one source feeds it and the run finished.
+        if (shape.cat || shape.stdin)
+            && shape.operands.len() + usize::from(shape.operands.is_empty()) == 1
+            && matches!(code, 0 | 2)
+            && !out.is_empty()
+        {
+            let source = if shape.stdin { stdin } else { payload };
+            check_compress_stream(dir, "standard output", name, args, &out, source);
+        }
+    }
+}
+
+/// The compress family's read bound: every path a run opened is one an
+/// operand can name (the file name starts with the operand: the operand
+/// itself, or the operand plus `.Z`), at most one open and `len` bytes per
+/// operand that can name it (`len` the largest length the file had when
+/// opened): both personalities read an input once, straight through. Measured
+/// over the seeds and a long run of the target (the report of 0.18.0 Task 4
+/// has the figures); a looser bound would let a second pass over the input
+/// go unseen.
+fn check_compress_reads(
+    dir: &Path,
+    ctx: &str,
+    shape: &CompressShape,
+    reads: &BTreeMap<PathBuf, compat::InputReads>,
+) {
+    for (path, r) in reads {
+        let file = path
+            .strip_prefix(dir)
+            .ok()
+            .and_then(|p| p.to_str())
+            .unwrap_or_else(|| panic!("{ctx}: opened {path:?}, outside {dir:?}"));
+        let operands = shape
+            .operands
+            .iter()
+            .filter(|o| **o != "-" && file.starts_with(**o))
+            .count() as u64;
+        assert!(
+            r.opens <= operands,
+            "{ctx}: {} opens of {file:?}, which {operands} operand(s) can name",
+            r.opens
+        );
+        assert!(
+            r.bytes <= r.len * operands,
+            "{ctx}: read {} bytes of the {}-byte {file:?}, which {operands} operand(s) can name",
+            r.bytes,
+            r.len
+        );
+    }
+}
+
+/// No `.stuffr-compress-*` temporary (Apple's A2 output) survives a run, and
+/// every name in the run's directory is one `could_be_written` allows.
+fn check_compress_leftovers(dir: &Path, ctx: &str) {
+    let Ok(listing) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in listing.flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        assert!(
+            !n.starts_with(".stuffr-compress-"),
+            "{ctx}: left its temporary {n:?}"
+        );
+        assert!(
+            could_be_written(&n)
+                || (case_insensitive_fs() && !n.contains('/') && could_be_written_folded(&n)),
+            "{ctx}: left a stray {n:?}"
+        );
+    }
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -2175,7 +2525,14 @@ fuzz_target!(|data: &[u8]| {
         "unzip" | "zipinfo" | "funzip" => {
             run_unzip(&dir, case.name, case.flavour, &case.args, stdin)
         }
-        "compress" | "uncompress" => run_compress(&dir, case.name, case.flavour, &case.args, stdin),
+        "compress" | "uncompress" => run_compress(
+            &dir,
+            case.name,
+            case.flavour,
+            &case.args,
+            stdin,
+            case.payload,
+        ),
         other => unreachable!("{other} is in COMPAT_NAMES but has no arm here"),
     }
 
