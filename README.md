@@ -409,6 +409,19 @@ read list.
 > change. **3027** tests under `--all-features`, **2913** on the default
 > tier — measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
+> `0.17.1` is a PATCH of `stuffr bench` follow-ups. A progress bar now moves
+> within each row (blocks with a spinner, drawn only between timed 64 KiB
+> pieces and cut to the terminal's width). An input bench cannot read — an
+> unreadable file, a dangling symlink, an unreadable directory on a
+> pattern's way — is a usage error naming the path (exit 2, was 1). Each
+> codec keeps its compressed output in memory when its own worst case fits
+> the budget; a row whose output had to go to a temp file while timed is
+> marked `*` with a footnote, and JSON/CSV carry `output: memory|disk`. A
+> new `lzma-c` feature labels lzma's backend truthfully. The lz4 fuzz
+> oracle now holds quiet decodes to the loud re-run's failure count.
+> **3050** tests under `--all-features`, **2936** on the default tier —
+> measured from this bump's own `make check`, `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
