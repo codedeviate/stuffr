@@ -55,9 +55,7 @@ mod common {
             compare_output_bytes: true,
             expect_stdout_plain: None,
             setup: None,
-            // Never consulted: with `compare_output_bytes` every output is
-            // compared byte for byte and nothing is decoded.
-            roundtrip: Roundtrip::Bzip2,
+            roundtrip: Roundtrip::Exact,
             tz: None,
             unzip_flavour: None,
         }
@@ -1245,14 +1243,75 @@ mod interrupts {
                     let mut want = vec![input.to_string(), partial.to_string()];
                     want.sort();
                     assert_eq!(r.left, want, "{why}");
-                    let len = std::fs::metadata(dir.join(input)).unwrap().len();
-                    assert!(len > 0, "{why}: the input was emptied");
+                    // The input is intact: the bytes of the attempt that ran
+                    // (64 MiB, or the retry's 256).
+                    let got = std::fs::read(dir.join(input)).unwrap();
+                    assert!(
+                        [64, 256].iter().any(|&m| make(m) == got),
+                        "{why}: the input changed"
+                    );
                     assert!(r.stderr.is_empty(), "{why}: {:?}", r.stderr);
                     seen.push(r.left);
                 }
                 if seen.len() == 2 {
                     assert_eq!(seen[0], seen[1], "{name} signal {sig}");
                 }
+            }
+        }
+    }
+
+    /// Deviation A2 under a signal: `compress -f big` with `big.Z` a link to
+    /// `big` writes a temporary (`.stuffr-compress-*.tmp`); INT, TERM and
+    /// HUP remove it and kill the run, leaving the input and the link as
+    /// they were. stuffr only: Apple has already emptied `big` by then.
+    #[test]
+    fn a2_temporary_is_removed_on_a_signal() {
+        let _serial = interrupt_lock();
+        let data = big_input(64);
+        for (sig, hard) in [
+            (libc::SIGINT, true),
+            (libc::SIGTERM, true),
+            (libc::SIGHUP, true),
+            (libc::SIGINT, false),
+        ] {
+            let dir = ScratchDir::unique("compress-intr-a2");
+            std::fs::create_dir_all(&*dir).unwrap();
+            std::fs::write(dir.join("big"), &data).unwrap();
+            if hard {
+                std::fs::hard_link(dir.join("big"), dir.join("big.Z")).unwrap();
+            } else {
+                std::os::unix::fs::symlink("big", dir.join("big.Z")).unwrap();
+            }
+            let named = |n: &str| n.starts_with(".stuffr-compress-");
+            let ready = has_data(&dir, &named);
+            let why = format!("signal {sig}, hard link {hard}");
+            let r = interrupt_env(
+                &exe(true, "compress"),
+                "compress",
+                &["-f", "big"],
+                &dir,
+                ENV,
+                Inherit::Default,
+                sig,
+                &ready,
+            )
+            .unwrap_or_else(|| panic!("{why}: compress finished before the signal"));
+            assert!(killed_by(&r, sig), "{why}: {:?}", r.status);
+            assert_eq!(r.left, ["big", "big.Z"], "{why}: the temporary was left");
+            assert!(
+                std::fs::read(dir.join("big")).unwrap() == data,
+                "{why}: big changed"
+            );
+            if hard {
+                use std::os::unix::fs::MetadataExt;
+                let (a, b) = (
+                    std::fs::metadata(dir.join("big")).unwrap(),
+                    std::fs::metadata(dir.join("big.Z")).unwrap(),
+                );
+                assert_eq!((a.dev(), a.ino()), (b.dev(), b.ino()), "{why}");
+            } else {
+                let t = std::fs::read_link(dir.join("big.Z")).unwrap();
+                assert_eq!(t, Path::new("big"), "{why}");
             }
         }
     }

@@ -76,13 +76,25 @@
 //!   (`.stuffr-compress-*.tmp`, removed on INT, TERM or HUP) and renames it
 //!   over the link when complete, then removes the input as usual: the
 //!   data survives, compressed or decompressed, silently, exit 0 (spec
-//!   anti-goal: an input is never lost; ruling E4).
+//!   anti-goal: an input is never lost; ruling E4). After a `y` at the
+//!   prompt without `-f`, a compressed output not smaller than its input is
+//!   still "no saving", exit 2 (with its `-v` line): stuffr drops its
+//!   temporary and leaves the `f.Z` link and `f` as they were, where Apple
+//!   unlinks `f.Z` after it has already emptied `f`.
 //! - **A3.** A header and nothing else (`1f 9d 90`, what ncompress writes
 //!   for an empty input) is a valid stream of no bytes: stuffr writes the
 //!   empty output (exit 0, the input removed as after any success). Apple
 //!   refuses it with whatever `errno` was left (`No such file or directory`
 //!   from the output's `stat`, `Undefined error: 0` with `-c` or standard
 //!   input), exit 1.
+//! - **A4.** A read error part-way through a `.Z` input (`EIO`, say):
+//!   Apple's `getcode` takes it for the end of the stream, so the cut-short
+//!   output is published and the input removed, exit 0, and the data is
+//!   lost. stuffr warns as Apple warns for a failed read
+//!   (`uncompress: NAME: <strerror>`), exit 1, removes the output (standard
+//!   output keeps what was written) and keeps the input (ruling E7). A read
+//!   error inside the 3-byte header stays Apple's `Inappropriate file type
+//!   or format`.
 //! - The overwrite question's answer is judged by the C locale's
 //!   `rpmatch` (`y` or `Y`), whatever `LC_MESSAGES` says; Apple loads the
 //!   user's locale first.
@@ -132,11 +144,26 @@ mod tests {
     use crate::compat::compress::{Flavour, run_in_counted};
     use std::ffi::OsString;
 
-    fn scratch(tag: &str) -> std::path::PathBuf {
+    /// A scratch directory removed when dropped, a panicking test's unwind
+    /// included.
+    struct Scratch(std::path::PathBuf);
+    impl std::ops::Deref for Scratch {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(tag: &str) -> Scratch {
         let d = std::env::temp_dir().join(format!("stuffr-compress-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        d
+        Scratch(d)
     }
 
     fn run(
@@ -173,7 +200,6 @@ mod tests {
         assert_eq!(code, 0, "{err}");
         assert_eq!(std::fs::read(d.join("f")).unwrap(), data);
         assert!(!d.join("f.Z").exists());
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// A write that fails part-way (the sandbox's budget, as a full disk)
@@ -205,7 +231,32 @@ mod tests {
             (1, "compress: /dev/stdout: No space left on device\n")
         );
         assert!(!out.is_empty());
-        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The same when decompressing: 9 MiB of zeros decode past the
+    /// sandbox's 8 MiB budget, so the write fails part-way: `NAME: No space
+    /// left on device`, exit 1, the partial output removed and the `.Z`
+    /// kept; to standard output, what was written stays.
+    #[test]
+    fn a_failed_decompressing_write_keeps_the_input() {
+        let d = scratch("full-d");
+        let (code, z, err) = run(&d, "compress", &[], &vec![0u8; 9 << 20]);
+        assert_eq!(code, 0, "{err}");
+        std::fs::write(d.join("z.Z"), &z).unwrap();
+        let (code, _, err) = run(&d, "uncompress", &["z.Z"], b"");
+        assert_eq!(
+            (code, err.as_str()),
+            (1, "uncompress: z: No space left on device\n")
+        );
+        assert_eq!(std::fs::read(d.join("z.Z")).unwrap(), z);
+        assert!(!d.join("z").exists());
+        let (code, out, err) = run(&d, "uncompress", &["-c", "z.Z"], b"");
+        assert_eq!(
+            (code, err.as_str()),
+            (1, "uncompress: /dev/stdout: No space left on device\n")
+        );
+        assert!(!out.is_empty() && out.iter().all(|&b| b == 0));
+        assert_eq!(std::fs::read_dir(&*d).unwrap().count(), 1);
     }
 
     /// Deviation A2 in the sandbox: a hard link `f.Z` to `f` and `-f`.
@@ -226,9 +277,8 @@ mod tests {
         assert_eq!((code, err.as_str()), (0, ""));
         assert_eq!(std::fs::read(d.join("f")).unwrap(), data);
         assert!(!d.join("f.Z").exists());
-        let left = std::fs::read_dir(&d).unwrap().count();
+        let left = std::fs::read_dir(&*d).unwrap().count();
         assert_eq!(left, 1, "a temporary was left");
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// Hostile streams never panic (overflow checks on, as the fuzz target
@@ -268,6 +318,5 @@ mod tests {
             let (code, _, _) = run(&d, "uncompress", &["-c"], &b);
             assert!(matches!(code, 0 | 1), "round {round}: exit {code}");
         }
-        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -19,10 +19,12 @@
 //! in groups of `n_bits` bytes, a short last group rounded down to whole
 //! codes and still yielding one from whatever its buffer held before; a
 //! code past the next free entry is `EINVAL`, a bad magic `EFTYPE`, and a
-//! read error ends the input like its end. Two changes, both deviations of
-//! `apple/mod.rs`: the header's maxbits may be anything up to 16 (Apple
-//! refuses below 12: A1, with ruling E1 widening it to every maxbits
-//! ncompress's decoder accepts), and a table chain longer than the stack
+//! read error ends the input like its end. Three changes, all deviations
+//! of `apple/mod.rs`: a read error is kept (`Decoder::read_error`) so the
+//! caller fails instead of finishing (A4); the header's maxbits may be
+//! anything up to 16 (Apple refuses below 12: A1, with ruling E1 widening
+//! it to every maxbits ncompress's decoder accepts); and a table chain
+//! longer than the stack
 //! (only reachable through the unchecked first code; C overflows its
 //! stack there) is `EINVAL`.
 //!
@@ -339,18 +341,24 @@ pub(super) struct Decoder<R: Read> {
     gbuf: [u8; BITS as usize + 1],
     /// The stream held its header and nothing else.
     empty: bool,
+    /// The first read error, which ended the input (A4).
+    read_error: Option<io::Error>,
 }
 
 /// `fread(buf, 1, n, fp)`: as many bytes as there are, up to `buf.len()`;
-/// an error ends it like the end of the input.
-fn fread(fp: &mut dyn Read, buf: &mut [u8]) -> usize {
+/// an error ends it like the end of the input, and the first one is kept in
+/// `error` (Apple forgets it: deviation A4).
+fn fread(fp: &mut dyn Read, buf: &mut [u8], error: &mut Option<io::Error>) -> usize {
     let mut got = 0;
     while got < buf.len() {
         match fp.read(&mut buf[got..]) {
             Ok(0) => break,
             Ok(n) => got += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => break,
+            Err(e) => {
+                error.get_or_insert(e);
+                break;
+            }
         }
     }
     got
@@ -379,6 +387,7 @@ impl<R: Read> Decoder<R> {
             size: 0,
             gbuf: [0; BITS as usize + 1],
             empty: false,
+            read_error: None,
         }
     }
 
@@ -386,6 +395,12 @@ impl<R: Read> Decoder<R> {
     /// call returned 0 without an error (deviation A3's case).
     pub(super) fn was_empty(&self) -> bool {
         self.empty
+    }
+
+    /// The first read error the input gave, which `getcode` took for its
+    /// end (deviation A4: the caller fails instead of finishing).
+    pub(super) fn read_error(&self) -> Option<&io::Error> {
+        self.read_error.as_ref()
     }
 
     /// `zread`: up to `out.len()` bytes, 0 at the end. A failing call's
@@ -486,7 +501,7 @@ impl<R: Read> Decoder<R> {
     /// `zread`'s `S_START` part: the magic, the bit count, the table.
     fn start(&mut self) -> Result<(), ZFail> {
         let mut header = [0u8; 3];
-        if fread(&mut self.fp, &mut header) != 3 || header[..2] != MAGIC {
+        if fread(&mut self.fp, &mut header, &mut self.read_error) != 3 || header[..2] != MAGIC {
             return Err(ZFail::Format);
         }
         self.block_compress = header[2] & BLOCK_MASK != 0;
@@ -524,7 +539,12 @@ impl<R: Read> Decoder<R> {
                 self.clear_flg = false;
             }
             let n = self.n_bits as usize;
-            let got = fread(&mut self.fp, &mut self.gbuf[..n]);
+            // Once the input has failed it is at its end: no later read.
+            let got = if self.read_error.is_some() {
+                0
+            } else {
+                fread(&mut self.fp, &mut self.gbuf[..n], &mut self.read_error)
+            };
             if got == 0 {
                 return -1;
             }
@@ -614,6 +634,56 @@ mod tests {
         assert!(encode(b"", 16).is_empty());
         assert!(bits_in_range(0) && bits_in_range(16));
         assert!(!bits_in_range(-1) && !bits_in_range(17));
+    }
+
+    /// A `Read` that gives `n` bytes of `data`, then fails with `EIO`.
+    struct FailsAfter<'a> {
+        data: &'a [u8],
+        n: usize,
+    }
+
+    impl Read for FailsAfter<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.n == 0 {
+                return Err(io::Error::other("injected read error"));
+            }
+            let k = buf.len().min(self.n).min(self.data.len());
+            buf[..k].copy_from_slice(&self.data[..k]);
+            self.data = &self.data[k..];
+            self.n -= k;
+            if k == 0 {
+                return Ok(0);
+            }
+            Ok(k)
+        }
+    }
+
+    /// Deviation A4: a read error part-way is the end of the input to
+    /// `getcode`, as in Apple's, but it is kept for the caller, which then
+    /// fails instead of publishing a cut-short output.
+    #[test]
+    fn a_read_error_is_kept_not_taken_for_the_end() {
+        let data = sample(100_000);
+        let z = encode(&data, 16);
+        let mut d = Decoder::new(FailsAfter {
+            data: &z,
+            n: z.len() / 2,
+        });
+        let mut out = Vec::new();
+        loop {
+            let mut buf = [0u8; 1024];
+            match d.zread(&mut buf).unwrap() {
+                0 => break,
+                n => out.extend_from_slice(&buf[..n]),
+            }
+        }
+        assert!(out.len() < data.len() && data.starts_with(&out));
+        let e = d.read_error().expect("the read error is kept");
+        assert_eq!(e.to_string(), "injected read error");
+        // A clean end leaves none.
+        let mut d = Decoder::new(&z[..]);
+        while d.zread(&mut [0u8; 1024]).unwrap() > 0 {}
+        assert!(d.read_error().is_none());
     }
 
     /// Hand-checked: `A` alone is the header and one 9-bit code; `AAAA`

@@ -584,7 +584,7 @@ impl Run<'_, '_> {
             self.discard(&target, false);
             return;
         }
-        let failed = loop {
+        let mut failed = loop {
             match dec.zread(&mut buf) {
                 Ok(0) => break false,
                 Ok(n) => {
@@ -599,6 +599,15 @@ impl Run<'_, '_> {
                 }
             }
         };
+        // Deviation A4: a read error ended the input early. Apple's stdio
+        // takes it for the end of the stream, publishes the cut-short
+        // output and removes the input; stuffr warns as Apple warns for a
+        // failed read (`ferror(ifp)`: `cwarn(in)`) and keeps the input.
+        if !failed && let Some(e) = dec.read_error() {
+            let text = host::strerror(e);
+            self.cwarn("%s", &[in_shown], &text);
+            failed = true;
+        }
         drop(dec);
         let flushed = if failed {
             // `fclose(ofp)` on the way out flushes what was written.
@@ -717,5 +726,58 @@ fn zfail_text(f: ZFail) -> &'static [u8] {
     match f {
         ZFail::Format => m::EFTYPE_TEXT.as_bytes(),
         ZFail::Code => EINVAL_TEXT,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Records every `write` the inner writer gets.
+    #[derive(Default)]
+    struct Writes(Vec<Vec<u8>>);
+
+    impl Write for Writes {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// stdio's line buffering: one `write` per line as its newline
+    /// arrives, a stretch without one cut at the buffer's size, and a
+    /// partial line held for the next call (or a flush).
+    #[test]
+    fn line_buffering_writes_a_line_at_a_time() {
+        let mut lb = LineBuffered {
+            inner: Writes::default(),
+            buf: Vec::new(),
+            cap: 8,
+        };
+        lb.write_all(b"ab\ncd\nefghijklmnop").unwrap();
+        lb.write_all(b"qr\n").unwrap();
+        lb.write_all(b"xyz").unwrap();
+        assert_eq!(
+            lb.inner.0,
+            [&b"ab\n"[..], b"cd\n", b"efghijkl"]
+                .iter()
+                .map(|w| w.to_vec())
+                .chain([b"mnopqr\n".to_vec()])
+                .collect::<Vec<_>>()
+        );
+        lb.flush().unwrap();
+        assert_eq!(lb.inner.0.last().unwrap(), b"xyz");
+        assert_eq!(lb.inner.0.len(), 5);
+        // A line of exactly the buffer's size goes out once, not twice.
+        let mut lb = LineBuffered {
+            inner: Writes::default(),
+            buf: Vec::new(),
+            cap: 4,
+        };
+        lb.write_all(b"abc\n").unwrap();
+        assert_eq!(lb.inner.0, [b"abc\n".to_vec()]);
     }
 }

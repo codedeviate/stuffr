@@ -330,9 +330,17 @@ mod tests {
     /// flavour it is given, and counts the inputs it opens.
     #[test]
     fn run_in_counted_reaches_the_compress_family() {
+        /// Removes the directory when dropped, a panic's unwind included.
+        struct Guard(std::path::PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
         let dir = std::env::temp_dir().join(format!("stuffr-run-in-z-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        let _guard = Guard(dir.clone());
         std::fs::write(dir.join("a"), b"hello hello hello hello\n").unwrap();
         for c in [compress::Flavour::Apple, compress::Flavour::Ncompress] {
             let (code, _, err, _) =
@@ -357,7 +365,6 @@ mod tests {
             assert!(out.starts_with(&[0x1f, 0x9d, 0x90]), "{c:?}");
             assert_eq!(reads[&dir.join("a")].opens, 1, "{c:?}");
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The `compat` fuzz target picks its tool from `COMPAT_NAMES`; a name

@@ -870,6 +870,12 @@ pub enum Roundtrip {
     /// dictionary (see `lz4_decode_args`). The kind of stream (the magic) is
     /// compared, not the frame's own header.
     Lz4 { ref_lz4: &'static str },
+    /// Nothing is decoded: the case promises its compressed bytes identical
+    /// to the reference's everywhere (the compress family's suites, whose
+    /// streams no single reference decoder reads at every bit count), so
+    /// every output is compared byte for byte. Asking to decode is a test
+    /// bug and panics.
+    Exact,
 }
 
 pub struct Case<'a> {
@@ -1793,6 +1799,7 @@ fn ref_decompress_args(rt: &Roundtrip, extra: &[String], data: &[u8]) -> Result<
         Roundtrip::Xz { ref_xz } => (PathBuf::from(ref_xz), "xz"),
         Roundtrip::Zstd { ref_zstd } => (PathBuf::from(ref_zstd), "zstd"),
         Roundtrip::Lz4 { ref_lz4 } => (PathBuf::from(ref_lz4), "lz4"),
+        Roundtrip::Exact => panic!("Roundtrip::Exact decodes nothing; its bytes are compared"),
     };
     let mut child = spawn(
         Command::new(exe)
@@ -1826,6 +1833,7 @@ fn has_magic(rt: &Roundtrip, b: &[u8]) -> bool {
         Roundtrip::Xz { .. } => b.starts_with(&XZ_MAGIC),
         Roundtrip::Zstd { .. } => zstd_stream_kind(b).is_some(),
         Roundtrip::Lz4 { .. } => lz4_stream_kind(b).is_some(),
+        Roundtrip::Exact => false,
     }
 }
 
@@ -2033,6 +2041,7 @@ fn is_compressed_name(c: &Case, n: &str) -> bool {
                 || zstd_suffix(&c.args).is_some_and(|s| !s.is_empty() && n.ends_with(s))
         }
         Roundtrip::Lz4 { .. } => n.ends_with(".lz4"),
+        Roundtrip::Exact => false,
     }
 }
 
@@ -2135,6 +2144,7 @@ fn original_for(c: &Case, name: &str) -> Option<Vec<u8>> {
         // An explicit output name (`lz4 a x.lz4`) may carry no `.lz4`; the
         // case's one file is then its original (below).
         Roundtrip::Lz4 { .. } => name.strip_suffix(".lz4").unwrap_or_default().to_owned(),
+        Roundtrip::Exact => return None,
     };
     let found = c.files.iter().find(|(n, _)| *n == base);
     if found.is_none() && matches!(c.roundtrip, Roundtrip::Lz4 { .. }) {
@@ -2244,6 +2254,7 @@ fn tool_name(rt: &Roundtrip) -> &'static str {
         Roundtrip::Xz { .. } => "xz",
         Roundtrip::Zstd { .. } => "zstd",
         Roundtrip::Lz4 { .. } => "lz4",
+        Roundtrip::Exact => "nothing",
     }
 }
 
@@ -2257,6 +2268,7 @@ fn stream_mismatch(rt: &Roundtrip, reference: &[u8], ours: &[u8]) -> Option<Stri
         Roundtrip::Xz { .. } => xz_header_mismatch(reference, ours),
         Roundtrip::Zstd { .. } => zstd_kind_mismatch(reference, ours),
         Roundtrip::Lz4 { .. } => lz4_kind_mismatch(reference, ours),
+        Roundtrip::Exact => None,
     }
 }
 
