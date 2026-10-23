@@ -2452,6 +2452,10 @@ pub fn decoder_peak_rss(
     assert!(st.success(), "{st:?}: {err}");
     assert_eq!(err, "");
     assert!(same, "decoded output differs");
+    // A decoder run of tens of MiB lasts far longer than one sampling
+    // interval, so a miss here is a harness defect, not a fast run.
+    #[cfg(target_os = "linux")]
+    assert!(peak > 0, "{NEVER_SAMPLED}");
     peak
 }
 
@@ -2460,6 +2464,23 @@ pub fn decoder_peak_rss(
 /// wait status, standard output, standard error and peak memory in bytes,
 /// measured as [`decoder_peak_rss`] describes. For a run expected to fail
 /// (0.14.0's `window_limit_refuses_before_allocating`).
+///
+/// **Linux, a run too short to sample.** Sampling cannot see a run that
+/// ends before its first post-exec sample (CI run 39942816975: the child
+/// was sampled once before its exec, then stuffr refused a hostile header
+/// and exited inside one 5 ms sleep). The sampler now spins, without
+/// sleeping, until `/proc/<pid>/exe` is stuffr, which closes the exec
+/// race, but a run that exits right after the exec can still go unseen.
+/// Such a run is repeated, up to [`MAX_ATTEMPTS`] times, until one attempt
+/// is sampled while it is stuffr; the attempt that was measured is the one
+/// returned, whole (status, output, standard error, peak), so what is
+/// asserted about the peak is always about the run that produced the other
+/// values. Retrying is sound because each attempt is a complete, fresh,
+/// independent run of the same command in its own scratch directory, and a
+/// miss only ever means "no sample", never a lower peak. If every attempt
+/// misses, this panics: the bound was not measured. A caller that needs no
+/// peak, or one that must bound a run too short for any sampler, uses
+/// `data_limited_run` instead (a cap, deterministic).
 pub fn peak_rss_run(
     name: &str,
     args: &[&str],
@@ -2467,12 +2488,25 @@ pub fn peak_rss_run(
     input: &[u8],
     env: &[(&str, &str)],
 ) -> (std::process::ExitStatus, Vec<u8>, String, u64) {
-    peak_rss_run_into(name, args, file, input, env, |mut out| {
-        let mut v = Vec::new();
-        out.read_to_end(&mut v).unwrap();
-        v
-    })
+    const MAX_ATTEMPTS: usize = 20;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let run = peak_rss_run_into(name, args, file, input, env, |mut out| {
+            let mut v = Vec::new();
+            out.read_to_end(&mut v).unwrap();
+            v
+        });
+        // Off Linux the peak is `ru_maxrss`, which every run has.
+        if cfg!(target_os = "linux") && run.3 == 0 {
+            eprintln!("attempt {attempt}/{MAX_ATTEMPTS}: exited before it was sampled as stuffr");
+        } else {
+            return run;
+        }
+    }
+    panic!("{NEVER_SAMPLED} (in {MAX_ATTEMPTS} attempts)");
 }
+
+/// The message of a run no sample of which was taken while it was stuffr.
+const NEVER_SAMPLED: &str = "RssAnon was never sampled while the process was stuffr";
 
 /// [`peak_rss_run`], with standard output handed to `sink` (on its own
 /// thread, while the run lasts) instead of collected.
@@ -2627,7 +2661,15 @@ pub fn wait_with_maxrss(child: std::process::Child) -> (std::process::ExitStatus
 }
 
 /// The sampling loop of [`decoder_peak_rss`] on Linux: until `child`
-/// exits, the largest `RssAnon` seen while it is stuffr.
+/// exits, the largest `RssAnon` seen while it is stuffr. Returns 0 if the
+/// child exited without a single sample taken while it was stuffr; callers
+/// decide what that means ([`peak_rss_run`] repeats the run).
+///
+/// Between the fork and the exec `/proc/<pid>` describes the spawning test
+/// process, so those samples are not counted, and no 5 ms sleep is taken
+/// while the child is not yet stuffr: the loop yields and looks again, so
+/// the first post-exec sample follows the exec by microseconds, not by up
+/// to one sleep (this is what CI run 39942816975 lost).
 #[cfg(target_os = "linux")]
 fn linux_rss_anon_peak(child: &mut std::process::Child) -> u64 {
     let status = format!("/proc/{}/status", child.id());
@@ -2664,15 +2706,18 @@ fn linux_rss_anon_peak(child: &mut std::process::Child) -> u64 {
                     .join("; ");
             }
         }
-        std::thread::sleep(Duration::from_millis(5));
+        if is_stuffr || peak > 0 {
+            std::thread::sleep(Duration::from_millis(5));
+        } else {
+            // Not exec'd yet (or already gone): look again at once.
+            std::thread::yield_now();
+        }
     }
     eprintln!("RssAnon timeline: {}", timeline.join(" "));
-    assert!(
-        peak > 0,
-        "RssAnon was never sampled while the process was stuffr"
-    );
-    eprintln!("/proc status at the peak: {at_peak}");
-    eprintln!("peak RssAnon: {:.1} MiB", peak as f64 / 1048576.0);
+    if peak > 0 {
+        eprintln!("/proc status at the peak: {at_peak}");
+        eprintln!("peak RssAnon: {:.1} MiB", peak as f64 / 1048576.0);
+    }
     peak
 }
 

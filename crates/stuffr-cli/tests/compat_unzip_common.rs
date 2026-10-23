@@ -2719,8 +2719,25 @@ mod unix {
         assert!(over.len() < 200_000, "{} bytes", over.len());
         let env = [("LC_ALL", "C")];
         let args = ["unpack", "bomb.zip", "-C", "out"];
-        let (st, _, err, _) = peak_rss_run("stuffr", &args, "bomb.zip", &over, &env);
-        assert_eq!(st.code(), Some(6), "{err}");
+        // The refusal is over within a millisecond or two, too soon for the
+        // `RssAnon` sampler to be sure to see it (CI run 39942816975), and
+        // this test never read the peak. On Linux the bound is a cap
+        // instead, deterministic: under 64 MiB of data segment stuffr still
+        // answers "ceiling" (exit 6), so it refused before reserving or
+        // decoding anything near the 256 MiB it was told. Elsewhere the
+        // exit code and message are all there is to check.
+        #[cfg(target_os = "linux")]
+        let (code, err) = {
+            let (code, _, err) =
+                data_limited_run("stuffr", &args, "bomb.zip", &over, &env, Some(64 << 20));
+            (code, err)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (code, err) = {
+            let (st, _, err, _) = peak_rss_run("stuffr", &args, "bomb.zip", &over, &env);
+            (st.code(), err)
+        };
+        assert_eq!(code, Some(6), "{err}");
         assert!(err.contains("ceiling"), "{err}");
 
         let n: u64 = (40 << 20) + 12345;
