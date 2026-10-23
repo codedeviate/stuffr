@@ -1455,23 +1455,33 @@ mod interrupts {
             return;
         }
         for mine in [false, true] {
-            let dir = ScratchDir::unique("ncompress-intr-c");
-            std::fs::create_dir_all(&*dir).unwrap();
-            std::fs::write(dir.join("big"), big_input(64)).unwrap();
             let (exe, arg0) = exe(mine, "compress");
-            // Ready once compressed bytes arrive: both programs install
-            // their handlers before writing any.
-            let Some(r) = interrupt_once_stdout_has_data(
-                &exe,
-                &arg0,
-                &["-c", "big"],
-                &dir,
-                ENV,
-                Inherit::Default,
-                libc::SIGTERM,
-            ) else {
-                panic!("mine={mine}: compress -c finished before the signal");
-            };
+            // A run that finished before the signal (no result, or exit 0
+            // after "ready") is a miss: retry with a larger input.
+            let mut hit = None;
+            for mib in [64, 256] {
+                let dir = ScratchDir::unique("ncompress-intr-c");
+                std::fs::create_dir_all(&*dir).unwrap();
+                std::fs::write(dir.join("big"), big_input(mib)).unwrap();
+                // Ready once compressed bytes arrive: both programs install
+                // their handlers before writing any.
+                let r = interrupt_once_stdout_has_data(
+                    &exe,
+                    &arg0,
+                    &["-c", "big"],
+                    &dir,
+                    ENV,
+                    Inherit::Default,
+                    libc::SIGTERM,
+                );
+                if let Some(r) = r.filter(|r| !r.status.success()) {
+                    hit = Some(r);
+                    break;
+                }
+            }
+            let r = hit.unwrap_or_else(|| {
+                panic!("mine={mine}: compress -c finished before the signal at 64 and 256 MiB")
+            });
             assert_eq!(r.status.code(), Some(1), "mine={mine}: {:?}", r.status);
             assert_eq!(r.left, ["big"], "mine={mine}");
         }
@@ -1485,25 +1495,34 @@ mod interrupts {
             return;
         }
         let block = text(4 << 20, 0x0018_0020);
-        let big: Vec<u8> = block.iter().copied().cycle().take(32 << 20).collect();
         for mine in [false, true] {
-            let dir = ScratchDir::unique("ncompress-intr-ign");
-            std::fs::create_dir_all(&*dir).unwrap();
-            std::fs::write(dir.join("big"), &big).unwrap();
-            let ready = has_data(&dir, &|n: &str| n == "big.Z");
             let (exe, arg0) = exe(mine, "compress");
-            let Some(r) = interrupt_env(
-                &exe,
-                &arg0,
-                &["big"],
-                &dir,
-                ENV,
-                Inherit::IgnoreInt,
-                libc::SIGINT,
-                &ready,
-            ) else {
-                panic!("mine={mine}: compress finished before the signal");
-            };
+            // A run that ends before the signal lands is a miss: retry with
+            // a larger input, fail only when every size misses.
+            let mut hit = None;
+            for mib in [64, 256] {
+                let big: Vec<u8> = block.iter().copied().cycle().take(mib << 20).collect();
+                let dir = ScratchDir::unique("ncompress-intr-ign");
+                std::fs::create_dir_all(&*dir).unwrap();
+                std::fs::write(dir.join("big"), &big).unwrap();
+                let ready = has_data(&dir, &|n: &str| n == "big.Z");
+                if let Some(r) = interrupt_env(
+                    &exe,
+                    &arg0,
+                    &["big"],
+                    &dir,
+                    ENV,
+                    Inherit::IgnoreInt,
+                    libc::SIGINT,
+                    &ready,
+                ) {
+                    hit = Some(r);
+                    break;
+                }
+            }
+            let r = hit.unwrap_or_else(|| {
+                panic!("mine={mine}: compress finished before the signal at 64 and 256 MiB")
+            });
             assert!(r.status.success(), "mine={mine}: {:?}", r.status);
             assert_eq!(r.left, ["big.Z"], "mine={mine}");
         }

@@ -131,8 +131,8 @@ mod common {
         pub bz: Vec<u8>,
     }
 
-    /// [`Fx`] (built once for the run), or `None` (after `require_reference`'s note) without the
-    /// reference.
+    /// [`Fx`] (built once for the run), or `None` (after
+    /// `require_reference`'s note) without the reference.
     pub fn fixtures() -> Option<&'static Fx> {
         static FX: std::sync::OnceLock<Option<Fx>> = std::sync::OnceLock::new();
         FX.get_or_init(build_fixtures).as_ref()
@@ -146,9 +146,9 @@ mod common {
         let a = text(30_000, 0x0018_0002);
         let b = text(30_000, 0x0018_0003);
         let r = random(4096, 0x0018_0004);
-        let fz = apple(&["-c"], &f);
-        let az = apple(&["-c"], &a);
-        let bz = apple(&["-c"], &b);
+        let fz = apple(&[], &f);
+        let az = apple(&[], &a);
+        let bz = apple(&[], &b);
         assert!(
             fz.starts_with(&[0x1f, 0x9d, 0x90]),
             "Apple's .Z of f: {} bytes, starts {:02x?}",
@@ -497,7 +497,7 @@ mod differential {
             case(
                 "uncompress",
                 &["-v", "r.Z"],
-                vec![("r.Z", apple(&["-c"], &x.r))],
+                vec![("r.Z", apple(&[], &x.r))],
             ),
         ];
         group("no saving", &cases);
@@ -1288,35 +1288,48 @@ mod interrupts {
     #[test]
     fn a2_temporary_is_removed_on_a_signal() {
         let _serial = interrupt_lock();
-        let data = big_input(64);
         for (sig, hard) in [
             (libc::SIGINT, true),
             (libc::SIGTERM, true),
             (libc::SIGHUP, true),
             (libc::SIGINT, false),
         ] {
-            let dir = ScratchDir::unique("compress-intr-a2");
-            std::fs::create_dir_all(&*dir).unwrap();
-            std::fs::write(dir.join("big"), &data).unwrap();
-            if hard {
-                std::fs::hard_link(dir.join("big"), dir.join("big.Z")).unwrap();
-            } else {
-                std::os::unix::fs::symlink("big", dir.join("big.Z")).unwrap();
-            }
-            let named = |n: &str| n.starts_with(".stuffr-compress-");
-            let ready = has_data(&dir, &named);
             let why = format!("signal {sig}, hard link {hard}");
-            let r = interrupt_env(
-                &exe(true, "compress"),
-                "compress",
-                &["-f", "big"],
-                &dir,
-                ENV,
-                Inherit::Default,
-                sig,
-                &ready,
-            )
-            .unwrap_or_else(|| panic!("{why}: compress finished before the signal"));
+            // A run that ends before the signal can land is a miss: retry
+            // with a larger input, fail only when every size misses.
+            let mut hit = None;
+            for mib in [64, 256] {
+                let data = big_input(mib);
+                let dir = ScratchDir::unique("compress-intr-a2");
+                std::fs::create_dir_all(&*dir).unwrap();
+                std::fs::write(dir.join("big"), &data).unwrap();
+                if hard {
+                    std::fs::hard_link(dir.join("big"), dir.join("big.Z")).unwrap();
+                } else {
+                    std::os::unix::fs::symlink("big", dir.join("big.Z")).unwrap();
+                }
+                let r = {
+                    let named = |n: &str| n.starts_with(".stuffr-compress-");
+                    let ready = has_data(&dir, &named);
+                    interrupt_env(
+                        &exe(true, "compress"),
+                        "compress",
+                        &["-f", "big"],
+                        &dir,
+                        ENV,
+                        Inherit::Default,
+                        sig,
+                        &ready,
+                    )
+                };
+                if let Some(r) = r {
+                    hit = Some((r, data, dir));
+                    break;
+                }
+            }
+            let (r, data, dir) = hit.unwrap_or_else(|| {
+                panic!("{why}: compress finished before the signal at 64 and 256 MiB")
+            });
             assert!(killed_by(&r, sig), "{why}: {:?}", r.status);
             assert_eq!(r.left, ["big", "big.Z"], "{why}: the temporary was left");
             assert!(
@@ -1345,21 +1358,31 @@ mod interrupts {
             return;
         }
         for mine in [false, true] {
-            let dir = ScratchDir::unique("compress-intr-c");
-            std::fs::create_dir_all(&*dir).unwrap();
-            std::fs::write(dir.join("big"), big_input(64)).unwrap();
-            // Ready once compressed bytes arrive: the run is under way.
-            let Some(r) = interrupt_once_stdout_has_data(
-                &exe(mine, "compress"),
-                "compress",
-                &["-c", "big"],
-                &dir,
-                ENV,
-                Inherit::Default,
-                libc::SIGTERM,
-            ) else {
-                panic!("mine={mine}: compress -c finished before the signal");
-            };
+            // A run that finished before the signal (no result, or exit 0
+            // after "ready") is a miss: retry with a larger input.
+            let mut hit = None;
+            for mib in [64, 256] {
+                let dir = ScratchDir::unique("compress-intr-c");
+                std::fs::create_dir_all(&*dir).unwrap();
+                std::fs::write(dir.join("big"), big_input(mib)).unwrap();
+                // Ready once compressed bytes arrive: the run is under way.
+                let r = interrupt_once_stdout_has_data(
+                    &exe(mine, "compress"),
+                    "compress",
+                    &["-c", "big"],
+                    &dir,
+                    ENV,
+                    Inherit::Default,
+                    libc::SIGTERM,
+                );
+                if let Some(r) = r.filter(|r| !r.status.success()) {
+                    hit = Some(r);
+                    break;
+                }
+            }
+            let r = hit.unwrap_or_else(|| {
+                panic!("mine={mine}: compress -c finished before the signal at 64 and 256 MiB")
+            });
             assert!(killed_by(&r, libc::SIGTERM), "mine={mine}: {:?}", r.status);
             assert_eq!(r.left, ["big"], "mine={mine}");
         }
@@ -1374,24 +1397,33 @@ mod interrupts {
             return;
         }
         let block = text(4 << 20, 0x0018_0020);
-        let big: Vec<u8> = block.iter().copied().cycle().take(32 << 20).collect();
         for mine in [false, true] {
-            let dir = ScratchDir::unique("compress-intr-ign");
-            std::fs::create_dir_all(&*dir).unwrap();
-            std::fs::write(dir.join("big"), &big).unwrap();
-            let ready = has_data(&dir, &|n: &str| n == "big.Z");
-            let Some(r) = interrupt_env(
-                &exe(mine, "compress"),
-                "compress",
-                &["big"],
-                &dir,
-                ENV,
-                Inherit::IgnoreInt,
-                libc::SIGINT,
-                &ready,
-            ) else {
-                panic!("mine={mine}: compress finished before the signal");
-            };
+            // A run that ends before the signal lands is a miss: retry with
+            // a larger input, fail only when every size misses.
+            let mut hit = None;
+            for mib in [64, 256] {
+                let big: Vec<u8> = block.iter().copied().cycle().take(mib << 20).collect();
+                let dir = ScratchDir::unique("compress-intr-ign");
+                std::fs::create_dir_all(&*dir).unwrap();
+                std::fs::write(dir.join("big"), &big).unwrap();
+                let ready = has_data(&dir, &|n: &str| n == "big.Z");
+                if let Some(r) = interrupt_env(
+                    &exe(mine, "compress"),
+                    "compress",
+                    &["big"],
+                    &dir,
+                    ENV,
+                    Inherit::IgnoreInt,
+                    libc::SIGINT,
+                    &ready,
+                ) {
+                    hit = Some(r);
+                    break;
+                }
+            }
+            let r = hit.unwrap_or_else(|| {
+                panic!("mine={mine}: compress finished before the signal at 64 and 256 MiB")
+            });
             assert!(r.status.success(), "mine={mine}: {:?}", r.status);
             assert_eq!(r.left, ["big.Z"], "mine={mine}");
         }
