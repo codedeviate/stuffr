@@ -1092,6 +1092,8 @@ const COMPAT_SHAPES: &[&str] = &[
     // ncompress's own flags, and Apple's standard input dash
     "compress-ncompress-keep",
     "compress-ncompress-recursive",
+    "compress-ncompress-recursive-upper",
+    "compress-ncompress-quiet",
     "compress-ncompress-help",
     "compress-ncompress-quiet-flags",
     "compress-ncompress-bits-8",
@@ -2431,6 +2433,8 @@ fn compress_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>
         ("compress", "decompress-flag") => z(tool, &["-d", "a.Z"], az, false, &stream),
         ("compress", "keep") if nc => z(tool, &["-k", "a"], a, false, &text),
         ("compress", "recursive") if nc => z(tool, &["-r", "a"], a, false, &text),
+        ("compress", "recursive-upper") if nc => z(tool, &["-R", "a"], a, false, &text),
+        ("compress", "quiet") if nc => z(tool, &["-q", "a"], a, false, &text),
         ("compress", "help") if nc => z(tool, &["-h"], &[], false, b""),
         ("compress", "quiet-flags") if nc => z(tool, &["-s", "-n", "-F", "a"], a, false, &text),
         ("compress", "bits-8") if nc => z(tool, &["-b8", "a"], a, false, &long),

@@ -787,6 +787,11 @@ mod differential {
                 child.stdin.take().unwrap().write_all(&x.a).unwrap();
             }
             let out = child.wait_with_output().unwrap();
+            assert!(
+                out.status.success(),
+                "stuffr compress -b 8: {:?}",
+                out.status
+            );
             assert_eq!(out.stdout[2], 0x88);
             out.stdout
         };

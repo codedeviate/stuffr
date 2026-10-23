@@ -2299,6 +2299,12 @@ fn check_compress_stream(
 ///
 /// Not detected: a partial output in a run with several operands or with
 /// standard input (which operand failed is not known from outside).
+///
+/// Limits: the sandbox cannot send signals, so ruling E3's per-personality
+/// partial-output rules (Apple leaves it, ncompress removes it on INT, TERM
+/// and HUP) rest on the differential suites of Tasks 2 and 3. The decode
+/// round-trip is a self-consistency check (stuffr's decoders read stuffr's
+/// streams); that the bytes are the reference's rests on those suites too.
 #[allow(clippy::too_many_arguments)]
 fn run_compress(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8], payload: &[u8]) {
     let flavour = match (flavour, compress::default_flavour()) {
@@ -2361,8 +2367,13 @@ fn run_compress(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]
     }
     if matches!(code, 1 | 4) {
         // ncompress refuses a regular file without `.Z` silently when
-        // decompressing (`-v` says why).
-        let silent_ok = flavour == compress::Flavour::Ncompress && shape.decompress;
+        // decompressing (`-v` says why); a corrupt input is never silent.
+        let silent_ok = flavour == compress::Flavour::Ncompress
+            && shape.decompress
+            && shape
+                .operands
+                .iter()
+                .any(|o| *o != "-" && !o.ends_with(".Z"));
         assert!(
             !err.is_empty() || silent_ok,
             "{ctx}: failed (exit {code}) with no stderr line"
@@ -2429,8 +2440,8 @@ fn run_compress(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]
 }
 
 /// The compress family's read bound: every path a run opened is one an
-/// operand can name (the file name starts with the operand: the operand
-/// itself, or the operand plus `.Z`), at most one open and `len` bytes per
+/// operand can name (the operand itself, or, when decompressing, the
+/// operand plus `.Z`), at most one open and `len` bytes per
 /// operand that can name it (`len` the largest length the file had when
 /// opened): both personalities read an input once, straight through. Measured
 /// over the seeds and a long run of the target (the report of 0.18.0 Task 4
@@ -2451,7 +2462,9 @@ fn check_compress_reads(
         let operands = shape
             .operands
             .iter()
-            .filter(|o| **o != "-" && file.starts_with(**o))
+            .filter(|o| {
+                **o != "-" && (file == **o || (shape.decompress && file == format!("{}.Z", **o)))
+            })
             .count() as u64;
         assert!(
             r.opens <= operands,

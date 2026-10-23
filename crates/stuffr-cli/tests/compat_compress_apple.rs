@@ -30,7 +30,6 @@ mod compat_harness;
 #[cfg(target_os = "macos")]
 mod common {
     pub use super::compat_harness::*;
-    use std::io::Write;
     use std::path::Path;
     use std::process::{Command, Stdio};
 
@@ -89,22 +88,34 @@ mod common {
         run_group(name, cases, Skipped::none(), &compare);
     }
 
-    /// Apple's `compress` as a filter: `args`, `input` on standard input,
-    /// standard output returned.
+    /// Apple's `compress -c` on `input`, standard output returned. The input
+    /// is a file in a scratch directory and standard input is `/dev/null`:
+    /// no pipe, no writer thread, no `/dev/stdin` reopen. Exit status,
+    /// standard error and length are asserted and named in the panic.
     pub fn apple(args: &[&str], input: &[u8]) -> Vec<u8> {
+        let dir = ScratchDir::unique("compress-fixture");
+        std::fs::create_dir_all(&*dir).unwrap();
+        std::fs::write(dir.join("in"), input).unwrap();
         let mut cmd = Command::new(Path::new(DIR).join("compress"));
-        cmd.args(args)
-            .stdin(Stdio::piped())
+        cmd.arg("-c")
+            .args(args)
+            .arg("in")
+            .current_dir(&*dir)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let mut child = spawn(&mut cmd).expect("spawn /usr/bin/compress");
-        let mut si = child.stdin.take().unwrap();
-        let data = input.to_vec();
-        let writer = std::thread::spawn(move || {
-            let _ = si.write_all(&data);
-        });
-        let out = child.wait_with_output().unwrap();
-        writer.join().unwrap();
+            .stderr(Stdio::piped());
+        let out = spawn(&mut cmd)
+            .expect("spawn /usr/bin/compress")
+            .wait_with_output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "/usr/bin/compress -c {args:?} ({} input bytes): {:?}, stderr {:?}, {} output bytes",
+            input.len(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr),
+            out.stdout.len()
+        );
         out.stdout
     }
 
@@ -120,9 +131,14 @@ mod common {
         pub bz: Vec<u8>,
     }
 
-    /// [`Fx`], or `None` (after `require_reference`'s note) without the
+    /// [`Fx`] (built once for the run), or `None` (after `require_reference`'s note) without the
     /// reference.
-    pub fn fixtures() -> Option<Fx> {
+    pub fn fixtures() -> Option<&'static Fx> {
+        static FX: std::sync::OnceLock<Option<Fx>> = std::sync::OnceLock::new();
+        FX.get_or_init(build_fixtures).as_ref()
+    }
+
+    fn build_fixtures() -> Option<Fx> {
         if !require_reference(&Path::new(DIR).join("compress")) {
             return None;
         }
@@ -133,7 +149,12 @@ mod common {
         let fz = apple(&["-c"], &f);
         let az = apple(&["-c"], &a);
         let bz = apple(&["-c"], &b);
-        assert!(fz.starts_with(&[0x1f, 0x9d, 0x90]), "Apple's .Z of f");
+        assert!(
+            fz.starts_with(&[0x1f, 0x9d, 0x90]),
+            "Apple's .Z of f: {} bytes, starts {:02x?}",
+            fz.len(),
+            &fz[..fz.len().min(8)]
+        );
         Some(Fx {
             f,
             a,
