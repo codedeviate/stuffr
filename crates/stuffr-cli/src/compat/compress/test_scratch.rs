@@ -39,7 +39,8 @@ pub(super) fn scratch(tag: &str) -> Scratch {
 /// Restores user rwx on every directory under `p`, without following
 /// symlinks.
 // keep in sync with the copies in tests/cli.rs, compat_harness/mod.rs (stuffr-cli),
-// tests/zip_on_a_pipe.rs (stuffr-formats), tests/common/mod.rs and src/entries.rs (stuffr)
+// src/compat/compress/test_scratch.rs (stuffr-cli), tests/zip_on_a_pipe.rs (stuffr-formats),
+// tests/common/mod.rs and src/entries.rs (stuffr)
 #[cfg(unix)]
 fn make_dirs_writable(p: &Path) {
     use std::os::unix::fs::PermissionsExt;

@@ -1967,6 +1967,7 @@ mod unix {
         use std::os::unix::process::ExitStatusExt;
         let Some(dir) = zstd_dir() else { return };
         let plain = text().repeat(4000);
+        // Safe as `at`: only this test builds the name, and it has the pid.
         let work = ScratchDir::at(
             std::env::temp_dir().join(format!("stuffr-zstdcat-pipe-{}", std::process::id())),
         );
@@ -2208,6 +2209,8 @@ mod unix {
         let Some(dir) = zstd_dir() else { return };
         let tag = std::process::id();
         let input = big_input;
+        // Safe as `at`: `tag` is the pid, only this test builds the names, and it holds
+        // `interrupt_lock`.
         let ref_dir =
             ScratchDir::at(std::env::temp_dir().join(format!("stuffr-zstd-int-ref-{tag}")));
         let our_dir = ScratchDir::at(std::env::temp_dir().join(format!("stuffr-zstd-int-{tag}")));
@@ -3409,12 +3412,7 @@ mod unix {
             );
             // One name per call: cases run in parallel, and a key built
             // from the case could repeat.
-            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let dir = ScratchDir::at(std::env::temp_dir().join(format!(
-                "stuffr-zstd-cover-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            )));
+            let dir = ScratchDir::unique("zstd-cover");
             fs::create_dir_all(&*dir).unwrap();
             let d = dir.join("d");
             fs::write(&d, &sb).unwrap();
@@ -3748,12 +3746,7 @@ mod unix {
         if zstd_dir().is_none() {
             return Vec::new();
         }
-        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let dir = ScratchDir::at(std::env::temp_dir().join(format!(
-            "stuffr-zstd-packed-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        )));
+        let dir = ScratchDir::unique("zstd-packed");
         fs::create_dir_all(&*dir).unwrap();
         let d = dir.join("d");
         fs::write(&d, dict).unwrap();

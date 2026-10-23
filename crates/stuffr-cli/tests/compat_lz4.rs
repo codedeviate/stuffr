@@ -2746,6 +2746,7 @@ mod unix {
     /// as the reference's do (the Task 3 rows compare those).
     #[test]
     fn benchmark_options_are_refused() {
+        // Safe as `at`: only this test builds the name, and it has the pid.
         let dir = ScratchDir::at(
             std::env::temp_dir().join(format!("stuffr-lz4-bench-{}", std::process::id())),
         );
@@ -2794,6 +2795,7 @@ mod unix {
         if lz4_dir().is_none() {
             return;
         }
+        // Safe as `at`: only this test builds the name, and it has the pid.
         let dir = ScratchDir::at(
             std::env::temp_dir().join(format!("stuffr-lz4-liststdin-{}", std::process::id())),
         );
@@ -3712,6 +3714,7 @@ mod unix {
         use interrupt::big_input;
         use std::os::unix::process::ExitStatusExt;
         let Some(dir) = lz4_dir() else { return };
+        // Safe as `at`: only this test builds the name, and it has the pid.
         let work = ScratchDir::at(
             std::env::temp_dir().join(format!("stuffr-lz4cat-pipe-{}", std::process::id())),
         );
@@ -4052,6 +4055,7 @@ mod unix {
         use std::os::unix::fs::PermissionsExt;
         let Some(dir) = lz4_dir() else { return };
         let mode_after = |exe: &Path, tag: &str| -> u32 {
+            // Safe as `at`: only this test builds it, with the pid; its two calls pass "ref" and "ours".
             let w = ScratchDir::at(
                 std::env::temp_dir().join(format!("stuffr-lz4-fifo-{tag}-{}", std::process::id())),
             );
@@ -4090,6 +4094,7 @@ mod unix {
             );
             fs::symlink_metadata(&fifo).unwrap().permissions().mode() & 0o7777
         };
+        // Safe as `at`: only this test builds the name, and it has the pid.
         let link_dir = ScratchDir::at(
             std::env::temp_dir().join(format!("stuffr-lz4-fifo-bin-{}", std::process::id())),
         );
@@ -4107,6 +4112,7 @@ mod unix {
     /// input as failed.
     #[test]
     fn an_input_that_is_its_output_is_never_lost() {
+        // Safe as `at`: only this test builds the name, and it has the pid.
         let dir = ScratchDir::at(
             std::env::temp_dir().join(format!("stuffr-lz4-same-{}", std::process::id())),
         );
@@ -4178,6 +4184,8 @@ mod unix {
         let _serial = interrupt_lock();
         let Some(dir) = lz4_dir() else { return };
         let tag = std::process::id();
+        // Safe as `at`: `tag` is the pid, only this test builds the names, and it holds
+        // `interrupt_lock`.
         let ref_dir =
             ScratchDir::at(std::env::temp_dir().join(format!("stuffr-lz4-int-ref-{tag}")));
         let our_dir = ScratchDir::at(std::env::temp_dir().join(format!("stuffr-lz4-int-{tag}")));
@@ -4283,6 +4291,7 @@ mod unix {
         use std::os::unix::process::{CommandExt, ExitStatusExt};
         use std::process::{Command, Stdio};
         let Some(dir) = lz4_dir() else { return };
+        // Safe as `at`: only this test builds the name, and it has the pid.
         let work = ScratchDir::at(
             std::env::temp_dir().join(format!("stuffr-lz4-pipe-{}", std::process::id())),
         );

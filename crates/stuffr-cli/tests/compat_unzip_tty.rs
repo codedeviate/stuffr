@@ -363,6 +363,8 @@ mod unix {
                 (reference.as_path(), vec![]),
                 (stuffr, vec![("STUFFR_UNZIP_FLAVOR", flavour)]),
             ] {
+                // Safe as `at`: `scratch` has the pid, this is the only test using it, it holds
+                // `interrupt_lock`, and each pass drops `d` before the next.
                 let d = ScratchDir::at(scratch.join("run"));
                 let big = |n: &str| n == "big.bin";
                 let ready = interrupt::has_data(&d, &big);

@@ -102,6 +102,8 @@ mod macos {
     /// A scratch directory of its own for archives a test makes with
     /// Apple's own tools.
     fn workdir(tag: &str) -> ScratchDir {
+        // Safe as `at`: pid in the name, and the three callers pass distinct tags
+        // (makers, zip64, zipinfo), all words, so the pid is the only all-digit field.
         let d = ScratchDir::at(
             std::env::temp_dir().join(format!("stuffr-unzip-{tag}-{}", std::process::id())),
         );

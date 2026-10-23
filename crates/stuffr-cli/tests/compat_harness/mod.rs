@@ -1174,7 +1174,8 @@ impl Drop for ScratchDir {
 /// Restores user rwx on every directory under `p`, without following
 /// symlinks. Read-only files are left alone: only directories block removal.
 // keep in sync with the copies in tests/cli.rs, compat_harness/mod.rs (stuffr-cli),
-// tests/zip_on_a_pipe.rs (stuffr-formats), tests/common/mod.rs and src/entries.rs (stuffr)
+// src/compat/compress/test_scratch.rs (stuffr-cli), tests/zip_on_a_pipe.rs (stuffr-formats),
+// tests/common/mod.rs and src/entries.rs (stuffr)
 fn make_dirs_writable(p: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let Ok(meta) = fs::symlink_metadata(p) else {
@@ -2650,14 +2651,9 @@ fn peak_rss_run_into<T: Send>(
     env: &[(&str, &str)],
     sink: impl FnOnce(std::process::ChildStdout) -> T + Send,
 ) -> (std::process::ExitStatus, T, String, u64) {
-    static N: AtomicUsize = AtomicUsize::new(0);
     // Removed when this returns, a failed `unwrap` or a panicking `sink`
     // included.
-    let dir = ScratchDir::at(std::env::temp_dir().join(format!(
-        "stuffr-rss-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    )));
+    let dir = ScratchDir::unique("rss");
     fs::create_dir_all(dir.join("bin")).unwrap();
     let link = dir.join("bin").join(name);
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
@@ -3589,6 +3585,7 @@ pub fn zstd_trained_dictionary() -> Option<&'static [u8]> {
     static D: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
     D.get_or_init(|| {
         zstd_dir()?;
+        // Safe as `at`: built once per process inside this `OnceLock`, pid in the name.
         let dir = ScratchDir::at(
             std::env::temp_dir().join(format!("stuffr-zstd-dict-{}", std::process::id())),
         );

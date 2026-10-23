@@ -1370,6 +1370,8 @@ mod interrupts {
     }
 
     fn scratch(tag: &str) -> ScratchDir {
+        // Safe as `at`: pid in the name, and every test using it holds `interrupt_lock`, so
+        // one at a time per process; no two tests share a tag.
         ScratchDir::at(
             std::env::temp_dir().join(format!("stuffr-bz-intr-{}-{tag}", std::process::id())),
         )

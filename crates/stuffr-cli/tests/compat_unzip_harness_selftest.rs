@@ -20,6 +20,8 @@ mod unix {
     use std::time::{Duration, SystemTime};
 
     fn scratch(tag: &str) -> ScratchDir {
+        // Safe as `at`: pid in the name, and each caller passes its own tag ("tree", "same-a",
+        // "same-b"; none all digits).
         let d = ScratchDir::at(std::env::temp_dir().join(format!(
             "stuffr-unzip-selftest-{tag}-{}",
             std::process::id()
@@ -423,6 +425,8 @@ mod unix {
     #[test]
     fn scratch_guards_remove_read_only_trees_and_survive_panics() {
         let pid = std::process::id();
+        // `at` on purpose below: these two tests build `stuffr-guard-{pid}-*` names no other
+        // test uses, and the guard test re-creates the same path after a drop.
         let a = std::env::temp_dir().join(format!("stuffr-guard-{pid}-a"));
         let path = {
             let d = ScratchDir::at(a.clone());
@@ -458,6 +462,7 @@ mod unix {
     #[test]
     fn scratch_guards_do_not_follow_symlinks_out_of_the_tree() {
         let pid = std::process::id();
+        // Safe as `at`: only this test builds `stuffr-guard-{pid}-outside` and `-link-d`.
         let outside =
             ScratchDir::at(std::env::temp_dir().join(format!("stuffr-guard-{pid}-outside")));
         fs::create_dir_all(&*outside).unwrap();
