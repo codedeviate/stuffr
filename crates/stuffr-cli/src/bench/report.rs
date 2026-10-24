@@ -274,7 +274,24 @@ fn table_lines(rows: &[Row], bytes_in: u64, memory: MemoryMode) -> Vec<String> {
         .collect()
 }
 
-/// The table, then the footnote when a row is marked.
+/// The footnote's start when a memory cell is `-` for a reason.
+const MEM_NOTE: &str = "- memory not measured: ";
+
+/// The first reason a measured run's memory cell shows `-`: a row that ran
+/// whose memory run failed on at least one side.
+fn first_mem_error(rows: &[Row], memory: MemoryMode) -> Option<&str> {
+    if memory != MemoryMode::Measured {
+        return None;
+    }
+    rows.iter()
+        .filter(|r| measured(r).is_some())
+        .filter_map(|r| r.memory.as_ref())
+        .filter(|m| m.compress.is_none() || m.decompress.is_none())
+        .find_map(|m| m.error.as_deref())
+}
+
+/// The table, then the footnotes: one when a row is marked, one naming
+/// the first reason a memory cell is `-`.
 fn write_table(
     rows: &[Row],
     bytes_in: u64,
@@ -286,6 +303,9 @@ fn write_table(
     }
     if any_on_disk(rows) {
         writeln!(out, "{DISK_NOTE}")?;
+    }
+    if let Some(why) = first_mem_error(rows, memory) {
+        writeln!(out, "{MEM_NOTE}{}", one_line(why))?;
     }
     Ok(())
 }
@@ -872,6 +892,36 @@ mod tests {
         assert_eq!(got, include_str!("testdata/human-memory.txt"));
         let table = render(|o| table_only(&mem_rows(), 412 * MIB, MemoryMode::Measured, o));
         assert_eq!(table, include_str!("testdata/table-only-memory.txt"));
+    }
+
+    /// A memory cell that is `-` because its run failed gets one footnote
+    /// under the table, naming the first such reason on one line; a cell
+    /// that is `-` without an error, or a run without memory, gets none.
+    #[test]
+    fn a_failed_memory_run_gets_a_footnote() {
+        let mut rows = mem_rows();
+        rows[0].memory.as_mut().unwrap().error =
+            Some("decompress: refused by --memory-limit: needs 64 MiB\nsecond line".into());
+        rows[2].memory = Some(Memory {
+            compress: None,
+            decompress: None,
+            error: Some("compress: later reason".into()),
+        });
+        let got = render(|o| human(&mem_cond(), &rows, o));
+        assert_eq!(got, include_str!("testdata/human-memory-error.txt"));
+        let table = render(|o| table_only(&rows, 412 * MIB, MemoryMode::Measured, o));
+        assert!(
+            table.ends_with(
+                "- memory not measured: decompress: refused by --memory-limit: needs 64 MiB …\n"
+            ),
+            "{table}"
+        );
+        // No error text, no footnote (the existing golden), and none when
+        // memory was skipped.
+        let plain = render(|o| table_only(&mem_rows(), 412 * MIB, MemoryMode::Measured, o));
+        assert!(!plain.contains(MEM_NOTE), "{plain}");
+        let skipped = render(|o| table_only(&rows, 412 * MIB, MemoryMode::Skipped, o));
+        assert!(!skipped.contains(MEM_NOTE), "{skipped}");
     }
 
     #[test]

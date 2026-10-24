@@ -328,7 +328,7 @@ fn compress_child(
         None => Box::new(io::sink()),
     };
     let dst = BufWriter::with_capacity(CHUNK, dst);
-    let baseline = peak_rss()?;
+    let baseline = baseline_rss()?;
     let mut sink = codec.encoder(Box::new(dst), encode)?;
     for (snap, f) in &mut feeds {
         feed(snap, f, &mut buf, &mut *sink)?;
@@ -348,7 +348,7 @@ fn decompress_child(
         copy.len,
     ));
     let mut buf = vec![0u8; CHUNK];
-    let baseline = peak_rss()?;
+    let baseline = baseline_rss()?;
     let mut decoder = codec.decoder(src, decode)?;
     while fill(&mut decoder, &mut buf).map_err(Error::from_decode_io)? == buf.len() {}
     drop(decoder);
@@ -378,9 +378,33 @@ fn feed(
     Ok(())
 }
 
-/// This process's peak resident set so far, in bytes: `ru_maxrss`, which
-/// macOS (and iOS) give in bytes and Linux and the BSDs in KiB.
-#[cfg(unix)]
+/// Whether this platform's memory figures have been verified: macOS
+/// (`ru_maxrss`) and Linux (`/proc/self/status`). Elsewhere (the BSDs, and
+/// off unix) bench reports memory as not measured (ruling F9).
+pub const MEASURES: bool = cfg!(any(target_vendor = "apple", target_os = "linux"));
+
+/// The resident size just before the codec starts, in bytes.
+///
+/// macOS: `ru_maxrss`, the high-water so far, which is the current size
+/// since nothing has run yet. Linux: `VmRSS` from `/proc/self/status`, not
+/// `ru_maxrss`: exec copies the spawning process's high-water mark into the
+/// new image's `ru_maxrss` (fs/exec.c, `setmax_mm_hiwater_rss`), so there it
+/// starts at bench's own lifetime peak and would swallow the codec's.
+fn baseline_rss() -> io::Result<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        proc_status_bytes(b"VmRSS:")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        peak_rss()
+    }
+}
+
+/// The address space's peak resident size so far, in bytes. macOS:
+/// `ru_maxrss` (bytes there). Linux: `VmHWM` from `/proc/self/status`, the
+/// high-water of this address space only, fresh at exec.
+#[cfg(target_vendor = "apple")]
 fn peak_rss() -> io::Result<u64> {
     // SAFETY: `getrusage` only writes the `rusage` it is given, which is
     // plain data and valid zeroed.
@@ -389,23 +413,58 @@ fn peak_rss() -> io::Result<u64> {
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    let unit = if cfg!(target_vendor = "apple") {
-        1
-    } else {
-        1024
-    };
-    Ok(u64::try_from(usage.ru_maxrss)
-        .unwrap_or(0)
-        .saturating_mul(unit))
+    Ok(u64::try_from(usage.ru_maxrss).unwrap_or(0))
 }
 
-/// Off unix there is no `ru_maxrss`; bench does not measure memory there.
-#[cfg(not(unix))]
+#[cfg(target_os = "linux")]
+fn peak_rss() -> io::Result<u64> {
+    proc_status_bytes(b"VmHWM:")
+}
+
+/// Elsewhere memory is not measured; bench never starts a child there.
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 fn peak_rss() -> io::Result<u64> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "memory is not measured on this platform",
     ))
+}
+
+/// `field` (with its colon, e.g. `VmHWM:`) of `/proc/self/status`, given
+/// there in kB, as bytes. Read into a buffer on the stack, so sampling
+/// allocates nothing on the heap that the codec's figure could include.
+#[cfg(target_os = "linux")]
+fn proc_status_bytes(field: &[u8]) -> io::Result<u64> {
+    use std::io::Read;
+    let mut buf = [0u8; 8192];
+    let mut f = File::open("/proc/self/status")?;
+    let mut len = 0;
+    while len < buf.len() {
+        match f.read(&mut buf[len..]) {
+            Ok(0) => break,
+            Ok(n) => len += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    status_field_kib(&buf[..len], field)
+        .map(|kib| kib.saturating_mul(1024))
+        .ok_or_else(|| io::Error::other("no memory figure in /proc/self/status"))
+}
+
+/// The number on the line starting with `field` in a `/proc/<pid>/status`
+/// text (`VmHWM:\t   1234 kB`), in kB.
+#[cfg(any(target_os = "linux", test))]
+fn status_field_kib(text: &[u8], field: &[u8]) -> Option<u64> {
+    let line = text.split(|&b| b == b'\n').find(|l| l.starts_with(field))?;
+    let rest = line[field.len()..].trim_ascii_start();
+    let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    rest[..digits].iter().try_fold(0u64, |n, &b| {
+        n.checked_mul(10)?.checked_add(u64::from(b - b'0'))
+    })
 }
 
 /// Runs one child job and returns its reply. The real one spawns a
@@ -416,13 +475,30 @@ pub trait Runner {
 
 /// Runs each job as `<this executable> __bench-memory-child …`, with stdin
 /// closed and stdout and stderr captured, keeping its pid in
-/// [`RUNNING_CHILD`] while it runs.
-pub struct ProcessRunner;
+/// [`RUNNING_CHILD`] while it runs. The executable is resolved once, when
+/// the runner is made at the start of the run, and reused for every child.
+pub struct ProcessRunner {
+    exe: Result<PathBuf, String>,
+}
+
+impl Default for ProcessRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProcessRunner {
+    pub fn new() -> Self {
+        Self {
+            exe: std::env::current_exe()
+                .map_err(|e| format!("cannot find bench's own executable: {e}")),
+        }
+    }
+}
 
 impl Runner for ProcessRunner {
     fn run(&mut self, job: &ChildJob) -> Result<u64, String> {
-        let exe = std::env::current_exe()
-            .map_err(|e| format!("cannot find bench's own executable: {e}"))?;
+        let exe = self.exe.clone()?;
         // Bench's signals are held back from the spawn until the pid is
         // stored, so a signal sent to bench alone in between is delivered
         // with the pid known, and the cleanup kills the child (no orphan).
@@ -457,15 +533,16 @@ impl Runner for ProcessRunner {
     }
 }
 
-/// [`measure_memory_with`] with real child processes. Unix only in use:
-/// off unix the caller reports memory as not measured instead.
+/// [`measure_memory_with`] with real child processes (`runner`). Only
+/// where [`MEASURES`]: elsewhere the caller reports memory as not measured.
 pub fn measure_memory(
+    runner: &mut ProcessRunner,
     codec: &'static str,
     level: Option<i32>,
     plan: &Plan,
     input_files: &[Snapshot],
 ) -> Memory {
-    measure_memory_with(&mut ProcessRunner, codec, level, plan, input_files)
+    measure_memory_with(runner, codec, level, plan, input_files)
 }
 
 /// One row's memory under `plan`: a compress child and a decompress child
@@ -738,6 +815,21 @@ mod tests {
     }
 
     #[test]
+    fn proc_status_fields_parse_in_kib() {
+        // The kernel pads the numbers with spaces; built, not spelled, so
+        // no literal carries a run of them.
+        let pad = " ".repeat(4);
+        let status = format!(
+            "Name:\tstuffr\nVmPeak:\t{pad}123456 kB\nVmHWM:\t{pad}6372 kB\nVmRSS:\t{pad}6100 kB\n"
+        );
+        let status = status.as_bytes();
+        assert_eq!(status_field_kib(status, b"VmHWM:"), Some(6372));
+        assert_eq!(status_field_kib(status, b"VmRSS:"), Some(6100));
+        assert_eq!(status_field_kib(status, b"VmSwap:"), None);
+        assert_eq!(status_field_kib(b"VmHWM:\t kB\n", b"VmHWM:"), None);
+    }
+
+    #[test]
     fn child_reply_parses_ok_and_err() {
         assert_eq!(parse_reply(b"ok 12345\n"), Some(Ok(12345)));
         assert_eq!(parse_reply(b"ok 0\n"), Some(Ok(0)));
@@ -764,13 +856,13 @@ mod tests {
 
     /// The env vars that make [`memory_probe`] run, and the prefix its
     /// reply line carries in libtest's captured output.
-    #[cfg(unix)]
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     const PROBE_CODEC: &str = "STUFFR_BENCH_MEMORY_PROBE_CODEC";
-    #[cfg(unix)]
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     const PROBE_LEVEL: &str = "STUFFR_BENCH_MEMORY_PROBE_LEVEL";
-    #[cfg(unix)]
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     const PROBE_FILE: &str = "STUFFR_BENCH_MEMORY_PROBE_FILE";
-    #[cfg(unix)]
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     const PROBE_MARK: &str = "memory-probe-reply: ";
 
     /// Not a test of its own: [`fresh_processes_measure_xz_9_above_lz4`]
@@ -778,7 +870,7 @@ mod tests {
     /// it runs has a process (and an `ru_maxrss` high-water mark) to
     /// itself. Prints the child's reply line after [`PROBE_MARK`]. Does
     /// nothing without the env vars.
-    #[cfg(unix)]
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     #[test]
     #[ignore = "a probe that fresh_processes_measure_xz_9_above_lz4 runs in its own process"]
     fn memory_probe() {
@@ -805,7 +897,7 @@ mod tests {
     /// 64 MiB dictionary's hash table) touches more than lz4's. Each figure
     /// is that process's own peak above its own baseline, so no other test
     /// can move it.
-    #[cfg(unix)]
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     #[test]
     fn fresh_processes_measure_xz_9_above_lz4() {
         let dir = Scratch::new();
@@ -845,7 +937,7 @@ mod tests {
 
     /// `input` compressed by the compress child (in-process) into the
     /// existing file `name` in `dir`, as the parent's temp file is filled.
-    #[cfg(unix)]
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     fn compressed_by_the_child(
         dir: &Scratch,
         name: &str,
@@ -876,7 +968,7 @@ mod tests {
     /// end over it and gets the input back. Only that each succeeds is
     /// checked of the figures: in-process, they are this whole test
     /// binary's high-water mark, shared with every test beside it.
-    #[cfg(unix)]
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     #[test]
     fn the_compress_child_writes_the_copy_the_decompress_child_reads() {
         let dir = Scratch::new();
@@ -1061,7 +1153,10 @@ mod tests {
     /// The pure xz decoder refuses a header whose dictionary exceeds the
     /// limit; the child reports that as a refusal. (The C tier's decoder
     /// takes no limit, so this is pure-tier only.)
-    #[cfg(all(unix, not(feature = "xz-c")))]
+    #[cfg(all(
+        any(target_vendor = "apple", target_os = "linux"),
+        not(feature = "xz-c")
+    ))]
     #[test]
     fn a_child_refusal_names_the_memory_limit() {
         let dir = Scratch::new();

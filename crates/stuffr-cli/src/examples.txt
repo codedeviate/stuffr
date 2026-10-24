@@ -1314,9 +1314,9 @@ BENCHMARKING FORMATS ON YOUR OWN DATA
       library ("C: zstd, xz"), or says "pure". A format that fails is a
       row marked failed, never an exit code. On a terminal, stderr shows
       a bar for the row being measured, drawn only between timed pieces
-      and cleared before the table (and by Ctrl-C, SIGTERM or SIGHUP,
-      which also stop a running memory run and remove bench's temp file
-      before bench dies of the signal). Timings from a debug build
+      and cleared before the table (and by Ctrl-C, SIGTERM, SIGHUP or
+      SIGQUIT, which also stop a running memory run and remove bench's
+      temp file before bench dies of the signal). Timings from a debug build
       mean nothing, so bench refuses to run in one (exit 2): build with
       --release.
 
@@ -1356,28 +1356,34 @@ BENCHMARKING FORMATS ON YOUR OWN DATA
       is measured once per row, whatever N is.
 
   stuffr bench --no-memory access.log
-      The memory columns come from one more run of each row, after its
-      timed runs and untimed, in a separate child process: once to
-      compress, once to decompress (on the bar: "memory"). The figure is
-      that process's peak resident memory (what it actually touched, not
-      what it reserved) above its size before the codec started, under the
-      same level, --threads and --memory-limit as the timed runs. It
-      includes a small floor of code paged in and fixed buffers, about
-      0.1-0.35 MiB, so even a tiny format shows a small non-zero value,
-      and a light format such as lz4 shows a few hundred KiB (the floor
-      plus its own state).
-      xz on a small input touches less than it reserves, so its figure
-      can be well under its nominal dictionary size. A format that holds
-      its whole input (the pure tier's zstd encoder) grows with the
-      input. With --per-file each file gets its own pair of runs and the
-      row shows the largest. A memory run that fails (for example refused
-      by --memory-limit) shows - and never fails the row or changes the
-      exit code. The memory runs add one compression and one
-      decompression per row, so a run takes up to about twice as long
-      (1.8x for every level of xz and lz4 on 19 MiB of text), most for
-      slow compressors such as xz. --no-memory skips them: no memory
-      columns, no least-memory line. Memory is not measured on
-      Windows (the cells show -).
+      On macOS and Linux the memory columns come from one more run of
+      each row, after its timed runs and untimed, in a separate child
+      process: once to compress, once to decompress (on the bar:
+      "memory"). The figure is that process's peak resident memory (what
+      it actually touched, not what it reserved) above its size before
+      the codec started, under the same level, --threads and
+      --memory-limit as the timed runs. It includes a small floor of
+      code paged in and fixed buffers, about 0.1-0.35 MiB, so even a
+      tiny format shows a small non-zero value, and a light format such
+      as lz4 shows a few hundred KiB (the floor plus its own state). xz
+      on a small input touches less than it reserves, so its figure can
+      be well under its nominal dictionary size. A format that holds its
+      whole input (the pure tier's zstd encoder) grows with the input.
+      With --per-file each file gets its own pair of runs and the row
+      shows the largest. The compress run writes the compressed output
+      to a temp file in $TMPDIR (on Linux possibly a tmpfs, so in RAM),
+      removed once the decompress run has read it. A memory run that
+      fails (a full disk, for example) shows -, with a footnote under
+      the table naming the first reason, and never fails the row or
+      changes the exit code. A row whose timed run failed (a refusal by
+      --memory-limit included) has no memory run; on the C tier the
+      decoders take no memory limit, so d-mem can exceed --memory-limit.
+      The memory runs add one compression and one decompression per row,
+      so a run takes up to about twice as long (1.8x for every level of
+      xz and lz4 on 19 MiB of text), most for slow compressors such as
+      xz. --no-memory skips them: no memory columns, no least-memory
+      line. Memory is not measured on Windows or the BSDs (the cells
+      show -).
 
   stuffr bench --json access.log | jq .winners
   stuffr bench --csv access.log > bench.csv

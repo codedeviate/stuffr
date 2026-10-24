@@ -1934,30 +1934,41 @@ dangling symlink, a directory that cannot be read (named, or on a pattern's
 way) and a file that cannot be read are exit 2 as well, naming the path. A format that fails is a row
 marked failed, not an exit code. On a terminal, stderr shows a bar for the
 row being measured, drawn only between timed pieces and cleared before the
-table; Ctrl-C, SIGTERM and SIGHUP clear it too (and stop a running memory
-run and remove bench's temp file) before bench dies of the signal. Timings
+table; Ctrl-C, SIGTERM, SIGHUP and SIGQUIT clear it too (and stop a running
+memory run and remove bench's temp file) before bench dies of the signal
+(SIGQUIT still dumps core where core dumps are on). Timings
 need a release build; a debug build refuses with exit 2.
 
-**Memory.** After a row's timed runs, bench runs it once more, untimed, in a
-separate child process: once to compress, once to decompress (the bar reads
-`memory`). The figure is that process's peak resident memory, what it actually
-touched, not what it reserved, above its size just before the codec started,
-under the same level, `--threads` and `--memory-limit` as the timed runs, and
-measured once per row whatever `--repeat` says. It includes a small floor of
-code paged in and fixed buffers, about 0.1–0.35 MiB, so even a tiny format
-shows a small non-zero value, and a light format such as lz4 shows a few
-hundred KiB (the floor plus its own state). xz on a small input touches less
-than it reserves, so its figure can be well under its nominal dictionary size.
-A format that holds its whole input (the pure tier's zstd encoder) grows with
-the input. With `--per-file` each file gets its own pair of runs and the row
-shows the largest. A memory run that fails (for example refused by
-`--memory-limit`) shows `-`; the row's other figures stand, it takes no part
-in `least memory`, and the exit code is unchanged. The memory runs add one
-compression and one decompression per row, so a run takes up to about twice as
-long (1.8x for every level of xz and lz4 on 19 MiB of text), most for slow
-compressors such as xz. `--no-memory` skips them: no memory columns and no
-`least memory` line. Off unix (Windows) memory is not measured: the cells show
-`-` and the input line says `memory not measured on this platform`.
+**Memory.** On macOS and Linux, after a row's timed runs, bench runs it once
+more, untimed, in a separate child process: once to compress, once to
+decompress (the bar reads `memory`). The figure is that process's peak
+resident memory, what it actually touched, not what it reserved, above its
+size just before the codec started (macOS: `getrusage`'s `ru_maxrss`; Linux:
+`VmHWM` and `VmRSS` from `/proc/self/status`), under the same level,
+`--threads` and `--memory-limit` as the timed runs, and measured once per row
+whatever `--repeat` says. It includes a small floor of code paged in and fixed
+buffers, about 0.1–0.35 MiB, so even a tiny format shows a small non-zero
+value, and a light format such as lz4 shows a few hundred KiB (the floor plus
+its own state). xz on a small input touches less than it reserves, so its
+figure can be well under its nominal dictionary size. A format that holds its
+whole input (the pure tier's zstd encoder) grows with the input. With
+`--per-file` each file gets its own pair of runs and the row shows the
+largest. The compress run writes the row's compressed output to a temp file in
+`$TMPDIR` (`stuffr-bench-<pid>-<n>`, removed as soon as the decompress run has
+read it, and on Ctrl-C), which the decompress run reads back; on Linux
+`$TMPDIR` may be a tmpfs, which holds it in RAM. A memory run that fails (a
+full disk, for example) shows `-`, a footnote under the table names the first
+reason, and JSON and CSV carry it in `mem_error`; the row's other figures
+stand, it takes no part in `least memory`, and the exit code is unchanged. A
+row whose timed run failed, a refusal by `--memory-limit` included, has no
+memory run. On the C tier the decoders take no memory limit, so `d-mem` can
+exceed `--memory-limit`. The memory runs add one compression and one
+decompression per row, so a run takes up to about twice as long (1.8x for
+every level of xz and lz4 on 19 MiB of text), most for slow compressors such
+as xz. `--no-memory` skips them: no memory columns and no `least memory` line.
+Elsewhere (Windows, and the BSDs until their figures are verified) memory is
+not measured: the cells show `-` and the input line says `memory not measured
+on this platform`.
 
 `--json` prints one object. `conditions` holds `files`, `bytes_in`, `mode`
 (`one-stream` or `per-file`), `threads` (`--threads` as given, `null` when

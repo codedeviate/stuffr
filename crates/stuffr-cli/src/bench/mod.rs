@@ -62,7 +62,7 @@ pub fn run(args: BenchArgs) -> stuffr::Result<Ran> {
     let _signals = crate::compat::hook_run_signals(on_run_signal);
     let memory_mode = if args.no_memory {
         MemoryMode::Skipped
-    } else if cfg!(unix) {
+    } else if memory::MEASURES {
         MemoryMode::Measured
     } else {
         MemoryMode::Unsupported
@@ -90,6 +90,7 @@ pub fn run(args: BenchArgs) -> stuffr::Result<Ran> {
     );
     let mut clock = RealClock::new();
     let snapshots = snapshots_of(&paths, &input);
+    let mut runner = memory::ProcessRunner::new();
     let mut rows = Vec::with_capacity(planned.len());
     for (k, p) in planned.iter().enumerate() {
         meter.row(RowLabel {
@@ -112,7 +113,7 @@ pub fn run(args: BenchArgs) -> stuffr::Result<Ran> {
         let memory = (memory_mode == MemoryMode::Measured && matches!(outcome, Outcome::Ok(_)))
             .then(|| {
                 meter.memory();
-                memory::measure_memory(p.format, p.level, &plan, &snapshots)
+                memory::measure_memory(&mut runner, p.format, p.level, &plan, &snapshots)
             });
         rows.push(Row {
             format: p.format,
@@ -1266,12 +1267,15 @@ mod tests {
         assert!(run(0, false).is_empty());
     }
 
-    /// End to end in a forked child, as bench registers it: SIGINT with
-    /// a memory child running and the bar up kills that child (SIGKILL),
-    /// writes the clear to stderr, and the process dies of SIGINT.
+    /// End to end in a forked child, as bench registers it: SIGINT or
+    /// SIGQUIT with a memory child running and the bar up kills that child
+    /// (SIGKILL), writes the clear to stderr, and the process dies of the
+    /// signal it got (SIGQUIT re-raised at its default, core and all; the
+    /// child's core limit is 0 so no core file is written).
     #[cfg(unix)]
     #[test]
     fn a_signal_kills_the_memory_child_clears_the_bar_and_kills_bench() {
+        use std::os::unix::process::ExitStatusExt;
         /// The stand-in child, killed and reaped however the test ends.
         struct Victim(std::process::Child);
         impl Drop for Victim {
@@ -1280,47 +1284,66 @@ mod tests {
                 let _ = self.0.wait();
             }
         }
-        let mut victim = Victim(
-            std::process::Command::new("sleep")
-                .arg("60")
-                .spawn()
-                .unwrap(),
-        );
-        let pid = i32::try_from(victim.0.id()).unwrap();
-        let fds = cloexec_pipe();
-        // SAFETY: the child makes only async-signal-safe calls (signal,
-        // dup2, atomics, sigaction inside `hook_run_signals`, raise) and
-        // ends by the signal or `_exit`; it never returns into the harness.
-        let status = unsafe {
-            let child = libc::fork();
-            assert!(child >= 0, "fork: {}", io::Error::last_os_error());
-            if child == 0 {
-                for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-                    libc::signal(sig, libc::SIG_DFL);
+        for sig in [libc::SIGINT, libc::SIGQUIT] {
+            let mut victim = Victim(
+                std::process::Command::new("sleep")
+                    .arg("60")
+                    .spawn()
+                    .unwrap(),
+            );
+            let pid = i32::try_from(victim.0.id()).unwrap();
+            let fds = cloexec_pipe();
+            // SAFETY: the child makes only async-signal-safe calls (signal,
+            // setrlimit, dup2, atomics, sigaction inside
+            // `hook_run_signals`, raise) and ends by the signal or `_exit`;
+            // it never returns into the harness.
+            let status = unsafe {
+                let child = libc::fork();
+                assert!(child >= 0, "fork: {}", io::Error::last_os_error());
+                if child == 0 {
+                    for s in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+                        libc::signal(s, libc::SIG_DFL);
+                    }
+                    let none = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    libc::setrlimit(libc::RLIMIT_CORE, &none);
+                    // The parent's arm and hook (another test's) are not
+                    // ours; clearing the hook also keeps the one-hook
+                    // debug check from panicking here.
+                    crate::compat::disarm_inherited();
+                    libc::dup2(fds[1], libc::STDERR_FILENO);
+                    memory::RUNNING_CHILD.store(pid, Ordering::SeqCst);
+                    BAR_DRAWN.store(true, Ordering::SeqCst);
+                    let _hook = crate::compat::hook_run_signals(on_run_signal);
+                    libc::raise(sig);
+                    libc::_exit(99);
                 }
-                // The parent's armed temp file (another test's) is not ours.
-                crate::compat::disarm_inherited();
-                libc::dup2(fds[1], libc::STDERR_FILENO);
-                memory::RUNNING_CHILD.store(pid, Ordering::SeqCst);
-                BAR_DRAWN.store(true, Ordering::SeqCst);
-                let _hook = crate::compat::hook_run_signals(on_run_signal);
-                libc::raise(libc::SIGINT);
-                libc::_exit(99);
+                libc::close(fds[1]);
+                let mut status = 0;
+                while libc::waitpid(child, &mut status, 0) < 0 {
+                    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EINTR));
+                }
+                status
+            };
+            let got = read_within_10s(fds[0]);
+            assert!(libc::WIFSIGNALED(status), "{sig}: exited: {status:#x}");
+            assert_eq!(libc::WTERMSIG(status), sig);
+            assert_eq!(got, CLEAR_LINE, "{sig}");
+            // Waited for at most 10 s: a stand-in the hook missed is killed
+            // by the guard instead of holding the test for a minute.
+            let mut ended = None;
+            for _ in 0..1000 {
+                ended = victim.0.try_wait().unwrap();
+                if ended.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            libc::close(fds[1]);
-            let mut status = 0;
-            while libc::waitpid(child, &mut status, 0) < 0 {
-                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EINTR));
-            }
-            status
-        };
-        let got = read_within_10s(fds[0]);
-        assert!(libc::WIFSIGNALED(status), "exited: {status:#x}");
-        assert_eq!(libc::WTERMSIG(status), libc::SIGINT);
-        assert_eq!(got, CLEAR_LINE);
-        let ended = victim.0.wait().unwrap();
-        use std::os::unix::process::ExitStatusExt;
-        assert_eq!(ended.signal(), Some(libc::SIGKILL), "{ended:?}");
+            let ended = ended.expect("the hook should have killed the stand-in child");
+            assert_eq!(ended.signal(), Some(libc::SIGKILL), "{sig}: {ended:?}");
+        }
     }
 
     /// A pipe with `FD_CLOEXEC` on both ends, so a test elsewhere that

@@ -302,7 +302,7 @@ impl Drop for RunHookGuard {
 
 /// For a whole native run (`stuffr bench`), not a compatibility family:
 /// install the cleanup handler [`create_armed`] uses on its signals
-/// (SIGINT, SIGTERM, SIGHUP; one left ignored stays ignored) now rather
+/// (SIGINT, SIGTERM, SIGHUP, SIGQUIT; one left ignored stays ignored) now rather
 /// than at the first arm, and register `hook` for it to call first. On one
 /// of those signals the handler then runs `hook`, removes the armed temp
 /// file if one is armed, and re-raises at the default action, so the
@@ -321,7 +321,7 @@ pub(crate) fn hook_run_signals(hook: extern "C" fn()) -> RunHookGuard {
         "hook_run_signals: a hook is already registered"
     );
     PRE_EXIT_HOOK.store(hook as usize, Ordering::Release);
-    install_handlers(TEMP_SIGNALS);
+    install_handlers(BENCH_SIGNALS);
     RunHookGuard { _private: () }
 }
 
@@ -1047,26 +1047,29 @@ fn private_new_file() -> fs::OpenOptions {
 }
 
 /// The signals that remove an armed temporary outside the compatibility
-/// families (`stuffr bench`'s compressed output): the three that end a run
-/// from the terminal or the system. SIGPIPE stays ignored (the native CLI
-/// answers a closed pipe itself), so it is not listed.
+/// families (`stuffr bench`'s compressed output, and its memory child):
+/// the three that end a run from the terminal or the system, and SIGQUIT,
+/// which then still dumps core (it is re-raised at `SIG_DFL`; ruling F10:
+/// bench's memory phase made a temp file left by Ctrl-backslash routine). SIGPIPE
+/// stays ignored (the native CLI answers a closed pipe itself), so it is
+/// not listed. No compatibility family uses this set: each passes its own.
 #[cfg(unix)]
-const TEMP_SIGNALS: Signals = &[libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+const BENCH_SIGNALS: Signals = &[libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
 #[cfg(not(unix))]
-const TEMP_SIGNALS: Signals = &[];
+const BENCH_SIGNALS: Signals = &[];
 
 /// Create `path` (write-only, `create_new`, mode 0600) and arm its removal
-/// on SIGINT, SIGTERM and SIGHUP, which then kill the process as
+/// on SIGINT, SIGTERM, SIGHUP and SIGQUIT, which then kill the process as
 /// [`arm_cleanup`] describes; the signals are held back between the create
 /// and the arm, as in [`create_temp_armed`]. For a stuffr temporary that is
 /// no compatibility family's output, so it takes no host or signal set: the
 /// host is the process itself. The caller names the file and removes it;
 /// dropping the guard only disarms.
 pub(crate) fn create_armed(path: &Path) -> io::Result<(File, CleanupGuard)> {
-    held_back(TEMP_SIGNALS, || {
+    held_back(BENCH_SIGNALS, || {
         private_new_file()
             .open(path)
-            .map(|f| (f, arm_cleanup(&Host::Real, path, TEMP_SIGNALS)))
+            .map(|f| (f, arm_cleanup(&Host::Real, path, BENCH_SIGNALS)))
     })
 }
 
@@ -1084,12 +1087,14 @@ pub(crate) fn armed_path() -> Option<PathBuf> {
     Some(PathBuf::from(std::ffi::OsStr::from_bytes(&slot[..len])))
 }
 
-/// In a test's forked child: forget the arm inherited at `fork` (another
-/// test's temp file in the parent), so a signal there removes nothing of
-/// the parent's. Only after `fork`: a store, async-signal-safe.
+/// In a test's forked child: forget the arm and the hook inherited at
+/// `fork` (another test's), so a signal there removes nothing of the
+/// parent's and `hook_run_signals`'s one-hook check cannot panic in the
+/// child. Only after `fork`: stores, async-signal-safe.
 #[cfg(all(test, unix))]
 pub(crate) fn disarm_inherited() {
     ARMED.store(false, Ordering::SeqCst);
+    PRE_EXIT_HOOK.store(0, Ordering::SeqCst);
 }
 
 /// Held by every lib test that arms the cleanup in the test process itself
@@ -1138,10 +1143,10 @@ pub(crate) fn create_temp_armed_exit(
 }
 
 /// Run `f` with the signals [`hook_run_signals`] covers (SIGINT, SIGTERM,
-/// SIGHUP) held back, as [`create_armed`] holds them; one that arrived
+/// SIGHUP, SIGQUIT) held back, as [`create_armed`] holds them; one that arrived
 /// meanwhile is delivered once `f` is done. Off unix, just `f`.
 pub(crate) fn with_run_signals_held<T>(f: impl FnOnce() -> T) -> T {
-    held_back(TEMP_SIGNALS, f)
+    held_back(BENCH_SIGNALS, f)
 }
 
 /// Run `f` with `signals` blocked on this thread, then restore the mask; a
@@ -2171,10 +2176,22 @@ mod tests {
     /// installed (another test's arm) or inherited (`nohup`).
     #[cfg(unix)]
     fn default_dispositions() {
-        for &sig in XZ_SIGNALS {
+        for &sig in XZ_SIGNALS.iter().chain(BENCH_SIGNALS) {
             // SAFETY: SIG_DFL installs no handler and touches no Rust state.
             unsafe { libc::signal(sig, libc::SIG_DFL) };
         }
+        no_core_dump();
+    }
+
+    /// A forked child that dies of SIGQUIT writes no core file.
+    #[cfg(unix)]
+    pub(crate) fn no_core_dump() {
+        let none = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: setrlimit reads the struct it is given; a syscall.
+        unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) };
     }
 
     /// The real path end to end, as xz's signals.c behaves: an armed run
@@ -2213,7 +2230,7 @@ mod tests {
     #[test]
     fn a_signal_removes_the_create_armed_file() {
         let dir = scratch("create-armed");
-        for &sig in TEMP_SIGNALS {
+        for &sig in BENCH_SIGNALS {
             let file = dir.join(format!("bench-{sig}"));
             let status = in_child(|| {
                 default_dispositions();
@@ -2264,7 +2281,7 @@ mod tests {
     fn the_run_hook_runs_before_the_cleanup_and_the_reraise() {
         use std::os::unix::ffi::OsStrExt;
         let dir = scratch("run-hook");
-        for &sig in TEMP_SIGNALS {
+        for &sig in BENCH_SIGNALS {
             for arm in [true, false] {
                 let file = dir.join(format!("bench-{sig}-{arm}"));
                 let cpath = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
