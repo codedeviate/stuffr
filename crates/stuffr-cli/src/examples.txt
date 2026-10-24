@@ -1293,10 +1293,12 @@ BENCHMARKING FORMATS ON YOUR OWN DATA
   stuffr bench access.log*
       Compresses and decompresses the files with every codec this build can
       write with its real encoder, at each one's default level, and prints
-      one row per format: compressed size, ratio, compress time and
-      decompress time. Below the table it names the smallest, the fastest
-      to compress, the fastest to decompress and the best balance of the
-      three. The files are one stream, as `cat access.log* | stuffr pack`
+      one row per format: compressed size, ratio, compress time,
+      decompress time, and the peak memory to compress (c-mem) and to
+      decompress (d-mem). Below the table it names the smallest, the
+      fastest to compress, the fastest to decompress, the best balance of
+      those three, and the least memory (the row whose larger memory figure
+      is smallest, shown as c-mem / d-mem). The files are one stream, as `cat access.log* | stuffr pack`
       would see them. A quoted pattern (`'logs/*.log'`) is expanded by
       stuffr itself, sorted; no match is exit 2, and so is a directory
       (name its files: `logs/*`). A pipe or device is exit 2 as well:
@@ -1311,7 +1313,9 @@ BENCHMARKING FORMATS ON YOUR OWN DATA
       library ("C: zstd, xz"), or says "pure". A format that fails is a
       row marked failed, never an exit code. On a terminal, stderr shows
       a bar for the row being measured, drawn only between timed pieces
-      and cleared before the table. Timings from a debug build
+      and cleared before the table (and by Ctrl-C, SIGTERM or SIGHUP,
+      which also stop a running memory run and remove bench's temp file
+      before bench dies of the signal). Timings from a debug build
       mean nothing, so bench refuses to run in one (exit 2): build with
       --release.
 
@@ -1347,14 +1351,36 @@ BENCHMARKING FORMATS ON YOUR OWN DATA
       the output field of --json and --csv.
 
   stuffr bench --repeat 5 access.log
-      --repeat N times each row N times and reports the medians.
+      --repeat N times each row N times and reports the medians. Memory
+      is measured once per row, whatever N is.
+
+  stuffr bench --no-memory access.log
+      The memory columns come from one more run of each row, after its
+      timed runs and untimed, in a separate child process: once to
+      compress, once to decompress (on the bar: "memory"). The figure is
+      that process's peak resident memory (what it actually touched, not
+      what it reserved) above its size before the codec started, under the
+      same level, --threads and --memory-limit as the timed runs. It
+      includes a small floor of code paged in and fixed buffers, about
+      0.1-0.35 MiB, so even a tiny format shows a small non-zero value.
+      xz on a small input touches less than it reserves, so its figure
+      can be well under its nominal dictionary size. A format that holds
+      its whole input (the pure tier's zstd encoder) grows with the
+      input. With --per-file each file gets its own pair of runs and the
+      row shows the largest. A memory run that fails (for example refused
+      by --memory-limit) shows - and never fails the row or changes the
+      exit code. --no-memory skips these runs (about half the run time):
+      no memory columns, no least-memory line. Memory is not measured on
+      Windows (the cells show -).
 
   stuffr bench --json access.log | jq .winners
   stuffr bench --csv access.log > bench.csv
-      --json prints one object (conditions, rows with scores and each
-      row's backend and output, winners); --csv one line per row, the
-      run's conditions, the row's backend and its output (memory or disk)
-      after the measurements. The README
+      --json prints one object (conditions, rows with scores, each row's
+      backend and output and its memory figures, winners); --csv one line
+      per row, the run's conditions, the row's backend and its output
+      (memory or disk) after the measurements, then compress_mem,
+      decompress_mem and mem_error (21 columns; the last three are new in
+      0.18.1, appended). The README
       documents both schemas. They cannot be combined, nor used with
       --table-only.
 

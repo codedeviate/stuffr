@@ -23,10 +23,14 @@ pub mod zstd;
 pub(crate) use host::ARM_TEST_LOCK;
 #[doc(hidden)]
 pub use host::InputReads;
-#[cfg(all(test, unix))]
-pub(crate) use host::armed_path;
+/// The whole-run signal hook `stuffr bench` registers (kill its memory
+/// child, clear its bar) before the shared cleanup handler re-raises.
+#[cfg(unix)]
+pub(crate) use host::hook_run_signals;
 /// The armed-temporary entry point `stuffr bench` shares with the families.
 pub(crate) use host::{CleanupGuard, create_armed};
+#[cfg(all(test, unix))]
+pub(crate) use host::{armed_path, disarm_inherited};
 
 /// What [`run_in_counted`] returns: the exit code, standard output,
 /// standard error, and the inputs opened with what was read from each.

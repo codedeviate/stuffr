@@ -278,7 +278,10 @@ pub enum Command {
     /// read first. Only codec work is timed, except the temp file's writes
     /// for a codec whose worst-case output is too large for memory; such a
     /// row is marked. A format that fails is a row
-    /// marked failed, not an exit code. Timings need a release build.
+    /// marked failed, not an exit code. Each row is then run once more,
+    /// untimed, in a child process to measure its peak compress and
+    /// decompress memory (resident; see --no-memory). Timings need a
+    /// release build.
     Bench(BenchArgs),
     /// Create compatibility symlinks (`bzip2`, `bunzip2`, `bzcat`,
     /// `bzip2recover`) to this binary in a directory. Opt-in, never automatic.
@@ -512,4 +515,9 @@ pub struct BenchArgs {
     /// Print the table alone: no input line, no winners, no progress.
     #[arg(short = 'q', long, conflicts_with_all = ["json", "csv"])]
     pub table_only: bool,
+    /// Skip the memory columns: by default each row is run once more,
+    /// untimed, in a child process to measure its peak compress and
+    /// decompress memory (resident set).
+    #[arg(long)]
+    pub no_memory: bool,
 }

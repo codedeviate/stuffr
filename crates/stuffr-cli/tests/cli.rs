@@ -15915,6 +15915,27 @@ fn bench_rejects_a_zero_repeat() {
     assert!(err.contains("--repeat"), "{err}");
 }
 
+/// `--no-memory` is a flag: it takes no value (a usage error naming the
+/// value, not an unknown option), and bare it is accepted, so a debug build
+/// gets as far as its refusal.
+#[test]
+fn bench_rejects_no_memory_with_an_unknown_value() {
+    let f = tmp("bench-no-memory.txt");
+    std::fs::write(&f, b"x").unwrap();
+    let (code, err) = bench_err(&["bench", "--no-memory=yes", f.to_str().unwrap()]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(
+        err.contains("unexpected value 'yes' for '--no-memory'"),
+        "{err}"
+    );
+    let (code, err) = bench_err(&["bench", "--no-memory", f.to_str().unwrap()]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(
+        err.contains("timings from a debug build are meaningless"),
+        "{err}"
+    );
+}
+
 /// A FIFO is refused from its metadata, never opened: opening one with no
 /// writer would block bench for ever.
 #[cfg(unix)]

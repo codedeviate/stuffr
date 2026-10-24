@@ -14,16 +14,19 @@ pub mod score;
 
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+#[cfg(any(unix, test))]
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use stuffr::{Error, FormatKind};
 
 use crate::cli::BenchArgs;
 use levels::{backend_of, benchable_codecs, levels_of};
 use measure::{
-    Clock, Input, Mode, Phase, Plan, RealClock, governor_for, load_input, measure, warm,
+    Clock, Input, Mode, Phase, Plan, RealClock, Snapshot, governor_for, load_input, measure, warm,
 };
 use report::{Conditions, MemoryMode};
-use score::Row;
+use score::{Outcome, Row};
 
 /// The refusal `main` prints, verbatim, for [`Ran::RefusedDebugBuild`] (exit
 /// 2). Not an `Error::Usage`, whose display would prefix "usage error:".
@@ -53,6 +56,17 @@ pub fn run(args: BenchArgs) -> stuffr::Result<Ran> {
     if cfg!(debug_assertions) {
         return Ok(Ran::RefusedDebugBuild);
     }
+    // For the whole run: SIGINT, SIGTERM and SIGHUP kill a running memory
+    // child, clear the bar, remove an armed temp file and kill bench.
+    #[cfg(unix)]
+    let _signals = crate::compat::hook_run_signals(on_run_signal);
+    let memory_mode = if args.no_memory {
+        MemoryMode::Skipped
+    } else if cfg!(unix) {
+        MemoryMode::Measured
+    } else {
+        MemoryMode::Unsupported
+    };
 
     let (input, bytes_in) = load_input(&paths, memory_limit)?;
     warm(&input)?;
@@ -75,6 +89,7 @@ pub fn run(args: BenchArgs) -> stuffr::Result<Ran> {
         terminal_width,
     );
     let mut clock = RealClock::new();
+    let snapshots = snapshots_of(&paths, &input);
     let mut rows = Vec::with_capacity(planned.len());
     for (k, p) in planned.iter().enumerate() {
         meter.row(RowLabel {
@@ -92,13 +107,19 @@ pub fn run(args: BenchArgs) -> stuffr::Result<Ran> {
             &mut clock,
             &mut |ph, d, t| meter.progress(ph, d, t),
         );
+        // Strictly after the timed runs, in untimed child processes; a
+        // failed row has nothing to measure.
+        let memory = (memory_mode == MemoryMode::Measured && matches!(outcome, Outcome::Ok(_)))
+            .then(|| {
+                meter.memory();
+                memory::measure_memory(p.format, p.level, &plan, &snapshots)
+            });
         rows.push(Row {
             format: p.format,
             level: p.label,
             backend: backend_of(p.format),
             outcome,
-            // Wired in a later task; until then nothing is measured.
-            memory: None,
+            memory,
         });
     }
     meter.clear();
@@ -112,8 +133,7 @@ pub fn run(args: BenchArgs) -> stuffr::Result<Ran> {
         workers: governor_for(&plan).map_or(1, |g| g.workers()),
         repeat: plan.repeat,
         streamed: matches!(input, Input::Files(_)),
-        // Wired in a later task, with the measuring itself.
-        memory: MemoryMode::Skipped,
+        memory: memory_mode,
     };
     let mut out = io::stdout().lock();
     if args.json {
@@ -127,6 +147,67 @@ pub fn run(args: BenchArgs) -> stuffr::Result<Ran> {
     }
     out.flush()?;
     Ok(Ran::Measured)
+}
+
+/// The files as the memory children read them: each with the length it
+/// had at load (the bytes read, for input held in memory).
+fn snapshots_of(paths: &[PathBuf], input: &Input) -> Vec<Snapshot> {
+    match input {
+        Input::Files(snaps) => snaps.clone(),
+        Input::Memory(parts) => paths
+            .iter()
+            .zip(parts)
+            .map(|(p, b)| Snapshot {
+                path: p.clone(),
+                len: b.len() as u64,
+            })
+            .collect(),
+    }
+}
+
+/// Whether the bar line is on stderr now (drawn and not yet cleared). The
+/// signal hook reads it, so it is an atomic, not the meter's own field.
+static BAR_DRAWN: AtomicBool = AtomicBool::new(false);
+
+/// What clears the bar line: back to its start, erase to the end.
+const CLEAR_LINE: &[u8] = b"\r\x1b[K";
+
+/// The pre-exit hook `compat::host` runs on SIGINT, SIGTERM and SIGHUP
+/// before it removes an armed temp file and re-raises: kill the memory
+/// child, then clear the bar. In a signal handler: `kill`, `write(2)` and
+/// atomics only.
+#[cfg(unix)]
+extern "C" fn on_run_signal() {
+    pre_exit(
+        &memory::RUNNING_CHILD,
+        &BAR_DRAWN,
+        // SAFETY: kill is async-signal-safe; `pre_exit` passes only a
+        // positive pid, never 0 or -1 (a process group, everyone).
+        |pid| unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        },
+        // SAFETY: write is async-signal-safe; the bytes are a static.
+        || unsafe {
+            libc::write(
+                libc::STDERR_FILENO,
+                CLEAR_LINE.as_ptr().cast(),
+                CLEAR_LINE.len(),
+            );
+        },
+    );
+}
+
+/// The hook's steps, in order: `kill` the running child (a positive pid
+/// in `child`; 0 is none), then `clear` the bar when `drawn` says it is up.
+#[cfg(any(unix, test))]
+fn pre_exit(child: &AtomicI32, drawn: &AtomicBool, kill: impl FnOnce(i32), clear: impl FnOnce()) {
+    let pid = child.load(Ordering::SeqCst);
+    if pid > 0 {
+        kill(pid);
+    }
+    if drawn.load(Ordering::SeqCst) {
+        clear();
+    }
 }
 
 /// The least time between two redraws of the bar, in nanoseconds.
@@ -163,6 +244,8 @@ struct Meter {
     drawn_at: Option<u64>,
     frame: usize,
     shown: bool,
+    /// `shown`, for the signal hook: [`BAR_DRAWN`] outside tests.
+    drawn: &'static AtomicBool,
     /// The terminal's width in columns, asked at each draw.
     width: fn() -> usize,
 }
@@ -184,7 +267,30 @@ impl Meter {
             drawn_at: None,
             frame: 0,
             shown: false,
+            drawn: &BAR_DRAWN,
         }
+    }
+
+    /// The flag to keep `shown` in, instead of [`BAR_DRAWN`].
+    #[cfg(test)]
+    fn with_drawn_flag(mut self, drawn: &'static AtomicBool) -> Self {
+        self.drawn = drawn;
+        self
+    }
+
+    /// The row's memory phase: `[k/N] format level  memory`, drawn at
+    /// once. The children report no progress, so there is no bar.
+    fn memory(&mut self) {
+        let (Some(out), Some(row)) = (self.out.as_mut(), self.row) else {
+            return;
+        };
+        let level = row.level.map_or_else(|| "-".to_string(), |l| l.to_string());
+        let line = format!("[{}/{}] {} {level}  memory", row.k, row.n, row.format);
+        let line = fit(&line, (self.width)().saturating_sub(1));
+        let _ = write!(out, "\r{line}\x1b[K");
+        let _ = out.flush();
+        self.shown = true;
+        self.drawn.store(true, Ordering::SeqCst);
     }
 
     /// The next row; its first report is drawn at once.
@@ -220,13 +326,17 @@ impl Meter {
         self.frame = (self.frame + 1) % SPINNER.len();
         self.drawn_at = Some(now);
         self.shown = true;
+        self.drawn.store(true, Ordering::SeqCst);
     }
 
     fn clear(&mut self) {
         if let Some(out) = self.out.as_mut()
             && self.shown
         {
-            let _ = write!(out, "\r\x1b[K");
+            // Down first: a signal between the two finds the line cleared
+            // or about to be, and clearing twice is harmless.
+            self.drawn.store(false, Ordering::SeqCst);
+            let _ = out.write_all(CLEAR_LINE);
             let _ = out.flush();
             self.shown = false;
         }
@@ -1052,5 +1162,151 @@ mod tests {
         meter.clear();
         assert_eq!(reads.get(), 0, "an off meter read its clock");
         assert!(!meter.shown);
+    }
+
+    /// The atomic the signal hook reads follows the meter: up from a
+    /// row's first draw (and the memory line), down at `clear`; an off
+    /// meter never raises it.
+    #[test]
+    fn the_meter_flag_tracks_drawing() {
+        static DRAWN: AtomicBool = AtomicBool::new(false);
+        let out = Captured::default();
+        let t = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut meter = Meter::new(
+            Some(Box::new(out.clone())),
+            Box::new(HandClock(t)),
+            1,
+            || 80,
+        )
+        .with_drawn_flag(&DRAWN);
+        meter.row(label(1, 2, "xz", Some(6)));
+        assert!(!DRAWN.load(Ordering::SeqCst), "up before any draw");
+        meter.progress(Phase::Compress, 0, 1000);
+        assert!(DRAWN.load(Ordering::SeqCst), "down after a draw");
+        meter.clear();
+        assert!(!DRAWN.load(Ordering::SeqCst), "up after clear");
+        meter.memory();
+        assert!(DRAWN.load(Ordering::SeqCst), "down after the memory line");
+        meter.clear();
+        assert!(!DRAWN.load(Ordering::SeqCst), "up after clear");
+
+        static OFF: AtomicBool = AtomicBool::new(false);
+        let mut off = Meter::new(None, Box::new(RealClock::new()), 1, || 80).with_drawn_flag(&OFF);
+        off.row(label(1, 1, "xz", Some(6)));
+        off.progress(Phase::Compress, 0, 1000);
+        off.memory();
+        assert!(!OFF.load(Ordering::SeqCst), "an off meter raised the flag");
+    }
+
+    /// The memory phase is the row's label and the word `memory`, no bar,
+    /// fitted to the width like the bar line.
+    #[test]
+    fn the_memory_phase_shows_the_row_and_memory() {
+        static DRAWN: AtomicBool = AtomicBool::new(false);
+        let out = Captured::default();
+        let mut meter = Meter::new(
+            Some(Box::new(out.clone())),
+            Box::new(RealClock::new()),
+            3,
+            || 80,
+        )
+        .with_drawn_flag(&DRAWN);
+        meter.row(label(3, 8, "xz", Some(9)));
+        meter.memory();
+        meter.row(label(8, 8, "lz4", None));
+        meter.memory();
+        assert_eq!(
+            out.lines(),
+            vec!["[3/8] xz 9  memory", "[8/8] lz4 -  memory"]
+        );
+        let mut narrow = Meter::new(
+            Some(Box::new(out.clone())),
+            Box::new(RealClock::new()),
+            1,
+            || 12,
+        )
+        .with_drawn_flag(&DRAWN);
+        narrow.row(label(3, 8, "xz", Some(9)));
+        narrow.memory();
+        assert_eq!(out.lines().last().unwrap(), "[3/8] xz 9");
+    }
+
+    /// The hook's order: the child is killed before the bar is cleared;
+    /// no child (0) is never killed, nor is a non-positive pid (kill(0)
+    /// and kill(-1) would reach the process group or everyone); a bar
+    /// that is not drawn is not cleared.
+    #[test]
+    fn the_signal_hook_kills_the_child_then_clears_the_bar() {
+        let steps = std::cell::RefCell::new(Vec::new());
+        let run = |pid: i32, drawn: bool| {
+            steps.borrow_mut().clear();
+            pre_exit(
+                &AtomicI32::new(pid),
+                &AtomicBool::new(drawn),
+                |p| steps.borrow_mut().push(format!("kill {p}")),
+                || steps.borrow_mut().push("clear".to_string()),
+            );
+            steps.borrow().clone()
+        };
+        assert_eq!(run(4242, true), vec!["kill 4242", "clear"]);
+        assert_eq!(run(4242, false), vec!["kill 4242"]);
+        assert_eq!(run(0, true), vec!["clear"]);
+        assert_eq!(run(-1, true), vec!["clear"]);
+        assert!(run(0, false).is_empty());
+    }
+
+    /// End to end in a forked child, as bench registers it: SIGINT with
+    /// a memory child running and the bar up kills that child (SIGKILL),
+    /// writes the clear to stderr, and the process dies of SIGINT.
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_kills_the_memory_child_clears_the_bar_and_kills_bench() {
+        let mut victim = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(victim.id()).unwrap();
+        let mut fds = [0; 2];
+        // SAFETY: pipe fills the two-element array it is given.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: the child makes only async-signal-safe calls (signal,
+        // dup2, atomics, sigaction inside `hook_run_signals`, raise) and
+        // ends by the signal or `_exit`; it never returns into the harness.
+        let status = unsafe {
+            let child = libc::fork();
+            assert!(child >= 0, "fork: {}", io::Error::last_os_error());
+            if child == 0 {
+                for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                    libc::signal(sig, libc::SIG_DFL);
+                }
+                // The parent's armed temp file (another test's) is not ours.
+                crate::compat::disarm_inherited();
+                libc::dup2(fds[1], libc::STDERR_FILENO);
+                memory::RUNNING_CHILD.store(pid, Ordering::SeqCst);
+                BAR_DRAWN.store(true, Ordering::SeqCst);
+                let _hook = crate::compat::hook_run_signals(on_run_signal);
+                libc::raise(libc::SIGINT);
+                libc::_exit(99);
+            }
+            libc::close(fds[1]);
+            let mut status = 0;
+            while libc::waitpid(child, &mut status, 0) < 0 {
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EINTR));
+            }
+            status
+        };
+        let mut got = [0u8; 16];
+        // SAFETY: reading into a buffer we own, then closing the read end.
+        let n = unsafe {
+            let n = libc::read(fds[0], got.as_mut_ptr().cast(), got.len());
+            libc::close(fds[0]);
+            n
+        };
+        assert!(libc::WIFSIGNALED(status), "exited: {status:#x}");
+        assert_eq!(libc::WTERMSIG(status), libc::SIGINT);
+        assert_eq!(&got[..usize::try_from(n).unwrap_or(0)], CLEAR_LINE);
+        let ended = victim.wait().unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(ended.signal(), Some(libc::SIGKILL), "{ended:?}");
     }
 }

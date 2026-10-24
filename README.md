@@ -1900,11 +1900,15 @@ stuffr bench access.log*                         # every benchable codec, defaul
 stuffr bench --levels --formats xz,brotli a.log  # every level of two formats
 stuffr bench --per-file a.log b.log              # each file its own stream
 stuffr bench --json access.log | jq .winners     # or --csv; --table-only (-q) for the table alone
+stuffr bench --no-memory access.log              # skip the memory runs
 ```
 
-Each row gives the compressed size, the ratio and the compress and
-decompress times; below the table come the smallest, the fastest each way
-and the best balance. Every format runs under the same conditions: the same
+Each row gives the compressed size, the ratio, the compress and
+decompress times, and the peak memory to compress (`c-mem`) and to
+decompress (`d-mem`); below the table come the smallest, the fastest each
+way, the best balance of those three, and `least memory:` (the row whose
+larger memory figure is smallest, shown as `c-mem / d-mem`; ties to the
+smaller output). Every format runs under the same conditions: the same
 input (in memory, or streamed from disk when it is over half of
 `--memory-limit`), the same
 `--threads` setting for compression (bench ignores `STUFFR_THREADS`;
@@ -1930,24 +1934,51 @@ dangling symlink, a directory that cannot be read (named, or on a pattern's
 way) and a file that cannot be read are exit 2 as well, naming the path. A format that fails is a row
 marked failed, not an exit code. On a terminal, stderr shows a bar for the
 row being measured, drawn only between timed pieces and cleared before the
-table. Timings need a release build; a debug build refuses with exit 2.
+table; Ctrl-C, SIGTERM and SIGHUP clear it too (and stop a running memory
+run and remove bench's temp file) before bench dies of the signal. Timings
+need a release build; a debug build refuses with exit 2.
+
+**Memory.** After a row's timed runs, bench runs it once more, untimed, in
+a separate child process: once to compress, once to decompress (the bar
+reads `memory`). The figure is that process's peak resident memory, what it
+actually touched, not what it reserved, above its size just before the
+codec started, under the same level, `--threads` and `--memory-limit` as the
+timed runs, and measured once per row whatever `--repeat` says. It includes
+a small floor of code paged in and fixed buffers, about 0.1–0.35 MiB, so
+even a tiny format shows a small non-zero value. xz on a small input
+touches less than it reserves, so its figure can be well under its nominal
+dictionary size. A format that holds its whole input (the pure tier's zstd
+encoder) grows with the input. With `--per-file` each file gets its own
+pair of runs and the row shows the largest. A memory run that fails (for
+example refused by `--memory-limit`) shows `-`; the row's other figures
+stand, it takes no part in `least memory`, and the exit code is unchanged.
+`--no-memory` skips these runs (they roughly double a run's time): no
+memory columns and no `least memory` line. Off unix (Windows) memory is not
+measured: the cells show `-` and the input line says `memory not measured
+on this platform`.
 
 `--json` prints one object. `conditions` holds `files`, `bytes_in`, `mode`
 (`one-stream` or `per-file`), `threads` (`--threads` as given, `null` when
-omitted), `workers` (the compression threads that resolved to), `repeat` and
-`streamed`. Each of `rows` holds `format`, `level` (`null` for lz4 and
+omitted), `workers` (the compression threads that resolved to), `repeat`,
+`streamed` and `memory` (`true` when the memory runs were made). Each of `rows` holds `format`, `level` (`null` for lz4 and
 snappy), `backend` (`c` or `pure`), `ok`, `bytes_out`, `ratio` (input bytes
 ÷ `bytes_out`), `compress_ns`, `decompress_ns` (medians, nanoseconds),
 `balance` (the mean of the three `best / value` scores, relative to this
 run), `error` and `output` (`memory`, or `disk` when the compressed output
-went to the temp file while timed; `null` for a failed row); a failed row has `ok: false`, its reason in `error` and
+went to the temp file while timed; `null` for a failed row), `compress_mem`
+and `decompress_mem` (peak resident bytes, `null` when not measured or when
+that side's run failed) and `mem_error` (why a memory run failed, else
+`null`); a failed row has `ok: false`, its reason in `error` and
 `null` in every measurement, and a ratio that cannot be computed (0 bytes)
 is `null`. `winners` names `smallest`, `fastest_compress`,
-`fastest_decompress` and `balance` as `{format, level}`, or `null` when no
-row succeeded. `--csv` has the columns `format, level, ok, bytes_in,
+`fastest_decompress`, `balance` and `least_memory` as `{format, level}`, or
+`null` when no row qualifies (`least_memory` is `null` under `--no-memory`).
+`--csv` has 21 columns: `format, level, ok, bytes_in,
 bytes_out, ratio, compress_ns, decompress_ns, balance, error, files, mode,
-threads, workers, repeat, streamed, backend, output`, in that order, with the same
-units; an empty field stands for `null`.
+threads, workers, repeat, streamed, backend, output, compress_mem,
+decompress_mem, mem_error`, in that order, with the same units; an empty
+field stands for `null`. The last three were appended in 0.18.1 (18
+columns before), so a reader that takes columns by position is unaffected.
 
 ### Two safety defaults that are not negotiable
 

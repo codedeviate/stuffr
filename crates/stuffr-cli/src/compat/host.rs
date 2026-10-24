@@ -255,6 +255,17 @@ fn install_handlers(signals: Signals) {
 /// It never allocates or locks.
 #[cfg(unix)]
 extern "C" fn on_cleanup_signal(sig: libc::c_int) {
+    // A hook registered for the whole run (`hook_run_signals`) goes first:
+    // `stuffr bench` kills its memory child and clears its bar there. No
+    // compatibility family registers one, so for them this load is 0.
+    let hook = PRE_EXIT_HOOK.load(Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: a non-zero value was stored by `hook_run_signals` from an
+        // `extern "C" fn()`, so transmuting it back gives that function.
+        // Its contract: async-signal-safe calls only.
+        let hook: extern "C" fn() = unsafe { std::mem::transmute(hook) };
+        hook();
+    }
     if ARMED.load(Ordering::Acquire) {
         // SAFETY: `ARMED` true means the slot holds a NUL-terminated path,
         // written before the Release store this load pairs with; unlink is
@@ -268,6 +279,50 @@ extern "C" fn on_cleanup_signal(sig: libc::c_int) {
         libc::signal(sig, libc::SIG_DFL);
         libc::raise(sig);
     }
+}
+
+/// The function `on_cleanup_signal` calls before removing the armed path,
+/// as a `usize` (0: none). Set only by [`hook_run_signals`].
+#[cfg(unix)]
+static PRE_EXIT_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// What [`hook_run_signals`] returns; dropping it unregisters the hook.
+#[cfg(unix)]
+#[must_use = "dropping the guard unregisters the hook at once"]
+pub(crate) struct RunHookGuard {
+    _private: (),
+}
+
+#[cfg(unix)]
+impl Drop for RunHookGuard {
+    fn drop(&mut self) {
+        PRE_EXIT_HOOK.store(0, Ordering::Release);
+    }
+}
+
+/// For a whole native run (`stuffr bench`), not a compatibility family:
+/// install the cleanup handler [`create_armed`] uses on its signals
+/// (SIGINT, SIGTERM, SIGHUP; one left ignored stays ignored) now rather
+/// than at the first arm, and register `hook` for it to call first. On one
+/// of those signals the handler then runs `hook`, removes the armed temp
+/// file if one is armed, and re-raises at the default action, so the
+/// process still dies of the signal. With nothing armed and no hook that is
+/// exactly the default action, which is why the handler may stay installed
+/// after the guard drops (as `arm_cleanup`'s does).
+///
+/// `hook` runs in a signal handler: it must make async-signal-safe calls
+/// only (no allocation, no locks). One hook at a time; no compatibility
+/// family registers one, so their handling is unchanged.
+#[cfg(unix)]
+pub(crate) fn hook_run_signals(hook: extern "C" fn()) -> RunHookGuard {
+    debug_assert_eq!(
+        PRE_EXIT_HOOK.load(Ordering::Acquire),
+        0,
+        "hook_run_signals: a hook is already registered"
+    );
+    PRE_EXIT_HOOK.store(hook as usize, Ordering::Release);
+    install_handlers(TEMP_SIGNALS);
+    RunHookGuard { _private: () }
 }
 
 /// zstd 1.5.7's addHandler (fileio.c): arm the removal of `path`, the run's
@@ -1027,6 +1082,14 @@ pub(crate) fn armed_path() -> Option<PathBuf> {
     let slot = unsafe { &*SLOT.0.get() };
     let len = slot.iter().position(|&b| b == 0)?;
     Some(PathBuf::from(std::ffi::OsStr::from_bytes(&slot[..len])))
+}
+
+/// In a test's forked child: forget the arm inherited at `fork` (another
+/// test's temp file in the parent), so a signal there removes nothing of
+/// the parent's. Only after `fork`: a store, async-signal-safe.
+#[cfg(all(test, unix))]
+pub(crate) fn disarm_inherited() {
+    ARMED.store(false, Ordering::SeqCst);
 }
 
 /// Held by every lib test that arms the cleanup in the test process itself
@@ -2160,6 +2223,83 @@ mod tests {
             );
             assert_eq!(libc::WTERMSIG(status), sig);
             assert!(!file.exists(), "signal {sig}: the temporary survived");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The pipe the recording hook writes to, and the path it checks.
+    #[cfg(unix)]
+    static HOOK_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+    #[cfg(unix)]
+    static HOOK_PATH: std::sync::atomic::AtomicPtr<libc::c_char> =
+        std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+    /// Records, async-signal-safely, whether the armed file still existed
+    /// when the hook ran: `H` yes, `h` no.
+    #[cfg(unix)]
+    extern "C" fn recording_hook() {
+        // SAFETY: access and write are async-signal-safe; the path is a
+        // NUL-terminated CString the forking test keeps alive.
+        unsafe {
+            let there = libc::access(HOOK_PATH.load(Ordering::SeqCst), libc::F_OK) == 0;
+            let b = if there { b"H" } else { b"h" };
+            libc::write(HOOK_PIPE.load(Ordering::SeqCst), b.as_ptr().cast(), 1);
+        }
+    }
+
+    /// `hook_run_signals`: the handler is installed for the whole run,
+    /// before anything is armed, and on each of bench's signals runs the
+    /// hook first (the armed temp file still there), then removes the
+    /// temp file, then dies of the signal. With nothing armed the hook
+    /// still runs and the process still dies of the signal.
+    #[cfg(unix)]
+    #[test]
+    fn the_run_hook_runs_before_the_cleanup_and_the_reraise() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = scratch("run-hook");
+        for &sig in TEMP_SIGNALS {
+            for arm in [true, false] {
+                let file = dir.join(format!("bench-{sig}-{arm}"));
+                let cpath = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+                let mut fds = [0; 2];
+                // SAFETY: pipe fills the two-element array it is given.
+                assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+                HOOK_PIPE.store(fds[1], Ordering::SeqCst);
+                HOOK_PATH.store(cpath.as_ptr().cast_mut(), Ordering::SeqCst);
+                let status = in_child(|| {
+                    default_dispositions();
+                    ARMED.store(false, Ordering::SeqCst);
+                    PRE_EXIT_HOOK.store(0, Ordering::SeqCst);
+                    let _hook = hook_run_signals(recording_hook);
+                    let armed = arm.then(|| create_armed(&file));
+                    if armed.as_ref().is_none_or(Result::is_ok) {
+                        // SAFETY: raise is async-signal-safe; the handler
+                        // runs the hook, unlinks, and re-raises at SIG_DFL.
+                        unsafe { libc::raise(sig) };
+                    }
+                });
+                // SAFETY: closing our write end, then reading what the
+                // child wrote into a buffer we own; closing the read end.
+                let mut got = [0u8; 4];
+                let n = unsafe {
+                    libc::close(fds[1]);
+                    let n = libc::read(fds[0], got.as_mut_ptr().cast(), got.len());
+                    libc::close(fds[0]);
+                    n
+                };
+                assert!(
+                    libc::WIFSIGNALED(status),
+                    "signal {sig}: the child exited (status {status:#x})"
+                );
+                assert_eq!(libc::WTERMSIG(status), sig);
+                let want: &[u8] = if arm { b"H" } else { b"h" };
+                assert_eq!(
+                    &got[..usize::try_from(n).unwrap_or(0)],
+                    want,
+                    "signal {sig}"
+                );
+                assert!(!file.exists(), "signal {sig}: the temporary survived");
+            }
         }
         let _ = fs::remove_dir_all(&dir);
     }
