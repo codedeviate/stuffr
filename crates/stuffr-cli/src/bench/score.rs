@@ -23,6 +23,24 @@ pub enum Outcome {
     Failed(String),
 }
 
+/// Peak resident memory of one row, from the untimed memory runs. A number is
+/// `None` when its run failed; `error` then says why (a refusal by
+/// `--memory-limit` reads differently from a crash).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Memory {
+    pub compress: Option<u64>,
+    pub decompress: Option<u64>,
+    pub error: Option<String>,
+}
+
+impl Memory {
+    /// The RAM a machine needs to use the row's format: the larger of the
+    /// two peaks. `None` unless both were measured.
+    fn needed(&self) -> Option<u64> {
+        Some(self.compress?.max(self.decompress?))
+    }
+}
+
 /// One line of the table. `level` is `None` for codecs without levels
 /// (lz4, snappy). `backend` is `"c"` or `"pure"`: which implementation of
 /// the format this build ran (`levels::backend_of`).
@@ -32,6 +50,8 @@ pub struct Row {
     pub level: Option<i32>,
     pub backend: &'static str,
     pub outcome: Outcome,
+    /// `None`: not measured (`--no-memory`, or a build without `getrusage`).
+    pub memory: Option<Memory>,
 }
 
 /// Indices into the rows slice, one per column; `None` when no row succeeded.
@@ -41,6 +61,8 @@ pub struct Winners {
     pub fastest_compress: Option<usize>,
     pub fastest_decompress: Option<usize>,
     pub balance: Option<usize>,
+    /// Smallest `max(compress, decompress)` memory, among rows with both.
+    pub least_memory: Option<usize>,
 }
 
 fn measured(row: &Row) -> Option<&Measured> {
@@ -79,7 +101,7 @@ pub fn balance_scores(rows: &[Row]) -> Vec<Option<f64>> {
 }
 
 /// The winner of each column. Ties go to the smaller `bytes_out`, then to
-/// the earlier row.
+/// the earlier row. `least_memory` considers only rows with both numbers.
 pub fn winners(rows: &[Row]) -> Winners {
     let scores = balance_scores(rows);
     let by_min = |key: fn(&Measured) -> u64| {
@@ -103,11 +125,18 @@ pub fn winners(rows: &[Row]) -> Winners {
             }
         })
         .map(|(i, _, _)| i);
+    let least_memory = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| Some((i, measured(r)?, r.memory.as_ref()?.needed()?)))
+        .min_by_key(|(i, m, need)| (*need, m.bytes_out, *i))
+        .map(|(i, _, _)| i);
     Winners {
         smallest: by_min(|m| m.bytes_out),
         fastest_compress: by_min(|m| m.compress_ns),
         fastest_decompress: by_min(|m| m.decompress_ns),
         balance,
+        least_memory,
     }
 }
 
@@ -126,7 +155,17 @@ mod tests {
                 decompress_ns,
                 on_disk: false,
             }),
+            memory: None,
         }
+    }
+
+    fn with_mem(mut row: Row, c: Option<u64>, d: Option<u64>) -> Row {
+        row.memory = Some(Memory {
+            compress: c,
+            decompress: d,
+            error: None,
+        });
+        row
     }
 
     fn failed() -> Row {
@@ -135,6 +174,7 @@ mod tests {
             level: None,
             backend: "pure",
             outcome: Outcome::Failed("boom".into()),
+            memory: None,
         }
     }
 
@@ -228,5 +268,39 @@ mod tests {
         assert_eq!(w.fastest_compress, Some(1));
         assert_eq!(w.fastest_decompress, Some(1));
         assert_eq!(w.balance, Some(1));
+    }
+
+    #[test]
+    fn least_memory_takes_the_smaller_maximum() {
+        let rows = vec![
+            with_mem(ok(1, 1, 1), Some(10), Some(90)),
+            with_mem(ok(1, 1, 1), Some(50), Some(50)),
+            with_mem(ok(1, 1, 1), Some(80), Some(5)),
+        ];
+        assert_eq!(winners(&rows).least_memory, Some(1));
+    }
+
+    #[test]
+    fn least_memory_ignores_rows_missing_a_number() {
+        let rows = vec![
+            with_mem(ok(1, 1, 1), Some(1), None),
+            with_mem(ok(1, 1, 1), None, Some(1)),
+            ok(1, 1, 1),
+            with_mem(failed(), Some(1), Some(1)),
+            with_mem(ok(1, 1, 1), Some(70), Some(60)),
+        ];
+        assert_eq!(winners(&rows).least_memory, Some(4));
+        let none = vec![with_mem(ok(1, 1, 1), Some(1), None), ok(1, 1, 1)];
+        assert_eq!(winners(&none).least_memory, None);
+    }
+
+    #[test]
+    fn least_memory_tie_goes_to_the_smaller_output() {
+        let rows = vec![
+            with_mem(ok(100, 1, 1), Some(5), Some(9)),
+            with_mem(ok(60, 1, 1), Some(9), Some(2)),
+            with_mem(ok(60, 1, 1), Some(9), Some(9)),
+        ];
+        assert_eq!(winners(&rows).least_memory, Some(1));
     }
 }

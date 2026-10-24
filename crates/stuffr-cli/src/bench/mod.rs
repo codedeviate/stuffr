@@ -21,7 +21,7 @@ use levels::{backend_of, benchable_codecs, levels_of};
 use measure::{
     Clock, Input, Mode, Phase, Plan, RealClock, governor_for, load_input, measure, warm,
 };
-use report::Conditions;
+use report::{Conditions, MemoryMode};
 use score::Row;
 
 /// The refusal `main` prints, verbatim, for [`Ran::RefusedDebugBuild`] (exit
@@ -96,6 +96,8 @@ pub fn run(args: BenchArgs) -> stuffr::Result<Ran> {
             level: p.label,
             backend: backend_of(p.format),
             outcome,
+            // Wired in a later task; until then nothing is measured.
+            memory: None,
         });
     }
     meter.clear();
@@ -109,6 +111,8 @@ pub fn run(args: BenchArgs) -> stuffr::Result<Ran> {
         workers: governor_for(&plan).map_or(1, |g| g.workers()),
         repeat: plan.repeat,
         streamed: matches!(input, Input::Files(_)),
+        // Wired in a later task, with the measuring itself.
+        memory: MemoryMode::Skipped,
     };
     let mut out = io::stdout().lock();
     if args.json {
@@ -116,7 +120,7 @@ pub fn run(args: BenchArgs) -> stuffr::Result<Ran> {
     } else if args.csv {
         report::csv(&conditions, &rows, &mut out)?;
     } else if args.table_only {
-        report::table_only(&rows, conditions.bytes_in, &mut out)?;
+        report::table_only(&rows, conditions.bytes_in, conditions.memory, &mut out)?;
     } else {
         report::human(&conditions, &rows, &mut out)?;
     }
