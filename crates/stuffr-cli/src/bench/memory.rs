@@ -47,7 +47,7 @@ use stuffr::source::{GuardedSeek, Source};
 use stuffr::{Codec, DecodeOpts, EncodeOpts, Error, FormatKind};
 
 use super::measure::{
-    CHUNK, Mode, Plan, Snapshot, TempOut, fill, governor_for, read_some, temp_source,
+    CHUNK, Mode, Plan, Snapshot, TempOut, fill, governor_for, read_some, shrank, temp_source,
 };
 use super::score::Memory;
 
@@ -99,6 +99,7 @@ impl ChildJob {
     /// The arguments after [`CHILD_ARG`]:
     /// `<side> <codec> <level|-> <threads|-> <memory-limit> [<len> <path>]…`,
     /// `side` being `compress` or `decompress`, every number in decimal.
+    /// The decompress side ignores the level (the parent sends `-`).
     /// Paths go as they are (not through UTF-8), each its own argument.
     pub fn to_args(&self) -> Vec<OsString> {
         let opt = |v: Option<String>| OsString::from(v.unwrap_or_else(|| NONE.to_string()));
@@ -240,15 +241,22 @@ pub fn child_entry(args: &[OsString]) -> Option<ExitCode> {
     if args.get(1).map(OsString::as_os_str) != Some(OsStr::new(CHILD_ARG)) {
         return None;
     }
-    let result = if cfg!(debug_assertions) {
-        Err(DEBUG_CHILD_REFUSAL.to_string())
+    // A malformed job is a usage error (exit 2): exit 1 is reserved for
+    // stuffr itself failing. The parent takes any non-zero exit with `err`.
+    let (result, code) = if cfg!(debug_assertions) {
+        (Err(DEBUG_CHILD_REFUSAL.to_string()), ExitCode::FAILURE)
     } else {
-        ChildJob::from_args(&args[2..]).and_then(child_main)
+        match ChildJob::from_args(&args[2..]) {
+            Ok(job) => (child_main(job), ExitCode::FAILURE),
+            Err(e) => (Err(e), ExitCode::from(2)),
+        }
     };
     let mut out = io::stdout().lock();
     let printed = writeln!(out, "{}", reply_line(&result)).and_then(|()| out.flush());
     Some(if result.is_ok() && printed.is_ok() {
         ExitCode::SUCCESS
+    } else if result.is_err() {
+        code
     } else {
         ExitCode::FAILURE
     })
@@ -302,18 +310,7 @@ fn compress_child(
     let baseline = peak_rss()?;
     let mut sink = codec.encoder(Box::new(dst), encode)?;
     for (snap, f) in &mut feeds {
-        let mut read = 0u64;
-        loop {
-            let n = read_some(f, &mut buf)?;
-            if n == 0 {
-                break;
-            }
-            read += n as u64;
-            sink.write_all(&buf[..n])?;
-        }
-        if read < snap.len {
-            return Err(shrank(snap, read));
-        }
+        feed(snap, f, &mut buf, &mut *sink)?;
     }
     sink.finish()?;
     Ok(peak_rss()?.saturating_sub(baseline))
@@ -337,15 +334,27 @@ fn decompress_child(
     Ok(peak_rss()?.saturating_sub(baseline))
 }
 
-fn shrank(snap: &Snapshot, read: u64) -> Error {
-    Error::Io(io::Error::new(
-        io::ErrorKind::UnexpectedEof,
-        format!(
-            "{} shrank to {read} bytes from {} while bench ran",
-            snap.path.display(),
-            snap.len
-        ),
-    ))
+/// Writes all of `f` (`snap` opened) to `sink` through `buf`; a file that
+/// ends short of its loaded length is an error, as in the timed runs.
+fn feed(
+    snap: &Snapshot,
+    f: &mut io::Take<File>,
+    buf: &mut [u8],
+    sink: &mut dyn Write,
+) -> stuffr::Result<()> {
+    let mut read = 0u64;
+    loop {
+        let n = read_some(f, buf)?;
+        if n == 0 {
+            break;
+        }
+        read += n as u64;
+        sink.write_all(&buf[..n])?;
+    }
+    if read < snap.len {
+        return Err(shrank(snap, read));
+    }
+    Ok(())
 }
 
 /// This process's peak resident set so far, in bytes: `ru_maxrss`, which
@@ -401,6 +410,12 @@ impl Runner for ProcessRunner {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("cannot start the memory run: {e}"))?;
+        // Known window, accepted (ruling F7): `wait_with_output` reaps the
+        // child before the clear below, so a signal arriving in between
+        // makes the cleanup `kill()` a pid that is no longer ours. It lasts
+        // microseconds and pids are handed out sequentially, so reuse
+        // inside it is theoretical. Clearing before the wait instead would
+        // leave the child running (orphaned) on a bare SIGTERM to bench.
         RUNNING_CHILD.store(i32::try_from(child.id()).unwrap_or(0), Ordering::SeqCst);
         let out = child.wait_with_output();
         RUNNING_CHILD.store(0, Ordering::SeqCst);
@@ -441,14 +456,23 @@ pub fn measure_memory_with(
     plan: &Plan,
     input_files: &[Snapshot],
 ) -> Memory {
+    // bench always has at least one input; with none there is nothing to
+    // measure, and a zero would wrongly win "least memory".
+    if input_files.is_empty() {
+        return Memory {
+            error: Some("no input to measure".into()),
+            ..Memory::default()
+        };
+    }
     let streams: Vec<&[Snapshot]> = match plan.mode {
         Mode::OneStream => vec![input_files],
         Mode::PerFile => input_files.chunks(1).collect(),
     };
+    // The decompress side has no level: it is sent as `-`.
     let job = |side, files| ChildJob {
         side,
         codec,
-        level,
+        level: if side == Side::Compress { level } else { None },
         threads: plan.threads,
         memory_limit: plan.memory_limit,
         files,
@@ -513,19 +537,7 @@ fn write_copy(
     let mut sink = codec.encoder(Box::new(BufWriter::with_capacity(CHUNK, file)), &encode)?;
     let mut buf = vec![0u8; CHUNK];
     for snap in files {
-        let mut f = snap.open()?;
-        let mut read = 0u64;
-        loop {
-            let n = read_some(&mut f, &mut buf)?;
-            if n == 0 {
-                break;
-            }
-            read += n as u64;
-            sink.write_all(&buf[..n])?;
-        }
-        if read < snap.len {
-            return Err(shrank(snap, read));
-        }
+        feed(snap, &mut snap.open()?, &mut buf, &mut *sink)?;
     }
     sink.finish()?;
     let len = std::fs::metadata(temp.path())?.len();
@@ -714,68 +726,115 @@ mod tests {
         }
     }
 
-    /// In-process, so a weak check: `ru_maxrss` is this whole test
-    /// process's high-water mark, shared with every other test running
-    /// beside it, so the figures here only show the child path runs and
-    /// that xz -9's encoder (a 64 MiB dictionary) touches more than lz4's.
-    /// The real figures come from the release-build manual run, where each
-    /// child is its own process.
+    /// The env vars that make [`memory_probe`] run, and the prefix its
+    /// reply line carries in libtest's captured output.
+    #[cfg(unix)]
+    const PROBE_CODEC: &str = "STUFFR_BENCH_MEMORY_PROBE_CODEC";
+    #[cfg(unix)]
+    const PROBE_LEVEL: &str = "STUFFR_BENCH_MEMORY_PROBE_LEVEL";
+    #[cfg(unix)]
+    const PROBE_FILE: &str = "STUFFR_BENCH_MEMORY_PROBE_FILE";
+    #[cfg(unix)]
+    const PROBE_MARK: &str = "memory-probe-reply: ";
+
+    /// Not a test of its own: [`fresh_processes_measure_xz_9_above_lz4`]
+    /// re-runs this test binary with only this test, so the compress child
+    /// it runs has a process (and an `ru_maxrss` high-water mark) to
+    /// itself. Prints the child's reply line after [`PROBE_MARK`]. Does
+    /// nothing without the env vars.
     #[cfg(unix)]
     #[test]
-    fn child_main_measures_lz4_and_xz_in_process() {
-        use std::io::Write;
+    #[ignore = "a probe that fresh_processes_measure_xz_9_above_lz4 runs in its own process"]
+    fn memory_probe() {
+        let (Ok(codec), Ok(level), Some(file)) = (
+            std::env::var(PROBE_CODEC),
+            std::env::var(PROBE_LEVEL),
+            std::env::var_os(PROBE_FILE),
+        ) else {
+            return;
+        };
+        let path = PathBuf::from(file);
+        let len = fs::metadata(&path).unwrap().len();
+        let args: Vec<OsString> = ["compress", &codec, &level, "-", "1073741824"]
+            .iter()
+            .map(OsString::from)
+            .chain([OsString::from(len.to_string()), path.into_os_string()])
+            .collect();
+        let job = ChildJob::from_args(&args).unwrap();
+        println!("{PROBE_MARK}{}", reply_line(&child_main(job)));
+    }
+
+    /// The compress child's figures for xz -9 and lz4 over 1 MiB, each
+    /// from a fresh process running [`memory_probe`]: xz -9's encoder (a
+    /// 64 MiB dictionary's hash table) touches more than lz4's. Each figure
+    /// is that process's own peak above its own baseline, so no other test
+    /// can move it.
+    #[cfg(unix)]
+    #[test]
+    fn fresh_processes_measure_xz_9_above_lz4() {
         let dir = Scratch::new();
         let input = dir.file("in", &text(1 << 20, 3));
-        let job = |side, codec, level, files| ChildJob {
-            side,
-            codec,
-            level,
-            threads: None,
-            memory_limit: 1 << 30,
-            files,
-        };
-        let lz4 = child_main(job(Side::Compress, "lz4", None, vec![input.clone()]));
-        let xz = child_main(job(Side::Compress, "xz", Some(9), vec![input.clone()]));
-        let (lz4, xz) = (lz4.unwrap(), xz.unwrap());
-        assert!(xz > lz4, "xz -9 {xz} vs lz4 {lz4}");
-
-        // The decompress side reads a compressed copy.
-        for (codec, level) in [("lz4", None), ("xz", Some(9))] {
-            let mut enc = Vec::new();
-            {
-                let reg = stuffr::registry();
-                let id = reg
-                    .matrix()
-                    .into_iter()
-                    .find(|r| r.id.as_str() == codec)
-                    .unwrap()
-                    .id;
-                let opts = stuffr::EncodeOpts {
-                    level,
-                    ..Default::default()
-                };
-                let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-                struct W(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-                impl Write for W {
-                    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                        self.0.lock().unwrap().extend_from_slice(b);
-                        Ok(b.len())
-                    }
-                    fn flush(&mut self) -> std::io::Result<()> {
-                        Ok(())
-                    }
-                }
-                let mut sink = reg
-                    .require_encoder(id)
-                    .unwrap()
-                    .encoder(Box::new(W(shared.clone())), &opts)
-                    .unwrap();
-                sink.write_all(&fs::read(&input.path).unwrap()).unwrap();
-                sink.finish().unwrap();
-                enc.extend_from_slice(&shared.lock().unwrap());
+        let probe = |codec: &str, level: &str| -> u64 {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "bench::memory::tests::memory_probe",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(PROBE_CODEC, codec)
+                .env(PROBE_LEVEL, level)
+                .env(PROBE_FILE, &input.path)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let reply = stdout
+                .lines()
+                .find_map(|l| l.split_once(PROBE_MARK).map(|(_, r)| r));
+            match reply.and_then(|r| parse_reply(r.as_bytes())) {
+                Some(Ok(n)) if out.status.success() => n,
+                _ => panic!(
+                    "{codec} probe gave no `ok` reply ({}):\n--- stdout\n{stdout}\n--- stderr\n{}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                ),
             }
-            let copy = dir.file(&format!("in.{codec}"), &enc);
-            let d = child_main(job(Side::Decompress, codec, level, vec![copy]));
+        };
+        let lz4 = probe("lz4", "-");
+        let xz = probe("xz", "9");
+        assert!(xz > lz4, "xz -9 {xz} vs lz4 {lz4}");
+    }
+
+    /// The decompress child runs to the end over the parent's copy. Only
+    /// that it succeeds is checked: in-process, its figure is this whole
+    /// test binary's high-water mark, shared with every test beside it.
+    #[cfg(unix)]
+    #[test]
+    fn child_main_decompresses_the_parents_copy() {
+        let _g = armed_lock();
+        let dir = Scratch::new();
+        let input = dir.file("in", &text(1 << 20, 3));
+        for (codec, level) in [("lz4", None), ("xz", Some(9))] {
+            let (copy, len) = write_copy(
+                codec,
+                level,
+                &plan(Mode::OneStream),
+                std::slice::from_ref(&input),
+            )
+            .unwrap();
+            let d = child_main(ChildJob {
+                side: Side::Decompress,
+                codec,
+                level: None,
+                threads: None,
+                memory_limit: 1 << 30,
+                files: vec![Snapshot {
+                    path: copy.path().to_path_buf(),
+                    len,
+                }],
+            });
             assert!(d.is_ok(), "{codec}: {d:?}");
         }
     }
@@ -813,7 +872,8 @@ mod tests {
         for (i, (job, present)) in r.seen.iter().enumerate() {
             assert_eq!(job.files.len(), 1);
             assert!(present, "job {i}'s file was missing");
-            assert_eq!((job.codec, job.level), ("gzip", Some(6)));
+            let level = (job.side == Side::Compress).then_some(6);
+            assert_eq!((job.codec, job.level), ("gzip", level));
             if job.side == Side::Compress {
                 assert_eq!(job.files[0], files[i / 2]);
             } else {
@@ -919,39 +979,20 @@ mod tests {
     #[cfg(all(unix, not(feature = "xz-c")))]
     #[test]
     fn a_child_refusal_names_the_memory_limit() {
-        use std::io::Write;
+        let _g = armed_lock();
         let dir = Scratch::new();
         let input = dir.file("in", &text(100_000, 0));
-        let reg = stuffr::registry();
-        let id = reg
-            .matrix()
-            .into_iter()
-            .find(|r| r.id.as_str() == "xz")
-            .unwrap()
-            .id;
-        let path = dir.0.join("in.xz");
-        let out = fs::File::create(&path).unwrap();
-        let mut sink = reg
-            .require_encoder(id)
-            .unwrap()
-            .encoder(
-                Box::new(out),
-                &stuffr::EncodeOpts {
-                    level: Some(9),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        sink.write_all(&fs::read(&input.path).unwrap()).unwrap();
-        sink.finish().unwrap();
-        let len = fs::metadata(&path).unwrap().len();
+        let (copy, len) = write_copy("xz", Some(9), &plan(Mode::OneStream), &[input]).unwrap();
         let r = child_main(ChildJob {
             side: Side::Decompress,
             codec: "xz",
-            level: Some(9),
+            level: None,
             threads: None,
             memory_limit: 1 << 20,
-            files: vec![Snapshot { path, len }],
+            files: vec![Snapshot {
+                path: copy.path().to_path_buf(),
+                len,
+            }],
         });
         let e = r.unwrap_err();
         assert!(e.starts_with("refused by --memory-limit"), "{e}");

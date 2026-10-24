@@ -546,14 +546,7 @@ impl Job<'_> {
                         let n = read_some(f, self.buf)?;
                         if n == 0 {
                             if read < snap.len {
-                                return Err(Error::Io(io::Error::new(
-                                    io::ErrorKind::UnexpectedEof,
-                                    format!(
-                                        "{} shrank to {read} bytes from {} while bench ran",
-                                        snap.path.display(),
-                                        snap.len
-                                    ),
-                                )));
+                                return Err(shrank(snap, read));
                             }
                             break;
                         }
@@ -604,6 +597,19 @@ fn decode(
     }
     drop(decoder);
     Ok((total, ns))
+}
+
+/// A streamed file ended at `read` bytes, short of the length it was
+/// loaded at.
+pub(super) fn shrank(snap: &Snapshot, read: u64) -> Error {
+    Error::Io(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        format!(
+            "{} shrank to {read} bytes from {} while bench ran",
+            snap.path.display(),
+            snap.len
+        ),
+    ))
 }
 
 /// Reads into `buf` until it is full or the reader ends, retrying
