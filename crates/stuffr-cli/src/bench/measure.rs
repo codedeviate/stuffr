@@ -62,7 +62,7 @@ use super::score::{Measured, Outcome};
 use crate::compat::{CleanupGuard, create_armed};
 
 /// The copy buffer, as `ops` uses.
-const CHUNK: usize = 64 * 1024;
+pub(super) const CHUNK: usize = 64 * 1024;
 
 /// A monotonic clock in nanoseconds; injected so tests can count its reads.
 pub trait Clock {
@@ -108,7 +108,7 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// The file, opened and limited to its loaded length.
-    fn open(&self) -> io::Result<io::Take<File>> {
+    pub(super) fn open(&self) -> io::Result<io::Take<File>> {
         Ok(File::open(&self.path)?.take(self.len))
     }
 
@@ -608,7 +608,7 @@ fn decode(
 
 /// Reads into `buf` until it is full or the reader ends, retrying
 /// `Interrupted`. Short only at the end.
-fn fill(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
+pub(super) fn fill(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
     let mut filled = 0;
     while filled < buf.len() {
         match r.read(&mut buf[filled..]) {
@@ -622,7 +622,7 @@ fn fill(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
 }
 
 /// `read`, retried on `Interrupted`.
-fn read_some(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
+pub(super) fn read_some(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
     loop {
         match r.read(buf) {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -711,14 +711,14 @@ impl Source for MemSource {
 /// 64 KiB buffer, so a decoder reading a byte at a time pays a memory copy
 /// per byte, as it does from [`MemSource`], not a system call. Seekable and
 /// sized like `MemSource`.
-fn temp_source<R: Read + Seek + Send>(inner: R, len: u64) -> BufSource<R> {
+pub(super) fn temp_source<R: Read + Seek + Send>(inner: R, len: u64) -> BufSource<R> {
     BufSource {
         inner: BufReader::with_capacity(CHUNK, inner),
         len,
     }
 }
 
-struct BufSource<R> {
+pub(super) struct BufSource<R> {
     inner: BufReader<R>,
     len: u64,
 }
@@ -767,7 +767,7 @@ static TEMP_SEQ: AtomicU32 = AtomicU32::new(0);
 /// The streamed run's compressed output, `stuffr-bench-<pid>-<n>` in the
 /// temp directory: armed for removal on SIGINT, SIGTERM and SIGHUP while it
 /// lives, removed when it drops (a panic included).
-struct TempOut {
+pub(super) struct TempOut {
     path: PathBuf,
     /// Dropped after `drop` has removed the file, so there is no moment the
     /// file exists unarmed.
@@ -775,7 +775,7 @@ struct TempOut {
 }
 
 impl TempOut {
-    fn create() -> io::Result<(Self, File)> {
+    pub(super) fn create() -> io::Result<(Self, File)> {
         let dir = std::env::temp_dir();
         let mut tries = 0;
         loop {
@@ -797,7 +797,7 @@ impl TempOut {
         }
     }
 
-    fn path(&self) -> &Path {
+    pub(super) fn path(&self) -> &Path {
         &self.path
     }
 }

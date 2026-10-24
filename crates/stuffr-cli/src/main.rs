@@ -33,7 +33,12 @@ fn output_of(s: &str) -> Output {
 }
 
 fn main() -> ExitCode {
-    if let Some(code) = stuffr_cli::compat::dispatch(std::env::args_os().collect()) {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(code) = stuffr_cli::compat::dispatch(args.clone()) {
+        return code;
+    }
+    // `stuffr bench`'s memory child: before clap, so it is in no help text.
+    if let Some(code) = stuffr_cli::bench::memory::child_entry(&args) {
         return code;
     }
     let cli = Cli::parse();
