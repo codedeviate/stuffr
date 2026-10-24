@@ -436,6 +436,18 @@ read list.
 > **3133** tests under `--all-features`, **3019** on the default tier —
 > measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
+> `0.18.1` is a PATCH: `stuffr bench` now shows how much RAM each format
+> needs. Two columns, `c-mem` and `d-mem`, give each row's peak compress
+> and decompress memory (resident set, macOS and Linux), measured in a
+> separate untimed run so the timings are unchanged, and a `least memory:`
+> winner line joins the others; best balance is unchanged. Memory is on by
+> default and `--no-memory` skips it (a run takes up to about twice as long
+> with it). JSON gains `compress_mem`/`decompress_mem`/`mem_error`; CSV
+> appends three columns. Ctrl-C (and TERM, HUP, QUIT) now clears the
+> progress bar and stops a running measurement before bench exits, leaving
+> no temporary file. **3159** tests under `--all-features`, **3046** on the
+> default tier — measured from this bump's own `make check`, `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
