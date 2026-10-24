@@ -1938,30 +1938,33 @@ table; Ctrl-C, SIGTERM and SIGHUP clear it too (and stop a running memory
 run and remove bench's temp file) before bench dies of the signal. Timings
 need a release build; a debug build refuses with exit 2.
 
-**Memory.** After a row's timed runs, bench runs it once more, untimed, in
-a separate child process: once to compress, once to decompress (the bar
-reads `memory`). The figure is that process's peak resident memory, what it
-actually touched, not what it reserved, above its size just before the
-codec started, under the same level, `--threads` and `--memory-limit` as the
-timed runs, and measured once per row whatever `--repeat` says. It includes
-a small floor of code paged in and fixed buffers, about 0.1–0.35 MiB, so
-even a tiny format shows a small non-zero value. xz on a small input
-touches less than it reserves, so its figure can be well under its nominal
-dictionary size. A format that holds its whole input (the pure tier's zstd
-encoder) grows with the input. With `--per-file` each file gets its own
-pair of runs and the row shows the largest. A memory run that fails (for
-example refused by `--memory-limit`) shows `-`; the row's other figures
-stand, it takes no part in `least memory`, and the exit code is unchanged.
-`--no-memory` skips these runs (they roughly double a run's time): no
-memory columns and no `least memory` line. Off unix (Windows) memory is not
-measured: the cells show `-` and the input line says `memory not measured
-on this platform`.
+**Memory.** After a row's timed runs, bench runs it once more, untimed, in a
+separate child process: once to compress, once to decompress (the bar reads
+`memory`). The figure is that process's peak resident memory, what it actually
+touched, not what it reserved, above its size just before the codec started,
+under the same level, `--threads` and `--memory-limit` as the timed runs, and
+measured once per row whatever `--repeat` says. It includes a small floor of
+code paged in and fixed buffers, about 0.1–0.35 MiB, so even a tiny format
+shows a small non-zero value, and a light format such as lz4 shows a few
+hundred KiB (the floor plus its own state). xz on a small input touches less
+than it reserves, so its figure can be well under its nominal dictionary size.
+A format that holds its whole input (the pure tier's zstd encoder) grows with
+the input. With `--per-file` each file gets its own pair of runs and the row
+shows the largest. A memory run that fails (for example refused by
+`--memory-limit`) shows `-`; the row's other figures stand, it takes no part
+in `least memory`, and the exit code is unchanged. The memory runs add one
+compression and one decompression per row, so a run takes up to about twice as
+long (1.8x for every level of xz and lz4 on 19 MiB of text), most for slow
+compressors such as xz. `--no-memory` skips them: no memory columns and no
+`least memory` line. Off unix (Windows) memory is not measured: the cells show
+`-` and the input line says `memory not measured on this platform`.
 
 `--json` prints one object. `conditions` holds `files`, `bytes_in`, `mode`
 (`one-stream` or `per-file`), `threads` (`--threads` as given, `null` when
 omitted), `workers` (the compression threads that resolved to), `repeat`,
-`streamed` and `memory` (`true` when the memory runs were made). Each of `rows` holds `format`, `level` (`null` for lz4 and
-snappy), `backend` (`c` or `pure`), `ok`, `bytes_out`, `ratio` (input bytes
+`streamed` and `memory` (`true` when the memory runs were made). Each of
+`rows` holds `format`, `level` (`null` for lz4 and snappy), `backend` (`c`
+or `pure`), `ok`, `bytes_out`, `ratio` (input bytes
 ÷ `bytes_out`), `compress_ns`, `decompress_ns` (medians, nanoseconds),
 `balance` (the mean of the three `best / value` scores, relative to this
 run), `error` and `output` (`memory`, or `disk` when the compressed output

@@ -287,10 +287,11 @@ impl Meter {
         let level = row.level.map_or_else(|| "-".to_string(), |l| l.to_string());
         let line = format!("[{}/{}] {} {level}  memory", row.k, row.n, row.format);
         let line = fit(&line, (self.width)().saturating_sub(1));
+        // Up before the write: a signal mid-write still clears the line.
+        self.drawn.store(true, Ordering::SeqCst);
         let _ = write!(out, "\r{line}\x1b[K");
         let _ = out.flush();
         self.shown = true;
-        self.drawn.store(true, Ordering::SeqCst);
     }
 
     /// The next row; its first report is drawn at once.
@@ -320,13 +321,14 @@ impl Meter {
         // its first part behind on the line above at the next redraw, and
         // one filling the last column leaves some terminals pending a wrap.
         let line = fit(&line, (self.width)().saturating_sub(1));
+        // Up before the write: a signal mid-write still clears the line.
+        self.drawn.store(true, Ordering::SeqCst);
         // `\x1b[K` after the text clears what a longer previous line left.
         let _ = write!(out, "\r{line}\x1b[K");
         let _ = out.flush();
         self.frame = (self.frame + 1) % SPINNER.len();
         self.drawn_at = Some(now);
         self.shown = true;
-        self.drawn.store(true, Ordering::SeqCst);
     }
 
     fn clear(&mut self) {
@@ -1180,22 +1182,31 @@ mod tests {
         )
         .with_drawn_flag(&DRAWN);
         meter.row(label(1, 2, "xz", Some(6)));
-        assert!(!DRAWN.load(Ordering::SeqCst), "up before any draw");
+        assert!(
+            !DRAWN.load(Ordering::SeqCst),
+            "the flag stays down until the first draw"
+        );
         meter.progress(Phase::Compress, 0, 1000);
-        assert!(DRAWN.load(Ordering::SeqCst), "down after a draw");
+        assert!(DRAWN.load(Ordering::SeqCst), "a draw raises the flag");
         meter.clear();
-        assert!(!DRAWN.load(Ordering::SeqCst), "up after clear");
+        assert!(!DRAWN.load(Ordering::SeqCst), "clear lowers the flag");
         meter.memory();
-        assert!(DRAWN.load(Ordering::SeqCst), "down after the memory line");
+        assert!(
+            DRAWN.load(Ordering::SeqCst),
+            "the memory line raises the flag"
+        );
         meter.clear();
-        assert!(!DRAWN.load(Ordering::SeqCst), "up after clear");
+        assert!(!DRAWN.load(Ordering::SeqCst), "clear lowers the flag");
 
         static OFF: AtomicBool = AtomicBool::new(false);
         let mut off = Meter::new(None, Box::new(RealClock::new()), 1, || 80).with_drawn_flag(&OFF);
         off.row(label(1, 1, "xz", Some(6)));
         off.progress(Phase::Compress, 0, 1000);
         off.memory();
-        assert!(!OFF.load(Ordering::SeqCst), "an off meter raised the flag");
+        assert!(
+            !OFF.load(Ordering::SeqCst),
+            "an off meter leaves the flag down"
+        );
     }
 
     /// The memory phase is the row's label and the word `memory`, no bar,
@@ -1261,14 +1272,22 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_signal_kills_the_memory_child_clears_the_bar_and_kills_bench() {
-        let mut victim = std::process::Command::new("sleep")
-            .arg("60")
-            .spawn()
-            .unwrap();
-        let pid = i32::try_from(victim.id()).unwrap();
-        let mut fds = [0; 2];
-        // SAFETY: pipe fills the two-element array it is given.
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        /// The stand-in child, killed and reaped however the test ends.
+        struct Victim(std::process::Child);
+        impl Drop for Victim {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut victim = Victim(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .unwrap(),
+        );
+        let pid = i32::try_from(victim.0.id()).unwrap();
+        let fds = cloexec_pipe();
         // SAFETY: the child makes only async-signal-safe calls (signal,
         // dup2, atomics, sigaction inside `hook_run_signals`, raise) and
         // ends by the signal or `_exit`; it never returns into the harness.
@@ -1295,18 +1314,52 @@ mod tests {
             }
             status
         };
-        let mut got = [0u8; 16];
-        // SAFETY: reading into a buffer we own, then closing the read end.
-        let n = unsafe {
-            let n = libc::read(fds[0], got.as_mut_ptr().cast(), got.len());
-            libc::close(fds[0]);
-            n
-        };
+        let got = read_within_10s(fds[0]);
         assert!(libc::WIFSIGNALED(status), "exited: {status:#x}");
         assert_eq!(libc::WTERMSIG(status), libc::SIGINT);
-        assert_eq!(&got[..usize::try_from(n).unwrap_or(0)], CLEAR_LINE);
-        let ended = victim.wait().unwrap();
+        assert_eq!(got, CLEAR_LINE);
+        let ended = victim.0.wait().unwrap();
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(ended.signal(), Some(libc::SIGKILL), "{ended:?}");
+    }
+
+    /// A pipe with `FD_CLOEXEC` on both ends, so a test elsewhere that
+    /// forks and execs meanwhile does not keep its write end open.
+    #[cfg(unix)]
+    fn cloexec_pipe() -> [libc::c_int; 2] {
+        let mut fds = [0; 2];
+        // SAFETY: pipe fills the two-element array it is given; fcntl on
+        // the two descriptors it just made.
+        unsafe {
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            for fd in fds {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+        }
+        fds
+    }
+
+    /// What `fd` holds within 10 s (nothing after that, rather than a
+    /// hang if the writer never wrote), then `fd` closed.
+    #[cfg(unix)]
+    fn read_within_10s(fd: libc::c_int) -> Vec<u8> {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let mut got = [0u8; 16];
+        // SAFETY: poll on one pollfd we own; read into a buffer we own;
+        // close the descriptor this function was given.
+        let n = unsafe {
+            let n = if libc::poll(&mut pfd, 1, 10_000) > 0 {
+                libc::read(fd, got.as_mut_ptr().cast(), got.len())
+            } else {
+                0
+            };
+            libc::close(fd);
+            n
+        };
+        got[..usize::try_from(n).unwrap_or(0)].to_vec()
     }
 }

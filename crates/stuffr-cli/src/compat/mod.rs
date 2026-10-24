@@ -28,7 +28,7 @@ pub use host::InputReads;
 #[cfg(unix)]
 pub(crate) use host::hook_run_signals;
 /// The armed-temporary entry point `stuffr bench` shares with the families.
-pub(crate) use host::{CleanupGuard, create_armed};
+pub(crate) use host::{CleanupGuard, create_armed, with_run_signals_held};
 #[cfg(all(test, unix))]
 pub(crate) use host::{armed_path, disarm_inherited};
 

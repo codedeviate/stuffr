@@ -1137,6 +1137,13 @@ pub(crate) fn create_temp_armed_exit(
     })
 }
 
+/// Run `f` with the signals [`hook_run_signals`] covers (SIGINT, SIGTERM,
+/// SIGHUP) held back, as [`create_armed`] holds them; one that arrived
+/// meanwhile is delivered once `f` is done. Off unix, just `f`.
+pub(crate) fn with_run_signals_held<T>(f: impl FnOnce() -> T) -> T {
+    held_back(TEMP_SIGNALS, f)
+}
+
 /// Run `f` with `signals` blocked on this thread, then restore the mask; a
 /// signal that arrived meanwhile is delivered on the restore. Off unix, just
 /// `f`.
@@ -2261,9 +2268,7 @@ mod tests {
             for arm in [true, false] {
                 let file = dir.join(format!("bench-{sig}-{arm}"));
                 let cpath = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
-                let mut fds = [0; 2];
-                // SAFETY: pipe fills the two-element array it is given.
-                assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+                let fds = cloexec_pipe();
                 HOOK_PIPE.store(fds[1], Ordering::SeqCst);
                 HOOK_PATH.store(cpath.as_ptr().cast_mut(), Ordering::SeqCst);
                 let status = in_child(|| {
@@ -2278,30 +2283,60 @@ mod tests {
                         unsafe { libc::raise(sig) };
                     }
                 });
-                // SAFETY: closing our write end, then reading what the
-                // child wrote into a buffer we own; closing the read end.
-                let mut got = [0u8; 4];
-                let n = unsafe {
-                    libc::close(fds[1]);
-                    let n = libc::read(fds[0], got.as_mut_ptr().cast(), got.len());
-                    libc::close(fds[0]);
-                    n
-                };
+                // SAFETY: closing our write end, which we own.
+                unsafe { libc::close(fds[1]) };
+                let got = read_within_10s(fds[0]);
                 assert!(
                     libc::WIFSIGNALED(status),
                     "signal {sig}: the child exited (status {status:#x})"
                 );
                 assert_eq!(libc::WTERMSIG(status), sig);
                 let want: &[u8] = if arm { b"H" } else { b"h" };
-                assert_eq!(
-                    &got[..usize::try_from(n).unwrap_or(0)],
-                    want,
-                    "signal {sig}"
-                );
+                assert_eq!(got, want, "signal {sig}");
                 assert!(!file.exists(), "signal {sig}: the temporary survived");
             }
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A pipe with `FD_CLOEXEC` on both ends, so a test elsewhere that
+    /// forks and execs meanwhile does not keep its write end open.
+    #[cfg(unix)]
+    fn cloexec_pipe() -> [libc::c_int; 2] {
+        let mut fds = [0; 2];
+        // SAFETY: pipe fills the two-element array it is given; fcntl on
+        // the two descriptors it just made.
+        unsafe {
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            for fd in fds {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+        }
+        fds
+    }
+
+    /// What `fd` holds within 10 s (nothing after that, rather than a
+    /// hang if the writer never wrote), then `fd` closed.
+    #[cfg(unix)]
+    fn read_within_10s(fd: libc::c_int) -> Vec<u8> {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let mut got = [0u8; 16];
+        // SAFETY: poll on one pollfd we own; read into a buffer we own;
+        // close the descriptor this function was given.
+        let n = unsafe {
+            let n = if libc::poll(&mut pfd, 1, 10_000) > 0 {
+                libc::read(fd, got.as_mut_ptr().cast(), got.len())
+            } else {
+                0
+            };
+            libc::close(fd);
+            n
+        };
+        got[..usize::try_from(n).unwrap_or(0)].to_vec()
     }
 
     /// The calling thread's current signal mask.

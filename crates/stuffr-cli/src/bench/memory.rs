@@ -8,8 +8,8 @@
 //! and why one per file in `--per-file` mode (the row reports the largest).
 //!
 //! **What a child measures.** Its 64 KiB read buffer, its 64 KiB output
-//! buffer (writing to a sink that discards) and its open files are made
-//! first; then it samples its peak resident set as the baseline (the
+//! buffer and its open files (the compress child's output file included)
+//! are made first; then it samples its peak resident set as the baseline (the
 //! high-water so far, which is its current size, since nothing has run
 //! yet), runs the codec to the end, and reports the peak minus that
 //! baseline, saturating at 0. So the number is the codec's resident working
@@ -18,9 +18,12 @@
 //! (each read stops at the length snapshotted at load, as in the timed
 //! runs), so an encoder that buffers its whole input (the pure-tier zstd
 //! encoder) shows memory growing with the input: that is what using it
-//! costs. The decompress child reads a compressed copy the parent wrote
-//! (untimed) to a guarded temp file, `stuffr-bench-<pid>-<n>`, through the
-//! same 64 KiB buffered source the timed runs use.
+//! costs. The compress child writes its compressed output to a guarded
+//! temp file the parent created and armed, `stuffr-bench-<pid>-<n>`; the
+//! decompress child then reads that file through the same 64 KiB buffered
+//! source the timed runs use. So the row is compressed once more, not
+//! twice (ruling F8), and a compress child that fails leaves nothing for
+//! the decompress side, which then shows `-` too.
 //!
 //! **Same conditions as the timed runs**: level, `--threads` (through
 //! [`governor_for`]) and `--memory-limit`. The backend is not sent: the
@@ -40,6 +43,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -80,8 +84,9 @@ impl Side {
     }
 }
 
-/// What one child runs. Compress: `files` concatenated as one stream.
-/// Decompress: exactly one file, the compressed copy.
+/// What one child runs. Compress: `files` concatenated as one stream,
+/// written to `out` (discarded when `None`). Decompress: exactly one file,
+/// the compressed copy; `out` is `None`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChildJob {
     pub side: Side,
@@ -89,6 +94,7 @@ pub struct ChildJob {
     pub level: Option<i32>,
     pub threads: Option<usize>,
     pub memory_limit: u64,
+    pub out: Option<PathBuf>,
     pub files: Vec<Snapshot>,
 }
 
@@ -97,9 +103,10 @@ const NONE: &str = "-";
 
 impl ChildJob {
     /// The arguments after [`CHILD_ARG`]:
-    /// `<side> <codec> <level|-> <threads|-> <memory-limit> [<len> <path>]…`,
+    /// `<side> <codec> <level|-> <threads|-> <memory-limit> <out|-> [<len> <path>]…`,
     /// `side` being `compress` or `decompress`, every number in decimal.
-    /// The decompress side ignores the level (the parent sends `-`).
+    /// The decompress side ignores the level (the parent sends `-`). `out`
+    /// is `-` for none; the parent's is always an absolute temp path.
     /// Paths go as they are (not through UTF-8), each its own argument.
     pub fn to_args(&self) -> Vec<OsString> {
         let opt = |v: Option<String>| OsString::from(v.unwrap_or_else(|| NONE.to_string()));
@@ -109,6 +116,9 @@ impl ChildJob {
             opt(self.level.map(|l| l.to_string())),
             opt(self.threads.map(|t| t.to_string())),
             OsString::from(self.memory_limit.to_string()),
+            self.out
+                .clone()
+                .map_or_else(|| OsString::from(NONE), PathBuf::into_os_string),
         ];
         for s in &self.files {
             args.push(OsString::from(s.len.to_string()));
@@ -145,6 +155,8 @@ impl ChildJob {
         let level = opt(text(it.next(), "level")?, "level")?;
         let threads = opt(text(it.next(), "threads")?, "threads")?;
         let memory_limit = num(text(it.next(), "memory limit")?, "memory limit")?;
+        let out = it.next().ok_or("missing output")?;
+        let out = (out != NONE).then(|| PathBuf::from(out));
         let mut files = Vec::new();
         while let Some(len) = it.next() {
             let len = num(text(Some(len), "length")?, "length")?;
@@ -160,6 +172,7 @@ impl ChildJob {
             level,
             threads,
             memory_limit,
+            out,
             files,
         })
     }
@@ -276,7 +289,8 @@ pub fn child_main(job: ChildJob) -> Result<u64, String> {
                 ..Default::default()
             };
             codec.check_encode_opts(&encode).map_err(|e| describe(&e))?;
-            compress_child(codec.as_ref(), &encode, &job.files).map_err(|e| describe(&e))
+            compress_child(codec.as_ref(), &encode, &job.files, job.out.as_deref())
+                .map_err(|e| describe(&e))
         }
         Side::Decompress => {
             let codec = reg.require_decoder(id).map_err(|e| describe(&e))?;
@@ -295,18 +309,25 @@ pub fn child_main(job: ChildJob) -> Result<u64, String> {
     }
 }
 
-/// Streams `files` through the encoder into a discarding sink.
+/// Streams `files` through the encoder into `out` (the parent's temp file,
+/// which it already created: opened here, truncated), or into a discarding
+/// sink when there is none.
 fn compress_child(
     codec: &dyn Codec,
     encode: &EncodeOpts,
     files: &[Snapshot],
+    out: Option<&Path>,
 ) -> stuffr::Result<u64> {
     let mut feeds = files
         .iter()
         .map(|s| s.open().map(|f| (s, f)))
         .collect::<io::Result<Vec<_>>>()?;
     let mut buf = vec![0u8; CHUNK];
-    let dst = BufWriter::with_capacity(CHUNK, io::sink());
+    let dst: Box<dyn Write + Send> = match out {
+        Some(path) => Box::new(File::options().write(true).truncate(true).open(path)?),
+        None => Box::new(io::sink()),
+    };
+    let dst = BufWriter::with_capacity(CHUNK, dst);
     let baseline = peak_rss()?;
     let mut sink = codec.encoder(Box::new(dst), encode)?;
     for (snap, f) in &mut feeds {
@@ -402,21 +423,28 @@ impl Runner for ProcessRunner {
     fn run(&mut self, job: &ChildJob) -> Result<u64, String> {
         let exe = std::env::current_exe()
             .map_err(|e| format!("cannot find bench's own executable: {e}"))?;
-        let child = Command::new(exe)
-            .arg(CHILD_ARG)
-            .args(job.to_args())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("cannot start the memory run: {e}"))?;
+        // Bench's signals are held back from the spawn until the pid is
+        // stored, so a signal sent to bench alone in between is delivered
+        // with the pid known, and the cleanup kills the child (no orphan).
+        // The child does not inherit the mask: std resets it before exec.
+        let child = crate::compat::with_run_signals_held(|| {
+            let child = Command::new(exe)
+                .arg(CHILD_ARG)
+                .args(job.to_args())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            RUNNING_CHILD.store(i32::try_from(child.id()).unwrap_or(0), Ordering::SeqCst);
+            Ok::<_, io::Error>(child)
+        })
+        .map_err(|e| format!("cannot start the memory run: {e}"))?;
         // Known window, accepted (ruling F7): `wait_with_output` reaps the
         // child before the clear below, so a signal arriving in between
         // makes the cleanup `kill()` a pid that is no longer ours. It lasts
         // microseconds and pids are handed out sequentially, so reuse
         // inside it is theoretical. Clearing before the wait instead would
         // leave the child running (orphaned) on a bare SIGTERM to bench.
-        RUNNING_CHILD.store(i32::try_from(child.id()).unwrap_or(0), Ordering::SeqCst);
         let out = child.wait_with_output();
         RUNNING_CHILD.store(0, Ordering::SeqCst);
         let out = out.map_err(|e| format!("the memory run failed: {e}"))?;
@@ -442,13 +470,16 @@ pub fn measure_memory(
 
 /// One row's memory under `plan`: a compress child and a decompress child
 /// per stream (`plan.mode`: one stream over every file, or one per file),
-/// reporting each side's largest peak. Between the two, the parent writes
-/// the stream's compressed copy to a guarded temp file (untimed; removed
-/// before the next stream begins). Strictly after the row's timed runs.
+/// reporting each side's largest peak. Per stream the parent creates an
+/// armed temp file, the compress child writes the compressed stream into
+/// it, and the decompress child reads it back; it is removed before the
+/// next stream begins. Strictly after the row's timed runs.
 ///
-/// A side whose child (or copy) fails for any stream is `None`, and the
-/// first failure's text, prefixed by its side, is `error`; the other side
-/// still stands. Never an error of its own.
+/// A side whose child fails for any stream is `None`, and the first
+/// failure's text, prefixed by its side, is `error`. A failed decompress
+/// child leaves the compress side standing; a failed compress child (or a
+/// temp file that cannot be made) leaves no copy, so both sides are `None`.
+/// Never an error of its own.
 pub fn measure_memory_with(
     runner: &mut dyn Runner,
     codec: &'static str,
@@ -469,12 +500,13 @@ pub fn measure_memory_with(
         Mode::PerFile => input_files.chunks(1).collect(),
     };
     // The decompress side has no level: it is sent as `-`.
-    let job = |side, files| ChildJob {
+    let job = |side, out, files| ChildJob {
         side,
         codec,
         level: if side == Side::Compress { level } else { None },
         threads: plan.threads,
         memory_limit: plan.memory_limit,
+        out,
         files,
     };
     let mut compress = Some(0u64);
@@ -485,30 +517,48 @@ pub fn measure_memory_with(
         error.get_or_insert_with(|| format!("{}: {e}", side.word()));
     };
     for files in streams {
-        if let Some(peak) = compress {
-            match runner.run(&job(Side::Compress, files.to_vec())) {
-                Ok(n) => compress = Some(peak.max(n)),
-                Err(e) => fail(Side::Compress, e, &mut compress),
+        let Some(peak) = compress else { break };
+        // The copy lives until this stream's decompress child is done; the
+        // compress child opens it by name, so the parent's handle closes.
+        let copy = match TempOut::create() {
+            Ok((copy, _file)) => copy,
+            Err(e) => {
+                fail(
+                    Side::Compress,
+                    format!("cannot make the temp file: {e}"),
+                    &mut compress,
+                );
+                decompress = None;
+                break;
+            }
+        };
+        let out = Some(copy.path().to_path_buf());
+        match runner.run(&job(Side::Compress, out, files.to_vec())) {
+            Ok(n) => compress = Some(peak.max(n)),
+            Err(e) => {
+                fail(
+                    Side::Compress,
+                    format!("{e} (so no decompress run)"),
+                    &mut compress,
+                );
+                decompress = None;
+                break;
             }
         }
         if let Some(peak) = decompress {
-            // The copy lives until this stream's decompress child is done.
-            let r = write_copy(codec, level, plan, files)
-                .map_err(|e| describe(&e))
-                .and_then(|(copy, len)| {
+            let r = std::fs::metadata(copy.path())
+                .map_err(|e| format!("cannot read the compressed copy: {e}"))
+                .and_then(|m| {
                     let snap = Snapshot {
                         path: copy.path().to_path_buf(),
-                        len,
+                        len: m.len(),
                     };
-                    runner.run(&job(Side::Decompress, vec![snap]))
+                    runner.run(&job(Side::Decompress, None, vec![snap]))
                 });
             match r {
                 Ok(n) => decompress = Some(peak.max(n)),
                 Err(e) => fail(Side::Decompress, e, &mut decompress),
             }
-        }
-        if compress.is_none() && decompress.is_none() {
-            break;
         }
     }
     Memory {
@@ -516,32 +566,6 @@ pub fn measure_memory_with(
         decompress,
         error,
     }
-}
-
-/// `files` compressed as one stream, as the timed runs compress them, into
-/// a new guarded temp file; returns it with its length.
-fn write_copy(
-    codec: &str,
-    level: Option<i32>,
-    plan: &Plan,
-    files: &[Snapshot],
-) -> stuffr::Result<(TempOut, u64)> {
-    let codec = stuffr::registry().require_encoder(codec_id(codec).map_err(Error::Usage)?)?;
-    let encode = EncodeOpts {
-        level,
-        governor: governor_for(plan),
-        ..Default::default()
-    };
-    codec.check_encode_opts(&encode)?;
-    let (temp, file) = TempOut::create()?;
-    let mut sink = codec.encoder(Box::new(BufWriter::with_capacity(CHUNK, file)), &encode)?;
-    let mut buf = vec![0u8; CHUNK];
-    for snap in files {
-        feed(snap, &mut snap.open()?, &mut buf, &mut *sink)?;
-    }
-    sink.finish()?;
-    let len = std::fs::metadata(temp.path())?.len();
-    Ok((temp, len))
 }
 
 #[cfg(test)]
@@ -617,7 +641,9 @@ mod tests {
     }
 
     /// A runner that answers from `answer` and records every job it saw,
-    /// with whether each job's files existed while it ran.
+    /// with whether each job's files (and output) existed while it ran. A
+    /// compress job that succeeds writes a stand-in copy to its output, as
+    /// the real child writes the compressed stream there.
     struct Fake<F: FnMut(&ChildJob) -> Result<u64, String>> {
         answer: F,
         seen: Vec<(ChildJob, bool)>,
@@ -625,9 +651,14 @@ mod tests {
 
     impl<F: FnMut(&ChildJob) -> Result<u64, String>> Runner for Fake<F> {
         fn run(&mut self, job: &ChildJob) -> Result<u64, String> {
-            let present = job.files.iter().all(|s| s.path.exists());
+            let present = job.files.iter().all(|s| s.path.exists())
+                && job.out.as_ref().is_none_or(|o| o.exists());
             self.seen.push((job.clone(), present));
-            (self.answer)(job)
+            let r = (self.answer)(job);
+            if let (Ok(_), Some(out)) = (&r, &job.out) {
+                fs::write(out, b"copy").unwrap();
+            }
+            r
         }
     }
 
@@ -654,6 +685,7 @@ mod tests {
                 level: Some(9),
                 threads: Some(4),
                 memory_limit: 123_456_789,
+                out: Some(odd.join("out")),
                 files: vec![
                     Snapshot {
                         path: odd.clone(),
@@ -671,6 +703,7 @@ mod tests {
                 level: Some(-5),
                 threads: None,
                 memory_limit: u64::MAX,
+                out: None,
                 files: vec![Snapshot {
                     path: odd,
                     len: u64::MAX,
@@ -682,6 +715,7 @@ mod tests {
                 level: None,
                 threads: None,
                 memory_limit: 0,
+                out: None,
                 files: Vec::new(),
             },
         ];
@@ -689,12 +723,14 @@ mod tests {
             let args = job.to_args();
             assert_eq!(ChildJob::from_args(&args), Ok(job.clone()), "{args:?}");
         }
-        // Not a codec of this build, a bad side, a missing length.
+        // Not a codec of this build, a bad side, a missing output, a
+        // missing length, a bad level.
         for bad in [
-            &["compress", "nope", "-", "-", "1"][..],
-            &["sideways", "lz4", "-", "-", "1"],
-            &["compress", "lz4", "-", "-", "1", "/x"],
-            &["compress", "lz4", "x", "-", "1"],
+            &["compress", "nope", "-", "-", "1", "-"][..],
+            &["sideways", "lz4", "-", "-", "1", "-"],
+            &["compress", "lz4", "-", "-", "1"],
+            &["compress", "lz4", "-", "-", "1", "/out", "/x"],
+            &["compress", "lz4", "x", "-", "1", "-"],
         ] {
             let args: Vec<OsString> = bad.iter().map(OsString::from).collect();
             assert!(ChildJob::from_args(&args).is_err(), "{bad:?}");
@@ -755,7 +791,7 @@ mod tests {
         };
         let path = PathBuf::from(file);
         let len = fs::metadata(&path).unwrap().len();
-        let args: Vec<OsString> = ["compress", &codec, &level, "-", "1073741824"]
+        let args: Vec<OsString> = ["compress", &codec, &level, "-", "1073741824", "-"]
             .iter()
             .map(OsString::from)
             .chain([OsString::from(len.to_string()), path.into_os_string()])
@@ -807,33 +843,71 @@ mod tests {
         assert!(xz > lz4, "xz -9 {xz} vs lz4 {lz4}");
     }
 
-    /// The decompress child runs to the end over the parent's copy. Only
-    /// that it succeeds is checked: in-process, its figure is this whole
-    /// test binary's high-water mark, shared with every test beside it.
+    /// `input` compressed by the compress child (in-process) into the
+    /// existing file `name` in `dir`, as the parent's temp file is filled.
+    #[cfg(unix)]
+    fn compressed_by_the_child(
+        dir: &Scratch,
+        name: &str,
+        codec: &'static str,
+        level: Option<i32>,
+        input: &Snapshot,
+    ) -> Snapshot {
+        let out = dir.file(name, b"stale bytes the child must truncate");
+        let c = child_main(ChildJob {
+            side: Side::Compress,
+            codec,
+            level,
+            threads: None,
+            memory_limit: 1 << 30,
+            out: Some(out.path.clone()),
+            files: vec![input.clone()],
+        });
+        assert!(c.is_ok(), "{codec}: {c:?}");
+        let len = fs::metadata(&out.path).unwrap().len();
+        Snapshot {
+            path: out.path,
+            len,
+        }
+    }
+
+    /// The compress child writes the compressed stream to its output file
+    /// (truncating what was there), and the decompress child runs to the
+    /// end over it and gets the input back. Only that each succeeds is
+    /// checked of the figures: in-process, they are this whole test
+    /// binary's high-water mark, shared with every test beside it.
     #[cfg(unix)]
     #[test]
-    fn child_main_decompresses_the_parents_copy() {
-        let _g = armed_lock();
+    fn the_compress_child_writes_the_copy_the_decompress_child_reads() {
         let dir = Scratch::new();
-        let input = dir.file("in", &text(1 << 20, 3));
+        let original = text(1 << 20, 3);
+        let input = dir.file("in", &original);
         for (codec, level) in [("lz4", None), ("xz", Some(9))] {
-            let (copy, len) = write_copy(
-                codec,
-                level,
-                &plan(Mode::OneStream),
-                std::slice::from_ref(&input),
+            let copy = compressed_by_the_child(&dir, codec, codec, level, &input);
+            let id = codec_id(codec).unwrap();
+            let decoder = stuffr::registry().require_decoder(id).unwrap();
+            let mut back = Vec::new();
+            let src: Box<dyn Source> = Box::new(temp_source(
+                GuardedSeek::new(File::open(&copy.path).unwrap()),
+                copy.len,
+            ));
+            io::Read::read_to_end(
+                &mut decoder.decoder(src, &DecodeOpts::default()).unwrap(),
+                &mut back,
             )
             .unwrap();
+            assert!(
+                back == original,
+                "{codec}: the copy does not decode to the input"
+            );
             let d = child_main(ChildJob {
                 side: Side::Decompress,
                 codec,
                 level: None,
                 threads: None,
                 memory_limit: 1 << 30,
-                files: vec![Snapshot {
-                    path: copy.path().to_path_buf(),
-                    len,
-                }],
+                out: None,
+                files: vec![copy],
             });
             assert!(d.is_ok(), "{codec}: {d:?}");
         }
@@ -865,20 +939,23 @@ mod tests {
             }
         );
         // One child pair per file, each child given exactly its one file
-        // (compress: the input; decompress: the temp copy, present).
+        // (compress: the input, writing to the temp copy; decompress: that
+        // copy, present, at the length the compress child left it).
         let sides: Vec<Side> = r.seen.iter().map(|(j, _)| j.side).collect();
         use Side::{Compress as C, Decompress as D};
         assert_eq!(sides, [C, D, C, D, C, D]);
         for (i, (job, present)) in r.seen.iter().enumerate() {
             assert_eq!(job.files.len(), 1);
-            assert!(present, "job {i}'s file was missing");
+            assert!(present, "job {i}'s file and output should exist");
             let level = (job.side == Side::Compress).then_some(6);
             assert_eq!((job.codec, job.level), ("gzip", level));
             if job.side == Side::Compress {
                 assert_eq!(job.files[0], files[i / 2]);
+                assert!(job.out.is_some(), "a compress child writes the copy");
             } else {
-                assert!(job.files[0].len > 0);
-                assert_ne!(job.files[0].path, files[i / 2].path);
+                assert_eq!(job.out, None);
+                assert_eq!(job.files[0].len, 4, "the length the compress child wrote");
+                assert_eq!(Some(&job.files[0].path), r.seen[i - 1].0.out.as_ref());
             }
         }
 
@@ -900,8 +977,9 @@ mod tests {
             dir.file("a", &text(10_000, 0)),
             dir.file("b", &text(10_000, 1)),
         ];
-        // The second file's compress child fails: the compress cell is a
-        // dash, the decompress one still stands (spec call 16).
+        // The second file's compress child fails: it left no copy, so
+        // there is no decompress run for that file and both cells are
+        // dashes (ruling F8); the error says why.
         let mut n = 0;
         let mut r = fake(|job: &ChildJob| match job.side {
             Side::Compress => {
@@ -916,9 +994,22 @@ mod tests {
         });
         let m = measure_memory_with(&mut r, "gzip", None, &plan(Mode::PerFile), &files);
         assert_eq!(m.compress, None);
-        assert_eq!(m.decompress, Some(20));
+        assert_eq!(m.decompress, None);
         let e = m.error.unwrap();
-        assert!(e.contains("compress") && e.contains("SIGKILL"), "{e}");
+        assert!(e.starts_with("compress: ") && e.contains("SIGKILL"), "{e}");
+        assert!(e.contains("no decompress run"), "{e}");
+        // No child ran after the failure: two compress, one decompress.
+        assert_eq!(r.seen.len(), 3);
+
+        // A failed decompress child leaves the compress side standing
+        // (spec call 16).
+        let mut r = fake(|job: &ChildJob| match job.side {
+            Side::Compress => Ok(10),
+            Side::Decompress => Err("the memory run failed (exit status: 1)".into()),
+        });
+        let m = measure_memory_with(&mut r, "gzip", None, &plan(Mode::PerFile), &files);
+        assert_eq!((m.compress, m.decompress), (Some(10), None));
+        assert!(m.error.unwrap().starts_with("decompress: "));
 
         // Both sides failing: two dashes.
         let mut r = fake(|_: &ChildJob| Err("boom".to_string()));
@@ -935,12 +1026,6 @@ mod tests {
             interpret(false, "exit status: 1", b"err nope\n", b""),
             Err("nope".into())
         );
-
-        // A codec the parent cannot even make its copy with.
-        let mut r = fake(|_: &ChildJob| Ok(1));
-        let m = measure_memory_with(&mut r, "nope", None, &plan(Mode::OneStream), &files);
-        assert_eq!(m.decompress, None);
-        assert!(m.error.is_some());
     }
 
     #[test]
@@ -979,20 +1064,17 @@ mod tests {
     #[cfg(all(unix, not(feature = "xz-c")))]
     #[test]
     fn a_child_refusal_names_the_memory_limit() {
-        let _g = armed_lock();
         let dir = Scratch::new();
         let input = dir.file("in", &text(100_000, 0));
-        let (copy, len) = write_copy("xz", Some(9), &plan(Mode::OneStream), &[input]).unwrap();
+        let copy = compressed_by_the_child(&dir, "in.xz", "xz", Some(9), &input);
         let r = child_main(ChildJob {
             side: Side::Decompress,
             codec: "xz",
             level: None,
             threads: None,
             memory_limit: 1 << 20,
-            files: vec![Snapshot {
-                path: copy.path().to_path_buf(),
-                len,
-            }],
+            out: None,
+            files: vec![copy],
         });
         let e = r.unwrap_err();
         assert!(e.starts_with("refused by --memory-limit"), "{e}");
