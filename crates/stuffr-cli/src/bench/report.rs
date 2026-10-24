@@ -212,7 +212,8 @@ fn output_name(m: &Measured) -> &'static str {
 
 fn table_lines(rows: &[Row], bytes_in: u64, memory: MemoryMode) -> Vec<String> {
     let any = any_on_disk(rows);
-    let with_mem = memory == MemoryMode::Measured;
+    let with_mem = matches!(memory, MemoryMode::Measured | MemoryMode::Unsupported);
+    let measured_mem = memory == MemoryMode::Measured;
     let mut header: Vec<String> = HEADER.iter().map(|s| s.to_string()).collect();
     if with_mem {
         header.extend(MEM_HEADER.iter().map(|s| s.to_string()));
@@ -233,7 +234,7 @@ fn table_lines(rows: &[Row], bytes_in: u64, memory: MemoryMode) -> Vec<String> {
                     time_text(m.decompress_ns),
                 ];
                 if with_mem {
-                    let mem = row.memory.as_ref();
+                    let mem = row.memory.as_ref().filter(|_| measured_mem);
                     line.push(mem_text(mem.and_then(|m| m.compress)));
                     line.push(mem_text(mem.and_then(|m| m.decompress)));
                 }
@@ -895,10 +896,10 @@ mod tests {
             first.ends_with(" · 1 run, memory not measured on this platform"),
             "{first}"
         );
-        assert!(
-            !got.contains("c-mem") && !got.contains("least memory"),
-            "{got}"
-        );
+        assert!(!got.contains("least memory"), "{got}");
+        // Columns of `-`, even when the rows carry numbers.
+        let got = render(|o| human(&c, &mem_rows(), o));
+        assert_eq!(got, include_str!("testdata/human-unsupported.txt"));
         for m in [MemoryMode::Measured, MemoryMode::Skipped] {
             let c = Conditions {
                 memory: m,
@@ -931,7 +932,7 @@ mod tests {
                 memory: m,
                 ..cond()
             };
-            let v = parse(&c, &self::rows());
+            let v = parse(&c, &mem_rows());
             assert_eq!(v["conditions"]["memory"], false, "{m:?}");
             for r in v["rows"].as_array().unwrap() {
                 assert!(r["compress_mem"].is_null() && r["decompress_mem"].is_null());
@@ -939,6 +940,30 @@ mod tests {
             }
             assert!(v["winners"]["least_memory"].is_null(), "{m:?}");
         }
+    }
+
+    #[test]
+    fn memory_never_leaks_from_a_mode_that_did_not_measure() {
+        for m in [MemoryMode::Skipped, MemoryMode::Unsupported] {
+            let c = Conditions {
+                memory: m,
+                ..cond()
+            };
+            let got = render(|o| csv(&c, &mem_rows(), o));
+            for line in got.lines().skip(1) {
+                assert!(line.ends_with(",,,"), "{m:?}: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_disk_marked_row_keeps_the_memory_columns_aligned() {
+        let mut rows = mem_rows();
+        if let Outcome::Ok(m) = &mut rows[2].outcome {
+            m.on_disk = true;
+        }
+        let got = render(|o| human(&mem_cond(), &rows, o));
+        assert_eq!(got, include_str!("testdata/human-memory-marked.txt"));
     }
 
     #[test]
