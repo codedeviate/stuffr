@@ -1386,7 +1386,13 @@ fn type_paced(
                 }
             }
             None => {
-                // SAFETY: kill on our child, which `done` says is unreaped.
+                // SAFETY: kill(2) on a pid with no memory side effects. `done`
+                // is set only after the owning thread has reaped the child,
+                // so it was checked at the top of this step, not here: the
+                // pid could in principle be reaped (and reused) in the few
+                // microseconds since. That window is accepted, because moving
+                // the signal to the owning thread would change the pacing the
+                // tty tests rely on.
                 unsafe { libc::kill(pid as libc::pid_t, signal.unwrap_or(0)) };
                 return;
             }

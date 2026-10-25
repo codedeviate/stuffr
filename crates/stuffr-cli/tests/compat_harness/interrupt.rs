@@ -300,10 +300,12 @@ fn interrupt_when(
         if is_ready {
             break;
         }
-        assert!(
-            Instant::now() < deadline,
-            "{name} {args:?}: never became ready"
-        );
+        if Instant::now() >= deadline {
+            // Do not leave the child running behind the panic.
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{name} {args:?}: never became ready");
+        }
         std::thread::sleep(Duration::from_millis(2));
     }
     // Drain stderr on a thread, so a chatty child can neither fill the pipe

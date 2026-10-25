@@ -1,36 +1,28 @@
-//! Apple's `zopen.c` (file_cmds-479 `compress/`, the Regents of the
-//! University of California, BSD-3-Clause, `LICENSE-compress-bsd`): the
-//! LZW coder `compress` writes and reads through stdio's `funopen`.
+//! Apple's `zopen.c` (file_cmds-479 `compress/`, the Regents of the University of California,
+//! BSD-3-Clause, `LICENSE-compress-bsd`): the LZW coder `compress` writes and reads through stdio's
+//! `funopen`.
 //!
-//! [`Encoder`] is `zwrite`, `output`, `cl_block`, `cl_hash` and `zclose`'s
-//! write half, state for state: the hash (`hsize` 69001, so `hshift` 8),
-//! the 16-byte code buffer whose stale bytes a width change writes out
-//! whole, the ratio check every 10 000 input bytes once the table is full
-//! (`rat > ratio` keeps the table, anything else is a CLEAR), the maxbits-9
-//! table that widens to 10-bit codes when entry 512 would be next, and a
-//! header of `maxbits | 0x80` for any maxbits from 1 to 16 (ruling E1: Apple's
-//! `-b 1` to `-b 8` bytes are reproduced; no entry ever fits below 2^9, so
-//! the stream is 9-bit literals and CLEARs). An empty input writes nothing,
-//! not even the header: `zwrite` is never called and `zclose` outputs a
-//! code of width 0 (ruling E2).
+//! [`Encoder`] is `zwrite`, `output`, `cl_block`, `cl_hash` and `zclose`'s write half, state for
+//! state: the hash (`hsize` 69001, so `hshift` 8), the 16-byte code buffer whose stale bytes a
+//! width change writes out whole, the ratio check every 10 000 input bytes once the table is full
+//! (`rat > ratio` keeps the table, anything else is a CLEAR), the maxbits-9 table that widens to
+//! 10-bit codes when entry 512 would be next, and a header of `maxbits | 0x80` for any maxbits from
+//! 1 to 16 (ruling E1: Apple's `-b 1` to `-b 8` bytes are reproduced; no entry ever fits below 2^9,
+//! so the stream is 9-bit literals and CLEARs). An empty input writes nothing, not even the header:
+//! `zwrite` is never called and `zclose` outputs a code of width 0 (ruling E2).
 //!
-//! [`Decoder`] is `zread` and `getcode`: the first code is written as its
-//! low byte without any check (`*bp++ = (u_char)finchar`); codes are read
-//! in groups of `n_bits` bytes, a short last group rounded down to whole
-//! codes and still yielding one from whatever its buffer held before; a
-//! code past the next free entry is `EINVAL`, a bad magic `EFTYPE`, and a
-//! read error ends the input like its end. Three changes, all deviations
-//! of `apple/mod.rs`: a read error is kept (`Decoder::read_error`) so the
-//! caller fails instead of finishing (A4); the header's maxbits may be
-//! anything up to 16 (Apple refuses below 12: A1, with ruling E1 widening
-//! it to every maxbits ncompress's decoder accepts); and a table chain
-//! longer than the stack
-//! (only reachable through the unchecked first code; C overflows its
-//! stack there) is `EINVAL`.
+//! [`Decoder`] is `zread` and `getcode`: the first code is written as its low byte without any
+//! check (`*bp++ = (u_char)finchar`); codes are read in groups of `n_bits` bytes, a short last
+//! group rounded down to whole codes and still yielding one from whatever its buffer held before; a
+//! code past the next free entry is `EINVAL`, a bad magic `EFTYPE`, and a read error ends the input
+//! like its end. Three changes, all deviations of `apple/mod.rs`: a read error is kept
+//! (`Decoder::read_error`) so the caller fails instead of finishing (A4); the header's maxbits may
+//! be anything up to 16 (Apple refuses below 12: A1, with ruling E1 widening it to every maxbits
+//! ncompress's decoder accepts); and a table chain longer than the stack (only reachable through
+//! the unchecked first code; C overflows its stack there) is `EINVAL`.
 //!
-//! This is not gzip's `zread.rs`: that ports `gzip/zuncompress.c`, which
-//! checks the first code like the rest and answers `EFTYPE` for a bad
-//! code, and keeps Apple's refusal below 12 bits.
+//! This is not gzip's `zread.rs`: that ports `gzip/zuncompress.c`, which checks the first code like
+//! the rest and answers `EFTYPE` for a bad code, and keeps Apple's refusal below 12 bits.
 
 use std::io::{self, Read, Write};
 

@@ -1298,6 +1298,7 @@ mod interrupts {
             // A run that ends before the signal can land is a miss: retry
             // with a larger input, fail only when every size misses.
             let mut hit = None;
+            let mut hung = false;
             for mib in [64, 256] {
                 let data = big_input(mib);
                 let dir = ScratchDir::unique("compress-intr-a2");
@@ -1322,14 +1323,21 @@ mod interrupts {
                         &ready,
                     )
                 };
+                hung |= take_reference_hung();
                 if let Some(r) = r {
                     hit = Some((r, data, dir));
                     break;
                 }
             }
-            let (r, data, dir) = hit.unwrap_or_else(|| {
-                panic!("{why}: compress finished before the signal at 64 and 256 MiB")
-            });
+            let Some((r, data, dir)) = hit else {
+                if hung {
+                    eprintln!(
+                        "note: the compress reference hung after the signal; comparison skipped"
+                    );
+                    continue;
+                }
+                panic!("{why}: no run reached the signal at 64 and 256 MiB");
+            };
             assert!(killed_by(&r, sig), "{why}: {:?}", r.status);
             assert_eq!(r.left, ["big", "big.Z"], "{why}: the temporary was left");
             assert!(
@@ -1361,6 +1369,7 @@ mod interrupts {
             // A run that finished before the signal (no result, or exit 0
             // after "ready") is a miss: retry with a larger input.
             let mut hit = None;
+            let mut hung = false;
             for mib in [64, 256] {
                 let dir = ScratchDir::unique("compress-intr-c");
                 std::fs::create_dir_all(&*dir).unwrap();
@@ -1375,14 +1384,21 @@ mod interrupts {
                     Inherit::Default,
                     libc::SIGTERM,
                 );
+                hung |= take_reference_hung();
                 if let Some(r) = r.filter(|r| !r.status.success()) {
                     hit = Some(r);
                     break;
                 }
             }
-            let r = hit.unwrap_or_else(|| {
-                panic!("mine={mine}: compress -c finished before the signal at 64 and 256 MiB")
-            });
+            let Some(r) = hit else {
+                if hung {
+                    eprintln!(
+                        "note: the compress reference hung after the signal; comparison skipped"
+                    );
+                    continue;
+                }
+                panic!("mine={mine}: compress -c: no run reached the signal at 64 and 256 MiB");
+            };
             assert!(killed_by(&r, libc::SIGTERM), "mine={mine}: {:?}", r.status);
             assert_eq!(r.left, ["big"], "mine={mine}");
         }
@@ -1401,13 +1417,14 @@ mod interrupts {
             // A run that ends before the signal lands is a miss: retry with
             // a larger input, fail only when every size misses.
             let mut hit = None;
+            let mut hung = false;
             for mib in [64, 256] {
                 let big: Vec<u8> = block.iter().copied().cycle().take(mib << 20).collect();
                 let dir = ScratchDir::unique("compress-intr-ign");
                 std::fs::create_dir_all(&*dir).unwrap();
                 std::fs::write(dir.join("big"), &big).unwrap();
                 let ready = has_data(&dir, &|n: &str| n == "big.Z");
-                if let Some(r) = interrupt_env(
+                let r = interrupt_env(
                     &exe(mine, "compress"),
                     "compress",
                     &["big"],
@@ -1416,14 +1433,22 @@ mod interrupts {
                     Inherit::IgnoreInt,
                     libc::SIGINT,
                     &ready,
-                ) {
+                );
+                hung |= take_reference_hung();
+                if let Some(r) = r {
                     hit = Some(r);
                     break;
                 }
             }
-            let r = hit.unwrap_or_else(|| {
-                panic!("mine={mine}: compress finished before the signal at 64 and 256 MiB")
-            });
+            let Some(r) = hit else {
+                if hung {
+                    eprintln!(
+                        "note: the compress reference hung after the signal; comparison skipped"
+                    );
+                    continue;
+                }
+                panic!("mine={mine}: compress: no run reached the signal at 64 and 256 MiB");
+            };
             assert!(r.status.success(), "mine={mine}: {:?}", r.status);
             assert_eq!(r.left, ["big.Z"], "mine={mine}");
         }
