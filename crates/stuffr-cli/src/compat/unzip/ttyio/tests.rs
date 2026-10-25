@@ -16,6 +16,15 @@ fn lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// The whole `termios` of `fd`, for before/after comparisons.
+fn termios_of(fd: &OwnedFd) -> libc::termios {
+    // SAFETY: termios is plain data filled by tcgetattr.
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: tcgetattr writes the termios we own.
+    assert_eq!(unsafe { libc::tcgetattr(fd.as_raw_fd(), &mut t) }, 0);
+    t
+}
+
 /// A pseudo-terminal: (master, slave).
 fn pty() -> (OwnedFd, OwnedFd) {
     let (mut m, mut s) = (-1, -1);
@@ -235,6 +244,7 @@ fn a_password_shows_nothing_and_is_zeroed() {
 fn a_terminal_that_hung_up_ends_the_prompt() {
     let _l = lock();
     let (master, slave) = pty();
+    let before = termios_of(&slave);
     drop(master);
     let fd = slave.as_raw_fd();
     let mut b = 0u8;
@@ -257,4 +267,10 @@ fn a_terminal_that_hung_up_ends_the_prompt() {
     let r = getp_on(&mut err, fd, b"pw: ", IZ_PWLEN + 1);
     assert_eq!(r.unwrap_err(), PwError::HungUp);
     assert_eq!(err, b"pw: ");
+    let after = termios_of(&slave);
+    assert_eq!(after.c_iflag, before.c_iflag);
+    assert_eq!(after.c_oflag, before.c_oflag);
+    assert_eq!(after.c_cflag, before.c_cflag);
+    assert_eq!(after.c_lflag, before.c_lflag);
+    assert_eq!(after.c_cc, before.c_cc);
 }

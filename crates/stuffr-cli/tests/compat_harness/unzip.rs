@@ -429,20 +429,13 @@ fn unzip_run(exe: &Path, c: &Case, stuffr_side: bool) -> UnzipRun {
     }
 }
 
-/// R2's tail of stuffr's banner for `flavour`, after `by stuffr X.Y.Z `.
-fn stuffr_banner_tail(flavour: &str) -> Option<&'static str> {
-    match flavour {
-        "apple" => Some("(altered; original by Info-ZIP, with modifications by Apple Inc.)."),
-        "ubuntu" => Some("(altered; Debian's build, original by Info-ZIP)."),
-        _ => None,
-    }
-}
-
 /// Every banner line becomes `<banner>`: on the reference side a line that
 /// is exactly one of the references' banners, on stuffr's side (`ours`
 /// the forced flavour) a line holding `, by stuffr X.Y.Z (altered; ` whose
-/// tail names that flavour's origin (Apple Inc. or Debian), so another
-/// flavour's banner, or text around a banner, still differs.
+/// tail names that flavour's origin (Apple Inc. or Debian) and whose text
+/// before `, by stuffr` equals a reference banner's text before its `, by `
+/// (the whole banner for funzip's, which has none), so another flavour's
+/// banner, or text around a banner, still differs.
 fn mask_unzip_banners(text: &[u8], ours: Option<&str>) -> Vec<u8> {
     let stuffr = format!(", by stuffr {} (altered; ", env!("CARGO_PKG_VERSION"));
     let marker = match ours {
@@ -450,6 +443,16 @@ fn mask_unzip_banners(text: &[u8], ours: Option<&str>) -> Vec<u8> {
         Some("ubuntu") => Some("Debian"),
         _ => None,
     };
+    let banners = [
+        APPLE_UNZIP_BANNER,
+        UBUNTU_UNZIP_BANNER,
+        ZIPINFO_BANNER,
+        FUNZIP_BANNER,
+    ];
+    let prefixes: Vec<&str> = banners
+        .iter()
+        .map(|b| b.split_once(", by ").map_or(*b, |(head, _)| head))
+        .collect();
     let mut out = Vec::with_capacity(text.len());
     for line in text.split_inclusive(|&b| b == b'\n') {
         let (body, nl) = match line.strip_suffix(b"\n") {
@@ -458,16 +461,10 @@ fn mask_unzip_banners(text: &[u8], ours: Option<&str>) -> Vec<u8> {
         };
         let s = String::from_utf8_lossy(body);
         let banner = match marker {
-            None => [
-                APPLE_UNZIP_BANNER,
-                UBUNTU_UNZIP_BANNER,
-                ZIPINFO_BANNER,
-                FUNZIP_BANNER,
-            ]
-            .contains(&s.as_ref()),
-            Some(m) => s
-                .split_once(&stuffr)
-                .is_some_and(|(_, tail)| tail.ends_with(").") && tail.contains(m)),
+            None => banners.contains(&s.as_ref()),
+            Some(m) => s.split_once(&stuffr).is_some_and(|(head, tail)| {
+                prefixes.contains(&head) && tail.ends_with(").") && tail.contains(m)
+            }),
         };
         out.extend_from_slice(if banner { b"<banner>" } else { body });
         out.extend_from_slice(nl);

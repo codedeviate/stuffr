@@ -268,7 +268,9 @@ pub(crate) fn zipinfo(uz: &mut Uz) -> i32 {
             }
             // ubuntu: -DUNICODE_SUPPORT: from here on `G.filename` is the
             // extra field's UTF-8 name, if any
-            e.filename = c_str(&uz.filename).to_vec();
+            if uz.flavour == super::Flavour::Ubuntu {
+                e.filename = c_str(&uz.filename).to_vec();
+            }
             uz.crec_relative_offset_local_header = e.relative_offset_local_header;
 
             match uz.o.lflag {

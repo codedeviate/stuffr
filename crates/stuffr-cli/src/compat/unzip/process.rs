@@ -946,7 +946,9 @@ pub(crate) fn walk(
         }
         // ubuntu: -DUNICODE_SUPPORT: the extra field's UTF-8 name, if any,
         // is the one matched and shown
-        e.filename = fileio::c_str(&uz.filename).to_vec();
+        if uz.flavour == super::Flavour::Ubuntu {
+            e.filename = fileio::c_str(&uz.filename).to_vec();
+        }
 
         let error = each(uz, &e);
         if error != 0 {

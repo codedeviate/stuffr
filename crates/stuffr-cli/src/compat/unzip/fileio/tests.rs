@@ -46,6 +46,36 @@ fn readbuf_past_the_buffer_reads_zeros() {
     });
 }
 
+/// ruling: T13-7. A name shorter on disk than declared reads what is there,
+/// is NUL-terminated at the declared length, and the bytes past the short
+/// read are zeros (the C's are uninitialised): the code is `PK_OK`, and a
+/// read that gives nothing at all is `PK_EOF`.
+#[test]
+fn read_filename_full_short_read_t13_7() {
+    // An open archive with nothing more in it: reads end at its end.
+    let path = std::env::temp_dir().join(format!("stuffr-unzip-t13-7-{}", std::process::id()));
+    std::fs::write(&path, b"").unwrap();
+    let open = || Some(std::fs::File::open(&path).unwrap().into());
+    with_uz(|uz| {
+        uz.zin.fd = open();
+        uz.zin.inbuf[..3].copy_from_slice(b"abc");
+        uz.zin.inptr = 0;
+        uz.zin.incnt = 3;
+        let rc = read_filename_full(uz, 8, &PInfo::default(), false);
+        assert_eq!(rc, PK_OK);
+        let full = uz.filename_full.as_ref().expect("buffer kept");
+        assert_eq!(&full[..9], b"abc\0\0\0\0\0\0");
+        assert_eq!(c_str(&uz.filename), b"abc");
+        assert_eq!(uz.zin.incnt, 0);
+    });
+    with_uz(|uz| {
+        uz.zin.fd = open();
+        uz.zin.incnt = 0; // nothing buffered, nothing in the archive
+        assert_eq!(read_filename_full(uz, 8, &PInfo::default(), false), PK_EOF);
+    });
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn readbuf_refills_a_block_at_a_time() {
     let dir = std::env::temp_dir().join(format!("stuffr-unzip-readbuf-{}", std::process::id()));

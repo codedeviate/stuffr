@@ -3,7 +3,7 @@ Info-ZIP method fixtures (stuffr 0.16.0, Task 1)
 
 Archives that the Info-ZIP decoder ports (stuffr_formats::infozip) are tested
 against. Every file is at most 64 KiB, is committed byte-for-byte as fetched
-(or generated as stated), and was checked with BOTH references:
+(or generated as stated; lzma.zip is the one fetched file renamed, from .zipx), and was checked with BOTH references:
 
   Apple   /usr/bin/unzip  (UnZip 6.00 of 20 April 2009, modified by Apple Inc.)
   Ubuntu  unzip 6.0-28ubuntu4.1 on ubuntu:24.04 (docker; zip 3.0-13ubuntu0.2)
@@ -53,6 +53,8 @@ bzip2.zip               | 12 bzip2, 7600 bytes
   GENERATED. In docker ubuntu:24.04 (zip 3.0-13ubuntu0.2), from a file of 200
   copies of "bzip2 sample line for stuffr fixtures\n" named sample.txt:
     TZ=UTC zip -q -X -Z bzip2 bzip2.zip sample.txt
+  Regenerating gives different bytes: the archive embeds the run's timestamp, so
+  the committed sha256 below is the pin, not the command.
   Authored for this repository, so it carries the repository licence (MIT).
   6ffce363b0be63ff1e65ffd65c2e26487f6aad2265bc49e8f2c89c396235762b
 aes128.zip              | 99 WinZip AES-128 (extra field 0x9901)

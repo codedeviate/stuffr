@@ -92,7 +92,7 @@ impl Keys {
 
     /// Decrypts one byte and advances the keys over its plain text: crypt.h's
     /// `zdecode(c)`, `update_keys(c ^= decrypt_byte())`.
-    // port: crypt.c:zdecode
+    // port: crypt.h:zdecode
     pub fn decrypt_byte(&mut self, c: u8) -> u8 {
         let plain = c ^ self.stream_byte();
         self.update_keys(plain);

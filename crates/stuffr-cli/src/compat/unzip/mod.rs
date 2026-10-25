@@ -443,6 +443,9 @@ impl<'a> Uz<'a> {
     /// holds the window (`slide` empty) it is kept for
     /// [`Uz::restore_slide`]; a write past the window's end is the C's
     /// never-reached case and is dropped.
+    ///
+    /// A message exactly the slide's length has no room for C's NUL, so none
+    /// is written; unobservable, as nothing reads past the length.
     pub(crate) fn put_slide_at(&mut self, at: usize, buf: &[u8], nul: bool) {
         if self.slide.is_empty() {
             self.pending_slide.push((at, buf.to_vec(), nul));
