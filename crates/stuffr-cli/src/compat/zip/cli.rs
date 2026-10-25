@@ -1866,10 +1866,7 @@ fn show_options(z: &mut Zr, table: &[OptionSpec]) {
 /// (`-m` has nothing to delete yet).
 fn finish(z: &mut Zr, e: i32) -> Exit {
     if z.o.latest && z.o.zipfile.as_deref().is_some_and(|f| f != b"-") {
-        z.zipwarn(
-            b"zip file is empty, can't make it as old as latest entry",
-            b"",
-        );
+        z.zipwarn(m::ZIP_EMPTY_NO_LATEST.as_bytes(), b"");
     }
     Exit { code: e }
 }
@@ -1881,14 +1878,14 @@ fn add_filter(z: &mut Zr, flag: u8, pattern: Vec<u8>) -> Result<(), Exit> {
     if pattern.first() == Some(&b'@') {
         // read a file with one pattern per line
         if pattern.len() == 1 {
-            return Err(z.ziperr(ZE_PARMS, b"missing file after @"));
+            return Err(z.ziperr(ZE_PARMS, m::MISSING_FILE_AFTER_AT.as_bytes()));
         }
         let path = z.host.path(&pattern[1..]);
         let file = match std::fs::File::open(&path) {
             Ok(f) => f,
             Err(e) => {
                 let mut why = Vec::new();
-                printf(&mut why, "%s pattern file '%s'", &[&[flag], &pattern]);
+                printf(&mut why, m::PATTERN_FILE, &[&[flag], &pattern]);
                 return Err(z.ziperr_os(ZE_OPEN, &why, &e));
             }
         };
@@ -2288,7 +2285,13 @@ pub(crate) fn parse_zip(z: &mut Zr, argv0: &[u8], rest: &[Vec<u8>]) -> Result<()
             (_, o::NON_OPTION_ARG) => {
                 non_option_arg(z, val(value), st.argnum)?;
             }
-            _ => unreachable!("every ID in the table has a case"),
+            // every ID in the table has an arm (a unit test pins it); an
+            // unknown one is the C's `no such option ID` ziperr
+            (_, id) => {
+                let mut e = Vec::new();
+                printf(&mut e, m::NO_SUCH_OPTION_ID, &[id.to_string().as_bytes()]);
+                return Err(z.ziperr(ZE_PARMS, &e));
+            }
         }
     }
 

@@ -638,7 +638,7 @@ mod unix {
         }
     }
 
-    /// The two compress names (0.18.0) make 27 links in all. Each runs as
+    /// The two compress names (0.18.0) are among the 31 links. Each runs as
     /// its name in the flavour `STUFFR_COMPRESS_FLAVOR` picks (Apple's
     /// usage line names the program), and any other value of it is refused,
     /// exit 1, in stuffr's words.

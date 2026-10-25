@@ -1127,3 +1127,29 @@ const PINNED_OVERFLOWS: &[&str] = &[
 
 /// What Ubuntu's table adds (its `-su` and `-sU`).
 const PINNED_OVERFLOWS_UBUNTU: &[&str] = &["--show-unicode=v", "--show-just-unicode=v"];
+
+/// Every row of both tables has an arm in `main()`'s loop: no option ever
+/// reaches the "no such option ID" answer.
+#[test]
+fn every_table_row_has_an_arm() {
+    for f in [Flavour::Apple, Flavour::Ubuntu] {
+        for s in table(f) {
+            let arg = if !s.long.is_empty() {
+                match s.value {
+                    ValueType::No => format!("--{}", s.long),
+                    _ => format!("--{}=1", s.long),
+                }
+            } else {
+                match s.value {
+                    ValueType::No => format!("-{}", s.short),
+                    _ => format!("-{}1", s.short),
+                }
+            };
+            let (_, out, err) = go(f, "zip", &[arg.as_str()]);
+            assert!(
+                !out.contains("no such option ID") && !err.contains("no such option ID"),
+                "{f:?} {arg}: {out}{err}"
+            );
+        }
+    }
+}

@@ -1408,8 +1408,9 @@ COMPATIBILITY LINKS (INSTALL-LINKS)
       gunzip, zcat, gzcat, xz, unxz, xzcat, lzma, unlzma, lzcat, zstd,
       unzstd, zstdcat, zstdmt, lz4, unlz4, lz4cat, lz4c, unzip, zipinfo,
       funzip, compress, uncompress, zip, zipcloak, zipnote and zipsplit in
-      that directory, each pointing at this stuffr binary. Run under one of those names, the binary behaves
-      as that tool, with its flags, messages and exit codes. This is
+      that directory, each pointing at this stuffr binary. Run under one of
+      those names, the binary behaves as that tool, with its flags, messages
+      and exit codes. This is
       opt-in: nothing creates these links unless you run this verb. The
       directory must exist (exit 2 if not); one that cannot be written to
       is exit 1, naming the link and the operating system's reason. A second run reports "already present" and changes nothing.

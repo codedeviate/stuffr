@@ -13,7 +13,9 @@
 //! stuffr banner replaces a reference line (deviation 2: only the banner
 //! line of `-v` and the header line of each program's help name stuffr and
 //! say they are altered, Info-ZIP licence clause 3). The
-//! collapsed-indentation scan exempts this file.
+//! collapsed-indentation scan exempts this file. The option descriptions of
+//! the options tables (`-so`'s last column and `optionerr`'s text) are table
+//! data and live in `cli.rs` with the tables.
 
 pub(super) use crate::compat::host::printf;
 
@@ -112,6 +114,17 @@ pub(super) const OPTION_NAME_DESC: &str = "'%s' (%s)";
 pub(super) const OPTION_NAME: &str = "'%s'";
 
 // ---- zip.c: main()'s messages ----
+
+/// zip.c:main, an option ID without a case (`%s` the ID).
+pub(super) const NO_SUCH_OPTION_ID: &str = "no such option ID: %s";
+/// zip.c:finish, `-o` with an empty archive, a warning.
+pub(super) const ZIP_EMPTY_NO_LATEST: &str =
+    "zip file is empty, can't make it as old as latest entry";
+/// zip.c:add_filter, `-i @` or `-x @` with no file name.
+pub(super) const MISSING_FILE_AFTER_AT: &str = "missing file after @";
+/// zip.c:add_filter, a pattern file that cannot be opened (`%s` the flag,
+/// then the pattern as given).
+pub(super) const PATTERN_FILE: &str = "%s pattern file '%s'";
 
 /// zip.c:main, `-d`, `-f`, `-u`, `-U` after another action.
 pub(super) const JUST_ONE_ACTION: &str = "specify just one action";
