@@ -4139,7 +4139,9 @@ fn the_link_and_escape_seeds_read_as_what_they_claim() {
 }
 
 /// The legacy-directory seeds (0.16.0 deep fuzz) list their directory as a
-/// directory of its declared size, under the legacy method's codec.
+/// directory of its declared size, under the legacy method's codec. This pins
+/// the seeds' shape only; the original crash (an empty reader under a
+/// declared size) is reproduced by the deep-fuzz `container` target alone.
 #[test]
 fn the_legacy_directory_seeds_read_as_what_they_claim() {
     let dir = tempfile::tempdir().unwrap();

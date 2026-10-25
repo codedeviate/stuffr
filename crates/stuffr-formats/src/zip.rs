@@ -1469,9 +1469,18 @@ impl ZipIndexed {
         // A directory has no payload to decode, but keeps its declared size
         // and the normal path's length check: a directory declaring bytes it
         // never delivers is refused on read (exit 5), as `entry_at`'s
-        // `EntryPayload` refuses it for every other method.
+        // `EntryPayload` refuses it for every other method. The stored
+        // payload is read raw (never decoded), so a directory carrying bytes
+        // it declares none of is refused too, as the stored path refuses it.
         if meta.kind == EntryKind::Dir {
-            let payload = EntryPayload::new(io::empty(), meta.size, &meta.name);
+            let raw = RawPayload {
+                handle: self.handle.clone(),
+                start: params.data_start,
+                left: params.csize,
+                seeked: false,
+                name: params.name.clone(),
+            };
+            let payload = EntryPayload::new(raw, meta.size, &meta.name);
             return Ok(Entry::new(meta, Box::new(payload)));
         }
         for (what, n) in [
@@ -1495,6 +1504,44 @@ impl ZipIndexed {
                 data: io::Cursor::new(Vec::new()),
             }),
         ))
+    }
+}
+
+/// The raw (undecoded) payload of a legacy-method entry: `csize` bytes from
+/// `start`. It seeks on the first read, so listing stays cheap, and a payload
+/// that ends before `csize` bytes is `InvalidData` (exit 5), never a short
+/// success.
+struct RawPayload {
+    handle: SeekAdapter,
+    start: u64,
+    left: u64,
+    seeked: bool,
+    name: String,
+}
+
+impl Read for RawPayload {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if !self.seeked {
+            self.handle.seek(SeekFrom::Start(self.start))?;
+            self.seeked = true;
+        }
+        if self.left == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        let want = usize::try_from(self.left).map_or(buf.len(), |l| l.min(buf.len()));
+        let n = self.handle.read(&mut buf[..want])?;
+        if n == 0 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "entry `{}`: {} bytes short of the compressed size its header \
+                     declares; the archive is truncated",
+                    self.name, self.left
+                ),
+            ));
+        }
+        self.left -= n as u64;
+        Ok(n)
     }
 }
 
@@ -5318,11 +5365,13 @@ z.close()\n";
         require_bin("this-binary-does-not-exist-xyz");
     }
 
-    /// `hand_built_zip`'s one entry, re-stored with `method` in both its
-    /// local and its central header (the payload is left as given).
-    fn hand_built_with_method(name: &str, declared: u32, method: u16) -> Vec<u8> {
-        let mut bytes = hand_built_zip(name, 0, 0, declared, b"");
-        let cd = 30 + name.len();
+    /// `hand_built_zip`'s one entry carrying `payload` (compressed size =
+    /// its length), re-stored with `method` in both its local and its
+    /// central header.
+    fn hand_built_with_method(name: &str, declared: u32, method: u16, payload: &[u8]) -> Vec<u8> {
+        let csize = u32::try_from(payload.len()).expect("a test payload is short");
+        let mut bytes = hand_built_zip(name, 0, csize, declared, payload);
+        let cd = 30 + name.len() + payload.len();
         bytes[8..10].copy_from_slice(&method.to_le_bytes());
         bytes[cd + 10..cd + 12].copy_from_slice(&method.to_le_bytes());
         bytes
@@ -5350,19 +5399,72 @@ z.close()\n";
     /// empty reader under a size it never delivers.
     #[test]
     fn a_legacy_directory_entry_lists_and_reads_as_the_normal_path_does() {
-        for declared in [0x0200_0000u32, 1, 0] {
+        let rows: [(u32, &[u8]); 6] = [
+            (0x0200_0000, b""),
+            (1, b""),
+            (0, b""),
+            (0, b"x"),
+            (0, b"0123456789"),
+            (5, b"abc"),
+        ];
+        for (declared, payload) in rows {
             let (stored, stored_read) =
-                list_and_read_first(&hand_built_with_method("sample/", declared, 0));
-            assert_eq!(stored.kind, EntryKind::Dir);
-            assert_eq!(stored.size, Some(u64::from(declared)));
-            assert_eq!(stored_read, if declared == 0 { Ok(0) } else { Err(5) });
+                list_and_read_first(&hand_built_with_method("sample/", declared, 0, payload));
+            let what = format!("declared {declared}, payload {} bytes", payload.len());
+            assert_eq!(stored.kind, EntryKind::Dir, "{what}");
+            assert_eq!(stored.size, Some(u64::from(declared)), "{what}");
+            let expected = if declared == 0 && payload.is_empty() {
+                Ok(0)
+            } else {
+                Err(5)
+            };
+            assert_eq!(stored_read, expected, "stored: {what}");
             for method in [1u16, 6] {
-                let (legacy, legacy_read) =
-                    list_and_read_first(&hand_built_with_method("sample/", declared, method));
-                let what = format!("method {method}, declared {declared}");
+                let (legacy, legacy_read) = list_and_read_first(&hand_built_with_method(
+                    "sample/", declared, method, payload,
+                ));
+                let what = format!("method {method}, {what}");
                 assert_eq!(legacy.kind, stored.kind, "{what}");
                 assert_eq!(legacy.size, stored.size, "{what}");
                 assert_eq!(legacy_read, stored_read, "{what}");
+            }
+        }
+    }
+
+    /// A directory whose compressed size claims bytes the archive does not
+    /// hold (the payload runs past EOF) is corrupt (exit 5) on both paths,
+    /// never a panic or a short success.
+    #[test]
+    fn a_legacy_directory_payload_past_the_end_is_corrupt() {
+        for method in [0u16, 1, 6] {
+            let mut bytes = hand_built_with_method("sample/", 0, method, b"0123456789");
+            // Central directory csize (offset 20 in the record) claims more.
+            let cd = 30 + "sample/".len() + 10;
+            assert_eq!(&bytes[cd..cd + 4], &SIG_CENTRAL_HEADER);
+            bytes[cd + 20..cd + 24].copy_from_slice(&0x0100_0000u32.to_le_bytes());
+            let mut ar = open_seekable(&bytes);
+            let Ok(Some(mut e)) = ar.next_entry() else {
+                // Refused at listing: also a refusal, not a panic.
+                continue;
+            };
+            let read = e
+                .reader()
+                .read_to_end(&mut Vec::new())
+                .map_err(|err| Error::from_decode_io(err).exit_code());
+            assert_eq!(read, Err(5), "method {method}");
+        }
+    }
+
+    /// The forward-only (pipe) rung keeps refusing a legacy method, for a
+    /// directory carrying a payload as for a file: the change above touches
+    /// the seekable path only.
+    #[test]
+    fn a_legacy_method_stays_refused_on_the_forward_rung() {
+        for method in [1u16, 6] {
+            for name in ["sample/", "f.txt"] {
+                let bytes = hand_built_with_method(name, 0, method, b"x");
+                let err = read_all_forward(&bytes).expect_err("forward must refuse");
+                assert_eq!(err.exit_code(), 3, "method {method}, {name}");
             }
         }
     }
@@ -5374,7 +5476,8 @@ z.close()\n";
     #[test]
     fn a_short_legacy_file_entry_is_corrupt() {
         for method in [1u16, 6] {
-            let (meta, read) = list_and_read_first(&hand_built_with_method("f.txt", 10, method));
+            let (meta, read) =
+                list_and_read_first(&hand_built_with_method("f.txt", 10, method, b""));
             assert_eq!(meta.kind, EntryKind::File);
             assert_eq!(meta.size, Some(10));
             assert_eq!(read, Err(5), "method {method}");
