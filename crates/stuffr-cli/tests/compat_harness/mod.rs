@@ -998,6 +998,7 @@ pub enum Roundtrip {
     Exact,
 }
 
+#[derive(Clone)]
 pub struct Case<'a> {
     /// The invoked name, e.g. `"bunzip2"`.
     pub name: &'a str,
@@ -1253,12 +1254,18 @@ pub fn reference(tool_dir: &str, c: &Case) -> Option<Run> {
 
 /// Run stuffr through a symlink named `c.name`.
 pub fn stuffr_as(c: &Case) -> Run {
+    let (s, link) = stuffr_link(c);
+    execute(&link, &s, c, true)
+}
+
+/// A fresh scratch directory holding `bin/<c.name>`, a symlink to stuffr.
+pub fn stuffr_link(c: &Case) -> (Scratch, PathBuf) {
     let s = Scratch::new();
     let bin = s.0.join("bin");
     fs::create_dir_all(&bin).unwrap();
     let link = bin.join(c.name);
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
-    execute(&link, &s, c, true)
+    (s, link)
 }
 
 /// Run `exe` on case `c` in a fresh scratch directory, as the reference
@@ -1634,23 +1641,30 @@ fn spawn_case(exe: &Path, s: &Scratch, c: &Case, stuffr_side: bool) -> Spawned {
 /// The only normalisation: the program path becomes the bare invoked name.
 /// Only a whole occurrence is replaced, one followed by `:`, whitespace or
 /// the end of the text, so a longer path that merely starts with the
-/// program path (`/x/bzip2.bak`) is left alone.
+/// program path (`/x/bzip2.bak`) is left alone. One rule for both streams:
+/// stderr is this, decoded lossily.
 pub fn normalise_stderr(raw: &[u8], exe: &Path, name: &str) -> String {
-    let text = String::from_utf8_lossy(raw);
-    let path = exe.to_str().unwrap();
-    let mut out = String::with_capacity(text.len());
-    let mut rest: &str = &text;
-    while let Some(i) = rest.find(path) {
-        let after = &rest[i + path.len()..];
-        let whole = after
-            .chars()
-            .next()
-            .is_none_or(|c| c == ':' || c.is_whitespace());
-        out.push_str(&rest[..i]);
-        out.push_str(if whole { name } else { path });
-        rest = after;
+    String::from_utf8_lossy(&normalise_path_bytes(raw, exe, name)).into_owned()
+}
+
+/// [`normalise_stderr`]'s rule on bytes, for standard output.
+pub fn normalise_path_bytes(raw: &[u8], exe: &Path, name: &str) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = exe.as_os_str().as_bytes();
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i..].starts_with(path) {
+            let after = raw.get(i + path.len());
+            if after.is_none_or(|&b| b == b':' || b.is_ascii_whitespace()) {
+                out.extend_from_slice(name.as_bytes());
+                i += path.len();
+                continue;
+            }
+        }
+        out.push(raw[i]);
+        i += 1;
     }
-    out.push_str(rest);
     out
 }
 

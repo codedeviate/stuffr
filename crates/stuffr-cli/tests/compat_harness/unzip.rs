@@ -351,28 +351,6 @@ pub struct UnzipRun {
     pub tty_mode: Option<(bool, bool)>,
 }
 
-/// `raw` with every whole occurrence of the program path replaced by the
-/// bare name, as [`normalise_stderr`] does, for standard output's bytes.
-fn normalise_path_bytes(raw: &[u8], exe: &Path, name: &str) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
-    let path = exe.as_os_str().as_bytes();
-    let mut out = Vec::with_capacity(raw.len());
-    let mut i = 0;
-    while i < raw.len() {
-        if raw[i..].starts_with(path) {
-            let after = raw.get(i + path.len());
-            if after.is_none_or(|&b| b == b':' || b.is_ascii_whitespace()) {
-                out.extend_from_slice(name.as_bytes());
-                i += path.len();
-                continue;
-            }
-        }
-        out.push(raw[i]);
-        i += 1;
-    }
-    out
-}
-
 /// `raw` with every occurrence of each of `dirs` replaced by `<work>`:
 /// Apple's unzip names the extraction root by its real absolute path in
 /// some messages, and each run has its own scratch directory.
@@ -741,11 +719,7 @@ pub fn assert_same_unzip(c: &Case) -> bool {
 /// `c.unzip_flavour`), as [`assert_same_unzip`] makes it: for the rulings
 /// on upstream undefined behaviour, which have no reference to compare.
 pub fn stuffr_unzip(c: &Case) -> UnzipRun {
-    let s = Scratch::new();
-    let bin = s.0.join("bin");
-    fs::create_dir_all(&bin).unwrap();
-    let link = bin.join(c.name);
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
+    let (_s, link) = stuffr_link(c);
     unzip_run(&link, c, true)
 }
 

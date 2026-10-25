@@ -15673,10 +15673,11 @@ fn unpack_damaged_implode_is_exit_5() {
 }
 
 /// `list` enumerates shrink and implode archives without decoding them (the
-/// payload decodes on its first read, so listing a damaged one still works). The CLI's listing has no codec column;
+/// payload decodes on its first read, so listing a damaged one still works).
+/// The CLI's listing has no codec column;
 /// `zip::tests::shrink_and_implode_entries_decode` pins the per-entry codec.
 #[test]
-fn list_shows_the_methods() {
+fn list_shows_shrink_and_implode_entries() {
     let dir = tmp_dir();
     for (fixture, name, size) in [
         ("shrink-commons.zip", "TEST1.XML", 76),

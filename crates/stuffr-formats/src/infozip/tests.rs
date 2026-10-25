@@ -93,6 +93,7 @@ fn sha256(data: &[u8]) -> String {
     h.iter().map(|x| format!("{x:08x}")).collect()
 }
 
+mod damage;
 mod explode;
 mod unshrink;
 

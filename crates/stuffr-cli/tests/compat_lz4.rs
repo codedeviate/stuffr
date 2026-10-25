@@ -19,9 +19,10 @@
 //!   `-v`.
 //!
 //! The normalisations: a failed decode's partial output, which is the
-//! reference's own race (`tolerate_lz4_partial_output`); the banner (`-V`, `-v`'s welcome line), which names
-//! stuffr (spec deviation 1; masked exactly), and deviation 2's refreshes,
-//! timing fields and thread count (`normalise_lz4_progress`).
+//! reference's own race (`tolerate_lz4_partial_output`); the banner (`-V`,
+//! `-v`'s welcome line), which names stuffr (spec deviation 1; masked
+//! exactly), and deviation 2's refreshes, timing fields and thread count
+//! (`normalise_lz4_progress`).
 //!
 //! Not reproducible by the harness, recorded in `compat.md` only: standard
 //! output or input closed (`>&-`, Rust reopens them on `/dev/null`);
@@ -3971,10 +3972,6 @@ mod unix {
             ]
         };
         let to_stdout = |args: &[&'static str]| Case {
-            tz: None,
-            unzip_flavour: None,
-            tty_ctl: false,
-            tty_signal: None,
             expect_stdout_plain: Some(text()),
             ..lz4_case("lz4", args, files())
         };

@@ -3501,21 +3501,9 @@ mod unix {
         let mut args = c.args.clone();
         args[i] = leak(format!("--Xrain-{}", &c.args[i]["--train-".len()..]));
         let renamed = Case {
-            name: c.name,
             args,
-            files: c.files.clone(),
-            stdin: c.stdin.clone(),
-            tty_stdin: c.tty_stdin,
-            tty_stdout: c.tty_stdout,
-            env: c.env.clone(),
-            compare_output_bytes: c.compare_output_bytes,
-            tz: None,
-            unzip_flavour: None,
-            tty_ctl: false,
-            tty_signal: None,
             expect_stdout_plain: None,
-            setup: c.setup,
-            roundtrip: c.roundtrip,
+            ..c.clone()
         };
         let mut r = reference(dir, &renamed)?;
         r.stderr = r.stderr.replace("--Xrain-", "--train-");

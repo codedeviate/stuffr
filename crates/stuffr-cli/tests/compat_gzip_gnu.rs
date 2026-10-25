@@ -105,23 +105,7 @@ mod differential {
     /// The same case under another invoked name (the reference has no
     /// `gzcat`; GNU's `zcat` is what stuffr's `gzcat` follows).
     fn renamed<'a>(c: &Case<'a>, name: &'a str) -> Case<'a> {
-        Case {
-            name,
-            args: c.args.clone(),
-            files: c.files.clone(),
-            stdin: c.stdin.clone(),
-            tty_stdin: c.tty_stdin,
-            tty_stdout: c.tty_stdout,
-            env: c.env.clone(),
-            compare_output_bytes: c.compare_output_bytes,
-            tz: None,
-            unzip_flavour: None,
-            tty_ctl: false,
-            tty_signal: None,
-            expect_stdout_plain: c.expect_stdout_plain.clone(),
-            setup: c.setup,
-            roundtrip: c.roundtrip,
-        }
+        Case { name, ..c.clone() }
     }
 
     fn reference_name(name: &str) -> &str {

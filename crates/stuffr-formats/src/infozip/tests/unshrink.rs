@@ -1,7 +1,7 @@
 //! `unshrink.c`: the fixtures, hand-built code streams, and the damage
 //! table.
 
-use super::explode::{Bits, DAMAGED, Damaged, damage, fill, table, write_inputs};
+use super::damage::{Bits, DAMAGED, Damaged, damage, fill, table, write_inputs};
 use crate::infozip::unshrink::unshrink_counted;
 use crate::infozip::{Stop, WSIZE, unshrink};
 
@@ -510,7 +510,7 @@ fn tables_are_kept_where_the_c_keeps_them() {
 /// `unzip -t` "OK" on both references (probe in compat.md, "Task 5
 /// probes"), which is why [`unshrink`] takes no `ucsize`.
 #[test]
-fn ucsize_is_not_read() {
+fn the_full_table_fixture_decodes_26001_bytes() {
     let Some(zip) = super::fixture("shrink-full-table.zip") else {
         return;
     };
