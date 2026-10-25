@@ -50,7 +50,7 @@ help:
 	@echo '  make clean    remove build artefacts'
 	@echo '  make fuzz-corpus  (re)generate fuzz/corpus/{codec,container,chain,roundtrip,salvage,compat,infozip}'
 	@echo '  make fuzz     short, seeded smoke pass over the seven targets (mirrors CI)'
-	@echo '  make compat-ubuntu  the unzip suites against Ubuntu 24.04 unzip, in Docker'
+	@echo '  make compat-ubuntu  the unzip, compress and zip suites against Ubuntu 24.04, in Docker'
 	@echo '                (not in check; COMPAT_UBUNTU_ARGS=... is passed to the tests)'
 
 # Ordered so the cheapest gate fails first.
@@ -521,6 +521,9 @@ compat-ubuntu:
 	$(COMPAT_UBUNTU_RUN) sh -c \
 	  'cargo test --locked -p stuffr-cli --lib compat::compress -- $(COMPAT_UBUNTU_ALL_ARGS) \
 	   && cargo test --locked -p stuffr-cli --test compat_compress_ncompress -- $(COMPAT_UBUNTU_ALL_ARGS)'
+	$(COMPAT_UBUNTU_RUN) sh -c \
+	  'cargo test --locked -p stuffr-cli --lib compat::zip -- $(COMPAT_UBUNTU_ALL_ARGS) \
+	   && cargo test --locked -p stuffr-cli --test compat_zip_common --test compat_zip_harness_selftest -- $(COMPAT_UBUNTU_ALL_ARGS)'
 
 clean:
 	$(CARGO) clean

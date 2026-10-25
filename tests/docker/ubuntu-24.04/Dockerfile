@@ -3,7 +3,9 @@
 # with a Rust toolchain to build and run the suites beside it. Since 0.18.0
 # it also carries apt's ncompress 5.0-1, the compress family's ncompress
 # oracle (`compress` and `uncompress.real`; `ncompress_dir()` requires that
-# version under `CI`).
+# version under `CI`). Since 0.19.0 its apt `zip` 3.0-13ubuntu0.2 is the zip
+# family's Ubuntu oracle (`zip`, `zipcloak`, `zipnote`, `zipsplit`;
+# `zip_dir()` requires that version under `CI`).
 #
 # Used by `make compat-ubuntu`, which builds this image and runs
 # `compat_unzip_ubuntu` and `compat_unzip_common` in it with `CI=1`. The

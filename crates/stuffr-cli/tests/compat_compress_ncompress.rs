@@ -59,6 +59,8 @@ mod common {
             roundtrip: Roundtrip::Exact,
             tz: None,
             unzip_flavour: None,
+            zip_flavour: None,
+            zip_tree: None,
         }
     }
 

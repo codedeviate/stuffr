@@ -7,8 +7,11 @@
 
 pub mod interrupt;
 pub mod unzip;
+pub mod zip;
 #[allow(unused_imports)] // only the unzip suites use it
 pub use unzip::*;
+#[allow(unused_imports)] // only the zip suites use it
+pub use zip::*;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -1053,6 +1056,13 @@ pub struct Case<'a> {
     /// reference's flavour whatever the platform's default is, and the
     /// reference never sees the variable.
     pub unzip_flavour: Option<&'a str>,
+    /// The zip family's flavour (`apple`, `ubuntu`), given to stuffr's side
+    /// only, as `STUFFR_ZIP_FLAVOR` (0.19.0), as [`Case::unzip_flavour`].
+    pub zip_flavour: Option<&'a str>,
+    /// The zip family's input tree ([`ZipTree`]: bytes, modes, mtimes and
+    /// atimes, directories, symlinks), made in the work directory after
+    /// `files` and before `setup`, the same on both sides.
+    pub zip_tree: Option<ZipTree>,
 }
 
 /// In [`Case::tty_ctl`]'s input, ends a piece without being typed (ASCII
@@ -1426,6 +1436,9 @@ fn spawn_case(exe: &Path, s: &Scratch, c: &Case, stuffr_side: bool) -> Spawned {
         f.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(INPUT_MTIME))
             .unwrap();
     }
+    if let Some(t) = &c.zip_tree {
+        t.materialise(&work);
+    }
     if let Some(setup) = c.setup {
         setup(&work);
     }
@@ -1441,6 +1454,9 @@ fn spawn_case(exe: &Path, s: &Scratch, c: &Case, stuffr_side: bool) -> Spawned {
         .envs(c.env.iter().copied());
     if stuffr_side && let Some(f) = c.unzip_flavour {
         cmd.env("STUFFR_UNZIP_FLAVOR", f);
+    }
+    if stuffr_side && let Some(f) = c.zip_flavour {
+        cmd.env("STUFFR_ZIP_FLAVOR", f);
     }
 
     let mut stdin_master: Option<std::fs::File> = None;
@@ -1464,8 +1480,8 @@ fn spawn_case(exe: &Path, s: &Scratch, c: &Case, stuffr_side: bool) -> Spawned {
                 Ok(())
             });
         }
-    } else if c.unzip_flavour.is_some() {
-        // The unzip family opens `/dev/tty` for a password (and the
+    } else if c.unzip_flavour.is_some() || c.zip_flavour.is_some() {
+        // The unzip and zip families open `/dev/tty` for a password (and the
         // pager's keys read the session's terminal through stdin): a case
         // without `tty_ctl` gets a session of its own, with no controlling
         // terminal, so run from a terminal it answers "unable to get

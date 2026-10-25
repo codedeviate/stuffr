@@ -175,6 +175,8 @@ pub fn unzip_case<'a>(
         roundtrip: Roundtrip::Bzip2,
         tz: None,
         unzip_flavour: Some(platform_unzip_flavour()),
+        zip_flavour: None,
+        zip_tree: None,
         tty_ctl: false,
         tty_signal: None,
     }
@@ -251,7 +253,7 @@ fn quarantine_of(_: &Path) -> Option<Vec<u8>> {
 }
 
 /// One entry of an [`UnzipTree`]: what unzip can set on it.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum UnzipNode {
     /// A regular file (a FIFO or other special file reads as `<special>`,
     /// never opened; an unreadable file as `<unreadable>`).
@@ -354,7 +356,7 @@ pub struct UnzipRun {
 /// `raw` with every occurrence of each of `dirs` replaced by `<work>`:
 /// Apple's unzip names the extraction root by its real absolute path in
 /// some messages, and each run has its own scratch directory.
-fn mask_work(raw: &[u8], dirs: &[Vec<u8>]) -> Vec<u8> {
+pub(super) fn mask_work(raw: &[u8], dirs: &[Vec<u8>]) -> Vec<u8> {
     let mut out = raw.to_vec();
     for d in dirs.iter().filter(|d| !d.is_empty()) {
         let mut v = Vec::with_capacity(out.len());
@@ -453,7 +455,7 @@ fn mask_unzip_banners(text: &[u8], ours: Option<&str>) -> Vec<u8> {
 /// P41: the one `Compiled with ... on <date>.` line of `-v`, which names
 /// the compiler and date of the Apple build, becomes `<compiled-with>`.
 /// Another macOS ships another build; everything else stays compared.
-fn mask_compiled_with(text: &[u8]) -> Vec<u8> {
+pub(super) fn mask_compiled_with(text: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(text.len());
     for line in text.split_inclusive(|&b| b == b'\n') {
         let (body, nl) = match line.strip_suffix(b"\n") {
