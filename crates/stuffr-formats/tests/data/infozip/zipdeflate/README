@@ -1,0 +1,60 @@
+Info-ZIP Zip 3.0 deflate streams (stuffr 0.19.0, Task 2)
+========================================================
+
+The raw deflate data that both references wrote for the corpus inputs of at
+most 64 KiB, which `infozip::tests::zipdeflate` holds `ZipDeflater` to byte
+for byte. The inputs are not committed: the test generates them
+(`corpus()`, a fixed xorshift64* generator). The larger inputs (mixed-65537,
+dict300k, random2m, zeros1m, big3m) are compared at test time against the
+reference found on the machine (`the_reference_agrees_on_large_inputs`).
+
+References (2026-10-25):
+
+  Apple   /usr/bin/zip, Zip 3.0 "with modifications by Apple Inc.",
+          macOS 27.0.1 arm64
+  Ubuntu  zip 3.0-13ubuntu0.2 on ubuntu:24.04 aarch64
+          (docker image stuffr-ubuntu-24.04, uid 4242)
+
+Apple's and Ubuntu's streams were identical for every archive made (162:
+fourteen inputs at levels 1-9 as a named archive, four at levels 1-9 as
+standard input to a pipe), as were method, CRC, compressed size, bits 1-2
+of the general-purpose flags and the internal text attribute.
+
+How they were made
+------------------
+
+1. The inputs:
+
+     STUFFR_ZIPDEFLATE_CORPUS_OUT=<corpus> cargo +1.95 test -p stuffr-formats \
+       --all-features --lib infozip::tests::zipdeflate::dump_corpus -- --ignored
+
+2. The archives, with mk.sh (in this directory):
+
+     env -i PATH=/usr/bin:/bin LANG=C TZ=UTC sh mk.sh /usr/bin/zip <corpus> <apple>
+     docker run --rm -u 4242 -v <corpus>:/c:ro -v <ubuntu>:/o -v <dir of mk.sh>:/s:ro \
+       -e LANG=C -e TZ=UTC stuffr-ubuntu-24.04 sh /s/mk.sh zip /c /o
+
+   Per input and level: `zip -X -q -<n> <case>.file.<n>.zip <case>` (mode
+   `file`: seekable, so a single block that does not pay is rewritten as a
+   stored entry), and for empty, one, random40k and mixed-32769 also
+   `cat <case> | zip -X -q -<n> - - | cat > <case>.pipe.<n>.zip` (mode `pipe`:
+   data descriptors, never the stored fallback).
+
+3. The streams and MANIFEST, with extract.py (in this directory), which
+   also compares the two references field by field and reports any
+   difference (there were none):
+
+     python3 -I extract.py <apple> <ubuntu> <this directory>
+
+MANIFEST
+--------
+
+One line per small case, mode and level:
+
+  case mode level method gp-flags(hex) crc32(hex) csize text data-file
+
+`data-file` is `-` for a stored entry (the data is the input itself), else
+`<first 16 hex digits of the stream's SHA-256>.deflate`, so levels that
+wrote the same stream share one file. `gp-flags` is the whole local header
+field; the test compares bits 1-2 (bit 3 is the pipe mode's descriptor).
+`text` is bit 0 of the central header's internal attributes.

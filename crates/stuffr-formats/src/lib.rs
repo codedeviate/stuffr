@@ -239,7 +239,8 @@ pub mod deflate;
 #[cfg(feature = "gzip")]
 pub mod gzip;
 // Info-ZIP UnZip 6.0's decoders (crypt.c, then inflate.c, explode.c and
-// unshrink.c), ported for the `unzip` compatibility family and reached
+// unshrink.c), ported for the `unzip` compatibility family, and Zip 3.0's
+// deflate encoder (deflate.c, trees.c) for the `zip` family; reached
 // through `stuffr-cli` only; not part of the public surface. Pure Rust and
 // ungated, as `pack` is.
 #[doc(hidden)]

@@ -37,7 +37,7 @@ const CRC_32_TAB: [u32; 256] = {
 
 /// crc32.h `CRC32(c, b, crctab)`, the little-endian form:
 /// `crctab[((int)(c) ^ (b)) & 0xff] ^ ((c) >> 8)`.
-fn crc32(c: u32, b: u8) -> u32 {
+pub(super) fn crc32(c: u32, b: u8) -> u32 {
     CRC_32_TAB[((c ^ u32::from(b)) & 0xff) as usize] ^ (c >> 8)
 }
 

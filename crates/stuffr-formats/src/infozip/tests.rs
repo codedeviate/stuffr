@@ -96,6 +96,7 @@ fn sha256(data: &[u8]) -> String {
 mod damage;
 mod explode;
 mod unshrink;
+mod zipdeflate;
 
 mod crypt {
     use crate::infozip::crypt::{Keys, RAND_HEAD_LEN, check_byte, test_key};

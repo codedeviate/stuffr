@@ -34,15 +34,23 @@
 //! [`remaining`](ByteSource::remaining) bytes and [`Stop`] has a
 //! [`Length`](Stop::Length) case; unshrink stops at the end of the data and
 //! takes no size at all.
+//!
+//! **Zip 3.0's encoder.** [`ZipDeflater`] is Info-ZIP Zip 3.0's
+//! `deflate.c` and `trees.c` (with `zipup.c`'s `file_read`), ported for the
+//! `zip` compatibility family, whose archives must equal Apple's and
+//! Ubuntu's byte for byte. It is under the same licence and clause 3 note
+//! as the decoders.
 
 pub mod crypt;
 mod explode;
 mod inflate;
 mod unshrink;
+mod zipdeflate;
 
 pub use explode::explode;
 pub use inflate::{INCOMPLETE_D_TREE, INCOMPLETE_L_TREE, WSIZE, inflate};
 pub use unshrink::unshrink;
+pub use zipdeflate::{DeflateSummary, ZipDeflater};
 
 #[cfg(test)]
 mod tests;
