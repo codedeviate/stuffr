@@ -53,8 +53,15 @@ fn readbuf_past_the_buffer_reads_zeros() {
 #[test]
 fn read_filename_full_short_read_t13_7() {
     // An open archive with nothing more in it: reads end at its end.
-    let path = std::env::temp_dir().join(format!("stuffr-unzip-t13-7-{}", std::process::id()));
+    struct Rm(std::path::PathBuf);
+    impl Drop for Rm {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let path = std::env::temp_dir().join(format!("stuffr-unzip-{}-t137", std::process::id()));
     std::fs::write(&path, b"").unwrap();
+    let _rm = Rm(path.clone());
     let open = || Some(std::fs::File::open(&path).unwrap().into());
     with_uz(|uz| {
         uz.zin.fd = open();
@@ -73,7 +80,6 @@ fn read_filename_full_short_read_t13_7() {
         uz.zin.incnt = 0; // nothing buffered, nothing in the archive
         assert_eq!(read_filename_full(uz, 8, &PInfo::default(), false), PK_EOF);
     });
-    let _ = std::fs::remove_file(&path);
 }
 
 #[test]

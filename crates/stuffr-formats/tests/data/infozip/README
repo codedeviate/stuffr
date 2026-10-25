@@ -3,7 +3,8 @@ Info-ZIP method fixtures (stuffr 0.16.0, Task 1)
 
 Archives that the Info-ZIP decoder ports (stuffr_formats::infozip) are tested
 against. Every file is at most 64 KiB, is committed byte-for-byte as fetched
-(or generated as stated; lzma.zip is the one fetched file renamed, from .zipx), and was checked with BOTH references:
+(or generated as stated; lzma.zip is the one fetched file renamed, from .zipx), and
+was checked with BOTH references:
 
   Apple   /usr/bin/unzip  (UnZip 6.00 of 20 April 2009, modified by Apple Inc.)
   Ubuntu  unzip 6.0-28ubuntu4.1 on ubuntu:24.04 (docker; zip 3.0-13ubuntu0.2)
