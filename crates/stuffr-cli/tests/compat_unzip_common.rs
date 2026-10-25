@@ -2702,16 +2702,6 @@ mod unix {
         v
     }
 
-    /// I1: `stuffr unpack` decodes a shrink or implode entry whole in
-    /// memory, so its declared size is bounded (256 MiB, exit 6 past it,
-    /// before any decode) and its buffer is reserved exactly, never grown
-    /// by doubling. A 110 KB bomb declaring one byte past the ceiling is
-    /// refused; one of 40 MiB and change unpacks within its own size plus
-    /// headroom. On Linux that is a data-segment cap (`data_limited_run`;
-    /// the doubling reserved 64 MiB there and aborted), and a cap below
-    /// the entry's size is a refused reservation, exit 6; elsewhere only
-    /// the unpack's success is checked (the resident peak counts only
-    /// touched pages, so it cannot see the reservation).
     /// A stuffr-only case forced to `flavour`.
     fn case<'a>(
         flavour: &'a str,
@@ -3032,6 +3022,16 @@ mod unix {
         }
     }
 
+    /// I1: `stuffr unpack` decodes a shrink or implode entry whole in
+    /// memory, so its declared size is bounded (256 MiB, exit 6 past it,
+    /// before any decode) and its buffer is reserved exactly, never grown
+    /// by doubling. A 110 KB bomb declaring one byte past the ceiling is
+    /// refused; one of 40 MiB and change unpacks within its own size plus
+    /// headroom. On Linux that is a data-segment cap (`data_limited_run`;
+    /// the doubling reserved 64 MiB there and aborted), and a cap below
+    /// the entry's size is a refused reservation, exit 6; elsewhere only
+    /// the unpack's success is checked (the resident peak counts only
+    /// touched pages, so it cannot see the reservation).
     #[test]
     fn stuffr_unpack_bounds_a_shrink_bomb() {
         const CAP: u64 = 256 << 20;
