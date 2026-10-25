@@ -5436,22 +5436,34 @@ z.close()\n";
     /// never a panic or a short success.
     #[test]
     fn a_legacy_directory_payload_past_the_end_is_corrupt() {
-        for method in [0u16, 1, 6] {
+        // The outcome of listing and reading the one entry: a read giving
+        // exit 5, or a listing refusal with its exit code. An entry that
+        // lists and reads cleanly, or no entry at all, is -1 (a failure).
+        let outcome = |method: u16| -> std::result::Result<(), i32> {
             let mut bytes = hand_built_with_method("sample/", 0, method, b"0123456789");
             // Central directory csize (offset 20 in the record) claims more.
             let cd = 30 + "sample/".len() + 10;
             assert_eq!(&bytes[cd..cd + 4], &SIG_CENTRAL_HEADER);
             bytes[cd + 20..cd + 24].copy_from_slice(&0x0100_0000u32.to_le_bytes());
             let mut ar = open_seekable(&bytes);
-            let Ok(Some(mut e)) = ar.next_entry() else {
-                // Refused at listing: also a refusal, not a panic.
-                continue;
-            };
-            let read = e
-                .reader()
-                .read_to_end(&mut Vec::new())
-                .map_err(|err| Error::from_decode_io(err).exit_code());
-            assert_eq!(read, Err(5), "method {method}");
+            match ar.next_entry() {
+                Ok(Some(mut e)) => e
+                    .reader()
+                    .read_to_end(&mut Vec::new())
+                    .map(|_| ())
+                    .map_err(|err| Error::from_decode_io(err).exit_code()),
+                Ok(None) => Err(-1),
+                Err(err) => Err(err.exit_code()),
+            }
+        };
+        let stored = outcome(0);
+        assert_eq!(stored, Err(5), "stored");
+        for method in [1u16, 6] {
+            assert_eq!(
+                outcome(method),
+                stored,
+                "method {method} differs from stored"
+            );
         }
     }
 

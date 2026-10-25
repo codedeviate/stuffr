@@ -71,7 +71,7 @@ jobs:
       #     `/usr/bin/lhasa`, per the Debian bookworm and Ubuntu noble file
       #     lists, with no `lha` at all. Homebrew's formula of the same name
       #     installs the same program as `lha`. `require_lhasa` (in
-      #     `legacy/lha.rs` and again in `cli.rs`) tries both names for
+      #     `legacy/lha.rs` and again in `cli/common.rs`) tries both names for
       #     exactly that reason.
       #   * It belongs on ALL THREE of these lines, the `c-backed` one
       #     included. That is measured, not assumed: `cargo test --workspace
@@ -85,7 +85,7 @@ jobs:
       # fallback test, not a single-reference-tool one, and every candidate
       # it lists is already part of this image or the base image. (`python3`
       # is not named here: it is part of the base image and cannot be
-      # absent.) Since 0.8.1 `tar.rs` and `cli.rs` also have tests that
+      # absent.) Since 0.8.1 `tar.rs` and `cli/entries.rs` also have tests that
       # REQUIRE GNU tar (`--sparse --hole-detection=raw`, `--format=pax`):
       # `gtar`, or a `tar` whose `--version` says GNU. The runner's own
       # `tar` is GNU's, so nothing is installed for them here; on macOS

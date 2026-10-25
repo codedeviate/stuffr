@@ -1172,13 +1172,30 @@ pub(crate) fn with_run_signals_held<T>(f: impl FnOnce() -> T) -> T {
 /// signal that arrived meanwhile is delivered on the restore. Off unix, just
 /// `f`.
 ///
-/// Precondition: it blocks on the calling thread only. That suffices because
-/// at every call site the calling thread is the process's only thread:
-/// `create_excl_armed`, `create_armed`, `create_temp_armed`,
-/// `create_temp_armed_exit` and `with_run_signals_held` all run before codec
-/// workers exist or between rows, when none is alive. A caller that runs while
-/// codec workers are alive must block the signals in those threads too (or
-/// before spawning them), else the kernel may deliver on an unblocked one.
+/// Precondition: it blocks on the calling thread only, so it covers a signal
+/// only while no other thread of the process has it unblocked. That holds at
+/// most call sites: `create_excl_armed`, `create_armed`, `create_temp_armed`
+/// and `with_run_signals_held` run before codec workers exist or between
+/// rows or files, when none is alive.
+///
+/// One exception, present since 0.14.0: the C-tier `zstd` family with several
+/// inputs. `compress_files` (`compat/zstd/fileio.rs`) keeps one compression
+/// context for the whole run, and libzstd's worker thread(s)
+/// (`ZSTD_c_nbWorkers`, set in `zstd_opts/c.rs`; the default is at least 1)
+/// stay alive, signals unblocked, until it is freed. So when
+/// `create_temp_armed_exit` runs for the second and later files, the kernel may
+/// deliver SIGINT to a worker while the calling thread sits between creating
+/// the temporary and arming it. The handler then finds nothing armed, and the
+/// just-created temporary is leaked. The cost is one leftover temporary file,
+/// never data: the input is untouched and no output was published.
+///
+/// The xz family's threaded C-tier encoder does not share this: `coder::run`
+/// builds the encoder per file and drops it before the next file, and
+/// liblzma starts its MT workers lazily on the first `lzma_code`, which is
+/// after `create_temp_armed` returns (read from the source, not reproduced).
+///
+/// Follow-up, not done here: block the signals in libzstd's workers, or before
+/// the first encoder call, so the hold covers every thread.
 fn held_back<T>(signals: Signals, f: impl FnOnce() -> T) -> T {
     #[cfg(unix)]
     {

@@ -4052,7 +4052,8 @@ mod unix {
         use std::os::unix::fs::PermissionsExt;
         let Some(dir) = lz4_dir() else { return };
         let mode_after = |exe: &Path, tag: &str| -> u32 {
-            // Safe as `at`: only this test builds it, with the pid; its two calls pass "ref" and "ours".
+            // Safe as `at`: only this test builds it, with the pid; its two calls
+            // pass "ref" and "ours".
             let w = ScratchDir::at(
                 std::env::temp_dir().join(format!("stuffr-lz4-fifo-{tag}-{}", std::process::id())),
             );

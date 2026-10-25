@@ -300,7 +300,7 @@ fn an_st_mode_shaped_header_mode_raises_no_warning() {
 /// four verbs would exit 0 and the assertion would fail on every Linux job.
 /// Measured directly: `stuffr list crafted.tar.lz --memory-limit 3500M`
 /// exits 0. 0x1D is lzip's LARGEST coded dictionary, so the fixture cannot
-/// be made hungrier to compensate. `cli.rs`'s
+/// be made hungrier to compensate. `cli/verbs.rs`'s
 /// `info_reports_the_resolved_memory_limit` states the same convention.
 #[test]
 fn a_container_under_a_codec_declaring_a_huge_dictionary_is_refused_on_every_verb() {

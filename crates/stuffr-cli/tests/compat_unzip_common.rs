@@ -461,7 +461,8 @@ mod unix {
         "  -I CHARSET  specify a character encoding for UNIX and other archives\n",
     );
 
-    /// The end of Apple's `unzip -v`: compile options and environment (the lines above name the compiler and date, which vary by build: R11).
+    /// The end of Apple's `unzip -v`: compile options and environment (the
+    /// lines above name the compiler and date, which vary by build: R11).
     const APPLE_OPTIONS: &str = concat!(
         "UnZip special compilation options:\n",
         "        COPYRIGHT_CLEAN (PKZIP 0.9x unreducing method not supported)\n",
@@ -484,7 +485,8 @@ mod unix {
         "      ZIPINFOOPT:  [none]\n",
     );
 
-    /// The end of Ubuntu's `unzip -v` under `LANG=C` (`char coding: other`; the UTF-8 locales are `compat_unzip_ubuntu::ubuntu_build_rows`').
+    /// The end of Ubuntu's `unzip -v` under `LANG=C` (`char coding: other`;
+    /// the UTF-8 locales are `compat_unzip_ubuntu::ubuntu_build_rows`').
     const UBUNTU_OPTIONS: &str = concat!(
         "UnZip special compilation options:\n",
         "        ACORN_FTYPE_NFS\n",

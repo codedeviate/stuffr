@@ -1648,6 +1648,10 @@ pub fn normalise_stderr(raw: &[u8], exe: &Path, name: &str) -> String {
 }
 
 /// [`normalise_stderr`]'s rule on bytes, for standard output.
+///
+/// The byte after the program path must be `:` or ASCII whitespace
+/// (`u8::is_ascii_whitespace`). The old stderr rule used Unicode whitespace;
+/// this one does not match vertical tab (0x0B) or non-ASCII spaces.
 pub fn normalise_path_bytes(raw: &[u8], exe: &Path, name: &str) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
     let path = exe.as_os_str().as_bytes();

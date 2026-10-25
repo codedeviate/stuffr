@@ -169,9 +169,10 @@ pub fn listing(dir: &Path) -> Vec<String> {
 
 /// Runs `exe` (argv[0] = `name`) with `args` in `dir`; waits until a
 /// directory entry satisfies `ready`, sends `sig`, waits up to
-/// `HANG_DEADLINE` (`IGNORED_SIGNAL_DEADLINE` if the child ignores it) for exit. `None` if the run ended before the signal could
-/// be sent, or if a reference (not stuffr) hung after it
-/// ([`take_reference_hung`] tells which); stuffr hanging panics.
+/// `HANG_DEADLINE` (`IGNORED_SIGNAL_DEADLINE` if the child ignores it) for
+/// exit. `None` if the run ended before the signal could be sent, or if a
+/// reference (not stuffr) hung after it ([`take_reference_hung`] tells which);
+/// stuffr hanging panics.
 pub fn interrupt(
     exe: &Path,
     name: &str,
