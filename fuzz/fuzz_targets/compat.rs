@@ -181,7 +181,7 @@ use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use libfuzzer_sys::fuzz_target;
-use stuffr_cli::compat::{self, bzip2recover, compress, gzip::Flavour, unzip};
+use stuffr_cli::compat::{self, bzip2recover, compress, gzip::Flavour, unzip, zip};
 use stuffr_core::testing::{
     COMPAT_FILES, COMPAT_FUZZ_MAX_INPUT, COMPAT_TOKENS, check_extraction_contained,
     check_scan_is_linear, decode_compat_case,
@@ -505,6 +505,7 @@ fn run_gzip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8], pa
         flavour,
         unzip::default_flavour(),
         compress::default_flavour(),
+        zip::default_flavour(),
     )
     .expect("a COMPAT_NAMES entry is a compat name");
     let why = || String::from_utf8_lossy(&err).into_owned();
@@ -770,6 +771,7 @@ fn run_xz(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
         Flavour::Gnu,
         unzip::default_flavour(),
         compress::default_flavour(),
+        zip::default_flavour(),
     )
     .expect("a COMPAT_NAMES entry is a compat name");
     let why = || String::from_utf8_lossy(&err).into_owned();
@@ -1126,6 +1128,7 @@ fn run_zstd(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
         Flavour::Gnu,
         unzip::default_flavour(),
         compress::default_flavour(),
+        zip::default_flavour(),
     )
     .expect("a COMPAT_NAMES entry is a compat name");
     let why = || String::from_utf8_lossy(&err).into_owned();
@@ -1493,6 +1496,7 @@ fn run_lz4(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
         Flavour::Gnu,
         unzip::default_flavour(),
         compress::default_flavour(),
+        zip::default_flavour(),
     )
     .expect("a COMPAT_NAMES entry is a compat name");
     let why = || String::from_utf8_lossy(&err).into_owned();
@@ -1576,6 +1580,7 @@ fn run_lz4(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
                 Flavour::Gnu,
                 unzip::default_flavour(),
                 compress::default_flavour(),
+                zip::default_flavour(),
             )
             .expect("a COMPAT_NAMES entry is a compat name");
             assert_eq!(
@@ -1874,6 +1879,7 @@ fn run_unzip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]) {
         Flavour::Gnu,
         flavour,
         compress::default_flavour(),
+        zip::default_flavour(),
     )
     .expect("a COMPAT_NAMES entry is a compat name");
     let why = || String::from_utf8_lossy(&err).into_owned();
@@ -2240,6 +2246,7 @@ fn compress_decode(dir: &Path, flavour: compress::Flavour, payload: &[u8]) -> Op
         Flavour::Gnu,
         unzip::default_flavour(),
         flavour,
+        zip::default_flavour(),
     )
     .expect("uncompress is a compat name");
     (code == 0).then_some(out)
@@ -2322,6 +2329,7 @@ fn run_compress(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]
         Flavour::Gnu,
         unzip::default_flavour(),
         flavour,
+        zip::default_flavour(),
     )
     .expect("a COMPAT_NAMES entry is a compat name");
     let why = String::from_utf8_lossy(&err).into_owned();
@@ -2500,6 +2508,37 @@ fn check_compress_leftovers(dir: &Path, ctx: &str) {
     }
 }
 
+/// The zip family (0.19.0) through `compat::run_in_counted`, as the
+/// flavour byte says (0 Ubuntu, 1 Apple, absolute: the same rule as the
+/// unzip and compress families). Task 4's oracle only: no panic, and an exit
+/// code from `zip::EXIT_CODES` (the front end answers 1 for a command line
+/// whose work is not built yet; Task 12 replaces this with the family's
+/// real oracle and its byte).
+fn run_zip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]) {
+    let flavour = if flavour == 0 {
+        zip::Flavour::Ubuntu
+    } else {
+        zip::Flavour::Apple
+    };
+    let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
+    let (code, _out, err, _reads) = compat::run_in_counted(
+        dir,
+        name,
+        os_args,
+        stdin,
+        Flavour::Gnu,
+        unzip::default_flavour(),
+        compress::default_flavour(),
+        flavour,
+    )
+    .expect("a COMPAT_NAMES entry is a compat name");
+    assert!(
+        code == 1 || zip::EXIT_CODES.contains(&code),
+        "{name} {args:?}: exit {code}: {}",
+        String::from_utf8_lossy(&err)
+    );
+}
+
 fuzz_target!(|data: &[u8]| {
     if data.len() > COMPAT_FUZZ_MAX_INPUT {
         return;
@@ -2546,6 +2585,9 @@ fuzz_target!(|data: &[u8]| {
             stdin,
             case.payload,
         ),
+        "zip" | "zipcloak" | "zipnote" | "zipsplit" => {
+            run_zip(&dir, case.name, case.flavour, &case.args, stdin)
+        }
         other => unreachable!("{other} is in COMPAT_NAMES but has no arm here"),
     }
 

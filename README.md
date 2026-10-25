@@ -1072,7 +1072,7 @@ hand under a name stuffr does not handle: `zcat2 -> stuffr` runs `stuffr`.
 Homebrew. One verb makes them:
 
 ```sh
-stuffr install-links --dir ~/.local/bin                  # all twenty-seven names
+stuffr install-links --dir ~/.local/bin                  # all thirty-one names
 stuffr install-links --dir ~/.local/bin --names bzcat,zcat   # comma-separated subset
 stuffr install-links --dir ~/.local/bin --dry-run        # "would create ...", changes nothing
 stuffr install-links --dir ~/.local/bin --force          # replace what is already there

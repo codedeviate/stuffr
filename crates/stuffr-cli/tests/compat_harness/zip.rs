@@ -627,10 +627,27 @@ fn zip_run(exe: &Path, c: &Case, stuffr_side: bool) -> ZipRun {
         }
         tree.insert(key, node);
     }
+    // `-sc` shows argv[0] in quotes, as invoked: by path, here
+    let quoted = |b: &[u8]| -> Vec<u8> {
+        let from = [&b"'"[..], exe.as_os_str().as_bytes(), &b"'"[..]].concat();
+        let to = [&b"'"[..], c.name.as_bytes(), &b"'"[..]].concat();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            if b[i..].starts_with(&from) {
+                out.extend_from_slice(&to);
+                i += from.len();
+            } else {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+        out
+    };
     ZipRun {
         code,
-        stdout: mask_work(&normalise_path_bytes(&stdout, exe, c.name), &dirs),
-        stderr: mask_work(&stderr_bytes, &dirs),
+        stdout: mask_work(&quoted(&normalise_path_bytes(&stdout, exe, c.name)), &dirs),
+        stderr: mask_work(&quoted(&stderr_bytes), &dirs),
         tree,
         start,
         end,

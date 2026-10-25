@@ -17,6 +17,7 @@ pub mod links;
 pub mod lz4;
 pub mod unzip;
 pub mod xz;
+pub mod zip;
 pub mod zstd;
 
 #[cfg(test)]
@@ -58,6 +59,9 @@ pub enum Family {
     /// `compress`, `uncompress`, in the flavour
     /// [`compress::default_flavour`] or `STUFFR_COMPRESS_FLAVOR` picks.
     Compress,
+    /// `zip`, `zipcloak`, `zipnote`, `zipsplit`, in the flavour
+    /// [`zip::default_flavour`] or `STUFFR_ZIP_FLAVOR` picks.
+    Zip,
 }
 
 /// Invoked name to family. The name is matched exactly, after the directory
@@ -90,6 +94,10 @@ const NAMES: &[(&str, Family)] = &[
     ("funzip", Family::Unzip),
     ("compress", Family::Compress),
     ("uncompress", Family::Compress),
+    ("zip", Family::Zip),
+    ("zipcloak", Family::Zip),
+    ("zipnote", Family::Zip),
+    ("zipsplit", Family::Zip),
 ];
 
 /// Every compatibility name, from the one table `family_for` also reads.
@@ -137,6 +145,7 @@ pub fn dispatch(args: Vec<OsString>) -> Option<ExitCode> {
         Family::Lz4 => lz4::run(name, &argv0, rest),
         Family::Unzip => unzip::run(name, &argv0, rest),
         Family::Compress => compress::run(name, rest),
+        Family::Zip => zip::run(name, &argv0, rest),
     })
 }
 
@@ -147,8 +156,9 @@ pub fn dispatch(args: Vec<OsString>) -> Option<ExitCode> {
 /// keeps its disposition. `None` when `name` is not a compatibility name.
 /// The gzip family runs as `gzip_flavour` (the environment's
 /// `STUFFR_GZIP_FLAVOR` is not read); the other families ignore it. The
-/// unzip and compress families run as [`unzip::default_flavour`] and
-/// [`compress::default_flavour`] here; pick theirs with [`run_in_counted`].
+/// unzip, compress and zip families run as [`unzip::default_flavour`],
+/// [`compress::default_flavour`] and [`zip::default_flavour`] here; pick
+/// theirs with [`run_in_counted`].
 /// Same code as [`dispatch`] below the process boundary; for the fuzz
 /// target, not a stable interface.
 #[doc(hidden)]
@@ -167,6 +177,7 @@ pub fn run_in(
         gzip_flavour,
         unzip::default_flavour(),
         compress::default_flavour(),
+        zip::default_flavour(),
     )
     .map(|(code, out, err, _)| (code, out, err))
 }
@@ -180,8 +191,10 @@ pub fn run_in(
 /// family runs as `unzip_flavour` (R7; `STUFFR_UNZIP_FLAVOR` is not read),
 /// as [`unzip::run_in_counted`] describes, and the compress family as
 /// `compress_flavour` (`STUFFR_COMPRESS_FLAVOR` is not read), counting its
-/// inputs ([`compress::run_in_counted`]).
+/// inputs ([`compress::run_in_counted`]); the zip family as `zip_flavour`
+/// ([`zip::run_in_counted`]; `STUFFR_ZIP_FLAVOR` is not read).
 #[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
 pub fn run_in_counted(
     dir: &Path,
     name: &str,
@@ -190,6 +203,7 @@ pub fn run_in_counted(
     gzip_flavour: gzip::Flavour,
     unzip_flavour: unzip::Flavour,
     compress_flavour: compress::Flavour,
+    zip_flavour: zip::Flavour,
 ) -> Option<CountedRun> {
     let (family, canonical) = family_for(OsStr::new(name))?;
     Some(match family {
@@ -211,6 +225,7 @@ pub fn run_in_counted(
         Family::Compress => {
             compress::run_in_counted(compress_flavour, dir, canonical, &args, stdin, &|_| None)
         }
+        Family::Zip => zip::run_in_counted(zip_flavour, dir, canonical, &args, stdin),
     })
 }
 
@@ -281,6 +296,9 @@ mod tests {
     /// ignore it.
     const C: compress::Flavour = compress::Flavour::Apple;
 
+    /// The zip flavour `run_in_counted` gets; the other families ignore it.
+    const Z: zip::Flavour = zip::Flavour::Apple;
+
     /// `STUFFR_UNZIP_FLAVOR` selects `apple` or `ubuntu`, unset or empty is
     /// the default, and anything else (another case, a blank) is refused.
     #[test]
@@ -308,7 +326,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let run = |name: &str, f: unzip::Flavour| {
             let (code, out, err, reads) =
-                run_in_counted(&dir, name, vec!["-h".into()], b"", G, f, C).unwrap();
+                run_in_counted(&dir, name, vec!["-h".into()], b"", G, f, C, Z).unwrap();
             assert!(reads.is_empty(), "{reads:?}");
             (code, String::from_utf8(out).unwrap(), err)
         };
@@ -357,7 +375,7 @@ mod tests {
             ),
         ] {
             let (code, _, err, _) =
-                run_in_counted(&dir, "uncompress", vec!["-x".into()], b"", G, U, c).unwrap();
+                run_in_counted(&dir, "uncompress", vec!["-x".into()], b"", G, U, c, Z).unwrap();
             assert_eq!(code, 1, "{c:?}");
             assert!(
                 String::from_utf8_lossy(&err).starts_with(usage),
@@ -372,12 +390,40 @@ mod tests {
                 G,
                 U,
                 c,
+                Z,
             )
             .unwrap();
             assert_eq!(code, 0, "{c:?}: {}", String::from_utf8_lossy(&err));
             assert!(out.starts_with(&[0x1f, 0x9d, 0x90]), "{c:?}");
             assert_eq!(reads[&dir.join("a")].opens, 1, "{c:?}");
         }
+    }
+
+    /// `run_in_counted` reaches the zip family by all four names, in the
+    /// flavour it is given: the banner names the build.
+    #[test]
+    fn run_in_counted_reaches_the_zip_family() {
+        let dir = std::env::temp_dir();
+        for name in ["zip", "zipcloak", "zipnote", "zipsplit"] {
+            for (f, origin) in [
+                (zip::Flavour::Apple, "with modifications by Apple Inc."),
+                (zip::Flavour::Ubuntu, "Debian's build"),
+            ] {
+                let (code, out, err, reads) =
+                    run_in_counted(&dir, name, vec!["-h".into()], b"", G, U, C, f).unwrap();
+                let out = String::from_utf8(out).unwrap();
+                assert_eq!((code, err.as_slice()), (0, &b""[..]), "{name}");
+                assert!(reads.is_empty(), "{reads:?}");
+                assert!(
+                    out.contains(", by stuffr ") && out.contains(origin),
+                    "{name} {f:?}: {out}"
+                );
+            }
+        }
+        // the plain entry point runs the zip family in its default flavour
+        let (code, out, _) = run_in(&dir, "zipsplit", vec!["-L".into()], b"", G).unwrap();
+        assert_eq!(code, 0);
+        assert!(String::from_utf8(out).unwrap().contains("Info-ZIP"));
     }
 
     /// The `compat` fuzz target picks its tool from `COMPAT_NAMES`; a name
@@ -478,7 +524,7 @@ mod tests {
             std::fs::write(dir.join("a"), b"hello hello hello\n").unwrap();
             let args = |a: &[&str]| a.iter().map(OsString::from).collect::<Vec<_>>();
             let (code, _, err, reads) =
-                run_in_counted(&dir, "gzip", args(&["-k", "a"]), b"", flavour, U, C).unwrap();
+                run_in_counted(&dir, "gzip", args(&["-k", "a"]), b"", flavour, U, C, Z).unwrap();
             assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
             let a = reads[&dir.join("a")];
             assert_eq!((a.opens, a.bytes, a.len), (1, 18, 18), "{flavour:?}");
@@ -487,7 +533,7 @@ mod tests {
             let len = std::fs::metadata(dir.join("a.gz")).unwrap().len();
             for mode in [&["-t", "a.gz", "a.gz"][..], &["-l", "a.gz"]] {
                 let (code, _, err, reads) =
-                    run_in_counted(&dir, "gzip", args(mode), b"", flavour, U, C).unwrap();
+                    run_in_counted(&dir, "gzip", args(mode), b"", flavour, U, C, Z).unwrap();
                 assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
                 let gz = reads[&dir.join("a.gz")];
                 assert_eq!(gz.opens, mode.len() as u64 - 1, "{flavour:?} {mode:?}");
@@ -495,7 +541,7 @@ mod tests {
                 assert!(gz.bytes > 0 && gz.bytes <= 2 * len * gz.opens, "{gz:?}");
             }
             let (_, _, _, reads) =
-                run_in_counted(&dir, "bzip2", args(&["-k", "a"]), b"", flavour, U, C).unwrap();
+                run_in_counted(&dir, "bzip2", args(&["-k", "a"]), b"", flavour, U, C, Z).unwrap();
             assert!(reads.is_empty(), "{reads:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -512,7 +558,7 @@ mod tests {
         let args = |a: &[&str]| a.iter().map(OsString::from).collect::<Vec<_>>();
         let run = |a: &[&str]| {
             let (code, _, err, reads) =
-                run_in_counted(&dir, "zstd", args(a), b"", gzip::Flavour::Gnu, U, C).unwrap();
+                run_in_counted(&dir, "zstd", args(a), b"", gzip::Flavour::Gnu, U, C, Z).unwrap();
             assert_eq!(code, 0, "{a:?}: {}", String::from_utf8_lossy(&err));
             reads
         };
@@ -619,7 +665,11 @@ mod tests {
                 "zipinfo",
                 "funzip",
                 "compress",
-                "uncompress"
+                "uncompress",
+                "zip",
+                "zipcloak",
+                "zipnote",
+                "zipsplit"
             ]
         );
     }

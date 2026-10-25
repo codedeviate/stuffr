@@ -1101,6 +1101,13 @@ const COMPAT_SHAPES: &[&str] = &[
     "uncompress-ncompress-keep",
     "uncompress-ncompress-force-uppercase",
     "uncompress-ncompress-force-not-compressed",
+    // The zip family (0.19.0 Task 4): a front-end seed per name and
+    // flavour; Task 12 adds the archive seeds and the flavour byte's oracle.
+    "zip-apple-help",
+    "zip-ubuntu-version",
+    "zipcloak-apple-help",
+    "zipnote-ubuntu-help",
+    "zipsplit-apple-help",
     "compress-apple-stdin-dash",
     "compress-apple-cluster-force",
 ];
@@ -2456,6 +2463,28 @@ fn compress_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>
     }))
 }
 
+/// The `compat` seed for a zip-family `shape` (`<tool>-<apple|ubuntu>-
+/// <case>`), or `None` for another family's. The flavour byte is absolute:
+/// 0 Ubuntu, 1 Apple.
+fn zip_seed(shape: &str) -> Option<Vec<u8>> {
+    let mut parts = shape.splitn(3, '-');
+    let (tool, flavour, case) = (parts.next()?, parts.next()?, parts.next()?);
+    if !matches!(tool, "zip" | "zipcloak" | "zipnote" | "zipsplit") {
+        return None;
+    }
+    let flavour = match flavour {
+        "ubuntu" => 0,
+        "apple" => 1,
+        _ => return None,
+    };
+    let args: &[&str] = match case {
+        "help" => &["-h"],
+        "version" => &["-v"],
+        other => unreachable!("COMPAT_SHAPES lists an unhandled zip shape {other:?}"),
+    };
+    Some(encode_compat_case(tool, flavour, args, &[], false, b""))
+}
+
 /// The `compat` seed for `shape`.
 fn compat_seed(work: &Path, shape: &str) -> stuffr_core::Result<Vec<u8>> {
     if let Some(seed) = gzip_seed(work, shape)? {
@@ -2474,6 +2503,9 @@ fn compat_seed(work: &Path, shape: &str) -> stuffr_core::Result<Vec<u8>> {
         return Ok(seed);
     }
     if let Some(seed) = compress_seed(work, shape)? {
+        return Ok(seed);
+    }
+    if let Some(seed) = zip_seed(shape) {
         return Ok(seed);
     }
     let text = compat_text(4000);
@@ -4637,6 +4669,7 @@ fn every_compat_seed_decodes_fits_and_carries_its_shape() {
         let gzip_family = matches!(case.name, "gzip" | "gunzip" | "zcat" | "gzcat");
         let unzip_family = matches!(case.name, "unzip" | "zipinfo" | "funzip");
         let compress_family = matches!(case.name, "compress" | "uncompress");
+        let zip_family = matches!(case.name, "zip" | "zipcloak" | "zipnote" | "zipsplit");
         let flavour = match shape.split('-').nth(1) {
             Some("bsd") if gzip_family => 1,
             Some("gnu") if gzip_family => 0,
@@ -4647,8 +4680,14 @@ fn every_compat_seed_decodes_fits_and_carries_its_shape() {
             // same personality everywhere).
             Some("apple") if compress_family => 1,
             Some("ncompress") if compress_family => 0,
+            // Also absolute: 0 Ubuntu, 1 Apple.
+            Some("apple") if zip_family => 1,
+            Some("ubuntu") if zip_family => 0,
             _ => {
-                assert!(!gzip_family && !unzip_family, "{shape} names no flavour");
+                assert!(
+                    !gzip_family && !unzip_family && !zip_family,
+                    "{shape} names no flavour"
+                );
                 0
             }
         };

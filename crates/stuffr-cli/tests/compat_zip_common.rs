@@ -47,8 +47,11 @@ mod unix {
     /// One probed command and what the reference did.
     struct Row {
         flavour: Which,
-        /// The task whose differential runs the row.
+        /// The task whose behaviour the row records.
         task: u8,
+        /// A later task that makes the row comparable with stuffr (its
+        /// answer needs code that task writes); 0 when `task` is enough.
+        needs: u8,
         label: &'static str,
         name: &'static str,
         args: Vec<&'static str>,
@@ -99,6 +102,17 @@ mod unix {
             self.tree = tree;
             self
         }
+
+        /// The row's answer comes from archive code of a later task.
+        fn needs(mut self, task: u8) -> Row {
+            self.needs = task;
+            self
+        }
+
+        /// The task whose differential runs the row.
+        fn ready_at(&self) -> u8 {
+            self.task.max(self.needs)
+        }
     }
 
     /// A row over the standard tree ([`ZipTree::standard`]).
@@ -116,6 +130,7 @@ mod unix {
         Row {
             flavour,
             task,
+            needs: 0,
             label,
             name,
             args: args.to_vec(),
@@ -237,16 +252,20 @@ mod unix {
                 "\tzip warning: Unable to read number (must start with digit): u\n\n\
                  zip error: Invalid command arguments (bad split size:  'u')\n", ""),
             row(Ubuntu, 4, "-su", "zip", &["-su", "t.zip", "a.txt"], 0,
-                "Would Add/Update:\n  a.txt\nTotal 1 entries (6 bytes)\n", ""),
+                "Would Add/Update:\n  a.txt\nTotal 1 entries (6 bytes)\n", "")
+                .needs(5),
             row(Apple, 4, "-UN", "zip", &["t.zip", "a.txt", "-UN", "warn"], 16,
                 "\nzip error: Invalid command arguments (short option 'N' not supported)\n", ""),
             row(Ubuntu, 4, "-UN", "zip", &["t.zip", "a.txt", "-UN", "warn"], 0,
-                "  adding: a.txt (stored 0%)\n", ""),
+                "  adding: a.txt (stored 0%)\n", "")
+                .needs(6),
             row(Both, 4, "ZIP quiet", "zip", &["t.zip", "a.txt"], 0, "", "")
-                .env(&[("ZIP", "-q")]),
+                .env(&[("ZIP", "-q")])
+                .needs(6),
             row(Both, 4, "ZIPOPT verbose", "zip", &["t.zip", "a.txt"], 0,
                 "  adding: a.txt\t(in=6) (out=6) (stored 0%)\ntotal bytes=6, compressed=6 -> 0% savings\n", "")
-                .env(&[("ZIP", "-q"), ("ZIPOPT", "-v")]),
+                .env(&[("ZIP", "-q"), ("ZIPOPT", "-v")])
+                .needs(6),
             row(Both, 4, "ZIP bad option", "zip", &["t.zip", "a.txt"], 16,
                 "\nzip error: Invalid command arguments (short option '%' not supported)\n", "")
                 .env(&[("ZIP", "-%")]),
@@ -445,15 +464,37 @@ mod unix {
         ]
     }
 
-    /// The rows of `task` that run on this platform's reference, as cases
-    /// (for the tasks' differentials).
-    #[allow(dead_code)] // Tasks 4-11 run their rows against stuffr
+    /// The rows `task` makes comparable that run on this platform's
+    /// reference, as cases (for the tasks' differentials).
     fn rows_of(task: u8) -> Vec<Case<'static>> {
         rows()
             .into_iter()
-            .filter(|r| r.task == task && r.runs_here())
+            .filter(|r| r.ready_at() == task && r.runs_here())
             .map(|r| r.case())
             .collect()
+    }
+
+    /// The rows of `task` on this platform's reference, against stuffr in
+    /// this platform's flavour: exit code, standard output and error, every
+    /// byte of the tree.
+    fn differential(task: u8) {
+        let cases = rows_of(task);
+        assert!(!cases.is_empty(), "Task {task} has no row here");
+        run_group(
+            &format!("task{task}"),
+            &cases,
+            Skipped::none(),
+            &assert_same_zip,
+        );
+    }
+
+    /// Task 4's rows: options, help and version screens, the environment,
+    /// the checks of `main()` and the helpers' usage. The rows whose answer
+    /// needs the archive code (the `ZIP` and `ZIPOPT` that archive, Ubuntu's
+    /// `-su` and `-UN`) run with the task that builds it.
+    #[test]
+    fn task4_rows_match_the_reference() {
+        differential(4);
     }
 
     #[test]

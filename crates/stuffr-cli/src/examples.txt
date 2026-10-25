@@ -1407,8 +1407,8 @@ COMPATIBILITY LINKS (INSTALL-LINKS)
       Creates symlinks named bzip2, bunzip2, bzcat, bzip2recover, gzip,
       gunzip, zcat, gzcat, xz, unxz, xzcat, lzma, unlzma, lzcat, zstd,
       unzstd, zstdcat, zstdmt, lz4, unlz4, lz4cat, lz4c, unzip, zipinfo,
-      funzip, compress and uncompress in that directory, each pointing at
-      this stuffr binary. Run under one of those names, the binary behaves
+      funzip, compress, uncompress, zip, zipcloak, zipnote and zipsplit in
+      that directory, each pointing at this stuffr binary. Run under one of those names, the binary behaves
       as that tool, with its flags, messages and exit codes. This is
       opt-in: nothing creates these links unless you run this verb. The
       directory must exist (exit 2 if not); one that cannot be written to
@@ -1457,6 +1457,13 @@ COMPATIBILITY LINKS (INSTALL-LINKS)
       refused, exit 1). UNZIP and UNZIPOPT (ZIPINFO and ZIPINFOOPT for
       zipinfo) are read before the command line, as unzip reads them. The
       first line of the usage and -v screens names stuffr.
+
+      The zip, zipcloak, zipnote and zipsplit names behave as Info-ZIP Zip
+      3.0: Apple's build on macOS and the BSDs, Ubuntu 24.04's elsewhere;
+      STUFFR_ZIP_FLAVOR=apple or ubuntu overrides that (any other value is
+      refused, exit 1). ZIPOPT and ZIP are read before the command line, as
+      zip reads them. The banner line of -v and the first line of each help
+      screen name stuffr.
 
       The compress and uncompress names behave as Apple's compress 487.0.1
       on macOS and the BSDs and as ncompress 5.0 elsewhere;
