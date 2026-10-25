@@ -256,22 +256,20 @@ pub fn child_entry(args: &[OsString]) -> Option<ExitCode> {
     }
     // A malformed job is a usage error (exit 2): exit 1 is reserved for
     // stuffr itself failing. The parent takes any non-zero exit with `err`.
-    let (result, code) = if cfg!(debug_assertions) {
-        (Err(DEBUG_CHILD_REFUSAL.to_string()), ExitCode::FAILURE)
+    let (result, usage) = if cfg!(debug_assertions) {
+        (Err(DEBUG_CHILD_REFUSAL.to_string()), None)
     } else {
         match ChildJob::from_args(&args[2..]) {
-            Ok(job) => (child_main(job), ExitCode::FAILURE),
-            Err(e) => (Err(e), ExitCode::from(2)),
+            Ok(job) => (child_main(job), None),
+            Err(e) => (Err(e), Some(ExitCode::from(2))),
         }
     };
     let mut out = io::stdout().lock();
     let printed = writeln!(out, "{}", reply_line(&result)).and_then(|()| out.flush());
-    Some(if result.is_ok() && printed.is_ok() {
-        ExitCode::SUCCESS
-    } else if result.is_err() {
-        code
-    } else {
-        ExitCode::FAILURE
+    Some(match usage {
+        Some(code) => code,
+        None if result.is_ok() && printed.is_ok() => ExitCode::SUCCESS,
+        None => ExitCode::FAILURE,
     })
 }
 
@@ -706,6 +704,28 @@ mod tests {
             threads: None,
             memory_limit: 1 << 30,
         }
+    }
+
+    #[test]
+    fn measure_memory_with_no_input_files_measures_nothing() {
+        struct Counting(u32);
+        impl Runner for Counting {
+            fn run(&mut self, _job: &ChildJob) -> Result<u64, String> {
+                self.0 += 1;
+                Ok(1)
+            }
+        }
+        let mut stub = Counting(0);
+        let got = measure_memory_with(&mut stub, "lz4", None, &plan(Mode::OneStream), &[]);
+        assert_eq!(
+            got,
+            Memory {
+                compress: None,
+                decompress: None,
+                error: Some("no input to measure".to_string()),
+            }
+        );
+        assert_eq!(stub.0, 0);
     }
 
     fn bench_temps() -> Vec<String> {

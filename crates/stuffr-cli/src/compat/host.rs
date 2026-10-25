@@ -272,12 +272,31 @@ extern "C" fn on_cleanup_signal(sig: libc::c_int) {
         // async-signal-safe.
         unsafe { libc::unlink(SLOT.0.get().cast::<libc::c_char>()) };
     }
-    // SAFETY: signal and raise are async-signal-safe. The re-raised signal
-    // is blocked until this handler returns, then delivered at SIG_DFL,
-    // which ends the process with that signal.
+    // SAFETY: sigaction and raise are async-signal-safe. The re-raised
+    // signal is blocked until this handler returns, then delivered at
+    // SIG_DFL, which ends the process with that signal.
     unsafe {
-        libc::signal(sig, libc::SIG_DFL);
+        reset_to_default(sig);
         libc::raise(sig);
+    }
+}
+
+/// Put `sig` back to its default action with `sigaction`: an empty mask and
+/// no flags, so nothing of the handler's own installation survives (BSD
+/// `signal` keeps flags such as `SA_RESTART`). Async-signal-safe: POSIX lists
+/// `sigaction`, `sigemptyset` and `raise`.
+///
+/// # Safety
+/// `sig` must be a valid signal number; call from a handler or before exit.
+#[cfg(unix)]
+unsafe fn reset_to_default(sig: libc::c_int) {
+    // SAFETY: a zeroed sigaction is plain data; every field it needs is set.
+    unsafe {
+        let mut act: libc::sigaction = std::mem::zeroed();
+        act.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut act.sa_mask);
+        act.sa_flags = 0;
+        libc::sigaction(sig, &act, std::ptr::null_mut());
     }
 }
 
@@ -769,11 +788,11 @@ extern "C" fn on_interrupt_exit_code(
     if own || EXIT_RERAISES.load(Ordering::SeqCst) {
         // ruling: P28: our own abort stays a crash (and funzip, which has
         // no handler, dies of every signal).
-        // SAFETY: signal and raise are async-signal-safe; the re-raised
+        // SAFETY: sigaction and raise are async-signal-safe; the re-raised
         // signal is blocked until this handler returns, then delivered at
         // SIG_DFL, which ends the process with it.
         unsafe {
-            libc::signal(sig, libc::SIG_DFL);
+            reset_to_default(sig);
             libc::raise(sig);
         }
         return;
@@ -1152,6 +1171,14 @@ pub(crate) fn with_run_signals_held<T>(f: impl FnOnce() -> T) -> T {
 /// Run `f` with `signals` blocked on this thread, then restore the mask; a
 /// signal that arrived meanwhile is delivered on the restore. Off unix, just
 /// `f`.
+///
+/// Precondition: it blocks on the calling thread only. That suffices because
+/// at every call site the calling thread is the process's only thread:
+/// `create_excl_armed`, `create_armed`, `create_temp_armed`,
+/// `create_temp_armed_exit` and `with_run_signals_held` all run before codec
+/// workers exist or between rows, when none is alive. A caller that runs while
+/// codec workers are alive must block the signals in those threads too (or
+/// before spawning them), else the kernel may deliver on an unblocked one.
 fn held_back<T>(signals: Signals, f: impl FnOnce() -> T) -> T {
     #[cfg(unix)]
     {
