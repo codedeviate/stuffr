@@ -168,6 +168,9 @@ fn fnfilter_escapes_and_truncates() {
         assert_eq!(fnfilter1(uz, b"plain.txt"), b"plain.txt");
         assert_eq!(fnfilter1(uz, b"nl\nx\x01\x1f"), b"nl^Jx^A^_");
         // Not printable in the C locale: `?`.
+        // Only the C locale is pinned here: a sandbox is fixed to it, and a real
+        // locale is process-global and absent on some machines, so it cannot be
+        // set deterministically in a unit test (the Apple suite covers it).
         assert_eq!(fnfilter1(uz, b"\x7f\x80\xe9"), b"???");
         // A C string: the name ends at its NUL.
         assert_eq!(fnfilter1(uz, b"ab\0cd"), b"ab");
