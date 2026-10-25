@@ -1,7 +1,7 @@
 //! Traditional PKWARE decryption (ZipCrypto), ported from Info-ZIP UnZip
 //! 6.0's `crypt.c` (decryption 2.11, Info-ZIP licence; see the parent
-//! module). Decryption only: unzip never encrypts, so `zencode` and
-//! `crypthead` are not ported.
+//! module), plus the encryption side Zip 3.0's `crypt.c` shares
+//! (`zencode`, `crypthead`); unzip itself only decrypts.
 //!
 //! The C keeps the three keys in unzip's global `G.keys`; here they are a
 //! [`Keys`] value per entry. `decrypt()` and `testp()` in `crypt.c` (the
@@ -106,11 +106,59 @@ impl Keys {
         }
     }
 
+    /// Encrypts one byte and advances the keys over its plain text:
+    /// crypt.h's `zencode(c, t)`, `t = decrypt_byte(), update_keys(c), t ^ c`.
+    // port: crypt.h:zencode
+    pub fn encrypt_byte(&mut self, c: u8) -> u8 {
+        let stream = self.stream_byte();
+        self.update_keys(c);
+        stream ^ c
+    }
+
+    /// Encrypts `buf` in place, `zencode` over each byte in turn (the loop
+    /// in `zfwrite` and `zipcloak`).
+    // port: crypt.c:zfwrite
+    pub fn encrypt(&mut self, buf: &mut [u8]) {
+        for c in buf {
+            *c = self.encrypt_byte(*c);
+        }
+    }
+
     /// The raw keys, for the tests that pin them against `crypt.c`.
     #[cfg(test)]
     pub(super) fn raw(&self) -> [u32; 3] {
         [self.k0, self.k1, self.k2]
     }
+}
+
+/// The 12 header bytes Zip 3.0's `crypthead` writes, and `keys` left
+/// positioned after them, ready for the entry's data.
+///
+/// `keys` must be `Keys::new(password)`. `random` stands for the ten raw
+/// draws `(rand() >> 7) & 0xff`, BEFORE `crypthead` touches them. The C
+/// encrypts them twice: first under the fresh keys while drawing (so the
+/// stored draws are `zencode(draw)`), then, after `init_keys` again, each of
+/// those is passed through `zencode` a second time. Only that second
+/// schedule's keys continue into the data, so `keys` ends after the
+/// twelfth byte of the second pass. `check` is `crc >> 16` (low byte first
+/// in the header, `crc >> 16 & 0xff` then `crc >> 24`), or the DOS time's
+/// when general-purpose bit 3 is set. The caller supplies the draws, so the
+/// header is deterministic here; the C's `rand()`/`srand()` seeding is the
+/// caller's.
+// port: crypt.c:crypthead
+pub fn crypt_header(keys: &mut Keys, random: [u8; 10], check: u16) -> [u8; RAND_HEAD_LEN] {
+    let password_keys = keys.clone();
+    let mut header = [0u8; RAND_HEAD_LEN];
+    for (h, &r) in header.iter_mut().zip(&random) {
+        *h = keys.encrypt_byte(r);
+    }
+    *keys = password_keys;
+    for h in &mut header[..RAND_HEAD_LEN - 2] {
+        *h = keys.encrypt_byte(*h);
+    }
+    header[RAND_HEAD_LEN - 2] = keys.encrypt_byte((check & 0xff) as u8);
+    header[RAND_HEAD_LEN - 1] = keys.encrypt_byte((check >> 8) as u8);
+    header
 }
 
 /// crypt.c `testkey()`: decrypt the 12-byte header with `password` and

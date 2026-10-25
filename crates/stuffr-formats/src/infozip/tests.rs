@@ -99,7 +99,7 @@ mod unshrink;
 mod zipdeflate;
 
 mod crypt {
-    use crate::infozip::crypt::{Keys, RAND_HEAD_LEN, check_byte, test_key};
+    use crate::infozip::crypt::{Keys, RAND_HEAD_LEN, check_byte, crypt_header, test_key};
 
     /// P10: the central bit 3 picks the DOS time's high byte (of its low 16
     /// bits), else the CRC's.
@@ -222,6 +222,84 @@ mod crypt {
         let mut body = stream[RAND_HEAD_LEN..].to_vec();
         keys.decrypt(&mut body);
         assert_eq!(body, data);
+    }
+
+    /// `crypthead` from Apple's zip-33 `crypt.c`, its body verbatim, in a
+    /// scratch `ch.c` with `rand()` stubbed to return `draw << 7` for the
+    /// fixed draws 10 21 32 43 54 65 76 87 98 ff, `bfwrite` capturing the
+    /// 12 bytes, and `init_keys`/`update_keys`/`decrypt_byte`/`zencode`
+    /// copied from the same file:
+    ///
+    ///   cc -O0 -Wall -include stdlib.h -o ch ch.c \
+    ///     && ./ch secret 9f606eec && ./ch "" 0000ffff
+    ///
+    /// (Apple clang.) The second argument is the CRC, whose bits 16..32 are
+    /// `check`. The C harness is not committed.
+    const DRAWS: [u8; 10] = [0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xff];
+
+    #[test]
+    fn crypt_header_matches_crypthead_with_fixed_random() {
+        let secret: [u8; 12] = [
+            0x10, 0xbf, 0x62, 0xd0, 0x52, 0xf1, 0xf0, 0xd0, 0xc5, 0x1b, 0x33, 0x29,
+        ];
+        let mut keys = Keys::new(b"secret");
+        assert_eq!(crypt_header(&mut keys, DRAWS, 0x9f60), secret);
+        assert_eq!(keys.raw(), [0xcae3_af23, 0x6f4f_c7bf, 0x08d5_0027]);
+
+        let empty: [u8; 12] = [
+            0x10, 0x2f, 0xb3, 0x50, 0xe2, 0xe4, 0xf1, 0x97, 0x05, 0x19, 0x98, 0x86,
+        ];
+        let mut keys = Keys::new(b"");
+        assert_eq!(crypt_header(&mut keys, DRAWS, 0x0000), empty);
+        assert_eq!(keys.raw(), [0x43fd_27f5, 0xa669_aa22, 0xc67e_7d46]);
+    }
+
+    #[test]
+    fn an_encrypted_entry_decrypts_with_test_key_and_decrypt() {
+        let data = b"The quick brown fox jumps over the lazy dog.\n".repeat(40);
+        let crc_top = 0xbeefu16;
+        let mut keys = Keys::new(b"hunter2");
+        let mut stream = crypt_header(&mut keys, DRAWS, crc_top).to_vec();
+        let mut body = data.clone();
+        keys.encrypt(&mut body);
+        stream.extend(body);
+
+        let head: [u8; RAND_HEAD_LEN] = stream[..RAND_HEAD_LEN].try_into().unwrap();
+        let mut dec = test_key(b"hunter2", &head, (crc_top >> 8) as u8).expect("password");
+        let mut out = stream[RAND_HEAD_LEN..].to_vec();
+        dec.decrypt(&mut out);
+        assert_eq!(out, data);
+        assert!(test_key(b"hunter3", &head, (crc_top >> 8) as u8).is_none());
+    }
+
+    #[test]
+    fn encrypt_inverts_decrypt() {
+        // A small LCG stands in for random buffers (no dev-dependency).
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u8
+        };
+        for len in [0usize, 1, 2, 11, 12, 255, 4096] {
+            let plain: Vec<u8> = (0..len).map(|_| next()).collect();
+            let mut buf = plain.clone();
+            Keys::new(b"pw").encrypt(&mut buf);
+            if len > 8 {
+                assert_ne!(buf, plain);
+            }
+            Keys::new(b"pw").decrypt(&mut buf);
+            assert_eq!(buf, plain);
+            // The reverse order, and byte at a time, agree too.
+            let mut dec = Keys::new(b"pw");
+            let mut enc = Keys::new(b"pw");
+            let mut round = plain.clone();
+            dec.decrypt(&mut round);
+            enc.encrypt(&mut round);
+            assert_eq!(round, plain);
+            assert_eq!(dec.raw(), enc.raw());
+        }
     }
 
     /// Twelve arbitrary ciphertext bytes; `secret` decrypts the last to
