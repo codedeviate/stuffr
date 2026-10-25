@@ -309,6 +309,69 @@ pub(super) const FLAVOR_REFUSED: &str = "%s: STUFFR_ZIP_FLAVOR must be apple or 
 pub(super) const NOT_BUILT: &str =
     "%s: this command is not built yet (stuffr %s, zip family under development)\n";
 
+// ---- scanning names (Task 5: fileio.c, unix.c, zip.c:main) ----
+
+/// zip.c:main, `zipwarn(NAME_NOT_MATCHED, name)`.
+pub(super) const NAME_NOT_MATCHED: &str = "name not matched: ";
+/// zip.c:main, the name for an unmatched `-R` run.
+pub(super) const FOR_R_NAME: &str = "current directory for -R";
+/// zip.c:main, `ZIPERR(ZE_OPEN, "-R")`.
+pub(super) const R_NAME: &str = "-R";
+/// unix.c:procname, a FIFO without `-FI`.
+pub(super) const IGNORING_FIFO: &str = "ignoring FIFO (Named Pipe) - use -FI to read: ";
+/// unix.c:procname, a FIFO with `-FI`.
+pub(super) const READING_FIFO: &str = "Reading FIFO (Named Pipe): ";
+/// unix.c:procname, a device, socket or the like.
+pub(super) const IGNORING_SPECIAL: &str = "ignoring special file: ";
+/// fileio.c:newname, `error()` for a name that reduces to nothing.
+pub(super) const EMPTY_NAME: &str = "empty name without -j or -r";
+/// fileio.c:newname, `-v`.
+pub(super) const MATCHES_ZIP: &str = "file matches zip file -- skipping\n";
+/// zip.c:main, `-sd`.
+pub(super) const SD_READING_ARCHIVE: &str = "sd: Reading archive\n";
+/// zip.c:main, `-sd`.
+pub(super) const SD_SCANNING_FILES: &str = "sd: Scanning files\n";
+/// zip.c:main, `-sd`.
+pub(super) const SD_APPLYING_FILTERS: &str = "sd: Applying filters\n";
+/// zip.c:main, `-sd`.
+pub(super) const SD_CHECKING_DUPS: &str = "sd: Checking dups\n";
+/// zip.c:main, `-sd`.
+pub(super) const SD_SCANNING_TO_UPDATE: &str = "sd: Scanning files to update\n";
+/// zip.c:main, `-sd` (`%u` there).
+pub(super) const SD_FCOUNT: &str = "sd: fcount = %d\n";
+/// fileio.c:check_dup, the first of the three lines.
+pub(super) const DUP_FIRST: &str = "  first full name: %s\n";
+/// fileio.c:check_dup, the indent before the second and third lines.
+pub(super) const DUP_INDENT: &str = "                     ";
+/// fileio.c:check_dup, the second line.
+pub(super) const DUP_SECOND: &str = " second full name: %s\n";
+/// fileio.c:check_dup, the third.
+pub(super) const DUP_REPEATED: &str = "name in zip file repeated: %s";
+/// fileio.c:check_dup, appended under `-j`.
+pub(super) const DUP_JUNK: &str = "\n                     this may be a result of using -j";
+/// zip.c:main, `ZIPERR(ZE_PARMS, ...)` after check_dup.
+pub(super) const CANNOT_REPEAT: &str = "cannot repeat names in zip file";
+/// zip.c:main, no archive and an action other than add.
+pub(super) const NOT_FOUND_OR_EMPTY: &str = " not found or empty";
+/// zip.c:main, `-sf`, the heading with an archive and no names.
+pub(super) const ARCHIVE_CONTAINS: &str = "Archive contains:\n";
+/// zip.c:main, `-sf` with `-d`.
+pub(super) const WOULD_DELETE: &str = "Would Delete:\n";
+/// zip.c:main, `-sf` with `-f`.
+pub(super) const WOULD_FRESHEN: &str = "Would Freshen:\n";
+/// zip.c:main, `-sf` with `-U`.
+pub(super) const WOULD_COPY: &str = "Would Copy:\n";
+/// zip.c:main, `-sf` otherwise.
+pub(super) const WOULD_ADD: &str = "Would Add/Update:\n";
+/// zip.c:main, `-sf`, one name.
+pub(super) const SF_ENTRY: &str = "  %s\n";
+/// zip.c:main, `-sf`, the last line.
+pub(super) const SF_TOTAL: &str = "Total %d entries (%d bytes)\n";
+/// zip.c:main, nothing to do with `-r` and no `-i`: the hint's start.
+pub(super) const TRY_ZIP: &str = "try: zip";
+/// zip.c:main, the hint's `. -i`.
+pub(super) const TRY_DOT_I: &str = " . -i";
+
 // ---- recorded texts (the references' own output) ----
 
 /// zip.c:help, `copyright[]` (printed before the header line).

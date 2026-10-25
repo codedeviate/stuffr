@@ -290,10 +290,12 @@ pub fn snapshot_unzip_tree(root: &Path, exclude: &[&str]) -> UnzipTree {
 
 fn walk_unzip(root: &Path, dir: &Path, exclude: &[&str], t: &mut UnzipTree) {
     use std::os::unix::ffi::OsStrExt;
-    let mut entries: Vec<PathBuf> = fs::read_dir(dir)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .collect();
+    // a directory the tree made unreadable (mode 000, for the zip suites)
+    // is a node with its mode and no children
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<PathBuf> = rd.map(|e| e.unwrap().path()).collect();
     entries.sort_by(|a, b| a.as_os_str().as_bytes().cmp(b.as_os_str().as_bytes()));
     for p in entries {
         let rel = p

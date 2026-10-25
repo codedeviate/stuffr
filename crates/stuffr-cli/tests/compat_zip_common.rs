@@ -300,37 +300,46 @@ mod unix {
                  zip warning: Not all files were readable\n\
                  \x20 files/entries read:  2 (8 bytes)  skipped:  1 (2.1K bytes)\n",
                 "zip warning: Permission denied\n")
-                .tree(ZipTree::standard().file_mode("b.txt", vec![b'x'; 2240], 0o000)),
+                .tree(ZipTree::standard().file_mode("b.txt", vec![b'x'; 2240], 0o000))
+                .needs(6),
             row(Both, 5, "-MM missing name", "zip", &["-MM", "t.zip", "a.txt", "nosuch"], 18,
                 "\tzip warning: name not matched: nosuch\nzip I/O error: No such file or directory\n\
                  zip error: File not found or no read permission (nosuch)\n", ""),
             row(Both, 5, "FIFO without -FI", "zip", &["t.zip", "f", "a.txt"], 0,
                 "\tzip warning: ignoring FIFO (Named Pipe) - use -FI to read: f\n  adding: a.txt (stored 0%)\n", "")
-                .tree(ZipTree::standard().fifo("f")),
+                .tree(ZipTree::standard().fifo("f"))
+                .needs(6),
             row(Both, 5, "dangling symlink without -y", "zip", &["t.zip", "l", "a.txt"], 0,
                 "\tzip warning: name not matched: l\n  adding: a.txt (stored 0%)\n", "")
-                .tree(ZipTree::standard().symlink("l", "nosuch")),
+                .tree(ZipTree::standard().symlink("l", "nosuch"))
+                .needs(6),
             row(Both, 5, "special file", "zip", &["t.zip", "/dev/null"], 12,
                 "\tzip warning: ignoring special file: /dev/null\n\nzip error: Nothing to do! (t.zip)\n", ""),
             row(Both, 5, "show files", "zip", &["-sf", "t.zip", "a.txt"], 0,
                 "Would Add/Update:\n  a.txt\nTotal 1 entries (6 bytes)\n", ""),
             row(Both, 5, "DOS names", "zip", &["-k", "t.zip", "b.txt", "d/c.txt"], 0,
-                "  adding: B.TXT (deflated 92%)\n  adding: D/C.TXT (stored 0%)\n", ""),
+                "  adding: B.TXT (deflated 92%)\n  adding: D/C.TXT (stored 0%)\n", "")
+                .needs(6),
             row(Both, 5, "-x pattern", "zip", &["-r", "t.zip", ".", "-x", "*.txt"], 0,
-                "  adding: d/ (stored 0%)\n", ""),
+                "  adding: d/ (stored 0%)\n", "")
+                .needs(6),
             row(Both, 5, "-j", "zip", &["-j", "t.zip", "d/c.txt", "a.txt"], 0,
-                "  adding: c.txt (stored 0%)\n  adding: a.txt (stored 0%)\n", ""),
+                "  adding: c.txt (stored 0%)\n  adding: a.txt (stored 0%)\n", "")
+                .needs(6),
             row(Both, 5, "names from stdin", "zip", &["-@", "t.zip"], 0,
                 "  adding: a.txt (stored 0%)\n  adding: d/c.txt (stored 0%)\n", "")
-                .piped(b"a.txt\nd/c.txt\n"),
+                .piped(b"a.txt\nd/c.txt\n")
+                .needs(6),
             row(Both, 5, "-t date excludes all", "zip", &["-t", "01012002", "t.zip", "a.txt"], 12,
                 "\nzip error: Nothing to do! (t.zip)\n", ""),
             row(Apple, 5, "newline in a name", "zip", &["t.zip", "new\nline"], 0,
                 "  adding: new\nline (stored 0%)\n", "")
-                .tree(ZipTree::standard().file("new\nline", b"x")),
+                .tree(ZipTree::standard().file("new\nline", b"x"))
+                .needs(6),
             row(Ubuntu, 5, "newline in a name", "zip", &["t.zip", "new\nline"], 0,
                 "  adding: new^Jline (stored 0%)\n", "")
-                .tree(ZipTree::standard().file("new\nline", b"x")),
+                .tree(ZipTree::standard().file("new\nline", b"x"))
+                .needs(6),
             // ---- Task 6: writing ----
             row(Both, 6, "store and deflate", "zip", &["t.zip", "a.txt", "b.txt"], 0,
                 "  adding: a.txt (stored 0%)\n  adding: b.txt (deflated 92%)\n", ""),
@@ -495,6 +504,19 @@ mod unix {
     #[test]
     fn task4_rows_match_the_reference() {
         differential(4);
+    }
+
+    /// Task 5's rows: the names zip finds, and the runs that end before
+    /// anything is written (nothing to do, a name that matched nothing,
+    /// `-MM`, a special file, `-sf`'s listing). The rows that archive what
+    /// they find (a FIFO or dangling link skipped beside a file that is
+    /// added, `-k`, `-j`, `-x`, names from standard input, an unreadable
+    /// file among readable ones, Review Focus 2) run with Task 6, which
+    /// writes the archive; the scanning matrices are in
+    /// `compat_zip_apple` and `compat_zip_ubuntu`.
+    #[test]
+    fn task5_rows_match_the_reference() {
+        differential(5);
     }
 
     #[test]

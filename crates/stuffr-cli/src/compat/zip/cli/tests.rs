@@ -542,6 +542,10 @@ fn the_name_dash_sends_messages_to_standard_error() {
     );
 }
 
+/// The scan's answer when `a` is not there and nothing else is named.
+const NOT_MATCHED_A: &str =
+    "\tzip warning: name not matched: a\n\nzip error: Nothing to do! (t.zip)\n";
+
 #[test]
 fn compression_methods_follow_the_build() {
     let (code, out, _) = go(Flavour::Apple, "zip", &["-Z", "bzip2", "t.zip", "a"]);
@@ -550,10 +554,9 @@ fn compression_methods_follow_the_build() {
         out,
         "\nzip error: Not supported (Compression method bzip2 not enabled)\n"
     );
-    // Ubuntu accepts it and goes on (to the not-built answer)
-    let (code, out, err) = go(Flavour::Ubuntu, "zip", &["-Z", "b", "t.zip", "a"]);
-    assert_eq!((code, out.as_str()), (1, ""));
-    assert!(err.contains("not built yet"), "{err}");
+    // Ubuntu accepts it and goes on (to the scan: `a` is not there)
+    let (code, out, _) = go(Flavour::Ubuntu, "zip", &["-Z", "b", "t.zip", "a"]);
+    assert_eq!((code, out.as_str()), (12, NOT_MATCHED_A));
     let (code, out, _) = go(Flavour::Ubuntu, "zip", &["-Z", "foo", "t.zip", "a"]);
     assert_eq!(code, 16);
     assert_eq!(
@@ -580,7 +583,7 @@ fn the_unicode_option_takes_its_words() {
         "q", "quit", "w", "Warn", "i", "n", "no", "e", "escape", "u", "UTF8",
     ] {
         let (code, out, err) = go(Flavour::Ubuntu, "zip", &["-UN", w, "t.zip", "a"]);
-        assert_eq!((code, out.as_str()), (1, ""), "{w}: {err}");
+        assert_eq!((code, out.as_str()), (12, NOT_MATCHED_A), "{w}: {err}");
     }
     let (code, out, _) = go(Flavour::Ubuntu, "zip", &["-UN", "x", "t.zip", "a"]);
     assert_eq!(code, 16);
@@ -691,12 +694,17 @@ fn a_log_file_gets_its_header_and_the_log_extension() {
         .map(OsString::from)
         .collect();
     let (code, _, err) = run_in(&s.0, "zip", args, b"", Flavour::Apple);
-    // the command line is accepted; the work is not built
-    assert_eq!(code, 1, "{}", String::from_utf8_lossy(&err));
+    // the command line is accepted; `a` is not there (nothing to do)
+    assert_eq!(code, 12, "{}", String::from_utf8_lossy(&err));
     let log = std::fs::read_to_string(s.0.join("run.log")).unwrap();
     assert!(log.starts_with("---------\nZip log opened "), "{log}");
     assert!(
-        log.ends_with("command line arguments:\n -lf run -sd t.zip a \n\n"),
+        log.contains("command line arguments:\n -lf run -sd t.zip a \n\n"),
+        "{log:?}"
+    );
+    // the scan's warning and the error end are in the log too
+    assert!(
+        log.ends_with("\tzip warning: name not matched: a\n\nzip error: Nothing to do! (t.zip)\n"),
         "{log:?}"
     );
     // an unwritable log is a usage error naming the path with its extension
@@ -724,7 +732,11 @@ fn names_from_stdin_are_read_when_the_archive_name_is_known() {
     // name is known, which the permutation never gives)
     let args: Vec<OsString> = ["-@", "t.zip", "-"].iter().map(OsString::from).collect();
     let (code, out, err) = run_in(&s.0, "zip", args, b"a\n", Flavour::Apple);
-    assert_eq!((code, out.as_slice()), (1, &b""[..]));
+    // `a` is not there; `-` is standard input, which goes on to the archive
+    assert_eq!(
+        (code, out.as_slice()),
+        (1, &b"\tzip warning: name not matched: a\n"[..])
+    );
     assert!(String::from_utf8_lossy(&err).contains("not built yet"));
 }
 

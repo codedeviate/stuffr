@@ -523,7 +523,7 @@ compat-ubuntu:
 	   && cargo test --locked -p stuffr-cli --test compat_compress_ncompress -- $(COMPAT_UBUNTU_ALL_ARGS)'
 	$(COMPAT_UBUNTU_RUN) sh -c \
 	  'cargo test --locked -p stuffr-cli --lib compat::zip -- $(COMPAT_UBUNTU_ALL_ARGS) \
-	   && cargo test --locked -p stuffr-cli --test compat_zip_common --test compat_zip_harness_selftest -- $(COMPAT_UBUNTU_ALL_ARGS)'
+	   && cargo test --locked -p stuffr-cli --test compat_zip_common --test compat_zip_ubuntu --test compat_zip_harness_selftest -- $(COMPAT_UBUNTU_ALL_ARGS)'
 
 clean:
 	$(CARGO) clean

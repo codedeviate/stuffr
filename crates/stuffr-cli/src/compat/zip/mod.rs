@@ -15,10 +15,16 @@
 //! command lines of all four programs (`cli.rs`: `zip.c`'s option table and
 //! `main()`'s loop and checks, `fileio.c`'s `get_option()`, `util.c`'s
 //! `envargs()` for `ZIPOPT` and `ZIP`, and the three helpers' own
-//! parsing), and every help, licence, version and option-listing screen. A
-//! command line that gets past every check and would archive answers
-//! `messages::NOT_BUILT` (exit 1) until the later tasks build the
-//! archive code.
+//! parsing), and every help, licence, version and option-listing screen.
+//!
+//! **Task 5 (`scan.rs`, `unix.rs`):** which names `zip` operates on: the
+//! operands and `-R`, `-i`/`-x`/`-R` patterns, `-r`, `-j`, `-k`, `-D`, `-y`,
+//! `-t`/`-tt`, `-@`, duplicates and the archive itself, and `-sf`'s listing
+//! (`fileio.c`, `util.c`'s matcher, `unix/unix.c`); also the unix extra
+//! fields Task 6 writes (`unix::extra_fields`). A command line that gets
+//! past all of it and would archive answers `messages::NOT_BUILT` (exit 1)
+//! until Task 6 writes the archive, and the helpers' work answers it until
+//! theirs.
 //!
 //! **Zr is `G`:** zip's globals are one value per run (`Zr`, with its
 //! options `o`), so a sandboxed run ([`run_in_counted`]) touches nothing of
@@ -59,6 +65,20 @@
 //!    which zip's handler answers in both builds with a blank line and
 //!    `zip error: Interrupted (aborting)`, exit 9. stuffr gives that answer
 //!    without the dereference.
+//! 7. The "Scanning files" progress message `newname` prints when a scan
+//!    of 100 or more names takes over five seconds, with a dot every two
+//!    seconds after, is not made (it depends on the clock, not on the
+//!    names).
+//! 8. A name that is `//host` or `//host/share` and nothing more makes
+//!    `ex2in` dereference NULL in both references: SIGSEGV, which zip's
+//!    handler answers with a blank line and `Interrupted (aborting)`, exit
+//!    9. stuffr gives that answer without the dereference (as for 6), also
+//!    for an `-i`/`-x`/`-R` pattern of that shape. The order of two equal
+//!    names in the found list follows each libc's `qsort` (Ubuntu's stable
+//!    merge sort, Apple's BSD quicksort ported in `scan.rs`); the port
+//!    orders 6 of 4000 random arrays with many equal keys differently from
+//!    macOS (a known gap: which of two equal names is dropped, when the
+//!    same operand is given twice among many).
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -74,6 +94,8 @@ use super::host::{self, Host, SANDBOX_OUTPUT_CAP, Sandbox};
 pub(crate) mod cli;
 pub(crate) mod flavour;
 mod messages;
+pub(crate) mod scan;
+pub(crate) mod unix;
 
 pub use flavour::Flavour;
 use messages::{self as m, printf};
@@ -325,13 +347,24 @@ impl<'a> Zr<'a> {
     }
 }
 
-/// `asctime(localtime(now))` with its newline: `Sun Sep 16 01:03:52 1973\n`.
-/// A sandbox's zone is UTC; so is any other target's.
-pub(crate) fn asctime(host: &Host, t: i64) -> String {
-    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
+/// A broken-down local time (`struct tm`, the fields zip reads).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Tm {
+    /// The full year (`tm_year + 1900`).
+    pub(crate) year: i64,
+    /// 0 to 11.
+    pub(crate) mon: u32,
+    pub(crate) mday: u32,
+    pub(crate) hour: u32,
+    pub(crate) min: u32,
+    pub(crate) sec: u32,
+    /// 0 is Sunday.
+    pub(crate) wday: u32,
+}
+
+/// `localtime(&t)`: the process's zone under `Host::Real` on unix, UTC for a
+/// sandbox (and for any other target).
+pub(crate) fn localtime(host: &Host, t: i64) -> Tm {
     #[cfg(unix)]
     if matches!(host, Host::Real) {
         // SAFETY: `tm` is plain data that a successful `localtime_r` fills
@@ -339,16 +372,15 @@ pub(crate) fn asctime(host: &Host, t: i64) -> String {
         let tt = t as libc::time_t;
         let mut tm: libc::tm = unsafe { std::mem::zeroed() };
         if !unsafe { libc::localtime_r(&tt, &mut tm) }.is_null() {
-            return format!(
-                "{} {} {:2} {:02}:{:02}:{:02} {}\n",
-                DAYS[(tm.tm_wday as usize) % 7],
-                MONTHS[(tm.tm_mon as usize) % 12],
-                tm.tm_mday,
-                tm.tm_hour,
-                tm.tm_min,
-                tm.tm_sec,
-                i64::from(tm.tm_year) + 1900
-            );
+            return Tm {
+                year: i64::from(tm.tm_year) + 1900,
+                mon: tm.tm_mon as u32 % 12,
+                mday: tm.tm_mday as u32,
+                hour: tm.tm_hour as u32,
+                min: tm.tm_min as u32,
+                sec: tm.tm_sec as u32,
+                wday: tm.tm_wday as u32 % 7,
+            };
         }
     }
     let _ = host;
@@ -365,15 +397,28 @@ pub(crate) fn asctime(host: &Host, t: i64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let mo = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if mo <= 2 { y + 1 } else { y };
+    Tm {
+        year,
+        mon: (mo - 1) as u32,
+        mday: d as u32,
+        hour: (secs / 3600) as u32,
+        min: (secs / 60 % 60) as u32,
+        sec: (secs % 60) as u32,
+        wday: ((days + 4).rem_euclid(7)) as u32,
+    }
+}
+
+/// `asctime(localtime(t))` with its newline: `Sun Sep 16 01:03:52 1973\n`.
+/// A sandbox's zone is UTC; so is any other target's.
+pub(crate) fn asctime(host: &Host, t: i64) -> String {
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let tm = localtime(host, t);
     format!(
         "{} {} {:2} {:02}:{:02}:{:02} {}\n",
-        DAYS[((days + 4).rem_euclid(7)) as usize],
-        MONTHS[(mo - 1) as usize],
-        d,
-        secs / 3600,
-        secs / 60 % 60,
-        secs % 60,
-        year
+        DAYS[tm.wday as usize], MONTHS[tm.mon as usize], tm.mday, tm.hour, tm.min, tm.sec, tm.year
     )
 }
 
@@ -487,7 +532,10 @@ fn main(
     };
     let code = match result {
         Err(Exit { code }) => code,
-        // A command line the checks accepted: the work is not built yet.
+        // A `zip` command line the checks accepted: the names, and (Task 6)
+        // the archive.
+        Ok(()) if name == "zip" => scan::run(&mut z).code,
+        // The helpers' work is not built yet.
         Ok(()) => z.not_built().code,
     };
     let _ = z.out.flush();

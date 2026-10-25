@@ -990,3 +990,274 @@ pub fn decrypt_equal(a: &Path, b: &Path, pw: &str) -> Result<(), String> {
         zip_region(&av, diff_at(&av, &bv))
     ))
 }
+
+// ---- The scanning matrix (0.19.0 Task 5) ----
+
+/// The cases of `compat_zip_apple` and `compat_zip_ubuntu`'s scanning
+/// matrix: which names zip would operate on (`-sf` lists them without
+/// writing), over every shape of operand, pattern, directory, link and date
+/// filter, in `flavour`. Nothing in them writes an archive, so the exit
+/// code, both streams and the (unchanged) tree are all there is to compare.
+pub fn zip_scan_matrix(flavour: &'static str) -> Vec<Case<'static>> {
+    let std_tree = ZipTree::standard;
+    let mut out: Vec<Case<'static>> = Vec::new();
+    let mut add = |args: &[&'static str], tree: ZipTree, stdin: Option<&[u8]>| {
+        let mut c = zip_case("zip", args, tree);
+        c.zip_flavour = Some(flavour);
+        c.stdin = stdin.map(<[u8]>::to_vec);
+        out.push(c);
+    };
+    // operands, directories and recursion
+    for args in [
+        &["-sf", "t.zip", "a.txt"][..],
+        &["-sf", "t.zip", "a.txt", "b.txt", "d/c.txt"],
+        &["-sf", "t.zip", "d"],
+        &["-sf", "t.zip", "d/"],
+        &["-sf", "-r", "t.zip", "d"],
+        &["-sf", "-r", "t.zip", "d/"],
+        &["-sf", "-r", "t.zip", "."],
+        &["-sf", "-r", "t.zip", "./"],
+        &["-sf", "-r", "-j", "t.zip", "./"],
+        &["-sf", "-r", "t.zip", ".", "d"],
+        &["-sf", "-r", "-D", "t.zip", "d"],
+        &["-sf", "-r", "-D", "t.zip", "."],
+        &["-sf", "-j", "t.zip", "d/c.txt", "a.txt"],
+        &["-sf", "-j", "-r", "t.zip", "d"],
+        &["-sf", "-k", "t.zip", "b.txt", "d/c.txt"],
+        &["-sf", "-k", "-r", "t.zip", "d"],
+        &["-sf", "t.zip", "./a.txt", "a.txt"],
+        &["-sf", "t.zip", "a.txt", "a.txt", "b.txt"],
+        &["-sf", "t.zip", "b.txt", "a.txt", "b.txt"],
+        &["-sf", "t.zip", "d/../a.txt"],
+        &["-sf", "t.zip", "../w/a.txt"],
+        &["-sf", "-r", "t.zip", "d/.."],
+        &["-sf", "t.zip", "."],
+        &["-sf", "t.zip", "//tmp"],
+        &["-sf", "t.zip", "//tmp/"],
+        &["-sf", "t.zip", "/dev/null"],
+        &["-sf", "t.zip", "nosuch", "a.txt"],
+        &["-sf", "-MM", "t.zip", "a.txt", "nosuch"],
+        &["-sf", "t.zip", "*.txt"],
+        &["-sf", "-sd", "t.zip", "a.txt"],
+        &["-sf", "-sd", "-r", "t.zip", "d"],
+        &["-sf", "-q", "t.zip", "a.txt"],
+        &["-sf", "-q", "-lf", "log", "t.zip", "a.txt"],
+        &["-sf", "-lf", "log", "t.zip", "a.txt"],
+        &["-sf", "-d", "t.zip", "a.txt"],
+        &["-sf", "-f", "t.zip", "a.txt"],
+        &["-sf", "-u", "t.zip", "a.txt"],
+        &["-sf", "-O", "o.zip", "t.zip", "a.txt"],
+        &["-sf", "-U", "t.zip", "a.txt"],
+        &["-sf", "t.zip"],
+        &["-sf", "-sf", "-sf-", "t.zip", "a.txt"],
+        // nothing to do
+        &["t.zip"],
+        &["t.zip", "nosuch"],
+        &["-r", "t.zip", "nosuch"],
+        &["-r", "t.zip", "nosuch", "-x", "*.x"],
+        &["-d", "t.zip", "a.txt"],
+        &["-f", "t.zip", "a.txt"],
+        &["-t", "01012002", "t.zip", "a.txt"],
+        &["-MM", "t.zip", "nosuch"],
+        &["t.zip", "/dev/null"],
+        &["-R", "t.zip", "*.nomatch"],
+        &["-MM", "-R", "t.zip", "*.nomatch"],
+        &["-O", "o.zip", "t.zip", "a.txt"],
+        &["-sf", "t.zip", "-x"],
+    ] {
+        add(args, std_tree(), None);
+    }
+    // -R, -i and -x: the wild card rules
+    for args in [
+        &["-sf", "-R", "t.zip", "*.txt"][..],
+        &["-sf", "-R", "t.zip", "d/*"],
+        &["-sf", "-R", "t.zip", "c.txt"],
+        &["-sf", "-R", "t.zip", "*/*.txt"],
+        &["-sf", "-R", "t.zip", "d/"],
+        &["-sf", "-R", "t.zip", "*.txt", "-x", "b*"],
+        &["-sf", "-R", "t.zip", "*", "-i", "*.txt"],
+        &["-sf", "-R", "-D", "t.zip", "*"],
+        &["-sf", "-r", "t.zip", ".", "-i", "*.txt"],
+        &["-sf", "-r", "t.zip", ".", "-i", "d/*", "-x", "*c.txt"],
+        &["-sf", "-r", "t.zip", ".", "-x", "d/*", "b*"],
+        &["-sf", "-r", "t.zip", ".", "-ws", "-x", "*.txt"],
+        &["-sf", "-r", "t.zip", ".", "-x", "d/?.txt"],
+        &["-sf", "-r", "t.zip", ".", "-x", "[a-b].txt"],
+        &["-sf", "-r", "t.zip", ".", "-x", "[!a-b].txt"],
+        &["-sf", "-r", "t.zip", ".", "-x", "[^a-b]*"],
+        &["-sf", "-r", "t.zip", ".", "-nw", "-x", "*.txt"],
+        &["-sf", "-r", "t.zip", ".", "-RE", "-x", "[a].txt"],
+        &["-sf", "-r", "t.zip", ".", "-x", "[a"],
+        &["-sf", "-r", "t.zip", ".", "-x", "[]a]*"],
+        &["-sf", "-r", "t.zip", ".", "-x", "[\\]a]*"],
+        &["-sf", "-r", "t.zip", ".", "-x", "a\\"],
+        &["-sf", "-r", "t.zip", ".", "-x", "[a-]*"],
+        &["-sf", "-r", "t.zip", ".", "-x", "[-a]*"],
+        &["-sf", "-r", "t.zip", ".", "-x", "[a-c-e]*"],
+        &["-sf", "-r", "t.zip", ".", "-x", "*.t?t"],
+        &["-sf", "-r", "t.zip", ".", "-x", "*x*t"],
+        &["-sf", "-r", "t.zip", ".", "-x", "**"],
+        &["-sf", "-r", "t.zip", ".", "-x", ""],
+        &["-sf", "-r", "t.zip", ".", "-x", "./a.txt"],
+        &["-sf", "-r", "t.zip", ".", "-x", "/a.txt"],
+        &["-sf", "-r", "t.zip", ".", "-x", "//tmp"],
+        &["-sf", "-r", "-j", "t.zip", ".", "-x", "d/c.txt"],
+        &["-sf", "-r", "-j", "t.zip", ".", "-x", "c.txt"],
+        &["-sf", "-r", "-k", "t.zip", ".", "-x", "B.TXT"],
+        &["-sf", "-r", "-k", "t.zip", ".", "-x", "b.txt"],
+        &["-sf", "t.zip", "a.txt", "-x", "a.txt"],
+        &["-sf", "t.zip", "a.txt", "-i", "b.txt"],
+        &["-sf", "-r", "t.zip", "d", "-i", "d/"],
+        &["-sf", "-r", "t.zip", "d", "-x", "d/"],
+        &["-sf", "-r", "t.zip", ".", "-x", "@nosuch"],
+        &["-sf", "-r", "t.zip", ".", "-x", "@"],
+    ] {
+        add(args, std_tree(), None);
+    }
+    // the date filters (the tree's times are 2001-09-09 01:46:40 UTC)
+    for args in [
+        &["-sf", "-t", "01012002", "t.zip", "a.txt"][..],
+        &["-sf", "-t", "01012001", "t.zip", "a.txt"],
+        &["-sf", "-t", "09092001", "t.zip", "a.txt"],
+        &["-sf", "-tt", "09092001", "t.zip", "a.txt"],
+        &["-sf", "-tt", "01012030", "t.zip", "a.txt"],
+        &[
+            "-sf",
+            "-t",
+            "2001-09-09",
+            "-tt",
+            "2001-09-10",
+            "t.zip",
+            "a.txt",
+        ],
+        &[
+            "-sf", "-r", "-t", "01012001", "-tt", "01012002", "t.zip", ".",
+        ],
+    ] {
+        add(args, std_tree(), None);
+    }
+    // links
+    let link = || std_tree().symlink("l", "a.txt");
+    let dangling = || std_tree().symlink("l", "nosuch");
+    let dir_link = || std_tree().symlink("dl", "d");
+    for (args, tree) in [
+        (&["-sf", "t.zip", "l"][..], link()),
+        (&["-sf", "-y", "t.zip", "l"][..], link()),
+        (&["-sf", "t.zip", "l", "a.txt"][..], dangling()),
+        (&["-sf", "-y", "t.zip", "l", "a.txt"][..], dangling()),
+        (&["-sf", "-r", "t.zip", "dl"][..], dir_link()),
+        (&["-sf", "-r", "-y", "t.zip", "dl"][..], dir_link()),
+        (&["-sf", "-r", "t.zip", "."][..], dangling()),
+        (&["-sf", "-r", "-y", "t.zip", "."][..], dangling()),
+        (&["-sf", "-r", "-y", "t.zip", "."][..], dir_link()),
+        (&["t.zip", "l"][..], dangling()),
+        (&["-MM", "t.zip", "l"][..], dangling()),
+    ] {
+        add(args, tree, None);
+    }
+    // special files, hidden files and unreadable ones (Review Focus 2: the
+    // scan lists a mode-000 file and says nothing; the warning is the
+    // reading's, Task 6)
+    let fifo = || std_tree().fifo("f");
+    let hidden = || std_tree().file(".hid", b"h").file("d/.h2", b"h");
+    let unreadable = || std_tree().file_mode("b.txt", vec![b'x'; 2240], 0o000);
+    for (args, tree) in [
+        (&["-sf", "t.zip", "f", "a.txt"][..], fifo()),
+        (&["-sf", "-FI", "t.zip", "f", "a.txt"][..], fifo()),
+        (&["-sf", "-FI", "-q", "t.zip", "f", "a.txt"][..], fifo()),
+        (&["-sf", "-r", "t.zip", "."][..], fifo()),
+        (&["-sf", "-r", "t.zip", "."][..], hidden()),
+        (&["-sf", "-R", "t.zip", "*"][..], hidden()),
+        (&["-sf", "-r", "t.zip", ".", "-x", ".*"][..], hidden()),
+        (
+            &["-sf", "t.zip", "a.txt", "b.txt", "d/c.txt"][..],
+            unreadable(),
+        ),
+        (&["-sf", "-r", "t.zip", "."][..], unreadable()),
+        (&["-sf", "-MM", "t.zip", "b.txt"][..], unreadable()),
+        (
+            &["-sf", "-r", "t.zip", "d"][..],
+            std_tree().dir_mode("d", 0o000),
+        ),
+        (
+            &["-sf", "-r", "t.zip", "."][..],
+            std_tree().dir_mode("d", 0o000),
+        ),
+    ] {
+        add(args, tree, None);
+    }
+    // names from standard input, and standard input as a name
+    for (args, stdin) in [
+        (&["-sf", "-@", "t.zip"][..], &b"a.txt\nd/c.txt\n"[..]),
+        (&["-sf", "-@", "t.zip", "b.txt"][..], &b"a.txt\n"[..]),
+        (&["-sf", "-@", "t.zip"][..], &b"a.txt\nnosuch\n\nb.txt"[..]),
+        (&["-sf", "-@", "-r", "t.zip"][..], &b"d\n"[..]),
+        (&["-sf", "-@", "-R", "t.zip"][..], &b"*.txt\n"[..]),
+        (&["-sf", "t.zip", "-"][..], &b"data"[..]),
+        (&["-sf", "t.zip", "-", "a.txt"][..], &b"data"[..]),
+        (&["-sf", "-x", "-", "t.zip", "-", "a.txt"][..], &b"data"[..]),
+        (
+            &["-sf", "-t", "01012030", "t.zip", "-", "a.txt"][..],
+            &b"data"[..],
+        ),
+        (&["-sf"][..], &b"data"[..]),
+        (&["-sf", "-@"][..], &b"a.txt\n"[..]),
+    ] {
+        add(args, std_tree(), Some(stdin));
+    }
+    // pattern files
+    let lists = || {
+        std_tree()
+            .file("list", b"*.txt\n")
+            .file("names", b"a.txt\nd/c.txt\n")
+    };
+    for args in [
+        &["-sf", "-r", "t.zip", ".", "-x", "@list"][..],
+        &["-sf", "-r", "t.zip", ".", "-i", "@list"],
+        &["-sf", "t.zip", "-i", "@names"],
+    ] {
+        add(args, lists(), None);
+    }
+    // names that are not plain
+    let odd = || {
+        std_tree()
+            .file_at(b"new\nline", b"x", 0o644)
+            .file_at(b"-n", b"x", 0o644)
+            .file_at(b"tab\there", b"x", 0o644)
+            .file_at(b"*", b"x", 0o644)
+            .file_at(b"sp ace", b"x", 0o644)
+    };
+    for args in [
+        &["-sf", "t.zip", "new\nline"][..],
+        &["-sf", "-r", "t.zip", "."],
+        &["-sf", "t.zip", "--", "-n"],
+        &["-sf", "t.zip", "./-n"],
+        &["-sf", "-r", "t.zip", ".", "-x", "\\*"],
+        &["-sf", "-r", "t.zip", ".", "-nw", "-x", "\\*"],
+        &["-sf", "-r", "t.zip", ".", "-nw", "-x", "*"],
+        &["-sf", "-k", "t.zip", "sp ace", "tab\there"],
+        &["-sf", "-r", "-j", "t.zip", "d", "."],
+    ] {
+        add(args, odd(), None);
+    }
+    // names the archive would store twice
+    let twins = || {
+        std_tree()
+            .dir("e")
+            .file("d/a.txt", b"x")
+            .file("e/a.txt", b"y")
+    };
+    for args in [
+        &["-sf", "-j", "t.zip", "a.txt", "d/a.txt"][..],
+        &["-sf", "-j", "t.zip", "e/a.txt", "d/a.txt", "a.txt"],
+        &[
+            "-sf", "-j", "t.zip", "d/a.txt", "e/a.txt", "d/a.txt", "a.txt", "e/a.txt",
+        ],
+        &["-sf", "-j", "-r", "t.zip", "."],
+        &["-sf", "t.zip", "a.txt", "d/a.txt", "e/a.txt"],
+        &["t.zip", "-j", "a.txt", "d/a.txt"],
+    ] {
+        add(args, twins(), None);
+    }
+    out
+}

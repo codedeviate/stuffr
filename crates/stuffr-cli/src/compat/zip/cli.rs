@@ -24,6 +24,7 @@ use std::io::{self, BufRead, Read};
 
 use super::flavour::{self, Flavour};
 use super::messages::{self as m, printf};
+use super::scan;
 use super::{Exit, Zr};
 
 // ziperr.h's ZE_* codes the front end meets.
@@ -1652,9 +1653,12 @@ pub(crate) struct Options {
     /// Whether any name or pattern came after the archive name
     /// (`first_listarg != 0`).
     pub(crate) first_listarg: i64,
-    /// `procname("-")` is still to do: no names, zip filters stdin
-    /// (Task 5/6).
+    /// No names: zip is a filter and `procname("-")` makes standard input
+    /// the one name ([`scan::collect`]).
     pub(crate) filter_mode: bool,
+    /// The arguments after the environment's were put in front (zip.c's
+    /// `args`, `argv[0]` first): `-R`'s "try: zip ..." hint repeats them.
+    pub(crate) args: Vec<Vec<u8>>,
 }
 
 impl Options {
@@ -1733,6 +1737,7 @@ impl Options {
             kk: 0,
             first_listarg: 0,
             filter_mode: false,
+            args: Vec::new(),
         }
     }
 }
@@ -1864,7 +1869,7 @@ fn show_options(z: &mut Zr, table: &[OptionSpec]) {
 /// zip.c:finish for the paths `main()` leaves through `RETURN(finish(e))`
 /// before any archive is read: `-o` finds an empty archive, so says so
 /// (`-m` has nothing to delete yet).
-fn finish(z: &mut Zr, e: i32) -> Exit {
+pub(crate) fn finish(z: &mut Zr, e: i32) -> Exit {
     if z.o.latest && z.o.zipfile.as_deref().is_some_and(|f| f != b"-") {
         z.zipwarn(m::ZIP_EMPTY_NO_LATEST.as_bytes(), b"");
     }
@@ -1891,9 +1896,17 @@ fn add_filter(z: &mut Zr, flag: u8, pattern: Vec<u8>) -> Result<(), Exit> {
         };
         let mut r = io::BufReader::new(file);
         while let Some(p) = getnam(&mut r) {
-            z.o.filters.push(Filter { flag, pattern: p });
+            let Some(pattern) = scan::ex2in(&p, z.o.pathput, z.o.dosify) else {
+                return Err(scan::crashed(z));
+            };
+            z.o.filters.push(Filter { flag, pattern });
         }
     } else {
+        // the pattern is converted as a name is (`in2ex(ex2in(...))`), with
+        // the options in force at this point of the command line
+        let Some(pattern) = scan::ex2in(&pattern, z.o.pathput, z.o.dosify) else {
+            return Err(scan::crashed(z));
+        };
         z.o.filters.push(Filter { flag, pattern });
     }
     Ok(())
@@ -1946,6 +1959,7 @@ pub(crate) fn parse_zip(z: &mut Zr, argv0: &[u8], rest: &[Vec<u8>]) -> Result<()
     }
     // get options from the environment
     let mut args = envargs(args, z.env, "ZIPOPT", "ZIP");
+    z.o.args = args.clone();
 
     let mut st = GetOpt::new();
     loop {
@@ -2541,7 +2555,7 @@ fn checks(z: &mut Zr) -> Result<(), Exit> {
     // no names: zip is used as a filter, on standard input
     if z.o.kk < 3 {
         zipstdout(z)?;
-        // procname("-"): Task 5 adds standard input as the one name
+        // procname("-"): `scan::collect` makes standard input the one name
         z.o.filter_mode = true;
         z.o.kk = 4;
         if z.o.names_from_stdin {
