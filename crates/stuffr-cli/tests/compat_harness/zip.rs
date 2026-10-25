@@ -7,7 +7,7 @@
 //! The measurements behind every rule here are in
 //! `~/Development/Thomas/superpowers/stuffr/upstream/zip-measurements.md`.
 
-use super::unzip::{mask_compiled_with, mask_work};
+use super::unzip::{ZipKeys, mask_compiled_with, mask_work};
 use super::*;
 
 /// The Ubuntu reference: apt's `zip` on ubuntu 24.04 (`dpkg-query -W -f
@@ -453,8 +453,12 @@ pub fn mask_temp_names(text: &[u8]) -> Vec<u8> {
 
 /// [`mask_zip_banners`], [`mask_temp_names`], then for the Apple flavour
 /// the `Compiled with ... on <date>.` line of `-v` (another macOS ships
-/// another build, as for unzip's P41).
+/// another build, as for unzip's P41). An output that [`looks_like_zip`]
+/// is an archive, not text: returned unchanged.
 pub fn mask_zip_output(text: &[u8], ours: Option<&str>, apple: bool) -> Vec<u8> {
+    if looks_like_zip(text) {
+        return text.to_vec();
+    }
     let masked = mask_temp_names(&mask_zip_banners(text, ours));
     if apple {
         mask_compiled_with(&masked)
@@ -577,7 +581,8 @@ fn archive_name(name: &[u8]) -> bool {
 pub struct ZipRun {
     pub code: i32,
     pub stdout: Vec<u8>,
-    pub stderr: String,
+    /// Bytes, compared byte for byte (rendered lossily only in messages).
+    pub stderr: Vec<u8>,
     /// The work directory afterwards (a temporary file's name masked as
     /// `zi??????`).
     pub tree: UnzipTree,
@@ -599,9 +604,10 @@ fn zip_run(exe: &Path, c: &Case, stuffr_side: bool) -> ZipRun {
     let Spawned {
         code,
         stdout,
-        stderr,
+        stderr_bytes,
         start,
         tty_mode,
+        ..
     } = spawn_case(exe, &s, c, stuffr_side);
     let end = now_secs();
     let work = s.0.join("work");
@@ -624,7 +630,7 @@ fn zip_run(exe: &Path, c: &Case, stuffr_side: bool) -> ZipRun {
     ZipRun {
         code,
         stdout: mask_work(&normalise_path_bytes(&stdout, exe, c.name), &dirs),
-        stderr: String::from_utf8_lossy(&mask_work(stderr.as_bytes(), &dirs)).into_owned(),
+        stderr: mask_work(&stderr_bytes, &dirs),
         tree,
         start,
         end,
@@ -672,8 +678,8 @@ pub fn zip_differences(c: &Case, r: &ZipRun, s: &ZipRun) -> Vec<String> {
         ));
     }
     let (re, se) = (
-        mask_zip_output(r.stderr.as_bytes(), None, apple),
-        mask_zip_output(s.stderr.as_bytes(), c.zip_flavour, apple),
+        mask_zip_output(&r.stderr, None, apple),
+        mask_zip_output(&s.stderr, c.zip_flavour, apple),
     );
     if re != se {
         d.push(format!(
@@ -792,49 +798,13 @@ pub fn zip_reference(c: &Case) -> Option<ZipRun> {
 
 // ---- Encrypted archives ----
 
-/// The key schedule of traditional PKWARE encryption (APPNOTE 6.1.5).
-struct Keys([u32; 3]);
-
-impl Keys {
-    fn new(password: &[u8]) -> Self {
-        let mut k = Keys([0x1234_5678, 0x2345_6789, 0x3456_7890]);
-        for &p in password {
-            k.update(p);
-        }
-        k
-    }
-    fn update(&mut self, p: u8) {
-        let k = &mut self.0;
-        k[0] = crc32_byte(k[0], p);
-        k[1] = k[1]
-            .wrapping_add(k[0] & 0xff)
-            .wrapping_mul(134_775_813)
-            .wrapping_add(1);
-        k[2] = crc32_byte(k[2], (k[1] >> 24) as u8);
-    }
-    fn stream_byte(&self) -> u8 {
-        let t = (self.0[2] | 2) & 0xffff;
-        ((t.wrapping_mul(t ^ 1) >> 8) & 0xff) as u8
-    }
-    fn decrypt(&mut self, c: u8) -> u8 {
-        let p = c ^ self.stream_byte();
-        self.update(p);
-        p
-    }
-    fn encrypt(&mut self, p: u8) -> u8 {
-        let c = p ^ self.stream_byte();
-        self.update(p);
-        c
-    }
-}
-
 /// `body` encrypted with traditional PKWARE encryption under `password`,
 /// after the 12-byte header `head` + `check` (as zip writes it: ten random
 /// bytes in zip's own header, the last two its check). Unlike
 /// [`zipcrypto`], the header bytes are the caller's, so two archives that
 /// differ only by them can be built.
 pub fn zipcrypto_with(password: &[u8], head: [u8; 11], check: u8, body: &[u8]) -> Vec<u8> {
-    let mut k = Keys::new(password);
+    let mut k = ZipKeys::new(password);
     head.iter()
         .chain(std::iter::once(&check))
         .chain(body)
@@ -962,7 +932,7 @@ fn decrypted_view(b: &[u8], pw: &[u8]) -> Result<Vec<u8>, String> {
                 String::from_utf8_lossy(&e.name)
             ));
         }
-        let mut k = Keys::new(pw);
+        let mut k = ZipKeys::new(pw);
         let plain: Vec<u8> = data.iter().map(|&c| k.decrypt(c)).collect();
         let check = if e.flags & 8 != 0 {
             b[lh + 11]

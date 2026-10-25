@@ -1311,6 +1311,9 @@ struct Spawned {
     stdout: Vec<u8>,
     /// Normalised ([`normalise_stderr`]).
     stderr: String,
+    /// The same, as bytes ([`normalise_path_bytes`]; nothing replaced by
+    /// U+FFFD).
+    stderr_bytes: Vec<u8>,
     /// Unix seconds before the inputs were created.
     start: i64,
     /// With [`Case::tty_ctl`]: whether the controlling terminal had echo
@@ -1641,6 +1644,7 @@ fn spawn_case(exe: &Path, s: &Scratch, c: &Case, stuffr_side: bool) -> Spawned {
     let stderr_raw = err_t.map(|t| t.join().unwrap()).unwrap_or_default();
 
     let stderr = normalise_stderr(&stderr_raw, exe, c.name);
+    let stderr_bytes = normalise_path_bytes(&stderr_raw, exe, c.name);
 
     let code = status
         .code()
@@ -1649,6 +1653,7 @@ fn spawn_case(exe: &Path, s: &Scratch, c: &Case, stuffr_side: bool) -> Spawned {
         code,
         stdout,
         stderr,
+        stderr_bytes,
         start,
         tty_mode,
     }

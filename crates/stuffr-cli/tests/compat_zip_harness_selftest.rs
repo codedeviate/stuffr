@@ -48,7 +48,7 @@ mod unix {
         ZipRun {
             code: 0,
             stdout: stdout.to_vec(),
-            stderr: stderr.to_owned(),
+            stderr: stderr.as_bytes().to_vec(),
             tree,
             start: 1_800_000_000,
             end: 1_800_000_001,
@@ -100,6 +100,19 @@ mod unix {
                 "stdout differs (first difference at offset 36, local header at 0, +36)"
             ),
             "{d:#?}"
+        );
+    }
+
+    #[test]
+    fn an_archive_on_stdout_is_not_masked_as_text() {
+        // a temp-like name and a banner line inside archive bytes stay as
+        // they are
+        let mut a = b"PK\x03\x04 zi123456 ".to_vec();
+        a.extend_from_slice(b"Zip 3.0 (July 5th 2008). Usage:\n");
+        assert_eq!(mask_zip_output(&a, None, true), a);
+        assert_eq!(
+            mask_zip_output(b"x zi123456 y", None, false),
+            b"x zi?????? y".to_vec()
         );
     }
 

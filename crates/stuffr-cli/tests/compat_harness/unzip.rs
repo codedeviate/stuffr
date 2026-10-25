@@ -387,6 +387,7 @@ fn unzip_run(exe: &Path, c: &Case, stuffr_side: bool) -> UnzipRun {
         stderr,
         start,
         tty_mode,
+        ..
     } = spawn_case(exe, &s, c, stuffr_side);
     let work = s.0.join("work");
     let mut dirs = vec![work.as_os_str().as_bytes().to_vec()];
@@ -754,30 +755,53 @@ pub fn crc32_byte(crc: u32, b: u8) -> u32 {
 /// fixed, so the archive is deterministic. Store it with flag bit 0 and
 /// `stored_data`.
 pub fn zipcrypto(password: &[u8], check: u8, body: &[u8]) -> Vec<u8> {
-    let mut k = [0x1234_5678u32, 0x2345_6789, 0x3456_7890];
-    let update = |k: &mut [u32; 3], p: u8| {
+    let mut k = ZipKeys::new(password);
+    b"stuffr-hdr!"
+        .iter()
+        .chain(std::iter::once(&check))
+        .chain(body)
+        .map(|&p| k.encrypt(p))
+        .collect()
+}
+
+/// The key schedule of traditional PKWARE encryption (APPNOTE 6.1.5),
+/// shared by the unzip and zip harnesses.
+pub struct ZipKeys([u32; 3]);
+
+impl ZipKeys {
+    /// The keys after `password`.
+    pub fn new(password: &[u8]) -> Self {
+        let mut k = ZipKeys([0x1234_5678, 0x2345_6789, 0x3456_7890]);
+        for &p in password {
+            k.update(p);
+        }
+        k
+    }
+    fn update(&mut self, p: u8) {
+        let k = &mut self.0;
         k[0] = crc32_byte(k[0], p);
         k[1] = k[1]
             .wrapping_add(k[0] & 0xff)
             .wrapping_mul(134_775_813)
             .wrapping_add(1);
         k[2] = crc32_byte(k[2], (k[1] >> 24) as u8);
-    };
-    for &p in password {
-        update(&mut k, p);
     }
-    let mut plain = b"stuffr-hdr!".to_vec();
-    plain.push(check);
-    plain.extend_from_slice(body);
-    plain
-        .into_iter()
-        .map(|p| {
-            let t = (k[2] | 2) & 0xffff;
-            let c = p ^ ((t.wrapping_mul(t ^ 1) >> 8) & 0xff) as u8;
-            update(&mut k, p);
-            c
-        })
-        .collect()
+    fn stream_byte(&self) -> u8 {
+        let t = (self.0[2] | 2) & 0xffff;
+        ((t.wrapping_mul(t ^ 1) >> 8) & 0xff) as u8
+    }
+    /// One plain byte from cipher byte `c`.
+    pub fn decrypt(&mut self, c: u8) -> u8 {
+        let p = c ^ self.stream_byte();
+        self.update(p);
+        p
+    }
+    /// One cipher byte from plain byte `p`.
+    pub fn encrypt(&mut self, p: u8) -> u8 {
+        let c = p ^ self.stream_byte();
+        self.update(p);
+        c
+    }
 }
 
 /// One central directory header, every field settable: what zipinfo

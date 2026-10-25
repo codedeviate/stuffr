@@ -67,30 +67,10 @@ mod unix {
         ])
     }
 
-    /// One step of the keys `zipcrypto` encrypts with.
-    fn update(k: &mut [u32; 3], p: u8) {
-        k[0] = crc32_byte(k[0], p);
-        k[1] = k[1]
-            .wrapping_add(k[0] & 0xff)
-            .wrapping_mul(134_775_813)
-            .wrapping_add(1);
-        k[2] = crc32_byte(k[2], (k[1] >> 24) as u8);
-    }
-
     /// The header's last byte decrypted with `password` (testkey's check).
     fn check_under(password: &[u8], header: &[u8]) -> u8 {
-        let mut k = [0x1234_5678u32, 0x2345_6789, 0x3456_7890];
-        for &p in password {
-            update(&mut k, p);
-        }
-        let mut last = 0;
-        for &c in &header[..12] {
-            let t = (k[2] | 2) & 0xffff;
-            let p = c ^ ((t.wrapping_mul(t ^ 1) >> 8) & 0xff) as u8;
-            update(&mut k, p);
-            last = p;
-        }
-        last
+        let mut k = ZipKeys::new(password);
+        header[..12].iter().fold(0, |_, &c| k.decrypt(c))
     }
 
     /// Review Focus 4's last shape: a wrong password whose header check

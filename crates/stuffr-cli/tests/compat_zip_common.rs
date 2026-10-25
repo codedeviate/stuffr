@@ -61,8 +61,10 @@ mod unix {
         code: i32,
         /// Text its standard output holds (`""`: nothing is checked).
         stdout_contains: &'static str,
-        /// Its standard error, exactly.
+        /// Its standard error, exactly (or, with `stderr_contains`, a text
+        /// it holds).
         stderr: &'static str,
+        stderr_contains: bool,
     }
 
     impl Row {
@@ -84,6 +86,12 @@ mod unix {
 
         fn env(mut self, env: &[(&'static str, &'static str)]) -> Row {
             self.env = env.to_vec();
+            self
+        }
+
+        /// Check only that standard error holds the recorded text.
+        fn stderr_contains(mut self) -> Row {
+            self.stderr_contains = true;
             self
         }
 
@@ -117,6 +125,7 @@ mod unix {
             code,
             stdout_contains,
             stderr,
+            stderr_contains: false,
         }
     }
 
@@ -350,7 +359,9 @@ mod unix {
                 "test of t.zip FAILED\n\nzip error: Zip file invalid, could not spawn unzip, or wrong unzip (original files unmodified)\n", ""),
             row(Ubuntu, 7, "-TT test fails (double free)", "zip", &["-T", "-TT", "false", "t.zip", "a.txt"], 5,
                 "test of t.zip FAILED\n\nzip error: Zip file invalid, could not spawn unzip, or wrong unzip (original files unmodified)\n\n",
-                "free(): double free detected in tcache 2\n"),
+                // glibc's wording may differ on CI's x86_64
+                "double free"
+            ).stderr_contains(),
             row(Apple, 7, "-TT with {}", "zip", &["-T", "-TT", "true {}", "t.zip", "a.txt"], 16,
                 "\nzip error: Invalid command arguments ({} in -TT not supported)\n", ""),
             row(Ubuntu, 7, "-TT through a shell", "zip", &["-T", "-TT", "true {}", "t.zip", "a.txt"], 0,
@@ -458,9 +469,16 @@ mod unix {
             };
             ran += 1;
             let stdout = String::from_utf8_lossy(&mask_temp_names(&run.stdout)).into_owned();
-            let stderr =
-                String::from_utf8_lossy(&mask_temp_names(run.stderr.as_bytes())).into_owned();
-            if run.code != r.code || !stdout.contains(r.stdout_contains) || stderr != r.stderr {
+            let stderr = mask_temp_names(&run.stderr);
+            let stderr_ok = if r.stderr_contains {
+                stderr
+                    .windows(r.stderr.len())
+                    .any(|w| w == r.stderr.as_bytes())
+            } else {
+                stderr == r.stderr.as_bytes()
+            };
+            let stderr = String::from_utf8_lossy(&stderr);
+            if run.code != r.code || !stdout.contains(r.stdout_contains) || !stderr_ok {
                 bad.push(format!(
                     "{} ({} {:?}): recorded exit {}, stdout holding {:?}, stderr {:?};\n  \
                      the reference gave exit {}\n  stdout {:?}\n  stderr {:?}",
