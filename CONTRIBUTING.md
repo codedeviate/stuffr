@@ -24,13 +24,13 @@ brew install gnu-tar cpio binutils
 ```
 
 - GNU tar is found as `gtar` on `PATH` (the formula puts it there). Besides
-  the catalogues, the GNU sparse and pax tests in `tar.rs` and `cli.rs`
+  the catalogues, the GNU sparse and pax tests in `tar.rs` and the `cli/` tests
   (0.8.1) need it: they write archives with GNU-only flags
   (`--sparse --hole-detection=raw`, `--format=pax`) that bsdtar rejects.
 - GNU cpio and GNU ar are keg-only and on `PATH` under no name, so the tests
   look for them at fixed paths: `/opt/homebrew/opt/cpio/bin/cpio` and
   `/opt/homebrew/opt/binutils/bin/ar`. The GNU `ar` symbol-table tests (in
-  `ar.rs`, `ar_salvage.rs` and `cli.rs`) also need a C compiler (`cc`,
+  `ar.rs`, `ar_salvage.rs` and the `cli/` tests) also need a C compiler (`cc`,
   from the Xcode command-line tools).
 - **From 0.12.0 the gzip suites also use two keg-only tools,** addressed by
   path and never put on `PATH`: GNU gzip (`brew install gzip`,
@@ -1127,7 +1127,7 @@ Adding a family touches these places, and the tests fail if one is missed:
   attribution and the family's list of known deviations. **`messages.rs`**
   beside it holds every string verbatim from the reference source, each
   commented with the function it comes from.
-- **The lint exemption.** `cli.rs`'s
+- **The lint exemption.** The `cli/` tests'
   `no_message_literal_in_the_workspace_carries_a_run_of_collapsed_indentation`
   skips exactly `src/compat/<family>/messages.rs`, matched by whole path
   components (`is_verbatim_reference_messages`), because that file is

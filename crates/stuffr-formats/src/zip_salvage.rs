@@ -213,7 +213,7 @@
 //!
 //! # Cross-checked against Info-Zip's `zip -FF` (Task 7)
 //!
-//! `crates/stuffr-cli/tests/cli.rs`'s damage catalogue (Task 7, Step 2) builds
+//! `crates/stuffr-cli/tests/cli/`'s damage catalogue (Task 7, Step 2) builds
 //! one real, undamaged three-entry archive with the SYSTEM `zip` binary (never
 //! this project's own writer), damages it in the shapes this module's
 //! [`SalvageStatus`] tiers exist to describe, and — for the external-witness

@@ -58,7 +58,7 @@ const ZIP: FormatId = FormatId::new("zip");
 /// The path to the compiled `stuffr` binary.
 ///
 /// The task brief that seeded this file assumed `env!("CARGO_BIN_EXE_stuffr")`
-/// would resolve it, the way `stuffr-cli/tests/cli.rs` does. Confirmed by
+/// would resolve it, the way `stuffr-cli/tests/cli/common.rs` does. Confirmed by
 /// trying it: that only works for a crate's OWN `[[bin]]` target — Cargo does
 /// NOT propagate `CARGO_BIN_EXE_<name>` across a dev-dependency edge (even
 /// after declaring one on `stuffr-cli` here, the variable stayed undefined at
@@ -195,7 +195,7 @@ impl Drop for Scratch {
 }
 
 /// Restores user rwx on every directory under `p`, never following symlinks.
-// keep in sync with the copies in tests/cli.rs, compat_harness/mod.rs (stuffr-cli),
+// keep in sync with the copies in tests/cli/common.rs, compat_harness/mod.rs (stuffr-cli),
 // src/compat/compress/test_scratch.rs (stuffr-cli), tests/zip_on_a_pipe.rs (stuffr-formats),
 // tests/common/mod.rs and src/entries.rs (stuffr)
 #[cfg(unix)]

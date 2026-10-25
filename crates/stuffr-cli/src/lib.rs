@@ -1,6 +1,6 @@
 //! Library surface behind the `stuffr` binary.
 //!
-//! Two reasons it exists. [`cli::Cli`] is here so `tests/cli.rs` can
+//! Two reasons it exists. [`cli::Cli`] is here so `tests/cli/` can
 //! introspect it through `clap::CommandFactory`: the examples page's test
 //! asserts every flag and subcommand clap knows about is mentioned on the
 //! page, and doing that against the real `Cli` (rather than a hand-copied

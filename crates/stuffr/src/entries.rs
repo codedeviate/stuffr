@@ -766,7 +766,7 @@ pub fn test(src: Input, max_ratio: u64, memory_limit: Option<u64>) -> Result<Out
     // inspect an UNTRUSTED archive, so it must be the strictest of the
     // three, not the only unbounded one.
     // `every_entry_aware_verb_applies_the_same_expansion_bound` in
-    // `crates/stuffr-cli/tests/cli.rs` pins the parity, and
+    // `crates/stuffr-cli/tests/cli/` pins the parity, and
     // `a_piped_archive_larger_than_the_ratio_floor_is_not_refused` pins that
     // the bound this gained does not refuse ordinary piped archives.
     let mut budget = ArchiveBudget::new(compressed_total, max_ratio).tracking(consumed);

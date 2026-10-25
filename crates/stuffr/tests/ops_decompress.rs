@@ -76,7 +76,7 @@ fn round_trips_byte_identically() {
 // the real `stuffr` binary with a piped stdin — a separate OS process, safe to
 // redirect — is the honest way to exercise that path, and
 // `info_over_a_pipe_reports_forward_only_not_exact` in
-// `crates/stuffr-cli/tests/cli.rs` already does exactly that for `inspect`
+// `crates/stuffr-cli/tests/cli/` already does exactly that for `inspect`
 // (and `pack_over_a_pipe_reports_forward_only_not_exact` does the same for
 // `compress`). So: renamed to describe only what it actually checks, rather
 // than implying pipe coverage that belongs — and lives — one layer up.

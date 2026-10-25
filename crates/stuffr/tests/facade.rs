@@ -59,7 +59,7 @@ fn facade_reexports_core_version() {
 /// exemption meant to expose it, and pass on every leg forever.
 ///
 /// `cfg!(feature = ...)` rather than a live-registry witness, which is what
-/// `stuffr-cli`'s tests have to use (see `crates/stuffr-cli/tests/cli.rs`):
+/// `stuffr-cli`'s tests have to use (see `crates/stuffr-cli/tests/cli/`):
 /// THIS crate is the one that declares the features, so it can ask the
 /// question directly, and a misspelled FEATURE name is a `cargo` check-cfg
 /// warning — which `-D warnings` turns into a build failure — rather than a
