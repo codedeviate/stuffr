@@ -448,6 +448,18 @@ read list.
 > no temporary file. **3159** tests under `--all-features`, **3046** on the
 > default tier — measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
+> `0.18.2` is a PATCH of follow-ups from 0.16.0, 0.18.0 and 0.18.1. One
+> user-visible change: a shrink- or implode-method zip DIRECTORY entry that
+> declares no content but carries compressed bytes is now refused on read
+> (exit 5), as the same entry stored is; it used to read as empty. The
+> compat families' signal re-raise resets with `sigaction`; nothing else a
+> user can see changes. New tests cover compress's read-error rule (A4) end
+> to end, bench with no input, and an unzip short filename read; the unzip
+> ruling pins now run on Linux too; the compress interrupt tests skip when
+> the reference hangs; `tests/cli.rs` is now `tests/cli/`.
+> **3165** tests under `--all-features`, **3052** on the default tier —
+> measured from this bump's own `make check`, `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
