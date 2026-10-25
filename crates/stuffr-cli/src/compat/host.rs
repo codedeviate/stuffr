@@ -1415,7 +1415,7 @@ pub struct InputReads {
     pub bytes: u64,
     /// The largest length the file had at an open.
     pub len: u64,
-    /// Test builds only: reads fail with `EIO` once this many bytes have
+    /// Test builds only: reads fail with `EIO` (a generic error off unix) once this many bytes have
     /// been read (a read never crosses it). Not compiled otherwise.
     #[cfg(test)]
     pub fail_after: Option<u64>,
@@ -1471,7 +1471,10 @@ impl Read for InFile {
                 {
                     let (fail_after, bytes) = limit;
                     if bytes >= fail_after {
+                        #[cfg(unix)]
                         return Err(io::Error::from_raw_os_error(libc::EIO));
+                        #[cfg(not(unix))]
+                        return Err(io::Error::other("injected read fault"));
                     }
                     let room = usize::try_from(fail_after - bytes).unwrap_or(usize::MAX);
                     let cut = buf.len().min(room);
