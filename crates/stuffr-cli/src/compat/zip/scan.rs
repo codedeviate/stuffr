@@ -714,11 +714,54 @@ fn filetime(z: &Zr, name: &[u8]) -> Option<(UnixMeta, u64, Option<u64>, FoundKin
 fn qsort(f: flavour::Flavour, v: &mut [usize], cmp: &dyn Fn(usize, usize) -> std::cmp::Ordering) {
     match f {
         flavour::Flavour::Ubuntu => v.sort_by(|&a, &b| cmp(a, b)),
+        #[cfg(target_os = "macos")]
+        flavour::Flavour::Apple => macos_qsort(v, cmp),
+        #[cfg(not(target_os = "macos"))]
         flavour::Flavour::Apple => bsd_qsort(v, cmp),
     }
 }
 
+/// The platform's own `qsort_r` (ruling Z12): on macOS the Apple flavour
+/// sorts exactly as the reference does.
+#[cfg(target_os = "macos")]
+fn macos_qsort(v: &mut [usize], cmp: &dyn Fn(usize, usize) -> std::cmp::Ordering) {
+    type Cmp<'a> = &'a dyn Fn(usize, usize) -> std::cmp::Ordering;
+    extern "C" fn shim(
+        thunk: *mut libc::c_void,
+        a: *const libc::c_void,
+        b: *const libc::c_void,
+    ) -> libc::c_int {
+        // SAFETY: `thunk` is the `&Cmp` made below, alive for the whole
+        // `qsort_r` call; `a` and `b` point at two `usize` elements of `v`.
+        let (cmp, a, b) = unsafe {
+            (
+                &*(thunk as *const Cmp),
+                *(a as *const usize),
+                *(b as *const usize),
+            )
+        };
+        match cmp(a, b) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        }
+    }
+    let mut thunk: Cmp = cmp;
+    // SAFETY: `v` is a valid slice of `usize`; `shim` reads only elements of
+    // it and the thunk, both live for the call; Apple's argument order.
+    unsafe {
+        libc::qsort_r(
+            v.as_mut_ptr().cast(),
+            v.len(),
+            std::mem::size_of::<usize>(),
+            (&mut thunk as *mut Cmp).cast(),
+            Some(shim),
+        );
+    }
+}
+
 // port: FreeBSD libc stdlib/qsort.c (the algorithm of Apple's libc)
+#[cfg_attr(target_os = "macos", allow(dead_code))] // tests only there
 fn bsd_qsort(mut a: &mut [usize], cmp: &dyn Fn(usize, usize) -> std::cmp::Ordering) {
     use std::cmp::Ordering::{Equal, Greater, Less};
     let c = |x: usize, y: usize| -> i32 {

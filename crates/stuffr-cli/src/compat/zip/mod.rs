@@ -75,10 +75,11 @@
 //!    9. stuffr gives that answer without the dereference (as for 6), also
 //!    for an `-i`/`-x`/`-R` pattern of that shape. The order of two equal
 //!    names in the found list follows each libc's `qsort` (Ubuntu's stable
-//!    merge sort, Apple's BSD quicksort ported in `scan.rs`); the port
-//!    orders 6 of 4000 random arrays with many equal keys differently from
-//!    macOS (a known gap: which of two equal names is dropped, when the
-//!    same operand is given twice among many).
+//!    merge sort; Apple's, on macOS, the platform's own `qsort_r`, and off
+//!    macOS a BSD quicksort ported in `scan.rs`). Off macOS the port orders
+//!    6 of 4000 random arrays with many equal keys differently from macOS
+//!    (a known gap: which of two equal names is dropped, when the same
+//!    operand is given twice among many).
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};

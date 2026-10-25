@@ -290,10 +290,13 @@ pub fn snapshot_unzip_tree(root: &Path, exclude: &[&str]) -> UnzipTree {
 
 fn walk_unzip(root: &Path, dir: &Path, exclude: &[&str], t: &mut UnzipTree) {
     use std::os::unix::ffi::OsStrExt;
-    // a directory the tree made unreadable (mode 000, for the zip suites)
-    // is a node with its mode and no children
-    let Ok(rd) = fs::read_dir(dir) else {
-        return;
+    // a directory below the root that the tree made unreadable (mode 000,
+    // for the zip suites) is a node with its mode and no children; any
+    // other failure, or one at the root, is a harness failure
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && dir != root => return,
+        Err(e) => panic!("read_dir {}: {e}", dir.display()),
     };
     let mut entries: Vec<PathBuf> = rd.map(|e| e.unwrap().path()).collect();
     entries.sort_by(|a, b| a.as_os_str().as_bytes().cmp(b.as_os_str().as_bytes()));

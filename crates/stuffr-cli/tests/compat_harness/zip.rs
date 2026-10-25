@@ -1150,6 +1150,20 @@ pub fn zip_scan_matrix(flavour: &'static str) -> Vec<Case<'static>> {
         (&["-sf", "-r", "t.zip", "."][..], dangling()),
         (&["-sf", "-r", "-y", "t.zip", "."][..], dangling()),
         (&["-sf", "-r", "-y", "t.zip", "."][..], dir_link()),
+        // a link up the tree: followed until the kernel says ELOOP (or the
+        // path is too long), a leaf under -y
+        (
+            &["-sf", "-r", "t.zip", "d"][..],
+            std_tree().symlink("d/up", ".."),
+        ),
+        (
+            &["-sf", "-r", "-y", "t.zip", "d"][..],
+            std_tree().symlink("d/up", ".."),
+        ),
+        (
+            &["-sf", "-r", "-j", "t.zip", "."][..],
+            std_tree().symlink("d/self", "."),
+        ),
         (&["t.zip", "l"][..], dangling()),
         (&["-MM", "t.zip", "l"][..], dangling()),
     ] {

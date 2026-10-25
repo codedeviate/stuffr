@@ -286,3 +286,48 @@ fn the_bsd_qsort_matches_macos_on_recorded_arrays() {
         assert_eq!(sorted_by_key(keys), want, "{keys:?}");
     }
 }
+
+struct Scratch(std::path::PathBuf);
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A tree as deep as the system lets a path be (up to 1500 single-letter
+/// levels; macOS stops near 500, Linux near 2000) is walked on a thread
+/// with the default 2 MiB stack, in a debug build, without overflowing.
+#[test]
+fn a_very_deep_tree_does_not_overflow_the_stack() {
+    let root =
+        Scratch(std::env::temp_dir().join(format!("stuffr-zipscan-{}-deep", std::process::id())));
+    let _ = std::fs::remove_dir_all(&root.0);
+    std::fs::create_dir_all(&root.0).unwrap();
+    let mut rel = std::path::PathBuf::new();
+    let mut levels = 0;
+    for _ in 0..1500 {
+        rel.push("d");
+        if std::fs::create_dir(root.0.join(&rel)).is_err() {
+            break;
+        }
+        levels += 1;
+    }
+    assert!(levels > 200, "only {levels} levels");
+    let dir = root.0.clone();
+    let h = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            let args = ["-sf", "-r", "t.zip", "d"]
+                .map(std::ffi::OsString::from)
+                .to_vec();
+            super::super::run_in(&dir, "zip", args, b"", flavour::Flavour::Ubuntu)
+        })
+        .unwrap();
+    let (code, out, _) = h.join().expect("the walk overflowed or panicked");
+    assert_eq!(code, 0);
+    assert!(
+        String::from_utf8_lossy(&out).contains("Total "),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+}
