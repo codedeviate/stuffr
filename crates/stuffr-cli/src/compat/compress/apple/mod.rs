@@ -241,6 +241,73 @@ mod tests {
         assert_eq!(std::fs::read_dir(&*d).unwrap().count(), 1);
     }
 
+    /// Deviation A4 at run level: a read error part-way through the `.Z`
+    /// (EIO injected after `n` bytes) is not the end of the stream. Apple's
+    /// stdio would take it for EOF and lose the input; stuffr warns with
+    /// the file name and `strerror`, exits 1, keeps the `.Z` and publishes
+    /// no output. `-c` takes the same branch (the output is only standard
+    /// output, which gets whatever was decoded before the error).
+    #[test]
+    fn a4_a_read_error_mid_file_keeps_the_input() {
+        use crate::compat::host::{Host, InputReads, Sandbox};
+        use std::sync::atomic::AtomicU64;
+        use std::sync::{Arc, Mutex};
+
+        let d = scratch("a4");
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let data: Vec<u8> = (0..200_000)
+            .map(|i| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                b"abcdefgh"[(x >> 40) as usize % 8] ^ (i / 50_000) as u8
+            })
+            .collect();
+        let (code, z, err) = run(&d, "compress", &[], &data);
+        assert_eq!(code, 0, "{err}");
+        assert!(z.len() >= 64 << 10, "fixture too small: {}", z.len());
+        std::fs::write(d.join("a.Z"), &z).unwrap();
+        for cat in [false, true] {
+            for n in [0u64, 4096, 20_000] {
+                let reads = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+                reads.lock().unwrap().insert(
+                    d.join("a.Z"),
+                    InputReads {
+                        fail_after: Some(n),
+                        ..Default::default()
+                    },
+                );
+                let mut host = Host::Sandbox(Sandbox {
+                    dir: d.to_path_buf(),
+                    stdin: Some(Vec::new()),
+                    stdout: Arc::new(Mutex::new(Vec::new())),
+                    budget: Arc::new(AtomicU64::new(u64::MAX)),
+                    reads,
+                });
+                let args: Vec<OsString> = if cat {
+                    vec!["-c".into(), "a.Z".into()]
+                } else {
+                    vec!["a.Z".into()]
+                };
+                let mut err = Vec::new();
+                let code = super::main("uncompress", b"uncompress", &args, &mut host, &mut err);
+                let err = String::from_utf8(err).unwrap();
+                let ctx = format!("cat={cat} n={n}: {err}");
+                assert_eq!(code, 1, "{ctx}");
+                // Before the header is whole, a failed read is Apple's own
+                // short-header answer (EFTYPE), not the A4 branch.
+                let text = if n == 0 {
+                    "Inappropriate file type or format"
+                } else {
+                    "Input/output error"
+                };
+                assert!(err.contains("a.Z") && err.contains(text), "{ctx}");
+                assert_eq!(std::fs::read(d.join("a.Z")).unwrap(), z, "{ctx}");
+                assert!(!d.join("a").exists(), "{ctx}");
+            }
+        }
+    }
+
     /// Deviation A2 in the sandbox: a hard link `f.Z` to `f` and `-f`.
     #[cfg(unix)]
     #[test]

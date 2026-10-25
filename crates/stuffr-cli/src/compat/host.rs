@@ -1398,6 +1398,10 @@ pub struct InputReads {
     pub bytes: u64,
     /// The largest length the file had at an open.
     pub len: u64,
+    /// Test builds only: reads fail with `EIO` once this many bytes have
+    /// been read (a read never crosses it). Not compiled otherwise.
+    #[cfg(test)]
+    pub fail_after: Option<u64>,
 }
 
 /// A sandboxed run's [`InputReads`], by the path opened.
@@ -1439,6 +1443,26 @@ impl std::ops::Deref for InFile {
 
 impl Read for InFile {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        #[cfg(test)]
+        let buf = {
+            let mut buf = buf;
+            if let Some((log, path)) = &self.log {
+                let log = log.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(limit) = log
+                    .get(path)
+                    .and_then(|r| r.fail_after.map(|f| (f, r.bytes)))
+                {
+                    let (fail_after, bytes) = limit;
+                    if bytes >= fail_after {
+                        return Err(io::Error::from_raw_os_error(libc::EIO));
+                    }
+                    let room = usize::try_from(fail_after - bytes).unwrap_or(usize::MAX);
+                    let cut = buf.len().min(room);
+                    buf = &mut buf[..cut];
+                }
+            }
+            buf
+        };
         let n = self.file.read(buf)?;
         if let Some((log, path)) = &self.log {
             let mut log = log.lock().unwrap_or_else(|p| p.into_inner());

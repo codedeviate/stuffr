@@ -69,6 +69,7 @@ fn run(d: &Dir, args: &[&str]) -> (i32, String, String, crate::compat::host::Inp
                 opens: a.opens + r.opens,
                 bytes: a.bytes + r.bytes,
                 len: a.len.max(r.len),
+                ..Default::default()
             }
         });
     (

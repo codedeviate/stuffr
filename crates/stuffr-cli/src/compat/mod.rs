@@ -526,7 +526,8 @@ mod tests {
             InputReads {
                 opens: 1,
                 bytes: 18,
-                len: 18
+                len: 18,
+                ..Default::default()
             }
         );
         let zst = std::fs::metadata(dir.join("a.zst")).unwrap().len();
@@ -538,7 +539,8 @@ mod tests {
             InputReads {
                 opens: 1,
                 bytes: 17,
-                len: 17
+                len: 17,
+                ..Default::default()
             }
         );
         assert_eq!(reads[&dir.join("a.zst")].len, zst);
@@ -549,7 +551,8 @@ mod tests {
             InputReads {
                 opens: 1,
                 bytes: 2,
-                len: 2
+                len: 2,
+                ..Default::default()
             }
         );
         assert_eq!(reads[&dir.join("a")].opens, 1);
