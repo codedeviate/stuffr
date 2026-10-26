@@ -1633,6 +1633,10 @@ pub(crate) fn publish(tmp: &Path, out: &Path, force: bool) -> io::Result<Publish
 /// else changes (a trailing `/`, `.`, `//` and `a..b` stay as they are): the
 /// system then answers `a/` and `a//b` exactly as for a real run. Everything
 /// the fuzz tokens produce is already relative and `..`-free.
+///
+/// `/` is the only separator and root it knows: this is a unix facility of
+/// the fuzz target. A drive prefix or a `\` separator (Windows) is not
+/// confined, and the sandbox is not used for untrusted names there.
 pub(crate) fn confine_name(b: &[u8]) -> Vec<u8> {
     let b = &b[b.iter().take_while(|&&c| c == b'/').count()..];
     let mut out = Vec::with_capacity(b.len() + 16);
@@ -1649,16 +1653,44 @@ pub(crate) fn confine_name(b: &[u8]) -> Vec<u8> {
     out
 }
 
+/// `canonicalize(dir)`, once per directory (a run's directory is one path
+/// for its whole life, and every name Apple's unzip builds on its real root
+/// asks for it).
+fn canonical_dir(dir: &Path) -> Option<PathBuf> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<PathBuf>>>> = OnceLock::new();
+    let mut cache = CACHE
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if cache.len() > 256 {
+        cache.clear();
+    }
+    cache
+        .entry(dir.to_path_buf())
+        .or_insert_with(|| std::fs::canonicalize(dir).ok())
+        .clone()
+}
+
 /// A sandbox's operand as a path under `dir`. A name already under `dir`
 /// (or under its canonical form: unzip's root is `realpath`ed and every name
 /// built on it comes back through here) keeps that prefix and has only its
-/// remainder confined; any other absolute name is confined and joined.
+/// remainder confined; any other absolute name is confined and joined. An
+/// empty `dir` (a test's) never matches a prefix.
 fn sandbox_path(dir: &Path, b: &[u8]) -> PathBuf {
     if b.first() == Some(&b'/') {
-        let canonical = std::fs::canonicalize(dir).ok();
+        let canonical = if dir.as_os_str().is_empty() {
+            None
+        } else {
+            canonical_dir(dir)
+        };
         for base in std::iter::once(dir.to_path_buf()).chain(canonical) {
             let base_bytes = base.as_os_str().as_encoded_bytes();
             let base_bytes = base_bytes.strip_suffix(b"/").unwrap_or(base_bytes);
+            if base_bytes.is_empty() {
+                continue;
+            }
             if let Some(rest) = b.strip_prefix(base_bytes)
                 && (rest.is_empty() || rest[0] == b'/')
             {
@@ -2470,6 +2502,18 @@ mod tests {
         assert_eq!(host.path(b"/boxer/x"), Path::new("/box/boxer/x"));
         // The real process's paths are untouched.
         assert_eq!(Host::Real.path(b"/etc/passwd"), Path::new("/etc/passwd"));
+    }
+
+    #[test]
+    fn an_empty_sandbox_directory_never_lets_a_root_through() {
+        let host = Host::Sandbox(Sandbox {
+            dir: PathBuf::new(),
+            stdin: None,
+            stdout: Arc::default(),
+            budget: Arc::new(AtomicU64::new(0)),
+            reads: Arc::default(),
+        });
+        assert_eq!(host.path(b"/etc/x"), Path::new("etc/x"));
     }
 
     #[test]

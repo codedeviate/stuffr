@@ -52,8 +52,12 @@ stuffr-cli = { path = "../crates/stuffr-cli" }
 tempfile = "3"
 # Only for `container.rs`'s independent EOCD re-parse (Ruling A's second
 # guard) — opens a SECOND `zip::ZipArchive` over the same bytes stuffr's own
-# `zip.rs` already opened, so the two can be compared from outside. Metadata
-# only, never decoding an entry, so no codec features are needed.
+# `zip.rs` already opened, so the two can be compared from outside; and
+# `compat.rs`' zip read-back (`zip_readback.rs`) reads every entry through it
+# as a second decoder. This asks for no codecs, but cargo unifies features
+# with the workspace's `zip` (which `stuffr-formats/zip` brings, with
+# `deflate-flate2`, `deflate64`, `bzip2`, ...), so deflated entries decode
+# too (`cargo tree -e features -i zip` in this directory shows it).
 zip = { version = "8.6", default-features = false }
 
 [[bin]]
