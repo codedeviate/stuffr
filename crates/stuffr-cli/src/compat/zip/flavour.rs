@@ -55,7 +55,6 @@ pub(crate) fn unicode_support(f: Flavour) -> bool {
 /// Whether the 16-bit `Ux` extra field is written: neither build writes it
 /// (ruling Z3, measured: the field appears only for a 16-bit `st_uid`). For
 /// Task 6, which writes the extra fields.
-#[allow(dead_code)]
 pub(crate) fn writes_ux_16bit(_f: Flavour) -> bool {
     false
 }
@@ -81,6 +80,14 @@ pub(crate) fn tt_replaces_braces(f: Flavour) -> bool {
 /// `UNICODE_SUPPORT` display path); Apple shows it raw. For Task 5.
 #[allow(dead_code)]
 pub(crate) fn shows_newline_escaped(f: Flavour) -> bool {
+    f == Flavour::Ubuntu
+}
+
+/// zip.c:main, `-MM` and an input that could not be opened: Ubuntu's
+/// `zip I/O error:` line says `Invalid argument`, the `errno` glibc's
+/// stdio leaves after the warnings before it; Apple's says why the open
+/// failed (measured, the record's code table, exit 18).
+pub(crate) fn stale_errno_after_warning(f: Flavour) -> bool {
     f == Flavour::Ubuntu
 }
 

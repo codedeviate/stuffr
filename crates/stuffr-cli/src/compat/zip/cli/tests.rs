@@ -410,7 +410,11 @@ fn names_are_read_up_to_a_newline_or_return() {
 struct Scratch(PathBuf);
 impl Scratch {
     fn new(tag: &str) -> Scratch {
-        let d = std::env::temp_dir().join(format!("stuffr-zipcli-{}-{tag}", std::process::id()));
+        // one directory per call: tests sharing a tag run in parallel
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d =
+            std::env::temp_dir().join(format!("stuffr-zipcli-{}-{tag}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         Scratch(d)
@@ -732,12 +736,16 @@ fn names_from_stdin_are_read_when_the_archive_name_is_known() {
     // name is known, which the permutation never gives)
     let args: Vec<OsString> = ["-@", "t.zip", "-"].iter().map(OsString::from).collect();
     let (code, out, err) = run_in(&s.0, "zip", args, b"a\n", Flavour::Apple);
-    // `a` is not there; `-` is standard input, which goes on to the archive
+    // `a` is not there; `-` is standard input (empty: `-@` took it all)
     assert_eq!(
         (code, out.as_slice()),
-        (1, &b"\tzip warning: name not matched: a\n"[..])
+        (
+            0,
+            &b"\tzip warning: name not matched: a\n  adding: - (stored 0%)\n"[..]
+        ),
+        "{}",
+        String::from_utf8_lossy(&err)
     );
-    assert!(String::from_utf8_lossy(&err).contains("not built yet"));
 }
 
 #[test]

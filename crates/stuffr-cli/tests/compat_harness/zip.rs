@@ -1275,3 +1275,238 @@ pub fn zip_scan_matrix(flavour: &'static str) -> Vec<Case<'static>> {
     }
     out
 }
+
+/// The tree the byte matrix writes from: the standard tree and a text file
+/// long enough to slide deflate's window many times (`big.txt`, 300000
+/// bytes), a random one that does not deflate (`r.bin`, 70000 bytes,
+/// several blocks), a small random one that deflate makes larger
+/// (`s.bin`, 600 bytes: stored instead), an empty file, CR LF lines, a
+/// name with the `.Z` suffix (`-n`'s default list), a link to `a.txt` and
+/// a dangling one.
+pub fn zip_bytes_tree() -> ZipTree {
+    let mut crlf = Vec::new();
+    for i in 0..300 {
+        crlf.extend_from_slice(format!("crlf line {i}\r\n").as_bytes());
+    }
+    crlf.extend_from_slice(b"lone cr\rend\r");
+    ZipTree::standard()
+        .file("big.txt", text(300_000, 11))
+        .file("r.bin", random(70_000, 12))
+        .file("s.bin", random(600, 13))
+        .file("e.txt", b"")
+        .file("crlf.txt", crlf)
+        .file("x.Z", text(5_000, 14))
+        .file_mode("ro.txt", b"read only\n", 0o444)
+        .symlink("l", "a.txt")
+        .symlink("dl", "nosuch")
+}
+
+/// Task 6's byte matrix: new archives written from [`zip_bytes_tree`] (or
+/// the standard tree) under each option that changes what is written or
+/// said, compared byte for byte with the reference: the archive (or the
+/// archive on standard output), both streams, the exit code and the tree.
+/// A 300-byte line and a short one: `fgets(e, MAXCOM + 1)` cuts the first.
+const LONG_LINE: &[u8] = b"0123456789012345678901234567890123456789012345678901234567890123456789\
+012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789\
+012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789\
+01234567890123456789012345678901234567890123456789\nshort\n";
+
+pub fn zip_bytes_matrix(flavour: &'static str) -> Vec<Case<'static>> {
+    let mut out: Vec<Case<'static>> = Vec::new();
+    let mut add = |args: &[&'static str], tree: ZipTree, stdin: Option<&[u8]>| {
+        let mut c = zip_case("zip", args, tree);
+        c.zip_flavour = Some(flavour);
+        c.stdin = stdin.map(<[u8]>::to_vec);
+        out.push(c);
+    };
+    const ALL: [&str; 10] = [
+        "a.txt", "b.txt", "d", "d/c.txt", "big.txt", "r.bin", "s.bin", "e.txt", "x.Z", "ro.txt",
+    ];
+    let all = |pre: &[&'static str]| -> Vec<&'static str> {
+        let mut v = pre.to_vec();
+        v.push("t.zip");
+        v.extend_from_slice(&ALL);
+        v
+    };
+    // levels and methods
+    for pre in [
+        &["-0"][..],
+        &["-1"],
+        &["-2"],
+        &["-3"],
+        &["-4"],
+        &["-5"],
+        &["-6"],
+        &["-7"],
+        &["-8"],
+        &["-9"],
+        &[],
+        &["-Z", "store"],
+        &["-Z", "deflate"],
+        &["-0", "-Z", "deflate"],
+        &["-Z", "deflate", "-0"],
+        &["-Z", "store", "-9"],
+        // attributes, links, paths, line ends, suffixes
+        &["-X"],
+        &["-X-"],
+        &["-y"],
+        &["-D"],
+        &["-j"],
+        &["-k"],
+        &["-l"],
+        &["-ll"],
+        &["-n", ".txt"],
+        &["-n", ".txt:.bin"],
+        &["-n", ":"],
+        &["-9", "-n", ".txt"],
+        // Zip64 and descriptors
+        &["-fz"],
+        &["-fz-"],
+        &["-fd"],
+        &["-fd", "-0"],
+        // messages
+        &["-q"],
+        &["-v"],
+        &["-dc"],
+        &["-db"],
+        &["-du"],
+        &["-dv"],
+        &["-dc", "-db", "-du", "-dv"],
+        &["-dd"],
+        &["-dd", "-ds", "32k"],
+        &["-dg"],
+        &["-dg", "-ds", "32k"],
+        &["-dd", "-ds", "32k", "-v"],
+        &["-v", "-ds", "32k", "-0"],
+        &["-dd", "-ds", "32k", "-q"],
+        &["-dg", "-ds", "32k", "-q"],
+    ] {
+        add(&all(pre), zip_bytes_tree(), None);
+    }
+    // the same entry kinds one at a time
+    for args in [
+        &["t.zip", "l"][..],
+        &["-y", "t.zip", "l"],
+        &["-y", "t.zip", "dl"],
+        &["-y", "-0", "t.zip", "l"],
+        &["t.zip", "e.txt"],
+        &["t.zip", "d"],
+        &["-r", "t.zip", "d"],
+        &["-r", "-D", "t.zip", "d"],
+        &["t.zip", "s.bin"],
+        &["-l", "t.zip", "crlf.txt", "r.bin", "a.txt"],
+        &["-ll", "t.zip", "crlf.txt", "r.bin", "a.txt"],
+        &["-l", "-0", "t.zip", "crlf.txt", "r.bin", "a.txt"],
+        &["-ll", "-0", "t.zip", "crlf.txt", "r.bin", "a.txt"],
+        &["-ll", "-v", "t.zip", "crlf.txt", "big.txt"],
+        &["-fz", "-0", "t.zip", "a.txt", "d"],
+        &["-v", "t.zip", "e.txt", "d"],
+        &["-r", "t.zip", "."],
+        &["-r", "-q", "t.zip", ".", "-x", "*.bin"],
+    ] {
+        add(args, zip_bytes_tree(), None);
+    }
+    // standard output (a pipe: data descriptors, no going back)
+    for args in [
+        &["-", "a.txt", "b.txt", "d"][..],
+        &["-", "a.txt", "b.txt", "big.txt", "r.bin", "s.bin", "e.txt"],
+        &["-0", "-", "a.txt", "b.txt"],
+        &["-q", "-", "big.txt"],
+        &["-v", "-", "a.txt", "b.txt"],
+        &["-fz", "-", "a.txt"],
+        &["-y", "-", "l"],
+        &["-l", "-", "crlf.txt"],
+        &["-1", "-", "big.txt"],
+        &["-9", "-", "big.txt"],
+    ] {
+        add(args, zip_bytes_tree(), None);
+    }
+    // standard input as an entry, to a file and to a pipe
+    let hello = &b"hello\n"[..];
+    let long = text(100_000, 21);
+    let long: &'static [u8] = Box::leak(long.into_boxed_slice());
+    for (args, stdin) in [
+        (&["t.zip", "-"][..], hello),
+        (&["t.zip", "-", "a.txt"], hello),
+        (&["-v", "t.zip", "-"], long),
+        (&["-0", "t.zip", "-"], hello),
+        (&["-fz", "t.zip", "-"], hello),
+        (&["-fz-", "t.zip", "-"], hello),
+        (&[], hello),
+        (&[], long),
+        (&[], b""),
+        (&["-0"], hello),
+        (&["-", "-"], hello),
+        (&["-q", "-", "-"], long),
+        (&["-l", "t.zip", "-"], b"a\nb\n"),
+    ] {
+        add(args, zip_bytes_tree(), Some(stdin));
+    }
+    // comments from standard input
+    for (args, stdin) in [
+        (&["-z", "t.zip", "a.txt"][..], &b"hi\n"[..]),
+        (&["-z", "t.zip", "a.txt"], b"one\ntwo\n.\nthree\n"),
+        (&["-z", "t.zip", "a.txt"], b""),
+        (&["-z", "-q", "t.zip", "a.txt"], b"quiet\n"),
+        (&["-c", "t.zip", "a.txt", "b.txt"], b"first\nsecond\n"),
+        (&["-c", "t.zip", "a.txt", "b.txt"], b"only one\n"),
+        (&["-c", "-z", "t.zip", "a.txt"], b"entry\nzip\n.\n"),
+        // after -@ the questions read standard error (a pipe here: nothing)
+        (&["-c", "-@", "t.zip"], b"a.txt\nb.txt\n"),
+        (&["-z", "-@", "t.zip"], b"a.txt\n"),
+        // a line longer than MAXCOM is two answers
+        (&["-c", "t.zip", "a.txt", "b.txt"], LONG_LINE),
+        (&["-z", "t.zip", "a.txt"], LONG_LINE),
+    ] {
+        add(args, zip_bytes_tree(), Some(stdin));
+    }
+    // nothing to write
+    add(&["-r", "t.zip", "."], ZipTree::new(), None);
+    add(&["t.zip"], ZipTree::new(), None);
+    // unreadable inputs among readable ones (Review Focus 2)
+    let unreadable = || ZipTree::standard().file_mode("b.txt", vec![b'x'; 2240], 0o000);
+    for args in [
+        &["t.zip", "a.txt", "b.txt", "d/c.txt"][..],
+        &["-r", "t.zip", "."],
+        &["-q", "t.zip", "a.txt", "b.txt"],
+        &["-MM", "t.zip", "a.txt", "b.txt", "d/c.txt"],
+        &["t.zip", "b.txt"],
+        &["-", "a.txt", "b.txt"],
+        &["-dc", "-db", "t.zip", "a.txt", "b.txt", "d/c.txt"],
+    ] {
+        add(args, unreadable(), None);
+    }
+    // -m, -o and -sd over the standard tree
+    for args in [
+        &["-m", "t.zip", "a.txt", "d/c.txt"][..],
+        &["-mr", "t.zip", "d"],
+        &["-m", "-D", "-r", "t.zip", "d"],
+        &["-v", "-m", "t.zip", "a.txt", "d", "d/c.txt"],
+        &["-o", "t.zip", "a.txt", "b.txt"],
+        &["-o", "t.zip", "d"],
+        &["-o", "-X", "t.zip", "a.txt"],
+        &["-sd", "t.zip", "a.txt", "b.txt"],
+        &["-sd", "-", "a.txt"],
+        &["-db", "-dc", "-r", "t.zip", "."],
+    ] {
+        add(
+            args,
+            ZipTree::standard().times("b.txt", 1_100_000_000, 1_100_000_000),
+            None,
+        );
+    }
+    // where the archive cannot be made
+    for (args, tree) in [
+        (&["nodir/t.zip", "a.txt"][..], ZipTree::standard()),
+        (
+            &["ro/t.zip", "a.txt"],
+            ZipTree::standard().dir_mode("ro", 0o555),
+        ),
+        (&["-b", "nodir", "t.zip", "a.txt"], ZipTree::standard()),
+        (&["-b", "d", "t.zip", "a.txt"], ZipTree::standard()),
+        (&["d/t.zip", "a.txt", "b.txt"], ZipTree::standard()),
+    ] {
+        add(args, tree, None);
+    }
+    out
+}

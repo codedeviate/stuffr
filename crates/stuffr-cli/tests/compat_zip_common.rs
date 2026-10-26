@@ -519,6 +519,18 @@ mod unix {
         differential(5);
     }
 
+    /// Task 6's rows: writing new archives (stored and deflated entries,
+    /// `-v` and the progress counters, an archive or standard input on a
+    /// pipe, descriptors, an archive that cannot be created), and the rows
+    /// of Tasks 4 and 5 whose answer is written (`ZIP`/`ZIPOPT` that
+    /// archive, Ubuntu's `-UN`, a FIFO or a dangling link beside a file,
+    /// `-k`, `-j`, `-x`, `-@`, names with a newline, and Review Focus 2's
+    /// unreadable file among readable ones).
+    #[test]
+    fn task6_rows_match_the_reference() {
+        differential(6);
+    }
+
     #[test]
     fn zip_recorded_rows_hold_on_the_reference() {
         let rows: Vec<Row> = rows().into_iter().filter(Row::runs_here).collect();

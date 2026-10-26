@@ -16,9 +16,13 @@
 //! or `DEFL_UNDETERM`, so neither does this port.
 //!
 //! The input is read as `zipup.c`'s `file_read` reads a regular file
-//! (`translate_eol` 0; `-l`/`-ll` are not ported here): every request is
-//! filled until the end of the input, whatever the reader returns per call.
-//! The CRC-32 and the byte count are taken over what is read, as there.
+//! (`translate_eol` 0): every request is filled until the end of the input,
+//! whatever the reader returns per call; or, with
+//! [`ZipDeflater::set_one_read`], one `read` per request, as `zread` does
+//! (the zip family's own reader then does `-l`/`-ll`'s translation and
+//! the short reads of a pipe). The CRC-32 and the byte count are taken over
+//! what is read, as there. The output is written in the C's pieces (each
+//! `flush_outbuf`), which zip's `-dg` dots count.
 //!
 //! **Stored fallback.** `flush_block` rewrites an entry that is one block
 //! which does not pay as a stored entry (method 0) when the archive is
@@ -145,10 +149,37 @@ pub struct DeflateSummary {
     /// `set_file_type`'s verdict on the first block: `ASCII` (true) or
     /// `BINARY`, the internal file attributes' bit 0.
     pub text: bool,
+    /// How many times `fill_window` slid the window: zip prints its `-dd`
+    /// progress dots there.
+    pub slides: u64,
 }
+
+/// The C's `error("block vanished")` (`ZE_LOGIC`): a stored entry's only
+/// block has left the window. The error [`ZipDeflater::compress`] returns
+/// for it carries this, so a caller can tell it from a read or write error
+/// (`e.get_ref().is_some_and(|i| i.is::<BlockVanished>())`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockVanished;
+
+impl std::fmt::Display for BlockVanished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("block vanished")
+    }
+}
+
+impl std::error::Error for BlockVanished {}
+
+/// trees.c's `out_size` for file compression: zipup's `file_outbuf[1024]`.
+const OUT_SIZE: usize = 1024;
 
 /// `zipup.c`'s I/O for one entry: `file_read` (with its CRC and `isize`),
 /// the bit buffer of `bi_init`, and `flush_outbuf`.
+///
+/// The output is handed on in the C's pieces: each `flush_outbuf` of the
+/// 1024-byte `out_buf` (when `PUTSHORT` or `PUTBYTE` finds it full, at
+/// `bi_windup`, around a stored block) is one `write_all` of `out`, and a
+/// stored block's data is one more. The bytes are the same either way; zip's
+/// `-dg` counts its dots by those writes.
 struct Io<'a> {
     input: &'a mut dyn Read,
     out: &'a mut dyn Write,
@@ -158,19 +189,33 @@ struct Io<'a> {
     bi_buf: u32,
     bi_valid: u32,
     buf: Vec<u8>,
+    /// Where the C's `out_buf` begins in `buf` (`out_offset` is
+    /// `buf.len() - seg`).
+    seg: usize,
+    /// The ends in `buf` of the `flush_outbuf` calls not yet handed on.
+    cuts: Vec<usize>,
     written: u64,
+    /// One `read` per request (zipup's `zread`), not a filled request.
+    one_read: bool,
 }
 
 impl Io<'_> {
-    /// `file_read` with `translate_eol` 0 over a regular file: fills `dst`
-    /// unless the input ends first; 0 is the end.
+    /// `file_read` with `translate_eol` 0: one `read()` of the input per
+    /// request with [`ZipDeflater::set_one_read`], else the request filled
+    /// unless the input ends first (what `read()` gives on a regular file);
+    /// 0 is the end.
     // port: zipup.c:file_read
     fn read_buf(&mut self, dst: &mut [u8]) -> io::Result<u32> {
         let mut n = 0;
         while n < dst.len() {
             match self.input.read(&mut dst[n..]) {
                 Ok(0) => break,
-                Ok(k) => n += k,
+                Ok(k) => {
+                    n += k;
+                    if self.one_read {
+                        break;
+                    }
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
@@ -182,9 +227,29 @@ impl Io<'_> {
         Ok(n as u32)
     }
 
+    /// `flush_outbuf(out_buf, &out_offset)`: the bytes since the last one
+    /// make one piece (none when `out_buf` is empty).
+    fn cut(&mut self) {
+        if self.buf.len() > self.seg {
+            self.cuts.push(self.buf.len());
+            self.seg = self.buf.len();
+        }
+    }
+
     /// `PUTSHORT`.
     fn put_short(&mut self, w: u16) {
+        if self.buf.len() - self.seg >= OUT_SIZE - 1 {
+            self.cut();
+        }
         self.buf.extend_from_slice(&w.to_le_bytes());
+    }
+
+    /// `PUTBYTE`.
+    fn put_byte(&mut self, b: u8) {
+        if self.buf.len() - self.seg >= OUT_SIZE {
+            self.cut();
+        }
+        self.buf.push(b);
     }
 
     // port: trees.c:send_bits
@@ -203,25 +268,35 @@ impl Io<'_> {
         self.send_bits(u32::from(tree[c].fc), u32::from(tree[c].dl));
     }
 
-    // port: trees.c:bi_windup
+    // port: trees.c:bi_windup (`flush_flg` is set for file compression)
     fn bi_windup(&mut self) {
         if self.bi_valid > 8 {
             self.put_short(self.bi_buf as u16);
         } else if self.bi_valid > 0 {
-            self.buf.push(self.bi_buf as u8);
+            self.put_byte(self.bi_buf as u8);
         }
+        self.cut();
         self.bi_buf = 0;
         self.bi_valid = 0;
     }
 
-    /// `flush_outbuf`: hands the buffered bytes to the archive.
+    /// Hands the finished pieces to the archive, one `write_all` each (the
+    /// C's `flush_outbuf` calls); the part of `out_buf` not yet flushed
+    /// stays, unless `all`.
     // port: zipup.c:flush_outbuf
-    fn flush(&mut self) -> io::Result<()> {
-        if !self.buf.is_empty() {
-            self.out.write_all(&self.buf)?;
-            self.written += self.buf.len() as u64;
-            self.buf.clear();
+    fn flush(&mut self, all: bool) -> io::Result<()> {
+        if all {
+            self.cut();
         }
+        let mut from = 0;
+        for &to in &self.cuts {
+            self.out.write_all(&self.buf[from..to])?;
+            self.written += (to - from) as u64;
+            from = to;
+        }
+        self.cuts.clear();
+        self.buf.drain(..from);
+        self.seg -= from;
         Ok(())
     }
 }
@@ -535,6 +610,8 @@ fn send_tree(io: &mut Io, tree: &[CtData], max_code: usize, bl_tree: &[CtData]) 
 pub struct ZipDeflater {
     level: u32,
     store_fallback: bool,
+    one_read: bool,
+    slides: u64,
 
     // deflate.c
     window: Vec<u8>,
@@ -594,6 +671,8 @@ impl ZipDeflater {
         let mut d = ZipDeflater {
             level: u32::from(level),
             store_fallback: true,
+            one_read: false,
+            slides: 0,
             window: vec![0; WINDOW_SIZE as usize],
             prev: vec![0; WSIZE as usize],
             head: vec![0; HASH_SIZE as usize],
@@ -699,6 +778,15 @@ impl ZipDeflater {
         self.store_fallback = allowed;
     }
 
+    /// Whether each of the C's read requests is one `read` of the input
+    /// (zipup's `zread`, which a pipe answers short and a regular file in
+    /// full), or filled until the input ends (the default). zip's own
+    /// reads are the former; `-l`'s translation and standard input depend
+    /// on it.
+    pub fn set_one_read(&mut self, one: bool) {
+        self.one_read = one;
+    }
+
     /// Deflates all of `input` into `out` as zip's `filecompress` does
     /// (`bi_init`, `ct_init`, `lm_init`, `deflate`).
     ///
@@ -721,12 +809,16 @@ impl ZipDeflater {
             bi_buf: 0,
             bi_valid: 0,
             buf: Vec::with_capacity(1 << 16),
+            seg: 0,
+            cuts: Vec::new(),
             written: 0,
+            one_read: self.one_read,
         };
         // ct_init's per-file part; init_block as the previous file's last
         // flush_block left it (a no-op unless that file failed).
         self.file_type = None;
         self.stored = false;
+        self.slides = 0;
         self.cmpr_bytelen = 0;
         self.cmpr_len_bits = 0;
         self.init_block();
@@ -736,7 +828,7 @@ impl ZipDeflater {
         } else {
             self.deflate(&mut io)?;
         }
-        io.flush()?;
+        io.flush(true)?;
         Ok(DeflateSummary {
             in_bytes: io.isize,
             out_bytes: io.written,
@@ -744,6 +836,7 @@ impl ZipDeflater {
             gp_flags: self.gp_flags,
             stored: self.stored,
             text: self.file_type == Some(true),
+            slides: self.slides,
         })
     }
 
@@ -893,6 +986,7 @@ impl ZipDeflater {
                     };
                 }
                 more += WSIZE;
+                self.slides += 1;
             }
             if self.eofile {
                 return Ok(());
@@ -1147,7 +1241,7 @@ impl ZipDeflater {
             && self.store_fallback
         {
             let Some(at) = buf else {
-                return Err(io::Error::other("block vanished"));
+                return Err(io::Error::other(BlockVanished));
             };
             self.copy_block(io, at, stored_len as usize, false);
             self.cmpr_bytelen = stored_len;
@@ -1189,7 +1283,7 @@ impl ZipDeflater {
             io.bi_windup();
             self.cmpr_len_bits += 7;
         }
-        io.flush()
+        io.flush(false)
     }
 
     // port: trees.c:ct_tally
@@ -1301,6 +1395,9 @@ impl ZipDeflater {
             io.put_short(len as u16);
             io.put_short(!(len as u16));
         }
+        // flush_flg: out_buf is flushed, then the block is written as is
+        io.cut();
         io.buf.extend_from_slice(&self.window[at..at + len]);
+        io.cut();
     }
 }

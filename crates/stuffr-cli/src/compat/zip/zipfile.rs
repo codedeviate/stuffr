@@ -1,0 +1,563 @@
+//! The writing half of `zipfile.c`: the local header (`putlocal`), the data
+//! descriptor (`putextended`), the central header (`putcentral`), the end
+//! records (`putend`, with the Zip64 end record and locator), the Zip64
+//! extra fields, and `fileio.c`'s `bfwrite`, which every one of them goes
+//! through and which keeps the offsets and the central directory's counts.
+//!
+//! Each record is built in memory and written whole, as the C's
+//! `append_*_to_mem` and one `bfwrite` do; a local header is rewritten in
+//! place with [`ZWrite::rewrite`] once its sizes and CRC are known, unless
+//! the archive cannot be rewound (a pipe) or `-fd` asks for data
+//! descriptors.
+//!
+//! Splits (`-s`, `bfwrite`'s other half) are Task 8's; this writer is one
+//! disk, number 0.
+
+use std::io::{self, Write};
+
+/// zip.h:LOCSIG and friends.
+const LOCSIG: u32 = 0x0403_4b50;
+const CENSIG: u32 = 0x0201_4b50;
+const ENDSIG: u32 = 0x0605_4b50;
+const EXTLOCSIG: u32 = 0x0807_4b50;
+const ZIP64_CENTRAL_DIR_TAIL_SIG: u32 = 0x0606_4b50;
+const ZIP64_CENTRAL_DIR_TAIL_END_SIG: u32 = 0x0706_4b50;
+/// zipfile.c: `56 - 8 - 4`, the Zip64 end record's size field.
+const ZIP64_CENTRAL_DIR_TAIL_SIZE: u64 = 56 - 8 - 4;
+/// zipfile.c:ZIP64_MIN_VER
+pub(crate) const ZIP64_MIN_VER: u16 = 45;
+/// zipfile.c:ZIP64_EF_TAG
+const ZIP64_EF_TAG: u16 = 0x0001;
+/// zipfile.c:ZIP_EF_HEADER_SIZE
+const ZIP_EF_HEADER_SIZE: usize = 4;
+const ZIP_UWORD32_MAX: u64 = 0xffff_ffff;
+const ZIP_UWORD16_MAX: u64 = 0xffff;
+/// zip.h: the fixed part of a local header after its signature.
+pub(crate) const LOCHEAD: u64 = 26;
+/// zip.h: the fixed part of a central header after its signature.
+pub(crate) const CENHEAD: u64 = 42;
+
+/// One archive entry as zip writes it: the fields of `struct zlist` that
+/// the headers carry (zip.h), with the C's names.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ZEntry {
+    /// The name on disk (`z->name`): `-m` deletes it, messages show it.
+    pub(crate) name: Vec<u8>,
+    /// The stored name (`z->iname`; `z->zname` is the same on unix).
+    pub(crate) iname: Vec<u8>,
+    /// The name messages show (`z->oname`).
+    pub(crate) oname: Vec<u8>,
+    /// Version made by.
+    pub(crate) vem: u16,
+    /// Version needed to extract.
+    pub(crate) ver: u16,
+    /// General-purpose flags of the central header.
+    pub(crate) flg: u16,
+    /// General-purpose flags of the local header.
+    pub(crate) lflg: u16,
+    /// Compression method.
+    pub(crate) how: u16,
+    /// MS-DOS time and date.
+    pub(crate) tim: u32,
+    pub(crate) crc: u32,
+    /// Compressed size.
+    pub(crate) siz: u64,
+    /// Uncompressed size.
+    pub(crate) len: u64,
+    /// The local extra field (`extra`, `ext`).
+    pub(crate) extra: Vec<u8>,
+    /// The central extra field (`cextra`, `cext`).
+    pub(crate) cextra: Vec<u8>,
+    /// The entry comment (`comment`, `com`).
+    pub(crate) comment: Vec<u8>,
+    /// The disk the local header is on.
+    pub(crate) dsk: u64,
+    /// Internal attributes (bit 0: text).
+    pub(crate) att: u16,
+    /// External attributes.
+    pub(crate) atx: u32,
+    /// Offset of the local header.
+    pub(crate) off: u64,
+}
+
+/// Where an archive is written: a file (the temporary archive, or standard
+/// output when it is one) that can be rewound to rewrite a local header,
+/// or a stream that cannot (a pipe).
+pub(crate) trait ZWrite: Write {
+    /// Whether a local header can be rewritten (`is_seekable(y)`).
+    fn seekable(&self) -> bool;
+    /// Bytes written so far: the offset of the next one.
+    fn offset(&self) -> u64;
+    /// Writes `bytes` over what is at `at`, then goes back to the end
+    /// (`zfseeko(y, z->off, SEEK_SET)`, `fwrite`, `zfseeko(y,
+    /// bytes_this_split, SEEK_SET)`).
+    fn rewrite(&mut self, at: u64, bytes: &[u8]) -> io::Result<()>;
+}
+
+/// What `bfwrite` is writing (fileio.c's `BFWRITE_*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Bf {
+    /// File data: counted in `bytes_this_entry`.
+    Data,
+    /// A local header: its offset is remembered.
+    LocalHeader,
+    /// A central header: counted in the end record.
+    CentralHeader,
+    /// Any other record (a descriptor, the end records).
+    Header,
+}
+
+/// `-dg`'s dots: printed per archive as `bfwrite` writes, not per file.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GlobalDots {
+    pub(crate) dot_size: i64,
+    pub(crate) dot_count: i64,
+}
+
+/// The archive being written and `bfwrite`'s globals (fileio.c, zip.c).
+pub(crate) struct ZOut {
+    pub(crate) w: Box<dyn ZWrite>,
+    /// `bytes_this_entry`: data bytes of the current entry.
+    pub(crate) bytes_this_entry: u64,
+    /// `current_local_offset`
+    pub(crate) current_local_offset: u64,
+    /// `cd_start_offset`, once the first central header is written.
+    cd_start_offset: Option<u64>,
+    /// `cd_entries_this_disk`, `total_cd_entries`.
+    cd_entries: u64,
+    /// `zip64_entry`: the current entry's headers use Zip64.
+    pub(crate) zip64_entry: bool,
+    /// `zip64_archive`: an entry needed Zip64.
+    pub(crate) zip64_archive: bool,
+    /// `-fz` (1), `-fz-` (0), neither (-1).
+    pub(crate) force_zip64: i8,
+    /// `-dg`'s state, when it is on.
+    pub(crate) gdots: Option<GlobalDots>,
+    /// Dots (and the leading space) `bfwrite` printed and the caller has
+    /// not yet passed to `mesg`.
+    pub(crate) dots: Vec<u8>,
+}
+
+impl ZOut {
+    pub(crate) fn new(w: Box<dyn ZWrite>, force_zip64: i8, gdots: Option<GlobalDots>) -> ZOut {
+        ZOut {
+            w,
+            bytes_this_entry: 0,
+            current_local_offset: 0,
+            cd_start_offset: None,
+            cd_entries: 0,
+            zip64_entry: false,
+            zip64_archive: false,
+            force_zip64,
+            gdots,
+            dots: Vec::new(),
+        }
+    }
+
+    /// fileio.c:bfwrite for an archive of one disk: writes `b` whole and
+    /// keeps the counts; `-dg` prints its dots here.
+    // port: fileio.c:bfwrite
+    pub(crate) fn bfwrite(&mut self, b: &[u8], mode: Bf) -> io::Result<()> {
+        if mode == Bf::LocalHeader {
+            self.bytes_this_entry = 0;
+            self.current_local_offset = self.w.offset();
+        }
+        if mode == Bf::CentralHeader {
+            if self.cd_start_offset.is_none() {
+                self.cd_start_offset = Some(self.w.offset());
+            }
+            self.cd_entries += 1;
+        }
+        let r = if b.is_empty() {
+            Ok(())
+        } else {
+            self.w.write_all(b)
+        };
+        if r.is_ok() && mode == Bf::Data {
+            self.bytes_this_entry += b.len() as u64;
+        }
+        // display dots for the archive instead of for each file
+        if let Some(g) = self.gdots.as_mut() {
+            if g.dot_size > 0 {
+                if g.dot_count == -1 {
+                    self.dots.push(b' ');
+                    // assume a header will be written first, so avoid 0
+                    g.dot_count = 1;
+                }
+                // skip incrementing the count for small buffers (headers)
+                if b.len() > 1000 {
+                    g.dot_count += 1;
+                    if g.dot_size <= g.dot_count.saturating_mul(b.len() as i64) {
+                        g.dot_count = 0;
+                    }
+                }
+            }
+            if g.dot_size != 0 && g.dot_count == 0 {
+                g.dot_count += 1;
+                self.dots.push(b'.');
+            }
+        }
+        r
+    }
+}
+
+fn put16(b: &mut Vec<u8>, v: u16) {
+    b.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put32(b: &mut Vec<u8>, v: u32) {
+    b.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put64(b: &mut Vec<u8>, v: u64) {
+    b.extend_from_slice(&v.to_le_bytes());
+}
+
+/// zipfile.c:get_extra_field: the offset of the block tagged `tag` in
+/// `extra`, if any.
+// port: zipfile.c:get_extra_field
+fn get_extra_field(tag: u16, extra: &[u8]) -> Option<usize> {
+    let mut p = 0usize;
+    // `for (p = extra; p < extra + len - 4;)`
+    while p + ZIP_EF_HEADER_SIZE < extra.len() {
+        let block_tag = u16::from_le_bytes([extra[p], extra[p + 1]]);
+        let size = u16::from_le_bytes([extra[p + 2], extra[p + 3]]);
+        if block_tag == tag {
+            return Some(p);
+        }
+        p += usize::from(size) + ZIP_EF_HEADER_SIZE;
+    }
+    None
+}
+
+/// zipfile.c:add_local_zip64_extra_field: the local Zip64 block (both
+/// sizes) added after the other blocks, or updated where it is.
+// port: zipfile.c:add_local_zip64_extra_field
+fn add_local_zip64_extra_field(z: &mut ZEntry) {
+    const Z64_LOCAL_LEN: usize = ZIP_EF_HEADER_SIZE + 8 + 8;
+    let at = match get_extra_field(ZIP64_EF_TAG, &z.extra) {
+        None => {
+            let at = z.extra.len();
+            z.extra.resize(at + Z64_LOCAL_LEN, 0);
+            at
+        }
+        Some(old) => {
+            let size = usize::from(u16::from_le_bytes([z.extra[old + 2], z.extra[old + 3]]));
+            if size == Z64_LOCAL_LEN - ZIP_EF_HEADER_SIZE {
+                old
+            } else {
+                // drop the old block and add one of the right size where it
+                // was, before what followed it
+                let end = (old + ZIP_EF_HEADER_SIZE + size).min(z.extra.len());
+                let tail = z.extra.split_off(end);
+                z.extra.truncate(old);
+                let at = z.extra.len();
+                z.extra.resize(at + Z64_LOCAL_LEN, 0);
+                z.extra.extend_from_slice(&tail);
+                at
+            }
+        }
+    };
+    let mut b = Vec::with_capacity(Z64_LOCAL_LEN);
+    put16(&mut b, ZIP64_EF_TAG);
+    put16(&mut b, (Z64_LOCAL_LEN - ZIP_EF_HEADER_SIZE) as u16);
+    put64(&mut b, z.len);
+    put64(&mut b, z.siz);
+    z.extra[at..at + Z64_LOCAL_LEN].copy_from_slice(&b);
+}
+
+/// zipfile.c:add_central_zip64_extra_field: the central Zip64 block, with
+/// the fields that do not fit (and the uncompressed size under `-fz`).
+/// `Err(())` is `ZE_BIG` under `-fz-`.
+// port: zipfile.c:add_central_zip64_extra_field
+fn add_central_zip64_extra_field(z: &mut ZEntry, force_zip64: i8) -> Result<(), ()> {
+    let mut efsize = ZIP_EF_HEADER_SIZE;
+    let mut used = false;
+    if z.len > ZIP_UWORD32_MAX || force_zip64 == 1 {
+        efsize += 8;
+        used = true;
+    }
+    if z.siz > ZIP_UWORD32_MAX {
+        efsize += 8;
+        used = true;
+    }
+    if z.off > ZIP_UWORD32_MAX {
+        efsize += 8;
+        used = true;
+    }
+    if z.dsk > ZIP_UWORD16_MAX {
+        efsize += 4;
+        used = true;
+    }
+    if used && force_zip64 == 0 {
+        return Err(());
+    }
+    let at = if z.cextra.is_empty() {
+        if efsize == ZIP_EF_HEADER_SIZE {
+            return Ok(());
+        }
+        z.cextra.resize(efsize, 0);
+        0
+    } else {
+        match get_extra_field(ZIP64_EF_TAG, &z.cextra) {
+            None => {
+                let at = z.cextra.len();
+                z.cextra.resize(at + efsize, 0);
+                at
+            }
+            Some(old) => {
+                let size = usize::from(u16::from_le_bytes([z.cextra[old + 2], z.cextra[old + 3]]));
+                let oldefsize = size + ZIP_EF_HEADER_SIZE;
+                if z.cextra.len() == oldefsize {
+                    // only the Zip64 block
+                    z.cextra.resize(efsize, 0);
+                    0
+                } else {
+                    // take the old block out and add the new one at the end
+                    let end = (old + oldefsize).min(z.cextra.len());
+                    z.cextra.drain(old..end);
+                    let at = z.cextra.len();
+                    z.cextra.resize(at + efsize, 0);
+                    at
+                }
+            }
+        }
+    };
+    let mut b = Vec::with_capacity(efsize);
+    put16(&mut b, ZIP64_EF_TAG);
+    put16(&mut b, (efsize - ZIP_EF_HEADER_SIZE) as u16);
+    if z.len > ZIP_UWORD32_MAX || force_zip64 == 1 {
+        put64(&mut b, z.len);
+    }
+    if z.siz > ZIP_UWORD32_MAX {
+        put64(&mut b, z.siz);
+    }
+    if z.off > ZIP_UWORD32_MAX {
+        put64(&mut b, z.off);
+    }
+    if z.dsk > ZIP_UWORD16_MAX {
+        put32(&mut b, z.dsk as u32);
+    }
+    z.cextra[at..at + efsize].copy_from_slice(&b);
+    Ok(())
+}
+
+/// Why a header could not be written: `ZE_BIG` with zip's warning and
+/// message, or `ZE_TEMP` (the write failed).
+#[derive(Debug)]
+pub(crate) enum PutError {
+    /// `zipwarn(warn, oname)` (when `warn` is not empty), then
+    /// `ZIPERR(ZE_BIG, why)`.
+    Big {
+        warn: &'static str,
+        why: &'static str,
+    },
+    /// `ZE_TEMP`: the write failed with this error.
+    Temp(io::Error),
+}
+
+/// The local header of `z` as `putlocal` builds it, Zip64 decided as it
+/// decides (`rewrite`: the second write, once the sizes are known), or the
+/// error it ends the run with.
+// port: zipfile.c:putlocal
+fn local_header(z: &mut ZEntry, out: &mut ZOut, rewrite: bool) -> Result<Vec<u8>, PutError> {
+    use super::messages as m;
+    // standard input is streamed: its size is not known in advance
+    let streaming_in = z.name == b"-";
+    let force = out.force_zip64;
+    let needs = z.siz > ZIP_UWORD32_MAX
+        || z.len > ZIP_UWORD32_MAX
+        || force == 1
+        || (force != 0 && streaming_in);
+    let mut was_zip64 = false;
+    if !rewrite {
+        out.zip64_entry = false;
+        if needs {
+            if force == 0 {
+                return Err(PutError::Big {
+                    warn: m::ENTRY_TOO_BIG,
+                    why: m::LARGE_DISABLED_NEEDED,
+                });
+            }
+            out.zip64_entry = true;
+            if z.ver < ZIP64_MIN_VER {
+                z.ver = ZIP64_MIN_VER;
+            }
+            was_zip64 = true;
+        }
+    } else {
+        was_zip64 = out.zip64_entry;
+        out.zip64_entry = needs;
+        if force == 0 && out.zip64_entry {
+            return Err(PutError::Big {
+                warn: m::ENTRY_TOO_BIG,
+                why: m::LARGE_DISABLED_ENTRY_NEEDS,
+            });
+        }
+        if !was_zip64 && out.zip64_entry {
+            return Err(PutError::Big {
+                warn: m::ENTRY_TOO_BIG,
+                why: if force == 0 {
+                    m::UNEXPECTEDLY_LARGE
+                } else {
+                    m::POOR_COMPRESSION
+                },
+            });
+        }
+        if out.zip64_entry {
+            out.zip64_archive = true;
+            if z.ver < ZIP64_MIN_VER {
+                z.ver = ZIP64_MIN_VER;
+            }
+        }
+        if was_zip64 && !out.zip64_entry {
+            z.ver = 20;
+        }
+    }
+    if out.zip64_entry || was_zip64 {
+        add_local_zip64_extra_field(z);
+    }
+    // Task 11: Ubuntu's UTF-8 flag and Unicode path field go here.
+    let mut b = Vec::with_capacity(30 + z.iname.len() + z.extra.len());
+    put32(&mut b, LOCSIG);
+    put16(&mut b, z.ver);
+    put16(&mut b, z.lflg);
+    put16(&mut b, z.how);
+    put32(&mut b, z.tim);
+    put32(&mut b, z.crc);
+    if out.zip64_entry {
+        put32(&mut b, 0xffff_ffff);
+        put32(&mut b, 0xffff_ffff);
+    } else {
+        put32(&mut b, z.siz as u32);
+        put32(&mut b, z.len as u32);
+    }
+    put16(&mut b, z.iname.len() as u16);
+    put16(&mut b, z.extra.len() as u16);
+    b.extend_from_slice(&z.iname);
+    b.extend_from_slice(&z.extra);
+    Ok(b)
+}
+
+/// zipfile.c:putlocal, the first write (`PUTLOCAL_WRITE`, through
+/// `bfwrite`, which remembers where it is).
+pub(crate) fn putlocal(z: &mut ZEntry, out: &mut ZOut) -> Result<(), PutError> {
+    let b = local_header(z, out, false)?;
+    out.bfwrite(&b, Bf::LocalHeader).map_err(PutError::Temp)
+}
+
+/// zipfile.c:putlocal, the rewrite (`PUTLOCAL_REWRITE`): over the first,
+/// at `z.off`, then back to the end.
+pub(crate) fn putlocal_rewrite(z: &mut ZEntry, out: &mut ZOut) -> Result<(), PutError> {
+    let b = local_header(z, out, true)?;
+    out.w.rewrite(z.off, &b).map_err(PutError::Temp)
+}
+
+/// zipfile.c:putextended: the data descriptor (Zip64 sizes when the entry
+/// is Zip64).
+// port: zipfile.c:putextended
+pub(crate) fn putextended(z: &ZEntry, out: &mut ZOut) -> io::Result<()> {
+    let mut b = Vec::with_capacity(24);
+    put32(&mut b, EXTLOCSIG);
+    put32(&mut b, z.crc);
+    if out.zip64_entry {
+        put64(&mut b, z.siz);
+        put64(&mut b, z.len);
+    } else {
+        put32(&mut b, z.siz as u32);
+        put32(&mut b, z.len as u32);
+    }
+    out.bfwrite(&b, Bf::Header)
+}
+
+/// zipfile.c:putcentral: the central header of `z` (its Zip64 block added
+/// first when a field does not fit or `-fz` asks).
+// port: zipfile.c:putcentral
+pub(crate) fn putcentral(z: &mut ZEntry, out: &mut ZOut) -> Result<(), PutError> {
+    // Task 11: Ubuntu's UTF-8 flag and Unicode path field go here.
+    if (z.siz > ZIP_UWORD32_MAX
+        || z.len > ZIP_UWORD32_MAX
+        || z.off > ZIP_UWORD32_MAX
+        || z.dsk > ZIP_UWORD16_MAX
+        || out.force_zip64 == 1)
+        && add_central_zip64_extra_field(z, out.force_zip64).is_err()
+    {
+        return Err(PutError::Big {
+            warn: "",
+            why: super::messages::LARGE_DISABLED_USING,
+        });
+    }
+    let mut b = Vec::with_capacity(46 + z.iname.len() + z.cextra.len() + z.comment.len());
+    put32(&mut b, CENSIG);
+    put16(&mut b, z.vem);
+    put16(&mut b, z.ver);
+    put16(&mut b, z.flg);
+    put16(&mut b, z.how);
+    put32(&mut b, z.tim);
+    put32(&mut b, z.crc);
+    put32(&mut b, z.siz.min(ZIP_UWORD32_MAX) as u32);
+    if z.len > ZIP_UWORD32_MAX || out.force_zip64 == 1 {
+        put32(&mut b, 0xffff_ffff);
+    } else {
+        put32(&mut b, z.len as u32);
+    }
+    put16(&mut b, z.iname.len() as u16);
+    put16(&mut b, z.cextra.len() as u16);
+    put16(&mut b, z.comment.len() as u16);
+    put16(&mut b, z.dsk.min(ZIP_UWORD16_MAX) as u16);
+    put16(&mut b, z.att);
+    put32(&mut b, z.atx);
+    put32(&mut b, z.off.min(ZIP_UWORD32_MAX) as u32);
+    b.extend_from_slice(&z.iname);
+    b.extend_from_slice(&z.cextra);
+    b.extend_from_slice(&z.comment);
+    out.bfwrite(&b, Bf::CentralHeader).map_err(PutError::Temp)
+}
+
+/// zipfile.c:putend: the end of central directory record, after the Zip64
+/// end record and locator when the archive needs them. `n` entries, a
+/// central directory of `s` bytes at `c`, the archive comment.
+// port: zipfile.c:putend
+pub(crate) fn putend(out: &mut ZOut, n: u64, s: u64, c: u64, comment: &[u8]) -> io::Result<()> {
+    let _ = c; // the C writes `cd_start_offset`, the same on one disk
+    let current_disk: u64 = 0;
+    let zip64_eocd_offset = out.w.offset();
+    let cd_start_disk: u64 = 0;
+    let cd_start_offset = out.cd_start_offset.unwrap_or(0);
+    let cd_entries = out.cd_entries;
+    let mut b = Vec::with_capacity(98 + comment.len());
+    if n > ZIP_UWORD16_MAX || s > ZIP_UWORD32_MAX || c > ZIP_UWORD32_MAX || out.zip64_archive {
+        put32(&mut b, ZIP64_CENTRAL_DIR_TAIL_SIG);
+        put64(&mut b, ZIP64_CENTRAL_DIR_TAIL_SIZE);
+        // version made by: OS_CODE + Z_MAJORVER * 10 + Z_MINORVER
+        put16(&mut b, 0x300 + 30);
+        put16(&mut b, ZIP64_MIN_VER);
+        put32(&mut b, current_disk as u32);
+        put32(&mut b, cd_start_disk as u32);
+        put64(&mut b, cd_entries);
+        put64(&mut b, n);
+        put64(&mut b, s);
+        put64(&mut b, cd_start_offset);
+        put32(&mut b, ZIP64_CENTRAL_DIR_TAIL_END_SIG);
+        put32(&mut b, current_disk as u32);
+        put64(&mut b, zip64_eocd_offset);
+        put32(&mut b, (current_disk + 1) as u32);
+    }
+    put32(&mut b, ENDSIG);
+    put16(&mut b, current_disk.min(0xffff) as u16);
+    put16(&mut b, cd_start_disk.min(0xffff) as u16);
+    put16(&mut b, cd_entries.min(0xffff) as u16);
+    put16(&mut b, cd_entries.min(0xffff) as u16);
+    put32(&mut b, s.min(ZIP_UWORD32_MAX) as u32);
+    if out.force_zip64 == 1 || cd_start_offset > ZIP_UWORD32_MAX {
+        put32(&mut b, 0xffff_ffff);
+    } else {
+        put32(&mut b, cd_start_offset as u32);
+    }
+    put16(&mut b, comment.len() as u16);
+    b.extend_from_slice(comment);
+    out.bfwrite(&b, Bf::Header)
+}
+
+#[cfg(test)]
+mod tests;

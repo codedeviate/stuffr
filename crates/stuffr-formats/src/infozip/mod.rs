@@ -50,7 +50,7 @@ mod zipdeflate;
 pub use explode::explode;
 pub use inflate::{INCOMPLETE_D_TREE, INCOMPLETE_L_TREE, WSIZE, inflate};
 pub use unshrink::unshrink;
-pub use zipdeflate::{DeflateSummary, ZipDeflater};
+pub use zipdeflate::{BlockVanished, DeflateSummary, ZipDeflater};
 
 #[cfg(test)]
 mod tests;

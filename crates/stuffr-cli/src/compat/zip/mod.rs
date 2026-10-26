@@ -21,10 +21,19 @@
 //! operands and `-R`, `-i`/`-x`/`-R` patterns, `-r`, `-j`, `-k`, `-D`, `-y`,
 //! `-t`/`-tt`, `-@`, duplicates and the archive itself, and `-sf`'s listing
 //! (`fileio.c`, `util.c`'s matcher, `unix/unix.c`); also the unix extra
-//! fields Task 6 writes (`unix::extra_fields`). A command line that gets
-//! past all of it and would archive answers `messages::NOT_BUILT` (exit 1)
-//! until Task 6 writes the archive, and the helpers' work answers it until
-//! theirs.
+//! fields (`unix::extra_fields`).
+//!
+//! **Task 6 (`zipup.rs`, `zipfile.rs`):** writing a new archive, byte for
+//! byte as the references write it: `zipup.c` (the method, stored or
+//! deflated through `stuffr::infozip::ZipDeflater`, `-l`/`-ll`, the
+//! descriptor or the rewritten local header), `zipfile.c`'s writing half
+//! (local and central headers, Zip64 fields and end records, the end
+//! record) and `zip.c:main` from the temporary archive to `finish()`
+//! (progress counters and dots, unreadable inputs, `-c`, `-z`, `-m`,
+//! `-o`). An archive already at the path (Task 7), splits (Task 8),
+//! encryption (Task 9), `-T` (Task 7), bzip2 (Task 11) and the helpers'
+//! work still answer `messages::NOT_BUILT` (exit 1). Signals are not armed
+//! yet (Task 7): an interrupted run leaves its `ziXXXXXX` temporary.
 //!
 //! **Zr is `G`:** zip's globals are one value per run (`Zr`, with its
 //! options `o`), so a sandboxed run ([`run_in_counted`]) touches nothing of
@@ -80,6 +89,14 @@
 //!    6 of 4000 random arrays with many equal keys differently from macOS
 //!    (a known gap: which of two equal names is dropped, when the same
 //!    operand is given twice among many).
+//! 9. `-c` or `-z` after `-@` (or with zip as a filter) read standard error
+//!    (`fdopen(fileno(stderr), "r")`). When it is not open for reading (a
+//!    pipe, a file opened to write) `fdopen` fails and the C's `fgets(NULL)`
+//!    dies of SIGSEGV in both references, which zip's handler answers with
+//!    a blank line and `Interrupted (aborting)`, exit 9, the temporary
+//!    removed. stuffr gives that answer without the dereference (as 6 and
+//!    8), at the first question, and a sandbox's standard error is never
+//!    readable.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -97,6 +114,8 @@ pub(crate) mod flavour;
 mod messages;
 pub(crate) mod scan;
 pub(crate) mod unix;
+pub(crate) mod zipfile;
+pub(crate) mod zipup;
 
 pub use flavour::Flavour;
 use messages::{self as m, printf};

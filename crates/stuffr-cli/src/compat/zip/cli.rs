@@ -1647,6 +1647,9 @@ pub(crate) struct Options {
     pub(crate) grow: bool,
     /// `-@` was given (zip.c's `s`).
     pub(crate) names_from_stdin: bool,
+    /// zip.c's `comment_stream` is NULL (`-@`, or zip as a filter): `-c`
+    /// and `-z` read standard error, not standard input.
+    pub(crate) comment_from_stderr: bool,
     /// zip.c's `kk`: 0 expecting the archive name, 3 after it, 4 after a
     /// name, 6 reading `-R` patterns.
     pub(crate) kk: u8,
@@ -1734,6 +1737,7 @@ impl Options {
             names: Vec::new(),
             grow: false,
             names_from_stdin: false,
+            comment_from_stderr: false,
             kk: 0,
             first_listarg: 0,
             filter_mode: false,
@@ -2291,7 +2295,10 @@ pub(crate) fn parse_zip(z: &mut Zr, argv0: &[u8], rest: &[Vec<u8>]) -> Result<()
                 }
             }
             // -@: defer reading names until the archive name is known
-            (Some(b'@'), _) => z.o.names_from_stdin = true,
+            (Some(b'@'), _) => {
+                z.o.names_from_stdin = true;
+                z.o.comment_from_stderr = true;
+            }
             // -X
             (Some(b'X'), _) => z.o.extra_fields = if negated { 2 } else { 0 },
             (_, o::DES) => z.o.use_descriptors = true,

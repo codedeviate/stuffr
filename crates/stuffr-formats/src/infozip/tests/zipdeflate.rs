@@ -421,6 +421,88 @@ fn short_reads_do_not_change_the_stream() {
     assert!(out == whole);
 }
 
+/// Records the size of every `write` (the C's `flush_outbuf` pieces).
+struct Pieces(Vec<u8>, Vec<usize>);
+
+impl std::io::Write for Pieces {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.extend_from_slice(buf);
+        self.1.push(buf.len());
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `set_one_read`: one `read` per request. Over a reader that answers each
+/// request whole (a regular file) the stream is the filled one; over a
+/// one-byte reader each request takes one byte, and the stream is still a
+/// valid deflate of the same input with the same CRC and size.
+#[test]
+fn one_read_per_request() {
+    let input = mixed(70_000);
+    let (whole, ws) = deflate(&input, 6, true);
+    let mut d = ZipDeflater::new(6);
+    d.set_one_read(true);
+    let mut out = Vec::new();
+    let s = d.compress(&mut &input[..], &mut out).unwrap();
+    assert!(out == whole);
+    assert_eq!((s.crc32, s.in_bytes), (ws.crc32, ws.in_bytes));
+    let mut d = ZipDeflater::new(6);
+    d.set_one_read(true);
+    let mut out = Vec::new();
+    let s = d.compress(&mut Trickle(&input), &mut out).unwrap();
+    assert_eq!((s.crc32, s.in_bytes), (ws.crc32, ws.in_bytes));
+    let mut back = Vec::new();
+    let mut window = vec![0; WSIZE];
+    let r = inflate(
+        &mut out.iter(),
+        false,
+        &mut window,
+        &mut |c: &[u8]| -> Result<(), ()> {
+            back.extend_from_slice(c);
+            Ok(())
+        },
+        &mut |_| {},
+    );
+    assert!(matches!(r, Ok(())));
+    assert!(back == input);
+}
+
+/// The output is written in trees.c's pieces: `out_buf` is 1024 bytes and
+/// `PUTSHORT` flushes it at 1023, so no piece of coded data is longer than
+/// 1024 bytes; a stored block's data is one piece of its own. The pieces
+/// make the same stream.
+#[test]
+fn output_is_written_in_the_c_pieces() {
+    let input = mixed(200_000);
+    let (whole, _) = deflate(&input, 6, true);
+    let mut d = ZipDeflater::new(6);
+    let mut p = Pieces(Vec::new(), Vec::new());
+    d.compress(&mut &input[..], &mut p).unwrap();
+    assert!(p.0 == whole);
+    assert!(p.1.len() > 10, "{:?}", p.1);
+    assert!(p.1.iter().all(|&n| n > 0));
+    let random = random(9, 100_000);
+    let mut d = ZipDeflater::new(6);
+    d.set_store_fallback(false);
+    let mut p = Pieces(Vec::new(), Vec::new());
+    d.compress(&mut &random[..], &mut p).unwrap();
+    // incompressible: stored blocks, each block's data one write
+    assert!(p.1.iter().any(|&n| n > 1024), "{:?}", p.1);
+}
+
+/// `slides` counts `fill_window`'s slides: none for a small input, one per
+/// 32 KiB or so of a large one.
+#[test]
+fn slides_are_counted() {
+    let (_, s) = deflate(&mixed(10_000), 6, true);
+    assert_eq!(s.slides, 0);
+    let (_, s) = deflate(&mixed(1_000_000), 6, true);
+    assert!((25..=31).contains(&s.slides), "{}", s.slides);
+}
+
 #[test]
 fn gp_flags_follow_lm_init() {
     for level in 1..=9u8 {

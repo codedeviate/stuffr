@@ -71,10 +71,15 @@ fn run_in_reaches_each_program() {
 /// and `-v` alone prints the version screen.
 #[test]
 fn a_sandbox_is_not_a_terminal() {
-    let (code, out, err) = go("zip", &[], b"data");
-    // the filter is the later tasks'; the front end accepts the line
-    assert_eq!((code, out.as_str()), (1, ""), "{err}");
-    assert!(err.contains("not built yet"), "{err}");
+    // zip as a filter: standard input to standard output, a pipe (so a
+    // data descriptor follows the data)
+    let dir = std::env::temp_dir();
+    let (code, out, err) = run_in(&dir, "zip", vec![], b"data", Flavour::Apple);
+    assert_eq!(
+        (code, err.as_slice()),
+        (0, &b"  adding: - (deflated -49%)\n"[..])
+    );
+    assert!(out.starts_with(b"PK\x03\x04") && out.windows(4).any(|w| w == b"PK\x07\x08"));
     let (code, out, _) = go("zip", &["-v"], b"");
     assert_eq!(code, 0);
     assert!(out.contains("Zip special compilation options:"), "{out}");

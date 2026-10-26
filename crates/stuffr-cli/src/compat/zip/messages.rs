@@ -1033,3 +1033,127 @@ pub(super) const ZIPSPLIT_V_UBUNTU_POST: &str = concat!(
     "ZipSplit special compilation options:\n",
     "\t[none]\n",
 );
+
+// ---- writing new archives (Task 6: zipup.c, zipfile.c, zip.c:main) ----
+
+/// zip.c:main, before each new entry (`%s` the shown name).
+pub(super) const ADDING: &str = "  adding: %s";
+/// zipup.c:zipup, `-du`: the size the scan found, `DisplayNumString`.
+pub(super) const USIZE: &str = " (%s)";
+/// zipup.c:zipup, `-v`.
+pub(super) const IN_OUT: &str = "\t(in=%s) (out=%s)";
+/// zipup.c:zipup, a deflated entry (`%d%%`).
+pub(super) const DEFLATED: &str = " (deflated %s%%)\n";
+/// zipup.c:zipup, a stored entry.
+pub(super) const STORED: &str = " (stored 0%%)\n";
+/// zip.c:main, `-v`'s last line (`%s`, `%s`, `%d%%`).
+pub(super) const TOTAL_BYTES: &str = "total bytes=%s, compressed=%s -> %s%% savings\n";
+/// zip.c:main, `perror("zip warning")` and its log copy.
+pub(super) const PERROR_WARNING: &str = "zip warning: %s\n";
+/// zipup.c:zipup, `perror("\nzip warning")` and its log copy.
+pub(super) const PERROR_WARNING_NL: &str = "\nzip warning: %s\n";
+/// zip.c:main, an input that could not be opened.
+pub(super) const COULD_NOT_OPEN: &str = "could not open for reading: ";
+/// zip.c:main, a name that is a file in the scan and a directory now (or
+/// the other way round).
+pub(super) const FILE_AND_DIR: &str = "file and directory with the same name: ";
+/// zip.c:main, `ZIPERR(r, errbuf)` after zipup.
+pub(super) const WAS_ZIPPING: &str = "was zipping %s";
+/// zipup.c:zipup, a read error (stored entries).
+pub(super) const COULD_NOT_READ: &str = "could not read input file: ";
+/// zipup.c:zipup, the size read is not the size `stat` gave.
+pub(super) const SIZE_CHANGED: &str = " file size changed while zipping ";
+/// zipup.c:zipup, `-l` on a file `is_text_buf` found binary.
+pub(super) const L_BINARY_IGNORED: &str = "has binary so -l ignored";
+/// zipup.c:zipup, `-ll` on such a file.
+pub(super) const LL_BINARY_IGNORED: &str = "has binary so -ll ignored";
+/// zipup.c:zipup, `-l` on a file deflate found binary.
+pub(super) const L_CORRUPTED: &str = "-l used on binary file - corrupted?";
+/// zipup.c:zipup, `-ll` likewise.
+pub(super) const LL_CORRUPTED: &str = "-ll used on binary file - corrupted?";
+/// zipup.c:zipup, `-0` and an input of unknown size on a pipe.
+pub(super) const NO_STORE_ON_PIPES: &str = "zip -0 not supported for I/O on pipes or devices";
+/// deflate.c:lm_init, `error("bad pack level")` (`-Z deflate` after `-0`).
+pub(super) const BAD_PACK_LEVEL: &str = "bad pack level";
+/// trees.c:flush_block, `error("block vanished")`.
+pub(super) const BLOCK_VANISHED: &str = "block vanished";
+/// zipup.c:flush_outbuf, `ziperr(ZE_WRITE, ...)`.
+pub(super) const WRITE_ERROR_ON_ZIP: &str = "write error on zip file";
+/// zip.c:main, the summary after unreadable inputs.
+pub(super) const NOT_ALL_READABLE: &str = "\nzip warning: Not all files were readable\n";
+/// zip.c:main, the summary's counts (`%lu`).
+pub(super) const FILES_READ: &str = "  files/entries read:  %s";
+/// zip.c:main, a byte count of the summary.
+pub(super) const N_BYTES: &str = " (%s bytes)";
+/// zip.c:main, the summary's skipped count (`%lu`).
+pub(super) const SKIPPED: &str = "  skipped:  %s";
+/// zip.c:main, `-c`'s question.
+pub(super) const ENTER_COMMENT: &str = "Enter comment for %s:\n";
+/// zip.c:main, `-z`'s question.
+pub(super) const ENTER_ZIP_COMMENT: &str = "enter new zip file comment (end with .):\n";
+/// zip.c:main, nothing in the central directory.
+pub(super) const ZIP_FILE_EMPTY: &str = "zip file empty";
+/// zip.c:main, `replace()` failed.
+pub(super) const NEW_ZIP_LEFT_AS: &str = "new zip file left as: ";
+/// zip.c:main, `ZIPERR(r, ...)` after a failed `replace()`.
+pub(super) const WAS_REPLACING: &str = "was replacing the original zip file";
+/// zip.c:main, `-sd`.
+pub(super) const SD_OPEN_ZIP: &str = "sd: Open zip file and create temp file\n";
+/// zip.c:main, `-sd`.
+pub(super) const SD_CREATING: &str = "sd: Creating new zip file\n";
+/// zip.c:main, `-sd`.
+pub(super) const SD_ZIPPING_NEW: &str = "sd: Zipping up new entries\n";
+/// zip.c:main, `-sd`.
+pub(super) const SD_GET_COMMENT: &str = "sd: Get comment if any\n";
+/// zip.c:main, `-sd`.
+pub(super) const SD_WRITING_CENTRAL: &str = "sd: Writing central directory\n";
+/// zip.c:main, `-sd`.
+pub(super) const SD_WRITING_END: &str = "sd: Writing end of central directory\n";
+/// zip.c:main, `-sd`.
+pub(super) const SD_REPLACING: &str = "sd: Replacing old zip file\n";
+/// zip.c:main, `-sd`.
+pub(super) const SD_SETTING_TYPE: &str = "sd: Setting file type\n";
+/// zip.c:DisplayRunningStats, `-dv` (`%lu>%lu: `).
+pub(super) const DV: &str = "%s>%s: ";
+/// zip.c:DisplayRunningStats, `-dc` (`%3ld/%3ld `).
+pub(super) const DC: &str = "%s/%s ";
+/// zip.c:DisplayRunningStats, `-db`'s start (`[%4s`).
+pub(super) const DB_START: &str = "[%s";
+/// zip.c:DisplayRunningStats, `-db`'s bytes to go (`/%4s] `).
+pub(super) const DB_LEFT: &str = "/%s] ";
+/// zip.c:DisplayRunningStats, `-db` past the planned total (`-%4s] `).
+pub(super) const DB_OVER: &str = "-%s] ";
+/// zip.c:main, the log file's last lines (`-lf`).
+pub(super) const LOG_TOTAL: &str = "\nTotal %s entries (";
+/// zip.c:main, the log's planned/actual bytes.
+pub(super) const LOG_PLANNED: &str = "planned ";
+/// zip.c:main, the log.
+pub(super) const LOG_ACTUAL: &str = " bytes, actual ";
+/// zip.c:main, the log.
+pub(super) const LOG_BYTES: &str = " bytes)";
+/// zip.c:main, the log's end (`%s` is `asctime()`).
+pub(super) const LOG_DONE: &str = "\nDone %s";
+/// zipfile.c:putlocal, before a `ZE_BIG` error.
+pub(super) const ENTRY_TOO_BIG: &str = "Entry too big:";
+/// zipfile.c:putlocal, `-fz-` and an entry that needs Zip64.
+pub(super) const LARGE_DISABLED_NEEDED: &str = "Large entry support disabled with -fz- but needed";
+/// zipfile.c:putlocal, `-fz-` and an entry that turned out to need Zip64.
+pub(super) const LARGE_DISABLED_ENTRY_NEEDS: &str =
+    "Large entry support disabled with -fz- but entry needs";
+/// zipfile.c:putlocal, an entry that needs Zip64 only once written.
+pub(super) const UNEXPECTEDLY_LARGE: &str =
+    "Compressed/stored entry unexpectedly large - do not use -fz-";
+/// zipfile.c:putlocal, likewise under `-fz`.
+pub(super) const POOR_COMPRESSION: &str =
+    "Poor compression resulted in unexpectedly large entry - try -fz";
+/// zipfile.c:add_central_zip64_extra_field, `-fz-` and a field too big.
+pub(super) const LARGE_DISABLED_USING: &str = "Large entry support disabled using -fz- but needed";
+/// zipfile.c:trash, `-m` with `-v`.
+pub(super) const DELETING_FILE: &str = "zip diagnostic: deleting file %s\n";
+/// zipfile.c:trash, a failed `unlink`.
+pub(super) const ERROR_DELETING: &str = "error deleting ";
+/// zipfile.c:trash, `-m` with `-v`, a directory.
+pub(super) const DELETING_DIR: &str = "deleting directory %s (if empty)                \n";
+/// zip.c:finish, `-o` over directories only.
+pub(super) const ONLY_DIRS_NO_LATEST: &str =
+    "zip file has only directories, can't make it as old as latest entry";

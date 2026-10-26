@@ -140,7 +140,6 @@ pub(crate) fn unix2dostime(z: &Zr, t: i64) -> u64 {
 /// only where [`flavour::writes_ux_16bit`] says; neither build writes it.
 /// The caller leaves all of this out under `-X`.
 // port: unix/unix.c:set_extra_field
-#[allow(dead_code)] // Task 6 writes them
 pub(crate) fn extra_fields(f: Flavour, meta: &UnixMeta, local: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(32);
     // UT: tag 0x5455, flags = mtime | atime (the central copy keeps the

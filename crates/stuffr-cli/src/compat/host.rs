@@ -1419,6 +1419,11 @@ pub struct InputReads {
     /// been read (a read never crosses it). Not compiled otherwise.
     #[cfg(test)]
     pub fail_after: Option<u64>,
+    /// Test builds only: the file ends (reads give 0) once this many bytes
+    /// have been read (a read never crosses it), as a file that shrinks
+    /// while it is read. Not compiled otherwise.
+    #[cfg(test)]
+    pub eof_after: Option<u64>,
 }
 
 /// A sandboxed run's [`InputReads`], by the path opened.
@@ -1465,6 +1470,17 @@ impl Read for InFile {
             let mut buf = buf;
             if let Some((log, path)) = &self.log {
                 let log = log.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some((end, bytes)) = log
+                    .get(path)
+                    .and_then(|r| r.eof_after.map(|f| (f, r.bytes)))
+                {
+                    if bytes >= end {
+                        return Ok(0);
+                    }
+                    let room = usize::try_from(end - bytes).unwrap_or(usize::MAX);
+                    let cut = buf.len().min(room);
+                    buf = &mut buf[..cut];
+                }
                 if let Some(limit) = log
                     .get(path)
                     .and_then(|r| r.fail_after.map(|f| (f, r.bytes)))
@@ -1962,7 +1978,7 @@ impl Write for Capped {
 /// left. Never wraps. A `compare_exchange` loop rather than `fetch_update`:
 /// clippy on stable 1.99 denies `fetch_update` as deprecated (renamed
 /// `try_update`), and `try_update` is newer than the 1.88 MSRV.
-fn take(budget: &AtomicU64, n: u64) -> io::Result<()> {
+pub(crate) fn take(budget: &AtomicU64, n: u64) -> io::Result<()> {
     let mut left = budget.load(Ordering::Relaxed);
     loop {
         let rest = left.checked_sub(n).ok_or_else(no_space)?;

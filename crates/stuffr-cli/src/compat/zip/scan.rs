@@ -59,8 +59,9 @@ pub(crate) enum FoundKind {
     Stdin,
 }
 
-/// One input zip will add: a `struct flist` after the whole scan. Task 6
-/// reads every field.
+/// One input zip will add: a `struct flist` after the whole scan.
+// `kind`, `meta`, `dostime`, `dosflag`: zipup stats each name again, as
+// the C does; Task 7's updates compare the scan's times with the archive's.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct Found {
@@ -1166,8 +1167,7 @@ pub(crate) fn run(z: &mut Zr) -> Exit {
         }
         return z.ziperr(ZE_NONE, &zipfile);
     }
-    // Task 6 writes the archive.
-    z.not_built()
+    super::zipup::write_new(z, found)
 }
 
 #[cfg(test)]
