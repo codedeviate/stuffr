@@ -337,7 +337,8 @@ These come from the design specification and are the reason Phase 0 shipped as
 | `0.17.0` | `stuffr bench` — every writable, non-weak codec timed on the user's own files (size, ratio, compress and decompress time, winners by smallest, fastest and best balance), one stream or `--per-file`, `--levels` sweeps, `--repeat` medians, `--json`/`--csv`/`--table-only`; a release build is required. A MINOR because it is a new user-facing verb. |
 | `0.17.1` | Bench follow-ups — a progress bar within each row, unreadable inputs refused as usage errors naming the path (exit 2), each codec's output destination chosen from its own worst case (a row timed with disk output is marked `*`), the `lzma-c` passthrough feature, and a lz4 fuzz oracle that holds quiet decodes to the loud re-run's count. A PATCH. |
 | `0.18.0` | Phase 5's seventh part — the compress compatibility family (`compress`, `uncompress`; `zcat` stays in the gzip family) in two personalities, a port of Apple's file_cmds-487.0.1 `compress` (default on macOS and the BSDs, `LICENSE-compress-bsd`) and a port of ncompress 5.0 with Ubuntu's `5.0-1` patches (default elsewhere, `LICENSE-ncompress`), chosen by platform or `STUFFR_COMPRESS_FLAVOR`; stdout, stderr, exit codes and compressed bytes identical to the reference wherever its output is a valid stream; `install-links` now makes twenty-seven names; `stuffr-cli` licensed `MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD AND Info-ZIP AND Unlicense`. A MINOR because it is a new user-facing surface. |
-| `0.18.x`/later | The rest of Phase 5 — the remaining compatibility families, one per release (`tar` excluded), each claiming the next open number; polish (completions, man pages) under a separate spec. |
+| `0.19.0` | Phase 5's eighth part — the zip compatibility family (`zip`, `zipcloak`, `zipnote`, `zipsplit`) behaving as Info-ZIP Zip 3.0 in two flavours, Apple's `zip-33` tree (a port, `LICENSE-infozip`) and Ubuntu 24.04's `3.0-13ubuntu0.2` (Unicode paths, bzip2, the thirteen-patch series), chosen by platform or `STUFFR_ZIP_FLAVOR`; stdout, stderr, exit codes and every archive byte identical to the reference in both (encryption compatible only: the ten random bytes of each 12-byte header differ), including split archives, `-F`/`-FF` and the helpers, over the doc-hidden `stuffr::infozip` deflater; twenty-nine stated deviations; `install-links` now makes thirty-one names. A MINOR because it is a new user-facing surface. |
+| `0.19.x`/later | The rest of Phase 5 — the remaining compatibility families, one per release (`tar` excluded), each claiming the next open number; polish (completions, man pages) under a separate spec. |
 | `1.0.0` | Reserved for feature-complete, not for any single phase — no earlier milestone claims it. |
 
 This table was revised after Phase 1: the original plan put legacy read/write
@@ -1317,6 +1318,15 @@ binary `// probe:`. The module doc of `compat/unzip/mod.rs` is the source of
 truth for the ten deviations; the README mirrors it. The shared decoders and
 the crypt keys live in the doc-hidden `stuffr::infozip`. `make
 compat-ubuntu` runs the unzip suites against Ubuntu's unzip in Docker.
+
+**The zip family** (`compat/zip/`) is a port of Info-ZIP Zip 3.0 in two
+flavours, built like unzip's: Apple's `zip-33` tree is the base and Ubuntu's
+`3.0-13ubuntu0.2` is a set of flavour checks (`flavour.rs`, one function per
+Debian define or patch). Comment conventions are unzip's (`// port:`, `//
+apple:`, `// ubuntu:`, `// probe:`, plus `// ruling:` for each undefined
+behaviour decision). The module doc of `compat/zip/mod.rs` is the source of
+truth for the twenty-nine deviations; the README mirrors it. `make
+compat-ubuntu` runs the zip suites against Ubuntu's zip in Docker.
 
 **Reference tools.** The bzip2 family is tested against the system
 `/usr/bin/bzip2` and `/usr/bin/bzip2recover`, which are not the same program
