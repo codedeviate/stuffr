@@ -277,7 +277,10 @@
 //!     template (`sprintf(name, template, n)`, undefined behaviour); stuffr takes it
 //!     as a character. After an error writing the index under `-p` and a
 //!     yes to "redo entire disk?", the C goes back to the wrong disk (its
-//!     loop variable holds the failure flag); stuffr redoes disk 1.
+//!     loop variable holds the failure flag); stuffr redoes disk 1. An
+//!     interrupt removes the parts only when `-b`'s directory is shorter
+//!     than half of `PATH_MAX` (the handler's static holds that much;
+//!     longer arms nothing and the parts stay).
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};

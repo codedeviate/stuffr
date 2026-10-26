@@ -29,7 +29,7 @@ pub(crate) struct FileSink {
     pos: u64,
     /// The buffer's size when the stream is a plain `fopen` one (zipsplit's
     /// files): a write goes through as libc's `fwrite` makes it.
-    stdio: Option<usize>,
+    stdio: Option<(usize, bool)>,
     /// stdio's error flag: the first write error (its `errno`), sticky.
     err: Option<(Option<i32>, io::ErrorKind)>,
 }
@@ -61,27 +61,57 @@ impl FileSink {
     }
 
     /// zipsplit's streams: `FileSink::with_capacity` whose writes are libc's
-    /// `fwrite` as well: what fills the buffer is flushed, the rest goes
-    /// out in whole blocks and the last part, shorter than a block, stays
-    /// in the buffer until the stream is flushed or closed. Where a write
-    /// error shows (a limit on the file's size) depends on it.
-    pub(crate) fn stdio(cap: usize, f: File, budget: Option<Arc<AtomicU64>>) -> FileSink {
+    /// `fwrite` as well. What fills the buffer is flushed, whole blocks go
+    /// out directly and the last part, shorter than a block, stays in the
+    /// buffer until the stream is flushed or closed; where a write error
+    /// shows (a limit on the file's size) depends on it. glibc retries a
+    /// direct write until it has all gone (`bsd` false); Apple's
+    /// `__sfvwrite` takes a short direct write as progress and works out
+    /// what is left again, which may then be less than a block and stay
+    /// buffered (`bsd`: measured under `ulimit -f` against `/usr/bin/zipsplit`).
+    pub(crate) fn stdio(
+        cap: usize,
+        f: File,
+        budget: Option<Arc<AtomicU64>>,
+        bsd: bool,
+    ) -> FileSink {
         let mut s = FileSink::with_capacity(cap, f, budget);
-        s.stdio = Some(cap);
+        s.stdio = Some((cap, bsd));
         s
     }
 
-    fn fwrite(&mut self, buf: &[u8], cap: usize) -> io::Result<()> {
-        let space = cap - self.f.buffer().len();
-        if buf.len() <= space {
-            return self.f.write_all(buf);
+    fn fwrite(&mut self, mut buf: &[u8], cap: usize, bsd: bool) -> io::Result<()> {
+        if !bsd {
+            let space = cap - self.f.buffer().len();
+            if buf.len() <= space {
+                return self.f.write_all(buf);
+            }
+            self.f.write_all(&buf[..space])?;
+            self.f.flush()?;
+            let rest = &buf[space..];
+            let direct = rest.len() - rest.len() % cap;
+            self.f.write_all(&rest[..direct])?;
+            return self.f.write_all(&rest[direct..]);
         }
-        self.f.write_all(&buf[..space])?;
-        self.f.flush()?;
-        let rest = &buf[space..];
-        let direct = rest.len() - rest.len() % cap;
-        self.f.write_all(&rest[..direct])?;
-        self.f.write_all(&rest[direct..])
+        while !buf.is_empty() {
+            let space = cap - self.f.buffer().len();
+            if !self.f.buffer().is_empty() && buf.len() > space {
+                // fill and flush
+                self.f.write_all(&buf[..space])?;
+                self.f.flush()?;
+                buf = &buf[space..];
+            } else if buf.len() >= cap {
+                // write directly, a block at a time
+                let n = self.f.get_mut().write(&buf[..cap])?;
+                if n == 0 {
+                    return Err(io::Error::from(io::ErrorKind::WriteZero));
+                }
+                buf = &buf[n..];
+            } else {
+                return self.f.write_all(buf);
+            }
+        }
+        Ok(())
     }
 
     /// Remember a failed write as stdio's error flag does.
@@ -154,7 +184,7 @@ impl Write for Charged {
 impl Write for FileSink {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let r = match self.stdio {
-            Some(cap) => self.fwrite(buf, cap),
+            Some((cap, bsd)) => self.fwrite(buf, cap, bsd),
             None => self.f.write_all(buf),
         };
         if let Err(e) = r {

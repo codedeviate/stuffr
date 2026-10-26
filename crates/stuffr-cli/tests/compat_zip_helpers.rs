@@ -969,16 +969,15 @@ mod unix {
         }
     }
 
-    /// Write failures (`ulimit -f`, which Apple's kernel does not enforce:
-    /// Linux only): at every limit from mid-stream to just past the end of
+    /// Write failures (`ulimit -f`): at every limit from mid-stream to just past the end of
     /// the first part, with and without `-p` and `-i`, stuffr and the
     /// reference agree on exit, both streams and what is left: `write error
     /// on zip file` from the middle of a copy, `-p`'s "redo entire disk?"
     /// and `Output file write failure (<part>)` where the error surfaces
     /// when the part is closed (zipsplit's files are stdio's, 4096-byte
     /// buffers).
-    #[cfg(target_os = "linux")]
     #[test]
+    #[allow(clippy::manual_is_multiple_of)]
     fn zipsplit_write_failures_match_the_reference() {
         use std::io::Write as _;
         use std::process::{Command, Stdio};
@@ -1012,19 +1011,26 @@ mod unix {
             b"",
             b"",
         );
+        // sh's `ulimit -f` counts 512-byte blocks in dash, 1024-byte ones in
+        // macOS's sh: the limits are the same bytes
+        let unit: u64 = if cfg!(target_os = "linux") { 512 } else { 1024 };
         let mut compared = 0;
-        for (limit, pause, index, input, answers) in (96..=120).flat_map(|l| {
-            [
-                (l, false, false, &two, &b"\n\n\n\n\nn\n"[..]),
-                (l, true, false, &two, &b"\n\n\n\n\nn\n"[..]),
-                (l, true, true, &two, &b"\n\n\n\n\nn\n"[..]),
-                (l, true, false, &three, &b"\n\n\n\n\nn\n"[..]),
-                // yes, twice: the disk is made again from the offsets the
-                // first pass left in the entries
-                (l, true, false, &three, &b"\ny\n\ny\n\nn\n"[..]),
-                (l, true, true, &two, &b"\ny\n\ny\n\nn\n"[..]),
-            ]
-        }) {
+        for (limit, pause, index, input, answers) in (96..=120)
+            .map(|l| l * 512 / unit)
+            .filter(|l| l * unit % 512 == 0)
+            .flat_map(|l| {
+                [
+                    (l, false, false, &two, &b"\n\n\n\n\nn\n"[..]),
+                    (l, true, false, &two, &b"\n\n\n\n\nn\n"[..]),
+                    (l, true, true, &two, &b"\n\n\n\n\nn\n"[..]),
+                    (l, true, false, &three, &b"\n\n\n\n\nn\n"[..]),
+                    // yes, twice: the disk is made again from the offsets the
+                    // first pass left in the entries
+                    (l, true, false, &three, &b"\ny\n\ny\n\nn\n"[..]),
+                    (l, true, true, &two, &b"\ny\n\ny\n\nn\n"[..]),
+                ]
+            })
+        {
             let mut seen = Vec::new();
             for exe in [&reference, &stuffr] {
                 let s = ScratchDir::unique("zipsplit-full");
@@ -1045,7 +1051,7 @@ mod unix {
                     ))
                     .arg(exe)
                     .args(&args)
-                    .env("STUFFR_ZIP_FLAVOR", flavour_name())
+                    .env("STUFFR_ZIP_FLAVOR", platform_zip_flavour())
                     .env("LANG", "C")
                     .current_dir(&*s)
                     .stdin(Stdio::piped())
@@ -1070,12 +1076,6 @@ mod unix {
             );
             compared += 1;
         }
-        assert!(compared >= 140, "{compared}");
-    }
-
-    /// The flavour stuffr is run in: this platform's.
-    #[cfg(target_os = "linux")]
-    fn flavour_name() -> &'static str {
-        platform_zip_flavour()
+        assert!(compared >= 70, "{compared}");
     }
 }

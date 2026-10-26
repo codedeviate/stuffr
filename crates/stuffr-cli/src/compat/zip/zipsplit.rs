@@ -40,7 +40,7 @@ use super::split::{self, Prompt};
 use super::zipcloak::fail_exit;
 use super::zipfile::{self, CENHEAD, LOCHEAD, PutError, ZEntry, ZOut};
 use super::zipup::write_failed;
-use super::{Exit, Zr, scan};
+use super::{Exit, Flavour, Zr, scan};
 use crate::compat::host::{self, Host};
 
 /// ziperr.h codes zipsplit raises.
@@ -422,7 +422,12 @@ fn make_part(
             Ok(f) => f,
             Err(e) => return Err(part_error(z, job, ZE_CREAT, &path, &e)),
         };
-        let mut w = FileSink::stdio(STDIO_BUF, f, job.budget.clone());
+        let mut w = FileSink::stdio(
+            STDIO_BUF,
+            f,
+            job.budget.clone(),
+            z.flavour == Flavour::Apple,
+        );
         let mut buf = Vec::new();
         for (idx, zf) in zfiles.iter().enumerate() {
             let n = format!("{:>5}", job.a[idx] + 1);
@@ -446,7 +451,12 @@ fn make_part(
         Ok(f) => f,
         Err(e) => return Err(part_error(z, job, ZE_CREAT, &path, &e)),
     };
-    out.restart(Box::new(FileSink::stdio(STDIO_BUF, f, job.budget.clone())));
+    out.restart(Box::new(FileSink::stdio(
+        STDIO_BUF,
+        f,
+        job.budget.clone(),
+        z.flavour == Flavour::Apple,
+    )));
     let mut tempzn = 0u64;
 
     // write local headers and copy compressed data
