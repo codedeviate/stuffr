@@ -68,6 +68,11 @@ pub(crate) fn getp(z: &mut Zr, prompt: &[u8]) -> Option<Password> {
 /// `rand()` draws), from the system: `getentropy()` (macOS and the BSDs),
 /// `getrandom()` (Linux), else `/dev/urandom`; never a seeded `rand()`.
 /// `Err` when the system gives none (the caller ends the run).
+///
+/// `getentropy` is declared for each of these targets by the `libc` crate
+/// in Cargo.lock (0.2.189: `unix/bsd/apple`, `unix/bsd/freebsdlike` for
+/// FreeBSD and DragonFly, `unix/bsd/netbsdlike` for NetBSD and OpenBSD).
+#[cfg(unix)]
 pub(crate) fn random_header() -> std::io::Result<[u8; 10]> {
     let mut b = [0u8; 10];
     #[cfg(any(
@@ -103,14 +108,14 @@ pub(crate) fn random_header() -> std::io::Result<[u8; 10]> {
             return Ok(b);
         }
     }
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b))?;
-        Ok(b)
-    }
-    #[cfg(not(unix))]
-    {
-        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
-    }
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b))?;
+    Ok(b)
+}
+
+/// Off unix the system gives no generator this port reads: `Err`, and the
+/// caller ends the run.
+#[cfg(not(unix))]
+pub(crate) fn random_header() -> std::io::Result<[u8; 10]> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
 }

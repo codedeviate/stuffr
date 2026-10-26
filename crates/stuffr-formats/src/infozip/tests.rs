@@ -224,17 +224,17 @@ mod crypt {
         assert_eq!(body, data);
     }
 
-    /// `crypthead` from Apple's zip-33 `crypt.c`, its body verbatim, in a
-    /// scratch `ch.c` with `rand()` stubbed to return `draw << 7` for the
-    /// fixed draws 10 21 32 43 54 65 76 87 98 ff, `bfwrite` capturing the
-    /// 12 bytes, and `init_keys`/`update_keys`/`decrypt_byte`/`zencode`
-    /// copied from the same file:
-    ///
-    ///   cc -O0 -Wall -include stdlib.h -o ch ch.c \
-    ///     && ./ch secret 9f606eec && ./ch "" 0000ffff
-    ///
-    /// (Apple clang.) The second argument is the CRC, whose bits 16..32 are
-    /// `check`. The C harness is not committed.
+    // `crypthead` from Apple's zip-33 `crypt.c`, its body verbatim, in a
+    // scratch `ch.c` with `rand()` stubbed to return `draw << 7` for the
+    // fixed draws 10 21 32 43 54 65 76 87 98 ff, `bfwrite` capturing the
+    // 12 bytes, and `init_keys`/`update_keys`/`decrypt_byte`/`zencode`
+    // copied from the same file:
+    //
+    //   cc -O0 -Wall -include stdlib.h -o ch ch.c \
+    //     && ./ch secret 9f606eec && ./ch "" 0000ffff
+    //
+    // (Apple clang.) The second argument is the CRC, whose bits 16..32 are
+    // `check`. The C harness is not committed.
     const DRAWS: [u8; 10] = [0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xff];
 
     #[test]

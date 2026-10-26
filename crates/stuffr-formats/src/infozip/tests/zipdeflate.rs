@@ -603,8 +603,12 @@ fn first_entry(zip: &[u8]) -> (u16, u16, u32, &[u8]) {
 fn reference_entry(zip_bin: &Path, dir: &Path, name: &str, level: u8) -> Vec<u8> {
     let archive = dir.join(format!("{name}-{level}.zip"));
     let _ = std::fs::remove_file(&archive);
+    // zip reads ZIP and ZIPOPT before its arguments: an exported one would
+    // change the goldens
     let st = std::process::Command::new(zip_bin)
         .current_dir(dir)
+        .env_remove("ZIP")
+        .env_remove("ZIPOPT")
         .arg("-X")
         .arg("-q")
         .arg(format!("-{level}"))

@@ -345,7 +345,9 @@ fn file_read_translates_each_request() {
 /// rewrite) sends the entry to a data descriptor, and the next local
 /// header finds the stream's error flag: "unexpected error on zip file"
 /// (14); deflate's `seekable()` flushes too; and what only `fclose` cannot
-/// flush is "Temporary file failure" (10). Nothing is left behind.
+/// flush is "Temporary file failure" (10). Nothing is left behind. Unix
+/// only: the system's text for the failure is unix's ("File too large").
+#[cfg(unix)]
 #[test]
 fn a_failed_write_is_zips_write_error() {
     let efbig = "zip I/O error: File too large\n";

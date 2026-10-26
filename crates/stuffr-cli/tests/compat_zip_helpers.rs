@@ -1012,12 +1012,14 @@ mod unix {
             b"",
         );
         // sh's `ulimit -f` counts 512-byte blocks in dash, 1024-byte ones in
-        // macOS's sh: the limits are the same bytes
+        // macOS's sh: the limits are the same bytes, those a whole number of
+        // units holds (so no limit is tried twice). Linux's sh is taken to be
+        // dash: true on ubuntu-24.04 and in the compat-ubuntu image.
         let unit: u64 = if cfg!(target_os = "linux") { 512 } else { 1024 };
         let mut compared = 0;
-        for (limit, pause, index, input, answers) in (96..=120)
+        for (limit, pause, index, input, answers) in (96..=120u64)
+            .filter(|l| l * 512 % unit == 0)
             .map(|l| l * 512 / unit)
-            .filter(|l| l * unit % 512 == 0)
             .flat_map(|l| {
                 [
                     (l, false, false, &two, &b"\n\n\n\n\nn\n"[..]),
