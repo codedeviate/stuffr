@@ -847,4 +847,235 @@ mod unix {
         }
         assert!(n >= 65, "{n} runs");
     }
+
+    /// Ruling Z27: zipsplit interrupted while it writes its second part
+    /// removes the index and every part made, as the C's handler does
+    /// through `ziperr`: INT, TERM, ABRT, BUS, ILL and SEGV print
+    /// `Interrupted (aborting)` after the run's output and exit 9; HUP
+    /// kills it and leaves them. Both sides must agree (output, exit,
+    /// what is left). The second part is a 64 MiB (then 256 MiB) stored
+    /// entry, so the signal lands while it is being copied.
+    #[test]
+    fn zipsplit_interrupts_match_the_reference() {
+        use super::compat_harness::interrupt::*;
+        use std::os::unix::process::ExitStatusExt;
+        let _serial = interrupt_lock();
+        let Some(dir) = zip_dir() else {
+            return;
+        };
+        let reference = std::path::Path::new(dir).join("zipsplit");
+        if !require_reference(&reference) {
+            return;
+        }
+        let stuffr = std::path::PathBuf::from(env!("CARGO_BIN_EXE_stuffr"));
+        let flavour = platform_zip_flavour();
+        let env = [("STUFFR_ZIP_FLAVOR", flavour), ("LANG", "C"), ("TZ", "UTC")];
+        let rows: [(i32, bool); 8] = [
+            (libc::SIGINT, false),
+            (libc::SIGINT, true),
+            (libc::SIGTERM, true),
+            (libc::SIGABRT, false),
+            (libc::SIGBUS, true),
+            (libc::SIGILL, false),
+            (libc::SIGSEGV, true),
+            (libc::SIGHUP, true),
+        ];
+        for (sig, index) in rows {
+            let mut seen = Vec::new();
+            for exe in [&reference, &stuffr] {
+                let s = ScratchDir::unique("zipsplit-intr");
+                let mut got = None;
+                for mib in [64usize, 256] {
+                    let _ = std::fs::remove_dir_all(&*s);
+                    std::fs::create_dir_all(&*s).unwrap();
+                    let big = big_input(mib);
+                    let zip = zip_with(
+                        &[
+                            ZipEntrySpec::new(b"a", b"hi"),
+                            ZipEntrySpec::new(b"big", &big),
+                        ],
+                        b"",
+                        b"",
+                    );
+                    std::fs::write(s.join("t.zip"), zip).unwrap();
+                    // the first part holds `a` alone, the second `big`
+                    let n = (big.len() + 142).to_string();
+                    let mut args = vec!["-n", &n, "-s"];
+                    if index {
+                        args.push("-i");
+                    }
+                    args.push("t.zip");
+                    let d: &std::path::Path = &s;
+                    let ready = |name: &str| {
+                        name == "t2.zip"
+                            && std::fs::metadata(d.join(name)).map_or(0, |m| m.len()) > 100_000
+                    };
+                    match interrupt_listing_stdout(
+                        exe,
+                        "zipsplit",
+                        &args,
+                        d,
+                        &env,
+                        Inherit::Default,
+                        sig,
+                        &ready,
+                    ) {
+                        Some(r) if !r.status.success() => {
+                            got = Some(r);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(r) = got else {
+                    assert!(
+                        exe == &reference && take_reference_hung(),
+                        "signal {sig}: no run"
+                    );
+                    continue;
+                };
+                let left: Vec<String> = r
+                    .left
+                    .iter()
+                    .filter(|n| n.as_str() != "t.zip")
+                    .cloned()
+                    .collect();
+                seen.push((r.status.code(), r.status.signal(), r.stdout, r.stderr, left));
+            }
+            if seen.len() != 2 {
+                continue;
+            }
+            if sig == libc::SIGHUP {
+                // killed: the C's buffered standard output (a pipe) is lost
+                // with it, stuffr's is written as it goes
+                seen[0].2.clear();
+                seen[1].2.clear();
+            }
+            assert_eq!(seen[0], seen[1], "signal {sig}, index {index}");
+            let (code, signal, stdout, _, left) = &seen[1];
+            if sig == libc::SIGHUP {
+                assert_eq!(*signal, Some(sig));
+                assert!(left.iter().any(|n| n == "t2.zip"), "{left:?}");
+            } else {
+                assert_eq!(*code, Some(9), "signal {sig}");
+                assert!(
+                    String::from_utf8_lossy(stdout)
+                        .ends_with("creating: t2.zip\n\nzipsplit error: Interrupted (aborting)\n"),
+                    "{}",
+                    String::from_utf8_lossy(stdout)
+                );
+                assert!(left.is_empty(), "left behind: {left:?}");
+            }
+        }
+    }
+
+    /// Write failures (`ulimit -f`, which Apple's kernel does not enforce:
+    /// Linux only): at every limit from mid-stream to just past the end of
+    /// the first part, with and without `-p` and `-i`, stuffr and the
+    /// reference agree on exit, both streams and what is left: `write error
+    /// on zip file` from the middle of a copy, `-p`'s "redo entire disk?"
+    /// and `Output file write failure (<part>)` where the error surfaces
+    /// when the part is closed (zipsplit's files are stdio's, 4096-byte
+    /// buffers).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zipsplit_write_failures_match_the_reference() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+        let Some(dir) = zip_dir() else {
+            return;
+        };
+        let reference = std::path::Path::new(dir).join("zipsplit");
+        if !require_reference(&reference) {
+            return;
+        }
+        let links = ScratchDir::unique("zipsplit-link");
+        std::fs::create_dir_all(&*links).unwrap();
+        let stuffr = links.join("zipsplit");
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &stuffr).unwrap();
+        // two entries in a part each of its own, and three in one part
+        // (where a redo reads offsets zipcopy has overwritten)
+        let two = zip_with(
+            &[
+                ZipEntrySpec::new(b"r1", &random(60_000, 1)),
+                ZipEntrySpec::new(b"r2", &random(60_000, 2)),
+            ],
+            b"",
+            b"",
+        );
+        let three = zip_with(
+            &[
+                ZipEntrySpec::new(b"r1", &random(20_000, 1)),
+                ZipEntrySpec::new(b"r2", &random(20_000, 2)),
+                ZipEntrySpec::new(b"r3", &random(20_000, 3)),
+            ],
+            b"",
+            b"",
+        );
+        let mut compared = 0;
+        for (limit, pause, index, input, answers) in (96..=120).flat_map(|l| {
+            [
+                (l, false, false, &two, &b"\n\n\n\n\nn\n"[..]),
+                (l, true, false, &two, &b"\n\n\n\n\nn\n"[..]),
+                (l, true, true, &two, &b"\n\n\n\n\nn\n"[..]),
+                (l, true, false, &three, &b"\n\n\n\n\nn\n"[..]),
+                // yes, twice: the disk is made again from the offsets the
+                // first pass left in the entries
+                (l, true, false, &three, &b"\ny\n\ny\n\nn\n"[..]),
+                (l, true, true, &two, &b"\ny\n\ny\n\nn\n"[..]),
+            ]
+        }) {
+            let mut seen = Vec::new();
+            for exe in [&reference, &stuffr] {
+                let s = ScratchDir::unique("zipsplit-full");
+                std::fs::create_dir_all(&*s).unwrap();
+                std::fs::write(s.join("t.zip"), input).unwrap();
+                let mut args = vec!["-n".to_owned(), "70000".to_owned()];
+                if pause {
+                    args.push("-p".into());
+                }
+                if index {
+                    args.push("-i".into());
+                }
+                args.push("t.zip".into());
+                let mut cmd = Command::new("sh");
+                cmd.arg("-c")
+                    .arg(format!(
+                        "trap '' XFSZ; ulimit -f {limit}; exec \"$0\" \"$@\""
+                    ))
+                    .arg(exe)
+                    .args(&args)
+                    .env("STUFFR_ZIP_FLAVOR", flavour_name())
+                    .env("LANG", "C")
+                    .current_dir(&*s)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let mut child = spawn(&mut cmd).unwrap();
+                let mut sin = child.stdin.take().unwrap();
+                let _ = sin.write_all(answers);
+                drop(sin);
+                let o = child.wait_with_output().unwrap();
+                let mut left: Vec<String> = std::fs::read_dir(&*s)
+                    .unwrap()
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect();
+                left.sort();
+                seen.push((o.status.code(), o.stdout, o.stderr, left));
+            }
+            assert_eq!(
+                seen[0], seen[1],
+                "limit {limit} blocks, -p {pause}, -i {index}, answers {answers:?}"
+            );
+            compared += 1;
+        }
+        assert!(compared >= 140, "{compared}");
+    }
+
+    /// The flavour stuffr is run in: this platform's.
+    #[cfg(target_os = "linux")]
+    fn flavour_name() -> &'static str {
+        platform_zip_flavour()
+    }
 }

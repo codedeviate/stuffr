@@ -563,6 +563,169 @@ static ZIP_ABORT_EXTRA: std::sync::atomic::AtomicPtr<u8> =
 #[cfg(unix)]
 static ZIP_ABORT_EXTRA_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// zipsplit's cleanup for [`on_zip_abort`]: the names `ziperr` removes, as
+/// the template makes them (the directory, the name's prefix, the digits),
+/// and how many parts and whether the index have been made. Fixed statics,
+/// so the handler never allocates or locks.
+#[cfg(unix)]
+struct SplitNames(std::cell::UnsafeCell<[u8; SLOT_LEN]>);
+
+// SAFETY: written only by `arm_split_cleanup` with `SPLIT_ARMED` false and
+// read only by the handler after it saw `SPLIT_ARMED` true (Acquire,
+// pairing with the Release after the write).
+#[cfg(unix)]
+unsafe impl Sync for SplitNames {}
+
+#[cfg(unix)]
+static SPLIT_DIR: SplitNames = SplitNames(std::cell::UnsafeCell::new([0; SLOT_LEN]));
+#[cfg(unix)]
+static SPLIT_DIR_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(unix)]
+static SPLIT_PREFIX: SplitNames = SplitNames(std::cell::UnsafeCell::new([0; SLOT_LEN]));
+#[cfg(unix)]
+static SPLIT_PREFIX_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(unix)]
+static SPLIT_DIGITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(unix)]
+static SPLIT_PARTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(unix)]
+static SPLIT_INDEX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(unix)]
+static SPLIT_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What a zipsplit run holds while it may have made files; dropping it
+/// disarms the handler's removal.
+#[must_use = "dropping the guard disarms the cleanup at once"]
+pub(crate) struct SplitGuard {
+    armed: bool,
+}
+
+impl Drop for SplitGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if self.armed {
+            SPLIT_ARMED.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Arm the handler ([`install_zip_abort`]'s) to remove what zipsplit made
+/// when it is interrupted, as `ziperr` does: the index, then the parts
+/// `<dir><prefix><n padded to digits>.zip` from the last made down to 1.
+/// Nothing under a sandbox, or for a directory the static cannot hold.
+pub(crate) fn arm_split_cleanup(
+    host: &Host,
+    dir: &[u8],
+    prefix: &[u8],
+    digits: usize,
+) -> SplitGuard {
+    #[cfg(unix)]
+    if matches!(host, Host::Real) && dir.len() < SLOT_LEN / 2 && prefix.len() < 16 {
+        SPLIT_ARMED.store(false, Ordering::SeqCst);
+        // SAFETY: SPLIT_ARMED is false, so no handler reads the buffers;
+        // both writes stay inside them (lengths checked above).
+        unsafe {
+            std::ptr::copy_nonoverlapping(dir.as_ptr(), SPLIT_DIR.0.get().cast::<u8>(), dir.len());
+            std::ptr::copy_nonoverlapping(
+                prefix.as_ptr(),
+                SPLIT_PREFIX.0.get().cast::<u8>(),
+                prefix.len(),
+            );
+        }
+        SPLIT_DIR_LEN.store(dir.len(), Ordering::SeqCst);
+        SPLIT_PREFIX_LEN.store(prefix.len(), Ordering::SeqCst);
+        SPLIT_DIGITS.store(digits, Ordering::SeqCst);
+        SPLIT_PARTS.store(0, Ordering::SeqCst);
+        SPLIT_INDEX.store(false, Ordering::SeqCst);
+        SPLIT_ARMED.store(true, Ordering::Release);
+        return SplitGuard { armed: true };
+    }
+    let _ = (host, dir, prefix, digits);
+    SplitGuard { armed: false }
+}
+
+/// zipsplit's `zipsmade` and `indexmade`, as the handler should see them.
+pub(crate) fn split_progress(parts: u64, index: bool) {
+    #[cfg(unix)]
+    {
+        SPLIT_PARTS.store(parts, Ordering::SeqCst);
+        SPLIT_INDEX.store(index, Ordering::SeqCst);
+    }
+    #[cfg(not(unix))]
+    let _ = (parts, index);
+}
+
+/// The handler's half of [`arm_split_cleanup`]: unlink the index, then
+/// each part from the last. Only stack memory and `unlink`.
+#[cfg(unix)]
+fn remove_split_files() {
+    if !SPLIT_ARMED.load(Ordering::Acquire) {
+        return;
+    }
+    let mut buf = [0u8; SLOT_LEN + 48];
+    let dl = SPLIT_DIR_LEN.load(Ordering::SeqCst).min(SLOT_LEN / 2);
+    let pl = SPLIT_PREFIX_LEN.load(Ordering::SeqCst).min(16);
+    // SAFETY: the buffers were filled before SPLIT_ARMED was set; the
+    // lengths are clamped to what they hold and `buf` is larger than
+    // dir + prefix + 20 digits + ".zip" + NUL.
+    unsafe {
+        std::ptr::copy_nonoverlapping(SPLIT_DIR.0.get().cast::<u8>(), buf.as_mut_ptr(), dl);
+    }
+    if SPLIT_INDEX.load(Ordering::SeqCst) {
+        let name = b"zipsplit.idx";
+        buf[dl..dl + name.len()].copy_from_slice(name);
+        buf[dl + name.len()] = 0;
+        // SAFETY: `buf` holds a NUL-terminated path.
+        unsafe { libc::unlink(buf.as_ptr().cast::<libc::c_char>()) };
+    }
+    // SAFETY: as above.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            SPLIT_PREFIX.0.get().cast::<u8>(),
+            buf.as_mut_ptr().add(dl),
+            pl,
+        );
+    }
+    let digits = SPLIT_DIGITS.load(Ordering::SeqCst).min(20);
+    let mut k = SPLIT_PARTS.load(Ordering::SeqCst);
+    while k > 0 {
+        let at = dl + pl;
+        let mut n = k;
+        for i in (0..digits).rev() {
+            buf[at + i] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+        // a part number wider than the digits (the C's %0kld prints it all)
+        let mut end = at + digits;
+        if n > 0 {
+            let mut t = [0u8; 20];
+            let mut tl = 0;
+            while n > 0 {
+                t[tl] = b'0' + (n % 10) as u8;
+                tl += 1;
+                n /= 10;
+            }
+            // shift the padded digits right, put the extra ones in front
+            let mut full = [0u8; 40];
+            let mut fl = 0;
+            while tl > 0 {
+                tl -= 1;
+                full[fl] = t[tl];
+                fl += 1;
+            }
+            full[fl..fl + digits].copy_from_slice(&buf[at..at + digits]);
+            fl += digits;
+            buf[at..at + fl].copy_from_slice(&full[..fl]);
+            end = at + fl;
+        }
+        buf[end..end + 4].copy_from_slice(b".zip");
+        buf[end + 4] = 0;
+        // SAFETY: `buf` holds a NUL-terminated path.
+        unsafe { libc::unlink(buf.as_ptr().cast::<libc::c_char>()) };
+        k -= 1;
+    }
+}
+
 /// The line [`install_zip_abort`]'s handler prints after its error text
 /// (`None`: nothing). A no-op under a sandbox.
 pub(crate) fn zip_abort_extra(host: &Host, extra: Option<&'static [u8]>) {
@@ -660,6 +823,7 @@ extern "C" fn on_zip_abort(_sig: libc::c_int) {
         if ARMED.load(Ordering::Acquire) {
             libc::unlink(SLOT.0.get().cast::<libc::c_char>());
         }
+        remove_split_files();
         libc::_exit(9);
     }
 }

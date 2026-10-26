@@ -27,6 +27,9 @@ const ZBSZ: usize = 16384;
 pub(crate) struct FileSink {
     f: BufWriter<Charged>,
     pos: u64,
+    /// The buffer's size when the stream is a plain `fopen` one (zipsplit's
+    /// files): a write goes through as libc's `fwrite` makes it.
+    stdio: Option<usize>,
     /// stdio's error flag: the first write error (its `errno`), sticky.
     err: Option<(Option<i32>, io::ErrorKind)>,
 }
@@ -35,9 +38,15 @@ impl FileSink {
     /// The file `f`, a sandbox's output `budget` charged as the buffer
     /// reaches it.
     pub(crate) fn new(f: File, budget: Option<Arc<AtomicU64>>) -> FileSink {
+        FileSink::with_capacity(ZBSZ, f, budget)
+    }
+
+    /// [`FileSink::new`] with another buffer: zipsplit's files are stdio's
+    /// default (`st_blksize`, 4096), not zip's `ZBSZ`.
+    pub(crate) fn with_capacity(cap: usize, f: File, budget: Option<Arc<AtomicU64>>) -> FileSink {
         FileSink {
             f: BufWriter::with_capacity(
-                ZBSZ,
+                cap,
                 Charged {
                     f,
                     budget,
@@ -46,8 +55,33 @@ impl FileSink {
                 },
             ),
             pos: 0,
+            stdio: None,
             err: None,
         }
+    }
+
+    /// zipsplit's streams: `FileSink::with_capacity` whose writes are libc's
+    /// `fwrite` as well: what fills the buffer is flushed, the rest goes
+    /// out in whole blocks and the last part, shorter than a block, stays
+    /// in the buffer until the stream is flushed or closed. Where a write
+    /// error shows (a limit on the file's size) depends on it.
+    pub(crate) fn stdio(cap: usize, f: File, budget: Option<Arc<AtomicU64>>) -> FileSink {
+        let mut s = FileSink::with_capacity(cap, f, budget);
+        s.stdio = Some(cap);
+        s
+    }
+
+    fn fwrite(&mut self, buf: &[u8], cap: usize) -> io::Result<()> {
+        let space = cap - self.f.buffer().len();
+        if buf.len() <= space {
+            return self.f.write_all(buf);
+        }
+        self.f.write_all(&buf[..space])?;
+        self.f.flush()?;
+        let rest = &buf[space..];
+        let direct = rest.len() - rest.len() % cap;
+        self.f.write_all(&rest[..direct])?;
+        self.f.write_all(&rest[direct..])
     }
 
     /// Remember a failed write as stdio's error flag does.
@@ -119,7 +153,11 @@ impl Write for Charged {
 
 impl Write for FileSink {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if let Err(e) = self.f.write_all(buf) {
+        let r = match self.stdio {
+            Some(cap) => self.fwrite(buf, cap),
+            None => self.f.write_all(buf),
+        };
+        if let Err(e) = r {
             return Err(self.failed(e));
         }
         self.pos += buf.len() as u64;

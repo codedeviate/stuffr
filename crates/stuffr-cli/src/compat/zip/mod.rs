@@ -273,12 +273,8 @@
 //!     `compat_zip_helpers::zipnote_w_is_the_same_in_both_flavours`
 //!     (stuffr's two flavours agree and exit 0) and, on Ubuntu, against the
 //!     reference. A comment's length wraps at 65536 as the C's `ush` does.
-//! 27. `zipsplit` writes its parts directly, so an interrupt (INT, TERM,
-//!     ABRT, BUS, ILL, SEGV) prints `Interrupted (aborting)` and exits 9
-//!     but leaves the parts made so far (the C's handler removes them all;
-//!     stuffr's can unlink one armed path, and none is armed). A `%` in the
-//!     archive's name is a conversion in the C's name template
-//!     (`sprintf(name, template, n)`, undefined behaviour); stuffr takes it
+//! 27. `zipsplit`: a `%` in the archive's name is a conversion in the C's name
+//!     template (`sprintf(name, template, n)`, undefined behaviour); stuffr takes it
 //!     as a character. After an error writing the index under `-p` and a
 //!     yes to "redo entire disk?", the C goes back to the wrong disk (its
 //!     loop variable holds the failure flag); stuffr redoes disk 1.

@@ -14,9 +14,10 @@
 //! Each output is written directly under its name (`fopen(path, "w")`, no
 //! temporary); an error removes every file made so far, the index too
 //! (`ziperr`). An interrupt (INT, TERM, ABRT, BUS, ILL, SEGV) prints
-//! `zipsplit error: Interrupted (aborting)` and exits 9 as the C's handler
-//! does, but the outputs made so far are left (deviation 27: the handler
-//! can remove only one armed path, and none is armed).
+//! `zipsplit error: Interrupted (aborting)`, removes the index and every
+//! part made, and exits 9, as the C's handler does through `ziperr`
+//! (`host::arm_split_cleanup`: the handler forms the names from the
+//! template itself, in pre-allocated statics).
 //!
 //! `zipsplit` never sets `out_path`, so a split archive, or an archive that
 //! is missing, ends in the C's SIGSEGV (`strcmp(in_path, NULL)`): the same
@@ -50,6 +51,8 @@ const ZE_NAME: i32 = 13;
 const ZE_CREAT: i32 = 15;
 /// zip.h:ENDHEAD plus the signature.
 const END_RECORD: u64 = 18 + 4;
+/// The buffer of a stdio stream opened with `fopen` (`st_blksize`).
+const STDIO_BUF: usize = 4096;
 /// zipsplit.c:INDEX
 const INDEX: &[u8] = b"zipsplit.idx";
 
@@ -314,6 +317,8 @@ pub(crate) fn run(z: &mut Zr, o: SplitOptions) -> Exit {
         index: false,
         parts: 0,
     };
+    // an interrupt removes what has been made, as ziperr does
+    let _guard = host::arm_split_cleanup(&z.host, &made.dir, &made.template.prefix, k);
 
     // Make the zip files from the linked lists of entry numbers
     let mut ia = InArchive { f: None };
@@ -412,11 +417,12 @@ fn make_part(
         printf(&mut l, m::SPLIT_CREATING, &[&path]);
         z.mesg_write(&l);
         made.index = true;
+        host::split_progress(made.parts, made.index);
         let f = match std::fs::File::create(z.host.path(&path)) {
             Ok(f) => f,
             Err(e) => return Err(part_error(z, job, ZE_CREAT, &path, &e)),
         };
-        let mut w = FileSink::new(f, job.budget.clone());
+        let mut w = FileSink::stdio(STDIO_BUF, f, job.budget.clone());
         let mut buf = Vec::new();
         for (idx, zf) in zfiles.iter().enumerate() {
             let n = format!("{:>5}", job.a[idx] + 1);
@@ -435,11 +441,12 @@ fn make_part(
     printf(&mut l, m::SPLIT_CREATING, &[&path]);
     z.mesg_write(&l);
     made.parts = j as u64 + 1;
+    host::split_progress(made.parts, made.index);
     let f = match std::fs::File::create(z.host.path(&path)) {
         Ok(f) => f,
         Err(e) => return Err(part_error(z, job, ZE_CREAT, &path, &e)),
     };
-    out.restart(Box::new(FileSink::new(f, job.budget.clone())));
+    out.restart(Box::new(FileSink::stdio(STDIO_BUF, f, job.budget.clone())));
     let mut tempzn = 0u64;
 
     // write local headers and copy compressed data

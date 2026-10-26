@@ -212,6 +212,31 @@ pub fn interrupt_env(
     )
 }
 
+/// [`interrupt_env`] with standard output captured (`Interrupted::stdout`):
+/// for a run that reports on it and creates files to wait on (zipsplit).
+#[allow(clippy::too_many_arguments)]
+pub fn interrupt_listing_stdout(
+    exe: &Path,
+    name: &str,
+    args: &[&str],
+    dir: &Path,
+    env: &[(&str, &str)],
+    inherit: Inherit,
+    sig: i32,
+    ready: &dyn Fn(&str) -> bool,
+) -> Option<Interrupted> {
+    interrupt_when(
+        exe,
+        name,
+        args,
+        dir,
+        env,
+        inherit,
+        sig,
+        Ready::ListingStdout(ready),
+    )
+}
+
 /// [`interrupt_env`] for a run that writes to standard output (`-c`, a
 /// filter) and creates nothing in `dir` to wait on: standard output is a
 /// pipe, and the run counts as ready once its first byte arrives (the rest
