@@ -30,10 +30,18 @@
 //! (local and central headers, Zip64 fields and end records, the end
 //! record) and `zip.c:main` from the temporary archive to `finish()`
 //! (progress counters and dots, unreadable inputs, `-c`, `-z`, `-m`,
-//! `-o`). An archive already at the path (Task 7), splits (Task 8),
-//! encryption (Task 9), `-T` (Task 7), bzip2 (Task 11) and the helpers'
-//! work still answer `messages::NOT_BUILT` (exit 1). Signals are not armed
-//! yet (Task 7): an interrupted run leaves its `ziXXXXXX` temporary.
+//! `-o`).
+//!
+//! **Task 7 (`readzip.rs`, `update.rs`):** an archive already at the path:
+//! `zipfile.c`'s reading half (`readzipfile`, `scanzipf_regnew`,
+//! `readlocal`, `zipcopy`, `bfcopy`), names matched against its entries
+//! (`zsearch`, patterns for names not on disk), `-u`, `-f`, `-d`, `-FS`,
+//! `-g`, `-U`, `--out`, `-A`, `-J`, `-c`/`-z` over old entries, `-T`/`-TT`
+//! (`check_zipfile`), and zip's interrupt handler (INT, TERM, ABRT, BUS,
+//! ILL, SEGV: the temporary removed, `Interrupted (aborting)`, exit 9;
+//! `host::install_zip_abort`). `-F`/`-FF` and split archives (Task 8),
+//! encryption (Task 9), bzip2 (Task 11) and the helpers' work still answer
+//! `messages::NOT_BUILT` (exit 1).
 //!
 //! **Zr is `G`:** zip's globals are one value per run (`Zr`, with its
 //! options `o`), so a sandboxed run ([`run_in_counted`]) touches nothing of
@@ -117,6 +125,34 @@
 //!     (`No such file or directory` from the time zone lookup in a
 //!     container without tzdata); stuffr shows the write's own error, as
 //!     Apple does.
+//! 13. Reading an archive, undefined behaviour of the C is not reproduced:
+//!     an end record or Zip64 record cut short is read as zeros (the C reads
+//!     its uninitialised stack buffer: Apple, for an archive that is only
+//!     `PK\5\6`, answers "cannot update a split archive"; stuffr sees an
+//!     empty archive); a Zip64 extra field shorter than the sizes it should
+//!     hold is read as zeros past its end; `-X-` stops copying old extra
+//!     blocks at one that runs past its field. And `-g` (grow) writes a copy
+//!     of the archive up to its central directory and renames it into
+//!     place, where zip writes into the archive itself: the bytes are the
+//!     same, but a failure leaves the archive as it was (zip, on a failed
+//!     `-T`, rewrites the old central directory in place and exits 5 with
+//!     `attempting to restore ...`), and `-T -g` tests the temporary, so a
+//!     `-TT` command is given its name, not the archive's.
+//! 14. zip truncates the output (`fopen "wb"`) when it checks that it can
+//!     write it, and removes an existing archive without entries there;
+//!     stuffr opens it without truncating and leaves an existing file, so a
+//!     run that fails before the new archive is in place leaves the output
+//!     as it was. The archive written is the same.
+//! 15. Ruling Z3: a failing `-T` in Ubuntu's build closes the temporary's
+//!     stream twice (`ziperr` after `fclose(y)`) and glibc aborts on the
+//!     double free (exit 5, a blank line, glibc's message); stuffr answers
+//!     as Apple's build does in both flavours: `test of t.zip FAILED`, `zip
+//!     error: Zip file invalid, could not spawn unzip, or wrong unzip
+//!     (original files unmodified)`, exit 8, the temporary removed.
+//! 16. A sandboxed run ([`run_in`]) spawns no `unzip` and no `-TT`
+//!     command: `-T` fails there as without an `unzip` on `PATH`. The
+//!     interrupt handler writes `Interrupted (aborting)` to `mesg` only; a
+//!     `-lf` log does not get it.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -132,9 +168,11 @@ use super::host::{self, Host, SANDBOX_OUTPUT_CAP, Sandbox};
 pub(crate) mod cli;
 pub(crate) mod flavour;
 mod messages;
+pub(crate) mod readzip;
 pub(crate) mod scan;
 pub(crate) mod sink;
 pub(crate) mod unix;
+pub(crate) mod update;
 pub(crate) mod write;
 pub(crate) mod zipfile;
 pub(crate) mod zipup;
@@ -242,6 +280,13 @@ impl<'a> Zr<'a> {
         }
     }
 
+    /// `mesg_line_started = v`, mirrored for the interrupt handler (which
+    /// prints a newline first when a line was started).
+    pub(crate) fn set_line(&mut self, v: bool) {
+        self.mesg_line_started = v;
+        host::zip_mesg_state(&self.host, self.mesg_err, v);
+    }
+
     /// Text written to standard output directly (`printf`, `puts`).
     pub(crate) fn stdout_write(&mut self, b: &[u8]) {
         let _ = self.out.write_all(b);
@@ -276,7 +321,7 @@ impl<'a> Zr<'a> {
                 self.mesg_write(b"\n");
             }
             self.mesg_write(&line);
-            self.mesg_line_started = false;
+            self.set_line(false);
         }
         if self.log.is_some() {
             if self.log_line_started {
@@ -298,7 +343,7 @@ impl<'a> Zr<'a> {
                 self.mesg_write(b"\n");
             }
             self.mesg_write(&line);
-            self.mesg_line_started = false;
+            self.set_line(false);
         }
         if self.log.is_some() {
             if self.log_line_started {
@@ -325,7 +370,7 @@ impl<'a> Zr<'a> {
     fn ziperr_with(&mut self, code: i32, h: &[u8], why: Option<Vec<u8>>) -> Exit {
         if self.mesg_line_started {
             self.mesg_write(b"\n");
-            self.mesg_line_started = false;
+            self.set_line(false);
         }
         if self.log.is_some() && self.log_line_started {
             self.log_write(b"\n");

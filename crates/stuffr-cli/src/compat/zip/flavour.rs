@@ -69,9 +69,7 @@ pub(crate) fn help2_brace_line(f: Flavour) -> bool {
 /// `-TT cmd` under Ubuntu is run through `system("cmd 'temp'")` with the
 /// first `{}` replaced by the quoted temp path; under Apple (apple.diff,
 /// zip.c:1425) it is `posix_spawnp` of `cmd` as ONE program name with argv
-/// `[cmd, temp]`, and a `{}` is refused (`ZE_PARMS`, exit 16). For Task 7
-/// (`-T`).
-#[allow(dead_code)]
+/// `[cmd, temp]`, and a `{}` is refused (`ZE_PARMS`, exit 16).
 pub(crate) fn tt_replaces_braces(f: Flavour) -> bool {
     f == Flavour::Ubuntu
 }
@@ -81,6 +79,21 @@ pub(crate) fn tt_replaces_braces(f: Flavour) -> bool {
 #[allow(dead_code)]
 pub(crate) fn shows_newline_escaped(f: Flavour) -> bool {
     f == Flavour::Ubuntu
+}
+
+/// zip.h:LAST_KNOWN_COMPMETHOD, which `-v`'s `zipoddities` compares an
+/// entry's method with: BZIP2 (12) with Ubuntu's `BZIP2_SUPPORT`, DEFLATE
+/// (8) for Apple.
+pub(crate) fn last_known_method(f: Flavour) -> u16 {
+    if bzip2_support(f) { 12 } else { 8 }
+}
+
+/// `-T` (zip.c:check_zipfile): Apple runs `unzip` and a `-TT` command with
+/// `posix_spawnp` (no shell; `{}` refused), Ubuntu through `system()`
+/// (`/bin/sh -c`, the temp path quoted, `{}` replaced). Same as
+/// [`tt_replaces_braces`].
+pub(crate) fn test_through_shell(f: Flavour) -> bool {
+    tt_replaces_braces(f)
 }
 
 /// zip.c:main, `-MM` and an input that could not be opened: Ubuntu's

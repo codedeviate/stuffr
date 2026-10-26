@@ -96,6 +96,10 @@ pub(crate) trait ZWrite: Write {
     fn write_here(&mut self, bytes: &[u8]) -> io::Result<()>;
     /// `zfseeko(y, bytes_this_split, SEEK_SET)`: back to the end.
     fn seek_end(&mut self) -> io::Result<()>;
+    /// zipup.c:seekable's `fseeko(y, ftello(y), SEEK_SET)`: flush and stay
+    /// where the stream really is (an absolute position: standard output
+    /// may have started past 0).
+    fn seek_here(&mut self) -> io::Result<()>;
     /// `ferror(y)`: the error a write of the stream met (sticky, as stdio's
     /// error flag), with the `errno` it left.
     fn ferror(&self) -> Option<io::Error>;

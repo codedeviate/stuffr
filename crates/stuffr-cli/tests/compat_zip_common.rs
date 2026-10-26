@@ -68,6 +68,9 @@ mod unix {
         /// it holds).
         stderr: &'static str,
         stderr_contains: bool,
+        /// Compared with stuffr (false: the reference's answer is
+        /// undefined behaviour stuffr does not reproduce, a ruling).
+        differential: bool,
     }
 
     impl Row {
@@ -109,6 +112,12 @@ mod unix {
             self
         }
 
+        /// Recorded only: stuffr answers otherwise by a ruling.
+        fn reference_only(mut self) -> Row {
+            self.differential = false;
+            self
+        }
+
         /// The task whose differential runs the row.
         fn ready_at(&self) -> u8 {
             self.task.max(self.needs)
@@ -141,6 +150,7 @@ mod unix {
             stdout_contains,
             stderr,
             stderr_contains: false,
+            differential: true,
         }
     }
 
@@ -389,7 +399,7 @@ mod unix {
                 "test of t.zip FAILED\n\nzip error: Zip file invalid, could not spawn unzip, or wrong unzip (original files unmodified)\n\n",
                 // glibc's wording may differ on CI's x86_64
                 "double free"
-            ).stderr_contains(),
+            ).stderr_contains().reference_only(),
             row(Apple, 7, "-TT with {}", "zip", &["-T", "-TT", "true {}", "t.zip", "a.txt"], 16,
                 "\nzip error: Invalid command arguments ({} in -TT not supported)\n", ""),
             row(Ubuntu, 7, "-TT through a shell", "zip", &["-T", "-TT", "true {}", "t.zip", "a.txt"], 0,
@@ -478,7 +488,7 @@ mod unix {
     fn rows_of(task: u8) -> Vec<Case<'static>> {
         rows()
             .into_iter()
-            .filter(|r| r.ready_at() == task && r.runs_here())
+            .filter(|r| r.ready_at() == task && r.runs_here() && r.differential)
             .map(|r| r.case())
             .collect()
     }
@@ -529,6 +539,50 @@ mod unix {
     #[test]
     fn task6_rows_match_the_reference() {
         differential(6);
+    }
+
+    /// Task 7's rows: updating, deleting, the temporary, `-T`/`-TT`, `-A`
+    /// (Ubuntu's `-T` double free is recorded only: ruling Z3).
+    #[test]
+    fn task7_rows_match_the_reference() {
+        differential(7);
+    }
+
+    /// Ruling Z3 (deviation 15): a failing `-T` answers as Apple's zip in
+    /// both flavours, where Ubuntu's frees the temporary's stream twice and
+    /// aborts (exit 5): `test of t.zip FAILED`, `ZE_TEST` (exit 8), nothing
+    /// on standard error, no temporary left and no archive made.
+    #[test]
+    fn a_failing_test_is_apples_answer_in_both_flavours() {
+        for flavour in ["apple", "ubuntu"] {
+            for args in [
+                &["-T", "-TT", "false", "t.zip", "a.txt"][..],
+                &["-T", "t.zip", "a.txt"],
+            ] {
+                let tree = with_fake_unzip(ZipTree::standard(), "", 1);
+                let mut c = zip_case("zip", args, tree);
+                c.zip_flavour = Some(flavour);
+                c.env = vec![FAKE_UNZIP_PATH];
+                let r = stuffr_zip(&c);
+                assert_eq!(r.code, 8, "{flavour} {args:?}");
+                let out = String::from_utf8_lossy(&r.stdout);
+                assert!(
+                    out.ends_with(
+                        "test of t.zip FAILED\n\nzip error: Zip file invalid, could not spawn unzip, \
+                         or wrong unzip (original files unmodified)\n"
+                    ),
+                    "{flavour} {args:?}: {out:?}"
+                );
+                assert!(r.stderr.is_empty(), "{flavour}: {:?}", r.stderr);
+                let names: Vec<&Vec<u8>> = r.tree.keys().collect();
+                assert!(
+                    !names
+                        .iter()
+                        .any(|k| k.as_slice() == b"t.zip" || k.starts_with(b"zi")),
+                    "{flavour}: {names:?}"
+                );
+            }
+        }
     }
 
     #[test]

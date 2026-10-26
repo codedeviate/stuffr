@@ -56,4 +56,14 @@ mod unix {
             String::from_utf8_lossy(&ours.stdout)
         );
     }
+
+    /// Task 7: a signal during an update or a new archive, as the reference
+    /// answers it (the record's signal table; Review Focus 4).
+    #[test]
+    fn interrupts_match_the_reference() {
+        if !apple_here() {
+            return;
+        }
+        zip_interrupts_match("apple");
+    }
 }

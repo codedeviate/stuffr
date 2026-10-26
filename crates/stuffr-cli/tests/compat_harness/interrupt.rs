@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 pub struct Interrupted {
     pub status: ExitStatus,
     pub stderr: Vec<u8>,
+    /// Standard output, for [`interrupt_prepared`] (empty otherwise).
+    pub stdout: Vec<u8>,
     /// The run's directory afterwards, sorted.
     pub left: Vec<String>,
 }
@@ -233,6 +235,8 @@ pub fn interrupt_once_stdout_has_data(
 enum Ready<'a> {
     /// An entry of the run's directory satisfies the predicate.
     Listing(&'a dyn Fn(&str) -> bool),
+    /// As `Listing`, standard output captured (a pipe, drained).
+    ListingStdout(&'a dyn Fn(&str) -> bool),
     /// The run has written to its standard output (a pipe).
     Stdout,
 }
@@ -253,8 +257,9 @@ fn interrupt_when(
     cmd.envs(env.iter().copied());
     let stdout = match ready {
         Ready::Listing(_) => Stdio::null(),
-        Ready::Stdout => Stdio::piped(),
+        Ready::Stdout | Ready::ListingStdout(_) => Stdio::piped(),
     };
+    let capture = matches!(ready, Ready::ListingStdout(_));
     cmd.stdin(Stdio::null())
         .stdout(stdout)
         .stderr(Stdio::piped());
@@ -277,16 +282,21 @@ fn interrupt_when(
     // With `Ready::Stdout`: set at the first byte; the thread then drains
     // standard output to its end.
     let wrote = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let _drain = child.stdout.take().map(|mut out| {
+    let drain = child.stdout.take().map(|mut out| {
         let wrote = wrote.clone();
         std::thread::spawn(move || {
+            let mut kept = Vec::new();
             let mut buf = [0u8; 65536];
             while let Ok(n) = out.read(&mut buf) {
                 if n == 0 {
                     break;
                 }
+                if capture {
+                    kept.extend_from_slice(&buf[..n]);
+                }
                 wrote.store(true, std::sync::atomic::Ordering::SeqCst);
             }
+            kept
         })
     });
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -295,7 +305,7 @@ fn interrupt_when(
             return None;
         }
         let is_ready = match ready {
-            Ready::Listing(f) => listing(dir).iter().any(|n| f(n)),
+            Ready::Listing(f) | Ready::ListingStdout(f) => listing(dir).iter().any(|n| f(n)),
             Ready::Stdout => wrote.load(std::sync::atomic::Ordering::SeqCst),
         };
         if is_ready {
@@ -347,11 +357,54 @@ fn interrupt_when(
         return None;
     };
     let stderr = reader.join().unwrap_or_default();
+    let stdout = drain.and_then(|d| d.join().ok()).unwrap_or_default();
     Some(Interrupted {
         status,
         stderr,
+        stdout,
         left: listing(dir),
     })
+}
+
+/// [`interrupt_with_input_env`] for a run whose directory `prepare(mib)`
+/// fills (after it is emptied) and whose standard output is captured: the
+/// same retry at 64 then 256 MiB, the same `None` for a hung reference.
+#[allow(clippy::too_many_arguments)]
+pub fn interrupt_prepared(
+    exe: &Path,
+    name: &str,
+    args: &[&str],
+    dir: &Path,
+    env: &[(&str, &str)],
+    prepare: &dyn Fn(usize),
+    inherit: Inherit,
+    sig: i32,
+    ready: &dyn Fn(&str) -> bool,
+) -> Option<Interrupted> {
+    let mut hung = false;
+    for mib in [64, 256] {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        prepare(mib);
+        match interrupt_when(
+            exe,
+            name,
+            args,
+            dir,
+            env,
+            inherit,
+            sig,
+            Ready::ListingStdout(ready),
+        ) {
+            Some(r) if !r.status.success() => return Some(r),
+            _ => hung |= take_reference_hung(),
+        }
+    }
+    if hung {
+        eprintln!("note: {name} {args:?}: the reference hung after the signal; comparison skipped");
+        return None;
+    }
+    panic!("{name} {args:?}: finished before the signal even at the larger size");
 }
 
 /// `interrupt` over `input(mib)` written to `dir/file`, retrying once with

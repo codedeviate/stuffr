@@ -54,4 +54,14 @@ mod linux {
         let out = String::from_utf8_lossy(&ours.stdout);
         assert!(out.contains("  new^Jline\n  tab^Ihere\n"), "{out}");
     }
+
+    /// Task 7: a signal during an update or a new archive, as the reference
+    /// answers it (the record's signal table; Review Focus 4).
+    #[test]
+    fn interrupts_match_the_reference() {
+        if zip_dir().is_none() {
+            return;
+        }
+        zip_interrupts_match("ubuntu");
+    }
 }

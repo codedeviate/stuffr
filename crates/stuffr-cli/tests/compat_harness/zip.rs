@@ -431,7 +431,7 @@ fn is_temp_name(b: &[u8]) -> bool {
 
 /// Every temporary file name (`zi` + six random characters, a whole path
 /// component: after the start, a space, `(`, `/` or `[`, before the end,
-/// a space, `)`, `]` or a newline) becomes `zi??????`: two runs never pick
+/// a space, `)`, `]`, `'`, `.` or a newline) becomes `zi??????`: two runs never pick
 /// the same, so messages that name one (`Temporary file failure
 /// (ziAb12Cd)`) and test commands given one differ by it alone.
 pub fn mask_temp_names(text: &[u8]) -> Vec<u8> {
@@ -440,7 +440,7 @@ pub fn mask_temp_names(text: &[u8]) -> Vec<u8> {
     while i + 8 <= out.len() {
         let before_ok = i == 0 || matches!(out[i - 1], b' ' | b'(' | b'/' | b'[' | b'\t' | b'\n');
         let after_ok =
-            i + 8 == out.len() || matches!(out[i + 8], b' ' | b')' | b']' | b'\n' | b'\'');
+            i + 8 == out.len() || matches!(out[i + 8], b' ' | b')' | b']' | b'\n' | b'\'' | b'.');
         if before_ok && after_ok && is_temp_name(&out[i..i + 8]) {
             out[i + 2..i + 8].copy_from_slice(b"??????");
             i += 8;
@@ -1513,4 +1513,509 @@ pub fn zip_bytes_matrix(flavour: &'static str) -> Vec<Case<'static>> {
         add(args, tree, None);
     }
     out
+}
+
+// ---- Updating archives (0.19.0 Task 7) ----
+
+/// The archive `zip args` writes over `tree`, made by stuffr in `flavour`
+/// (byte-identical to the reference for new archives: Task 6's matrix), in
+/// a scratch directory; `out` names the archive (`-` for standard output,
+/// returned as written there). An input for the update cases, the same on
+/// both sides.
+pub fn zip_made(flavour: &str, tree: &ZipTree, args: &[&str], out: &str) -> Vec<u8> {
+    use std::os::unix::process::CommandExt;
+    let s = ScratchDir::unique("zip-made");
+    std::fs::create_dir_all(&*s).unwrap();
+    tree.materialise(&s);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_stuffr"));
+    cmd.arg0("zip")
+        .args(args)
+        .current_dir(&*s)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C")
+        .env("TZ", "UTC")
+        .env("STUFFR_ZIP_FLAVOR", flavour)
+        .stdin(Stdio::null());
+    let o = output(&mut cmd).unwrap();
+    assert!(o.status.success(), "zip {args:?}: {o:?}");
+    if out == "-" {
+        o.stdout
+    } else {
+        std::fs::read(s.join(out)).unwrap()
+    }
+}
+
+/// `stuffr pack -o t.zip names` over `tree`: an archive another zip writer
+/// made.
+pub fn packed_zip(tree: &ZipTree, names: &[&str]) -> Vec<u8> {
+    let s = ScratchDir::unique("zip-pack");
+    std::fs::create_dir_all(&*s).unwrap();
+    tree.materialise(&s);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_stuffr"));
+    cmd.arg("pack")
+        .arg("-o")
+        .arg("t.zip")
+        .args(names)
+        .current_dir(&*s)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("TZ", "UTC")
+        .stdin(Stdio::null());
+    let o = output(&mut cmd).unwrap();
+    assert!(o.status.success(), "stuffr pack {names:?}: {o:?}");
+    std::fs::read(s.join("t.zip")).unwrap()
+}
+
+/// A fake `unzip` in `fb/` (a shell script): `unzip -v` prints `version`
+/// (nothing when empty), any other call prints its arguments and exits
+/// `code`. With `PATH=fb:/usr/bin:/bin` both sides run it for `-T`.
+pub fn with_fake_unzip(tree: ZipTree, version: &str, code: i32) -> ZipTree {
+    let v = if version.is_empty() {
+        String::new()
+    } else {
+        format!("echo '{version}'; echo more; ")
+    };
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = -v ]; then {v}exit 0; fi\necho unzip-args: \"$@\"\nexit {code}\n"
+    );
+    tree.file_mode("fb/unzip", script, 0o755)
+}
+
+/// The PATH that finds [`with_fake_unzip`]'s script first.
+pub const FAKE_UNZIP_PATH: (&str, &str) = ("PATH", "fb:/usr/bin:/bin");
+
+/// `b` with `n` bytes from `at` replaced by `with`.
+fn patched(mut b: Vec<u8>, at: usize, with: &[u8]) -> Vec<u8> {
+    b[at..at + with.len()].copy_from_slice(with);
+    b
+}
+
+/// Task 7's byte matrix: archives already at the path, updated, freshened,
+/// deleted from, copied, grown, tested, commented, adjusted, damaged, in
+/// `flavour`, compared byte for byte with the reference (both streams, the
+/// exit code, every archive and the rest of the tree). `failing_tests`:
+/// whether to include the `-T` runs whose test fails (Ubuntu's reference
+/// double-frees there: ruling Z3, pinned stuffr-only).
+pub fn zip_update_matrix(flavour: &'static str, failing_tests: bool) -> Vec<Case<'static>> {
+    let mut out: Vec<Case<'static>> = Vec::new();
+    let mut add = |args: &[&'static str],
+                   tree: ZipTree,
+                   stdin: Option<&[u8]>,
+                   env: &[(&'static str, &'static str)]| {
+        let mut c = zip_case("zip", args, tree);
+        c.zip_flavour = Some(flavour);
+        c.stdin = stdin.map(<[u8]>::to_vec);
+        c.env = env.to_vec();
+        out.push(c);
+    };
+    let std = ZipTree::standard;
+    let ab = zip_made(flavour, &std(), &["t.zip", "a.txt", "b.txt"], "t.zip");
+    let all = zip_made(flavour, &std(), &["-r", "t.zip", "."], "t.zip");
+    let with_x = zip_made(
+        flavour,
+        &std().file("x.txt", b"x\n"),
+        &["t.zip", "a.txt", "b.txt", "x.txt"],
+        "t.zip",
+    );
+    let commented = zip_made(flavour, &std(), &["-z", "t.zip", "a.txt"], "t.zip");
+    let streamed = zip_made(flavour, &std(), &["-", "a.txt", "b.txt"], "-");
+    let fz = zip_made(
+        flavour,
+        &std(),
+        &["-fz", "t.zip", "a.txt", "b.txt"],
+        "t.zip",
+    );
+    let fd = zip_made(
+        flavour,
+        &std(),
+        &["-fd", "t.zip", "a.txt", "b.txt"],
+        "t.zip",
+    );
+    let x_only = zip_made(flavour, &std(), &["-X", "t.zip", "a.txt", "b.txt"], "t.zip");
+    let packed = packed_zip(&std(), &["a.txt", "b.txt"]);
+    let mut prefixed = b"PREFIX-OF-AN-SFX\n".to_vec();
+    prefixed.extend_from_slice(&ab);
+    let a = || std().file("t.zip", ab.clone());
+    // b.txt newer than its entry
+    let newer = || a().times("b.txt", 1_100_000_000, 1_100_000_000);
+
+    // add, update, freshen, delete
+    for (args, tree) in [
+        (&["t.zip", "a.txt"][..], a()),
+        (&["t.zip", "a.txt", "d/c.txt"], a()),
+        (&["t.zip", "d/c.txt"], a()),
+        (&["-0", "t.zip", "b.txt"], a()),
+        (&["-9", "t.zip", "b.txt", "d"], a()),
+        (&["-u", "t.zip", "a.txt", "b.txt", "d/c.txt"], a()),
+        (&["-u", "t.zip", "a.txt", "b.txt"], a()),
+        (&["-u", "t.zip", "a.txt", "b.txt"], newer()),
+        (&["-u", "t.zip"], newer()),
+        (&["-u", "-v", "t.zip"], newer()),
+        (&["-f", "t.zip"], a()),
+        (&["-f", "t.zip"], newer()),
+        (&["-f", "t.zip", "b.txt", "d/c.txt"], newer()),
+        (&["-d", "t.zip", "a.txt"], a()),
+        (&["-d", "t.zip", "a*"], a()),
+        (&["-d", "t.zip", "*"], a()),
+        (&["-d", "t.zip", "nosuch"], a()),
+        (&["-d", "t.zip", "a.txt", "b.txt"], a()),
+        (&["-d", "-du", "-dc", "-db", "t.zip", "b.txt"], a()),
+        (&["-d", "t.zip", "d/*"], std().file("t.zip", all.clone())),
+        (
+            &["-d", "-v", "t.zip", "d/*"],
+            std().file("t.zip", all.clone()),
+        ),
+        (&["t.zip", "*"], a()),
+        (&["t.zip", "*.txt"], a()),
+        (&["-x", "b.txt", "-u", "t.zip"], newer()),
+        (&["-i", "b*", "-f", "t.zip"], newer()),
+        (&["-g", "t.zip", "d/c.txt"], a()),
+        (&["-g", "t.zip", "a.txt"], a()),
+        (&["-o", "t.zip", "d/c.txt"], newer()),
+        (&["-o", "t.zip"], a()),
+        (&["-m", "t.zip", "a.txt", "d/c.txt"], a()),
+        (&["-mu", "t.zip", "a.txt", "b.txt"], newer()),
+        (&["-m", "-v", "-r", "t.zip", "d"], a()),
+        (
+            &["-FS", "t.zip", "a.txt", "b.txt"],
+            std().file("t.zip", with_x.clone()),
+        ),
+        (
+            &["-FS", "-v", "t.zip", "a.txt", "b.txt"],
+            std().file("t.zip", with_x.clone()),
+        ),
+        (&["-FS", "t.zip", "a.txt", "b.txt"], a()),
+        (
+            &["-FS", "-r", "t.zip", "."],
+            std().file("t.zip", all.clone()),
+        ),
+        (
+            &["-FS", "-dc", "t.zip", "a.txt", "d/c.txt"],
+            std().file("t.zip", with_x.clone()),
+        ),
+        (
+            &["-DF", "t.zip", "a.txt", "b.txt", "--out", "o.zip"],
+            newer(),
+        ),
+        (&["-t", "06012010", "t.zip", "a.txt", "b.txt"], newer()),
+        (&["-tt", "06012010", "-d", "t.zip", "a.txt", "b.txt"], a()),
+        (&["-X-", "t.zip", "a.txt"], a()),
+        (&["-X", "t.zip", "a.txt"], a()),
+        (
+            &["-X-", "t.zip", "a.txt"],
+            std().file("t.zip", x_only.clone()),
+        ),
+        (&["-v", "t.zip", "d/c.txt"], a()),
+        (&["-v", "t.zip", "d/c.txt"], std().file("t.zip", fz.clone())),
+        (
+            &["-dc", "-db", "-du", "-dv", "t.zip", "a.txt", "d/c.txt"],
+            a(),
+        ),
+        (&["-dd", "-ds", "32k", "t.zip", "a.txt"], a()),
+        (&["-dg", "-ds", "32k", "t.zip", "a.txt"], a()),
+        (&["-sd", "-u", "t.zip"], newer()),
+        (&["-sd", "t.zip", "d/c.txt"], a()),
+        (&["-q", "t.zip", "a.txt", "d/c.txt"], a()),
+        (&["-sf", "t.zip"], a()),
+        (&["-sf", "t.zip", "d/c.txt"], a()),
+        (&["-sf", "-d", "t.zip", "a.txt"], a()),
+        (&["-sf", "-u", "t.zip"], newer()),
+        // copy mode and --out
+        (&["-U", "t.zip", "a.txt", "--out", "o.zip"], a()),
+        (&["-U", "t.zip", "nosuch", "--out", "o.zip"], a()),
+        (&["-U", "t.zip", "-", "--out", "o.zip"], a()),
+        (&["-U", "-v", "t.zip", "*", "--out", "o.zip"], a()),
+        (&["t.zip", "d/c.txt", "--out", "o.zip"], a()),
+        (&["t.zip", "--out", "o.zip"], a()),
+        (&["-d", "t.zip", "a.txt", "--out", "o.zip"], a()),
+        // Review Focus 3: the archive among its own inputs
+        (&["t.zip", "a.txt", "b.txt", "d", "t.zip"], a()),
+        (&["-r", "t.zip", "."], a()),
+        (&["-r", "-v", "t.zip", "."], a()),
+        (&["-r", "t.zip", "."], std().file("t.zip", all.clone())),
+        // Review Focus 4: the temporary cannot be made
+        (&["-b", "ro", "t.zip", "d/c.txt"], a().dir_mode("ro", 0o555)),
+        (&["-b", "nodir", "t.zip", "d/c.txt"], a()),
+        // archives other writers made, or other options did
+        (&["t.zip", "d/c.txt"], std().file("t.zip", streamed.clone())),
+        (&["t.zip", "a.txt"], std().file("t.zip", streamed.clone())),
+        (&["t.zip", "d/c.txt"], std().file("t.zip", fz.clone())),
+        (&["t.zip", "a.txt"], std().file("t.zip", fz.clone())),
+        (&["t.zip", "d/c.txt"], std().file("t.zip", fd.clone())),
+        (&["t.zip", "d/c.txt"], std().file("t.zip", x_only.clone())),
+        (&["t.zip", "d/c.txt"], std().file("t.zip", packed.clone())),
+        (&["t.zip", "a.txt"], std().file("t.zip", packed.clone())),
+        (
+            &["-d", "t.zip", "a.txt"],
+            std().file("t.zip", packed.clone()),
+        ),
+        (
+            &["t.zip", "d/c.txt"],
+            std().file("t.zip", commented.clone()),
+        ),
+        // a prefix (self-extractor)
+        (&["p.zip", "d/c.txt"], std().file("p.zip", prefixed.clone())),
+        (&["-A", "p.zip"], std().file("p.zip", prefixed.clone())),
+        (&["-J", "p.zip"], std().file("p.zip", prefixed.clone())),
+        (&["-A", "t.zip"], a()),
+        (&["-J", "t.zip"], a()),
+        // archives that cannot be updated
+        (
+            &["t.zip", "a.txt"],
+            a().file_mode("t.zip", ab.clone(), 0o444),
+        ),
+        (&["t.zip", "a.txt"], std().file("t.zip", &ab[..100])),
+        (
+            &["t.zip", "a.txt"],
+            std().file("t.zip", &ab[..ab.len() - 30]),
+        ),
+        (&["t.zip", "a.txt"], std().file("t.zip", b"")),
+        (&["t.zip", "a.txt"], std().dir("t.zip")),
+        (&["-s-", "t.zip", "a.txt"], a()),
+    ] {
+        add(args, tree, None, &[]);
+    }
+    // damaged archives: the end record, the central directory, local headers
+    let eocd = ab.len() - 22;
+    let cd = ab.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+    let second_local = ab[4..].windows(4).position(|w| w == b"PK\x03\x04").unwrap() + 4;
+    for bytes in [
+        // more entries than the directory holds, fewer
+        patched(ab.clone(), eocd + 10, &[3, 0]),
+        patched(ab.clone(), eocd + 10, &[1, 0]),
+        // a comment longer than the file
+        patched(ab.clone(), eocd + 20, &[40, 0]),
+        // the directory's offset past the end, before its start
+        patched(ab.clone(), eocd + 16, &[0xff, 0xff, 0, 0]),
+        patched(ab.clone(), eocd + 16, &[1, 0, 0, 0]),
+        // a damaged central signature
+        patched(ab.clone(), cd + 2, b"\x09\x09"),
+        // a central name of length 0
+        patched(ab.clone(), cd + 28, &[0, 0]),
+        // a local header that is not one, a local name that differs
+        patched(ab.clone(), second_local, b"XX"),
+        patched(ab.clone(), second_local + 30, b"B"),
+        patched(ab.clone(), 30, b"A"),
+        // local version, flags and CRC that differ from the central ones
+        patched(ab.clone(), 4, &[20]),
+        patched(ab.clone(), 6, &[8]),
+        patched(ab.clone(), 14, &[0]),
+        // a disk number on the end record
+        patched(ab.clone(), eocd + 4, &[1, 0]),
+    ] {
+        for args in [
+            &["t.zip", "d/c.txt"][..],
+            &["-u", "t.zip", "a.txt"],
+            &["-v", "t.zip", "a.txt"],
+        ] {
+            add(args, std().file("t.zip", bytes.clone()), None, &[]);
+        }
+    }
+    // comments
+    for (args, tree, stdin) in [
+        (
+            &["-c", "t.zip", "d/c.txt"][..],
+            a(),
+            &b"one\ntwo\nthree\n"[..],
+        ),
+        (&["-c", "t.zip"], a(), b"one\ntwo\n"),
+        (&["-c", "-u", "t.zip"], newer(), b"one\ntwo\n"),
+        (&["-z", "t.zip"], a(), b"new\n.\n"),
+        (
+            &["-z", "t.zip"],
+            std().file("t.zip", commented.clone()),
+            b"new\n.\n",
+        ),
+        (
+            &["-z", "t.zip", "d/c.txt"],
+            std().file("t.zip", commented.clone()),
+            b"x\ny\n.\n",
+        ),
+        (
+            &["-z", "-q", "t.zip"],
+            std().file("t.zip", commented.clone()),
+            b"q\n.\n",
+        ),
+        (
+            &["-z", "t.zip"],
+            std().file("t.zip", commented.clone()),
+            b"",
+        ),
+    ] {
+        add(args, tree, Some(stdin), &[]);
+    }
+    // -T and -TT
+    let fake = |v: &str, code: i32| with_fake_unzip(a(), v, code);
+    for (args, tree) in [
+        (&["-T", "t.zip", "d/c.txt"][..], a()),
+        (&["-T", "t.zip"], a()),
+        (&["-T", "-v", "t.zip", "d/c.txt"], a()),
+        (&["-T", "-m", "t.zip", "d/c.txt"], a()),
+        (&["-T", "t.zip", "d/c.txt"], fake("", 0)),
+        (
+            &["-T", "t.zip", "d/c.txt"],
+            fake("UnZip 6.00 of 20 April 2009", 0),
+        ),
+        (
+            &["-T", "t.zip", "d/c.txt"],
+            fake("UnZip 5.52 of 28 February 2005", 0),
+        ),
+        (
+            &["-T", "-fz", "t.zip", "d/c.txt"],
+            fake("UnZip 6.00 of 20 April 2009", 0),
+        ),
+        (&["-T", "-v", "t.zip", "d/c.txt"], fake("not unzip", 0)),
+        (&["-T", "-TT", "fb/unzip", "t.zip", "d/c.txt"], fake("", 0)),
+        (&["-T", "-TT", "true", "t.zip", "d/c.txt"], a()),
+        (&["-TT", "false", "t.zip", "d/c.txt"], a()),
+        (&["-T", "-TT", "true {}", "t.zip", "d/c.txt"], a()),
+        (&["-T", "-b", "d", "t.zip", "a.txt"], fake("", 0)),
+    ] {
+        add(args, tree, None, &[FAKE_UNZIP_PATH]);
+    }
+    if failing_tests {
+        for (args, tree) in [
+            (&["-T", "t.zip", "d/c.txt"][..], fake("", 1)),
+            (&["-T", "-TT", "false", "t.zip", "d/c.txt"], a()),
+            (
+                &["-T", "-fz", "t.zip", "d/c.txt"],
+                fake("UnZip 5.52 of 28 February 2005", 0),
+            ),
+            (&["-T", "-m", "t.zip", "d/c.txt"], fake("", 2)),
+        ] {
+            add(args, tree, None, &[FAKE_UNZIP_PATH]);
+        }
+    }
+    // an unreadable or vanished file whose entry is updated
+    for args in [
+        &["t.zip", "a.txt", "d/c.txt"][..],
+        &["-MM", "t.zip", "a.txt", "d/c.txt"],
+        &["-u", "t.zip"],
+    ] {
+        add(
+            args,
+            newer().file_mode("a.txt", b"hello\n", 0o000),
+            None,
+            &[],
+        );
+    }
+    // a directory entry whose name is a file now
+    let dir_zip = zip_made(flavour, &std(), &["-r", "t.zip", "d"], "t.zip");
+    add(
+        &["t.zip", "d/"],
+        ZipTree::new()
+            .file("d", b"now a file\n")
+            .file("t.zip", dir_zip),
+        None,
+        &[],
+    );
+    out
+}
+
+/// Review Focus 4 and the record's signal table (0.19.0 Task 7), against
+/// this platform's reference in `flavour`: `zip t.zip big` over a new
+/// archive and over an existing one, interrupted once the temporary
+/// `ziXXXXXX` holds data. INT, TERM, ABRT, BUS, ILL and SEGV: exit 9,
+/// `  adding: big\n\n\nzip error: Interrupted (aborting)\n` on standard
+/// output, nothing on standard error, the temporary removed and the old
+/// archive byte for byte as it was (also with INT ignored at start: zip's
+/// `signal()` overrides it). HUP and QUIT: killed by the signal, the
+/// temporary left, the old archive untouched. Both sides must agree.
+pub fn zip_interrupts_match(flavour: &'static str) {
+    /// Exit code, signal, standard output, standard error, what is left.
+    type Seen = (Option<i32>, Option<i32>, Vec<u8>, Vec<u8>, Vec<String>);
+    use super::interrupt::*;
+    let _serial = interrupt_lock();
+    let Some(dir) = zip_dir() else {
+        return;
+    };
+    let reference = Path::new(dir).join("zip");
+    if !require_reference(&reference) {
+        return;
+    }
+    let stuffr = std::path::PathBuf::from(env!("CARGO_BIN_EXE_stuffr"));
+    let env = [("STUFFR_ZIP_FLAVOR", flavour), ("LANG", "C"), ("TZ", "UTC")];
+    // an archive with an entry (an empty one is removed at zip's
+    // writability check, before the temporary is made)
+    let old = stored_zip(b"a.txt", b"hello\n");
+    let caught = [
+        libc::SIGINT,
+        libc::SIGTERM,
+        libc::SIGABRT,
+        libc::SIGBUS,
+        libc::SIGILL,
+        libc::SIGSEGV,
+    ];
+    let mut rows: Vec<(i32, bool, Inherit)> = Vec::new();
+    for &sig in &caught {
+        rows.push((sig, true, Inherit::Default));
+    }
+    rows.push((libc::SIGINT, false, Inherit::Default));
+    rows.push((libc::SIGINT, true, Inherit::IgnoreInt));
+    rows.push((libc::SIGHUP, true, Inherit::Default));
+    rows.push((libc::SIGQUIT, false, Inherit::Default));
+    for (sig, existing, inherit) in rows {
+        let mut seen: Vec<Seen> = Vec::new();
+        for exe in [&reference, &stuffr] {
+            let s = ScratchDir::unique("zip-intr");
+            let prepare = |mib: usize| {
+                std::fs::write(s.join("big"), big_input(mib)).unwrap();
+                if existing {
+                    std::fs::write(s.join("t.zip"), &old).unwrap();
+                }
+            };
+            let named = |n: &str| is_temp_name(n.as_bytes());
+            let ready = has_data(&s, &named);
+            let Some(r) = interrupt_prepared(
+                exe,
+                "zip",
+                &["t.zip", "big"],
+                &s,
+                &env,
+                &prepare,
+                inherit,
+                sig,
+                &ready,
+            ) else {
+                continue;
+            };
+            let why = format!("{exe:?} signal {sig} existing {existing}");
+            if existing {
+                assert_eq!(std::fs::read(s.join("t.zip")).unwrap(), old, "{why}");
+            }
+            use std::os::unix::process::ExitStatusExt;
+            let left: Vec<String> = r
+                .left
+                .iter()
+                .map(|n| {
+                    if is_temp_name(n.as_bytes()) {
+                        "zi??????".to_owned()
+                    } else {
+                        n.clone()
+                    }
+                })
+                .collect();
+            seen.push((r.status.code(), r.status.signal(), r.stdout, r.stderr, left));
+        }
+        if seen.len() == 2 {
+            assert_eq!(
+                seen[0], seen[1],
+                "signal {sig}, existing archive {existing}"
+            );
+            let (code, signal, stdout, stderr, left) = &seen[1];
+            if caught.contains(&sig) {
+                assert_eq!(*code, Some(9), "signal {sig}");
+                assert_eq!(
+                    String::from_utf8_lossy(stdout),
+                    "  adding: big\n\n\nzip error: Interrupted (aborting)\n"
+                );
+                assert!(stderr.is_empty());
+                assert!(!left.iter().any(|n| n == "zi??????"), "{left:?}");
+            } else {
+                assert_eq!(*signal, Some(sig));
+                assert!(left.iter().any(|n| n == "zi??????"), "{left:?}");
+            }
+        }
+    }
 }

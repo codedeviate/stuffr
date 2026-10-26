@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use super::zipfile::ZWrite;
-use crate::compat::host::{self, Host};
+use crate::compat::host::{self, CleanupGuard, Host};
 
 /// ziperr.h codes `replace` returns.
 const ZE_TEMP: i32 = 10;
@@ -149,6 +149,12 @@ impl ZWrite for FileSink {
         let pos = self.pos;
         self.f.get_mut().f.seek(SeekFrom::Start(pos)).map(|_| ())
     }
+    fn seek_here(&mut self) -> io::Result<()> {
+        self.flush()?;
+        let f = &mut self.f.get_mut().f;
+        let here = f.stream_position()?;
+        f.seek(SeekFrom::Start(here)).map(|_| ())
+    }
     fn ferror(&self) -> Option<io::Error> {
         self.err.map(|(code, kind)| match code {
             Some(c) => io::Error::from_raw_os_error(c),
@@ -207,6 +213,9 @@ impl ZWrite for StreamSink {
     fn seek_end(&mut self) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(29))
     }
+    fn seek_here(&mut self) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(29))
+    }
     fn ferror(&self) -> Option<io::Error> {
         self.err.map(|(code, kind)| match code {
             Some(c) => io::Error::from_raw_os_error(c),
@@ -248,8 +257,10 @@ impl Drop for Temp {
 }
 
 /// `mkstemp(template)`: `dir` + `zi` + six random characters, created new,
-/// mode 0600. The name tried last is returned with the error.
-pub(crate) fn mkstemp(host: &Host, dir: &[u8]) -> (Vec<u8>, io::Result<File>) {
+/// mode 0600, and armed for zip's interrupt handler (`ZIP_SIGNALS`: removed
+/// if the run is interrupted before the guard drops). The name tried last
+/// is returned with the error.
+pub(crate) fn mkstemp(host: &Host, dir: &[u8]) -> (Vec<u8>, io::Result<(File, CleanupGuard)>) {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     let mut seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -258,21 +269,14 @@ pub(crate) fn mkstemp(host: &Host, dir: &[u8]) -> (Vec<u8>, io::Result<File>) {
     let mut name = Vec::new();
     for _ in 0..100 {
         name = dir.to_vec();
-        name.extend_from_slice(b"zi");
+        name.extend_from_slice(super::messages::TEMP_TEMPLATE.as_bytes());
         for _ in 0..6 {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
             name.push(CHARS[(seed % CHARS.len() as u64) as usize]);
         }
-        let mut opts = File::options();
-        opts.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        match opts.open(host.path(&name)) {
+        match host::create_new_armed(host, &host.path(&name), host::ZIP_SIGNALS) {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             r => return (name, r),
         }
@@ -280,12 +284,12 @@ pub(crate) fn mkstemp(host: &Host, dir: &[u8]) -> (Vec<u8>, io::Result<File>) {
     (name, Err(io::Error::from(io::ErrorKind::AlreadyExists)))
 }
 
-/// fileio.c:replace for a new archive: `rename` the temporary onto it, or
-/// copy it when the rename crosses devices. `Err` is the ziperr code and
-/// the system's answer.
+/// fileio.c:replace: `rename` the temporary onto the archive, or copy it
+/// over it when the archive has other links or is a symbolic link
+/// (respected: written through), or when the rename crosses devices. `Err`
+/// is the ziperr code and the system's answer.
 // port: fileio.c:replace
 pub(crate) fn replace(d: &Path, s: &Path) -> Result<(), (i32, io::Error)> {
-    // an existing destination is Task 7's (links respected, unlinked first)
     if let Ok(t) = std::fs::symlink_metadata(d) {
         #[cfg(unix)]
         let copy = {

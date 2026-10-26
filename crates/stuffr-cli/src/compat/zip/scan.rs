@@ -3,20 +3,18 @@
 //! Ports of `fileio.c` (`newname`, `filter`, `check_dup`, `msname`),
 //! `util.c` (`recmatch`, `shmatch`, `isshexp`) and `unix/unix.c`
 //! (`procname`, `ex2in`, `in2ex`, `filetime`), and of the stretch of
-//! `zip.c:main` that drives them: reading no old archive (Task 7 reads
-//! one), scanning the names and `-R`, applying `-i`/`-x`, removing
-//! duplicates, dropping what is missing, too old or the archive itself, and
-//! `-sf`'s listing.
+//! `zip.c:main` that drives them: reading the old archive
+//! (`readzip::read_archive`), scanning the names and `-R` (a name in the
+//! archive marks its entry, a name not on disk is a pattern over the
+//! entries), applying `-i`/`-x`, removing duplicates, checking the marked
+//! entries against the disk, dropping what is missing, too old or the
+//! archive itself, and `-sf`'s listing.
 //!
 //! **Everything that touches an operand goes through `Host`** (`Host::path`
 //! resolves it, a sandbox's included): scanning only `stat`s and lists
 //! directories, it opens and reads nothing, so there is nothing for
 //! `Host::track` to count yet; Task 6 opens the files it archives through
 //! `track`.
-//!
-//! The old archive's entries (`zfiles`) do not exist yet: a name that is not
-//! on disk is simply not matched (`ZE_MISS`), and `proc_archive_name` is
-//! Task 7's. The places that will gain them say `Task 7`.
 //!
 //! Deviations (module docs of `mod.rs`, 7 and 8): the "Scanning files"
 //! progress message after five seconds (`newname`) is not made, and a name
@@ -31,6 +29,7 @@ use std::path::PathBuf;
 use super::cli::{Action, Filter, ZE_ABORT, ZE_OK, ZE_OPEN, ZE_PARMS};
 use super::flavour;
 use super::messages::{self as m, printf};
+use super::readzip::{self, Archive, cstr, zsearch};
 use super::unix::{
     S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, UnixMeta, meta_of, stdin_meta, unix2dostime,
 };
@@ -61,7 +60,7 @@ pub(crate) enum FoundKind {
 
 /// One input zip will add: a `struct flist` after the whole scan.
 // `kind`, `meta`, `dostime`, `dosflag`: zipup stats each name again, as
-// the C does; Task 7's updates compare the scan's times with the archive's.
+// the C does (and the entries' check takes its own stat).
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct Found {
@@ -105,6 +104,8 @@ struct Scan {
     /// The error of the last failed `stat` (the C's stale `errno`, which
     /// `ziperr(ZE_OPEN, ...)` shows for `-MM`).
     last_err: Option<io::Error>,
+    /// The archive at the path (`zfiles`): names found there are marked.
+    ar: Archive,
 }
 
 // ---- util.c: names and patterns ----
@@ -448,7 +449,7 @@ fn filter(patterns: &[Filter], cx: Cx, name: &[u8]) -> bool {
 
 /// What a name looks like in zip's messages (`local_to_display_string`):
 /// Ubuntu shows a byte below a space as `^` and the letter, Apple as is.
-fn display(z: &Zr, iname: &[u8]) -> Vec<u8> {
+pub(crate) fn display(z: &Zr, iname: &[u8]) -> Vec<u8> {
     if !flavour::shows_newline_escaped(z.flavour) {
         return iname.to_vec();
     }
@@ -467,11 +468,12 @@ fn display(z: &Zr, iname: &[u8]) -> Vec<u8> {
 // ---- the scan ----
 
 impl Scan {
-    fn new() -> Scan {
+    fn new(ar: Archive) -> Scan {
         Scan {
             listed: Vec::new(),
             zip_stat: None,
             last_err: None,
+            ar,
         }
     }
 
@@ -504,9 +506,12 @@ impl Scan {
             return Ok(true);
         }
         let Some((meta, _)) = self.lsstat(z, n) else {
-            // Not a file or directory: Task 7 searches the shell
-            // expression in the archive's entries here.
-            return Ok(false);
+            // Not a file or directory: search for the shell expression in
+            // the archive (`ex2in` shouldn't affect the matching chars)
+            let Some(p) = ex2in(n, z.o.pathput, z.o.dosify) else {
+                return Err(crashed(z));
+            };
+            return Ok(self.mark_matching(z, &p));
         };
         let mode = meta.mode;
         // The C's tests are bit masks, so a socket (0140000) counts as a
@@ -578,10 +583,25 @@ impl Scan {
             iname.clone()
         };
         let oname = display(z, &iname);
-        // Task 7: a name already in the archive is marked there instead
-        // (`zsearch`), and listed in the found list only if it is not.
         let cx = cx_of(z);
-        if z.o.filters.is_empty() || filter(&z.o.filters, cx, &undosm) {
+        // a name already in the archive is marked there (`zsearch`)
+        if let Some(i) = zsearch(&self.ar, &iname) {
+            if !z.o.filters.is_empty() && !filter(&z.o.filters, cx, &undosm) {
+                // do not clear the mark when excluding: two names may hit
+                // the same entry under -k or -j
+                if z.o.verbose > 0 {
+                    let mut l = Vec::new();
+                    printf(&mut l, m::EXCLUDING, &[&oname]);
+                    z.mesg_write(&l);
+                }
+            } else {
+                let zf = &mut self.ar.zfiles[i];
+                zf.mark = 1;
+                zf.e.name = name.to_vec();
+                zf.e.oname = oname;
+                zf.dosflag = dosflag;
+            }
+        } else if z.o.filters.is_empty() || filter(&z.o.filters, cx, &undosm) {
             // Do not add the zip file to itself ("zip -m foo ../dir/foo.zip").
             if self.is_the_zip_file(z, name) {
                 if z.o.verbose > 0 {
@@ -597,6 +617,40 @@ impl Scan {
             });
         }
         Ok(())
+    }
+
+    /// unix.c:procname for a name not on disk (and fileio.c's
+    /// proc_archive_name): mark every entry the pattern `p` matches (`-i`,
+    /// `-x` still apply). Whether one did.
+    fn mark_matching(&mut self, z: &mut Zr, p: &[u8]) -> bool {
+        self.mark_matching_as(z, p, false)
+    }
+
+    /// [`Scan::mark_matching`]; `-v`'s line shows `oname` (proc_archive_name)
+    /// or `name` (procname).
+    fn mark_matching_as(&mut self, z: &mut Zr, p: &[u8], show_oname: bool) -> bool {
+        let cx = cx_of(z);
+        let mut matched = false;
+        for i in 0..self.ar.zfiles.len() {
+            let zf = &mut self.ar.zfiles[i];
+            if shmatch(p, cstr(&zf.e.iname), cx) {
+                zf.mark = u8::from(z.o.filters.is_empty() || filter(&z.o.filters, cx, &zf.zname));
+                if z.o.verbose > 0 {
+                    let mark = zf.mark;
+                    let name = if show_oname {
+                        zf.e.oname.clone()
+                    } else {
+                        zf.e.name.clone()
+                    };
+                    let mut l = Vec::new();
+                    let inex: &[u8] = if mark != 0 { b"in" } else { b"ex" };
+                    printf(&mut l, m::INCLUDING, &[inex, &name]);
+                    z.mesg_write(&l);
+                }
+                matched = true;
+            }
+        }
+        matched
     }
 
     /// Whether `name` is the archive being written: the same `stat` (mode,
@@ -712,7 +766,11 @@ fn filetime(z: &Zr, name: &[u8]) -> Option<(UnixMeta, u64, Option<u64>, FoundKin
 /// swaps). The six it orders differently, three equal keys among 66 to 140
 /// elements or two among 14, are a known gap: which of two equal names is
 /// dropped then can differ from macOS's.
-fn qsort(f: flavour::Flavour, v: &mut [usize], cmp: &dyn Fn(usize, usize) -> std::cmp::Ordering) {
+pub(crate) fn qsort(
+    f: flavour::Flavour,
+    v: &mut [usize],
+    cmp: &dyn Fn(usize, usize) -> std::cmp::Ordering,
+) {
     match f {
         flavour::Flavour::Ubuntu => v.sort_by(|&a, &b| cmp(a, b)),
         #[cfg(target_os = "macos")]
@@ -924,27 +982,72 @@ fn check_dup(z: &mut Zr, listed: &mut Vec<Listed>) -> Result<(), Exit> {
     Ok(())
 }
 
+/// What the scan leaves for writing: the new names, and the marks it made
+/// on the archive's entries with zip.c's counts.
+pub(crate) struct Collected {
+    /// The found list: names to add.
+    pub(crate) found: Vec<Found>,
+    /// The archive, its entries marked.
+    pub(crate) ar: Archive,
+    /// `k`: the marked entries.
+    pub(crate) k: u64,
+    /// `files_total`, `bytes_total`.
+    pub(crate) files_total: u64,
+    pub(crate) bytes_total: u64,
+    /// `all_current` (`-FS`).
+    pub(crate) all_current: bool,
+}
+
 /// zip.c:main, from the scan of the names to the listing of what is
-/// found: the names and `-R`, the filters, the duplicates, and the `stat`
-/// that drops names that are missing, outside `-t`/`-tt`, or the archive.
-/// What is left is what zip would add, in the order it found it.
+/// found: the names and `-R` (a name not on disk is a pattern for the
+/// archive's entries; one in the archive marks its entry), the filters, the
+/// duplicates, the entries checked against the disk (`-u`, `-f`, `-d`,
+/// `-t`, `-FS`), and the `stat` that drops new names that are missing,
+/// outside `-t`/`-tt`, or the archive.
 // port: zip.c:main
-pub(crate) fn collect(z: &mut Zr) -> Result<Vec<Found>, Exit> {
-    let mut sc = Scan::new();
+pub(crate) fn collect(z: &mut Zr, ar: Archive) -> Result<Collected, Exit> {
+    let mut sc = Scan::new(ar);
+    // copy mode with --out and no names: every entry
+    if z.o.have_out && z.o.kk == 3 {
+        let cx = cx_of(z);
+        for zf in &mut sc.ar.zfiles {
+            zf.mark = u8::from(z.o.filters.is_empty() || filter(&z.o.filters, cx, &zf.zname));
+        }
+    }
     // zip used as a filter: `procname("-", 0)`
     if z.o.filter_mode {
         sc.procname(z, b"-")?;
     }
-    // Process the file arguments from the command line. Task 7: for -U
-    // they name archive entries instead (`proc_archive_name`).
+    // Process the file arguments from the command line.
     let names = std::mem::take(&mut z.o.names);
-    if !names.is_empty() && z.o.action != Action::Archive {
-        if z.o.show_what_doing {
-            z.mesg_write(m::SD_SCANNING_FILES.as_bytes());
-        }
-        for n in &names {
-            if !sc.procname(z, n)? {
-                miss(z, &mut sc, n, n)?;
+    if !names.is_empty() {
+        if z.o.action == Action::Archive {
+            // find in archive
+            if z.o.show_what_doing {
+                z.mesg_write(m::SD_SCANNING_ARCHIVE.as_bytes());
+            }
+            for n in &names {
+                let found = if n == b"-" {
+                    z.zipwarn(m::CANNOT_SELECT_STDIN.as_bytes(), b"");
+                    false
+                } else {
+                    let Some(p) = ex2in(n, z.o.pathput, z.o.dosify) else {
+                        return Err(crashed(z));
+                    };
+                    sc.mark_matching_as(z, &p, true)
+                };
+                if !found {
+                    z.zipwarn(m::NOT_IN_ARCHIVE.as_bytes(), n);
+                }
+            }
+        } else {
+            if z.o.show_what_doing {
+                z.mesg_write(m::SD_SCANNING_FILES.as_bytes());
+            }
+            for n in &names {
+                if !sc.procname(z, n)? {
+                    miss(z, &mut sc, n, n)?;
+                }
             }
         }
     }
@@ -955,15 +1058,113 @@ pub(crate) fn collect(z: &mut Zr) -> Result<Vec<Found>, Exit> {
     }
     if z.o.show_what_doing {
         z.mesg_write(m::SD_APPLYING_FILTERS.as_bytes());
+    }
+    // -u or -f with no names: every entry, the filters applied
+    if z.o.kk != 4
+        && z.o.first_listarg == 0
+        && matches!(z.o.action, Action::Update | Action::Freshen)
+    {
+        let cx = cx_of(z);
+        for zf in &mut sc.ar.zfiles {
+            zf.mark = u8::from(z.o.filters.is_empty() || filter(&z.o.filters, cx, &zf.zname));
+        }
+    }
+    if z.o.show_what_doing {
         z.mesg_write(m::SD_CHECKING_DUPS.as_bytes());
     }
     // remove duplicates in the found list
     check_dup(z, &mut sc.listed)?;
 
-    // Task 7: the entries of the old archive are checked against the disk
-    // here ("Scanning files to update").
+    // For each marked entry, if not deleting, check that it exists and,
+    // updating or freshening, compare its time with the entry's.
     if z.o.show_what_doing {
         z.mesg_write(m::SD_SCANNING_TO_UPDATE.as_bytes());
+    }
+    let (before, after) = (z.o.before, z.o.after);
+    let mut k: u64 = 0;
+    let mut files_total: u64 = 0;
+    let mut bytes_total: u64 = 0;
+    let mut all_current = true;
+    for i in 0..sc.ar.zfiles.len() {
+        let zf = &mut sc.ar.zfiles[i];
+        zf.current = false;
+        if zf.mark == 0 {
+            // something excluded: run through the list to catch deletions
+            all_current = false;
+            continue;
+        }
+        let csize = zf.e.siz;
+        let usize_ = zf.e.len;
+        if matches!(z.o.action, Action::Delete | Action::Archive) {
+            // only delete (or keep) entries in the date range
+            let z_tim = match readzip::ut_mtime(&zf.e) {
+                Some(t) => unix2dostime(z, t),
+                None => u64::from(zf.e.tim),
+            };
+            if z_tim < before || (after != 0 && z_tim >= after) {
+                zf.mark = 0;
+            } else {
+                files_total += 1;
+                zf.e.len = usize_;
+                bytes_total = bytes_total.wrapping_add(csize);
+                k += 1;
+            }
+            continue;
+        }
+        let isdirname = zf.e.name.last() == Some(&b'/');
+        let (tf, usize_, f_mtime) = readzip::disk_time(z, &zf.e.name);
+        if tf == 0 {
+            // an entry that is not on disk
+            all_current = false;
+        }
+        let older = matches!(z.o.action, Action::Update | Action::Freshen)
+            && match readzip::ut_mtime(&zf.e) {
+                Some(zt) => f_mtime <= zt,
+                None => tf <= u64::from(zf.e.tim),
+            };
+        if tf == 0 || tf < before || (after != 0 && tf >= after) || older {
+            zf.mark = if z.o.comadd { 2 } else { 0 };
+            // delete if -um or -fm
+            zf.trash = tf != 0 && tf >= before && (after == 0 || tf < after);
+            let what: &[u8] = if zf.trash {
+                m::UP_TO_DATE.as_bytes()
+            } else {
+                m::MISSING_OR_EARLY.as_bytes()
+            };
+            let mut l = Vec::new();
+            printf(&mut l, m::ZIP_DIAGNOSTIC, &[&zf.e.oname, what]);
+            if z.o.verbose > 0 {
+                z.mesg_write(&l);
+            }
+            z.log_write(&l);
+        } else if z.o.diff_mode
+            && tf == u64::from(zf.e.tim)
+            && ((isdirname && usize_ == -1) || usize_ as u64 == zf.e.len)
+        {
+            // in diff mode, only a changed time or size is included
+            zf.mark = 0;
+        } else {
+            if tf == u64::from(zf.e.tim)
+                && ((zf.e.len == 0 && usize_ == -1) || usize_ as u64 == zf.e.len)
+            {
+                // -FS: the entry is current
+                zf.current = true;
+            } else {
+                all_current = false;
+            }
+            files_total += 1;
+            if usize_ >= 0 {
+                zf.e.len = usize_ as u64;
+                bytes_total += usize_ as u64;
+            } else {
+                zf.e.len = 0;
+            }
+            k += 1;
+        }
+    }
+
+    // Remove entries from the found list that do not exist or are too old.
+    if z.o.show_what_doing {
         let mut line = Vec::new();
         printf(
             &mut line,
@@ -972,9 +1173,6 @@ pub(crate) fn collect(z: &mut Zr) -> Result<Vec<Found>, Exit> {
         );
         z.mesg_write(&line);
     }
-
-    // Remove entries from the found list that do not exist or are too old.
-    let (before, after) = (z.o.before, z.o.after);
     let zipfile = z.o.zipfile.clone().unwrap_or_default();
     let mut found = Vec::new();
     for l in std::mem::take(&mut sc.listed) {
@@ -988,6 +1186,8 @@ pub(crate) fn collect(z: &mut Zr) -> Result<Vec<Found>, Exit> {
         {
             continue;
         }
+        files_total += 1;
+        bytes_total += usize.unwrap_or(0);
         found.push(Found {
             disk: z.host.path(l.name.strip_suffix(b"/").unwrap_or(&l.name)),
             name: l.name,
@@ -1000,7 +1200,18 @@ pub(crate) fn collect(z: &mut Zr) -> Result<Vec<Found>, Exit> {
             dosflag: l.dosflag,
         });
     }
-    Ok(found)
+    if z.mesg_line_started {
+        z.mesg_write(b"\n");
+        z.set_line(false);
+    }
+    Ok(Collected {
+        found,
+        ar: sc.ar,
+        k,
+        files_total,
+        bytes_total,
+        all_current,
+    })
 }
 
 /// zip.c:main: a name that matched nothing, in the loop over the names:
@@ -1032,10 +1243,11 @@ fn open_error(z: &mut Zr, sc: &mut Scan, name: &[u8]) -> Exit {
     z.ziperr_os(ZE_OPEN, name, &e)
 }
 
-/// zip.c:main, `-sf`: the heading, one line per name, the totals. Always
-/// ends the run.
+/// zip.c:main, `-sf`: the heading, the archive's marked entries (all of
+/// them for `-sf` alone), then the new names, and the totals. Always ends
+/// the run.
 // port: zip.c:main (show_files)
-pub(crate) fn show_files(z: &mut Zr, found: &[Found]) -> Exit {
+pub(crate) fn show_files(z: &mut Zr, c: &mut Collected) -> Exit {
     let sf = z.o.show_files;
     let mut count = 0u64;
     let mut bytes = 0u64;
@@ -1043,7 +1255,7 @@ pub(crate) fn show_files(z: &mut Zr, found: &[Found]) -> Exit {
     if z.o.noisy && listing {
         if z.mesg_line_started {
             z.mesg_write(b"\n");
-            z.mesg_line_started = false;
+            z.set_line(false);
         }
         z.mesg_write(heading(z).as_bytes());
     }
@@ -1054,13 +1266,23 @@ pub(crate) fn show_files(z: &mut Zr, found: &[Found]) -> Exit {
         }
         z.log_write(heading(z).as_bytes());
     }
-    // Task 7: the archive's marked entries are listed first.
-    for f in found {
+    let mut lines: Vec<(Vec<u8>, u64)> = Vec::new();
+    for zf in &c.ar.zfiles {
+        if zf.mark != 0 || z.o.kk == 3 {
+            lines.push((zf.e.oname.clone(), zf.e.len));
+        }
+    }
+    for f in &c.found {
+        lines.push((f.oname.clone(), f.usize.unwrap_or(0)));
+    }
+    for (oname, len) in lines {
         count += 1;
-        bytes += f.usize.unwrap_or(0);
+        if (len as i64) > 0 {
+            bytes += len;
+        }
         // Task 11: `-sU` with Ubuntu's escaped Unicode names
         let mut line = Vec::new();
-        printf(&mut line, m::SF_ENTRY, &[&f.oname]);
+        printf(&mut line, m::SF_ENTRY, &[&oname]);
         if z.o.noisy && listing {
             z.mesg_write(&line);
         }
@@ -1068,25 +1290,19 @@ pub(crate) fn show_files(z: &mut Zr, found: &[Found]) -> Exit {
             z.log_write(&line);
         }
     }
+    let mut line = Vec::new();
+    printf(
+        &mut line,
+        m::SF_TOTAL,
+        &[count.to_string().as_bytes(), bytes.to_string().as_bytes()],
+    );
     if z.o.noisy || z.log.is_none() {
-        let mut line = Vec::new();
-        printf(
-            &mut line,
-            m::SF_TOTAL,
-            &[count.to_string().as_bytes(), bytes.to_string().as_bytes()],
-        );
         z.mesg_write(&line);
     }
     if z.log.is_some() {
-        let mut line = Vec::new();
-        printf(
-            &mut line,
-            m::SF_TOTAL,
-            &[count.to_string().as_bytes(), bytes.to_string().as_bytes()],
-        );
         z.log_write(&line);
     }
-    super::cli::finish(z, ZE_OK)
+    super::write::finish(z, ZE_OK, &mut c.ar.zfiles)
 }
 
 /// The heading of `-sf`'s listing for the action.
@@ -1112,44 +1328,58 @@ pub(crate) fn run(z: &mut Zr) -> Exit {
     if z.o.fix != 0 {
         return z.not_built();
     }
+    // zip.c:main installs its handler for INT, TERM, ABRT, BUS, ILL, SEGV
+    // (the run so far only parsed: nothing a signal could find half done)
+    crate::compat::host::install_zip_abort(&z.host, m::INTERRUPTED_ABORTING);
+    let line = z.mesg_line_started;
+    z.set_line(line);
     if z.o.show_what_doing {
         z.mesg_write(m::SD_READING_ARCHIVE.as_bytes());
     }
     let zipfile = z.o.zipfile.clone().unwrap_or_default();
     // read the zip file if it exists (zipfile.c:readzipfile)
-    if !zipfile.is_empty() && zipfile != b"-" {
-        match std::fs::metadata(z.host.path(&zipfile)) {
-            // Task 7 reads the old archive.
-            Ok(_) => return z.not_built(),
-            Err(e) => {
-                if !z.o.zip_to_stdout && z.o.in_path != z.o.out_path {
-                    // if -O is used then in_path must exist
-                    return z.ziperr_os(ZE_OPEN, &zipfile, &e);
-                }
-            }
-        }
-    }
+    let ar = match readzip::read_archive(z) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
     // no input zip file and showing contents
-    if z.o.show_files != 0 && (z.o.kk == 3 || z.o.action == Action::Archive) {
+    if !ar.exists && z.o.show_files != 0 && (z.o.kk == 3 || z.o.action == Action::Archive) {
         // the stale errno of the failed open
         return z.ziperr_os(ZE_OPEN, &zipfile, &io::Error::from_raw_os_error(2));
     }
-    // zcount is 0 here
-    if z.o.action != Action::Add || z.o.grow {
+    if ar.zfiles.is_empty() && (z.o.action != Action::Add || z.o.grow) {
         z.zipwarn(&zipfile, m::NOT_FOUND_OR_EMPTY.as_bytes());
     }
-    let found = match collect(z) {
-        Ok(f) => f,
+    let mut c = match collect(z, ar) {
+        Ok(c) => c,
         Err(e) => return e,
     };
     if z.o.show_files != 0 {
-        return show_files(z, &found);
+        return show_files(z, &mut c);
     }
-    // Make sure there is something left to do (no old entries are marked).
-    if found.is_empty() && !z.o.diff_mode && !z.o.allow_empty_archive {
+    // Make sure there is something left to do.
+    let has_files = !c.ar.zfiles.is_empty();
+    if c.k == 0
+        && c.found.is_empty()
+        && !z.o.diff_mode
+        && (has_files || !z.o.allow_empty_archive)
+        && !(has_files
+            && (z.o.latest
+                || z.o.fix != 0
+                || z.o.adjust
+                || z.o.junk_sfx
+                || z.o.comadd
+                || z.o.zipedit))
+    {
+        if z.o.test && (has_files || c.ar.zipbeg != 0) {
+            if let Err(e) = super::update::check_zipfile(z, &zipfile) {
+                return e;
+            }
+            return super::write::finish(z, ZE_OK, &mut c.ar.zfiles);
+        }
         if matches!(z.o.action, Action::Update | Action::Freshen) {
-            return super::cli::finish(z, ZE_NONE);
-        } else if z.o.latest || z.o.fix != 0 || z.o.adjust || z.o.junk_sfx {
+            return super::write::finish(z, ZE_NONE, &mut c.ar.zfiles);
+        } else if !has_files && (z.o.latest || z.o.fix != 0 || z.o.adjust || z.o.junk_sfx) {
             return z.ziperr(ZE_NAME, &zipfile);
         } else if z.o.recurse != 0 && z.o.filters.is_empty() && z.o.first_listarg > 0 {
             let mut hint = m::TRY_ZIP.as_bytes().to_vec();
@@ -1167,7 +1397,11 @@ pub(crate) fn run(z: &mut Zr) -> Exit {
         }
         return z.ziperr(ZE_NONE, &zipfile);
     }
-    super::write::write_new(z, found)
+    if z.o.filesync && c.all_current && c.found.is_empty() {
+        z.zipmessage(m::ARCHIVE_IS_CURRENT.as_bytes(), b"");
+        return super::write::finish(z, ZE_OK, &mut c.ar.zfiles);
+    }
+    super::update::run(z, c)
 }
 
 #[cfg(test)]

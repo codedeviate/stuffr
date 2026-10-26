@@ -1162,3 +1162,176 @@ pub(super) const DELETING_DIR: &str = "deleting directory %s (if empty)         
 /// zip.c:finish, `-o` over directories only.
 pub(super) const ONLY_DIRS_NO_LATEST: &str =
     "zip file has only directories, can't make it as old as latest entry";
+
+// ---- updating archives (Task 7: zipfile.c, fileio.c, zip.c:main) ----
+
+/// zip.c:handler + ziperr(ZE_ABORT, "aborting"): what the interrupt
+/// handler prints after its newlines.
+pub(crate) const INTERRUPTED_ABORTING: &[u8] = b"\nzip error: Interrupted (aborting)\n";
+/// zipfile.c:scanzipf_regnew (no separator before the name).
+pub(super) const COULD_NOT_OPEN_INPUT_ARCHIVE: &str = "could not open input archive";
+/// zipfile.c:scanzipf_regnew
+pub(super) const UNABLE_TO_SEEK: &str = "unable to seek in input file ";
+/// zipfile.c:scanzipf_regnew, no end record.
+pub(super) const MISSING_END_1: &str = "missing end signature--probably not a zip file (did you";
+pub(super) const MISSING_END_2: &str = "remember to use binary mode when you transferred it?)";
+pub(super) const MISSING_END_3: &str = "(if you are trying to read a damaged archive try -F)";
+/// zipfile.c:scanzipf_regnew, `-A` on a split archive.
+pub(super) const ADJUST_SPLITS: &str = "Adjusting split archives not yet supported";
+/// zipfile.c:scanzipf_regnew
+pub(super) const SPLIT_NAME_ZIP: &str = "archive name must end in .zip for splits";
+/// zipfile.c:scanzipf_regnew
+pub(super) const CANNOT_UPDATE_SPLIT: &str = "cannot update a split archive (use --out option)";
+/// zipfile.c:scanzipf_regnew and friends (`%s` follows: `strerror`).
+pub(super) const READING_ARCHIVE_FSEEK: &str = "reading archive fseek: ";
+/// zipfile.c:scanzipf_regnew, `-A`.
+pub(super) const CENTRAL_NOT_WHERE_EXPECTED: &str =
+    "central dir not where expected - could not adjust offsets";
+/// zipfile.c:scanzipf_regnew
+pub(super) const TRY_FF: &str = "(try -FF)";
+/// zipfile.c:scanzipf_regnew
+pub(super) const READING_ARCHIVE: &str = "reading archive: ";
+/// zipfile.c:scanzipf_regnew
+pub(super) const UNABLE_TO_READ_EOCD: &str = "unable to read EOCD after seek: ";
+/// zipfile.c:scanzipf_regnew, `-A`.
+pub(super) const ADJUST_SPLITS_NOT_SUPPORTED: &str = "Adjusting split archives not supported:  ";
+/// zipfile.c:scanzipf_regnew, `-A`.
+pub(super) const COULD_NOT_DETERMINE_OFFSET: &str = "Could not determine offset of entries";
+/// zipfile.c:scanzipf_regnew, `-A` (`%s` bytes).
+pub(super) const OFFSETS_OFF_BY: &str = "Zip entry offsets appear off by %s bytes - correcting...";
+/// zipfile.c:scanzipf_regnew, `-A`.
+pub(super) const OFFSETS_DO_NOT_NEED: &str = "Zip entry offsets do not need adjusting";
+/// zipfile.c:scanzipf_regnew
+pub(super) const Z64_COMPENSATING: &str = "Zip64 EOCDR not found where expected - compensating";
+/// zipfile.c:scanzipf_regnew
+pub(super) const TRY_A: &str = "(try -A to adjust offsets)";
+/// zipfile.c:scanzipf_regnew
+pub(super) const Z64_EOCDR_NOT_FOUND: &str = "Zip64 End Of Central Directory Record not found:  ";
+/// zipfile.c:scanzipf_regnew
+pub(super) const Z64_EOCDR_TRUNCATED: &str = "Zip64 EOCD Record bad or truncated";
+/// zipfile.c:scanzipf_regnew (`%d.%d`).
+pub(super) const REQUIRES_VERSION: &str = "This archive requires version %s.%s";
+/// zipfile.c:scanzipf_regnew
+pub(super) const SUPPORTS_UP_TO_46: &str = "Zip currently only supports up to version 4.6 archives";
+/// zipfile.c:scanzipf_regnew
+pub(super) const UP_TO_45: &str = "(up to 4.5 if bzip2 is not compiled in)";
+/// zipfile.c:scanzipf_regnew
+pub(super) const TRY_F_READ_ANYWAY: &str = "Try -F to attempt to read anyway";
+/// zipfile.c:scanzipf_regnew (`%lu`, `%s`; the newline is the C's).
+pub(super) const UNEXPECTED_SIGNATURE: &str = "unexpected signature on disk %s at %s\n";
+/// zipfile.c:scanzipf_regnew
+pub(super) const NOT_IN_CORRECT_FORMAT: &str = "archive not in correct format: ";
+/// zipfile.c:scanzipf_regnew
+pub(super) const TRY_F: &str = "(try -F to attempt recovery)";
+/// zipfile.c:scanzipf_regnew
+pub(super) const READING_CENTRAL: &str = "reading central directory: ";
+/// zipfile.c:scanzipf_regnew
+pub(super) const ZERO_LENGTH_NAME: &str = "zero-length name for entry #";
+/// zipfile.c:scanzipf_regnew (`%s`, `%s`).
+pub(super) const EXPECTED_ENTRIES: &str = "expected %s entries but found %s";
+/// zipfile.c:zipoddities (`%d.%d`, `%d`).
+pub(super) const MADE_BY_VERSION: &str = "made by version %s.%s on system type %s: ";
+/// zipfile.c:zipoddities
+pub(super) const NEEDS_UNZIP: &str = "needs unzip %s.%s on system type %s: ";
+/// zipfile.c:zipoddities (`0x%04x`)
+pub(super) const UNDEFINED_BITS: &str = "undefined bits used in flags = 0x%s: ";
+/// zipfile.c:zipoddities
+pub(super) const UNKNOWN_METHOD: &str = "unknown compression method %s: ";
+/// zipfile.c:zipoddities
+pub(super) const STARTS_ON_DISK: &str = "starts on disk %s: ";
+/// zipfile.c:zipoddities (`0x%04x`)
+pub(super) const UNKNOWN_INTERNAL: &str = "unknown internal attributes = 0x%s: ";
+/// zipfile.c:readlocal, zipcopy
+pub(super) const DID_NOT_FIND_ENTRY: &str = "Did not find entry for ";
+/// zipfile.c:readlocal, zipcopy
+pub(super) const READING_LOCAL_ENTRY: &str = "reading local entry: ";
+/// zipfile.c:readlocal (`%d`, `%d`).
+pub(super) const LOCAL_VERSION_NEEDED: &str = "Local Version Needed (%s) does not match CD (%s): ";
+/// zipfile.c:zipcopy
+pub(super) const LOCAL_VERSION_MISMATCH: &str =
+    "Local Version Needed To Extract does not match CD: ";
+/// zipfile.c:readlocal, zipcopy
+pub(super) const LOCAL_FLAG_MISMATCH: &str = "Local Entry Flag does not match CD: ";
+/// zipfile.c:readlocal, zipcopy
+pub(super) const LOCAL_CRC_MISMATCH: &str = "Local Entry CRC does not match CD: ";
+/// zipfile.c:zipcopy
+pub(super) const LOCAL_NAME_MISMATCH: &str = "Local Entry name does not match CD: ";
+/// zip.c:main, an old entry being replaced (`%s`).
+pub(super) const UPDATING: &str = "updating: %s";
+/// zip.c:main, `-f`.
+pub(super) const FRESHENING: &str = "freshening: %s";
+/// zip.c:main, `-FS -v` and an entry that matches its file.
+pub(super) const FS_OK: &str = "      ok: %s";
+/// zip.c:main, the log's line for it.
+pub(super) const FS_CURRENT_LOG: &str = " current: %s";
+/// zip.c:main, `-d` and `-FS`.
+pub(super) const DELETING: &str = "deleting: %s";
+/// zip.c:main, `-U`.
+pub(super) const COPYING: &str = " copying: %s";
+/// zip.c:main
+pub(super) const COULD_NOT_READ_LOCAL: &str = "could not read local entry information: ";
+/// zip.c:main, an entry whose file could not be opened.
+pub(super) const WILL_JUST_COPY: &str = "will just copy entry over: ";
+/// zip.c:main, `ZIPERR(r, errbuf)` after zipcopy.
+pub(super) const WAS_COPYING: &str = "was copying %s";
+/// zip.c:main, `-U` after a failed copy.
+pub(super) const TRY_F_TO_FIX: &str = "(try -F to attempt to fix)";
+/// zip.c:main, `-v` and an entry left as it is (`%s %s`).
+pub(super) const ZIP_DIAGNOSTIC: &str = "zip diagnostic: %s %s\n";
+/// zip.c:main
+pub(super) const UP_TO_DATE: &str = "up to date";
+/// zip.c:main
+pub(super) const MISSING_OR_EARLY: &str = "missing or early";
+/// unix.c:procname, fileio.c:proc_archive_name, `-v` (`%s`: `in`/`ex`).
+pub(super) const INCLUDING: &str = "zip diagnostic: %scluding %s\n";
+/// fileio.c:newname, `-v` and an archive entry the filters exclude.
+pub(super) const EXCLUDING: &str = "excluding %s\n";
+/// fileio.c:proc_archive_name
+pub(super) const CANNOT_SELECT_STDIN: &str = "Cannot select stdin when selecting archive entries";
+/// zip.c:main, `-U` and a name no entry matches.
+pub(super) const NOT_IN_ARCHIVE: &str = "not in archive: ";
+/// zip.c:main, `-FS` with nothing to do.
+pub(super) const ARCHIVE_IS_CURRENT: &str = "Archive is current";
+/// zip.c:main, `-z` on an archive with a comment.
+pub(super) const CURRENT_COMMENT: &str = "current zip file comment is:\n";
+/// zip.c:main, `-sd`.
+pub(super) const SD_GOING_THROUGH: &str = "sd: Going through old zip file\n";
+/// zip.c:check_zipfile
+pub(super) const TEST_FAILED: &str = "test of %s FAILED\n";
+/// zip.c:check_zipfile
+pub(super) const TEST_OK: &str = "test of %s OK\n";
+/// zip.c:check_zipfile, `ziperr(ZE_TEST, ...)`.
+pub(super) const ORIGINAL_UNMODIFIED: &str = "original files unmodified";
+/// apple.diff, zip.c:check_zipfile.
+pub(super) const BRACES_NOT_SUPPORTED: &str = "{} in -TT not supported";
+/// zip.c:check_unzip_version
+pub(super) const FAILED_UNZIP_INFO: &str = "failed to get information from UnZip";
+/// zip.c:check_unzip_version
+pub(super) const UNEXPECTED_UNZIP_V: &str = "unexpected output of UnZip -v";
+/// zip.c:check_unzip_version (`%4.2f`).
+pub(super) const FOUND_UNZIP_VERSION: &str = "Found UnZip version %s";
+/// zip.c:check_unzip_version
+pub(super) const NEED_UNZIP_6: &str = "Need UnZip 6.00 or later to test this Zip64 archive";
+/// zip.c:check_unzip_version, `perror("unzip pipe error")`.
+pub(super) const UNZIP_PIPE_ERROR: &str = "unzip pipe error: %s\n";
+/// zip.c:check_zipfile: the program and its options.
+pub(super) const UNZIP: &str = "unzip";
+pub(super) const UNZIP_T: &str = "-t";
+pub(super) const UNZIP_QQ: &str = "-qq";
+/// zip.c:check_unzip_version, the version probe's command.
+pub(super) const UNZIP_V_CMD: &str = " -v";
+/// zip.c:check_zipfile (Ubuntu): `system()`'s command and its quoting.
+pub(super) const UNZIP_T_CMD: &str = "unzip -t ";
+pub(super) const QQ_CMD: &str = "-qq ";
+/// zip.c:check_unzip_version's `sscanf(buf, "UnZip %f ", ...)` prefix.
+pub(super) const UNZIP_V_PREFIX: &str = "UnZip";
+/// zip.c:main, the temporary's template.
+pub(super) const TEMP_TEMPLATE: &str = "zi";
+/// zip.c:main, `-sd` before `-U`'s names.
+pub(super) const SD_SCANNING_ARCHIVE: &str = "sd: Scanning archive entries\n";
+/// zip.c:BlankRunningStats, `-dv` (`%lu>%lu: ` of disks 1 and 1).
+pub(super) const BLANK_DV: &str = "1>1: ";
+/// zip.c:BlankRunningStats, `-dc`.
+pub(super) const BLANK_DC: &str = "   /    ";
+/// zip.c:BlankRunningStats, `-db`.
+pub(super) const BLANK_DB: &str = "     /      ";

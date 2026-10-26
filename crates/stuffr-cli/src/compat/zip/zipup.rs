@@ -17,7 +17,6 @@
 
 use std::fs::File;
 use std::io::{self, Read, Write};
-#[cfg(test)]
 use std::path::Path;
 
 use stuffr::infozip::{BlockVanished, ZipDeflater, ZipOut};
@@ -303,8 +302,10 @@ pub(crate) struct Wr {
 pub(crate) enum Zipped {
     /// The entry, written.
     Entry(ZEntry),
-    /// `ZE_OPEN`: it could not be stat'ed or opened (the system's answer).
-    Open(io::Error),
+    /// `ZE_OPEN`: it could not be stat'ed or opened (the system's answer),
+    /// and the entry as zipup left it (an old entry being updated keeps
+    /// those changes: its size, unknown attributes, new extra fields).
+    Open(io::Error, Box<ZEntry>),
     /// `ZE_MISS`: a directory in the scan is a file now, or the other way.
     Miss,
 }
@@ -326,7 +327,7 @@ pub(crate) fn drain_dots(z: &mut Zr, out: &mut ZOut) {
         z.mesg_write(&d);
         // the leading space does not start a line; a dot does
         if d.contains(&b'.') {
-            z.mesg_line_started = true;
+            z.set_line(true);
         }
     }
 }
@@ -350,7 +351,7 @@ pub(crate) fn file_dot(z: &mut Zr, unit: i64) {
     }
     if (z.o.verbose > 0 || z.o.noisy) && z.o.dot_size != 0 && z.o.dot_count == 0 {
         z.mesg_write(b".");
-        z.mesg_line_started = true;
+        z.set_line(true);
     }
 }
 
@@ -443,16 +444,38 @@ thread_local! {
 /// message line was begun by the caller.
 // port: zipup.c:zipup
 pub(crate) fn add(z: &mut Zr, w: &mut Wr, f: &Found) -> Result<Zipped, Exit> {
-    let mut e = ZEntry {
+    let e = ZEntry {
         name: f.name.clone(),
         iname: f.zname.clone(),
         oname: f.oname.clone(),
         ..ZEntry::default()
     };
+    add_entry(z, w, e, &f.disk)
+}
+
+/// [`add`] for an entry `e` (its names, and its comment when it is an old
+/// entry being updated; every other field is zipup's), the file at `disk`.
+/// Under `-X-` the old entry's extra fields (`e.extra` as its local header
+/// had it, `e.cextra`) are kept where zip writes no field of their tag
+/// (`copy_nondup_extra_fields`).
+pub(crate) fn add_entry(
+    z: &mut Zr,
+    w: &mut Wr,
+    mut e: ZEntry,
+    disk: &Path,
+) -> Result<Zipped, Exit> {
+    // the old extra fields are probably obsolete
+    let old_extra = std::mem::take(&mut e.extra);
+    let old_cextra = std::mem::take(&mut e.cextra);
     let isdir = e.iname.last() == Some(&b'/');
     let ft = match filetime(z, &e.name) {
         Ok(t) => t,
-        Err(err) => return Ok(Zipped::Open(err)),
+        Err(err) => {
+            // nothing of the entry changed yet
+            e.extra = old_extra;
+            e.cextra = old_cextra;
+            return Ok(Zipped::Open(err, Box::new(e)));
+        }
     };
     let mut q = ft.q;
     let a = ft.a;
@@ -471,7 +494,7 @@ pub(crate) fn add(z: &mut Zr, w: &mut Wr, f: &Found) -> Result<Zipped, Exit> {
         printf(&mut s, m::USIZE, &[write_num_string(uq).as_bytes()]);
         if z.o.noisy {
             z.mesg_write(&s);
-            z.mesg_line_started = true;
+            z.set_line(true);
         }
         if z.o.logall {
             z.log_write(&s);
@@ -519,10 +542,15 @@ pub(crate) fn add(z: &mut Zr, w: &mut Wr, f: &Found) -> Result<Zipped, Exit> {
             m_ = STORE;
             q = 0;
         } else {
-            let p = f.disk.clone();
+            let p = disk.to_path_buf();
             match File::open(&p) {
                 Ok(file) => data = Data::Read(Src::File(z.host.track(&p, file))),
-                Err(err) => return Ok(Zipped::Open(err)),
+                Err(err) => {
+                    // zipup has set these before its open
+                    e.att = 0xffff;
+                    e.atx = 0;
+                    return Ok(Zipped::Open(err, Box::new(e)));
+                }
             }
         }
         e.tim = ft.tim;
@@ -530,12 +558,18 @@ pub(crate) fn add(z: &mut Zr, w: &mut Wr, f: &Found) -> Result<Zipped, Exit> {
         if !isdir {
             AFTER_OPEN.with(|h| {
                 if let Some(h) = h.borrow_mut().as_mut() {
-                    h(&f.disk);
+                    h(disk);
                 }
             });
         }
     }
 
+    if z.o.extra_fields == 2 {
+        // -X-: step through the old extra fields and copy any not already
+        // in the new ones
+        e.extra = super::readzip::copy_nondup_extra_fields(&old_extra, &e.extra);
+        e.cextra = super::readzip::copy_nondup_extra_fields(&old_cextra, &e.cextra);
+    }
     if q == 0 {
         m_ = STORE;
     }
@@ -735,7 +769,7 @@ pub(crate) fn add(z: &mut Zr, w: &mut Wr, f: &Found) -> Result<Zipped, Exit> {
         let mut l = Vec::new();
         stat_line(&mut l, m_, isize, s);
         z.mesg_write(&l);
-        z.mesg_line_started = false;
+        z.set_line(false);
     }
     if z.o.logall {
         let mut l = Vec::new();
@@ -792,8 +826,10 @@ pub(crate) struct DataSink<'a> {
 impl ZipOut for DataSink<'_> {
     /// zipup.c:seekable: `fseekable(y)`, `ftello` and `fseeko` there, which
     /// flushes the stream (a pipe cannot seek; a failing write fails it).
+    /// The position is the stream's own, so standard output that started
+    /// past 0 stays where it is (`zip - f` after other output).
     fn seekable(&mut self) -> bool {
-        self.out.w.seekable() && self.out.w.seek_end().is_ok()
+        self.out.w.seekable() && self.out.w.seek_here().is_ok()
     }
 }
 

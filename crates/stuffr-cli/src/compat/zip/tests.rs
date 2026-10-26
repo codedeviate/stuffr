@@ -115,7 +115,7 @@ fn an_io_error_gets_the_zip_io_error_line() {
         Host::Sandbox(s) => s.stdout.lock().unwrap().clone(),
         Host::Real => unreachable!(),
     };
-    z.mesg_line_started = false;
+    z.set_line(false);
     drop(z);
     assert_eq!(
         String::from_utf8(out).unwrap(),

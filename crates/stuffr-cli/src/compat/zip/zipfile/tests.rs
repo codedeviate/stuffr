@@ -29,6 +29,9 @@ impl ZWrite for Mem {
     fn seek_end(&mut self) -> io::Result<()> {
         Ok(())
     }
+    fn seek_here(&mut self) -> io::Result<()> {
+        Ok(())
+    }
     fn ferror(&self) -> Option<io::Error> {
         None
     }

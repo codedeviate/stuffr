@@ -525,6 +525,147 @@ pub(crate) fn create_excl_armed(host: &Host, path: &Path) -> io::Result<(File, C
     })
 }
 
+/// Info-ZIP Zip 3.0 (zip.c:main, measured 2026-10-25 on both references):
+/// INT, TERM, ABRT, BUS, ILL and SEGV run zip's `handler`, installed with
+/// `signal()` over an inherited ignore: `putc('\n', mesg)`, then
+/// `ziperr(ZE_ABORT, "aborting")`, which ends a started line, prints the
+/// error, removes the temporary archive and exits 9. Every other signal
+/// keeps its default (the temporary is left).
+#[cfg(unix)]
+pub(crate) const ZIP_SIGNALS: Signals = &[
+    libc::SIGINT,
+    libc::SIGTERM,
+    libc::SIGABRT,
+    libc::SIGBUS,
+    libc::SIGILL,
+    libc::SIGSEGV,
+];
+#[cfg(not(unix))]
+pub(crate) const ZIP_SIGNALS: Signals = &[];
+
+/// zip's `mesg` descriptor (1 or 2) for [`on_zip_abort`].
+#[cfg(unix)]
+static ZIP_MESG_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+/// zip's `mesg_line_started`, mirrored for [`on_zip_abort`].
+#[cfg(unix)]
+static ZIP_LINE_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The error text the handler prints (a `'static` slice: pointer, length).
+#[cfg(unix)]
+static ZIP_ABORT_TEXT: std::sync::atomic::AtomicPtr<u8> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+#[cfg(unix)]
+static ZIP_ABORT_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// zip's `mesg` and `mesg_line_started` as the run has them, for the
+/// interrupt handler ([`install_zip_abort`]). A no-op under a sandbox.
+pub(crate) fn zip_mesg_state(host: &Host, to_stderr: bool, line_started: bool) {
+    #[cfg(unix)]
+    if matches!(host, Host::Real) {
+        ZIP_MESG_FD.store(if to_stderr { 2 } else { 1 }, Ordering::Release);
+        ZIP_LINE_STARTED.store(line_started, Ordering::Release);
+    }
+    #[cfg(not(unix))]
+    let _ = (host, to_stderr, line_started);
+}
+
+/// zip.c:main's `signal(SIG..., handler)` for [`ZIP_SIGNALS`], over an
+/// inherited ignore and with `SA_RESTART` (`signal()`): the handler
+/// ([`on_zip_abort`]) writes `\n`, another `\n` when a line was started
+/// ([`zip_mesg_state`]), then `text` (`\nzip error: Interrupted
+/// (aborting)\n`) to `mesg`, removes the temporary armed with
+/// [`create_new_armed`] if any, and exits 9. Installed for the whole run;
+/// under `Host::Sandbox` nothing is installed.
+pub(crate) fn install_zip_abort(host: &Host, text: &'static [u8]) {
+    #[cfg(unix)]
+    {
+        if matches!(host, Host::Sandbox(_)) {
+            return;
+        }
+        ZIP_ABORT_LEN.store(text.len(), Ordering::Release);
+        ZIP_ABORT_TEXT.store(text.as_ptr().cast_mut(), Ordering::Release);
+        let handler = on_zip_abort as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        // SAFETY: zeroed sigaction structs filled before use; the handler
+        // only makes async-signal-safe calls, with every zip signal blocked
+        // while it runs.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            libc::sigemptyset(&mut action.sa_mask);
+            for &sig in ZIP_SIGNALS {
+                libc::sigaddset(&mut action.sa_mask, sig);
+            }
+            action.sa_flags = libc::SA_RESTART;
+            action.sa_sigaction = handler;
+            for &sig in ZIP_SIGNALS {
+                libc::sigaction(sig, &action, std::ptr::null_mut());
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (host, text);
+}
+
+/// zip.c:handler + ziperr(ZE_ABORT, "aborting"). It never allocates or
+/// locks.
+#[cfg(unix)]
+extern "C" fn on_zip_abort(_sig: libc::c_int) {
+    let fd = ZIP_MESG_FD.load(Ordering::Acquire);
+    // SAFETY: write, unlink and _exit are async-signal-safe; the text is a
+    // `'static` slice stored before the handler was installed, and the
+    // slot is read only when `ARMED` says it holds a NUL-terminated path.
+    unsafe {
+        libc::write(fd, b"\n".as_ptr().cast(), 1);
+        if ZIP_LINE_STARTED.load(Ordering::Acquire) {
+            libc::write(fd, b"\n".as_ptr().cast(), 1);
+        }
+        let p = ZIP_ABORT_TEXT.load(Ordering::Acquire);
+        if !p.is_null() {
+            libc::write(fd, p.cast(), ZIP_ABORT_LEN.load(Ordering::Acquire));
+        }
+        if ARMED.load(Ordering::Acquire) {
+            libc::unlink(SLOT.0.get().cast::<libc::c_char>());
+        }
+        libc::_exit(9);
+    }
+}
+
+/// `mkstemp`'s open of `path` (read-write, `create_new`, 0600) with its
+/// removal armed for `signals`' handler (installed by the caller, as
+/// [`install_zip_abort`]); the signals are held back between the create
+/// and the arm. Dropping the guard only disarms. Under `Host::Sandbox`,
+/// for a path the slot cannot hold, and off unix, nothing is armed.
+pub(crate) fn create_new_armed(
+    host: &Host,
+    path: &Path,
+    signals: Signals,
+) -> io::Result<(File, CleanupGuard)> {
+    held_back(signals, || {
+        let mut opts = File::options();
+        opts.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let f = opts.open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let bytes = path.as_os_str().as_bytes();
+            let kind = GuardKind::Abort;
+            if matches!(host, Host::Sandbox(_)) || bytes.len() >= SLOT_LEN || bytes.contains(&0) {
+                return Ok((f, CleanupGuard { armed: false, kind }));
+            }
+            fill_slot(bytes, signals);
+            Ok((f, CleanupGuard { armed: true, kind }))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = host;
+            Ok((f, CleanupGuard {}))
+        }
+    })
+}
+
 /// Set by `on_interrupt_signal`; read and cleared by [`take_interrupt`].
 #[cfg(unix)]
 static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
