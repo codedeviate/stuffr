@@ -30,6 +30,11 @@ pub const REFERENCE_DIR: &str = "/usr/bin";
 /// The mtime every input file gets, so runs cannot differ by wall clock.
 pub const INPUT_MTIME: u64 = 1_000_000_000;
 const TIMEOUT: Duration = Duration::from_secs(30);
+/// What a case may write to its standard output and error together before
+/// it is killed (probe safety: a reference asking a question for ever).
+const CASE_OUTPUT_CAP: usize = 64 << 20;
+/// `RLIMIT_FSIZE` of a case's process: no file it writes grows past this.
+const CASE_FILE_LIMIT: libc::rlim_t = 1 << 30;
 
 /// Apple's gzip (one program; the invoked name sets the mode).
 pub const APPLE_GZIP_DIR: &str = "/usr/bin";
@@ -1499,6 +1504,20 @@ fn spawn_case(exe: &Path, s: &Scratch, c: &Case, stuffr_side: bool) -> Spawned {
             });
         }
     }
+    // Probe safety: no case's files may grow past 1 GiB (a runaway child
+    // dies of SIGXFSZ), and its streams are capped below (64 MiB).
+    // SAFETY: setrlimit is async-signal-safe and touches nothing else.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            let lim = libc::rlimit {
+                rlim_cur: CASE_FILE_LIMIT,
+                rlim_max: CASE_FILE_LIMIT,
+            };
+            libc::setrlimit(libc::RLIMIT_FSIZE, &lim);
+            Ok(())
+        });
+    }
     if c.tty_ctl {
         // standard input is the controlling terminal, set up above
     } else if c.tty_stdin {
@@ -1607,6 +1626,15 @@ fn spawn_case(exe: &Path, s: &Scratch, c: &Case, stuffr_side: bool) -> Spawned {
             let _ = child.kill();
             let _ = child.wait();
             panic!("{exe:?} {:?} timed out after {TIMEOUT:?}", c.args);
+        }
+        if activity.bytes.load(Ordering::SeqCst) > CASE_OUTPUT_CAP {
+            child_done.store(true, Ordering::SeqCst);
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "{exe:?} {:?} wrote more than {CASE_OUTPUT_CAP} bytes (a question asked for ever?)",
+                c.args
+            );
         }
         // A pty queues only a few KiB, so a child writing more is blocked
         // until we read: wait for the master to be readable (at most 2 ms),
@@ -1720,6 +1748,8 @@ fn drain<R: Read + Send + 'static>(mut r: R) -> std::thread::JoinHandle<Vec<u8>>
         loop {
             match r.read(&mut buf) {
                 Ok(0) => break,
+                // past the cap the run is killed: keep reading, store no more
+                Ok(_) if v.len() > CASE_OUTPUT_CAP => {}
                 Ok(n) => v.extend_from_slice(&buf[..n]),
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) if e.raw_os_error() == Some(libc::EIO) => break, // Linux hang-up

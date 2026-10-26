@@ -106,7 +106,7 @@ pub(crate) fn cstr(b: &[u8]) -> &[u8] {
 /// A stdio stream reading the archive: `getc`/`ungetc`, `fread`, `fseeko`,
 /// `ftello`, `feof`, `ferror`, and the `errno` the last failure left.
 pub(crate) struct CFile {
-    f: BufReader<InFile>,
+    f: BufReader<Charged>,
     back: Option<u8>,
     eof: bool,
     err: bool,
@@ -119,8 +119,20 @@ impl CFile {
     pub(crate) fn open(z: &Zr, name: &[u8]) -> io::Result<CFile> {
         let p = z.host.path(name);
         let f = File::open(&p)?;
+        // -FF reads the archive as a stream: a sandbox charges what it
+        // reads to the output budget, so its work has a bound (ruling Z22)
+        let budget = match &z.host {
+            crate::compat::host::Host::Sandbox(s) if z.o.fix == 2 => Some(s.budget.clone()),
+            _ => None,
+        };
         Ok(CFile {
-            f: BufReader::with_capacity(8192, z.host.track(&p, f)),
+            f: BufReader::with_capacity(
+                8192,
+                Charged {
+                    f: z.host.track(&p, f),
+                    budget,
+                },
+            ),
             back: None,
             eof: false,
             err: false,
@@ -200,7 +212,13 @@ impl CFile {
             self.errno = 22;
             return false;
         }
-        match self.f.seek(SeekFrom::Start(at as u64)) {
+        // within what is buffered: no new read (stdio's fseeko keeps its
+        // buffer too)
+        let r = match self.f.stream_position() {
+            Ok(here) => self.f.seek_relative((at - i128::from(here)) as i64),
+            Err(e) => Err(e),
+        };
+        match r {
             Ok(_) => {
                 self.eof = false;
                 true
@@ -241,6 +259,29 @@ impl CFile {
     /// The error a `ZE_READ` prints (`strerror(errno)`).
     pub(crate) fn error(&self) -> io::Error {
         io::Error::from_raw_os_error(self.errno)
+    }
+}
+
+/// The archive's file under the stream: `-FF`'s reads charged to a
+/// sandbox's budget (past it a read fails, `ENOSPC`).
+struct Charged {
+    f: InFile,
+    budget: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+}
+
+impl Read for Charged {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.f.read(buf)?;
+        if let Some(b) = &self.budget {
+            crate::compat::host::take(b, n as u64)?;
+        }
+        Ok(n)
+    }
+}
+
+impl Seek for Charged {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.f.seek(pos)
     }
 }
 

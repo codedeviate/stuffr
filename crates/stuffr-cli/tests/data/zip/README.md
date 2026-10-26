@@ -21,6 +21,7 @@ user or group id, and are the same bytes whichever machine reads them.
 | `comment-cut.zip` | `intact.zip` with the end record's comment length made 50 and only `abc` after it | `93f933edb0f13c0085414efc4ccf4691bdea51e73ac267899167f605270b9785` |
 | `junk.zip` | `intact.zip` with `JUNKJUNK` inserted after the first entry (offset 41) | `1786525efe947fc9f88cb6d1c30ae177e6c47006b274b9897814dda3cf4a55cd` |
 | `bad-version.zip` | `intact.zip` with the first local header's version byte 5 (host system) made 50 | `f433e7416cf4d6fd7d9707fb1214fe9b72372af6d76b56f9da8aa225db6038e0` |
+| `split.z01`, `split.zip` | a split set: `zip -X -s 64k r.zip big a.txt` over `a.txt` and a `big` of 70000 random bytes (Python `random.Random(11)`), the parts renamed `split.*` (so `-F split.zip` finds `split.z01`) | `ec8fd1e51c8ec31b833959cf875b628249fd8feceaa30732faf45e0792a81d5c`, `08fd63a1f9159f8319ecac856fe28f6ac40ff11b4f28a9feeb40c814d2a7b352` |
 | `extra-cut.zip` | `zip x.zip a.txt b.txt` WITHOUT `-X` (local `UT` and `ux` fields; uid 501, gid 20), cut 20 bytes into the first central header | `9c841f28ff8cf5446a00593c02f77440265715f6e783c220a92f6c77e9cc9d3b` |
 
 `extra-cut.zip` is the input of ruling Z19's pin (`-FF` copies a local extra
@@ -28,7 +29,8 @@ field into the central one with `strcpy`: Apple writes zeros after the first
 NUL, Ubuntu heap garbage that changes run to run); it is not in the
 differential on Ubuntu.
 
-The split sets the tests need (`s.z01`, `s.z02`, `s.zip`, one part missing)
-are made at test time by stuffr itself (`zip -X -s 64k` over 140000 bytes of
+`split.z01`/`split.zip` keep the `-F`/`-FF` matrix independent of stuffr's
+split writer. The other split sets the tests need (`s.z01`, `s.z02`,
+`s.zip`, one part missing) are made at test time by stuffr itself (`zip -X -s 64k` over 140000 bytes of
 the harness's `random(_, 7)`), whose splits `splits_are_byte_identical`
 compares with the reference's byte for byte.

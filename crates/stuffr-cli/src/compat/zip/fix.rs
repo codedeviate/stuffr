@@ -8,12 +8,24 @@
 //! local header is written again. The new archive's central directory is
 //! the entries copied, in the order met.
 //!
-//! **Bounded:** every byte of the archive is read once going forward,
-//! apart from the descriptor search's step back over what it has just read
-//! (fileio.c: the seek goes to `bytes_this_split + kk`, the OUTPUT's count,
-//! as in the C: where the two differ, the C, and stuffr, read some bytes
-//! again; each pass writes what it reads, so the sandbox's budget bounds
-//! it). The parts of a split archive are opened through `Host::track`.
+//! **Bounded (ruling Z22), with the C's output:** the archive is read
+//! going forward, once, but for two of the C's steps back, both kept as
+//! the C makes them and both made cheap: the descriptor search goes back
+//! over a signature whose sizes do not agree (4 bytes) or to the OUTPUT's
+//! count (`bytes_this_split + kk`: where the input and the output counts
+//! differ the C reads some bytes again, and each such pass writes at least
+//! one byte). stuffr reads only the bytes the C looks at (4, then a
+//! descriptor's 16 or 24, or a search reading on in doubling pieces up to
+//! the C's 16 KiB) and its stream keeps its buffer over a seek within it,
+//! so a run of fake descriptor signatures costs a few bytes each, not a
+//! 16 KiB read. The sort of the entries at each central header met (the
+//! C's `qsort` of all of them) is skipped when nothing was added and is an
+//! insertion when a few entries with new names were; only entries with
+//! equal names alternating with central headers are sorted again each
+//! time (their order is the flavour's `qsort`'s, as in the C): quadratic
+//! in the number of such entries. In a sandbox every byte `-FF` reads is
+//! charged to the output budget. The parts of a split archive are opened
+//! through `Host::track`.
 //!
 //! Undefined behaviour in the C, not reproduced (deviation 19):
 //! - zipcopy copies the local extra field into the central one with
@@ -239,6 +251,8 @@ fn scanzipf_fixnew(
     let mut errno = Errno::default();
     let mut sigbuf = [0u8; 4];
     let mut in_central_directory = false;
+    // how many entries `zsort` holds (ruling Z22)
+    let mut sorted_upto = 0usize;
     let mut r: i32 = 0;
     z.total_disks = 1_000_000;
     let in_path = z.o.in_path.clone().unwrap_or_default();
@@ -387,7 +401,6 @@ fn scanzipf_fixnew(
         errno.from(&f);
     }
     z.zipmessage(m::FF_SCANNING.as_bytes(), b"");
-    let mut skipped_disk = false;
     z.current_in_disk = 0;
     while z.current_in_disk < z.total_disks {
         let disk = z.current_in_disk;
@@ -425,12 +438,11 @@ fn scanzipf_fixnew(
                 split_path = super::split::get_in_split_path(z, &ip, disk)?;
             }
             if skip_disk {
-                skipped_disk = true;
+                // (the C sets skipped_disk here and never reads it)
                 z.current_in_disk += 1;
                 continue;
             }
         }
-        let _ = skipped_disk;
         // the main loop: the next signature, and what it starts
         while let Some(f) = ia.f.as_mut() {
             if !find_next_signature(f, &mut sigbuf) {
@@ -469,15 +481,7 @@ fn scanzipf_fixnew(
                 if !in_central_directory {
                     z.zipmessage(m::FF_CENTRAL_FOUND.as_bytes(), b"");
                     // sort what there is by name
-                    let mut order: Vec<usize> = (0..sc.ar.zfiles.len()).collect();
-                    let names: Vec<Vec<u8>> = sc
-                        .ar
-                        .zfiles
-                        .iter()
-                        .map(|f| cstr(&f.zname).to_vec())
-                        .collect();
-                    super::scan::qsort(z.flavour, &mut order, &|a, b| names[a].cmp(&names[b]));
-                    sc.ar.zsort = order;
+                    resort(z, &mut sc.ar, &mut sorted_upto);
                 }
                 if z.o.verbose > 0 {
                     message(z, m::FF_CEN, &[&d1, &o1], false);
@@ -635,6 +639,57 @@ fn scanzipf_fixnew(
         z.current_in_disk += 1;
     }
     Ok(0)
+}
+
+/// zipfile.c:scanzipf_fixnew's sort of the entries met so far, at each
+/// central directory met (`qsort(zsort, zcount, ..., zqcmp)`), with the
+/// same `zsort` and less work (ruling Z22): nothing when no entry was
+/// added since the last sort; a few new entries whose names are all
+/// distinct inserted where they go; many, or any equal names, sorted again
+/// (with names all distinct any sort gives the one order; with equal names
+/// the flavour's `qsort` decides their order, as in the C).
+fn resort(z: &Zr, ar: &mut Archive, sorted_upto: &mut usize) {
+    let n = ar.zfiles.len();
+    if n == *sorted_upto {
+        return;
+    }
+    let key = |zf: &[ZFile], i: usize| cstr(&zf[i].zname).to_vec();
+    let mut distinct = true;
+    if n - *sorted_upto <= 64 {
+        for i in *sorted_upto..n {
+            let k = key(&ar.zfiles, i);
+            match ar
+                .zsort
+                .binary_search_by(|&j| cstr(&ar.zfiles[j].zname).cmp(&k))
+            {
+                Ok(_) => {
+                    distinct = false;
+                    break;
+                }
+                Err(pos) => ar.zsort.insert(pos, i),
+            }
+        }
+        if distinct {
+            *sorted_upto = n;
+            return;
+        }
+    } else {
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| cstr(&ar.zfiles[a].zname).cmp(cstr(&ar.zfiles[b].zname)));
+        if order
+            .windows(2)
+            .all(|w| cstr(&ar.zfiles[w[0]].zname) != cstr(&ar.zfiles[w[1]].zname))
+        {
+            ar.zsort = order;
+            *sorted_upto = n;
+            return;
+        }
+    }
+    let names: Vec<&[u8]> = ar.zfiles.iter().map(|f| cstr(&f.zname)).collect();
+    let mut order: Vec<usize> = (0..n).collect();
+    super::scan::qsort(z.flavour, &mut order, &|a, b| names[a].cmp(names[b]));
+    ar.zsort = order;
+    *sorted_upto = n;
 }
 
 /// `strerror` of an error the output stream met.
@@ -898,7 +953,12 @@ fn bfcopy_ff(
             return Ok(ZE_READ);
         };
         let des_start = f.tell();
-        let b = f.fread(brd);
+        // ruling Z22: the C reads 16 KiB and looks at it; stuffr reads what
+        // it looks at (4 bytes, a descriptor's 16 or 24, or a search
+        // reading on in doubling pieces up to the 16 KiB): the same bytes
+        // written and the same position after
+        let first = if desc { 4 } else { brd };
+        let mut b = f.fread(first);
         if b.is_empty() {
             errno.from(f);
             return Ok(ZE_READ);
@@ -908,30 +968,51 @@ fn bfcopy_ff(
             des.crc = 0;
             des.csize = 0;
             des.usize = 0;
+            let size = if out.zip64_entry { 24 } else { 16 };
             if !b.starts_with(b"PK\x07\x08") {
                 // not at a descriptor: look for its signature, and stop
                 // the buffer before it
-                for (kk, &c) in b[..k].iter().enumerate() {
-                    sbuf.copy_within(1..4, 0);
-                    sbuf[3] = c;
-                    // deviation 19: only a signature wholly in this read
-                    // (one begun in the previous read makes the C write
-                    // `kk - 3`, wrapped, bytes)
-                    if &sbuf == b"PK\x07\x08" && kk >= 3 {
-                        let kk = kk - 3;
-                        // (the C seeks to the OUTPUT's count plus kk)
-                        let to = out.w.offset().wrapping_add(kk as u64);
-                        if !f.seek(i128::from(to)) {
-                            return Err(z.ziperr(ZE_READ, m::SEEK_FAILED_DESCRIPTOR.as_bytes()));
+                let mut scanned = 0;
+                let mut found = None;
+                loop {
+                    for (kk, &c) in b.iter().enumerate().skip(scanned) {
+                        sbuf.copy_within(1..4, 0);
+                        sbuf[3] = c;
+                        // deviation 19: only a signature wholly in this read
+                        // (one begun in the previous read makes the C write
+                        // `kk - 3`, wrapped, bytes)
+                        if &sbuf == b"PK\x07\x08" && kk >= 3 {
+                            found = Some(kk - 3);
+                            break;
                         }
-                        k = kk;
+                    }
+                    if found.is_some() || b.len() >= brd || f.feof() {
                         break;
                     }
+                    scanned = b.len();
+                    let more = scanned.max(64).min(brd - scanned);
+                    let c = f.fread(more);
+                    if c.is_empty() {
+                        break;
+                    }
+                    b.extend_from_slice(&c);
+                }
+                k = b.len();
+                if let Some(kk) = found {
+                    // (the C seeks to the OUTPUT's count plus kk)
+                    let to = out.w.offset().wrapping_add(kk as u64);
+                    if !f.seek(i128::from(to)) {
+                        return Err(z.ziperr(ZE_READ, m::SEEK_FAILED_DESCRIPTOR.as_bytes()));
+                    }
+                    k = kk;
                 }
             } else {
                 // the signature at the start of the buffer
+                if b.len() == 4 {
+                    b.extend_from_slice(&f.fread(size - 4));
+                }
+                k = b.len();
                 des.good = false;
-                let size = if out.zip64_entry { 24 } else { 16 };
                 if k >= size {
                     if out.zip64_entry {
                         des.crc = lg(&b, 4);
@@ -958,10 +1039,17 @@ fn bfcopy_ff(
                     }
                     // the right descriptor: skip it, it is written later
                     des.good = true;
+                    k = size;
                     if !f.seek(i128::from(des_start) + size as i128) {
                         return Err(z.ziperr(ZE_READ, m::SEEK_FAILED_DESCRIPTOR.as_bytes()));
                     }
                     data_start = f.tell();
+                } else {
+                    // fewer than a descriptor's bytes are left: the C's
+                    // 16 KiB read got these and no more
+                    let rest = f.fread(brd - b.len());
+                    b.extend_from_slice(&rest);
+                    k = b.len();
                 }
             }
         }
@@ -993,6 +1081,5 @@ fn bfcopy_ff(
             }
         }
     }
-    let _ = data_start;
     Ok(0)
 }

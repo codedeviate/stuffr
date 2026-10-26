@@ -202,6 +202,28 @@
 //!     descriptor signature split across two 16 KiB reads (the C then
 //!     writes `kk - 3`, wrapped, bytes) is not taken for one; a Zip64 extra
 //!     field shorter than its sizes is read as zeros past its end.
+//! 20. Ruling Z21: `-F`/`-FF` whose `--out` is the damaged archive under
+//!     another name (`./a.zip`, a hard or symbolic link to it) is refused
+//!     as the same name is (`--out path must be different than in path`,
+//!     exit 16), before anything is written: zip compares the names only
+//!     and renames its lossy salvage over the archive it salvaged from.
+//! 21. Ruling Z23: when what did not fit in a split cannot be written to
+//!     the next one ("Not enough room on disk"), `-sp` (`split_method` 2)
+//!     lets the user choose another disk and opens another split, for ever
+//!     on a full disk; stuffr warns as `-sp` does and ends with `-s`'s
+//!     answer, `zip error: Output file write failure (Not enough room on
+//!     disk)`, exit 14.
+//! 22. Ruling Z24: `-sp` with an archive name that has no directory: zip
+//!     takes the name part as empty, so an answer (a directory, a bare
+//!     name) makes the next split's name from a name shorter than `zip`
+//!     and indexes before its buffer. stuffr takes such a name as one in
+//!     the current directory: `zip -s 64k -sp t.zip big` answered `o/`
+//!     writes `t.z01` here, then `o/t.z02`, ..., `o/t.zip`.
+//! 23. Ruling Z25: `-z` whose first comment line is empty copies `\r\n`
+//!     into a one-byte block (`strcpy(p, "\r\n")`): Ubuntu's build dies in
+//!     glibc's buffer-overflow check (exit 9 through zip's SIGABRT
+//!     handler); Apple's writes the comment. stuffr writes it in both
+//!     flavours, as Apple's build does.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -316,6 +338,9 @@ pub(crate) struct Zr<'a> {
     /// Standard input as zip's prompts read it (`fgets(..., stdin)`: one
     /// stdio stream for every prompt of the run), once first asked for.
     pub(crate) prompt: Option<split::Prompt>,
+    /// `mesg_line_started`, shared with the split writer, which writes its
+    /// questions itself.
+    pub(crate) line_cell: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
 impl<'a> Zr<'a> {
@@ -345,6 +370,7 @@ impl<'a> Zr<'a> {
             total_disks: 1,
             skip_this_disk: 0,
             prompt: None,
+            line_cell: std::rc::Rc::new(std::cell::Cell::new(false)),
         }
     }
 
@@ -352,6 +378,7 @@ impl<'a> Zr<'a> {
     /// prints a newline first when a line was started).
     pub(crate) fn set_line(&mut self, v: bool) {
         self.mesg_line_started = v;
+        self.line_cell.set(v);
         host::zip_mesg_state(&self.host, self.mesg_err, v);
     }
 

@@ -323,6 +323,11 @@ enum Data {
 /// Pass on what `bfwrite` printed: `-dg`'s dots, and the split messages,
 /// bells and questions (`-sv`, `-sb`, `-sp`), in order.
 pub(crate) fn drain_dots(z: &mut Zr, out: &mut ZOut) {
+    // a split question wrote to mesg itself: its line state
+    let line = z.line_cell.get();
+    if line != z.mesg_line_started {
+        z.set_line(line);
+    }
     for p in std::mem::take(&mut out.pending) {
         match p {
             Pend::Dots(d) => {
@@ -339,6 +344,17 @@ pub(crate) fn drain_dots(z: &mut Zr, out: &mut ZOut) {
                 }
             }
             Pend::Message(b) => z.zipmessage(&b, b""),
+            Pend::LogOnly(b) => {
+                if z.log.is_some() {
+                    if z.log_line_started {
+                        z.log_write(b"\n");
+                    }
+                    let mut l = b;
+                    l.push(b'\n');
+                    z.log_write(&l);
+                    z.log_line_started = false;
+                }
+            }
         }
     }
 }

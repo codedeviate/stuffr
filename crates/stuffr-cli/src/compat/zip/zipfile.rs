@@ -149,6 +149,9 @@ pub(crate) enum Pend {
     NlIfLine,
     /// `zipmessage(text, "")`.
     Message(Vec<u8>),
+    /// A `zipmessage` already written to `mesg` (before a question): its
+    /// log copy.
+    LogOnly(Vec<u8>),
 }
 
 /// The archive being written and `bfwrite`'s globals (fileio.c, zip.c).

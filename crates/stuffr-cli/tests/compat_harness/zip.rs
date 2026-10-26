@@ -2297,6 +2297,20 @@ pub fn zip_fix_matrix(flavour: &'static str) -> Vec<Case<'static>> {
         parts(&["s.z02"]),
         b"q\n",
     );
+    // the committed reference-made split set (README)
+    let rset = || {
+        ZipTree::standard()
+            .file("split.z01", zip_data("split.z01"))
+            .file("split.zip", zip_data("split.zip"))
+    };
+    let rmissing = || ZipTree::standard().file("split.zip", zip_data("split.zip"));
+    add(&["-F", "split.zip", "--out", "f.zip"], rset(), b"");
+    add(&["-FF", "split.zip", "--out", "f.zip"], rset(), b"");
+    add(&["split.zip", "--out", "f.zip"], rset(), b"");
+    for answer in [&b"q\n"[..], b"s\n"] {
+        add(&["-F", "split.zip", "--out", "f.zip"], rmissing(), answer);
+        add(&["-FF", "split.zip", "--out", "f.zip"], rmissing(), answer);
+    }
     // the missing part in another directory: `c`, the directory, ENTER
     let mut moved = parts(&["s.z02"]);
     let z02 = set.iter().find(|(n, _)| n == "s.z02").unwrap().1.clone();

@@ -276,6 +276,9 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
             zip_attributes,
             prompt,
             fnmax: flavour::fnmax(z.flavour),
+            mesg: Some(z.host.out_writer(None)),
+            noisy: z.o.noisy,
+            line: z.line_cell.clone(),
         }));
     }
     let mut w = Wr {

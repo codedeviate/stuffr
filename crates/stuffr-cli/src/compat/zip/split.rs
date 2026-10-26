@@ -328,6 +328,13 @@ pub(crate) struct SplitW {
     pub(crate) zip_attributes: u32,
     pub(crate) prompt: Prompt,
     pub(crate) fnmax: usize,
+    /// `mesg` (standard output: splits never go to standard output), for
+    /// the questions written before their answers are read.
+    pub(crate) mesg: Option<std::io::BufWriter<Box<dyn Write + Send>>>,
+    /// `noisy`, for `zipmessage`'s text written early.
+    pub(crate) noisy: bool,
+    /// The run's `mesg_line_started` (`Zr::line_cell`).
+    pub(crate) line: Rc<std::cell::Cell<bool>>,
 }
 
 impl Drop for SplitW {
@@ -433,11 +440,15 @@ impl SplitW {
     // port: fileio.c:ask_for_split_write_path
     fn ask_for_split_write_path(&mut self, pending: &mut Vec<Pend>, current_disk: u64) {
         let num = (current_disk as u32).wrapping_add(1);
-        // a name with no directory leaves the directory the whole name and
-        // the name empty (the C's loop finds no separator)
+        // ruling Z24 (deviation 22): a name with no directory is a name in
+        // the current directory (the C leaves the name empty, and the next
+        // split's name then indexes before its buffer)
         let (split_dir, mut split_name) = match dir_of(&self.out_path, b"/\\:") {
             Some(i) => (self.out_path[..i].to_vec(), self.out_path[i..].to_vec()),
-            None => (m::CURRENT_DIRECTORY.as_bytes().to_vec(), Vec::new()),
+            None => (
+                m::CURRENT_DIRECTORY.as_bytes().to_vec(),
+                self.out_path.clone(),
+            ),
         };
         pending.push(Pend::NlIfLine);
         let mut s = Vec::new();
@@ -449,6 +460,9 @@ impl SplitW {
         pending.push(Pend::Raw(s));
         loop {
             pending.push(Pend::Raw(m::SPLIT_PATH_PROMPT.as_bytes().to_vec()));
+            // fprintf, fflush, then fgets: the question is on the terminal
+            // (and -sb's bell has rung) before the answer is read
+            self.flush_pending(pending);
             // ruling Z5: the end of standard input answers ENTER
             let Some(l) = fgets_n(&self.prompt, self.fnmax) else {
                 break;
@@ -477,12 +491,55 @@ impl SplitW {
             let mut s = Vec::new();
             printf(&mut s, m::WRITING_TO, &[&buf]);
             pending.push(Pend::Raw(s));
-            // the C's loop again: no `/`, no name
+            // the name again (ruling Z24: with no `/`, the whole name)
             split_name = match dir_of(&self.out_path, b"/") {
                 Some(i) => self.out_path[i..].to_vec(),
-                None => Vec::new(),
+                None => self.out_path.clone(),
             };
         }
+    }
+
+    /// Write what `bfwrite` has queued for `mesg` now, flushed, as the C
+    /// writes it before it reads an answer: `zipmessage`'s text (its log
+    /// copy stays queued for the caller), `fprintf`s, `-dg`'s dots, keeping
+    /// `mesg_line_started` in the run's shared cell.
+    pub(crate) fn flush_pending(&mut self, pending: &mut Vec<Pend>) {
+        let Some(w) = self.mesg.as_mut() else {
+            return;
+        };
+        let mut keep = Vec::new();
+        for p in pending.drain(..) {
+            match p {
+                Pend::Dots(d) => {
+                    let _ = w.write_all(&d);
+                    if d.contains(&b'.') {
+                        self.line.set(true);
+                    }
+                }
+                Pend::Raw(b) => {
+                    let _ = w.write_all(&b);
+                }
+                Pend::NlIfLine => {
+                    if self.line.get() {
+                        let _ = w.write_all(b"\n");
+                    }
+                }
+                Pend::Message(b) => {
+                    if self.noisy {
+                        if self.line.get() {
+                            let _ = w.write_all(b"\n");
+                        }
+                        let _ = w.write_all(&b);
+                        let _ = w.write_all(b"\n");
+                        self.line.set(false);
+                    }
+                    keep.push(Pend::LogOnly(b));
+                }
+                Pend::LogOnly(b) => keep.push(Pend::LogOnly(b)),
+            }
+        }
+        let _ = w.flush();
+        *pending = keep;
     }
 
     /// `mkstemp` of the next split's temporary, armed in place of the
@@ -502,6 +559,14 @@ impl SplitW {
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the write of what did not fit, into the new split, fails
+    /// (`fwrite` short: the disk full).
+    pub(crate) static FAIL_SPLIT_REST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 impl ZOut {
@@ -560,13 +625,23 @@ impl ZOut {
             }
             self.w = sp.open_temp()?;
             sp.published = false;
+            #[cfg(test)]
+            let r = if FAIL_SPLIT_REST.with(std::cell::Cell::get) {
+                Err(io::Error::from(io::ErrorKind::StorageFull))
+            } else {
+                self.w.write_all(rest)
+            };
+            #[cfg(not(test))]
             let r = self.w.write_all(rest);
             let n = if r.is_ok() { rest.len() } else { 0 };
             if !header {
                 self.bytes_this_entry += n as u64;
             }
             if let Err(e) = r {
-                // the buffer is bigger than a split
+                // the buffer is bigger than a split, or the disk full. Ruling
+                // Z23 (deviation 21): -sp's "let the user choose another
+                // disk" retry is not made (it would open another temporary
+                // for ever on a full disk): both methods end here
                 if sp.method == 2 {
                     self.pending.push(Pend::Message({
                         let mut l = Vec::new();

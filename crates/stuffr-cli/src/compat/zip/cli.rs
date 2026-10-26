@@ -2527,6 +2527,22 @@ fn checks(z: &mut Zr) -> Result<(), Exit> {
         );
         return Err(z.ziperr(ZE_PARMS, &e));
     }
+    // ruling Z21 (deviation 20): -F/-FF never replace the damaged archive
+    // with what they salvage, whatever --out spells it as (the C compares
+    // the names only)
+    if z.o.fix != 0
+        && z.o.have_out
+        && let (Some(i), Some(o)) = (&z.o.in_path, &z.o.out_path)
+        && let (Ok(a), Ok(b)) = (
+            std::fs::metadata(z.host.path(i)),
+            std::fs::metadata(z.host.path(o)),
+        )
+        && crate::compat::host::same_file(&a, &b) == Some(true)
+    {
+        let mut e = Vec::new();
+        printf(&mut e, m::OUT_PATH_DIFFERENT, &[o]);
+        return Err(z.ziperr(ZE_PARMS, &e));
+    }
 
     if z.o.fix != 0 && z.o.diff_mode {
         return Err(z.ziperr(ZE_PARMS, m::DIFF_WITH_FIX.as_bytes()));
