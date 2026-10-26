@@ -140,3 +140,55 @@ fn asctime_is_c_asctime() {
     );
     assert_eq!(asctime(&host, 0), "Thu Jan \x201 00:00:00 1970\n");
 }
+
+/// A sandbox's `-lf` log is charged to the output budget like any file
+/// (0.19.0 Task 12): what the budget holds is written, the rest is lost
+/// (a failed `fprintf` to the log is never looked at), and the budget ends
+/// at what was not taken.
+#[test]
+fn the_log_is_charged_to_the_sandbox_budget() {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("stuffr-zipcharge-{}-log", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let budget = Arc::new(AtomicU64::new(10));
+    let host = Host::Sandbox(Sandbox {
+        dir,
+        stdin: None,
+        stdout: Arc::default(),
+        budget: budget.clone(),
+        reads: Arc::default(),
+    });
+    let env = |_: &str| None;
+    let mut err = Vec::new();
+    let mut z = Zr::new(host, Flavour::Apple, "zip", &env, &mut err);
+    z.log = Some(Box::new(std::fs::File::create(&path).unwrap()));
+    z.log_write(b"12345678");
+    z.log_write(b"abcdef");
+    drop(z);
+    let written = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(written, b"12345678");
+    assert_eq!(budget.load(std::sync::atomic::Ordering::Relaxed), 2);
+}
+
+/// A pattern file (`-i @names`) is a tracked open of the sandbox: counted
+/// once, with the bytes read (0.19.0 Task 12).
+#[test]
+fn a_pattern_file_is_a_tracked_open() {
+    let dir = std::env::temp_dir().join(format!("stuffr-zippat-{}-d", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("names"), b"a\nb\n").unwrap();
+    let args: Vec<OsString> = ["-i", "@names", "out.zip", "a"]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    let (_, _, _, reads) = run_in_counted(Flavour::Apple, &dir, "zip", &args, b"");
+    let _ = std::fs::remove_dir_all(&dir);
+    let r = reads
+        .iter()
+        .find(|(p, _)| p.ends_with("names"))
+        .map(|(_, r)| *r)
+        .expect("the pattern file was opened through Host::track");
+    assert_eq!((r.opens, r.bytes, r.len), (1, 4, 4));
+}

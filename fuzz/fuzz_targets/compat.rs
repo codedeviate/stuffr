@@ -128,6 +128,21 @@
 //!   tokens bring `a.Z` and `b.Z`, the nineteenth and twentieth
 //!   `COMPAT_FILES` entries, on the third mask byte (bits 19 and 20), and
 //!   the `-b` forms.
+//! - the zip family (`zip`, `zipcloak`, `zipnote`, `zipsplit`; flavour byte
+//!   absolute, 0 Ubuntu and 1 Apple) exits with a ziperr code
+//!   (`zip::EXIT_CODES`, never 1), opens only files an operand names within
+//!   `check_zip_reads`' bound (`-FF` at `2 × len + 1 MiB`), makes only names
+//!   a token spells (`zip_name_ok`), leaves no `zi??????` temporary, makes at
+//!   most as many files as the archive has entries plus three (zipsplit),
+//!   keeps the output budget (the `-lf` log's bytes and `-FF`'s reads are
+//!   charged to it), and every archive it writes reads back by an
+//!   independent walk (`verify_zip`: stored and `infozip::inflate` data to
+//!   the record's size and CRC, the `zip` crate's count) when its input
+//!   archives were whole (`run_zip` says why only then). No token is
+//!   absolute or names `..`; names a payload supplies (`-@`, `@a`, an
+//!   archive's entries) are kept in the run's directory by the sandbox
+//!   (`Host::path`), and `check_extraction_contained` sees nothing outside
+//!   change. It adds no `COMPAT_FILES`: `a.zip` and `b.zip` are unzip's.
 //!
 //! **Memory under the xz names (Ruling P7).** libFuzzer's RSS limit is the
 //! bound: 1 GiB in a daytime `make fuzz`, which passes `-rss_limit_mb=1024`
@@ -2508,20 +2523,385 @@ fn check_compress_leftovers(dir: &Path, ctx: &str) {
     }
 }
 
+/// Tokens that make a zip-family run read names from the case's payload:
+/// `-@` (names from standard input) and any `@file` pattern (`-i @a`, `-x
+/// @a`, `-R @a`): the payload is every created file and standard input, so
+/// the lines of `a` are names. The library's sandbox keeps whatever they
+/// spell inside the run's directory (`Host::path`: a root is dropped, `..`
+/// is an ordinary name nothing has), and the read bound counts them.
+fn zip_names_from_payload(args: &[&str]) -> bool {
+    args.iter().any(|t| *t == "-@" || t.starts_with('@'))
+}
+
+/// The lines of `payload` as names, as `getnam` splits them (LF or CR).
+fn zip_payload_names(payload: &[u8]) -> Vec<&[u8]> {
+    payload
+        .split(|b| *b == b'\n' || *b == b'\r')
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// `-FF`'s read allowance beyond twice the archive: Task 8's bound (a
+/// descriptor's 24 bytes at a fake signature, doubling search pieces up to
+/// the C's 16 KiB, the stream's buffer kept over a seek within it), measured
+/// at `2 × len + 1 MiB` at most and enforced by the sandbox, which charges
+/// every byte `-FF` reads to the 8 MiB budget.
+const ZIP_FF_SLACK: u64 = 1024 * 1024;
+
+/// One `PK\1\2` per entry: the most entries a zipsplit run can place in
+/// parts, so the most files it can create (`ZIP_PARTS_SLACK` more: the index
+/// and a part for the archive's own end).
+fn zip_central_count(payload: &[u8]) -> u64 {
+    payload.windows(4).filter(|w| *w == b"PK\x01\x02").count() as u64
+}
+const ZIP_PARTS_SLACK: u64 = 3;
+
+/// Whether a name the run created is one the zip family may make: a token
+/// (`-O a`, `-b`), a token with the `.zip` zip appends to an archive name
+/// without an extension, a log (`-lf a` makes `a.log`), zipsplit's index
+/// and its parts (`<stem><n>.zip`, the stem a prefix of an archive token's).
+fn zip_name_ok(name: &str, tokens: &[&str]) -> bool {
+    if tokens
+        .iter()
+        .any(|t| name == *t || name == format!("{t}.zip") || name == format!("{t}.log"))
+    {
+        return true;
+    }
+    if name == "zipsplit.idx" {
+        return true;
+    }
+    if let Some(stem) = name.strip_suffix(".zip") {
+        let prefix = stem.trim_end_matches(|c: char| c.is_ascii_digit());
+        return !prefix.is_empty()
+            && tokens
+                .iter()
+                .any(|t| t.strip_suffix(".zip").unwrap_or(t).starts_with(prefix));
+    }
+    false
+}
+
+/// A zip temporary: `zi` and six letters or digits (`mkstemp`'s template).
+fn is_zip_temp(name: &str) -> bool {
+    name.len() == 8
+        && name.starts_with("zi")
+        && name[2..].bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// An archive's own view of itself, read independently of stuffr's reader:
+/// the end record (and a Zip64 one behind it), every central record, its
+/// local header (the names must agree), and the data of every stored or
+/// deflated entry that is not encrypted: stored as it is, deflated through
+/// `infozip::inflate`, either way to the central record's size and CRC-32.
+/// The `zip` crate counts the entries a second time. `Err` says what failed.
+fn verify_zip(bytes: &[u8]) -> Result<(usize, usize), String> {
+    use std::io::Cursor;
+    let le16 = |at: usize| -> Option<u64> {
+        bytes
+            .get(at..at + 2)
+            .map(|b| u64::from(u16::from_le_bytes([b[0], b[1]])))
+    };
+    let le32 = |at: usize| -> Option<u64> {
+        bytes
+            .get(at..at + 4)
+            .map(|b| u64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+    };
+    let le64 = |at: usize| -> Option<u64> {
+        bytes
+            .get(at..at + 8)
+            .map(|b| u64::from_le_bytes(b.try_into().expect("eight bytes")))
+    };
+    let eocd = bytes
+        .windows(4)
+        .rposition(|w| w == b"PK\x05\x06")
+        .ok_or("no end record")?;
+    let comment = le16(eocd + 20).ok_or("end record cut")? as usize;
+    if eocd + 22 + comment != bytes.len() {
+        return Err(format!(
+            "end record at {eocd} with a {comment}-byte comment ends at {}, not {}",
+            eocd + 22 + comment,
+            bytes.len()
+        ));
+    }
+    let (mut entries, mut cd_size, mut cd_off) = (
+        le16(eocd + 10).ok_or("cut")?,
+        le32(eocd + 12).ok_or("cut")?,
+        le32(eocd + 16).ok_or("cut")?,
+    );
+    if entries == 0xffff || cd_size == 0xffff_ffff || cd_off == 0xffff_ffff {
+        let loc = eocd.checked_sub(20).ok_or("no Zip64 locator")?;
+        if le32(loc) != Some(0x0706_4b50) {
+            return Err("Zip64 values without a locator".into());
+        }
+        let z64 = le64(loc + 8).ok_or("cut")? as usize;
+        if le32(z64) != Some(0x0606_4b50) {
+            return Err(format!("no Zip64 end record at {z64}"));
+        }
+        entries = le64(z64 + 32).ok_or("cut")?;
+        cd_size = le64(z64 + 40).ok_or("cut")?;
+        cd_off = le64(z64 + 48).ok_or("cut")?;
+    }
+    let mut at = usize::try_from(cd_off).map_err(|_| "offset")?;
+    let cd_end = at.checked_add(usize::try_from(cd_size).map_err(|_| "size")?);
+    if cd_end.is_none_or(|e| e > eocd) {
+        return Err(format!(
+            "central directory {cd_off}+{cd_size} runs past the end record"
+        ));
+    }
+    let mut seen = 0u64;
+    let mut unchecked = 0usize;
+    while seen < entries {
+        if le32(at) != Some(0x0201_4b50) {
+            return Err(format!("entry {seen}: no central record at {at}"));
+        }
+        let flags = le16(at + 8).ok_or("cut")?;
+        let method = le16(at + 10).ok_or("cut")?;
+        let (crc, mut csize, mut usize_) = (
+            le32(at + 16).ok_or("cut")?,
+            le32(at + 20).ok_or("cut")?,
+            le32(at + 24).ok_or("cut")?,
+        );
+        let (n, e, c) = (
+            le16(at + 28).ok_or("cut")? as usize,
+            le16(at + 30).ok_or("cut")? as usize,
+            le16(at + 32).ok_or("cut")? as usize,
+        );
+        let mut lho = le32(at + 42).ok_or("cut")?;
+        let name = bytes.get(at + 46..at + 46 + n).ok_or("name cut")?;
+        let extra = bytes.get(at + 46 + n..at + 46 + n + e).ok_or("extra cut")?;
+        // The Zip64 block gives, in order, the sizes and offset that are
+        // all ones in the record.
+        let mut x = 0;
+        while x + 4 <= extra.len() {
+            let id = u16::from_le_bytes([extra[x], extra[x + 1]]);
+            let len = usize::from(u16::from_le_bytes([extra[x + 2], extra[x + 3]]));
+            let body = extra.get(x + 4..x + 4 + len).ok_or("extra field cut")?;
+            if id == 1 {
+                let mut p = 0;
+                for v in [&mut usize_, &mut csize, &mut lho] {
+                    if *v == 0xffff_ffff {
+                        let w = body.get(p..p + 8).ok_or("Zip64 extra short")?;
+                        *v = u64::from_le_bytes(w.try_into().expect("eight bytes"));
+                        p += 8;
+                    }
+                }
+            }
+            x += 4 + len;
+        }
+        let lh = usize::try_from(lho).map_err(|_| "local offset")?;
+        if le32(lh) != Some(0x0403_4b50) {
+            return Err(format!("entry {seen} {name:?}: no local header at {lh}"));
+        }
+        let (ln, le) = (
+            le16(lh + 26).ok_or("cut")? as usize,
+            le16(lh + 28).ok_or("cut")? as usize,
+        );
+        if bytes.get(lh + 30..lh + 30 + ln) != Some(name) {
+            return Err(format!("entry {seen} {name:?}: the local name differs"));
+        }
+        let data_at = lh + 30 + ln + le;
+        let data = bytes
+            .get(data_at..data_at.saturating_add(usize::try_from(csize).map_err(|_| "csize")?))
+            .ok_or_else(|| format!("entry {seen} {name:?}: data runs past the file"))?;
+        if flags & 1 != 0 || !matches!(method, 0 | 8) {
+            // Encrypted, or a method the walk does not decode: structure only.
+            unchecked += 1;
+        } else {
+            let plain: Vec<u8> = if method == 0 {
+                data.to_vec()
+            } else {
+                let mut window = vec![0u8; stuffr::infozip::WSIZE];
+                let mut out = Vec::new();
+                let r = stuffr::infozip::inflate(
+                    &mut data.iter(),
+                    false,
+                    &mut window,
+                    &mut |c| {
+                        out.extend_from_slice(c);
+                        if out.len() as u64 > OUTPUT_BUDGET {
+                            Err(())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    &mut |_| {},
+                );
+                r.map_err(|e| format!("entry {seen} {name:?}: inflate failed: {e:?}"))?;
+                out
+            };
+            if plain.len() as u64 != usize_ {
+                return Err(format!(
+                    "entry {seen} {name:?}: {} bytes where the record says {usize_}",
+                    plain.len()
+                ));
+            }
+            let mut crc_now = !0u32;
+            for &b in &plain {
+                crc_now ^= u32::from(b);
+                for _ in 0..8 {
+                    crc_now = if crc_now & 1 != 0 {
+                        0xedb8_8320 ^ (crc_now >> 1)
+                    } else {
+                        crc_now >> 1
+                    };
+                }
+            }
+            if u64::from(!crc_now) != crc {
+                return Err(format!(
+                    "entry {seen} {name:?}: CRC {:08x}, the record says {crc:08x}",
+                    !crc_now
+                ));
+            }
+        }
+        at += 46 + n + e + c;
+        seen += 1;
+    }
+    if at as u64 != cd_off + cd_size {
+        return Err(format!(
+            "central records end at {at}, the end record says {}",
+            cd_off + cd_size
+        ));
+    }
+    let counted = ::zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|e| format!("the zip crate refuses it: {e}"))?
+        .len();
+    if counted as u64 != entries {
+        return Err(format!(
+            "the zip crate counts {counted} entries, the end record {entries}"
+        ));
+    }
+    Ok((counted, unchecked))
+}
+
+/// How many times `sig` occurs in `b` (overlaps counted, as a scan sees
+/// them).
+fn signature_count(b: &[u8], sig: &[u8; 4]) -> usize {
+    b.windows(4).filter(|w| *w == sig).count()
+}
+
+/// The mode tokens that make a run copy entries from an archive it did not
+/// make (so a damaged input's damage can reach the output): the archive is
+/// then read back only if every input archive was whole.
+fn zip_looks_like_archive(b: &[u8]) -> bool {
+    b.starts_with(b"PK\x03\x04") || b.starts_with(b"PK\x05\x06")
+}
+
+/// The zip family's read bound, for every path a run opened. A path is
+/// named by `m` operands: tokens equal to it or to it without the `.zip`
+/// zip appends, plus, when the run reads names from the payload (`-@`,
+/// `@file`), the payload's lines, plus one per `.` token (`-r .` visits
+/// every file of the directory). A path nobody names must not be opened.
+///
+/// Per path, `opens ≤ 4 × m` and `bytes ≤ m × 3 × len + 8 KiB × opens`
+/// (`len` the largest length at an open; the figures are what the seeds
+/// measured, see `ZIP_READ_*`). `-FF` is held to `m × (2 × len + 1 MiB)`
+/// and no more: its descriptor search is bounded (Task 8) and charged to
+/// the sandbox budget.
+fn check_zip_reads(
+    dir: &Path,
+    name: &str,
+    flavour: &str,
+    args: &[&str],
+    payload: &[u8],
+    reads: &BTreeMap<PathBuf, compat::InputReads>,
+) {
+    let from_payload = zip_names_from_payload(args);
+    let lines = if from_payload {
+        zip_payload_names(payload)
+    } else {
+        Vec::new()
+    };
+    let dots = args.iter().filter(|t| **t == ".").count() as u64;
+    let ff = args.contains(&"-FF");
+    for (path, r) in reads {
+        let file = path
+            .strip_prefix(dir)
+            .ok()
+            .and_then(|p| p.to_str())
+            .unwrap_or_else(|| {
+                panic!("{name} ({flavour}) {args:?}: opened {path:?}, outside {dir:?}")
+            });
+        // A token names a file as itself, as the archive zip appends `.zip`
+        // to, or as the `@file` of a pattern list.
+        let named = |t: &str| {
+            file == t || file.strip_suffix(".zip") == Some(t) || t.strip_prefix('@') == Some(file)
+        };
+        let m = args.iter().filter(|t| named(t)).count() as u64
+            + lines
+                .iter()
+                .filter(|l| named(&String::from_utf8_lossy(l)))
+                .count() as u64
+            + dots;
+        assert!(
+            m > 0,
+            "{name} ({flavour}) {args:?}: opened {file:?}, which no operand names"
+        );
+        assert!(
+            r.opens <= ZIP_READ_OPENS * m,
+            "{name} ({flavour}) {args:?}: {} opens of {file:?}, which {m} operand(s) name",
+            r.opens
+        );
+        // `-FF` reads the archive as a stream and scans on past damage:
+        // twice its length and a megabyte (Task 8), nothing looser.
+        let allowed = if ff {
+            m * (2 * r.len + ZIP_FF_SLACK)
+        } else {
+            m * ZIP_READ_PASSES * r.len + ZIP_READ_BLOCK * r.opens
+        };
+        assert!(
+            r.bytes <= allowed,
+            "{name} ({flavour}) {args:?}: read {} bytes of the {}-byte {file:?} in {} open(s), \
+             past {allowed} for {m} operand(s)",
+            r.bytes,
+            r.len,
+            r.opens
+        );
+    }
+}
+
+/// The zip family's measured read figures (`STUFFR_FUZZ_COMPAT_TRACE=1`, the
+/// seeds in both flavours): at most 4 opens of an archive per operand (`-g`:
+/// the old archive, its entries' copy, the temporary's re-read for the new
+/// central directory, the final check) and 2.15 passes over it in bytes
+/// (`-z`, `-u`, `-g` on the 1,228-byte seed archive read 2,640; zipsplit
+/// 4,401 of 2,083). A pass is an end-record search from the tail, the
+/// central directory, and each entry's local block once, so the bound is
+/// `3 × len` plus one 8 KiB buffer per open for the block granularity of a
+/// small archive.
+const ZIP_READ_OPENS: u64 = 4;
+const ZIP_READ_PASSES: u64 = 3;
+const ZIP_READ_BLOCK: u64 = 8192;
+
 /// The zip family (0.19.0) through `compat::run_in_counted`, as the
-/// flavour byte says (0 Ubuntu, 1 Apple, absolute: the same rule as the
-/// unzip and compress families). Task 4's oracle only: no panic, and an exit
-/// code from `zip::EXIT_CODES` (the front end answers 1 for a command line
-/// whose work is not built yet; Task 12 replaces this with the family's
-/// real oracle and its byte).
-fn run_zip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]) {
+/// flavour byte says (0 Ubuntu, 1 Apple, absolute: the rule of the unzip and
+/// compress families). Asserted:
+///
+/// - the exit is one of `zip::EXIT_CODES` (the ziperr set: never 1, which
+///   would mean stuffr itself failed) and a panic is a crash;
+/// - every file the run opened is one an operand names, within the read
+///   bound (`check_zip_reads`);
+/// - the files the run made are names the family makes (`zip_name_ok`),
+///   no zip temporary (`zi` + six characters) survives, no more files than
+///   a zipsplit of this archive could make, and standard output plus every
+///   new or changed file stays within the 8 MiB budget (the sandbox's own,
+///   which the `-lf` log's bytes and `-FF`'s reads are charged to);
+/// - every archive written (a new or changed file starting `PK`, and
+///   standard output) reads back by `verify_zip`, but only when each
+///   archive the run started with was whole itself, since a repair or an
+///   update copies an input's damage;
+/// - containment (in `fuzz_target!`): nothing outside the run's directory
+///   changed. No token is absolute, holds a `/` or names `..`; the names a
+///   payload supplies (`-@`, `@file`, an archive's own entries) are kept
+///   inside by the sandbox's `Host::path`.
+fn run_zip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8], payload: &[u8]) {
+    let flavour_name = if flavour == 0 { "ubuntu" } else { "apple" };
     let flavour = if flavour == 0 {
         zip::Flavour::Ubuntu
     } else {
         zip::Flavour::Apple
     };
+    let before = tree_contents(dir);
     let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
-    let (code, _out, err, _reads) = compat::run_in_counted(
+    let (code, out, err, reads) = compat::run_in_counted(
         dir,
         name,
         os_args,
@@ -2532,11 +2912,120 @@ fn run_zip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]) {
         flavour,
     )
     .expect("a COMPAT_NAMES entry is a compat name");
+    let why = || String::from_utf8_lossy(&err).into_owned();
+    if std::env::var_os("STUFFR_FUZZ_COMPAT_TRACE").is_some() {
+        eprintln!("compat: {name} {flavour_name} {args:?} -> {code}");
+        for (path, r) in &reads {
+            eprintln!("compat:   {path:?} {r:?}");
+        }
+    }
     assert!(
-        code == 1 || zip::EXIT_CODES.contains(&code),
-        "{name} {args:?}: exit {code}: {}",
-        String::from_utf8_lossy(&err)
+        zip::EXIT_CODES.contains(&code),
+        "{name} ({flavour_name}) {args:?}: exit {code} is not a ziperr code\n{}",
+        why()
     );
+    check_zip_reads(dir, name, flavour_name, args, payload, &reads);
+
+    let after = tree_contents(dir);
+    let mut created = Vec::new();
+    let mut written = out.len() as u64;
+    for (p, bytes) in &after {
+        if before.get(p) == Some(bytes) {
+            continue;
+        }
+        written += bytes.len() as u64;
+        if !before.contains_key(p) {
+            created.push(p);
+        }
+    }
+    assert!(
+        written <= OUTPUT_BUDGET,
+        "{name} ({flavour_name}) {args:?}: {written} bytes written, past the {OUTPUT_BUDGET}-byte budget"
+    );
+    for p in &created {
+        let rel = p
+            .strip_prefix(dir)
+            .ok()
+            .and_then(|r| r.to_str())
+            .unwrap_or_else(|| panic!("{name} {args:?}: made {p:?}, outside {dir:?}"));
+        assert!(
+            !is_zip_temp(rel),
+            "{name} ({flavour_name}) {args:?}: left its temporary {rel:?}\n{}",
+            why()
+        );
+        assert!(
+            zip_name_ok(rel, COMPAT_TOKENS) || {
+                // A name the payload gave (`-@`) or the archive holds is
+                // made by no zip program: only tokens name outputs.
+                false
+            },
+            "{name} ({flavour_name}) {args:?}: made a stray {rel:?}\n{}",
+            why()
+        );
+    }
+    let cap = zip_central_count(payload) + ZIP_PARTS_SLACK;
+    assert!(
+        created.len() as u64 <= cap,
+        "{name} ({flavour_name}) {args:?}: made {} files from {} entries",
+        created.len(),
+        cap - ZIP_PARTS_SLACK
+    );
+
+    // Read back what was written, if the run's own inputs were whole.
+    let repair = args.iter().any(|t| matches!(*t, "-F" | "-FF"));
+    let inputs_whole = before
+        .iter()
+        .filter(|(p, b)| {
+            // An input archive is a `.zip` file with any record in it,
+            // however far from the start (a preamble, a cut head).
+            p.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+                && [b"PK\x03\x04", b"PK\x01\x02", b"PK\x05\x06"]
+                    .iter()
+                    .any(|sig| signature_count(b, sig) > 0)
+        })
+        .all(|(_, b)| {
+            // A repair (`-F`, `-FF`) walks the local headers, not the
+            // directory, so its input must have exactly the local and
+            // central records the directory counts (anything more, a
+            // mutated duplicate or signature bytes in data, is a scan the
+            // directory cannot vouch for), and every entry's data checked
+            // (an encrypted or unknown-method record's local header may
+            // say something else, and the repair believes the local one).
+            verify_zip(b).is_ok_and(|(n, unchecked)| {
+                !repair
+                    || (unchecked == 0
+                        && n == signature_count(b, b"PK\x03\x04")
+                        && n == signature_count(b, b"PK\x01\x02"))
+            })
+        });
+    if inputs_whole {
+        for (p, bytes) in &after {
+            if before.get(p) != Some(bytes)
+                && zip_looks_like_archive(bytes)
+                && let Err(e) = verify_zip(bytes)
+            {
+                panic!(
+                    "{name} ({flavour_name}) {args:?}: wrote {p:?}, which does not read back: {e}\n{}",
+                    why()
+                );
+            }
+        }
+        // A run that failed has streamed only part of its archive; and
+        // `-fz` to standard output writes the Zip64 sizes into the records
+        // but an end record with all-ones directory offset and no Zip64 end
+        // record, which Zip 3.0 itself does (the references' bytes are
+        // identical to ours) and no reader can follow.
+        if matches!(code, 0 | 18)
+            && !args.contains(&"-fz")
+            && zip_looks_like_archive(&out)
+            && let Err(e) = verify_zip(&out)
+        {
+            panic!(
+                "{name} ({flavour_name}) {args:?}: wrote an archive to standard output that does not read back: {e}\n{}",
+                why()
+            );
+        }
+    }
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -2546,6 +3035,13 @@ fuzz_target!(|data: &[u8]| {
     let Some(case) = decode_compat_case(data) else {
         return;
     };
+    // `.` is the zip family's directory token (`-r .`); a directory operand
+    // is nothing the other families' read bounds were written for (gunzip
+    // opens it, reads nothing, and no operand names `""`), so those do not run.
+    if case.args.contains(&".") && !matches!(case.name, "zip" | "zipcloak" | "zipnote" | "zipsplit")
+    {
+        return;
+    }
     cwd_before();
     cwd_names_before();
     let parent = sandbox();
@@ -2585,9 +3081,14 @@ fuzz_target!(|data: &[u8]| {
             stdin,
             case.payload,
         ),
-        "zip" | "zipcloak" | "zipnote" | "zipsplit" => {
-            run_zip(&dir, case.name, case.flavour, &case.args, stdin)
-        }
+        "zip" | "zipcloak" | "zipnote" | "zipsplit" => run_zip(
+            &dir,
+            case.name,
+            case.flavour,
+            &case.args,
+            stdin,
+            case.payload,
+        ),
         other => unreachable!("{other} is in COMPAT_NAMES but has no arm here"),
     }
 

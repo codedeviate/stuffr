@@ -1626,6 +1626,25 @@ pub(crate) fn publish(tmp: &Path, out: &Path, force: bool) -> io::Result<Publish
     Ok(Published::Done)
 }
 
+/// A sandbox's operand kept inside its directory: a root (or drive prefix) is
+/// dropped, so `/etc/x` is `dir/etc/x`, and a `..` component becomes an
+/// ordinary name nothing has, so no name (an operand, a line of a names file,
+/// an archive's own entry name) reaches a file outside `dir`. Everything the
+/// fuzz tokens produce is already relative and `..`-free, so this changes
+/// nothing for them; it is what keeps a name a payload supplies in.
+fn confined(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::Prefix(_) | Component::RootDir => {}
+            Component::ParentDir => out.push("..stuffr-parent"),
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// Bytes to a path. On unix this is exact.
 pub(crate) fn path(b: &[u8]) -> PathBuf {
     #[cfg(unix)]
@@ -2197,7 +2216,7 @@ impl Host {
     pub(crate) fn path(&self, b: &[u8]) -> PathBuf {
         match self {
             Host::Real => path(b),
-            Host::Sandbox(s) => s.dir.join(path(b)),
+            Host::Sandbox(s) => s.dir.join(confined(&path(b))),
         }
     }
 
@@ -2387,6 +2406,28 @@ mod tests {
     fn detected_counts_are_positive() {
         let c = Cores::detect();
         assert!(c.logical >= 1 && c.physical >= 1, "{c:?}");
+    }
+
+    #[test]
+    fn a_sandbox_path_never_leaves_its_directory() {
+        let host = Host::Sandbox(Sandbox {
+            dir: PathBuf::from("/box"),
+            stdin: None,
+            stdout: Arc::default(),
+            budget: Arc::new(AtomicU64::new(0)),
+            reads: Arc::default(),
+        });
+        assert_eq!(host.path(b"a/b"), Path::new("/box/a/b"));
+        assert_eq!(host.path(b"./a"), Path::new("/box/a"));
+        assert_eq!(host.path(b"/etc/passwd"), Path::new("/box/etc/passwd"));
+        assert_eq!(host.path(b"../x"), Path::new("/box/..stuffr-parent/x"));
+        assert_eq!(
+            host.path(b"a/../../x"),
+            Path::new("/box/a/..stuffr-parent/..stuffr-parent/x")
+        );
+        assert!(host.path(b"/").starts_with("/box"));
+        // The real process's paths are untouched.
+        assert_eq!(Host::Real.path(b"/etc/passwd"), Path::new("/etc/passwd"));
     }
 
     #[test]

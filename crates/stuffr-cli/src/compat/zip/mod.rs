@@ -509,6 +509,15 @@ impl<'a> Zr<'a> {
 
     /// Text written to the log file, when there is one.
     pub(crate) fn log_write(&mut self, b: &[u8]) {
+        // A sandbox charges the log's bytes to the output budget, like any
+        // other file; a write the budget cannot hold is lost, as a failed
+        // `fprintf` to the log is (its result is never looked at).
+        if let Host::Sandbox(s) = &self.host
+            && self.log.is_some()
+            && crate::compat::host::take(&s.budget, b.len() as u64).is_err()
+        {
+            return;
+        }
         if let Some(l) = self.log.as_mut() {
             let _ = l.write_all(b);
             let _ = l.flush();

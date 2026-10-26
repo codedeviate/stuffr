@@ -1101,13 +1101,95 @@ const COMPAT_SHAPES: &[&str] = &[
     "uncompress-ncompress-keep",
     "uncompress-ncompress-force-uppercase",
     "uncompress-ncompress-force-not-compressed",
-    // The zip family (0.19.0 Task 4): a front-end seed per name and
-    // flavour; Task 12 adds the archive seeds and the flavour byte's oracle.
+    // The zip family (0.19.0 Tasks 4 and 12): every case in both flavours
+    // (`<tool>-<apple|ubuntu>-<case>`, the byte absolute: 0 Ubuntu, 1 Apple):
+    // the front-end screens, adding (stored, best, names from stdin and from
+    // a pattern file, junked, recursive, excluded, moved, logged, with
+    // attributes, encrypted, Unicode), updating, freshening, deleting,
+    // growing, commenting, the two repairs, `-T`, a difference archive, the
+    // three helpers (zipcloak, zipnote, zipsplit with each of its options).
     "zip-apple-help",
+    "zip-ubuntu-help",
+    "zip-apple-help2",
+    "zip-ubuntu-help2",
+    "zip-apple-version",
     "zip-ubuntu-version",
+    "zip-apple-add",
+    "zip-ubuntu-add",
+    "zip-apple-add-store",
+    "zip-ubuntu-add-store",
+    "zip-apple-add-best",
+    "zip-ubuntu-add-best",
+    "zip-apple-add-stdin-names",
+    "zip-ubuntu-add-stdin-names",
+    "zip-apple-add-pattern-file",
+    "zip-ubuntu-add-pattern-file",
+    "zip-apple-add-junk",
+    "zip-ubuntu-add-junk",
+    "zip-apple-add-recurse",
+    "zip-ubuntu-add-recurse",
+    "zip-apple-add-exclude",
+    "zip-ubuntu-add-exclude",
+    "zip-apple-add-move",
+    "zip-ubuntu-add-move",
+    "zip-apple-add-log",
+    "zip-ubuntu-add-log",
+    "zip-apple-add-attrs",
+    "zip-ubuntu-add-attrs",
+    "zip-apple-add-encrypt",
+    "zip-ubuntu-add-encrypt",
+    "zip-apple-add-show",
+    "zip-ubuntu-add-show",
+    "zip-apple-add-unicode",
+    "zip-ubuntu-add-unicode",
+    "zip-apple-update",
+    "zip-ubuntu-update",
+    "zip-apple-freshen",
+    "zip-ubuntu-freshen",
+    "zip-apple-delete",
+    "zip-ubuntu-delete",
+    "zip-apple-grow",
+    "zip-ubuntu-grow",
+    "zip-apple-comment",
+    "zip-ubuntu-comment",
+    "zip-apple-fix",
+    "zip-ubuntu-fix",
+    "zip-apple-fix-fix",
+    "zip-ubuntu-fix-fix",
+    "zip-apple-fix-fix-cut",
+    "zip-ubuntu-fix-fix-cut",
+    "zip-apple-test",
+    "zip-ubuntu-test",
+    "zip-apple-difference",
+    "zip-ubuntu-difference",
     "zipcloak-apple-help",
+    "zipcloak-ubuntu-help",
+    "zipcloak-apple-encrypt",
+    "zipcloak-ubuntu-encrypt",
+    "zipcloak-apple-decrypt",
+    "zipcloak-ubuntu-decrypt",
+    "zipcloak-apple-out",
+    "zipcloak-ubuntu-out",
+    "zipnote-apple-help",
     "zipnote-ubuntu-help",
+    "zipnote-apple-list",
+    "zipnote-ubuntu-list",
+    "zipnote-apple-write",
+    "zipnote-ubuntu-write",
+    "zipnote-apple-write-out",
+    "zipnote-ubuntu-write-out",
     "zipsplit-apple-help",
+    "zipsplit-ubuntu-help",
+    "zipsplit-apple-split",
+    "zipsplit-ubuntu-split",
+    "zipsplit-apple-split-pause",
+    "zipsplit-ubuntu-split-pause",
+    "zipsplit-apple-split-time",
+    "zipsplit-ubuntu-split-time",
+    "zipsplit-apple-split-dir",
+    "zipsplit-ubuntu-split-dir",
+    "zipsplit-apple-index",
+    "zipsplit-ubuntu-index",
     "compress-apple-stdin-dash",
     "compress-apple-cluster-force",
 ];
@@ -1446,6 +1528,13 @@ const INFOZIP_SHAPES: &[&str] = &[
     "crypt-unzip-wrong-check",
     "crypt-funzip-cut",
     "crypt-funzip64-cut",
+    // 0.19.0 Task 12: the encoder leg (selector 255): text at level 6, an
+    // incompressible block that falls back to stored, zeros at level 9,
+    // and a mixed input at level 1 without the fallback.
+    "deflater-text",
+    "deflater-store-fallback",
+    "deflater-zeros",
+    "deflater-mixed-fast",
 ];
 
 /// Deflate's bits, least significant first, with Huffman codes most
@@ -1605,7 +1694,31 @@ fn infozip_seed(work: &Path, shape: &str) -> stuffr_core::Result<Vec<u8>> {
         v
     };
     let deflated = encoded(work, &text, "deflate", None)?;
+    // `[255][level - 1][fallback] ++ x`.
+    let deflater = |level: u8, fallback: bool, x: &[u8]| {
+        let mut v = vec![255, level - 1, u8::from(fallback)];
+        v.extend_from_slice(x);
+        v
+    };
+    let noise = |n: usize, seed: u32| -> Vec<u8> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect()
+    };
     Ok(match shape {
+        "deflater-text" => deflater(6, true, &text),
+        "deflater-store-fallback" => deflater(6, true, &noise(300, 7)),
+        "deflater-zeros" => deflater(9, true, &[0u8; 20_000]),
+        "deflater-mixed-fast" => {
+            let mut x = text[..6_000].to_vec();
+            x.extend_from_slice(&noise(6_000, 11));
+            x.extend_from_slice(&text[..6_000]);
+            deflater(1, false, &x)
+        }
         "inflate-stored" => with(0, &encoded(work, &text, "deflate", Some(0))?),
         "inflate-default" => with(0, &deflated),
         "inflate-damaged" => with(0, &damaged(&deflated)),
@@ -2465,24 +2578,95 @@ fn compress_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>
 
 /// The `compat` seed for a zip-family `shape` (`<tool>-<apple|ubuntu>-
 /// <case>`), or `None` for another family's. The flavour byte is absolute:
-/// 0 Ubuntu, 1 Apple.
-fn zip_seed(shape: &str) -> Option<Vec<u8>> {
+/// 0 Ubuntu, 1 Apple. An archive-consuming case holds a small archive
+/// (`src`: a deflated `a.txt` and a stored `b.txt`, made by `unzip_zip`),
+/// an adding case holds text in `a` (and, for the names cases, `a` is the
+/// one name its own bytes list: the payload is every file and standard
+/// input at once).
+fn zip_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> {
     let mut parts = shape.splitn(3, '-');
-    let (tool, flavour, case) = (parts.next()?, parts.next()?, parts.next()?);
+    let (Some(tool), Some(flavour), Some(case)) = (parts.next(), parts.next(), parts.next()) else {
+        return Ok(None);
+    };
     if !matches!(tool, "zip" | "zipcloak" | "zipnote" | "zipsplit") {
-        return None;
+        return Ok(None);
     }
     let flavour = match flavour {
         "ubuntu" => 0,
         "apple" => 1,
-        _ => return None,
+        _ => return Ok(None),
     };
-    let args: &[&str] = match case {
-        "help" => &["-h"],
-        "version" => &["-v"],
+    let text = compat_text(3000);
+    let src = unzip_zip(&[
+        ZipSeed::deflated(work, "a.txt", &text)?,
+        ZipSeed::stored("b.txt", &compat_text(600)),
+    ]);
+    // Three stored entries of 600 bytes: `zipsplit -n 1000` makes three parts.
+    let big = unzip_zip(&[
+        ZipSeed::stored("a.txt", &compat_text(600)),
+        ZipSeed::stored("b.txt", &compat_text(601)),
+        ZipSeed::stored("c.txt", &compat_text(602)),
+    ]);
+    let a = &["a"][..];
+    let az = &["a.zip"][..];
+    let both = &["a.zip", "a"][..];
+    // (arguments, files, standard input carries the payload, payload)
+    let (args, files, stdin, payload): (&[&str], &[&str], bool, Vec<u8>) = match (tool, case) {
+        (_, "help") => (&["-h"], &[], false, Vec::new()),
+        ("zip", "help2") => (&["-h2"], &[], false, Vec::new()),
+        ("zip", "version") => (&["-v"], &[], false, Vec::new()),
+        ("zip", "add") => (&["b.zip", "a"], a, false, text),
+        ("zip", "add-store") => (&["-0", "b.zip", "a"], a, false, text),
+        ("zip", "add-best") => (&["-9", "b.zip", "a"], a, false, text),
+        ("zip", "add-stdin-names") => (&["b.zip", "-@"], a, true, b"a\n".to_vec()),
+        ("zip", "add-pattern-file") => (&["b.zip", "a", "-i", "@a"], a, false, b"a\n".to_vec()),
+        ("zip", "add-junk") => (&["-j", "b.zip", "a"], a, false, text),
+        ("zip", "add-recurse") => (&["-r", "b.zip", "."], both, false, text),
+        ("zip", "add-exclude") => (&["-r", "b.zip", ".", "-x", "a"], both, false, text),
+        ("zip", "add-move") => (&["-m", "b.zip", "a"], a, false, text),
+        ("zip", "add-log") => (&["-lf", "a", "b.zip", "a"], a, false, text),
+        ("zip", "add-attrs") => (&["-X", "-y", "b.zip", "a"], a, false, text),
+        ("zip", "add-encrypt") => (&["-e", "b.zip", "a"], a, false, text),
+        ("zip", "add-show") => (&["-sf", "b.zip", "a"], a, false, text),
+        ("zip", "add-unicode") => (&["-UN=u", "b.zip", "a"], a, false, text),
+        ("zip", "update") => (&["-u", "a.zip", "a"], both, false, src),
+        ("zip", "freshen") => (&["-f", "a.zip"], az, false, src),
+        ("zip", "delete") => (&["-d", "a.zip", "a.txt"], az, false, src),
+        ("zip", "grow") => (&["-g", "a.zip", "a"], both, false, src),
+        ("zip", "comment") => (&["-z", "a.zip"], az, true, src),
+        ("zip", "fix") => (
+            &["-F", "a.zip", "-O", "b.zip"],
+            az,
+            false,
+            cut(&src, src.len() - 30),
+        ),
+        ("zip", "fix-fix") => (&["-FF", "a.zip", "-O", "b.zip"], az, false, damaged(&src)),
+        ("zip", "fix-fix-cut") => (
+            &["-FF", "a.zip", "-O", "b.zip"],
+            az,
+            false,
+            cut(&src, src.len() - 60),
+        ),
+        ("zip", "test") => (&["-T", "b.zip", "a"], a, false, text),
+        ("zip", "difference") => (&["-DF", "a.zip", "-O", "b.zip"], az, false, src),
+        ("zipcloak", "encrypt") => (&["a.zip"], az, false, src),
+        ("zipcloak", "decrypt") => (&["-d", "a.zip"], az, false, src),
+        ("zipcloak", "out") => (&["a.zip", "-O", "b.zip"], az, false, src),
+        ("zipnote", "list") => (&["a.zip"], az, false, src),
+        // The payload is the archive AND the comments, so this reads an
+        // archive where notes are expected: the parser's error paths.
+        ("zipnote", "write") => (&["-w", "a.zip"], az, true, src),
+        ("zipnote", "write-out") => (&["-w", "a.zip", "-O", "b.zip"], az, true, src),
+        ("zipsplit", "split") => (&["-n", "1000", "a.zip"], az, false, big),
+        ("zipsplit", "split-pause") => (&["-p", "-n", "1000", "a.zip"], az, true, big),
+        ("zipsplit", "split-time") => (&["-t", "01012000", "-n", "1000", "a.zip"], az, false, big),
+        ("zipsplit", "split-dir") => (&["-b", ".", "-n", "1000", "a.zip"], az, false, big),
+        ("zipsplit", "index") => (&["-i", "-n", "1000", "a.zip"], az, false, big),
         other => unreachable!("COMPAT_SHAPES lists an unhandled zip shape {other:?}"),
     };
-    Some(encode_compat_case(tool, flavour, args, &[], false, b""))
+    Ok(Some(encode_compat_case(
+        tool, flavour, args, files, stdin, &payload,
+    )))
 }
 
 /// The `compat` seed for `shape`.
@@ -2505,7 +2689,7 @@ fn compat_seed(work: &Path, shape: &str) -> stuffr_core::Result<Vec<u8>> {
     if let Some(seed) = compress_seed(work, shape)? {
         return Ok(seed);
     }
-    if let Some(seed) = zip_seed(shape) {
+    if let Some(seed) = zip_seed(work, shape)? {
         return Ok(seed);
     }
     let text = compat_text(4000);
@@ -4751,6 +4935,84 @@ fn compress_seeds_name_their_personality_on_every_platform() {
     );
 }
 
+/// The zip-family seeds (0.19.0 Task 12) name their tool and carry the byte
+/// they say: every case in both flavours (0 Ubuntu, 1 Apple, on the wire and
+/// in the first byte), the archive-consuming ones hold a whole archive (the
+/// repairs a damaged or cut one), the names cases hold the one name their
+/// payload lists, the split cases three entries, and every argument is a
+/// token (the encoder refuses one that is not).
+#[test]
+fn the_zip_seeds_carry_their_shape() {
+    let work = tempfile::tempdir().unwrap();
+    let (mut apple, mut ubuntu) = (0, 0);
+    let mut healthy: Option<Vec<u8>> = None;
+    for shape in COMPAT_SHAPES {
+        let mut parts = shape.splitn(3, '-');
+        let (tool, flavour, case) = (
+            parts.next().unwrap(),
+            parts.next().unwrap_or(""),
+            parts.next().unwrap_or(""),
+        );
+        if !matches!(tool, "zip" | "zipcloak" | "zipnote" | "zipsplit") {
+            continue;
+        }
+        let want: u8 = match flavour {
+            "apple" => {
+                apple += 1;
+                1
+            }
+            "ubuntu" => {
+                ubuntu += 1;
+                0
+            }
+            other => panic!("{shape}: flavour {other:?}"),
+        };
+        let seed = compat_seed(work.path(), shape).unwrap();
+        let c = decode_compat_case(&seed).unwrap();
+        assert_eq!((c.name, c.flavour), (tool, want), "{shape}");
+        assert_eq!(
+            (usize::from(seed[0]) / COMPAT_NAMES.len()) & 1,
+            usize::from(want),
+            "{shape}: the byte is absolute"
+        );
+        let signature = |sig: &[u8; 4]| c.payload.windows(4).filter(|w| *w == sig).count();
+        // (`add-recurse` and `add-exclude` hold text in `a.zip` too: it is
+        // a file to add there, not an archive.)
+        if c.files.contains(&"a.zip") && !case.starts_with("add-") {
+            assert!(
+                signature(b"PK\x05\x06") >= 1 || case.starts_with("fix-fix-cut") || case == "fix",
+                "{shape}: a.zip holds no end record"
+            );
+            assert!(signature(b"PK\x03\x04") >= 1, "{shape}: no local header");
+            if case.starts_with("split") || case == "index" {
+                assert_eq!(signature(b"PK\x01\x02"), 3, "{shape}: three entries");
+            }
+        }
+        match case {
+            "add-stdin-names" | "add-pattern-file" => {
+                assert_eq!(c.payload, b"a\n", "{shape}");
+                assert_eq!(c.stdin, case == "add-stdin-names", "{shape}");
+            }
+            // The repairs and their healthy twin differ.
+            "update" => healthy = Some(c.payload.to_vec()),
+            "fix-fix" => {
+                let h = healthy.as_ref().expect("update comes first");
+                assert_eq!(c.payload.len(), h.len(), "{shape}");
+                assert_ne!(c.payload, h.as_slice(), "{shape}");
+            }
+            "fix" | "fix-fix-cut" => {
+                let h = healthy.as_ref().expect("update comes first");
+                assert!(c.payload.len() < h.len(), "{shape}: cut");
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        apple >= 40 && apple == ubuntu,
+        "{apple} apple, {ubuntu} ubuntu"
+    );
+}
+
 /// The hand-built inputs are what they claim: the pack seed unpacks to its
 /// text, and a gzip member's header CRC and trailer agree with a decoder.
 #[test]
@@ -4880,6 +5142,38 @@ fn the_infozip_seeds_carry_their_shape() {
     let work = tempfile::tempdir().unwrap();
     for shape in INFOZIP_SHAPES {
         let seed = infozip_seed(work.path(), shape).unwrap();
+        if shape.starts_with("deflater-") {
+            // The encoder leg: `[255][level - 1][fallback] ++ x`, whose
+            // output `inflate` gives back as `x` (or which came out stored).
+            assert_eq!(seed[0], 255, "{shape}");
+            let (level, fallback, x) = (1 + seed[1] % 9, seed[2] & 1 == 1, &seed[3..]);
+            let mut d = stuffr::infozip::ZipDeflater::new(level);
+            d.set_store_fallback(fallback);
+            let mut packed = Vec::new();
+            let summary = d.compress(&mut &x[..], &mut packed).unwrap();
+            assert_eq!(
+                summary.stored,
+                *shape == "deflater-store-fallback",
+                "{shape}: stored = {}",
+                summary.stored
+            );
+            if !summary.stored {
+                let (mut plain, mut window) = (Vec::new(), vec![0u8; stuffr::infozip::WSIZE]);
+                let r = inflate(
+                    &mut packed.iter(),
+                    false,
+                    &mut window,
+                    &mut |c| {
+                        plain.extend_from_slice(c);
+                        Ok::<(), ()>(())
+                    },
+                    &mut |_| {},
+                );
+                assert!(r.is_ok(), "{shape}: {r:?}");
+                assert_eq!(plain, x, "{shape}");
+            }
+            continue;
+        }
         let selector = seed[0] % 6;
         let expected = match shape.split('-').next().unwrap() {
             "inflate" => 0,

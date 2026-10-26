@@ -1896,7 +1896,8 @@ fn add_filter(z: &mut Zr, flag: u8, pattern: Vec<u8>) -> Result<(), Exit> {
                 return Err(z.ziperr_os(ZE_OPEN, &why, &e));
             }
         };
-        let mut r = io::BufReader::new(file);
+        // through `Host::track`, so a sandbox counts the open and the reads
+        let mut r = io::BufReader::new(z.host.track(&path, file));
         while let Some(p) = getnam(&mut r) {
             let Some(pattern) = scan::ex2in(&p, z.o.pathput, z.o.dosify) else {
                 return Err(scan::crashed(z));

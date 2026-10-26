@@ -143,7 +143,8 @@ pub const SALVAGE_FUZZ_MAX_ENTRY: u64 = 256 * 1024;
 /// 0.16.0, the unzip family's (0 Ubuntu, 1 Apple: the same side as gzip's)
 /// and, since 0.18.0, the compress family's (0 ncompress, 1 Apple: absolute
 /// like the others, so an artifact replays the same personality on every
-/// platform). Only those three families read it. Every seed the
+/// platform) and, since 0.19.0, the zip family's (0 Ubuntu, 1 Apple, absolute
+/// too). Only those four families read it. Every seed the
 /// 0.11.0 generator wrote has a name byte below 4,
 /// so it decodes to the same tool, as GNU (`old_seeds_decode_unchanged`).
 ///
@@ -456,6 +457,61 @@ pub const COMPAT_TOKENS: &[&str] = &[
     "-vk",
     "a.Z",
     "b.Z",
+    // 0.19.0: the zip family (`-r -R -j -m -o -X -y -l -k -z -c -C -b -O -x -e -F
+    // -d -f -n -p -q -v -h -0..-9 a.zip b.zip` are above). `-@`, `@a` (a
+    // pattern file) and `-lf`/`-la` (the log) are the paths that read or
+    // write a name the case supplies; `-b`, `-O`, `-lf`, `-i`, `-x` and
+    // `-n` take the next token; `.` is the one directory token. No token
+    // is absolute, holds a `/` or names `..`.
+    "-@",
+    "-u",
+    "-g",
+    "-FF",
+    "-T",
+    "-TT",
+    "-J",
+    "-A",
+    "-ll",
+    "-sf",
+    "-sd",
+    "-sc",
+    "-su",
+    "-sU",
+    "-sp",
+    "-sb",
+    "-sv",
+    "-fz",
+    "-fz-",
+    "-UN=e",
+    "-UN=n",
+    "-UN=q",
+    "-UN=u",
+    "-UN=w",
+    "-MM",
+    "-tt",
+    "-ds",
+    "-dg",
+    "-dv",
+    "-du",
+    "-lf",
+    "-la",
+    "-li",
+    "-nw",
+    "-ws",
+    "-i",
+    "@a",
+    "-DF",
+    "-FS",
+    "-h2",
+    "-w",
+    "01012000",
+    ".",
+    "100",
+    "1000",
+    // The names of the entries the zip seeds' archives hold, for `-d` and
+    // `zipnote`.
+    "a.txt",
+    "b.txt",
 ];
 
 /// The largest input the `compat` target runs. Here, not in the target, so
@@ -1877,6 +1933,34 @@ mod tests {
     /// A seed written by the 0.11.0 generator decodes as it did then, and
     /// as GNU: its name byte is below the first four names' count, its
     /// tokens below the 0.11.0 table's length, and its mask uses bits 0-4.
+    /// No token a case can draw names a path outside the run's directory
+    /// (0.19.0): none is absolute, holds a `/`, or is or holds `..`. The zip
+    /// family reads names a payload supplies (`-@`, `@a`), and the sandbox's
+    /// `Host::path` keeps those inside; this is the other half, for every
+    /// operand a token spells. Also: every token is reachable by the one
+    /// byte that selects it, and the zip family's flavour byte is the same
+    /// 0 Ubuntu / 1 Apple the unzip family's is.
+    #[test]
+    fn no_compat_token_escapes_the_run_directory() {
+        for t in COMPAT_TOKENS {
+            assert!(
+                !t.starts_with('/') && !t.contains('/') && !t.contains(".."),
+                "{t:?} could leave the run's directory"
+            );
+            assert!(!t.contains('\\'), "{t:?} holds a backslash");
+        }
+        assert!(
+            COMPAT_TOKENS.len() <= 256,
+            "a token byte cannot reach them all"
+        );
+        let zip = COMPAT_NAMES.iter().position(|n| *n == "zip").unwrap();
+        for (flavour, byte) in [(0u8, zip), (1, zip + COMPAT_NAMES.len())] {
+            let data = [byte as u8, 0, 0];
+            let case = decode_compat_case(&data).unwrap();
+            assert_eq!((case.name, case.flavour), ("zip", flavour));
+        }
+    }
+
     /// The 0.11.0 decoder is restated here from that release's tables.
     /// Then the same for the 0.12.0 generator's seeds
     /// (`seeds_of_0_12_0_decode_unchanged`).

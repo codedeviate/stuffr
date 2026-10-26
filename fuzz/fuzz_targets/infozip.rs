@@ -16,6 +16,13 @@
 //!   inflating, through funzip's `NEXTBYTE` (`FunzipSource`), whose EOF is
 //!   not sticky.
 //!
+//! - 255: the encoder leg (0.19.0 Task 12), `rest` = `[level][fallback]
+//!   ++ x`: `ZipDeflater::new(1 + level % 9)` (stored fallback when
+//!   `fallback & 1`) compresses `x`, and `inflate` of what it wrote must
+//!   give `x` back (the output itself when the entry came out stored). Only
+//!   255 means this: the other 5 of 256 selector values `% 6` keeps are
+//!   what they were (a corpus entry is coverage, not an assertion).
+//!
 //! Every run gets a fresh zeroed window (`WSIZE`, unzip's `slide[]` as a new
 //! `G` has it) and a flush callback that refuses past 8 MiB of output
 //! (`OUTPUT_CAP`, the sandbox's budget).
@@ -40,7 +47,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use stuffr::infozip::crypt::{self, Keys, RAND_HEAD_LEN};
-use stuffr::infozip::{ByteSource, Stop, WSIZE, explode, inflate, unshrink};
+use stuffr::infozip::{ByteSource, Stop, WSIZE, ZipDeflater, explode, inflate, unshrink};
 
 /// The flush callback refuses output past this: the sandbox's 8 MiB budget
 /// (`SANDBOX_OUTPUT_CAP`), the bound unzip's own output has under fuzzing.
@@ -311,10 +318,85 @@ fn run_crypt(rest: &[u8], deflate64: bool, funzip: bool) {
     }
 }
 
+/// CRC-32 (IEEE), the one zip's entries carry; independent of the encoder's.
+fn crc32(data: &[u8]) -> u32 {
+    let mut c = !0u32;
+    for &b in data {
+        c ^= u32::from(b);
+        for _ in 0..8 {
+            c = if c & 1 != 0 {
+                0xedb8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
+        }
+    }
+    !c
+}
+
+/// `ZipDeflater` over `x` at `level`, read back by `inflate`: the bytes must
+/// come back whole, and the summary must describe what was written.
+fn run_deflater(level: u8, fallback: bool, x: &[u8]) {
+    let mut d = ZipDeflater::new(level);
+    d.set_store_fallback(fallback);
+    let mut packed = Vec::new();
+    let summary = d
+        .compress(&mut &x[..], &mut packed)
+        .unwrap_or_else(|e| panic!("infozip: ZipDeflater level {level} failed on {x:?}: {e}"));
+    assert_eq!(summary.in_bytes, x.len() as u64, "infozip: in_bytes");
+    assert_eq!(summary.out_bytes, packed.len() as u64, "infozip: out_bytes");
+    assert_eq!(summary.crc32, crc32(x), "infozip: crc32");
+    assert!(
+        fallback || !summary.stored,
+        "infozip: stored without the fallback"
+    );
+    // At most a stored block's 5 bytes per 64 KiB, and the trees of a
+    // block that pays: generous, but a runaway encoder is far past it.
+    assert!(
+        packed.len() <= x.len() + x.len() / 8 + 1024,
+        "infozip: level {level} wrote {} bytes for {}",
+        packed.len(),
+        x.len()
+    );
+    if summary.stored {
+        assert!(packed == x, "infozip: a stored entry is not the input");
+        return;
+    }
+    let mut window = vec![0u8; WSIZE];
+    let mut plain = Vec::with_capacity(x.len());
+    let mut src = packed.iter();
+    let r = inflate(
+        &mut src,
+        false,
+        &mut window,
+        &mut |c| {
+            plain.extend_from_slice(c);
+            Ok::<(), Capped>(())
+        },
+        &mut |m| panic!("infozip: inflate printed {m:?} for the encoder's own output"),
+    );
+    assert!(
+        r.is_ok(),
+        "infozip: inflate of ZipDeflater level {level}'s output: {r:?}"
+    );
+    assert!(
+        plain == x,
+        "infozip: inflate(ZipDeflater level {level}) != the input ({} vs {} bytes)",
+        plain.len(),
+        x.len()
+    );
+}
+
 fuzz_target!(|data: &[u8]| {
     let Some((&selector, rest)) = data.split_first() else {
         return;
     };
+    if selector == 255 {
+        if let [level, fallback, x @ ..] = rest {
+            run_deflater(1 + level % 9, fallback & 1 == 1, x);
+        }
+        return;
+    }
     let wide = (selector / 6) & 1 == 1;
     match selector % 6 {
         0 => inflate_slice(rest, false),
