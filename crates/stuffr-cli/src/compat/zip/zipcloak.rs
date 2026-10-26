@@ -16,14 +16,19 @@
 //!
 //! Encryption is compatible, not identical: the ten random bytes of each
 //! header come from the system (`ttyio::random_header`), as the
-//! references' come from `rand()`.
+//! references' come from `rand()`. A system that gives none ends the run
+//! (`Internal logic error (no random bytes for the encryption header)`,
+//! exit 5).
 //!
 //! Undefined behaviour of the C, not reproduced (deviation 24): crypt.c's
 //! `zipcloak()` and `zipbare()` ignore `readlocal()`'s result and go on
 //! with an uninitialised local header when it fails (a local header that
 //! cannot be found or read); stuffr ends the run with that failure's code
 //! (`was encrypting an entry`, `was decrypting an entry`), the temporary
-//! removed. A central name longer than the local one makes `readlocal()`
+//! removed. That is also the answer for a split archive with `-O` (the
+//! UTIL build's `readlocal()` looks for every entry in the last part, as
+//! stuffr does, and does not find it: Ubuntu's then dies of SIGSEGV in its
+//! handler). A central name longer than the local one makes `readlocal()`
 //! write past the local name's buffer; stuffr keeps the local name.
 
 use stuffr::infozip::crypt::{Keys, RAND_HEAD_LEN, crypt_header};
@@ -41,6 +46,7 @@ use crate::compat::host::{self, Host};
 
 /// ziperr.h codes zipcloak raises.
 const ZE_EOF: i32 = 2;
+const ZE_LOGIC: i32 = 5;
 const ZE_BIG: i32 = 6;
 const ZE_TEMP: i32 = 10;
 const ZE_READ: i32 = 11;
@@ -251,8 +257,15 @@ pub(crate) fn run(z: &mut Zr, o: CloakOptions) -> Exit {
 /// What `readlocal()` gave crypt.c as `localz`, made a header to write: the
 /// local header's own fields, the sizes from the central directory, the
 /// local name cut where the central one ends (`iname[z->nam] = '\0'`).
+///
+/// The UTIL build's `readlocal()` reads the archive file already open
+/// (`in_file`) whatever disk the entry is on ("for utilities assume
+/// archive is on one disk"): of a split archive, the last part. So the
+/// entry is looked for on the disk being read, never in another part.
 fn local_entry(z: &mut Zr, ia: &mut InArchive, zf: &ZFile) -> Result<ZEntry, Fail> {
-    let local = readzip::readlocal(z, ia, zf).map_err(|c| CopyFail::Code(c, None))?;
+    let mut here = zf.clone();
+    here.e.dsk = z.current_in_disk;
+    let local = readzip::readlocal(z, ia, &here).map_err(|c| CopyFail::Code(c, None))?;
     let mut iname = local.iname;
     // ruling (deviation 24): only a shorter central name is honoured
     if let Some(b) = iname.get_mut(zf.e.iname.len()) {
@@ -319,11 +332,12 @@ fn zipcloak(
     put(z, &mut lz, out)?;
     // initialize keys with password and write random header
     let mut keys = Keys::new(passwd);
-    let h = crypt_header(
-        &mut keys,
-        super::ttyio::random_header(),
-        (lz.crc >> 16) as u16,
-    );
+    let Ok(random) = super::ttyio::random_header() else {
+        return Err(CopyFail::Exit(
+            z.ziperr(ZE_LOGIC, m::NO_RANDOM_BYTES.as_bytes()),
+        ));
+    };
+    let h = crypt_header(&mut keys, random, (lz.crc >> 16) as u16);
     out.bfwrite(&h, Bf::Data).map_err(CopyFail::Write)?;
     // encrypt data
     let mut left = lz.siz.wrapping_sub(RAND_HEAD_LEN as u64);

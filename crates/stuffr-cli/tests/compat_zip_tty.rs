@@ -35,29 +35,6 @@ mod unix {
 
     const PLAIN: &[u8] = b"hello\n";
 
-    /// The standard tree plus `t.zip`: `entries` (name, encrypted), each
-    /// holding `hello\n` stored, the encrypted ones under [`ZIP_PASSWORD`]
-    /// with fixed header bytes (traditional PKWARE encryption, the check
-    /// the CRC's high byte).
-    fn with_encrypted(entries: &[(&[u8], bool)]) -> ZipTree {
-        let body = zipcrypto(ZIP_PASSWORD.as_bytes(), (crc32(PLAIN) >> 24) as u8, PLAIN);
-        let specs: Vec<ZipEntrySpec> = entries
-            .iter()
-            .map(|&(n, enc)| {
-                if enc {
-                    ZipEntrySpec {
-                        flags: 1,
-                        stored_data: Some(&body),
-                        ..ZipEntrySpec::new(n, PLAIN)
-                    }
-                } else {
-                    ZipEntrySpec::new(n, PLAIN)
-                }
-            })
-            .collect();
-        ZipTree::standard().file("t.zip", zip_with(&specs, b"", b""))
-    }
-
     /// A password whose check byte fails [`with_encrypted`]'s header
     /// (zipcloak's one-byte check lets one in 256 through).
     fn wrong_password() -> String {
@@ -240,6 +217,65 @@ mod unix {
                 panic!("reference: no t.zip");
             };
             assert!(*bytes == original, "reference: not the original archive");
+        }
+    }
+
+    /// Hostile encrypted entries decrypted with the right password: the
+    /// first entry's central compressed size below, at and just past the
+    /// 12-byte header (zipbare's size goes negative: the data is read to
+    /// the end of the archive, `Unexpected end of zip file`; at 12 the entry
+    /// is decrypted empty), against the reference. Every read ends at the
+    /// archive's end, and the harness caps files and streams.
+    #[test]
+    fn hostile_encrypted_entries_answer_as_the_reference() {
+        let base = encrypted_zip(&[(b"a.txt", true), (b"b.txt", true)]);
+        let le32 =
+            |b: &[u8], at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        let cd = le32(&base, base.len() - 22 + 16) as usize;
+        let mut cases = Vec::new();
+        for siz in [0u32, 5, 11, 12, 13] {
+            let mut b = base.clone();
+            b[cd + 20..cd + 24].copy_from_slice(&siz.to_le_bytes());
+            let tree = ZipTree::standard().file("t.zip", b);
+            cases.push(typed("zipcloak", &["-d", "t.zip"], tree.clone(), b"pw\n"));
+            cases.push(typed(
+                "zipcloak",
+                &["-d", "-O", "o.zip", "t.zip"],
+                tree,
+                b"pw\n",
+            ));
+        }
+        run_group(
+            "hostile encrypted entries",
+            &cases,
+            Skipped::none(),
+            &assert_same_zip,
+        );
+    }
+
+    /// Deviation 24 on a split archive under `-O`, recorded: zipcloak's
+    /// `readlocal()` does not find the first entry in the last part, and
+    /// the reference goes on with an uninitialised local header (Ubuntu's
+    /// dies of SIGSEGV in Docker, its warning lost in its stdio buffer when
+    /// standard output is a pipe). Only the line before the undefined
+    /// behaviour is compared; stuffr's end is pinned in
+    /// `zipcloak::tests::a_split_archive_under_o_ends_at_its_first_entry`.
+    #[test]
+    fn a_split_archive_under_o_is_not_found_as_the_reference_says() {
+        let tree = with_parts(ZipTree::standard(), &zip_split_set("apple"), &[]);
+        let c = typed("zipcloak", &["-O", "o.zip", "s.zip"], tree, b"pw\npw\n");
+        let want = "encrypting: big\nzipcloak warning: Did not find entry for big\n";
+        let s = stuffr_zip(&c);
+        assert_eq!(s.code, 3);
+        assert!(String::from_utf8_lossy(&s.stdout).starts_with(want));
+        if let Some(r) = zip_reference(&c) {
+            // the reference's warning is still in its stdio buffer when it
+            // dies (standard output is a pipe here): only the first line,
+            // flushed by zipcloak's own fflush, reaches it
+            let out = String::from_utf8_lossy(&r.stdout);
+            assert!(out.starts_with("encrypting: big\n"), "reference: {out:?}");
+            assert_ne!(r.code, 0, "reference: {out:?}");
+            assert!(!r.tree.contains_key(&b"o.zip"[..]), "reference wrote o.zip");
         }
     }
 

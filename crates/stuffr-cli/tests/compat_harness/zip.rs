@@ -488,6 +488,11 @@ fn dos_to_unix(time: u16, date: u16) -> Option<i64> {
         i64::from((time >> 5) & 63),
         i64::from(time & 31) * 2,
     );
+    civil_to_unix(y, m, d, hh, mm, ss)
+}
+
+/// Unix seconds of a UTC civil date and time; `None` for an impossible one.
+fn civil_to_unix(y: i64, m: i64, d: i64, hh: i64, mm: i64, ss: i64) -> Option<i64> {
     if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 59 {
         return None;
     }
@@ -500,6 +505,60 @@ fn dos_to_unix(time: u16, date: u16) -> Option<i64> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
     Some(days * 86400 + hh * 3600 + mm * 60 + ss)
+}
+
+/// Unix seconds of an `asctime()` text (`Sun Sep 16 01:03:52 1973`, 24
+/// bytes, read as UTC: both sides run with `TZ=UTC`); `None` if `b` is not
+/// one.
+fn asctime_to_unix(b: &[u8]) -> Option<i64> {
+    const MONTHS: [&[u8]; 12] = [
+        b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov",
+        b"Dec",
+    ];
+    if b.len() != 24 || b[3] != b' ' || b[7] != b' ' || b[10] != b' ' || b[19] != b' ' {
+        return None;
+    }
+    let num = |x: &[u8]| -> Option<i64> { std::str::from_utf8(x).ok()?.trim_start().parse().ok() };
+    let m = MONTHS.iter().position(|&n| n == &b[4..7])? as i64 + 1;
+    if b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    civil_to_unix(
+        num(&b[20..24])?,
+        m,
+        num(&b[8..10])?,
+        num(&b[11..13])?,
+        num(&b[14..16])?,
+        num(&b[17..19])?,
+    )
+}
+
+/// The wall-clock times of two runs' text files made equal (`-lf`'s `Zip
+/// log opened <asctime>` line): wherever both lines hold an `asctime()`
+/// text at the same offset, each within its own run's window (`[start - 1,
+/// end + 1]`), `s` takes the reference's. Any other difference is left for
+/// the comparison.
+pub fn mask_asctimes(r: &[u8], r_window: (i64, i64), s: &mut [u8], s_window: (i64, i64)) {
+    if r.len() != s.len() {
+        return;
+    }
+    let inside = |t: i64, (start, end): (i64, i64)| t >= start - 1 && t <= end + 1;
+    let mut i = 0;
+    while i + 24 <= r.len() {
+        if r[i..i + 24] != s[i..i + 24]
+            && let (Some(a), Some(b)) = (
+                asctime_to_unix(&r[i..i + 24]),
+                asctime_to_unix(&s[i..i + 24]),
+            )
+            && inside(a, r_window)
+            && inside(b, s_window)
+        {
+            s[i..i + 24].copy_from_slice(&r[i..i + 24]);
+            i += 24;
+        } else {
+            i += 1;
+        }
+    }
 }
 
 /// Whether `b` looks like a zip archive: a local header or an end record
@@ -720,6 +779,10 @@ pub fn zip_differences(c: &Case, r: &ZipRun, s: &ZipRun) -> Vec<String> {
             continue;
         };
         if !(archive_name(key) || looks_like_zip(rb)) {
+            // a log's `Zip log opened <now>` line
+            if let Some(UnzipNode::File { bytes, .. }) = st.get_mut(key) {
+                mask_asctimes(rb, rw, bytes, sw);
+            }
             continue;
         }
         let mut sm = sb.clone();
@@ -1036,6 +1099,36 @@ pub fn assert_same_zip_decrypted(c: &Case, pw: &str) -> bool {
     decrypt_zip_run(&mut s, pw, "stuffr");
     compare_zip(c, &r, &s);
     true
+}
+
+/// The standard tree plus `t.zip`: `entries` (name, encrypted), each
+/// holding `hello\n` stored, the encrypted ones under [`ZIP_PASSWORD`] with
+/// fixed header bytes (traditional PKWARE encryption through
+/// [`zipcrypto`], the check the CRC's high byte): the same bytes on both
+/// sides of a comparison.
+pub fn with_encrypted(entries: &[(&[u8], bool)]) -> ZipTree {
+    ZipTree::standard().file("t.zip", encrypted_zip(entries))
+}
+
+/// [`with_encrypted`]'s archive alone.
+pub fn encrypted_zip(entries: &[(&[u8], bool)]) -> Vec<u8> {
+    let plain: &[u8] = b"hello\n";
+    let body = zipcrypto(ZIP_PASSWORD.as_bytes(), (crc32(plain) >> 24) as u8, plain);
+    let specs: Vec<ZipEntrySpec> = entries
+        .iter()
+        .map(|&(n, enc)| {
+            if enc {
+                ZipEntrySpec {
+                    flags: 1,
+                    stored_data: Some(&body),
+                    ..ZipEntrySpec::new(n, plain)
+                }
+            } else {
+                ZipEntrySpec::new(n, plain)
+            }
+        })
+        .collect();
+    zip_with(&specs, b"", b"")
 }
 
 /// Task 9's matrix: archives encrypted with `-P` (stored and deflated

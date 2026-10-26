@@ -633,7 +633,10 @@ pub(crate) fn add_entry(
     let mut keys = None;
     if let Some(k) = &key {
         let mut ks = Keys::new(k);
-        let h = crypt_header(&mut ks, super::ttyio::random_header(), (e.crc >> 16) as u16);
+        let Ok(random) = super::ttyio::random_header() else {
+            return Err(z.ziperr(ZE_LOGIC, m::NO_RANDOM_BYTES.as_bytes()));
+        };
+        let h = crypt_header(&mut ks, random, (e.crc >> 16) as u16);
         let r = w.out.bfwrite(&h, Bf::Data);
         drain_dots(z, &mut w.out);
         if let Err(err) = r {

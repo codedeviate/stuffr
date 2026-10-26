@@ -56,6 +56,7 @@ impl Drop for Scratch {
 struct Ran {
     code: i32,
     out: String,
+    out_bytes: Vec<u8>,
     err: String,
     reads: BTreeMap<PathBuf, InputReads>,
 }
@@ -74,6 +75,7 @@ fn run(dir: &Path, flavour: Flavour, name: &str, args: &[&str], typed: &[&str]) 
     Ran {
         code,
         out: String::from_utf8_lossy(&out).into_owned(),
+        out_bytes: out.clone(),
         err: String::from_utf8_lossy(&err).into_owned(),
         reads,
     }
@@ -120,8 +122,16 @@ fn with_plain(tag: &str, flavour: Flavour) -> Scratch {
     s
 }
 
-/// The central directory's (flags, compressed size) per entry.
-fn central(b: &[u8]) -> Vec<(u16, u32)> {
+/// One central record: (flags, compressed size, local header offset).
+struct Central {
+    flags: u16,
+    csize: u32,
+    local: usize,
+}
+
+/// The central directory's records, through the end record (no comment,
+/// no Zip64: the archives these tests make).
+fn central_records(b: &[u8]) -> Vec<Central> {
     let le16 = |at: usize| u16::from_le_bytes([b[at], b[at + 1]]);
     let le32 = |at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
     let eocd = (0..=b.len() - 22)
@@ -132,7 +142,11 @@ fn central(b: &[u8]) -> Vec<(u16, u32)> {
     let mut v = Vec::new();
     for _ in 0..n {
         assert!(b[at..].starts_with(b"PK\x01\x02"));
-        v.push((le16(at + 8), le32(at + 20)));
+        v.push(Central {
+            flags: le16(at + 8),
+            csize: le32(at + 20),
+            local: le32(at + 42) as usize,
+        });
         at += 46
             + usize::from(le16(at + 28))
             + usize::from(le16(at + 30))
@@ -141,29 +155,34 @@ fn central(b: &[u8]) -> Vec<(u16, u32)> {
     v
 }
 
-/// The encryption headers of the archive's encrypted entries (each
-/// entry's first 12 data bytes, found through its local header).
+/// The central directory's (flags, compressed size) per entry.
+fn central(b: &[u8]) -> Vec<(u16, u32)> {
+    central_records(b)
+        .iter()
+        .map(|c| (c.flags, c.csize))
+        .collect()
+}
+
+/// Each encrypted entry's data, header included (its compressed size from
+/// the central directory, found through its local header).
+fn encrypted_data(b: &[u8]) -> Vec<&[u8]> {
+    let le16 = |at: usize| usize::from(u16::from_le_bytes([b[at], b[at + 1]]));
+    central_records(b)
+        .iter()
+        .filter(|c| c.flags & 1 != 0)
+        .map(|c| {
+            let ds = c.local + 30 + le16(c.local + 26) + le16(c.local + 28);
+            &b[ds..ds + c.csize as usize]
+        })
+        .collect()
+}
+
+/// The encryption headers of the archive's encrypted entries.
 fn headers(b: &[u8]) -> Vec<[u8; 12]> {
-    let le16 = |at: usize| u16::from_le_bytes([b[at], b[at + 1]]);
-    let le32 = |at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
-    let eocd = (0..=b.len() - 22)
-        .rev()
-        .find(|&i| b[i..].starts_with(b"PK\x05\x06"))
-        .unwrap();
-    let (n, mut at) = (le16(eocd + 10), le32(eocd + 16) as usize);
-    let mut v = Vec::new();
-    for _ in 0..n {
-        if le16(at + 8) & 1 != 0 {
-            let lh = le32(at + 42) as usize;
-            let ds = lh + 30 + usize::from(le16(lh + 26)) + usize::from(le16(lh + 28));
-            v.push(b[ds..ds + 12].try_into().unwrap());
-        }
-        at += 46
-            + usize::from(le16(at + 28))
-            + usize::from(le16(at + 30))
-            + usize::from(le16(at + 32));
-    }
-    v
+    encrypted_data(b)
+        .iter()
+        .map(|d| d[..12].try_into().unwrap())
+        .collect()
 }
 
 /// A password (`wN`) whose check byte is wrong for every header: zipbare's
@@ -267,6 +286,21 @@ fn zip_p_to_a_pipe_is_encrypted_with_descriptors() {
     );
     assert_eq!(r.code, 0, "{}", r.err);
     assert_eq!(r.err, "  adding: a.txt (deflated -32%)\n");
+    // encrypted (bit 0) with a data descriptor (bit 3); the data, header
+    // stripped, is the deflated input
+    let c = central(&r.out_bytes);
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].0 & 9, 9, "flags {:#x}", c[0].0);
+    let data = encrypted_data(&r.out_bytes)[0].to_vec();
+    let mut k = Keys::new(b"pw");
+    let plain: Vec<u8> = data.iter().map(|&c| k.decrypt_byte(c)).collect();
+    let mut back = Vec::new();
+    std::io::Read::read_to_end(
+        &mut flate2::read::DeflateDecoder::new(&plain[12..]),
+        &mut back,
+    )
+    .unwrap();
+    assert_eq!(back, b"hello\n");
 }
 
 /// The answers zip refuses: two that differ, an empty one (after the first
@@ -520,5 +554,69 @@ fn hostile_encrypted_archives_end_cleanly() {
             assert!(s.read("t.zip") == p, "variant {i}: archive changed");
         }
         assert_eq!(s.names(), ["a.txt", "b.txt", "t.zip"], "variant {i}");
+    }
+}
+
+/// Deviation 24: a split archive under `-O`. zipcloak's `readlocal()` (the
+/// UTIL build's) looks for each entry in the archive file it has open, the
+/// last part; it does not find the first entry there. Ubuntu's build then
+/// uses its uninitialised local header and dies of SIGSEGV (measured at a
+/// terminal in Docker); stuffr warns as it does and ends with that
+/// failure: `Zip file structure invalid`, exit 3, nothing written. Without
+/// `-O` both refuse the split archive (exit 16, recorded in
+/// `compat_zip_common`'s probe, pinned here too).
+#[test]
+fn a_split_archive_under_o_ends_at_its_first_entry() {
+    for f in FLAVOURS {
+        let s = Scratch::new("split");
+        // incompressible: a xorshift stream
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let big: Vec<u8> = (0..200_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect();
+        s.write("big", &big);
+        s.write("a.txt", b"hello\n");
+        let r = run(
+            &s.0,
+            f,
+            "zip",
+            &["-q", "-s", "64k", "t.zip", "big", "a.txt"],
+            &[],
+        );
+        assert_eq!(r.code, 0, "{}{}", r.out, r.err);
+        let before = s.names();
+        assert!(before.contains(&"t.z01".to_string()), "{before:?}");
+        let r = run(
+            &s.0,
+            f,
+            "zipcloak",
+            &["-O", "o.zip", "t.zip"],
+            &["pw", "pw"],
+        );
+        assert_eq!(
+            (r.code, r.out.as_str()),
+            (
+                3,
+                "encrypting: big\nzipcloak warning: Did not find entry for big\n\
+                 zipcloak error: Zip file structure invalid (was encrypting an entry)\n"
+            ),
+            "{f:?}"
+        );
+        assert_eq!(s.names(), before, "{f:?}: nothing written, no temporary");
+        let r = run(&s.0, f, "zipcloak", &["t.zip"], &["pw", "pw"]);
+        assert_eq!(
+            (r.code, r.out.as_str()),
+            (
+                16,
+                "zipcloak warning: cannot update a split archive (use --out option)\n\
+                 zipcloak error: Invalid command arguments (t.zip)\n"
+            ),
+            "{f:?}"
+        );
     }
 }

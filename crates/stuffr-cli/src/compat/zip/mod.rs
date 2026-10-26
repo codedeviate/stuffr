@@ -86,7 +86,9 @@
 //!    the ones the command line meets.
 //! 4. Encryption is compatible, not identical: the ten random bytes of each
 //!    12-byte encryption header come from the system's generator
-//!    (`/dev/urandom`), where zip's come from `rand()` seeded with the time,
+//!    (`getentropy`, `getrandom` or `/dev/urandom`; a system that gives
+//!    none ends the run, `Internal logic error`, exit 5), where zip's come
+//!    from `rand()` seeded with the time,
 //!    so an encrypted entry's header and data differ from the reference's
 //!    run to run (every other byte of the archive is the same, and it
 //!    decrypts the same).
@@ -241,7 +243,14 @@
 //!     read) and goes on with an uninitialised local header; stuffr ends the
 //!     run there with that failure's code (`zipcloak error: ... (was
 //!     encrypting an entry)` or `(was decrypting an entry)`), the temporary
-//!     removed and the archive untouched. A central name longer than the
+//!     removed and the archive untouched. A split archive under `-O` meets
+//!     it at its first entry: zipcloak's `readlocal()` (the UTIL build's)
+//!     looks for every entry in the last part only, warns `Did not find
+//!     entry for <name>`, and Ubuntu's build then dies of SIGSEGV
+//!     (`Interrupted (aborting)`, exit 9, or killed by the signal from its
+//!     handler; measured with a terminal in Docker); stuffr warns the same
+//!     and ends with `Zip file structure invalid`, exit 3. (Without `-O` both
+//!     refuse a split archive: `cannot update a split archive`, exit 16.) A central name longer than the
 //!     local one makes `readlocal()` write past the local name's buffer;
 //!     stuffr keeps the local name as it is (a shorter central name cuts it
 //!     with a NUL, as the C does).

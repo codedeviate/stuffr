@@ -285,6 +285,43 @@ mod unix {
         assert_eq!(m, pinned);
     }
 
+    /// `-lf`'s `Zip log opened <asctime>`: the wall-clock time in each
+    /// run's own window compares equal (Task 9 fix round: the scan
+    /// matrix's two `-lf` cases straddling a second); outside it, or any
+    /// other text, is left alone.
+    #[test]
+    fn log_times_compare_equal_within_their_own_runs() {
+        // 1800000000 = Fri Jan 15 08:00:00 2027 UTC
+        let r = b"Zip log opened Fri Jan 15 08:00:00 2027\n\nend\n".to_vec();
+        let s = b"Zip log opened Fri Jan 15 08:00:03 2027\n\nend\n".to_vec();
+        let mut m = s.clone();
+        mask_asctimes(
+            &r,
+            (1_800_000_000, 1_800_000_000),
+            &mut m,
+            (1_800_000_002, 1_800_000_003),
+        );
+        assert_eq!(m, r);
+        let mut m = s.clone();
+        mask_asctimes(
+            &r,
+            (1_800_000_000, 1_800_000_000),
+            &mut m,
+            (1_800_000_100, 1_800_000_101),
+        );
+        assert_eq!(m, s);
+        let other = b"Zip log opened Fri Jan 15 08:00:03 2027\n\nENd\n".to_vec();
+        let mut m = other.clone();
+        mask_asctimes(
+            &r,
+            (1_800_000_000, 1_800_000_000),
+            &mut m,
+            (1_800_000_002, 1_800_000_003),
+        );
+        assert_eq!(&m[..40], &r[..40]);
+        assert_eq!(&m[40..], &other[40..]);
+    }
+
     #[test]
     fn the_tree_pins_modes_times_and_symlinks() {
         let d = scratch("tree");

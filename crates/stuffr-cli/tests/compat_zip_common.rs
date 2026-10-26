@@ -164,29 +164,6 @@ mod unix {
         ZipTree::standard().file("t.zip", zip_with(&specs, b"", b""))
     }
 
-    /// The standard tree plus `t.zip`, stored entries (name, encrypted)
-    /// holding `hello`, the encrypted ones under `pw` with traditional
-    /// PKWARE encryption (the check byte the CRC's high byte).
-    fn with_encrypted(entries: &[(&[u8], bool)]) -> ZipTree {
-        let plain: &[u8] = b"hello\n";
-        let body = zipcrypto(b"pw", (crc32(plain) >> 24) as u8, plain);
-        let specs: Vec<ZipEntrySpec> = entries
-            .iter()
-            .map(|&(n, enc)| {
-                if enc {
-                    ZipEntrySpec {
-                        flags: 1,
-                        stored_data: Some(&body),
-                        ..ZipEntrySpec::new(n, plain)
-                    }
-                } else {
-                    ZipEntrySpec::new(n, plain)
-                }
-            })
-            .collect();
-        ZipTree::standard().file("t.zip", zip_with(&specs, b"", b""))
-    }
-
     /// The standard tree plus `big`, 200000 random bytes (four 64 KiB
     /// splits; too large for a 1000-byte `zipsplit`).
     fn with_big() -> ZipTree {
@@ -480,6 +457,14 @@ mod unix {
                 "zipcloak error: Temporary file failure (nodir/zi??????)\n",
                 "zipcloak error: No such file or directory\n")
                 .tree(with_archive(&[(b"a.txt", b"hello\n")])),
+            row(Both, 9, "zipcloak, a split archive", "zipcloak", &["s.zip"], 16,
+                "zipcloak warning: cannot update a split archive (use --out option)\n\
+                 zipcloak error: Invalid command arguments (s.zip)\n", "")
+                .tree(with_parts(ZipTree::standard(), &zip_split_set("apple"), &[])),
+            row(Both, 9, "zipcloak -O, a split archive, without a terminal", "zipcloak",
+                &["-O", "o.zip", "s.zip"], 16,
+                "zipcloak error: Invalid command arguments (stderr is not a tty (you may never see this message!))\n", "")
+                .tree(with_parts(ZipTree::standard(), &zip_split_set("apple"), &[])),
             row(Both, 9, "-P then -e asks, without a terminal", "zip", &["-P", "pw", "-e", "t.zip", "a.txt"], 16,
                 "\nzip error: Invalid command arguments (stderr is not a tty)\n", ""),
             // ---- Task 10: zipnote, zipsplit ----

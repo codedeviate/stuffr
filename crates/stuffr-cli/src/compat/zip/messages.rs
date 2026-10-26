@@ -1525,3 +1525,6 @@ pub(super) const WAS_COPYING_AN_ENTRY: &str = "was copying an entry";
 /// zipcloak.c:handler + ziperr(ZE_ABORT, "aborting"): what the interrupt
 /// handler prints after its newline.
 pub(crate) const CLOAK_INTERRUPTED: &[u8] = b"zipcloak error: Interrupted (aborting)\n";
+/// stuffr's own (Task 9): the system gave no random bytes for an
+/// encryption header (zip's `rand()` cannot fail; `ZE_LOGIC`).
+pub(super) const NO_RANDOM_BYTES: &str = "no random bytes for the encryption header";

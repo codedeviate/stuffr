@@ -65,28 +65,52 @@ pub(crate) fn getp(z: &mut Zr, prompt: &[u8]) -> Option<Password> {
 }
 
 /// The ten random bytes of an encryption header (crypt.c:crypthead's
-/// `rand()` draws): from the system's generator (`/dev/urandom`), never
-/// from a seeded `rand()`. Off unix, or if that cannot be read, the
-/// standard library's randomly keyed hasher.
-pub(crate) fn random_header() -> [u8; 10] {
+/// `rand()` draws), from the system: `getentropy()` (macOS and the BSDs),
+/// `getrandom()` (Linux), else `/dev/urandom`; never a seeded `rand()`.
+/// `Err` when the system gives none (the caller ends the run).
+pub(crate) fn random_header() -> std::io::Result<[u8; 10]> {
     let mut b = [0u8; 10];
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    // SAFETY: getentropy fills the 10 bytes of a buffer we own (at most
+    // 256 may be asked for).
+    if unsafe { libc::getentropy(b.as_mut_ptr().cast(), b.len()) } == 0 {
+        return Ok(b);
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut got = 0;
+        while got < b.len() {
+            // SAFETY: getrandom writes at most `len - got` bytes into the
+            // part of our buffer not yet filled.
+            let n = unsafe { libc::getrandom(b[got..].as_mut_ptr().cast(), b.len() - got, 0) };
+            if n > 0 {
+                got += n as usize;
+            } else if n < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            } else {
+                break;
+            }
+        }
+        if got == b.len() {
+            return Ok(b);
+        }
+    }
     #[cfg(unix)]
     {
         use std::io::Read;
-        if std::fs::File::open("/dev/urandom")
-            .and_then(|mut f| f.read_exact(&mut b))
-            .is_ok()
-        {
-            return b;
-        }
+        std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b))?;
+        Ok(b)
     }
-    use std::hash::{BuildHasher, Hasher};
-    let s = std::collections::hash_map::RandomState::new();
-    for (i, chunk) in b.chunks_mut(8).enumerate() {
-        let mut h = s.build_hasher();
-        h.write_usize(i);
-        let v = h.finish().to_le_bytes();
-        chunk.copy_from_slice(&v[..chunk.len()]);
+    #[cfg(not(unix))]
+    {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     }
-    b
 }
