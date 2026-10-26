@@ -267,7 +267,11 @@ pub(crate) fn run(z: &mut Zr, o: CloakOptions) -> Exit {
 fn local_entry(z: &mut Zr, ia: &mut InArchive, zf: &ZFile) -> Result<ZEntry, Fail> {
     let mut here = zf.clone();
     here.e.dsk = z.current_in_disk;
-    let local = readzip::readlocal(z, ia, &here).map_err(|c| CopyFail::Code(c, None))?;
+    let local = readzip::readlocal(z, ia, &here).map_err(|f| match f {
+        readzip::LocalFail::Code(c) => CopyFail::Code(c, None),
+        // a run readlocal ended (ZIPERR does not return)
+        readzip::LocalFail::Exit(x) => CopyFail::Exit(x),
+    })?;
     let mut iname = local.iname;
     // ruling (deviation 24): only a shorter central name is honoured
     if let Some(b) = iname.get_mut(zf.e.iname.len()) {

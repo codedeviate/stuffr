@@ -626,10 +626,11 @@ mod unix {
     }
 
     /// Review Focus 5: names with a newline, a byte that is not UTF-8, a
-    /// leading `-`, under `LANG=C` and `C.UTF-8`, in this platform's
+    /// leading `-` or `/`, under `LANG=C` and `C.UTF-8`, in this platform's
     /// flavour: on disk (APFS refuses the high byte: macOS gets it from
     /// standard input only, where zip finds no such file) and stored in an
-    /// archive zip reads, updates, lists and copies.
+    /// archive zip reads, updates, lists and copies; and a leading `/`, on
+    /// the command line and stored.
     #[test]
     fn awkward_names_match_the_reference() {
         let linux = cfg!(target_os = "linux");
@@ -650,6 +651,7 @@ mod unix {
                 ZipEntrySpec::new(b"n\nl", b"y\n"),
                 ZipEntrySpec::new(b"-n", b"z\n"),
                 ZipEntrySpec::new("caf\u{e9}.txt".as_bytes(), b"w\n"),
+                ZipEntrySpec::new(b"/abs.txt", b"v\n"),
             ];
             disk().file("t.zip", zip_with(&specs, b"", b""))
         };
@@ -682,6 +684,18 @@ mod unix {
             add(&["zip", "-FF", "t.zip", "--out", "f.zip"], stored(), None);
             add(&["zipnote", "t.zip"], stored(), None);
             add(&["zipsplit", "-n", "65536", "t.zip"], stored(), None);
+            // a leading `/`: an absolute operand (a file every system has,
+            // -X so its access time is not stored) loses it; a stored one
+            // is kept
+            add(&["zip", "-X", "t.zip", "/etc/passwd"], disk(), None);
+            add(&["zip", "-X", "-sf", "t.zip", "/etc/passwd"], disk(), None);
+            add(&["zip", "-X", "-j", "t.zip", "/etc/passwd"], disk(), None);
+            add(&["zip", "-d", "t.zip", "/abs.txt"], stored(), None);
+            add(
+                &["zip", "-U", "t.zip", "/abs.txt", "--out", "o.zip"],
+                stored(),
+                None,
+            );
         }
         run_group("awkward names", &cases, Skipped::none(), &assert_same_zip);
     }
@@ -734,10 +748,13 @@ mod unix {
             assert_eq!(r.code, 0, "{flavour}");
             let (flags, _) = central_flags(&archive_of(&r, b"t.zip"));
             assert_eq!(flags, if ubuntu { 0x800 } else { 0 }, "{flavour}");
-            // patch 13: archive names of 1 to 40 bytes
-            for n in 1..=40usize {
-                let name: &'static str =
-                    Box::leak(format!("{}.zip", "q".repeat(n)).into_boxed_str());
+            // patch 13: end to end at three name lengths (the boundary
+            // itself is `update::tests::tt_command_is_whole_at_every_length`)
+            for name in [
+                "q.zip",
+                "qqqq.zip",
+                "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq.zip",
+            ] {
                 let mut c = zip_case(
                     "zip",
                     &["-T", "-TT", "true", name, "a.txt"],

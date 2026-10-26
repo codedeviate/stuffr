@@ -1306,15 +1306,25 @@ pub(crate) struct Local {
     pub(crate) iname: Vec<u8>,
 }
 
+/// How `readlocal` failed: a `ZE_*` code (the caller warns and goes on, or
+/// stops, as the C's caller does), or a run already ended inside it (a
+/// split it could not find, `-UN quit`'s `Unicode path error`, the crash
+/// answer of deviation 28): the caller returns it unchanged, as the C's
+/// `ZIPERR` never returns.
+pub(crate) enum LocalFail {
+    Code(i32),
+    Exit(Exit),
+}
+
 /// zipfile.c:readlocal: the flags and extra field of `zf`'s local header,
 /// and its warnings when they differ from the central header's. `Err` is
 /// the `ZE_*` code (the caller warns).
 // port: zipfile.c:readlocal
-pub(crate) fn readlocal(z: &mut Zr, ia: &mut InArchive, zf: &ZFile) -> Result<Local, i32> {
+pub(crate) fn readlocal(z: &mut Zr, ia: &mut InArchive, zf: &ZFile) -> Result<Local, LocalFail> {
     match open_entry_disk(z, ia, zf.e.dsk, false) {
         Ok(()) => {}
-        Err(OpenFail::Code(c)) => return Err(c),
-        Err(OpenFail::Exit(x)) => return Err(x.code),
+        Err(OpenFail::Code(c)) => return Err(LocalFail::Code(c)),
+        Err(OpenFail::Exit(x)) => return Err(LocalFail::Code(x.code)),
     }
     let e = &zf.e;
     let f = ia.f.as_mut().expect("opened above");
@@ -1322,19 +1332,19 @@ pub(crate) fn readlocal(z: &mut Zr, ia: &mut InArchive, zf: &ZFile) -> Result<Lo
         let s = strerror(f.errno);
         ia.f = None;
         z.zipwarn(m::READING_ARCHIVE_FSEEK.as_bytes(), &s);
-        return Err(ZE_READ);
+        return Err(LocalFail::Code(ZE_READ));
     }
     if !at_signature(f, b"PK\x03\x04") {
         ia.f = None;
         z.zipwarn(m::DID_NOT_FIND_ENTRY.as_bytes(), cstr(&e.iname));
-        return Err(ZE_FORM);
+        return Err(LocalFail::Code(ZE_FORM));
     }
     let buf = f.fread(LOCHEAD as usize);
     if buf.len() != LOCHEAD as usize {
         let (err, s) = (f.ferror(), strerror(f.errno));
         ia.f = None;
         z.zipwarn(m::READING_LOCAL_ENTRY.as_bytes(), &s);
-        return Err(if err { ZE_READ } else { ZE_EOF });
+        return Err(LocalFail::Code(if err { ZE_READ } else { ZE_EOF }));
     }
     let ver = sh(&buf, 0);
     let lflg = sh(&buf, 2);
@@ -1352,12 +1362,14 @@ pub(crate) fn readlocal(z: &mut Zr, ia: &mut InArchive, zf: &ZFile) -> Result<Lo
     if name.len() != nam || extra.len() != ext {
         let err = f.ferror();
         ia.f = None;
-        return Err(if err { ZE_READ } else { ZE_EOF });
+        return Err(LocalFail::Code(if err { ZE_READ } else { ZE_EOF }));
     }
     // ubuntu: the Unicode Path field's warnings (its name is not kept)
     if flavour::unicode_support(z.flavour) && z.o.unicode_mismatch != 3 {
-        unicode::read_unicode_path(z, &extra, &name, unicode::PathReader::ReadLocal)
-            .map_err(|x| x.code)?;
+        // `locz->iname[z->nam] = '\0'`: cut where the central name ends
+        let cut = &name[..name.len().min(e.nam.unwrap_or(e.iname.len()))];
+        unicode::read_unicode_path(z, &extra, cut, unicode::PathReader::ReadLocal)
+            .map_err(LocalFail::Exit)?;
     }
     let iname = cstr(&e.iname).to_vec();
     if ver != e.ver {
@@ -1578,8 +1590,13 @@ pub(crate) fn zipcopy(
             lz.iname = local;
         } else {
             let iname = lz.iname.clone();
-            lz.uname = unicode::read_unicode_path(z, &lz.extra, &iname, unicode::PathReader::Copy)
-                .map_err(CopyFail::Exit)?;
+            lz.uname = unicode::read_unicode_path(
+                z,
+                &lz.extra,
+                &iname,
+                unicode::PathReader::Copy(&lz.name.clone()),
+            )
+            .map_err(CopyFail::Exit)?;
         }
     }
     let ciname = cstr(&zf.e.iname).to_vec();

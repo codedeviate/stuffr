@@ -366,7 +366,9 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
                     }
                     // get the local header's flags and extra field
                     match readzip::readlocal(z, &mut ia, &zf) {
-                        Err(_) => {
+                        // a run readlocal ended (ZIPERR does not return)
+                        Err(readzip::LocalFail::Exit(x)) => return x,
+                        Err(readzip::LocalFail::Code(_)) => {
                             z.zipwarn(m::COULD_NOT_READ_LOCAL.as_bytes(), &oname);
                             zf.e.lflg = zf.e.flg;
                             zf.e.extra.clear();
@@ -903,6 +905,32 @@ pub(crate) fn check_zipfile(z: &mut Zr, name: &[u8]) -> Result<(), Exit> {
 /// `ZE_TEST`, "original files unmodified": ruling Z3 (deviation 15), as
 /// Apple answers in both flavours, where Ubuntu's build frees the
 /// temporary's stream twice and aborts.
+/// Ubuntu's `-TT` command (zip.c:check_zipfile): the first `{}` replaced
+/// by the quoted temporary name, or the quoted name appended. Built as a
+/// string: patch 13's buffer (`strlen(cmd) + strlen(name) + 3`, one byte
+/// short of the appended form and its NUL) has no counterpart, so the
+/// command is whole at every length (deviation 28).
+// port: zip.c:check_zipfile (-TT)
+pub(crate) fn tt_command(up: &[u8], name: &[u8]) -> Vec<u8> {
+    let mut cmd = Vec::with_capacity(up.len() + name.len() + 4);
+    match up.windows(2).position(|w| w == b"{}") {
+        Some(i) => {
+            cmd.extend_from_slice(&up[..i]);
+            cmd.extend_from_slice(b" '");
+            cmd.extend_from_slice(name);
+            cmd.extend_from_slice(b"' ");
+            cmd.extend_from_slice(&up[i + 2..]);
+        }
+        None => {
+            cmd.extend_from_slice(up);
+            cmd.extend_from_slice(b" '");
+            cmd.extend_from_slice(name);
+            cmd.push(b'\'');
+        }
+    }
+    cmd
+}
+
 // port: zip.c:check_zipfile
 fn check_zipfile_64(z: &mut Zr, name: &[u8], zip64_archive: bool) -> Result<(), Exit> {
     let _ = z.out.flush();
@@ -912,24 +940,7 @@ fn check_zipfile_64(z: &mut Zr, name: &[u8], zip64_archive: bool) -> Result<(), 
     let ok = match z.o.unzip_path.take() {
         Some(up) => {
             if shell {
-                // replace the first {} with the quoted name, or append it
-                let mut cmd = Vec::new();
-                match up.windows(2).position(|w| w == b"{}") {
-                    Some(i) => {
-                        cmd.extend_from_slice(&up[..i]);
-                        cmd.extend_from_slice(b" '");
-                        cmd.extend_from_slice(name);
-                        cmd.extend_from_slice(b"' ");
-                        cmd.extend_from_slice(&up[i + 2..]);
-                    }
-                    None => {
-                        cmd.extend_from_slice(&up);
-                        cmd.extend_from_slice(b" '");
-                        cmd.extend_from_slice(name);
-                        cmd.push(b'\'');
-                    }
-                }
-                system(z, &cmd)
+                system(z, &tt_command(&up, name))
             } else {
                 if up.windows(2).any(|w| w == b"{}") {
                     return Err(z.ziperr(ZE_PARMS, m::BRACES_NOT_SUPPORTED.as_bytes()));

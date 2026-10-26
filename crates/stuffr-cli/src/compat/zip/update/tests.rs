@@ -289,3 +289,24 @@ fn show_files_with_move_deletes_nothing() {
     assert!(out.starts_with("Would Add/Update:\n"), "{out}");
     assert_eq!(names(&s.0), ["a.txt", "big", "t.zip"]);
 }
+
+/// Patch 13 (deviation 28): the appended form needs `strlen(cmd) +
+/// strlen(name) + 3` bytes and a NUL, one more than the unpatched C's
+/// buffer; around that edge (and for buffers malloc rounds to 8 or 16)
+/// the command is whole: the name quoted after a space, nothing lost.
+#[test]
+fn tt_command_is_whole_at_every_length() {
+    for ul in [1usize, 4, 5, 6, 7, 8, 13, 16, 29] {
+        for nl in [1usize, 2, 3, 4, 8, 9, 15, 16, 17, 24] {
+            let (up, name) = (vec![b'c'; ul], vec![b'n'; nl]);
+            let cmd = super::tt_command(&up, &name);
+            assert_eq!(cmd.len(), ul + nl + 3, "{ul} {nl}");
+            assert_eq!(&cmd[..ul], &up[..]);
+            assert_eq!(&cmd[ul..ul + 2], b" '");
+            assert_eq!(&cmd[ul + 2..ul + 2 + nl], &name[..]);
+            assert_eq!(cmd.last(), Some(&b'\''));
+        }
+    }
+    assert_eq!(super::tt_command(b"t {} x", b"zi1"), b"t  'zi1'  x");
+    assert_eq!(super::tt_command(b"{}{}", b"z"), b" 'z' {}");
+}

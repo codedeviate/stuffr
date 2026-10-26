@@ -360,9 +360,14 @@ pub(crate) fn add_unicode_path_field(extra: &mut Vec<u8>, iname: &[u8], uname: &
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PathReader<'a> {
     Central,
-    /// `-FF`: the entry's oname, and its name for a field with none.
-    CentralFix(&'a [u8]),
-    Copy,
+    /// `-FF`: the entry's oname and its name (`z->name`, copied for a
+    /// field with no UTF-8 name).
+    CentralFix {
+        oname: &'a [u8],
+        name: &'a [u8],
+    },
+    /// `zipcopy`: the local entry's name (`localz->name`).
+    Copy(&'a [u8]),
     ReadLocal,
 }
 
@@ -389,7 +394,7 @@ pub(crate) fn read_unicode_path(
     let version = head[4];
     // the entry's oname is not set yet but under -FF (glibc's `(null)`)
     let oname: &[u8] = match reader {
-        PathReader::CentralFix(o) => o,
+        PathReader::CentralFix { oname, .. } => oname,
         _ => b"(null)",
     };
     if version > 1 {
@@ -400,7 +405,7 @@ pub(crate) fn read_unicode_path(
     let mut crc = flate2::Crc::new();
     crc.update(cstr(iname));
     if crc.sum() != chksum {
-        if matches!(reader, PathReader::Central | PathReader::CentralFix(_)) {
+        if matches!(reader, PathReader::Central | PathReader::CentralFix { .. }) {
             let mut l = Vec::new();
             printf(
                 &mut l,
@@ -424,9 +429,11 @@ pub(crate) fn read_unicode_path(
     let ulen = elen.wrapping_sub(5);
     if ulen == 0 {
         // the standard path is UTF-8: strcpy of the entry's name
+        // (`z->name`), not yet set (NULL) in the other two readers
         return match reader {
-            PathReader::Copy => Ok(Some(cstr(iname).to_vec())),
-            PathReader::CentralFix(_) => Ok(Some(cstr(iname).to_vec())),
+            PathReader::Copy(name) | PathReader::CentralFix { name, .. } => {
+                Ok(Some(cstr(name).to_vec()))
+            }
             _ => Err(segv(z)),
         };
     }

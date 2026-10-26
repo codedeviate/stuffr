@@ -570,13 +570,20 @@ fn scanzipf_fixnew(
                             if zf.e.flg & UTF8_BIT != 0 {
                                 zf.e.uname = Some(cstr(&zf.e.iname).to_vec());
                             } else {
-                                let (cx, iname, oname) =
-                                    (zf.e.cextra.clone(), zf.e.iname.clone(), zf.e.oname.clone());
+                                let (cx, iname, oname, name) = (
+                                    zf.e.cextra.clone(),
+                                    zf.e.iname.clone(),
+                                    zf.e.oname.clone(),
+                                    zf.e.name.clone(),
+                                );
                                 let u = unicode::read_unicode_path(
                                     z,
                                     &cx,
                                     &iname,
-                                    unicode::PathReader::CentralFix(&oname),
+                                    unicode::PathReader::CentralFix {
+                                        oname: &oname,
+                                        name: &name,
+                                    },
                                 );
                                 match u {
                                     Ok(u) => sc.ar.zfiles[i].e.uname = u,

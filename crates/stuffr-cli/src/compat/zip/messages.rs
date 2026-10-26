@@ -1589,6 +1589,8 @@ pub(super) const BZIPPED: &str = " (bzipped %s%%)\n";
 /// zipup.c:bz_compress_init, `BZ2_bzCompressInit`'s BZ_PARAM_ERROR (-2): a
 /// block size out of 1..9 (`-0 -Z bzip2`).
 pub(super) const BZ_INIT_FAILURE: &str = "bzlib bzCompressInit failure (-2)";
-/// zipup.c:bzfilecompress, an encoder error (unreachable with a valid
-/// level: stuffr's encoder does not fail on its own).
+/// zipup.c:bzfilecompress's `unexpected bzlib compress error %d`, an
+/// encoder error. Unreachable with a valid level (stuffr's encoder does
+/// not fail on its own), so the number is stuffr's own choice, not one
+/// libbzip2 returns.
 pub(super) const BZ_COMPRESS_ERROR: &str = "unexpected bzlib compress error -1";

@@ -105,6 +105,21 @@ mod linux {
             ),
             ("bit11bad", mk(&[e(b"h\xe9.txt", 0x800, vec![]), a()])),
             ("bit11nl", mk(&[e(b"n\nl\xc3\xa9", 0x800, vec![])])),
+            // a good central field over a local one whose checksum is wrong
+            ("locbad", {
+                let mut b = mk(&[e(b"caf\xe9.txt", 0, up(cafl, caf8, 1, None)), a()]);
+                let at = 30 + cafl.len() + 5;
+                b[at..at + 4].copy_from_slice(&1u32.to_le_bytes());
+                b
+            }),
+            // a good central field over a local one with no name (its data
+            // length 5: the name bytes become padding the field skips)
+            ("locempty", {
+                let mut b = mk(&[e(b"caf\xe9.txt", 0, up(cafl, caf8, 1, None)), a()]);
+                let at = 30 + cafl.len() + 2;
+                b[at..at + 2].copy_from_slice(&5u16.to_le_bytes());
+                b
+            }),
         ]
     }
 
@@ -170,6 +185,8 @@ mod linux {
                 &["zip", "t.zip", "-@"][..],
                 &["zip", "-sf", "t.zip", "-@"],
                 &["zip", "-UN=e", "-sf", "t.zip", "-@"],
+                &["zip", "-UN=u", "t.zip", "-@"],
+                &["zip", "-UN=u", "-sf", "t.zip", "-@"],
             ] {
                 push(&mut cases, args, names_tree(), Some(listed), env);
             }
@@ -185,9 +202,11 @@ mod linux {
         }
         // archives holding Unicode names
         for (an, bytes) in unicode_archives() {
+            // the archive is named after its kind, so a failure says which
+            let file: &'static str = Box::leak(format!("{an}.zip").into_boxed_str());
             let tree = || {
                 ZipTree::standard()
-                    .file_at(b"t.zip", &bytes, 0o644)
+                    .file_at(file.as_bytes(), &bytes, 0o644)
                     .file_at(caf.as_bytes(), b"new\n", 0o644)
             };
             let rows: &[&[&'static str]] = &[
@@ -222,20 +241,27 @@ mod linux {
                 &["zipnote", "t.zip"],
                 &["zipsplit", "t.zip"],
                 &["zipsplit", "-n", "65536", "-b", "d", "t.zip"],
+                &["zip", "-UN=q", "t.zip", "café.txt"],
+                &["zip", "-UN=q", "-U", "t.zip", "caf*", "--out", "o.zip"],
+                &["zip", "-U", "t.zip", "*", "--out", "-"],
+                &["zip", "t.zip", "b.txt", "--out", "-"],
             ];
             for args in rows {
-                push(&mut cases, args, tree(), None, &[]);
+                let args: Vec<&'static str> = args
+                    .iter()
+                    .map(|&a| if a == "t.zip" { file } else { a })
+                    .collect();
+                push(&mut cases, &args, tree(), None, &[]);
             }
             // zipnote -w renaming the first entry
             let rename = b"@ caf\xc3\xa9.txt\n@=new.txt\n@ (comment above this line)\n";
             push(
                 &mut cases,
-                &["zipnote", "-w", "t.zip"],
+                &["zipnote", "-w", file],
                 tree(),
                 Some(rename),
                 &[],
             );
-            let _ = an;
         }
         // -Z bzip2: stuffr's encoder at zip's block size; the store
         // fallback (an input of one buffer that does not shrink, archive
