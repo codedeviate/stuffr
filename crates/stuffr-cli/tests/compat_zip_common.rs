@@ -514,9 +514,17 @@ mod unix {
                 "\tUNICODE_SUPPORT      (store and read UTF-8 Unicode paths)\n\
                  \tSTORE_UNIX_UIDs_GIDs (store UID/GID sizes/values using new extra field)\n\
                  \tUIDGID_NOT_16BIT     (old Unix 16-bit UID/GID extra field not used)\n", ""),
-            row(Ubuntu, 11, "UTF-8 name", "zip", &["t.zip", "caf\u{e9}.txt"], 0,
+            row(Both, 11, "UTF-8 name", "zip", &["t.zip", "caf\u{e9}.txt"], 0,
                 "  adding: caf\u{e9}.txt (stored 0%)\n", "")
                 .tree(ZipTree::standard().file("caf\u{e9}.txt", b"x")),
+            row(Apple, 11, "-Z bzip2 not built", "zip", &["-Z", "bzip2", "t.zip", "b.txt"], 19,
+                "\nzip error: Not supported (Compression method bzip2 not enabled)\n", ""),
+            row(Both, 11, "a stored name that is not UTF-8", "zip", &["-sf", "t.zip"], 0,
+                "Archive contains:\n", "")
+                .tree(with_archive(&[(b"h\xe9.txt", b"x\n"), (b"n\nl", b"y\n")])),
+            row(Both, 11, "copying a name that is not UTF-8", "zip", &["t.zip", "b.txt"], 0,
+                "  adding: b.txt (deflated 92%)\n", "")
+                .tree(with_archive(&[(b"h\xe9.txt", b"x\n"), (b"-n", b"y\n")])),
         ]
     }
 
@@ -608,6 +616,200 @@ mod unix {
     #[test]
     fn task10_rows_match_the_reference() {
         differential(10);
+    }
+
+    /// Task 11's rows: Ubuntu's `-Z bzip2` and Unicode names, Apple's
+    /// answers to the same (its build has neither).
+    #[test]
+    fn task11_rows_match_the_reference() {
+        differential(11);
+    }
+
+    /// Review Focus 5: names with a newline, a byte that is not UTF-8, a
+    /// leading `-`, under `LANG=C` and `C.UTF-8`, in this platform's
+    /// flavour: on disk (APFS refuses the high byte: macOS gets it from
+    /// standard input only, where zip finds no such file) and stored in an
+    /// archive zip reads, updates, lists and copies.
+    #[test]
+    fn awkward_names_match_the_reference() {
+        let linux = cfg!(target_os = "linux");
+        let disk = || {
+            let t = ZipTree::standard()
+                .file_at(b"n\nl", b"x", 0o644)
+                .file_at(b"-n", b"x", 0o644)
+                .file_at("caf\u{e9}.txt".as_bytes(), b"x", 0o644);
+            if linux {
+                t.file_at(b"h\xe9.txt", b"x", 0o644)
+            } else {
+                t
+            }
+        };
+        let stored = || {
+            let specs = [
+                ZipEntrySpec::new(b"h\xe9.txt", b"x\n"),
+                ZipEntrySpec::new(b"n\nl", b"y\n"),
+                ZipEntrySpec::new(b"-n", b"z\n"),
+                ZipEntrySpec::new("caf\u{e9}.txt".as_bytes(), b"w\n"),
+            ];
+            disk().file("t.zip", zip_with(&specs, b"", b""))
+        };
+        let mut cases = Vec::new();
+        for env in [&[][..], &[("LC_ALL", "C.UTF-8")]] {
+            let mut add = |args: &[&'static str], tree: ZipTree, stdin: Option<&[u8]>| {
+                let mut c = zip_case(args[0], &args[1..], tree);
+                c.env = env.to_vec();
+                c.stdin = stdin.map(<[u8]>::to_vec);
+                cases.push(c);
+            };
+            add(&["zip", "t.zip", "n\nl", "--", "-n"], disk(), None);
+            add(&["zip", "-sf", "t.zip", "n\nl", "--", "-n"], disk(), None);
+            add(&["zip", "-r", "t.zip", "."], disk(), None);
+            add(
+                &["zip", "t.zip", "-@"],
+                disk(),
+                Some(b"h\xe9.txt\nn\nl\n-n\n"),
+            );
+            add(&["zip", "-sf", "t.zip", "-@"], disk(), Some(b"h\xe9.txt\n"));
+            add(&["zip", "-sf", "t.zip"], stored(), None);
+            add(&["zip", "t.zip", "b.txt"], stored(), None);
+            add(&["zip", "t.zip", "n\nl", "--", "-n"], stored(), None);
+            add(&["zip", "-d", "t.zip", "h*", "--", "-n"], stored(), None);
+            add(
+                &["zip", "-v", "-U", "t.zip", "*", "--out", "o.zip"],
+                stored(),
+                None,
+            );
+            add(&["zip", "-FF", "t.zip", "--out", "f.zip"], stored(), None);
+            add(&["zipnote", "t.zip"], stored(), None);
+            add(&["zipsplit", "-n", "65536", "t.zip"], stored(), None);
+        }
+        run_group("awkward names", &cases, Skipped::none(), &assert_same_zip);
+    }
+
+    /// The first central header's general-purpose flags and internal
+    /// attributes in archive `b`.
+    fn central_flags(b: &[u8]) -> (u16, u16) {
+        let at = b
+            .windows(4)
+            .position(|w| w == b"PK\x01\x02")
+            .expect("a central header");
+        let h = |o: usize| u16::from_le_bytes([b[at + o], b[at + o + 1]]);
+        (h(8), h(36))
+    }
+
+    fn archive_of(run: &ZipRun, name: &[u8]) -> Vec<u8> {
+        match run.tree.get(name) {
+            Some(UnzipNode::File { bytes, .. }) => bytes.clone(),
+            other => panic!("{} is {other:?}", String::from_utf8_lossy(name)),
+        }
+    }
+
+    /// stuffr-only pins of the undefined behaviour Ubuntu's patches 12 and
+    /// 13 remove and of Task 11's rulings (deviations 28 and 29), in both
+    /// flavours:
+    /// - patch 12 (`mbstowcs` told the buffer is `strlen + 1` wide
+    ///   characters; glibc's fortify aborts on any non-ASCII name): a
+    ///   non-ASCII name is archived (Ubuntu: bit 11; Apple, which has no
+    ///   Unicode code: no flag);
+    /// - patch 13 (`-TT`'s command one byte short): the test command runs
+    ///   whatever the archive name's length;
+    /// - deviation 28: where Ubuntu's C reads through a NULL from a
+    ///   conversion that failed (a bit-11 name that is not UTF-8, a Unicode
+    ///   Path field with no name), the answer is its crash's, without the
+    ///   crash; Apple reads such archives as any other;
+    /// - deviation 29: `-Z bzip2`'s text test of a first entry sees zeros
+    ///   past the bytes read (a short text file is binary).
+    #[test]
+    fn ub_rulings() {
+        for flavour in ["apple", "ubuntu"] {
+            let ubuntu = flavour == "ubuntu";
+            // patch 12
+            let mut c = zip_case(
+                "zip",
+                &["t.zip", "caf\u{e9}.txt"],
+                ZipTree::standard().file("caf\u{e9}.txt", b"x"),
+            );
+            c.zip_flavour = Some(flavour);
+            let r = stuffr_zip(&c);
+            assert_eq!(r.code, 0, "{flavour}");
+            let (flags, _) = central_flags(&archive_of(&r, b"t.zip"));
+            assert_eq!(flags, if ubuntu { 0x800 } else { 0 }, "{flavour}");
+            // patch 13: archive names of 1 to 40 bytes
+            for n in 1..=40usize {
+                let name: &'static str =
+                    Box::leak(format!("{}.zip", "q".repeat(n)).into_boxed_str());
+                let mut c = zip_case(
+                    "zip",
+                    &["-T", "-TT", "true", name, "a.txt"],
+                    ZipTree::standard(),
+                );
+                c.zip_flavour = Some(flavour);
+                let r = stuffr_zip(&c);
+                assert_eq!(
+                    r.code,
+                    0,
+                    "{flavour} {name}: {}",
+                    String::from_utf8_lossy(&r.stdout)
+                );
+                assert!(
+                    String::from_utf8_lossy(&r.stdout).contains(&format!("test of {name} OK")),
+                    "{flavour} {name}"
+                );
+            }
+            // deviation 28
+            let mut up = 0x7075u16.to_le_bytes().to_vec();
+            up.extend_from_slice(&5u16.to_le_bytes());
+            up.push(1);
+            let mut crc = flate2::Crc::new();
+            crc.update("caf\u{e9}.txt".as_bytes());
+            up.extend_from_slice(&crc.sum().to_le_bytes());
+            let mut empty_up = ZipEntrySpec::new("caf\u{e9}.txt".as_bytes(), b"x\n");
+            empty_up.extra = &up;
+            let mut not_utf8 = ZipEntrySpec::new(b"h\xe9.txt", b"x\n");
+            not_utf8.flags = 0x800;
+            for spec in [empty_up, not_utf8] {
+                let tree = ZipTree::standard().file("t.zip", zip_with(&[spec], b"", b""));
+                for (prog, args) in [
+                    ("zip", &["-sf", "t.zip"][..]),
+                    ("zip", &["t.zip", "b.txt"]),
+                    ("zipnote", &["t.zip"]),
+                    ("zipsplit", &["t.zip"]),
+                ] {
+                    let mut c = zip_case(prog, args, tree.clone());
+                    c.zip_flavour = Some(flavour);
+                    let r = stuffr_zip(&c);
+                    if !ubuntu {
+                        assert_eq!(r.code, 0, "{flavour} {prog} {args:?}");
+                        continue;
+                    }
+                    assert_eq!(r.code, 9, "{prog} {args:?}");
+                    let (out, err) = (r.stdout.clone(), r.stderr.clone());
+                    let text = match prog {
+                        "zip" => (out, b"\n\nzip error: Interrupted (aborting)\n".to_vec()),
+                        "zipnote" => (err, b"\nzipnote error: Interrupted (aborting)\n".to_vec()),
+                        _ => (out, b"\nzipsplit error: Interrupted (aborting)\n".to_vec()),
+                    };
+                    assert!(
+                        text.0.ends_with(&text.1),
+                        "{prog} {args:?}: {:?}",
+                        String::from_utf8_lossy(&text.0)
+                    );
+                }
+            }
+            // deviation 29 (Ubuntu only: Apple refuses -Z bzip2)
+            if ubuntu {
+                let mut c = zip_case(
+                    "zip",
+                    &["-Z", "bzip2", "t.zip", "b.txt"],
+                    ZipTree::standard(),
+                );
+                c.zip_flavour = Some(flavour);
+                let r = stuffr_zip(&c);
+                assert_eq!(r.code, 0);
+                let (_, iattr) = central_flags(&archive_of(&r, b"t.zip"));
+                assert_eq!(iattr, 0, "a short first text entry is binary");
+            }
+        }
     }
 
     /// Ruling Z3 (deviation 15): a failing `-T` answers as Apple's zip in

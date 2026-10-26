@@ -66,6 +66,13 @@
 //! split, the parts and the index written directly under their names), over
 //! the shared reader and writer.
 //!
+//! **Task 11 (`unicode.rs`, `zipup.rs`, `flavour.rs`):** Ubuntu's deltas:
+//! `UNICODE_SUPPORT` (bit 11 and the Unicode Path field written and read,
+//! `-UN`, `-su`/`-sU`, matching by the Unicode name, the helpers and `-FF`
+//! over such entries), `BZIP2_SUPPORT` (`-Z bzip2` through stuffr's bzip2
+//! encoder at zip's block size), and the thirteen-patch series (listed in
+//! `flavour.rs` with each hook or why it has none).
+//!
 //! **Zr is `G`:** zip's globals are one value per run (`Zr`, with its
 //! options `o`), so a sandboxed run ([`run_in_counted`]) touches nothing of
 //! the process.
@@ -281,6 +288,34 @@
 //!     interrupt removes the parts only when `-b`'s directory is shorter
 //!     than half of `PATH_MAX` (the handler's static holds that much;
 //!     longer arms nothing and the parts stay).
+//! 28. Ubuntu's `UNICODE_SUPPORT` (`unicode.rs`), undefined behaviour of the
+//!     C not reproduced. Where a conversion fails and the C reads through
+//!     the NULL it got (a bit-11 name zip's UTF-8 decoder refuses; a
+//!     Unicode Path field whose UTF-8 name it refuses; `-UN escape` over a
+//!     found name the locale cannot convert) or copies the entry's
+//!     not-yet-set name (a Unicode Path field with no name, read from the
+//!     central directory or by `readlocal`), the reference dies of SIGSEGV
+//!     and its handler answers `Interrupted (aborting)`, exit 9; stuffr
+//!     gives that answer without the crash (`unicode::segv`), as rulings
+//!     Z10/Z13 do. A Unicode Path field shorter than its header says is
+//!     read as zeros past its end (the C reads past it); an old field of
+//!     another length than the new one is taken out and the new one
+//!     appended (the C's copy of what follows it runs four bytes long).
+//!     Patch 12 (`mbstowcs` told the buffer holds `strlen + 1` wide
+//!     characters, which glibc's fortify takes for an overflow and aborts
+//!     on, for every name that is not ASCII) and patch 13 (`-TT`'s command
+//!     buffer one byte short) are Ubuntu's own fixes: both flavours take the
+//!     patched, defined behaviour (Apple has neither code path). Pinned,
+//!     stuffr-only, by `compat_zip_common::ub_rulings`; the crash answers
+//!     are also compared with the reference (`compat_zip_ubuntu`).
+//! 29. `-Z bzip2` (Ubuntu): zipup.c tests whether an entry is text over the
+//!     whole 16 KiB input buffer, past the bytes read, and the buffer is
+//!     allocated once per run and never cleared, so the test sees what an
+//!     earlier entry left there (reproduced: a short text file after a
+//!     longer text file is text). The block's first contents are
+//!     uninitialised in the C; stuffr takes them as zeros (a short first
+//!     text file is binary, `iattr` 0, as measured). Pinned by
+//!     `compat_zip_common::ub_rulings`.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};

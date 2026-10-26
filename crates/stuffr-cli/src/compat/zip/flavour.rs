@@ -9,20 +9,47 @@
 //! here, named for the behaviour, so a call site reads as the C's `#ifdef`
 //! did.
 //!
-//! **Measured, and overriding the spec (rulings Z3 to Z6 of the record,
-//! `zip-measurements.md`):**
-//! - Apple writes no 16-bit `Ux` field although its `-v` says
-//!   `UIDGID_16BIT` (`unix.c` writes it only for a 16-bit `st_uid`): both
-//!   builds write the same extra fields ([`writes_ux_16bit`] is false for
-//!   both).
-//! - Ubuntu's typo patches (01, 02, 05, 11) touch man pages only; patch 07
-//!   (`fclose(in_file)` for zipnote), 10 (no build date) and 12/13 (overflow
-//!   fixes) are the ones with an effect.
+//! **Measured, and overriding the spec (the record, `zip-measurements.md`):**
+//! Apple writes no 16-bit `Ux` field although its `-v` says `UIDGID_16BIT`
+//! (`unix.c` writes it only for a 16-bit `st_uid`): both builds write the
+//! same extra fields ([`writes_ux_16bit`] is false for both).
 //!
-//! Hooks used by the front end now: [`bzip2_support`], [`unicode_support`],
-//! [`help2_brace_line`], [`origin`],
-//! [`version_pre`], [`version_post`]. The others are consumed by the later tasks
-//! named in their docs; each states the behaviour it will select.
+//! **The build (Ubuntu's DEFINES):** `BZIP2_SUPPORT` ([`bzip2_support`]:
+//! `cli.rs`'s `-Z`, `zipup.rs`'s `bzfilecompress`, `-v`'s lines,
+//! [`last_known_method`]); `UNICODE_SUPPORT` ([`unicode_support`]: the
+//! option table, `-v`, [`shows_newline_escaped`], and every site in
+//! `unicode.rs`, `readzip.rs` (the central and local names), `zipfile.rs`
+//! (putlocal/putcentral), `scan.rs` (`-su`/`-sU`, `-UN escape`, matching by
+//! the Unicode name), `fix.rs` (`-FF`), `zipup.rs` (a new entry's UTF-8
+//! name)); `UIDGID_NOT_16BIT` ([`writes_ux_16bit`], no effect: neither build
+//! writes the field).
+//!
+//! **The patch series** (`debian/patches/series`, in order):
+//!
+//! | Patch | Effect | Hook |
+//! |---|---|---|
+//! | 01 typo "transferring" | `man/zip.1`, `zip.txt` only | none: no binary string changes |
+//! | 02 typo "privileges" | man page only | none |
+//! | 03 man pages in section 1 | man page only | none |
+//! | 04 no unwanted CFLAGS | build flags (`-O3` dropped) | none: no behaviour |
+//! | 05 typo "preceding" | man page only | none |
+//! | 06 stack markings in i386 assembly | `crc_i386.S`, `match.S` (x86 only) | none: no behaviour |
+//! | 07 `fclose(in_file)`, not `fclose(x)` | zipnote `-w` works (Apple's fails: closes the temp's stream) | none: both flavours take 07 (deviation 26, ruling Z4) |
+//! | 08 `printf("%s", text)` | help/licence texts have no `%`: same output | none |
+//! | 09 `LDFLAGS` | build only | none |
+//! | 10 no build date | `-v`'s `Compiled with gcc 13.3.0 for Unix (Linux ELF).` has no date | [`version_post`] (the recorded text) |
+//! | 11 typo "ambiguities" | man page only | none |
+//! | 12 `mbstowcs(..., wsize + 1)` | without it glibc's fortify aborts on any non-ASCII name | none: the defined, patched behaviour is the only one (`unicode::local_to_wide`; deviation 28, `ub_rulings`) |
+//! | 13 `-TT` buffer `+ 4` | without it one byte is written past the command | none: stuffr builds the command as a string (`-TT` in `zip.c:check_zipfile`'s port; deviation 28, `ub_rulings`) |
+//!
+//! Every Ubuntu row is compared with the reference by
+//! `compat_zip_ubuntu::ubuntu_build_rows` (Docker) and the shared table.
+//!
+//! Hooks used by the front end: [`bzip2_support`], [`unicode_support`],
+//! [`help2_brace_line`], [`tt_replaces_braces`], [`test_through_shell`],
+//! [`shows_newline_escaped`], [`last_known_method`],
+//! [`stale_errno_after_warning`], [`fnmax`], [`origin`], [`version_pre`],
+//! [`version_post`].
 
 /// Which reference the family behaves as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,8 +71,8 @@ pub(crate) fn bzip2_support(f: Flavour) -> bool {
 
 /// `-DUNICODE_SUPPORT`, Ubuntu only: the option table gains `-su`, `-sU`
 /// and `-UN` (`unicode`), `-v` has the `UNICODE_SUPPORT` line, names get
-/// the UTF-8 flag and the Unicode path field (Task 11), and a newline in a
-/// name is shown as `^J` (Task 5). Apple's table has none of the three
+/// the UTF-8 flag or the Unicode path field (`unicode.rs`), and a newline
+/// in a name is shown as `^J`. Apple's table has none of the three
 /// options: `-su` is `-s u` (a bad size), `--show-unicode` is not
 /// supported.
 pub(crate) fn unicode_support(f: Flavour) -> bool {
@@ -75,8 +102,7 @@ pub(crate) fn tt_replaces_braces(f: Flavour) -> bool {
 }
 
 /// Ubuntu shows a newline in an entry name as `^J` in its messages (its
-/// `UNICODE_SUPPORT` display path); Apple shows it raw. For Task 5.
-#[allow(dead_code)]
+/// `UNICODE_SUPPORT` display path); Apple shows it raw.
 pub(crate) fn shows_newline_escaped(f: Flavour) -> bool {
     f == Flavour::Ubuntu
 }
@@ -113,14 +139,6 @@ pub(crate) fn fnmax(f: Flavour) -> usize {
         Flavour::Apple => 1024,
         Flavour::Ubuntu => 4096,
     }
-}
-
-/// Ubuntu sets general-purpose bit 11 for any valid non-ASCII UTF-8 name in
-/// every locale and writes no Unicode path field for it; Apple never sets
-/// it. For Task 11.
-#[allow(dead_code)]
-pub(crate) fn sets_utf8_bit(f: Flavour) -> bool {
-    f == Flavour::Ubuntu
 }
 
 /// Where the reference came from, for the banner: stuffr's banner line is
