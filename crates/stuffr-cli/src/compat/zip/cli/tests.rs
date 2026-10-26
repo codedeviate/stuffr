@@ -827,9 +827,17 @@ fn the_helpers_parse_as_their_sources_do() {
         out,
         "zipsplit error: Invalid command arguments (options are separate and precede zip file)\n"
     );
-    // a good command line is accepted (and answers the not-built text)
+    // a good command line is accepted: zipcloak (Task 9) goes on to read
+    // the archive, `-O` making a missing one zip's ZE_OPEN
+    let (code, out, err) = go(a, "zipcloak", &["-d", "-b", "d", "-O", "o", "t"]);
+    assert_eq!(code, 18, "{out}{err}");
+    assert_eq!(
+        out,
+        "zipcloak error: File not found or no read permission (t.zip)\n"
+    );
+    assert_eq!(err, "zipcloak error: No such file or directory\n");
+    // the others answer the not-built text
     for (name, argv) in [
-        ("zipcloak", &["-d", "-b", "d", "-O", "o", "t"][..]),
         ("zipnote", &["-w", "-q", "-b", "d", "t"][..]),
         (
             "zipsplit",

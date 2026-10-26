@@ -164,6 +164,29 @@ mod unix {
         ZipTree::standard().file("t.zip", zip_with(&specs, b"", b""))
     }
 
+    /// The standard tree plus `t.zip`, stored entries (name, encrypted)
+    /// holding `hello`, the encrypted ones under `pw` with traditional
+    /// PKWARE encryption (the check byte the CRC's high byte).
+    fn with_encrypted(entries: &[(&[u8], bool)]) -> ZipTree {
+        let plain: &[u8] = b"hello\n";
+        let body = zipcrypto(b"pw", (crc32(plain) >> 24) as u8, plain);
+        let specs: Vec<ZipEntrySpec> = entries
+            .iter()
+            .map(|&(n, enc)| {
+                if enc {
+                    ZipEntrySpec {
+                        flags: 1,
+                        stored_data: Some(&body),
+                        ..ZipEntrySpec::new(n, plain)
+                    }
+                } else {
+                    ZipEntrySpec::new(n, plain)
+                }
+            })
+            .collect();
+        ZipTree::standard().file("t.zip", zip_with(&specs, b"", b""))
+    }
+
     /// The standard tree plus `big`, 200000 random bytes (four 64 KiB
     /// splits; too large for a 1000-byte `zipsplit`).
     fn with_big() -> ZipTree {
@@ -434,6 +457,31 @@ mod unix {
             row(Both, 9, "zipcloak not a zip", "zipcloak", &["g.zip"], 3,
                 "zipcloak warning: missing end signature--probably not a zip file (did you\n", "")
                 .tree(ZipTree::standard().file("g.zip", b"garbage")),
+            row(Both, 9, "zipcloak, every entry encrypted", "zipcloak", &["t.zip"], 12,
+                "zipcloak error: Nothing to do! (all files encrypted already)\n", "")
+                .tree(with_encrypted(&[(b"a.txt", true), (b"b.txt", true)])),
+            row(Both, 9, "zipcloak -d, no entry encrypted", "zipcloak", &["-d", "t.zip"], 12,
+                "zipcloak error: Nothing to do! (no encrypted files)\n", "")
+                .tree(with_archive(&[(b"a.txt", b"hello\n")])),
+            row(Both, 9, "zipcloak -d without a terminal", "zipcloak", &["-d", "t.zip"], 16,
+                "zipcloak error: Invalid command arguments (stderr is not a tty (you may never see this message!))\n", "")
+                .tree(with_encrypted(&[(b"a.txt", true), (b"b.txt", false)])),
+            row(Both, 9, "zipcloak -O without a terminal", "zipcloak", &["-O", "o.zip", "t.zip"], 16,
+                "zipcloak error: Invalid command arguments (stderr is not a tty (you may never see this message!))\n", "")
+                .tree(with_encrypted(&[(b"a.txt", true), (b"b.txt", false)])),
+            row(Both, 9, "zipcloak -O, a missing archive", "zipcloak", &["-O", "o.zip", "nosuch.zip"], 18,
+                "zipcloak error: File not found or no read permission (nosuch.zip)\n",
+                "zipcloak error: No such file or directory\n"),
+            row(Both, 9, "zipcloak, a read-only archive", "zipcloak", &["t.zip"], 15,
+                "zipcloak error: Could not create output file (t.zip)\n",
+                "zipcloak error: Permission denied\n")
+                .tree(with_archive(&[(b"a.txt", b"hello\n")]).file_mode("t.zip", zip_with(&[ZipEntrySpec::new(b"a.txt", b"hello\n")], b"", b""), 0o444)),
+            row(Both, 9, "zipcloak -b into a missing directory", "zipcloak", &["-b", "nodir", "t.zip"], 10,
+                "zipcloak error: Temporary file failure (nodir/zi??????)\n",
+                "zipcloak error: No such file or directory\n")
+                .tree(with_archive(&[(b"a.txt", b"hello\n")])),
+            row(Both, 9, "-P then -e asks, without a terminal", "zip", &["-P", "pw", "-e", "t.zip", "a.txt"], 16,
+                "\nzip error: Invalid command arguments (stderr is not a tty)\n", ""),
             // ---- Task 10: zipnote, zipsplit ----
             row(Both, 10, "zipnote list", "zipnote", &["t.zip"], 0,
                 "@ a.txt\n@ (comment above this line)\n@ (zip file comment below this line)\n", "")
@@ -557,6 +605,15 @@ mod unix {
     #[test]
     fn task8_rows_match_the_reference() {
         differential(8);
+    }
+
+    /// Task 9's rows: zipcloak's answers before its prompt (nothing to do,
+    /// no terminal, an archive it cannot open, append to, or make a
+    /// temporary beside), and `-e` after `-P`. The prompts themselves are
+    /// `compat_zip_tty`'s; the `-P` archives `compat_zip_bytes`'.
+    #[test]
+    fn task9_rows_match_the_reference() {
+        differential(9);
     }
 
     /// Ruling Z3 (deviation 15): a failing `-T` answers as Apple's zip in

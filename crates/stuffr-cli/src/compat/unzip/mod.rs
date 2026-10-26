@@ -120,7 +120,7 @@ mod list;
 mod matching;
 mod messages;
 mod process;
-mod ttyio;
+pub(crate) mod ttyio;
 mod unix;
 mod zipinfo;
 

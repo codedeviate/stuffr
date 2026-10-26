@@ -1193,6 +1193,12 @@ fn open_entry_disk(
 pub(crate) struct Local {
     pub(crate) lflg: u16,
     pub(crate) extra: Vec<u8>,
+    /// The rest of the header, for zipcloak (crypt.c's `localz`).
+    pub(crate) ver: u16,
+    pub(crate) how: u16,
+    pub(crate) tim: u32,
+    pub(crate) crc: u32,
+    pub(crate) iname: Vec<u8>,
 }
 
 /// zipfile.c:readlocal: the flags and extra field of `zf`'s local header,
@@ -1227,6 +1233,8 @@ pub(crate) fn readlocal(z: &mut Zr, ia: &mut InArchive, zf: &ZFile) -> Result<Lo
     }
     let ver = sh(&buf, 0);
     let lflg = sh(&buf, 2);
+    let how = sh(&buf, 4);
+    let tim = lg(&buf, 6);
     let crc = lg(&buf, 10);
     let nam = usize::from(sh(&buf, 22));
     let ext = usize::from(sh(&buf, 24));
@@ -1257,7 +1265,15 @@ pub(crate) fn readlocal(z: &mut Zr, ia: &mut InArchive, zf: &ZFile) -> Result<Lo
     if crc != e.crc {
         z.zipwarn(m::LOCAL_CRC_MISMATCH.as_bytes(), &iname);
     }
-    Ok(Local { lflg, extra })
+    Ok(Local {
+        lflg,
+        extra,
+        ver,
+        how,
+        tim,
+        crc,
+        iname: name,
+    })
 }
 
 /// The dots of `-U`'s copies (bfcopy, `copy_only` without `-dg`).

@@ -634,10 +634,12 @@ pub(crate) fn install_zip_abort(host: &Host, text: &'static [u8]) {
     let _ = (host, text);
 }
 
-/// zip.c:handler + ziperr(ZE_ABORT, "aborting"). It never allocates or
-/// locks.
+/// zip.c:handler + ziperr(ZE_ABORT, "aborting") (zipcloak.c's handler is
+/// the same with its own text). It never allocates or locks.
 #[cfg(unix)]
 extern "C" fn on_zip_abort(_sig: libc::c_int) {
+    // echon(): a password prompt's terminal mode put back (zip -e, zipcloak)
+    restore_saved_tty();
     let fd = ZIP_MESG_FD.load(Ordering::Acquire);
     // SAFETY: write, unlink and _exit are async-signal-safe; the text is a
     // `'static` slice stored before the handler was installed, and the

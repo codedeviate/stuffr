@@ -997,6 +997,142 @@ pub fn decrypt_equal(a: &Path, b: &Path, pw: &str) -> Result<(), String> {
     ))
 }
 
+/// The password of the encrypted cases ([`zip_encrypted_matrix`], the
+/// pty suite).
+pub const ZIP_PASSWORD: &str = "pw";
+
+/// Every archive of a run (an archive on standard output, and each archive
+/// in its tree) replaced by its [`decrypt_equal`] view under `pw`: headers
+/// zeroed, data decrypted, a check byte that does not hold a panic naming
+/// the side.
+pub fn decrypt_zip_run(run: &mut ZipRun, pw: &str, side: &str) {
+    if looks_like_zip(&run.stdout) {
+        run.stdout = decrypted_view(&run.stdout, pw.as_bytes())
+            .unwrap_or_else(|e| panic!("{side}'s standard output: {e}"));
+    }
+    for (key, node) in run.tree.iter_mut() {
+        let UnzipNode::File { bytes, .. } = node else {
+            continue;
+        };
+        if archive_name(key) || looks_like_zip(bytes) {
+            *bytes = decrypted_view(bytes, pw.as_bytes())
+                .unwrap_or_else(|e| panic!("{side}'s {}: {e}", String::from_utf8_lossy(key)));
+        }
+    }
+}
+
+/// [`assert_same_zip`] for a case whose archives are encrypted under `pw`
+/// (the spec's one exception: zip's header bytes are random): both sides'
+/// archives are first replaced by their decrypted views
+/// ([`decrypt_zip_run`]), so every byte outside the 12-byte headers and
+/// every decrypted byte is compared, and each header's check byte must
+/// hold.
+pub fn assert_same_zip_decrypted(c: &Case, pw: &str) -> bool {
+    let Some(mut r) = zip_reference(c) else {
+        return false;
+    };
+    let mut s = stuffr_zip(c);
+    decrypt_zip_run(&mut r, pw, "reference");
+    decrypt_zip_run(&mut s, pw, "stuffr");
+    compare_zip(c, &r, &s);
+    true
+}
+
+/// Task 9's matrix: archives encrypted with `-P` (stored and deflated
+/// entries, every level's path, data descriptors forced or on a pipe, a
+/// directory never encrypted, links, line ends, standard input, an update
+/// beside plain and encrypted old entries, `-d` over encrypted ones),
+/// compared with [`assert_same_zip_decrypted`] under [`ZIP_PASSWORD`].
+pub fn zip_encrypted_matrix(flavour: &'static str) -> Vec<Case<'static>> {
+    let tree = zip_bytes_tree();
+    let mut out: Vec<Case<'static>> = Vec::new();
+    let mut add = |args: &[&'static str], tree: &ZipTree, stdin: Option<&[u8]>| {
+        let mut c = zip_case("zip", args, tree.clone());
+        c.zip_flavour = Some(flavour);
+        c.stdin = stdin.map(<[u8]>::to_vec);
+        out.push(c);
+    };
+    const NAMES: [&str; 9] = [
+        "a.txt", "b.txt", "d", "d/c.txt", "big.txt", "r.bin", "s.bin", "e.txt", "x.Z",
+    ];
+    let with = |pre: &[&'static str], archive: &'static str| -> Vec<&'static str> {
+        let mut v = vec!["-P", ZIP_PASSWORD];
+        v.extend_from_slice(pre);
+        v.push(archive);
+        v.extend_from_slice(&NAMES);
+        v
+    };
+    for pre in [
+        &[][..],
+        &["-0"],
+        &["-1"],
+        &["-6"],
+        &["-9"],
+        &["-fd"],
+        &["-fd", "-0"],
+        &["-fz"],
+        &["-l"],
+        &["-X"],
+        &["-v"],
+        &["-q"],
+        &["-n", ".txt"],
+    ] {
+        add(&with(pre, "t.zip"), &tree, None);
+    }
+    // an archive on a pipe: descriptors, nothing stored after the fact
+    add(&with(&[], "-"), &tree, None);
+    add(&with(&["-0"], "-"), &tree, None);
+    // a directory is never encrypted; links stored as links
+    add(&["-P", ZIP_PASSWORD, "-r", "t.zip", "d"], &tree, None);
+    add(
+        &["-P", ZIP_PASSWORD, "-y", "t.zip", "l", "a.txt"],
+        &tree,
+        None,
+    );
+    add(&["-P", ZIP_PASSWORD, "t.zip", "e.txt"], &tree, None);
+    // standard input as an entry (to a file: the header rewritten)
+    add(
+        &["-P", ZIP_PASSWORD, "t.zip", "-"],
+        &tree,
+        Some(
+            b"from stdin
+",
+        ),
+    );
+    // `-e` after `-P` asks; `-P` after `-e` does not
+    add(&["-e", "-P", ZIP_PASSWORD, "t.zip", "a.txt"], &tree, None);
+    add(&["-P", ZIP_PASSWORD, "-e", "t.zip", "a.txt"], &tree, None);
+    // updates: plain old entries kept beside new encrypted ones, encrypted
+    // old entries copied (with their descriptors) beside new plain ones
+    let std = ZipTree::standard();
+    let plain = zip_made(flavour, &std, &["t.zip", "a.txt", "b.txt"], "t.zip");
+    let enc = zip_made(
+        flavour,
+        &std,
+        &["-P", ZIP_PASSWORD, "t.zip", "a.txt", "b.txt"],
+        "t.zip",
+    );
+    let over_plain = std.clone().file("t.zip", plain);
+    let over_enc = std.clone().file("t.zip", enc);
+    add(&["-P", ZIP_PASSWORD, "t.zip", "d/c.txt"], &over_plain, None);
+    add(&["-P", ZIP_PASSWORD, "t.zip", "a.txt"], &over_plain, None);
+    add(&["t.zip", "d/c.txt"], &over_enc, None);
+    add(&["-P", ZIP_PASSWORD, "t.zip", "b.txt"], &over_enc, None);
+    add(&["-d", "t.zip", "a.txt"], &over_enc, None);
+    add(
+        &["-P", ZIP_PASSWORD, "-g", "t.zip", "d/c.txt"],
+        &over_enc,
+        None,
+    );
+    add(
+        &["-P", ZIP_PASSWORD, "--out", "o.zip", "t.zip", "d/c.txt"],
+        &over_enc,
+        None,
+    );
+    add(&["-U", "t.zip", "a.txt", "--out", "o.zip"], &over_enc, None);
+    out
+}
+
 // ---- The scanning matrix (0.19.0 Task 5) ----
 
 /// The cases of `compat_zip_apple` and `compat_zip_ubuntu`'s scanning

@@ -39,8 +39,8 @@
 //! `-g`, `-U`, `--out`, `-A`, `-J`, `-c`/`-z` over old entries, `-T`/`-TT`
 //! (`check_zipfile`), and zip's interrupt handler (INT, TERM, ABRT, BUS,
 //! ILL, SEGV: the temporary removed, `Interrupted (aborting)`, exit 9;
-//! `host::install_zip_abort`). Encryption (Task 9), bzip2 (Task 11) and
-//! the helpers' work still answer `messages::NOT_BUILT` (exit 1).
+//! `host::install_zip_abort`). bzip2 (Task 11) and the work of `zipnote`
+//! and `zipsplit` still answer `messages::NOT_BUILT` (exit 1).
 //!
 //! **Task 8 (`split.rs`, `fix.rs`, `readzip.rs`):** split archives read
 //! (every part through `Host::track`, zip's questions when a part cannot be
@@ -51,6 +51,15 @@
 //! records skipped, a bad entry written over) and `-FF` (`scanzipf_fixnew`:
 //! the archive read from its first byte, every local header copied as it
 //! is met, a central header found later filling in what only it has).
+//!
+//! **Task 9 (`ttyio.rs`, `zipcloak.rs`, `zipup.rs`):** encryption (`-P`,
+//! `-e`): `crypthead`'s header after each local header (its check the
+//! time's, the entry always with a data descriptor), the data encrypted as
+//! `zfwrite` encrypts it; the password prompts on the controlling terminal
+//! (`getp`, unzip's port, the terminal put back by the interrupt handler
+//! too); and `zipcloak` (encrypt, `-d`, `-O`, `-b`), whose messages,
+//! warnings and errors are the helpers' (`zipcloak warning:`, `zipcloak
+//! error:`, `perror("zipcloak error")`).
 //!
 //! **Zr is `G`:** zip's globals are one value per run (`Zr`, with its
 //! options `o`), so a sandboxed run ([`run_in_counted`]) touches nothing of
@@ -75,9 +84,12 @@
 //! 3. Undefined behaviour and endless loops are not reproduced (the
 //!    record's rulings, in the code's `// ruling:` comments); 5 and 6 are
 //!    the ones the command line meets.
-//! 4. The encryption prompt (`zip -e`, `zipcloak`) is the later tasks';
-//!    until then a terminal on standard error answers `NOT_BUILT`, and
-//!    without one the answer is zip's own (`stderr is not a tty`, 16).
+//! 4. Encryption is compatible, not identical: the ten random bytes of each
+//!    12-byte encryption header come from the system's generator
+//!    (`/dev/urandom`), where zip's come from `rand()` seeded with the time,
+//!    so an encrypted entry's header and data differ from the reference's
+//!    run to run (every other byte of the archive is the same, and it
+//!    decrypts the same).
 //! 5. `get_option`'s error text is built in a 50-byte buffer
 //!    (`optionerr`'s `char optname[50]`, `sprintf`). An error about an
 //!    option whose `'name' (description)` needs 50 bytes or more (`-lf`,
@@ -224,6 +236,15 @@
 //!     glibc's buffer-overflow check (exit 9 through zip's SIGABRT
 //!     handler); Apple's writes the comment. stuffr writes it in both
 //!     flavours, as Apple's build does.
+//! 24. `zipcloak` (crypt.c's `zipcloak()` and `zipbare()`) ignores
+//!     `readlocal()`'s failure (a local header that cannot be found or
+//!     read) and goes on with an uninitialised local header; stuffr ends the
+//!     run there with that failure's code (`zipcloak error: ... (was
+//!     encrypting an entry)` or `(was decrypting an entry)`), the temporary
+//!     removed and the archive untouched. A central name longer than the
+//!     local one makes `readlocal()` write past the local name's buffer;
+//!     stuffr keeps the local name as it is (a shorter central name cuts it
+//!     with a NUL, as the C does).
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -244,9 +265,11 @@ pub(crate) mod readzip;
 pub(crate) mod scan;
 pub(crate) mod sink;
 pub(crate) mod split;
+pub(crate) mod ttyio;
 pub(crate) mod unix;
 pub(crate) mod update;
 pub(crate) mod write;
+pub(crate) mod zipcloak;
 pub(crate) mod zipfile;
 pub(crate) mod zipup;
 
@@ -409,6 +432,17 @@ impl<'a> Zr<'a> {
     /// zip.c:zipwarn: `\tzip warning: a b` to `mesg` (when noisy) and to
     /// the log.
     pub(crate) fn zipwarn(&mut self, a: &[u8], b: &[u8]) {
+        if self.program != "zip" {
+            // the helpers' zipwarn: `zipcloak warning: a b`, always
+            let mut line = Vec::new();
+            printf(
+                &mut line,
+                m::HELPER_WARNING,
+                &[self.program.as_bytes(), a, b],
+            );
+            self.mesg_write(&line);
+            return;
+        }
         let mut line = Vec::new();
         printf(&mut line, m::ZIP_WARNING, &[a, b]);
         if self.o.noisy {
@@ -489,6 +523,16 @@ impl<'a> Zr<'a> {
     }
 
     fn ziperr_with(&mut self, code: i32, h: &[u8], why: Option<Vec<u8>>) -> Exit {
+        if self.program != "zip" {
+            // the helpers' ziperr: `perror("zipcloak error")`, then the line
+            if let Some(why) = &why {
+                let mut l = Vec::new();
+                printf(&mut l, m::HELPER_PERROR, &[self.program.as_bytes(), why]);
+                let _ = self.err.write_all(&l);
+                let _ = self.err.flush();
+            }
+            return self.helper_err(code, h);
+        }
         if self.mesg_line_started {
             self.mesg_write(b"\n");
             self.set_line(false);
@@ -740,8 +784,15 @@ fn main(
 ) -> i32 {
     let mut z = Zr::new(host, flavour, name, env, err);
     let args: Vec<Vec<u8>> = args.iter().map(|a| a.as_encoded_bytes().to_vec()).collect();
+    if name == "zipcloak" {
+        let code = match cli::parse_cloak(&mut z, argv0, &args) {
+            Err(Exit { code }) => code,
+            Ok(o) => zipcloak::run(&mut z, o).code,
+        };
+        let _ = z.out.flush();
+        return code;
+    }
     let result = match name {
-        "zipcloak" => cli::parse_cloak(&mut z, argv0, &args).map(|_| ()),
         "zipnote" => cli::parse_note(&mut z, &args).map(|_| ()),
         "zipsplit" => cli::parse_split(&mut z, &args).map(|_| ()),
         _ => cli::parse_zip(&mut z, argv0, &args),

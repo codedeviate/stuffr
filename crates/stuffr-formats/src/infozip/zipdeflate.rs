@@ -638,6 +638,9 @@ pub struct ZipDeflater {
     level: u32,
     store_fallback: bool,
     one_read: bool,
+    /// zip's `key != NULL`: `copy_block` hands a stored block on in
+    /// `out_size` pieces (trees.c's copy for encryption in place).
+    encrypting: bool,
     slides: u64,
 
     // deflate.c
@@ -699,6 +702,7 @@ impl ZipDeflater {
             level: u32::from(level),
             store_fallback: true,
             one_read: false,
+            encrypting: false,
             slides: 0,
             window: vec![0; WINDOW_SIZE as usize],
             prev: vec![0; WSIZE as usize],
@@ -814,6 +818,15 @@ impl ZipDeflater {
     /// on it.
     pub fn set_one_read(&mut self, one: bool) {
         self.one_read = one;
+    }
+
+    /// Whether the entry is encrypted (zip's `key != NULL`). The bytes are
+    /// the same either way; a stored block's data is then handed on in
+    /// pieces of `out_size` (1024) bytes, as trees.c's `copy_block` copies
+    /// it into `out_buf` so that zip's in-place encryption leaves the
+    /// window alone. The caller encrypts what it is given.
+    pub fn set_encrypting(&mut self, encrypting: bool) {
+        self.encrypting = encrypting;
     }
 
     /// Deflates all of `input` into `out` as zip's `filecompress` does
@@ -1438,7 +1451,15 @@ impl ZipDeflater {
         }
         // flush_flg: out_buf is flushed, then the block is written as is
         io.cut();
-        io.buf.extend_from_slice(&self.window[at..at + len]);
+        if self.encrypting {
+            // copied through out_buf, out_size bytes at a time
+            for piece in self.window[at..at + len].chunks(OUT_SIZE) {
+                io.buf.extend_from_slice(piece);
+                io.cut();
+            }
+        } else {
+            io.buf.extend_from_slice(&self.window[at..at + len]);
+        }
         io.cut();
     }
 }

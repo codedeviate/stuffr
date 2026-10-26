@@ -19,6 +19,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
+use stuffr::infozip::crypt::{Keys, RAND_HEAD_LEN, crypt_header};
 use stuffr::infozip::{BlockVanished, ZipDeflater, ZipOut};
 
 use super::cli::{Method, ZE_PARMS};
@@ -606,6 +607,14 @@ pub(crate) fn add_entry(
     e.crc = 0;
     // assume first that an extended local header is needed
     e.flg = if isdir { 0 } else { 8 };
+    // the password, when this entry is encrypted (never a directory)
+    let key = if isdir { None } else { z.o.key.clone() };
+    if key.is_some() {
+        e.flg |= 1;
+        // the CRC is not known yet: the header's check is the time's, and
+        // so is the local header's CRC until it is rewritten
+        e.crc = e.tim << 16;
+    }
     e.lflg = e.flg;
     e.how = m_;
     e.siz = if m_ == STORE && q >= 0 { q as u64 } else { 0 };
@@ -619,6 +628,19 @@ pub(crate) fn add_entry(
     if let Err(pe) = r {
         return Err(put_failed(z, &e, pe));
     }
+    // crypt.c:crypthead: the encryption header, its ten random bytes from
+    // the system (not rand()), its check the time's high bytes
+    let mut keys = None;
+    if let Some(k) = &key {
+        let mut ks = Keys::new(k);
+        let h = crypt_header(&mut ks, super::ttyio::random_header(), (e.crc >> 16) as u16);
+        let r = w.out.bfwrite(&h, Bf::Data);
+        drain_dots(z, &mut w.out);
+        if let Err(err) = r {
+            return Err(write_failed(z, &err));
+        }
+        keys = Some(ks);
+    }
     // an earlier write's error (stdio's flag), now that a header is out
     if let Some(err) = w.out.w.ferror() {
         return Err(z.ziperr_os(ZE_WRITE, m::UNEXPECTED_ERROR_ON_ZIP.as_bytes(), &err));
@@ -627,6 +649,10 @@ pub(crate) fn add_entry(
     e.off = w.out.current_local_offset;
     e.dsk = w.out.current_local_disk;
     w.tempzn += 4 + LOCHEAD + e.iname.len() as u64 + e.extra.len() as u64;
+    if keys.is_some() {
+        e.siz += RAND_HEAD_LEN as u64;
+        w.tempzn += RAND_HEAD_LEN as u64;
+    }
 
     // Write stored or deflated file to zip file
     let mut isize: u64 = 0;
@@ -645,8 +671,12 @@ pub(crate) fn add_entry(
                 d
             });
             d.set_store_fallback(!w.use_descriptors);
+            d.set_encrypting(keys.is_some());
             let mut fr = FileRead::new(&mut src, z.o.translate_eol);
-            let mut sink = DataSink { out: &mut w.out };
+            let mut sink = DataSink {
+                out: &mut w.out,
+                keys: keys.as_mut(),
+            };
             let r = d.compress_to(&mut fr, &mut sink);
             drain_dots(z, &mut w.out);
             let sum = match r {
@@ -687,13 +717,17 @@ pub(crate) fn add_entry(
                 Err(_) => Vec::new(),
             };
             b.truncate(SBSZ);
+            // the CRC first: zfwrite encrypts the buffer in place
             crc.update(&b);
+            isize = b.len() as u64;
+            if let Some(ks) = keys.as_mut() {
+                ks.encrypt(&mut b);
+            }
             let r = w.out.bfwrite(&b, Bf::Data);
             drain_dots(z, &mut w.out);
             if let Err(err) = r {
                 return Err(write_failed(z, &err));
             }
-            isize = b.len() as u64;
             s = isize;
             e.crc = crc.sum();
         }
@@ -707,6 +741,9 @@ pub(crate) fn add_entry(
                 }
                 crc.update(&b[..k]);
                 isize += k as u64;
+                if let Some(ks) = keys.as_mut() {
+                    ks.encrypt(&mut b[..k]);
+                }
                 let r = w.out.bfwrite(&b[..k], Bf::Data);
                 drain_dots(z, &mut w.out);
                 if let Err(err) = r {
@@ -742,6 +779,9 @@ pub(crate) fn add_entry(
     } else {
         // Try to rewrite the local header with the right information
         e.siz = s;
+        if keys.is_some() {
+            e.siz += RAND_HEAD_LEN as u64;
+        }
         e.len = isize;
         // zfseeko() flushes the stream: a write that fails there makes the
         // seek fail, and zip writes a descriptor instead
@@ -765,7 +805,12 @@ pub(crate) fn add_entry(
             e.flg = e.lflg;
         } else {
             // ftell() is not as useful across splits
-            if w.out.bytes_this_entry != s {
+            let written = if keys.is_some() {
+                s + RAND_HEAD_LEN as u64
+            } else {
+                s
+            };
+            if w.out.bytes_this_entry != written {
                 let mut l = Vec::new();
                 printf(
                     &mut l,
@@ -799,6 +844,15 @@ pub(crate) fn add_entry(
             }
             if let Err(err) = w.out.w.seek_end() {
                 return Err(was_zipping(z, ZE_READ, &e, &err));
+            }
+            if e.flg & 1 != 0 {
+                // encrypted: the extended local header is still required
+                let r = putextended(&e, &mut w.out);
+                drain_dots(z, &mut w.out);
+                if let Err(err) = r {
+                    return Err(write_failed(z, &err));
+                }
+                w.tempzn += if w.out.zip64_entry { 24 } else { 16 };
             }
         }
     }
@@ -877,6 +931,8 @@ pub(crate) fn write_failed(z: &mut Zr, err: &io::Error) -> Exit {
 /// deflate's output, each piece one `zfwrite` (`bfwrite(..., BFWRITE_DATA)`).
 pub(crate) struct DataSink<'a> {
     out: &'a mut ZOut,
+    /// An encrypted entry's keys (crypt.c:zfwrite encrypts each piece).
+    keys: Option<&'a mut Keys>,
 }
 
 impl ZipOut for DataSink<'_> {
@@ -891,7 +947,14 @@ impl ZipOut for DataSink<'_> {
 
 impl Write for DataSink<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.out.bfwrite(buf, Bf::Data)?;
+        match self.keys.as_mut() {
+            Some(ks) => {
+                let mut b = buf.to_vec();
+                ks.encrypt(&mut b);
+                self.out.bfwrite(&b, Bf::Data)?;
+            }
+            None => self.out.bfwrite(buf, Bf::Data)?,
+        }
         // flush_outbuf: `if (ferror(y)) ziperr(ZE_WRITE, ...)`
         if let Some(err) = self.out.w.ferror() {
             return Err(err);

@@ -117,8 +117,8 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
         bytes_total,
         ..
     } = c;
-    // Tasks 9 (encryption) and 11 (bzip2)
-    if z.o.key.is_some() || z.o.key_needed || z.o.method == Method::Bzip2 {
+    // Task 11 (bzip2)
+    if z.o.method == Method::Bzip2 {
         return z.not_built();
     }
     let zipfile = z.o.zipfile.clone().unwrap_or_default();

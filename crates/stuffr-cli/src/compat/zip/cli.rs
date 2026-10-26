@@ -15,9 +15,8 @@
 //! [`messages::NOT_BUILT`], exit 1): the names and patterns it collects are
 //! stored as the command line gave them (`Options::names`, `Options::filters`;
 //! Task 5 converts them, `add_filter()`'s `ex2in`/`in2ex`), `procname("-")`
-//! for a run with no names (Task 5), reading the old archive, and the
-//! encryption prompt (a terminal is Task 11's; without one the answer is
-//! zip's own).
+//! for a run with no names (Task 5), and reading the old archive. The
+//! encryption prompt (`-e`) is `ttyio.rs`'s (Task 9).
 
 use std::ffi::OsString;
 use std::io::{self, BufRead, Read};
@@ -2318,12 +2317,27 @@ pub(crate) fn parse_zip(z: &mut Zr, argv0: &[u8], rest: &[Vec<u8>]) -> Result<()
 
     // Key not yet specified. If needed, get/verify it now.
     if z.o.key_needed {
-        // ttyio.c:getp finds no terminal to prompt on: encr_passwd's error.
-        // A terminal is Task 11's.
-        if z.host.stderr_is_tty() {
-            return Err(z.not_built());
+        // zip.c:main installed its interrupt handler before the options: a
+        // signal at the prompt puts the terminal back (echon) and ends the
+        // run with `Interrupted (aborting)`, exit 9
+        crate::compat::host::install_zip_abort(&z.host, m::INTERRUPTED_ABORTING);
+        let line = z.mesg_line_started;
+        z.set_line(line);
+        // encr_passwd: getp() finds no terminal to prompt on
+        let Some(key) = super::ttyio::getp(z, m::ENTER_PASSWORD.as_bytes()) else {
+            return Err(z.ziperr(ZE_PARMS, m::STDERR_NOT_TTY.as_bytes()));
+        };
+        if key.is_empty_answer() {
+            return Err(z.ziperr(ZE_PARMS, m::ZERO_LENGTH_PASSWORD.as_bytes()));
         }
-        return Err(z.ziperr(ZE_PARMS, m::STDERR_NOT_TTY.as_bytes()));
+        let Some(e) = super::ttyio::getp(z, m::VERIFY_PASSWORD.as_bytes()) else {
+            return Err(z.ziperr(ZE_PARMS, m::STDERR_NOT_TTY.as_bytes()));
+        };
+        // strcmp(key, e)
+        if key.key() != e.key() {
+            return Err(z.ziperr(ZE_PARMS, m::PASSWORD_VERIFICATION_FAILED.as_bytes()));
+        }
+        z.o.key = Some(key.key().to_vec());
     }
     if let Some(key) = &z.o.key
         && key.is_empty()

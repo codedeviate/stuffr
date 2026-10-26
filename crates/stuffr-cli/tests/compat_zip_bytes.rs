@@ -2,8 +2,9 @@
 //! and 7 of 0.19.0): every byte zip writes (local and central headers,
 //! extra fields, data descriptors, Zip64 records, comments, the deflate
 //! data at every level), both streams and the exit code, over
-//! [`zip_bytes_matrix`] (new archives) and [`zip_update_matrix`] (archives
-//! already at the path). Apple's `/usr/bin/zip` on macOS, Ubuntu's apt
+//! [`zip_bytes_matrix`] (new archives), [`zip_update_matrix`] (archives
+//! already at the path) and [`zip_encrypted_matrix`] (`-P`, compared
+//! outside the encryption headers). Apple's `/usr/bin/zip` on macOS, Ubuntu's apt
 //! `zip` under `make compat-ubuntu` and CI's Linux jobs.
 
 #[cfg(unix)]
@@ -41,6 +42,23 @@ mod unix {
             &cases,
             Skipped::none(),
             &assert_same_zip,
+        );
+    }
+
+    /// Task 9: archives encrypted with `-P`, compared outside the 12-byte
+    /// encryption headers (zip's random bytes) and decrypted: every other
+    /// byte, both streams, the exit code and the tree, each header's check
+    /// byte holding.
+    #[test]
+    fn encrypted_archives_decrypt_and_match_outside_the_headers() {
+        let f = platform_zip_flavour();
+        let cases = zip_encrypted_matrix(f);
+        assert!(cases.len() >= 25, "{} cases", cases.len());
+        run_group(
+            &format!("zip encrypted ({f})"),
+            &cases,
+            Skipped::none(),
+            &|c: &Case| assert_same_zip_decrypted(c, ZIP_PASSWORD),
         );
     }
 

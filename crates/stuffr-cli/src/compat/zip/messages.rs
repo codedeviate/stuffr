@@ -89,6 +89,11 @@ pub(super) const ZIP_ERROR: &str = "\nzip error: %s (%s)\n";
 pub(super) const HELPER_ERROR: &str = "%s error: %s (%s)\n";
 /// zip.c:zipwarn.
 pub(super) const ZIP_WARNING: &str = "\tzip warning: %s%s\n";
+/// zipcloak.c:zipwarn, zipnote.c:zipwarn, zipsplit.c:zipwarn (`%s` is the
+/// program).
+pub(super) const HELPER_WARNING: &str = "%s warning: %s%s\n";
+/// The helpers' `perror("zipcloak error")` (the program, `strerror`).
+pub(super) const HELPER_PERROR: &str = "%s error: %s\n";
 
 // ---- get_option's errors (fileio.c) ----
 
@@ -1487,3 +1492,36 @@ pub(super) const NO_ZIP_FOUND_2: &str =
 /// zipup.c:zipup, the data written is not the size counted.
 pub(super) const SIZE_ACTUAL: &str = " s=%s, actual=%s ";
 pub(super) const INCORRECT_COMPRESSED_SIZE: &str = "incorrect compressed size";
+
+// ---- encryption, the password prompts and zipcloak (Task 9) ----
+
+/// zip.c:encr_passwd, zipcloak.c:main: the first prompt.
+pub(super) const ENTER_PASSWORD: &str = "Enter password: ";
+/// zip.c:encr_passwd, zipcloak.c:main: the second prompt.
+pub(super) const VERIFY_PASSWORD: &str = "Verify password: ";
+/// zip.c:main, zipcloak.c:main: the two answers differ.
+pub(super) const PASSWORD_VERIFICATION_FAILED: &str = "password verification failed";
+/// zipcloak.c:main, no terminal to prompt on.
+pub(super) const CLOAK_STDERR_NOT_TTY: &str =
+    "stderr is not a tty (you may never see this message!)";
+/// zipcloak.c:main, `-d` and no entry encrypted.
+pub(super) const NO_ENCRYPTED_FILES: &str = "no encrypted files";
+/// zipcloak.c:main, every entry encrypted.
+pub(super) const ALL_ENCRYPTED_ALREADY: &str = "all files encrypted already";
+/// zipcloak.c:main (no newline: the answer follows on the line).
+pub(super) const DECRYPTING: &str = "decrypting: %s";
+/// zipcloak.c:main, the header's check byte did not match.
+pub(super) const WRONG_PASSWORD_JUST_COPYING: &str = " (wrong password--just copying)";
+/// zipcloak.c:main
+pub(super) const ENCRYPTING: &str = "encrypting: %s\n";
+/// zipcloak.c:main
+pub(super) const CLOAK_COPYING: &str = "   copying: %s\n";
+/// zipcloak.c:main
+pub(super) const WAS_DECRYPTING: &str = "was decrypting an entry";
+/// zipcloak.c:main
+pub(super) const WAS_ENCRYPTING: &str = "was encrypting an entry";
+/// zipcloak.c:main, crypt.c:zipbare
+pub(super) const WAS_COPYING_AN_ENTRY: &str = "was copying an entry";
+/// zipcloak.c:handler + ziperr(ZE_ABORT, "aborting"): what the interrupt
+/// handler prints after its newline.
+pub(crate) const CLOAK_INTERRUPTED: &[u8] = b"zipcloak error: Interrupted (aborting)\n";

@@ -493,6 +493,34 @@ fn output_is_written_in_the_c_pieces() {
     assert!(p.1.iter().any(|&n| n > 1024), "{:?}", p.1);
 }
 
+/// `set_encrypting`: a stored block's data is handed on in `out_size`
+/// (1024-byte) pieces, as trees.c's `copy_block` copies it through
+/// `out_buf` for zip's in-place encryption; the stream is the same.
+#[test]
+fn an_encrypted_entrys_stored_blocks_are_written_in_out_size_pieces() {
+    let noise = random(9, 100_000);
+    let mut plain = ZipDeflater::new(6);
+    plain.set_store_fallback(false);
+    let mut want = Pieces(Vec::new(), Vec::new());
+    plain.compress(&mut &noise[..], &mut want).unwrap();
+    let mut d = ZipDeflater::new(6);
+    d.set_store_fallback(false);
+    d.set_encrypting(true);
+    let mut p = Pieces(Vec::new(), Vec::new());
+    d.compress(&mut &noise[..], &mut p).unwrap();
+    assert!(p.0 == want.0);
+    assert!(p.1.iter().all(|&n| n <= 1024), "{:?}", p.1);
+    // the stored file of a small input that does not pay: 1024, 1024, rest
+    let small = random(3, 3000);
+    let mut d = ZipDeflater::new(6);
+    d.set_encrypting(true);
+    let mut p = Pieces(Vec::new(), Vec::new());
+    let s = d.compress(&mut &small[..], &mut p).unwrap();
+    assert!(s.stored);
+    assert!(p.0 == small);
+    assert_eq!(p.1, vec![1024, 1024, 952]);
+}
+
 /// `slides` counts `fill_window`'s slides: none for a small input, one per
 /// 32 KiB or so of a large one.
 #[test]
