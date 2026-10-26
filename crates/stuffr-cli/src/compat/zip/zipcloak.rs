@@ -177,6 +177,7 @@ pub(crate) fn run(z: &mut Zr, o: CloakOptions) -> Exit {
         Host::Real => None,
     };
     let mut out = ZOut::new(Box::new(FileSink::new(file, budget)), z.o.force_zip64, None);
+    out.unicode = z.unicode_out();
     if ar.zipbeg != 0
         && let Err(f) = readzip::bfcopy(z, &mut ia, &mut out, ar.zipbeg)
     {
@@ -223,12 +224,13 @@ pub(crate) fn run(z: &mut Zr, o: CloakOptions) -> Exit {
     // Write central directory and end of central directory
     let mut central: Vec<ZEntry> = ar.zfiles.iter().map(|f| f.e.clone()).collect();
     let mut at = out.w.offset();
-    let r = zipfile::write_central(
+    let r = zipfile::write_central_as(
         &mut central,
         &ar.zcomment,
         &mut out,
         &mut at,
         &mut |_, _| {},
+        true,
     );
     match r {
         Ok(_) => {}

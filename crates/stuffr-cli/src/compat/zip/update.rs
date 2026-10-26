@@ -20,7 +20,7 @@ use std::ffi::OsStr;
 use std::io::{self, BufRead, Write};
 use std::process::{Command, Stdio};
 
-use super::cli::{Action, Method, ZE_OK, ZE_OPEN, ZE_PARMS};
+use super::cli::{Action, ZE_OK, ZE_OPEN, ZE_PARMS};
 use super::flavour;
 use super::messages::{self as m, printf};
 use super::readzip::{self, CopyFail, InArchive, ZFile, zipcopy};
@@ -117,10 +117,6 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
         bytes_total,
         ..
     } = c;
-    // Task 11 (bzip2)
-    if z.o.method == Method::Bzip2 {
-        return z.not_built();
-    }
     let zipfile = z.o.zipfile.clone().unwrap_or_default();
     let to_stdout = zipfile == b"-";
     let in_path = z.o.in_path.clone().unwrap_or_else(|| zipfile.clone());
@@ -256,6 +252,7 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
         dot_count: z.o.dot_count,
     });
     let mut out = ZOut::new(sink, z.o.force_zip64, gdots);
+    out.unicode = z.unicode_out();
     out.split_size = z.o.split_size;
     if z.o.split_method > 0 && !to_stdout {
         // the splits own the temporary from here
@@ -284,6 +281,7 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
     let mut w = Wr {
         out,
         deflater: None,
+        bz_ibuf: None,
         use_descriptors,
         tempzn: 0,
         files_total,
@@ -384,7 +382,7 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
                         let disk = z.host.path(stripped);
                         match add_entry(z, &mut w, zf.e.clone(), &disk) {
                             Err(x) => return x,
-                            Ok(Zipped::Entry(e)) => zf.e = e,
+                            Ok(Zipped::Entry(e)) => zf.e = *e,
                             Ok(other) => r = Some(other),
                         }
                     } else {
@@ -601,12 +599,14 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
                 w.good_bytes_so_far = w.good_bytes_so_far.wrapping_add(e.len);
                 w.bytes_so_far = w.bytes_so_far.wrapping_add(len);
                 zfiles.push(ZFile {
-                    e,
+                    e: *e,
                     zname: f.zname.clone(),
                     mark: 1,
                     trash: false,
                     current: false,
                     dosflag: f.dosflag,
+                    zuname: None,
+                    ouname: None,
                 });
             }
         }

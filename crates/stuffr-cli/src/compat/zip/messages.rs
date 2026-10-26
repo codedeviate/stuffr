@@ -308,11 +308,6 @@ pub(super) const INVALID_SIZE: &str = "invalid size given. Use option -h for hel
 /// stuffr's own: the flavour variable holds neither name (exit 1). `%s` is
 /// the program name, then the value.
 pub(super) const FLAVOR_REFUSED: &str = "%s: STUFFR_ZIP_FLAVOR must be apple or ubuntu, not '%s'\n";
-/// stuffr's own, **temporary** (0.19.0 in development): a command line the
-/// front end accepted whose work is not built yet (Tasks 5 to 11 replace
-/// this). `%s` is the program, then stuffr's version.
-pub(super) const NOT_BUILT: &str =
-    "%s: this command is not built yet (stuffr %s, zip family under development)\n";
 
 // ---- scanning names (Task 5: fileio.c, unix.c, zip.c:main) ----
 
@@ -1571,3 +1566,29 @@ pub(super) const INDEX_LINE: &str = "%s %s\n";
 /// zipsplit.c:main: `ziperr(r, zipfile)` with `zipfile` freed and NULL: the
 /// C library prints `(null)`.
 pub(super) const NULL_TEXT: &str = "(null)";
+
+// ---- Ubuntu's UNICODE_SUPPORT (Task 11) ----
+
+/// zipfile.c:read_Unicode_Path_entry: a leftover debugging `printf` to
+/// standard output on a checksum mismatch (central directory only; `%d` is
+/// `unicode_mismatch`).
+pub(super) const UNICODE_MISMATCH_DEBUG: &str = "unicode_mismatch = %d\n";
+/// zipfile.c:read_Unicode_Path_entry (and the local one): `zipwarn` with
+/// the entry's oname, NULL there (glibc prints `(null)`), no space between.
+pub(super) const UNICODE_VERSION_SKIP: &str = "Unicode Path Extra Field version > 1 - skipping";
+/// zipfile.c:read_Unicode_Path_entry, `-UN warn` (the default).
+pub(super) const UNICODE_MISMATCH_WARN: &str = "Unicode does not match path - ignoring Unicode: ";
+/// zipfile.c:read_Unicode_Path_entry, `-UN quit`: `errbuf`, then
+/// `ZIPERR(ZE_FORM, "Unicode path error")`.
+pub(super) const UNICODE_MISMATCH_QUIT: &str = "Unicode does not match path:  %s\n                     Likely entry name changed but Unicode not updated\n                     Use -UN=i to ignore errors or n for no Unicode paths";
+pub(super) const UNICODE_PATH_ERROR: &str = "Unicode path error";
+/// zip.c:main (`-su`, and fileio.c:proc_archive_name under `-v`).
+pub(super) const ESCAPED_UNICODE: &str = "     Escaped Unicode:  %s\n";
+/// zipup.c (zip_stats): a bzip2 entry's line, `-Z bzip2` (Ubuntu).
+pub(super) const BZIPPED: &str = " (bzipped %s%%)\n";
+/// zipup.c:bz_compress_init, `BZ2_bzCompressInit`'s BZ_PARAM_ERROR (-2): a
+/// block size out of 1..9 (`-0 -Z bzip2`).
+pub(super) const BZ_INIT_FAILURE: &str = "bzlib bzCompressInit failure (-2)";
+/// zipup.c:bzfilecompress, an encoder error (unreachable with a valid
+/// level: stuffr's encoder does not fail on its own).
+pub(super) const BZ_COMPRESS_ERROR: &str = "unexpected bzlib compress error -1";

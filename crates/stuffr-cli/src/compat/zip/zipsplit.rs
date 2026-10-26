@@ -333,6 +333,7 @@ pub(crate) fn run(z: &mut Zr, o: SplitOptions) -> Exit {
         Host::Real => None,
     };
     let mut out = ZOut::new(Box::new(Closed), z.o.force_zip64, None);
+    out.unicode = z.unicode_out();
     let job = Job {
         o: &o,
         p,
@@ -469,7 +470,7 @@ fn make_part(
     // write central headers and the end of central directory record
     let mut central: Vec<ZEntry> = job.bins[j].iter().map(|&g| zfiles[g].e.clone()).collect();
     let mut at = out.w.offset();
-    match zipfile::write_central(&mut central, b"", out, &mut at, &mut |_, _| {}) {
+    match zipfile::write_central_as(&mut central, b"", out, &mut at, &mut |_, _| {}, true) {
         Ok(_) => {}
         Err(PutError::Big { .. }) => {
             if job.o.pause && retry(z, &job.p) {

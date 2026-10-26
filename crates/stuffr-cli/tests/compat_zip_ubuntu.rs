@@ -55,6 +55,254 @@ mod linux {
         assert!(out.contains("  new^Jline\n  tab^Ihere\n"), "{out}");
     }
 
+    /// The archives Task 11's rows read: bit 11 set, Unicode Path fields
+    /// good, mismatched, of version 2, with no name, a bit-11 name that is
+    /// not UTF-8, one with a newline.
+    fn unicode_archives() -> Vec<(&'static str, Vec<u8>)> {
+        fn up(iname: &[u8], utf8: &[u8], ver: u8, crc: Option<u32>) -> Vec<u8> {
+            let mut h = flate2::Crc::new();
+            h.update(iname);
+            let crc = crc.unwrap_or(h.sum());
+            let mut d = vec![ver];
+            d.extend_from_slice(&crc.to_le_bytes());
+            d.extend_from_slice(utf8);
+            let mut f = 0x7075u16.to_le_bytes().to_vec();
+            f.extend_from_slice(&(d.len() as u16).to_le_bytes());
+            f.extend_from_slice(&d);
+            f
+        }
+        let caf8 = "café.txt".as_bytes();
+        let cafl = b"caf\xe9.txt";
+        let e = |name: &'static [u8], flags: u16, extra: Vec<u8>| (name, flags, extra);
+        let mk = |list: &[(&[u8], u16, Vec<u8>)]| {
+            let specs: Vec<ZipEntrySpec> = list
+                .iter()
+                .map(|(n, f, x)| {
+                    let mut s =
+                        ZipEntrySpec::new(n, if n.starts_with(b"a.") { b"a\n" } else { b"x\n" });
+                    s.flags = *f;
+                    s.extra = x;
+                    s
+                })
+                .collect();
+            zip_with(&specs, b"", b"")
+        };
+        let a = || e(b"a.txt", 0, vec![]);
+        vec![
+            ("bit11", mk(&[e("café.txt".as_bytes(), 0x800, vec![]), a()])),
+            (
+                "upgood",
+                mk(&[e(b"caf\xe9.txt", 0, up(cafl, caf8, 1, None)), a()]),
+            ),
+            (
+                "upbad",
+                mk(&[e(b"caf\xe9.txt", 0, up(cafl, caf8, 1, Some(1))), a()]),
+            ),
+            ("upv2", mk(&[e(b"caf\xe9.txt", 0, up(cafl, caf8, 2, None))])),
+            (
+                "upempty",
+                mk(&[e("café.txt".as_bytes(), 0, up(caf8, b"", 1, None))]),
+            ),
+            ("bit11bad", mk(&[e(b"h\xe9.txt", 0x800, vec![]), a()])),
+            ("bit11nl", mk(&[e(b"n\nl\xc3\xa9", 0x800, vec![])])),
+        ]
+    }
+
+    /// Task 11: Ubuntu's `UNICODE_SUPPORT` and `BZIP2_SUPPORT` builds and
+    /// its patch series, against the reference (Docker). Names that are not
+    /// ASCII under `C`, `C.UTF-8` and `en_US.UTF-8` and with no
+    /// `en_US.UTF-8` at all (`LOCPATH` pointing nowhere), the `-UN` modes,
+    /// `-su`/`-sU`, archives holding UTF-8 names (bit 11) and Unicode Path
+    /// fields, and the helpers over them (Review Focus 5 included).
+    #[test]
+    fn ubuntu_build_rows() {
+        let caf = "café.txt";
+        let names_tree = || {
+            ZipTree::standard()
+                .file_at(caf.as_bytes(), b"x", 0o644)
+                .file_at(b"h\xe9.txt", b"x", 0o644)
+                .file_at(b"d\x7fl", b"x", 0o644)
+                .file_at(b"n\nl", b"x", 0o644)
+                .file_at(b"s\xed\xa0\x80", b"x", 0o644)
+                .file_at(b"b\xf4\x90\x80\x80", b"x", 0o644)
+                .file_at("z\u{1f600}.txt".as_bytes(), b"x", 0o644)
+                .file_at(b"-n", b"x", 0o644)
+        };
+        let locales: [&[(&'static str, &'static str)]; 4] = [
+            &[("LC_ALL", "C")],
+            &[("LC_ALL", "C.UTF-8")],
+            &[("LC_ALL", "en_US.UTF-8")],
+            &[("LOCPATH", "/nonexistent"), ("LC_ALL", "C.UTF-8")],
+        ];
+        let mut cases = Vec::new();
+        let push = |cases: &mut Vec<Case<'static>>,
+                    args: &[&'static str],
+                    tree: ZipTree,
+                    stdin: Option<&[u8]>,
+                    env: &[(&'static str, &'static str)]| {
+            let mut c = zip_case(args[0], &args[1..], tree);
+            c.zip_flavour = Some("ubuntu");
+            c.stdin = stdin.map(<[u8]>::to_vec);
+            c.env = env.to_vec();
+            cases.push(c);
+        };
+        // names on the command line, and on standard input (-@) for those
+        // that are not UTF-8
+        let listed = b"h\xe9.txt\nd\x7fl\nn\nl\ns\xed\xa0\x80\nb\xf4\x90\x80\x80\n".as_slice();
+        for env in locales {
+            for args in [
+                &["zip", "t.zip", "café.txt"][..],
+                &["zip", "t.zip", "z\u{1f600}.txt", "a.txt"],
+                &["zip", "-v", "t.zip", "café.txt"],
+                &["zip", "-UN=u", "t.zip", "café.txt"],
+                &["zip", "-UN=e", "t.zip", "café.txt"],
+                &["zip", "-UN=n", "t.zip", "café.txt"],
+                &["zip", "-su", "t.zip", "café.txt"],
+                &["zip", "-sU", "t.zip", "café.txt"],
+                &["zip", "-UN=e", "-sf", "t.zip", "café.txt", "a.txt"],
+                &["zip", "t.zip", "--", "-n"],
+                &["zip", "-r", "t.zip", "."],
+                &["zip", "-", "café.txt"],
+            ] {
+                push(&mut cases, args, names_tree(), None, env);
+            }
+            for args in [
+                &["zip", "t.zip", "-@"][..],
+                &["zip", "-sf", "t.zip", "-@"],
+                &["zip", "-UN=e", "-sf", "t.zip", "-@"],
+            ] {
+                push(&mut cases, args, names_tree(), Some(listed), env);
+            }
+            for one in [&b"d\x7fl\n"[..], b"n\nl\n", b"b\xf4\x90\x80\x80\n"] {
+                push(
+                    &mut cases,
+                    &["zip", "-UN=e", "-sf", "t.zip", "-@"],
+                    names_tree(),
+                    Some(one),
+                    env,
+                );
+            }
+        }
+        // archives holding Unicode names
+        for (an, bytes) in unicode_archives() {
+            let tree = || {
+                ZipTree::standard()
+                    .file_at(b"t.zip", &bytes, 0o644)
+                    .file_at(caf.as_bytes(), b"new\n", 0o644)
+            };
+            let rows: &[&[&'static str]] = &[
+                &["zip", "-sf", "t.zip"],
+                &["zip", "-su", "t.zip"],
+                &["zip", "-sU", "t.zip"],
+                &["zip", "-su-", "-lf", "log", "t.zip"],
+                &["zip", "-sU", "-lf", "log", "t.zip"],
+                &["zip", "-UN=e", "-sf", "t.zip"],
+                &["zip", "-UN=e", "-su", "t.zip"],
+                &["zip", "-UN=e", "-sU", "t.zip"],
+                &["zip", "-UN=n", "-sf", "t.zip"],
+                &["zip", "-UN=i", "-sf", "t.zip"],
+                &["zip", "-UN=w", "-sf", "t.zip"],
+                &["zip", "-UN=q", "-sf", "t.zip"],
+                &["zip", "t.zip", "b.txt"],
+                &["zip", "-UN=n", "t.zip", "b.txt"],
+                &["zip", "-UN=q", "t.zip", "b.txt"],
+                &["zip", "-UN=e", "t.zip", "b.txt"],
+                &["zip", "-UN=u", "t.zip", "b.txt"],
+                &["zip", "t.zip", "café.txt"],
+                &["zip", "-UN=e", "t.zip", "café.txt"],
+                &["zip", "-d", "t.zip", "café.txt"],
+                &["zip", "-d", "t.zip", "caf*"],
+                &["zip", "-U", "t.zip", "caf*", "--out", "o.zip"],
+                &["zip", "-v", "-U", "t.zip", "café.txt", "--out", "o.zip"],
+                &["zip", "-v", "t.zip", "b.txt"],
+                &["zip", "-", "t.zip"],
+                &["zip", "-F", "t.zip", "--out", "f.zip"],
+                &["zip", "-FF", "t.zip", "--out", "f.zip"],
+                &["zip", "-T", "t.zip"],
+                &["zipnote", "t.zip"],
+                &["zipsplit", "t.zip"],
+                &["zipsplit", "-n", "65536", "-b", "d", "t.zip"],
+            ];
+            for args in rows {
+                push(&mut cases, args, tree(), None, &[]);
+            }
+            // zipnote -w renaming the first entry
+            let rename = b"@ caf\xc3\xa9.txt\n@=new.txt\n@ (comment above this line)\n";
+            push(
+                &mut cases,
+                &["zipnote", "-w", "t.zip"],
+                tree(),
+                Some(rename),
+                &[],
+            );
+            let _ = an;
+        }
+        // -Z bzip2: stuffr's encoder at zip's block size; the store
+        // fallback (an input of one buffer that does not shrink, archive
+        // seekable), the text test over the stale input buffer, -0
+        let noise = |n: usize, seed: u32| {
+            let mut x = seed;
+            (0..n)
+                .map(|_| {
+                    x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    (x >> 16) as u8
+                })
+                .collect::<Vec<u8>>()
+        };
+        let big: Vec<u8> = (0..3000)
+            .flat_map(|i| format!("row {i} qwerty asdf\n").into_bytes())
+            .collect();
+        let bz_tree = || {
+            ZipTree::standard()
+                .file_at(b"big.txt", &big, 0o644)
+                .file_at(b"r10k", noise(10_000, 1), 0o644)
+                .file_at(b"r16k", noise(16_384, 2), 0o644)
+                .file_at(b"r16k1", noise(16_383, 3), 0o644)
+                .file_at(b"r300k", noise(300_000, 4), 0o644)
+                .file_at(b"e.txt", b"", 0o644)
+        };
+        for args in [
+            &["zip", "-1", "-Z", "bzip2", "t.zip", "b.txt", "big.txt"][..],
+            &["zip", "-9", "-Z", "bzip2", "t.zip", "b.txt", "big.txt"],
+            &["zip", "-Z", "b", "t.zip", "a.txt", "e.txt", "d"],
+            &[
+                "zip", "-Z", "bzip2", "t.zip", "big.txt", "a.txt", "r10k", "b.txt",
+            ],
+            &["zip", "-Z", "bzip2", "t.zip", "r16k", "r16k1", "r10k"],
+            &["zip", "-0", "-Z", "bzip2", "t.zip", "b.txt"],
+            &["zip", "-v", "-Z", "bzip2", "t.zip", "b.txt", "big.txt"],
+            &[
+                "zip", "-dd", "-ds", "32k", "-Z", "bzip2", "t.zip", "r300k", "big.txt",
+            ],
+            &["zip", "-fd", "-Z", "bzip2", "t.zip", "a.txt", "b.txt"],
+            &["zip", "-fd", "-Z", "bzip2", "t.zip", "big.txt", "r300k"],
+            &[
+                "zip", "-n", ".txt", "-Z", "bzip2", "t.zip", "a.txt", "big.txt",
+            ],
+            &["zip", "-Z", "bzip2", "-", "a.txt", "b.txt"],
+            &["zip", "-l", "-Z", "bzip2", "t.zip", "b.txt", "r10k"],
+            &["zip", "-ll", "-Z", "bzip2", "t.zip", "big.txt"],
+            &["zip", "-Z", "bzip2", "-s", "64k", "t.zip", "r300k"],
+            &["zip", "-Z", "bzip2", "-r", "t.zip", "."],
+        ] {
+            push(&mut cases, args, bz_tree(), None, &[]);
+        }
+        push(
+            &mut cases,
+            &["zip", "-Z", "bzip2", "t.zip", "-"],
+            bz_tree(),
+            Some(&big),
+            &[],
+        );
+        assert!(cases.len() >= 200, "{} cases", cases.len());
+        run_group(
+            "zip ubuntu build",
+            &cases,
+            Skipped::none(),
+            &assert_same_zip,
+        );
+    }
+
     /// Task 7: a signal during an update or a new archive, as the reference
     /// answers it (the record's signal table; Review Focus 4).
     #[test]

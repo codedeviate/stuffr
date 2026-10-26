@@ -45,12 +45,14 @@
 //!   zeros past its end (as deviation 13).
 
 use super::cli::ZE_ABORT;
+use super::flavour;
 use super::messages::{self as m, printf};
 use super::readzip::{
     self, Archive, CENHEAD, CFile, CopyFail, ENDHEAD, InArchive, ZFile, cstr, find_next_signature,
     find_signature, get_extra_field, lg, llg, sh,
 };
 use super::sink::{FileSink, Temp, mkstemp, replace};
+use super::unicode::{self, UTF8_BIT};
 use super::zipfile::{self, Bf, LOCHEAD, ZEntry, ZOut};
 use super::zipup::{drain_dots, write_failed, write_num_string, zerr};
 use super::{Exit, Zr};
@@ -127,6 +129,7 @@ pub(crate) fn run(z: &mut Zr) -> Exit {
         Host::Real => None,
     };
     let mut out = ZOut::new(Box::new(FileSink::new(file, budget)), z.o.force_zip64, None);
+    out.unicode = z.unicode_out();
     let mut tempzn: u64 = 0;
     // readzipfile: the archive is opened (and kept), then scanned
     if !zipfile.is_empty() && zipfile != b"-" {
@@ -556,6 +559,32 @@ fn scanzipf_fixnew(
                         zf.e.att = att;
                         zf.e.atx = atx;
                         zf.dosflag = (vem & 0xff00) == 0;
+                        // ubuntu: UNICODE_SUPPORT, the UTF-8 name from the
+                        // flags (as the local header had them, now) or the
+                        // central Unicode Path field; the local header is
+                        // rewritten with it below, as long as it now is
+                        if flavour::unicode_support(z.flavour)
+                            && z.o.unicode_mismatch != 3
+                            && zf.e.uname.is_none()
+                        {
+                            if zf.e.flg & UTF8_BIT != 0 {
+                                zf.e.uname = Some(cstr(&zf.e.iname).to_vec());
+                            } else {
+                                let (cx, iname, oname) =
+                                    (zf.e.cextra.clone(), zf.e.iname.clone(), zf.e.oname.clone());
+                                let u = unicode::read_unicode_path(
+                                    z,
+                                    &cx,
+                                    &iname,
+                                    unicode::PathReader::CentralFix(&oname),
+                                );
+                                match u {
+                                    Ok(u) => sc.ar.zfiles[i].e.uname = u,
+                                    Err(x) => return Err(x),
+                                }
+                            }
+                        }
+                        let zf = &mut sc.ar.zfiles[i];
                         if z.o.verbose > 0 {
                             let e = zf.e.clone();
                             readzip::zipoddities(z, &e);

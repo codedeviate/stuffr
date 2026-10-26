@@ -302,6 +302,7 @@ pub(crate) mod scan;
 pub(crate) mod sink;
 pub(crate) mod split;
 pub(crate) mod ttyio;
+pub(crate) mod unicode;
 pub(crate) mod unix;
 pub(crate) mod update;
 pub(crate) mod write;
@@ -402,6 +403,10 @@ pub(crate) struct Zr<'a> {
     /// `mesg_line_started`, shared with the split writer, which writes its
     /// questions itself.
     pub(crate) line_cell: std::rc::Rc<std::cell::Cell<bool>>,
+    /// zip's `using_utf8` (Ubuntu's `UNICODE_SUPPORT`): `en_US.UTF-8`
+    /// loads, so names convert as UTF-8 and new ones get bit 11
+    /// (`unicode::utf8_locale`); always false for Apple.
+    pub(crate) using_utf8: bool,
 }
 
 impl<'a> Zr<'a> {
@@ -413,6 +418,7 @@ impl<'a> Zr<'a> {
         err: &'a mut dyn Write,
     ) -> Zr<'a> {
         let out = host.out_writer(None);
+        let using_utf8 = flavour::unicode_support(flavour) && unicode::utf8_locale(&host);
         Zr {
             host,
             flavour,
@@ -432,7 +438,14 @@ impl<'a> Zr<'a> {
             skip_this_disk: 0,
             prompt: None,
             line_cell: std::rc::Rc::new(std::cell::Cell::new(false)),
+            using_utf8,
         }
+    }
+
+    /// What putlocal/putcentral need of `UNICODE_SUPPORT` (Ubuntu only):
+    /// `using_utf8` and `-UN UTF8`.
+    pub(crate) fn unicode_out(&self) -> Option<(bool, bool)> {
+        flavour::unicode_support(self.flavour).then_some((self.using_utf8, self.o.utf8_force))
     }
 
     /// `mesg_line_started = v`, mirrored for the interrupt handler (which
@@ -626,22 +639,6 @@ impl<'a> Zr<'a> {
         );
         self.mesg_write(&line);
         Exit { code }
-    }
-
-    /// stuffr's own answer to a command line whose work is not built yet.
-    pub(crate) fn not_built(&mut self) -> Exit {
-        let mut line = Vec::new();
-        printf(
-            &mut line,
-            m::NOT_BUILT,
-            &[
-                self.program.as_bytes(),
-                env!("CARGO_PKG_VERSION").as_bytes(),
-            ],
-        );
-        let _ = self.err.write_all(&line);
-        let _ = self.err.flush();
-        Exit { code: 1 }
     }
 }
 

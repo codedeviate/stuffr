@@ -31,6 +31,7 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use super::cli::{ZE_OPEN, ZE_PARMS};
 use super::flavour;
 use super::messages::{self as m, printf};
+use super::unicode;
 use super::zipfile::{Bf, LOCHEAD, ZEntry, ZOut};
 use super::{Exit, Zr};
 use crate::compat::host::InFile;
@@ -44,8 +45,7 @@ pub(crate) const ENDHEAD: usize = 18;
 const EC64LOC: usize = 16;
 const EC64REC: usize = 52;
 pub(crate) const CENHEAD: usize = 42;
-/// zip.h's general-purpose bit 11.
-const UTF8_BIT: u16 = 1 << 11;
+use super::unicode::UTF8_BIT;
 /// tailor.h:NUM_HOSTS
 const NUM_HOSTS: u16 = 31;
 /// tailor.h:CBSZ, bfcopy's buffer.
@@ -71,6 +71,12 @@ pub(crate) struct ZFile {
     pub(crate) current: bool,
     /// `-k` given when it was matched.
     pub(crate) dosflag: bool,
+    /// Ubuntu's `zuname`: the UTF-8 name in the local character set, the
+    /// other name the entry is matched by.
+    pub(crate) zuname: Option<Vec<u8>>,
+    /// Ubuntu's `ouname`: `zuname` as `-su`/`-sU` show it (escaped under
+    /// `-UN escape`).
+    pub(crate) ouname: Option<Vec<u8>>,
 }
 
 /// What `readzipfile` leaves in zip's globals.
@@ -83,6 +89,9 @@ pub(crate) struct Archive {
     /// `zsort`: indices of `zfiles` sorted by stored name (the flavour's
     /// `qsort`), for `zsearch`.
     pub(crate) zsort: Vec<usize>,
+    /// `zusort` (Ubuntu): indices sorted by `zuname`, else the stored
+    /// name, for `zsearch`'s second search.
+    pub(crate) zusort: Vec<usize>,
     /// `zipbeg`: where the first entry starts (what is before it is copied).
     pub(crate) zipbeg: u64,
     /// `cenbeg`: where the central directory starts.
@@ -460,6 +469,17 @@ pub(crate) fn read_archive(z: &mut Zr) -> Result<Archive, Exit> {
         .collect();
     super::scan::qsort(z.flavour, &mut order, &|a, b| names[a].cmp(&names[b]));
     ar.zsort = order;
+    if flavour::unicode_support(z.flavour) && z.o.fix != 2 {
+        // sort by zuname (the local conversion of the UTF-8 name)
+        let mut order: Vec<usize> = (0..ar.zfiles.len()).collect();
+        let unames: Vec<Vec<u8>> = ar
+            .zfiles
+            .iter()
+            .map(|f| cstr(f.zuname.as_ref().unwrap_or(&f.e.iname)).to_vec())
+            .collect();
+        super::scan::qsort(z.flavour, &mut order, &|a, b| unames[a].cmp(&unames[b]));
+        ar.zusort = order;
+    }
     Ok(ar)
 }
 
@@ -468,7 +488,19 @@ pub(crate) fn read_archive(z: &mut Zr) -> Result<Archive, Exit> {
 // port: zipfile.c:zsearch
 pub(crate) fn zsearch(ar: &Archive, n: &[u8]) -> Option<usize> {
     let n = cstr(n);
-    let a = &ar.zsort;
+    if let Some(i) = search(&ar.zsort, n, &|i| cstr(&ar.zfiles[i].zname)) {
+        return Some(i);
+    }
+    // ubuntu: the Unicode names (zusort is empty for Apple, under -UN no
+    // and under -FF)
+    search(&ar.zusort, n, &|i| {
+        let f = &ar.zfiles[i];
+        cstr(f.zuname.as_ref().unwrap_or(&f.zname))
+    })
+}
+
+/// util.c:search, a binary search of `a` for `n` by `key`.
+fn search<'a>(a: &[usize], n: &[u8], key: &dyn Fn(usize) -> &'a [u8]) -> Option<usize> {
     if a.is_empty() {
         return None;
     }
@@ -476,7 +508,7 @@ pub(crate) fn zsearch(ar: &Archive, n: &[u8]) -> Option<usize> {
     while u >= l {
         let i = l + ((u - l) >> 1);
         let idx = a[i as usize];
-        match n.cmp(cstr(&ar.zfiles[idx].zname)) {
+        match n.cmp(key(idx)) {
             std::cmp::Ordering::Less => u = i - 1,
             std::cmp::Ordering::Greater => l = i + 1,
             std::cmp::Ordering::Equal => return Some(idx),
@@ -986,7 +1018,32 @@ fn scanzipf_regnew(
                 }
                 return Err(read_fail(f));
             }
-            // ubuntu: UNICODE_SUPPORT's bit-11 and Unicode Path names (Task 11)
+            // ubuntu: UNICODE_SUPPORT's bit-11 and Unicode Path names
+            if flavour::unicode_support(z.flavour) && z.o.unicode_mismatch != 3 {
+                if e.flg & UTF8_BIT != 0 {
+                    // the path is UTF-8; a local name made from it (the
+                    // C's "illegal UTF-8 name" is never reached: the
+                    // conversion of such a name crashes, deviation 28)
+                    let u = cstr(&e.iname).to_vec();
+                    let Some(local) =
+                        unicode::utf8_to_local(z.using_utf8, z.o.unicode_escape_all, &u)
+                    else {
+                        return Err(Fail::Exit(unicode::segv(z)));
+                    };
+                    e.uname = Some(u);
+                    e.nam = Some(e.iname.len());
+                    e.iname = local;
+                } else {
+                    let iname = e.iname.clone();
+                    e.uname = unicode::read_unicode_path(
+                        z,
+                        &e.cextra,
+                        &iname,
+                        unicode::PathReader::Central,
+                    )
+                    .map_err(Fail::Exit)?;
+                }
+            }
             adjust_zip_central_entry(&mut e);
             // adjusting for a prefix: add the offset
             if (fix == 1 && z.total_disks == 1) || z.o.adjust {
@@ -999,6 +1056,26 @@ fn scanzipf_regnew(
             let zname = cstr(&e.iname).to_vec();
             e.name = zname.clone();
             e.oname = super::scan::display(z, &zname);
+            // ubuntu: the converted Unicode name, the alternate one to match
+            let (mut zuname, mut ouname) = (None, None);
+            if z.program == "zip"
+                && z.o.unicode_mismatch != 3
+                && let Some(u) = &e.uname
+            {
+                let Some(name) = unicode::utf8_to_local(z.using_utf8, z.o.unicode_escape_all, u)
+                else {
+                    return Err(Fail::Exit(unicode::segv(z)));
+                };
+                ouname = Some(if z.o.unicode_escape_all {
+                    match unicode::utf8_to_escape(u) {
+                        Some(o) => o,
+                        None => return Err(Fail::Exit(unicode::segv(z))),
+                    }
+                } else {
+                    name.clone()
+                });
+                zuname = Some(name);
+            }
             if z.o.verbose > 0 && fix == 0 {
                 zipoddities(z, &e);
             }
@@ -1009,6 +1086,8 @@ fn scanzipf_regnew(
                 trash: false,
                 current: false,
                 dosflag,
+                zuname,
+                ouname,
             });
         }
         // close this disk, on to the next
@@ -1275,6 +1354,11 @@ pub(crate) fn readlocal(z: &mut Zr, ia: &mut InArchive, zf: &ZFile) -> Result<Lo
         ia.f = None;
         return Err(if err { ZE_READ } else { ZE_EOF });
     }
+    // ubuntu: the Unicode Path field's warnings (its name is not kept)
+    if flavour::unicode_support(z.flavour) && z.o.unicode_mismatch != 3 {
+        unicode::read_unicode_path(z, &extra, &name, unicode::PathReader::ReadLocal)
+            .map_err(|x| x.code)?;
+    }
     let iname = cstr(&e.iname).to_vec();
     if ver != e.ver {
         let mut s = Vec::new();
@@ -1480,7 +1564,24 @@ pub(crate) fn zipcopy(
     // zip64_entry = adjust_zip_local_entry(localz)
     out.zip64_entry = get_extra_field(0x0001, &lz.extra).is_some();
     lz.vem = zf.e.vem;
-    // ubuntu: UNICODE_SUPPORT's local names (Task 11)
+    // ubuntu: UNICODE_SUPPORT's local names
+    if flavour::unicode_support(z.flavour) && z.o.unicode_mismatch != 3 {
+        if zf.e.flg & UTF8_BIT != 0 {
+            // the path is UTF-8 (a name that does not convert crashes the
+            // C: deviation 28)
+            let u = cstr(&lz.iname).to_vec();
+            let Some(local) = unicode::utf8_to_local(z.using_utf8, z.o.unicode_escape_all, &u)
+            else {
+                return Err(CopyFail::Exit(unicode::segv(z)));
+            };
+            lz.uname = Some(u);
+            lz.iname = local;
+        } else {
+            let iname = lz.iname.clone();
+            lz.uname = unicode::read_unicode_path(z, &lz.extra, &iname, unicode::PathReader::Copy)
+                .map_err(CopyFail::Exit)?;
+        }
+    }
     let ciname = cstr(&zf.e.iname).to_vec();
     if lz.ver != zf.e.ver {
         z.zipwarn(m::LOCAL_VERSION_MISMATCH.as_bytes(), &ciname);
@@ -1500,6 +1601,7 @@ pub(crate) fn zipcopy(
     // from zipnote (fix 3): the name may have been changed; the new one is
     // the entry's name, central and local
     if z.o.fix == 3 {
+        zf.e.nam = None;
         zf.e.iname = ciname.clone();
         nam = ciname.len();
         lz.iname = ciname.clone();

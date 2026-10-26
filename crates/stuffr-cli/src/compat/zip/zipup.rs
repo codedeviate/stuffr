@@ -30,6 +30,7 @@ use super::zipfile::{
     Bf, LOCHEAD, Pend, PutError, ZEntry, ZOut, putextended, putlocal, putlocal_rewrite,
 };
 use super::{Exit, Zr};
+use super::{flavour, unicode};
 use crate::compat::host::{self, Host};
 
 /// ziperr.h codes this file raises.
@@ -42,6 +43,10 @@ const ZE_WRITE: i32 = 14;
 /// zip.h's methods.
 const STORE: u16 = 0;
 const DEFLATE: u16 = 8;
+/// zip.h:BZIP2 (Ubuntu's `BZIP2_SUPPORT`).
+const BZIP2: u16 = 12;
+/// zipup.c:OBUF_SZ (tailor.h:ZBSZ), bzfilecompress's output buffer.
+const OBUF_SZ: usize = 16384;
 /// tailor.h:SBSZ, the stored entries' copy buffer.
 const SBSZ: usize = 16384;
 /// deflate.c's window half, for `-dd`'s dots.
@@ -297,12 +302,17 @@ pub(crate) struct Wr {
     pub(crate) good_bytes_so_far: u64,
     pub(crate) bad_files_so_far: u64,
     pub(crate) bad_bytes_so_far: u64,
+    /// zipup.c's `f_ibuf` for `-Z bzip2`: allocated once per run and never
+    /// cleared, so its text test (`is_text_buf` over the whole buffer)
+    /// sees what an earlier entry left past a short read (deviation 29:
+    /// it starts as zeros; the C's malloc'd block is uninitialised).
+    pub(crate) bz_ibuf: Option<Vec<u8>>,
 }
 
 /// What zipup made of one name.
 pub(crate) enum Zipped {
     /// The entry, written.
-    Entry(ZEntry),
+    Entry(Box<ZEntry>),
     /// `ZE_OPEN`: it could not be stat'ed or opened (the system's answer),
     /// and the entry as zipup left it (an old entry being updated keeps
     /// those changes: its size, unknown attributes, new extra fields).
@@ -472,10 +482,18 @@ thread_local! {
 /// message line was begun by the caller.
 // port: zipup.c:zipup
 pub(crate) fn add(z: &mut Zr, w: &mut Wr, f: &Found) -> Result<Zipped, Exit> {
+    // ubuntu: UNICODE_SUPPORT, the UTF-8 name only for a name that is not
+    // ASCII (fileio.c:newname's local_to_utf8_string, zip.c's is_ascii test)
+    let uname = if flavour::unicode_support(z.flavour) {
+        unicode::local_to_utf8(z.using_utf8, &f.zname).filter(|u| !unicode::is_ascii(Some(u)))
+    } else {
+        None
+    };
     let e = ZEntry {
         name: f.name.clone(),
         iname: f.zname.clone(),
         oname: f.oname.clone(),
+        uname,
         ..ZEntry::default()
     };
     add_entry(z, w, e, &f.disk)
@@ -533,7 +551,8 @@ pub(crate) fn add_entry(
     // Select the method by the suffix and the global method.
     let method = match z.o.method {
         Method::Store => STORE,
-        // Method::Bzip2 is refused before any entry (Task 11)
+        // ubuntu: -DBZIP2_SUPPORT (Apple refuses -Z bzip2 in the options)
+        Method::Bzip2 => BZIP2,
         _ => DEFLATE,
     };
     let mut m_: u16 = match &z.o.special {
@@ -604,6 +623,9 @@ pub(crate) fn add_entry(
     // (m == BEST is DEFLATE here: the method is STORE or DEFLATE already)
     e.vem = if z.o.dosify { 20 } else { 0x300 + 30 };
     e.ver = if m_ == STORE { 10 } else { 20 };
+    if method == BZIP2 {
+        e.ver = if m_ == STORE { 10 } else { 46 };
+    }
     e.crc = 0;
     // assume first that an extended local header is needed
     e.flg = if isdir { 0 } else { 8 };
@@ -663,6 +685,25 @@ pub(crate) fn add_entry(
     let mut crc = flate2::Crc::new();
     match data {
         Data::None => s = 0,
+        Data::Read(mut src) if m_ == BZIP2 => {
+            let level = z.o.level;
+            let ibuf = w.bz_ibuf.get_or_insert_with(|| vec![0u8; SBSZ]);
+            let mut sink = DataSink {
+                out: &mut w.out,
+                keys: keys.as_mut(),
+            };
+            let r = bzfilecompress(z, &mut sink, ibuf, &mut src, level);
+            drain_dots(z, &mut w.out);
+            let b = r?;
+            e.att = u16::from(b.text);
+            if b.stored {
+                m_ = STORE;
+            }
+            isize = b.isize;
+            s = b.s;
+            e.crc = b.crc;
+            translate_warning(z, b.file_binary, e.att);
+        }
         Data::Read(mut src) if m_ != STORE => {
             let level = z.o.level;
             if !(1..=9).contains(&level) {
@@ -701,16 +742,7 @@ pub(crate) fn add_entry(
             isize = sum.in_bytes;
             s = sum.out_bytes;
             e.crc = sum.crc32;
-            if e.att == 0 && z.o.translate_eol != 0 {
-                // `file_binary` is -1 (true) when nothing was read
-                let text = match (fr.file_binary != 0, z.o.translate_eol) {
-                    (true, 1) => m::L_BINARY_IGNORED,
-                    (true, _) => m::LL_BINARY_IGNORED,
-                    (false, 1) => m::L_CORRUPTED,
-                    (false, _) => m::LL_CORRUPTED,
-                };
-                z.zipwarn(text.as_bytes(), b"");
-            }
+            translate_warning(z, fr.file_binary, e.att);
         }
         Data::Link => {
             // deviation 11: a link gone between the stat and here (the C's
@@ -827,7 +859,11 @@ pub(crate) fn add_entry(
                 return Err(z.ziperr(ZE_LOGIC, m::INCORRECT_COMPRESSED_SIZE.as_bytes()));
             }
             e.how = m_;
-            e.ver = if m_ == STORE { 10 } else { 20 };
+            e.ver = match m_ {
+                STORE => 10,
+                BZIP2 => 46,
+                _ => 20,
+            };
             // not encrypting, so no extended local header
             if e.flg & 1 == 0 {
                 e.flg &= !8;
@@ -884,13 +920,178 @@ pub(crate) fn add_entry(
         z.log_write(&l);
         z.log_line_started = false;
     }
-    Ok(Zipped::Entry(e))
+    Ok(Zipped::Entry(Box::new(e)))
+}
+
+/// zipup.c, after either compressor: `-l`/`-ll` on a file that was not
+/// text, or one the translation may have corrupted (`file_binary` is -1,
+/// taken as true, when nothing was read).
+fn translate_warning(z: &mut Zr, file_binary: i8, att: u16) {
+    if att == 0 && z.o.translate_eol != 0 {
+        let text = match (file_binary != 0, z.o.translate_eol) {
+            (true, 1) => m::L_BINARY_IGNORED,
+            (true, _) => m::LL_BINARY_IGNORED,
+            (false, 1) => m::L_CORRUPTED,
+            (false, _) => m::LL_CORRUPTED,
+        };
+        z.zipwarn(text.as_bytes(), b"");
+    }
+}
+
+/// What [`bzfilecompress`] made of an entry.
+struct Bzipped {
+    isize: u64,
+    s: u64,
+    crc: u32,
+    text: bool,
+    stored: bool,
+    file_binary: i8,
+}
+
+/// The compressed bytes the bzip2 encoder has written, shared with it.
+#[derive(Clone, Default)]
+struct BzOut(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Write for BzOut {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().expect("one writer").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl BzOut {
+    /// The bytes ready in whole `OBUF_SZ` pieces (all of them at `end`).
+    fn take(&self, end: bool) -> Vec<Vec<u8>> {
+        let mut v = self.0.lock().expect("one writer");
+        let n = if end {
+            v.len()
+        } else {
+            v.len() / OBUF_SZ * OBUF_SZ
+        };
+        let ready: Vec<u8> = v.drain(..n).collect();
+        ready.chunks(OBUF_SZ).map(<[u8]>::to_vec).collect()
+    }
+}
+
+/// zipup.c:bzfilecompress (Ubuntu's `BZIP2_SUPPORT`): the entry through
+/// libbzip2 at block size `level` (stuffr's encoder, byte-identical to
+/// libbzip2 1.0.8, as `compat::bzip2` uses), written in `OBUF_SZ` pieces.
+/// An input that ends within the first two reads and does not get smaller
+/// is stored instead when the archive can be rewound. The text test runs
+/// over the whole input buffer, stale bytes included (deviation 29).
+// port: zipup.c:bzfilecompress
+fn bzfilecompress(
+    z: &mut Zr,
+    sink: &mut DataSink,
+    ibuf: &mut [u8],
+    src: &mut dyn Read,
+    level: u8,
+) -> Result<Bzipped, Exit> {
+    if !(1..=9).contains(&level) {
+        // BZ2_bzCompressInit's BZ_PARAM_ERROR
+        return Err(z.ziperr(ZE_LOGIC, m::BZ_INIT_FAILURE.as_bytes()));
+    }
+    let Some(codec) = stuffr::registry().codec(stuffr::FormatId::new("bzip2")) else {
+        return Err(z.ziperr(ZE_LOGIC, m::BZ_INIT_FAILURE.as_bytes()));
+    };
+    let bz = BzOut::default();
+    let opts = stuffr::EncodeOpts {
+        level: Some(level as i32),
+        ..stuffr::EncodeOpts::default()
+    };
+    let Ok(mut enc) = codec.encoder(Box::new(bz.clone()), &opts) else {
+        return Err(z.ziperr(ZE_LOGIC, m::BZ_INIT_FAILURE.as_bytes()));
+    };
+    let mut fr = FileRead::new(src, z.o.translate_eol);
+    let mut crc = flate2::Crc::new();
+    let mut binary = false;
+    let mut s: u64 = 0;
+    let mut mrk_cnt: u64 = 1;
+    let mut avail = fr.file_read(ibuf);
+    crc.update(&ibuf[..avail]);
+    if !binary && !is_text_buf(ibuf) {
+        binary = true;
+    }
+    let mut maybe_stored = false;
+    if avail < ibuf.len() {
+        let more = fr.file_read(&mut ibuf[avail..]);
+        if more == 0 {
+            maybe_stored = true;
+        } else {
+            crc.update(&ibuf[avail..avail + more]);
+            avail += more;
+        }
+    }
+    let mut isize = avail as u64;
+    let write = |z: &mut Zr, sink: &mut DataSink, pieces: Vec<Vec<u8>>, s: &mut u64| {
+        for p in pieces {
+            if let Err(err) = sink.write_all(&p) {
+                return Err(write_failed(z, &err));
+            }
+            *s += p.len() as u64;
+        }
+        Ok(())
+    };
+    let bad = |z: &mut Zr| z.ziperr(ZE_LOGIC, m::BZ_COMPRESS_ERROR.as_bytes());
+    if !maybe_stored {
+        while avail != 0 {
+            if enc.write_all(&ibuf[..avail]).is_err() {
+                return Err(bad(z));
+            }
+            write(z, sink, bz.take(false), &mut s)?;
+            if z.o.verbose > 0 || z.o.noisy {
+                while isize / WSIZE as u64 > mrk_cnt {
+                    mrk_cnt += 1;
+                    file_dot(z, WSIZE);
+                }
+            }
+            avail = fr.file_read(ibuf);
+            crc.update(&ibuf[..avail]);
+            isize += avail as u64;
+            if !binary && !is_text_buf(ibuf) {
+                binary = true;
+            }
+        }
+    }
+    let text = !binary;
+    let mut stored = false;
+    if maybe_stored && enc.write_all(&ibuf[..avail]).is_err() {
+        return Err(bad(z));
+    }
+    if enc.finish().is_err() {
+        return Err(bad(z));
+    }
+    if maybe_stored {
+        let n = bz.0.lock().expect("one writer").len();
+        // the first BZ_FINISH ended the stream (it fit the output buffer),
+        // it did not get smaller, and the archive can be rewound
+        if n <= OBUF_SZ && n >= avail && sink.seekable() {
+            write(z, sink, vec![ibuf[..avail].to_vec()], &mut s)?;
+            stored = true;
+        }
+    }
+    if !stored {
+        write(z, sink, bz.take(true), &mut s)?;
+    }
+    Ok(Bzipped {
+        isize,
+        s,
+        crc: crc.sum(),
+        text,
+        stored,
+        file_binary: fr.file_binary,
+    })
 }
 
 /// ` (deflated N%)` or ` (stored 0%)`, with the newline.
 pub(crate) fn stat_line(l: &mut Vec<u8>, method: u16, isize: u64, s: u64) {
     if method == DEFLATE {
         printf(l, m::DEFLATED, &[percent(isize, s).to_string().as_bytes()]);
+    } else if method == BZIP2 {
+        printf(l, m::BZIPPED, &[percent(isize, s).to_string().as_bytes()]);
     } else {
         printf(l, m::STORED, &[]);
     }

@@ -10,13 +10,12 @@
 //! `ZIPERR(ZE_PARMS, ...)`, come back as `Err(text)` and the caller makes
 //! them the `ziperr`.
 //!
-//! What this front end stops short of (the later tasks fill it, and until
-//! then a command line that gets past every check answers
-//! [`messages::NOT_BUILT`], exit 1): the names and patterns it collects are
-//! stored as the command line gave them (`Options::names`, `Options::filters`;
-//! Task 5 converts them, `add_filter()`'s `ex2in`/`in2ex`), `procname("-")`
-//! for a run with no names (Task 5), and reading the old archive. The
-//! encryption prompt (`-e`) is `ttyio.rs`'s (Task 9).
+//! What this front end leaves to the rest of the family: the names and
+//! patterns it collects are stored as the command line gave them
+//! (`Options::names`, `Options::filters`; `scan.rs` converts them,
+//! `add_filter()`'s `ex2in`/`in2ex`), `procname("-")` for a run with no
+//! names, and reading the old archive. The encryption prompt (`-e`) is
+//! `ttyio.rs`'s.
 
 use std::ffi::OsString;
 use std::io::{self, BufRead, Read};

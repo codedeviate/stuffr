@@ -27,13 +27,13 @@ use std::io;
 use std::path::PathBuf;
 
 use super::cli::{Action, Filter, ZE_ABORT, ZE_OK, ZE_OPEN, ZE_PARMS};
-use super::flavour;
 use super::messages::{self as m, printf};
 use super::readzip::{self, Archive, cstr, zsearch};
 use super::unix::{
     S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, UnixMeta, meta_of, stdin_meta, unix2dostime,
 };
 use super::{Exit, Zr};
+use super::{flavour, unicode};
 
 /// ziperr.h:ZE_LOGIC
 const ZE_LOGIC: i32 = 5;
@@ -645,6 +645,29 @@ impl Scan {
                     let mut l = Vec::new();
                     let inex: &[u8] = if mark != 0 { b"in" } else { b"ex" };
                     printf(&mut l, m::INCLUDING, &[inex, &name]);
+                    z.mesg_write(&l);
+                }
+                matched = true;
+            }
+        }
+        // ubuntu: proc_archive_name also checks the escaped Unicode names
+        if show_oname {
+            for i in 0..self.ar.zfiles.len() {
+                let zf = &mut self.ar.zfiles[i];
+                let Some(zu) = zf.zuname.clone() else {
+                    continue;
+                };
+                if !shmatch(p, cstr(&zu), cx) {
+                    continue;
+                }
+                zf.mark = u8::from(z.o.filters.is_empty() || filter(&z.o.filters, cx, &zu));
+                if z.o.verbose > 0 {
+                    let inex: &[u8] = if zf.mark != 0 { b"in" } else { b"ex" };
+                    let (oname, ouname) =
+                        (zf.e.oname.clone(), zf.ouname.clone().unwrap_or_default());
+                    let mut l = Vec::new();
+                    printf(&mut l, m::INCLUDING, &[inex, &oname]);
+                    printf(&mut l, m::ESCAPED_UNICODE, &[&ouname]);
                     z.mesg_write(&l);
                 }
                 matched = true;
@@ -1266,23 +1289,69 @@ pub(crate) fn show_files(z: &mut Zr, c: &mut Collected) -> Exit {
         }
         z.log_write(heading(z).as_bytes());
     }
-    let mut lines: Vec<(Vec<u8>, u64)> = Vec::new();
-    for zf in &c.ar.zfiles {
-        if zf.mark != 0 || z.o.kk == 3 {
-            lines.push((zf.e.oname.clone(), zf.e.len));
+    let listing_names = matches!(sf, 1 | 3);
+    for i in 0..c.ar.zfiles.len() {
+        let zf = &c.ar.zfiles[i];
+        if !(zf.mark != 0 || z.o.kk == 3) {
+            continue;
+        }
+        count += 1;
+        if (zf.e.len as i64) > 0 {
+            bytes = bytes.wrapping_add(zf.e.len);
+        }
+        let (oname, ouname) = (zf.e.oname.clone(), zf.ouname.clone());
+        let mut line = Vec::new();
+        printf(&mut line, m::SF_ENTRY, &[&oname]);
+        if z.o.noisy && listing_names {
+            z.mesg_write(&line);
+        }
+        if z.log.is_some() && !matches!(sf, 5 | 6) {
+            // not -sU: the log shows the normal name
+            z.log_write(&line);
+        }
+        // ubuntu: -su shows the escaped Unicode name under the name, -sU
+        // shows it instead of the name
+        if matches!(sf, 3 | 4)
+            && let Some(u) = &ouname
+        {
+            let mut l = Vec::new();
+            printf(&mut l, m::ESCAPED_UNICODE, &[u]);
+            if z.o.noisy && sf == 3 {
+                z.mesg_write(&l);
+            }
+            if z.log.is_some() {
+                z.log_write(&l);
+            }
+        }
+        if matches!(sf, 5 | 6) {
+            let mut l = Vec::new();
+            printf(&mut l, m::SF_ENTRY, &[ouname.as_ref().unwrap_or(&oname)]);
+            if z.o.noisy && sf == 5 {
+                z.mesg_write(&l);
+            }
+            if z.log.is_some() {
+                z.log_write(&l);
+            }
         }
     }
     for f in &c.found {
-        lines.push((f.oname.clone(), f.usize.unwrap_or(0)));
-    }
-    for (oname, len) in lines {
         count += 1;
+        let len = f.usize.unwrap_or(0);
         if (len as i64) > 0 {
             bytes = bytes.wrapping_add(len);
         }
-        // Task 11: `-sU` with Ubuntu's escaped Unicode names
+        // ubuntu: -UN escape shows the names escaped (a name the locale
+        // cannot convert crashes the C: deviation 28)
+        let shown = if z.o.unicode_escape_all {
+            match unicode::local_to_escape(z.using_utf8, &f.zname) {
+                Some(e) => e,
+                None => return unicode::segv(z),
+            }
+        } else {
+            f.oname.clone()
+        };
         let mut line = Vec::new();
-        printf(&mut line, m::SF_ENTRY, &[&oname]);
+        printf(&mut line, m::SF_ENTRY, &[&shown]);
         if z.o.noisy && listing {
             z.mesg_write(&line);
         }

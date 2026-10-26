@@ -15,6 +15,9 @@
 
 use std::io::{self, Write};
 
+use super::readzip::cstr;
+use super::unicode::{self, UTF8_BIT};
+
 /// zip.h:LOCSIG and friends.
 const LOCSIG: u32 = 0x0403_4b50;
 const CENSIG: u32 = 0x0201_4b50;
@@ -78,6 +81,13 @@ pub(crate) struct ZEntry {
     pub(crate) atx: u32,
     /// Offset of the local header.
     pub(crate) off: u64,
+    /// Ubuntu's `z->uname`: the UTF-8 name a non-ASCII name stores (bit
+    /// 11) or puts in a Unicode Path field; `None` for Apple.
+    pub(crate) uname: Option<Vec<u8>>,
+    /// The C's `z->nam` where it is not the name's length: the stored
+    /// length of a bit-11 name after the name was converted (the central
+    /// directory's size counts it, not the name written).
+    pub(crate) nam: Option<usize>,
 }
 
 /// Where an archive is written: a file (the temporary archive, or standard
@@ -190,6 +200,9 @@ pub(crate) struct ZOut {
     /// `split_size`, also when not splitting (`-s 64k -s-`: what does not
     /// fit is not written, as in the C).
     pub(crate) split_size: u64,
+    /// Ubuntu's `UNICODE_SUPPORT` in putlocal/putcentral: `using_utf8` and
+    /// `utf8_force` (`-UN UTF8`); `None` for Apple's build.
+    pub(crate) unicode: Option<(bool, bool)>,
 }
 
 impl ZOut {
@@ -211,6 +224,7 @@ impl ZOut {
             pending: Vec::new(),
             split: None,
             split_size: 0,
+            unicode: None,
         }
     }
 
@@ -550,8 +564,27 @@ fn local_header(z: &mut ZEntry, out: &mut ZOut, rewrite: bool) -> Result<Vec<u8>
     if out.zip64_entry || was_zip64 {
         add_local_zip64_extra_field(z);
     }
-    // Task 11: Ubuntu's UTF-8 flag and Unicode path field go here.
-    let mut b = Vec::with_capacity(30 + z.iname.len() + z.extra.len());
+    // ubuntu: UNICODE_SUPPORT, the UTF-8 name or the Unicode Path field
+    let mut name = z.iname.clone();
+    if let Some((using_utf8, utf8_force)) = out.unicode {
+        if let Some(u) = z.uname.clone() {
+            if utf8_force || using_utf8 {
+                z.lflg |= UTF8_BIT;
+                z.flg |= UTF8_BIT;
+            }
+            if z.flg & UTF8_BIT != 0 {
+                // restore UTF-8 as the path name
+                name = cstr(&u).to_vec();
+            } else {
+                unicode::add_unicode_path_field(&mut z.extra, &z.iname, &u);
+            }
+        } else {
+            // the UTF-8 bit is not needed
+            z.flg &= !UTF8_BIT;
+            z.lflg &= !UTF8_BIT;
+        }
+    }
+    let mut b = Vec::with_capacity(30 + name.len() + z.extra.len());
     put32(&mut b, LOCSIG);
     put16(&mut b, z.ver);
     put16(&mut b, z.lflg);
@@ -565,9 +598,9 @@ fn local_header(z: &mut ZEntry, out: &mut ZOut, rewrite: bool) -> Result<Vec<u8>
         put32(&mut b, z.siz as u32);
         put32(&mut b, z.len as u32);
     }
-    put16(&mut b, z.iname.len() as u16);
+    put16(&mut b, name.len() as u16);
     put16(&mut b, z.extra.len() as u16);
-    b.extend_from_slice(&z.iname);
+    b.extend_from_slice(&name);
     b.extend_from_slice(&z.extra);
     Ok(b)
 }
@@ -612,7 +645,23 @@ pub(crate) fn putextended(z: &ZEntry, out: &mut ZOut) -> io::Result<()> {
 /// first when a field does not fit or `-fz` asks).
 // port: zipfile.c:putcentral
 pub(crate) fn putcentral(z: &mut ZEntry, out: &mut ZOut) -> Result<(), PutError> {
-    // Task 11: Ubuntu's UTF-8 flag and Unicode path field go here.
+    // ubuntu: UNICODE_SUPPORT, the UTF-8 name or the Unicode Path field
+    let mut name = z.iname.clone();
+    if let Some((_, utf8_force)) = out.unicode {
+        if let Some(u) = z.uname.clone() {
+            if utf8_force {
+                z.flg |= UTF8_BIT;
+            }
+            if z.flg & UTF8_BIT != 0 {
+                name = cstr(&u).to_vec();
+            } else {
+                unicode::add_unicode_path_field(&mut z.cextra, &z.iname, &u);
+            }
+        } else {
+            z.flg &= !UTF8_BIT;
+            z.lflg &= !UTF8_BIT;
+        }
+    }
     if (z.siz > ZIP_UWORD32_MAX
         || z.len > ZIP_UWORD32_MAX
         || z.off > ZIP_UWORD32_MAX
@@ -625,7 +674,7 @@ pub(crate) fn putcentral(z: &mut ZEntry, out: &mut ZOut) -> Result<(), PutError>
             why: super::messages::LARGE_DISABLED_USING,
         });
     }
-    let mut b = Vec::with_capacity(46 + z.iname.len() + z.cextra.len() + z.comment.len());
+    let mut b = Vec::with_capacity(46 + name.len() + z.cextra.len() + z.comment.len());
     put32(&mut b, CENSIG);
     put16(&mut b, z.vem);
     put16(&mut b, z.ver);
@@ -639,14 +688,14 @@ pub(crate) fn putcentral(z: &mut ZEntry, out: &mut ZOut) -> Result<(), PutError>
     } else {
         put32(&mut b, z.len as u32);
     }
-    put16(&mut b, z.iname.len() as u16);
+    put16(&mut b, name.len() as u16);
     put16(&mut b, z.cextra.len() as u16);
     put16(&mut b, z.comment.len() as u16);
     put16(&mut b, z.dsk.min(ZIP_UWORD16_MAX) as u16);
     put16(&mut b, z.att);
     put32(&mut b, z.atx);
     put32(&mut b, z.off.min(ZIP_UWORD32_MAX) as u32);
-    b.extend_from_slice(&z.iname);
+    b.extend_from_slice(&name);
     b.extend_from_slice(&z.cextra);
     b.extend_from_slice(&z.comment);
     out.bfwrite(&b, Bf::CentralHeader).map_err(PutError::Write)
@@ -730,19 +779,42 @@ pub(crate) fn write_central(
     tempzn: &mut u64,
     before_end: &mut dyn FnMut(&mut ZOut, Totals),
 ) -> Result<Totals, PutError> {
+    write_central_as(entries, comment, out, tempzn, before_end, false)
+}
+
+/// [`write_central`]; `measured`: the helpers' way (zipnote, zipsplit,
+/// zipcloak), the central directory's size from where the stream is
+/// (`zftello`) rather than zip's count of the headers (which counts the
+/// C's `z->nam`, not the name a Unicode entry writes).
+pub(crate) fn write_central_as(
+    entries: &mut [ZEntry],
+    comment: &[u8],
+    out: &mut ZOut,
+    tempzn: &mut u64,
+    before_end: &mut dyn FnMut(&mut ZOut, Totals),
+    measured: bool,
+) -> Result<Totals, PutError> {
     let c = *tempzn;
+    let start = out.w.offset();
     let mut tot = Totals { n: 0, t: 0, k: 0 };
     for e in entries.iter_mut() {
         putcentral(e, out)?;
-        *tempzn +=
-            4 + CENHEAD + e.iname.len() as u64 + e.cextra.len() as u64 + e.comment.len() as u64;
+        *tempzn += 4
+            + CENHEAD
+            + e.nam.unwrap_or(e.iname.len()) as u64
+            + e.cextra.len() as u64
+            + e.comment.len() as u64;
         // an old entry's declared sizes wrap as the C's uzoff_t
         tot.n = tot.n.wrapping_add(e.len);
         tot.t = tot.t.wrapping_add(e.siz);
         tot.k += 1;
     }
     before_end(out, tot);
-    let size = *tempzn - c;
+    let size = if measured {
+        out.w.offset().wrapping_sub(start)
+    } else {
+        *tempzn - c
+    };
     putend(out, tot.k, size, c, comment).map_err(PutError::Write)?;
     Ok(tot)
 }
