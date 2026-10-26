@@ -214,6 +214,23 @@ impl ZOut {
         }
     }
 
+    /// zipsplit.c:main, the start of each output file: the archive is now
+    /// `w`, from its first byte, with no central directory written yet.
+    /// What outlives one file (`zip64_archive`, the force flags) stays, as
+    /// the C's globals do.
+    pub(crate) fn restart(&mut self, w: Box<dyn ZWrite>) {
+        self.w = w;
+        self.bytes_this_entry = 0;
+        self.current_local_offset = 0;
+        self.current_local_disk = 0;
+        self.current_disk = 0;
+        self.bytes_prev_splits = 0;
+        self.cd_start = None;
+        self.cd_entries_this_disk = 0;
+        self.total_cd_entries = 0;
+        self.pending.clear();
+    }
+
     /// The dots `bfwrite` has printed and not yet passed on (tests).
     #[cfg(test)]
     pub(crate) fn pending_dots(&self) -> Vec<u8> {

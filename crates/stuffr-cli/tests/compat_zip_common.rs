@@ -482,7 +482,8 @@ mod unix {
             row(Apple, 10, "zipnote -w always fails", "zipnote", &["-w", "t.zip"], 10, "",
                 "zipnote error: Bad file descriptor\nzipnote error: Temporary file failure (zi??????)\n")
                 .tree(with_archive(&[(b"a.txt", b"hello\n")]))
-                .piped(b"@ a.txt\nnew comment\n@ (comment above this line)\n@ (zip file comment below this line)\n"),
+                .piped(b"@ a.txt\nnew comment\n@ (comment above this line)\n@ (zip file comment below this line)\n")
+                .reference_only(),
             row(Ubuntu, 10, "zipnote -w", "zipnote", &["-w", "t.zip"], 0, "", "")
                 .tree(with_archive(&[(b"a.txt", b"hello\n")]))
                 .piped(b"@ a.txt\nnew comment\n@ (comment above this line)\n@ (zip file comment below this line)\n"),
@@ -599,6 +600,14 @@ mod unix {
     #[test]
     fn task9_rows_match_the_reference() {
         differential(9);
+    }
+
+    /// Task 10's rows: `zipnote` and `zipsplit` (the full matrices are
+    /// `compat_zip_helpers`'). Apple's `zipnote -w` row is recorded only
+    /// (ruling Z4).
+    #[test]
+    fn task10_rows_match_the_reference() {
+        differential(10);
     }
 
     /// Ruling Z3 (deviation 15): a failing `-T` answers as Apple's zip in

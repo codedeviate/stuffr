@@ -63,7 +63,7 @@ const BUF: usize = 1024;
 type Fail = CopyFail;
 
 /// `ziperr(res, h)` for a failure of the entry loop.
-fn fail_exit(z: &mut Zr, f: Fail, h: &[u8]) -> Exit {
+pub(super) fn fail_exit(z: &mut Zr, f: Fail, h: &[u8]) -> Exit {
     match f {
         CopyFail::Code(code, err) => zerr(z, code, h, err.as_ref()),
         CopyFail::Write(err) => write_failed(z, &err),

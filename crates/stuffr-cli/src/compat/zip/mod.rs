@@ -39,8 +39,7 @@
 //! `-g`, `-U`, `--out`, `-A`, `-J`, `-c`/`-z` over old entries, `-T`/`-TT`
 //! (`check_zipfile`), and zip's interrupt handler (INT, TERM, ABRT, BUS,
 //! ILL, SEGV: the temporary removed, `Interrupted (aborting)`, exit 9;
-//! `host::install_zip_abort`). bzip2 (Task 11) and the work of `zipnote`
-//! and `zipsplit` still answer `messages::NOT_BUILT` (exit 1).
+//! `host::install_zip_abort`).
 //!
 //! **Task 8 (`split.rs`, `fix.rs`, `readzip.rs`):** split archives read
 //! (every part through `Host::track`, zip's questions when a part cannot be
@@ -60,6 +59,12 @@
 //! too); and `zipcloak` (encrypt, `-d`, `-O`, `-b`), whose messages,
 //! warnings and errors are the helpers' (`zipcloak warning:`, `zipcloak
 //! error:`, `perror("zipcloak error")`).
+//!
+//! **Task 10 (`zipnote.rs`, `zipsplit.rs`):** `zipnote` (the comments listed,
+//! `-w` rewriting the archive with new comments and names) and `zipsplit`
+//! (`-n`, `-r`, `-t`, `-i`, `-p`, `-s`, `-b`: the sequential and the greedy
+//! split, the parts and the index written directly under their names), over
+//! the shared reader and writer.
 //!
 //! **Zr is `G`:** zip's globals are one value per run (`Zr`, with its
 //! options `o`), so a sandboxed run ([`run_in_counted`]) touches nothing of
@@ -254,6 +259,29 @@
 //!     local one makes `readlocal()` write past the local name's buffer;
 //!     stuffr keeps the local name as it is (a shorter central name cuts it
 //!     with a NUL, as the C does).
+//! 25. `zipnote` and `zipsplit` never set `out_path`, so `readzipfile()`'s
+//!     `strcmp(in_path, out_path)` over a NULL ends in SIGSEGV for an
+//!     archive that does not exist (or is named ``) and for a split archive
+//!     (a `.zip` that says it is one of several): both references' handler
+//!     prints `Interrupted (aborting)` and exits 9. stuffr answers the same
+//!     (`readzip::null_out_crash`); the signal is not raised.
+//! 26. Ruling Z4: Apple's `zipnote -w` closes the input stream twice (the
+//!     second `fclose` closes the temporary's) and always fails, exit 10,
+//!     `Bad file descriptor` then `Temporary file failure`, with the
+//!     archive untouched. That is undefined behaviour; stuffr takes Ubuntu's
+//!     patched answer (patch 07) in both flavours: `-w` works. Pinned by
+//!     `compat_zip_helpers::zipnote_w_is_the_same_in_both_flavours`
+//!     (stuffr's two flavours agree and exit 0) and, on Ubuntu, against the
+//!     reference. A comment's length wraps at 65536 as the C's `ush` does.
+//! 27. `zipsplit` writes its parts directly, so an interrupt (INT, TERM,
+//!     ABRT, BUS, ILL, SEGV) prints `Interrupted (aborting)` and exits 9
+//!     but leaves the parts made so far (the C's handler removes them all;
+//!     stuffr's can unlink one armed path, and none is armed). A `%` in the
+//!     archive's name is a conversion in the C's name template
+//!     (`sprintf(name, template, n)`, undefined behaviour); stuffr takes it
+//!     as a character. After an error writing the index under `-p` and a
+//!     yes to "redo entire disk?", the C goes back to the wrong disk (its
+//!     loop variable holds the failure flag); stuffr redoes disk 1.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -280,6 +308,8 @@ pub(crate) mod update;
 pub(crate) mod write;
 pub(crate) mod zipcloak;
 pub(crate) mod zipfile;
+pub(crate) mod zipnote;
+pub(crate) mod zipsplit;
 pub(crate) mod zipup;
 
 pub use flavour::Flavour;
@@ -801,18 +831,26 @@ fn main(
         let _ = z.out.flush();
         return code;
     }
-    let result = match name {
-        "zipnote" => cli::parse_note(&mut z, &args).map(|_| ()),
-        "zipsplit" => cli::parse_split(&mut z, &args).map(|_| ()),
-        _ => cli::parse_zip(&mut z, argv0, &args),
-    };
-    let code = match result {
+    if name == "zipnote" {
+        let code = match cli::parse_note(&mut z, &args) {
+            Err(Exit { code }) => code,
+            Ok(o) => zipnote::run(&mut z, o).code,
+        };
+        let _ = z.out.flush();
+        return code;
+    }
+    if name == "zipsplit" {
+        let code = match cli::parse_split(&mut z, &args) {
+            Err(Exit { code }) => code,
+            Ok(o) => zipsplit::run(&mut z, o).code,
+        };
+        let _ = z.out.flush();
+        return code;
+    }
+    let code = match cli::parse_zip(&mut z, argv0, &args) {
         Err(Exit { code }) => code,
-        // A `zip` command line the checks accepted: the names, and (Task 6)
-        // the archive.
-        Ok(()) if name == "zip" => scan::run(&mut z).code,
-        // The helpers' work is not built yet.
-        Ok(()) => z.not_built().code,
+        // A `zip` command line the checks accepted: the names and the archive.
+        Ok(()) => scan::run(&mut z).code,
     };
     let _ = z.out.flush();
     code

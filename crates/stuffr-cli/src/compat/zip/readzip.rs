@@ -391,6 +391,21 @@ pub(crate) fn strerror(errno: i32) -> Vec<u8> {
     crate::compat::host::strerror(&io::Error::from_raw_os_error(errno))
 }
 
+/// Whether the run is `zipnote` or `zipsplit`, which never set `out_path`:
+/// the C's `strcmp(in_path, out_path)` over a NULL (deviation 25).
+fn null_out(z: &Zr) -> bool {
+    matches!(z.program, "zipnote" | "zipsplit")
+}
+
+/// The SIGSEGV of `strcmp(in_path, NULL)` in `zipnote` and `zipsplit`
+/// (their `out_path` is never set), as both references' handler answers it
+/// (`putc('\n', mesg)`, `ziperr(ZE_ABORT, "aborting")`): for an archive
+/// that is missing (or named ``) and for a split archive (deviation 25).
+pub(crate) fn null_out_crash(z: &mut Zr) -> Exit {
+    z.mesg_write(b"\n");
+    z.helper_err(super::cli::ZE_ABORT, b"aborting")
+}
+
 /// zipfile.c:readzipfile: read the archive at the path, if there is one.
 /// A failure ends the run (`ZIPERR(r, zipfile)`).
 // port: zipfile.c:readzipfile
@@ -408,8 +423,16 @@ pub(crate) fn read_archive(z: &mut Zr) -> Result<Archive, Exit> {
         Some(CFile::open(z, &zipfile))
     };
     match opened {
-        None => return Ok(ar),
+        None => {
+            if null_out(z) && !z.o.zip_to_stdout && z.o.fix != 2 {
+                return Err(null_out_crash(z));
+            }
+            return Ok(ar);
+        }
         Some(Err(e)) => {
+            if null_out(z) && !z.o.zip_to_stdout && z.o.fix != 2 {
+                return Err(null_out_crash(z));
+            }
             if !z.o.zip_to_stdout && z.o.fix != 2 && in_path != out_path {
                 // if -O is used then in_path must exist
                 if z.o.fix == 1 {
@@ -583,6 +606,9 @@ fn scanzipf_regnew(
         }
     }
     // if input or output are split archives, they must be different
+    if (z.total_disks != 1 || z.o.split_method != 0) && z.o.show_files == 0 && null_out(z) {
+        return Err(Fail::Exit(null_out_crash(z)));
+    }
     if (z.total_disks != 1 || z.o.split_method != 0) && z.o.show_files == 0 && in_path == out_path {
         z.zipwarn(m::CANNOT_UPDATE_SPLIT.as_bytes(), b"");
         return Err(code(ZE_PARMS));
@@ -1440,7 +1466,7 @@ pub(crate) fn zipcopy(
         crc: lg(&buf, 10),
         ..ZEntry::default()
     };
-    let nam = usize::from(sh(&buf, 22));
+    let mut nam = usize::from(sh(&buf, 22));
     let ext = usize::from(sh(&buf, 24));
     lz.iname = f.fread(nam);
     if lz.iname.len() != nam {
@@ -1465,12 +1491,19 @@ pub(crate) fn zipcopy(
     if zf.e.flg & 8 == 0 && lz.crc != zf.e.crc {
         z.zipwarn(m::LOCAL_CRC_MISMATCH.as_bytes(), &ciname);
     }
-    if cstr(&lz.iname) != ciname.as_slice() {
+    if z.o.fix != 3 && cstr(&lz.iname) != ciname.as_slice() {
         z.zipwarn(m::LOCAL_NAME_MISMATCH.as_bytes(), &ciname);
     }
     // the sizes from the central directory
     lz.len = zf.e.len;
     lz.siz = zf.e.siz;
+    // from zipnote (fix 3): the name may have been changed; the new one is
+    // the entry's name, central and local
+    if z.o.fix == 3 {
+        zf.e.iname = ciname.clone();
+        nam = ciname.len();
+        lz.iname = ciname.clone();
+    }
     // the disk and offset in the new archive (before putlocal: a header
     // moved to the next split leaves them as they were, as in the C)
     zf.e.dsk = out.current_disk;

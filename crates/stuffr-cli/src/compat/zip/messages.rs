@@ -1528,3 +1528,46 @@ pub(crate) const CLOAK_INTERRUPTED: &[u8] = b"zipcloak error: Interrupted (abort
 /// stuffr's own (Task 9): the system gave no random bytes for an
 /// encryption header (zip's `rand()` cannot fail; `ZE_LOGIC`).
 pub(super) const NO_RANDOM_BYTES: &str = "no random bytes for the encryption header";
+
+// ---- zipnote and zipsplit (Task 10) ----
+
+/// zipnote.c:handler + ziperr(ZE_ABORT, "aborting"): what the interrupt
+/// handler prints after its newline.
+pub(crate) const NOTE_INTERRUPTED: &[u8] = b"zipnote error: Interrupted (aborting)\n";
+/// zipsplit.c:handler + ziperr(ZE_ABORT, "aborting").
+pub(crate) const SPLIT_INTERRUPTED: &[u8] = b"zipsplit error: Interrupted (aborting)\n";
+/// zipnote.c:main, an entry's name line (`%s` is its name).
+pub(super) const NOTE_NAME: &str = "@ %s\n";
+/// zipnote.c:main, the line after an entry's comment.
+pub(super) const NOTE_END_OF_COMMENT: &str = "@ (comment above this line)\n";
+/// zipnote.c:main, the line before the archive's comment.
+pub(super) const NOTE_ZIP_COMMENT: &str = "@ (zip file comment below this line)\n";
+/// zipnote.c:MARKZ, what follows the `@` of that line.
+pub(super) const NOTE_MARKZ: &str = " (zip file comment below this line)";
+/// zipnote.c:main
+pub(super) const UNEXPECTED_INPUT: &str = "unexpected input";
+/// zipnote.c:main
+pub(super) const UNKNOWN_ENTRY_NAME: &str = "unknown entry name";
+/// zipsplit.c:main (`%s` is the numbers: how many, `ould` or `ill`, how
+/// efficient).
+pub(super) const SPLIT_WILL_BE_MADE: &str = "%s zip files w%s be made (%s%% efficiency)\n";
+/// zipsplit.c:main, the largest an entry may be (`%s` is the number).
+pub(super) const ENTRY_LARGER_THAN_MAX: &str = "Entry is larger than max split size of: %s";
+/// zipsplit.c:main
+pub(super) const USE_N_TO_SET: &str = "use -n to set split size";
+/// zipsplit.c:main
+pub(super) const WAY_TOO_MANY: &str = "way too many zip files must be made";
+/// zipsplit.c:main, a file being made (`%s` is its path).
+pub(super) const SPLIT_CREATING: &str = "creating: %s\n";
+/// zipsplit.c:main, `-p`.
+pub(super) const INSERT_DISK: &str = "Insert disk #%s of %s and hit return: ";
+/// zipsplit.c:main, `-p`, at the end.
+pub(super) const SPLIT_DONE: &str = "Done.\n";
+/// zipsplit.c:retry
+pub(super) const REDO_DISK: &str = "Error writing to disk--redo entire disk? ";
+/// zipsplit.c:main, a line of the index (`%s` the number, as `%5s` makes
+/// it, then the name).
+pub(super) const INDEX_LINE: &str = "%s %s\n";
+/// zipsplit.c:main: `ziperr(r, zipfile)` with `zipfile` freed and NULL: the
+/// C library prints `(null)`.
+pub(super) const NULL_TEXT: &str = "(null)";

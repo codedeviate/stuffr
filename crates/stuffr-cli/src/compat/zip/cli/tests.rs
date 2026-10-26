@@ -836,18 +836,18 @@ fn the_helpers_parse_as_their_sources_do() {
         "zipcloak error: File not found or no read permission (t.zip)\n"
     );
     assert_eq!(err, "zipcloak error: No such file or directory\n");
-    // the others answer the not-built text
-    for (name, argv) in [
-        ("zipnote", &["-w", "-q", "-b", "d", "t"][..]),
-        (
-            "zipsplit",
-            &["-tips", "-n", "1000", "-r", "5", "-b", "d", "t"][..],
-        ),
-    ] {
-        let (code, _, err) = go(a, name, argv);
-        assert_eq!(code, 1, "{name}: {err}");
-        assert!(err.contains("not built yet"), "{name}: {err}");
-    }
+    // zipnote and zipsplit go on to read it: a missing archive is the
+    // signal the C dies of (deviation 25)
+    let (code, _, err) = go(a, "zipnote", &["-w", "-q", "-b", "d", "t"]);
+    assert_eq!(code, 9, "{err}");
+    assert_eq!(err, "\nzipnote error: Interrupted (aborting)\n");
+    let (code, out, _) = go(
+        a,
+        "zipsplit",
+        &["-tips", "-n", "1000", "-r", "5", "-b", "d", "t"],
+    );
+    assert_eq!(code, 9);
+    assert_eq!(out, "\nzipsplit error: Interrupted (aborting)\n");
 }
 
 #[test]
