@@ -310,3 +310,64 @@ fn tt_command_is_whole_at_every_length() {
     assert_eq!(super::tt_command(b"t {} x", b"zi1"), b"t  'zi1'  x");
     assert_eq!(super::tt_command(b"{}{}", b"z"), b" 'z' {}");
 }
+
+/// Deviation 13 (ruling Z33): `-g --out` leaves the input archive untouched
+/// and publishes the grown copy under the `--out` name (zip truncates the
+/// `--out` file to nothing and grows the input in place).
+#[test]
+fn growing_with_out_publishes_the_copy() {
+    let s = with_archive("grow-out");
+    let old = std::fs::read(s.0.join("t.zip")).unwrap();
+    std::fs::write(s.0.join("o.zip"), b"an older o.zip").unwrap();
+    let (code, out, err, _) = run(
+        &s.0,
+        Flavour::Apple,
+        &["-g", "t.zip", "--out", "o.zip", "big"],
+    );
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(
+        std::fs::read(s.0.join("t.zip")).unwrap() == old,
+        "the input changed"
+    );
+    let grown = std::fs::read(s.0.join("o.zip")).unwrap();
+    // o.zip is t.zip grown: the old entries where they were, `big` after them
+    let cenbeg = old.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+    assert!(grown[..cenbeg] == old[..cenbeg], "o.zip is not t.zip grown");
+    assert!(grown.len() > old.len(), "{} <= {}", grown.len(), old.len());
+    let cd = grown.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+    let central = &grown[cd..];
+    for name in [&b"a.txt"[..], b"big"] {
+        assert!(central.windows(name.len()).any(|w| w == name), "{name:?}");
+    }
+    assert_eq!(names(&s.0), ["a.txt", "big", "o.zip", "t.zip"]);
+}
+
+/// Deviation 14: the output is not truncated up front. A run that fails
+/// after the writability check (a write failure, exit 14) leaves an
+/// existing `--out` target and an entry-less archive byte for byte as they
+/// were (zip leaves the first empty and the second gone).
+#[test]
+fn a_failed_run_leaves_the_output_as_it_was() {
+    // an existing --out target
+    let s = with_archive("dev14-out");
+    let precious = b"precious bytes, not a zip".to_vec();
+    std::fs::write(s.0.join("o.zip"), &precious).unwrap();
+    FILE_SIZE_LIMIT.with(|l| l.set(Some(8 * 1024)));
+    let (code, out, _, _) = run(&s.0, Flavour::Apple, &["t.zip", "big", "--out", "o.zip"]);
+    FILE_SIZE_LIMIT.with(|l| l.set(None));
+    assert_eq!(code, 14, "{out}");
+    assert_eq!(std::fs::read(s.0.join("o.zip")).unwrap(), precious);
+    assert_eq!(names(&s.0), ["a.txt", "big", "o.zip", "t.zip"]);
+
+    // an archive with no entries (an end record and nothing else)
+    let s = with_archive("dev14-empty");
+    let mut empty = b"PK\x05\x06".to_vec();
+    empty.extend_from_slice(&[0u8; 18]);
+    std::fs::write(s.0.join("e.zip"), &empty).unwrap();
+    FILE_SIZE_LIMIT.with(|l| l.set(Some(8 * 1024)));
+    let (code, out, _, _) = run(&s.0, Flavour::Apple, &["e.zip", "big"]);
+    FILE_SIZE_LIMIT.with(|l| l.set(None));
+    assert_eq!(code, 14, "{out}");
+    assert_eq!(std::fs::read(s.0.join("e.zip")).unwrap(), empty);
+    assert_eq!(names(&s.0), ["a.txt", "big", "e.zip", "t.zip"]);
+}
