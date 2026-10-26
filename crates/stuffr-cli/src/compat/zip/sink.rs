@@ -414,8 +414,33 @@ pub(crate) fn mkstemp_with(
 /// over it when the archive has other links or is a symbolic link
 /// (respected: written through), or when the rename crosses devices. `Err`
 /// is the ziperr code and the system's answer.
+///
+/// SIGINT and SIGTERM are held back meanwhile (ruling Z32, deviation 30):
+/// between the archive's unlink and the rename, or while the copy rewrites
+/// it, zip's handler would remove the armed temporary and leave no whole
+/// archive at all. Held, the interrupt is answered once this returns, when
+/// the temporary is the archive (or, after a failure, still named).
 // port: fileio.c:replace
 pub(crate) fn replace(d: &Path, s: &Path) -> Result<(), (i32, io::Error)> {
+    host::with_zip_signals_held(|| replace_now(d, s))
+}
+
+/// In a test's forked child: raise SIGINT at the two points of [`replace`]
+/// where the archive is not whole (after its unlink, after the copy's
+/// truncation). Set only after `fork`, so no other test sees it.
+#[cfg(all(test, unix))]
+pub(crate) static RAISE_MID_REPLACE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(all(test, unix))]
+fn mid_replace() {
+    if RAISE_MID_REPLACE.load(std::sync::atomic::Ordering::SeqCst) {
+        // SAFETY: raise is async-signal-safe and touches no Rust state.
+        unsafe { libc::raise(libc::SIGINT) };
+    }
+}
+
+fn replace_now(d: &Path, s: &Path) -> Result<(), (i32, io::Error)> {
     if let Ok(t) = std::fs::symlink_metadata(d) {
         #[cfg(unix)]
         let copy = {
@@ -426,6 +451,8 @@ pub(crate) fn replace(d: &Path, s: &Path) -> Result<(), (i32, io::Error)> {
         let copy = t.file_type().is_symlink();
         if !copy {
             std::fs::remove_file(d).map_err(|e| (ZE_CREAT, e))?;
+            #[cfg(all(test, unix))]
+            mid_replace();
         } else {
             return copy_over(d, s);
         }
@@ -437,10 +464,13 @@ pub(crate) fn replace(d: &Path, s: &Path) -> Result<(), (i32, io::Error)> {
     }
 }
 
-/// fileio.c:replace's copy: `s` into `d`, then `s` removed.
-pub(crate) fn copy_over(d: &Path, s: &Path) -> Result<(), (i32, io::Error)> {
+/// fileio.c:replace's copy: `s` into `d`, then `s` removed. Reached only
+/// through [`replace`], under its held signals.
+fn copy_over(d: &Path, s: &Path) -> Result<(), (i32, io::Error)> {
     let mut f = File::open(s).map_err(|e| (ZE_TEMP, e))?;
     let mut g = File::create(d).map_err(|e| (ZE_CREAT, e))?;
+    #[cfg(all(test, unix))]
+    mid_replace();
     if let Err(e) = io::copy(&mut f, &mut g).and_then(|_| g.flush()) {
         let _ = std::fs::remove_file(d);
         return Err((ZE_WRITE, e));

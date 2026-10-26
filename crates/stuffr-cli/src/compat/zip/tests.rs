@@ -192,3 +192,117 @@ fn a_pattern_file_is_a_tracked_open() {
         .expect("the pattern file was opened through Host::track");
     assert_eq!((r.opens, r.bytes, r.len), (1, 4, 4));
 }
+
+/// A scratch directory, removed on drop (`stuffr-zipsig-<pid>-<tag>`).
+#[cfg(unix)]
+struct SigScratch(std::path::PathBuf);
+
+#[cfg(unix)]
+impl SigScratch {
+    fn new(tag: &str) -> SigScratch {
+        let d = std::env::temp_dir().join(format!("stuffr-zipsig-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        SigScratch(d)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SigScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Ruling Z32, deviation 30: a SIGINT that arrives while `replace()` has
+/// the archive unlinked (rename path) or truncated (copy path: a hard-linked
+/// or symbolic-linked archive) is held back until the archive is whole. The
+/// run then answers it as zip's handler does: `\n` + the error text on
+/// `mesg`, exit 9, and the (already published) temporary is gone. The
+/// signal is raised by `sink`'s test hook at exactly those points, in a
+/// forked child, so nothing depends on timing.
+#[cfg(unix)]
+#[test]
+fn an_interrupt_during_replace_leaves_a_whole_archive() {
+    use crate::compat::host;
+    use crate::compat::zip::sink;
+    use std::os::unix::io::AsRawFd;
+    use std::sync::atomic::Ordering;
+
+    for shape in ["plain", "hardlink", "symlink"] {
+        let s = SigScratch::new(shape);
+        let real = s.0.join("real.zip");
+        let archive = s.0.join("a.zip");
+        let tmp = s.0.join("zi123456");
+        std::fs::write(&real, b"OLD ARCHIVE BYTES").unwrap();
+        match shape {
+            "plain" => std::fs::rename(&real, &archive).unwrap(),
+            "hardlink" => std::fs::hard_link(&real, &archive).unwrap(),
+            _ => std::os::unix::fs::symlink(&real, &archive).unwrap(),
+        }
+        let new = vec![b'N'; 300_000];
+        let capture = std::fs::File::create(s.0.join("mesg")).unwrap();
+        let cfd = capture.as_raw_fd();
+        // SAFETY: the child calls sigaction, open, write, rename, unlink,
+        // raise and _exit (std's fs calls on short paths use stack buffers)
+        // and never returns into the harness; the parent only waits.
+        let status = unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+            if pid == 0 {
+                host::disarm_inherited();
+                libc::dup2(cfd, 1);
+                host::install_zip_abort(&Host::Real, messages::INTERRUPTED_ABORTING);
+                host::zip_mesg_state(&Host::Real, false, false);
+                let made = host::create_new_armed_if(true, &tmp, host::ZIP_SIGNALS);
+                let Ok((mut f, _armed)) = made else {
+                    libc::_exit(20);
+                };
+                if std::io::Write::write_all(&mut f, &new).is_err() {
+                    libc::_exit(21);
+                }
+                drop(f);
+                sink::RAISE_MID_REPLACE.store(true, Ordering::SeqCst);
+                let r = sink::replace(&archive, &tmp);
+                // the signal is delivered when replace() restores the mask:
+                // reaching here means it was not answered
+                libc::_exit(if r.is_ok() { 22 } else { 23 });
+            }
+            let mut status = 0;
+            while libc::waitpid(pid, &mut status, 0) < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EINTR)
+                );
+            }
+            status
+        };
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 9,
+            "{shape}: status {status:#x}"
+        );
+        assert_eq!(
+            std::fs::read(&archive).ok().map(|b| b.len()),
+            Some(new.len()),
+            "{shape}: the archive is not the whole new one"
+        );
+        assert!(
+            std::fs::read(&archive).unwrap() == new,
+            "{shape}: not the new bytes"
+        );
+        if shape != "plain" {
+            assert!(
+                std::fs::read(&real).unwrap() == new,
+                "{shape}: through the link"
+            );
+        }
+        assert!(!tmp.exists(), "{shape}: the temporary survived");
+        let mut want = b"\n".to_vec();
+        want.extend_from_slice(messages::INTERRUPTED_ABORTING);
+        assert_eq!(
+            String::from_utf8_lossy(&std::fs::read(s.0.join("mesg")).unwrap()),
+            String::from_utf8_lossy(&want),
+            "{shape}: zip's answer"
+        );
+    }
+}

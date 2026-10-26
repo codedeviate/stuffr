@@ -519,7 +519,7 @@ pub(crate) fn create_excl_armed(host: &Host, path: &Path) -> io::Result<(File, C
         }
         #[cfg(not(unix))]
         {
-            let _ = real;
+            let _ = host;
             Ok((f, CleanupGuard {}))
         }
     })
@@ -1458,6 +1458,8 @@ pub(crate) fn armed_path() -> Option<PathBuf> {
 pub(crate) fn disarm_inherited() {
     ARMED.store(false, Ordering::SeqCst);
     PRE_EXIT_HOOK.store(0, Ordering::SeqCst);
+    SPLIT_ARMED.store(false, Ordering::SeqCst);
+    ZIP_ABORT_EXTRA.store(std::ptr::null_mut(), Ordering::SeqCst);
 }
 
 /// Held by every lib test that arms the cleanup in the test process itself
@@ -1512,15 +1514,35 @@ pub(crate) fn with_run_signals_held<T>(f: impl FnOnce() -> T) -> T {
     held_back(BENCH_SIGNALS, f)
 }
 
+/// The signals of [`ZIP_SIGNALS`] that come from outside the process.
+#[cfg(unix)]
+const ZIP_OUTSIDE_SIGNALS: Signals = &[libc::SIGINT, libc::SIGTERM];
+#[cfg(not(unix))]
+const ZIP_OUTSIDE_SIGNALS: Signals = &[];
+
+/// Run `f` with SIGINT and SIGTERM held back (ruling Z32, zip deviation
+/// 30): the zip family's `replace()`, so an interrupt is answered (by
+/// [`install_zip_abort`]'s handler, exit 9) only once the archive is whole
+/// again, old or new. The synchronous faults (SEGV, BUS, ILL, ABRT) are not
+/// held: blocking them means nothing. Off unix, just `f`.
+///
+/// [`held_back`]'s single-thread precondition holds: the zip family runs on
+/// one thread, and the only threads a codec makes (the governor's) are
+/// scoped and joined before an entry is done, long before `replace`.
+pub(crate) fn with_zip_signals_held<T>(f: impl FnOnce() -> T) -> T {
+    held_back(ZIP_OUTSIDE_SIGNALS, f)
+}
+
 /// Run `f` with `signals` blocked on this thread, then restore the mask; a
 /// signal that arrived meanwhile is delivered on the restore. Off unix, just
 /// `f`.
 ///
 /// Precondition: it blocks on the calling thread only, so it covers a signal
 /// only while no other thread of the process has it unblocked. That holds at
-/// most call sites: `create_excl_armed`, `create_armed`, `create_temp_armed`
-/// and `with_run_signals_held` run before codec workers exist or between
-/// rows or files, when none is alive.
+/// most call sites: `create_excl_armed`, `create_armed`, `create_temp_armed`,
+/// `create_new_armed_if`, `with_run_signals_held` and
+/// `with_zip_signals_held` run before codec workers exist or between rows,
+/// files or entries, when none is alive.
 ///
 /// One exception, present since 0.14.0: the C-tier `zstd` family with several
 /// inputs. `compress_files` (`compat/zstd/fileio.rs`) keeps one compression

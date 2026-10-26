@@ -795,7 +795,21 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
             Some(sp) => (sp.env.path(&sp.tempzip), sp.out_path.clone()),
             None => (temp.path.take().unwrap_or_default(), out_path.clone()),
         };
-        let r = replace(&z.host.path(&out_path), &tmp);
+        let to = z.host.path(&out_path);
+        // SIGINT/SIGTERM held from the replace through -g's restore state
+        // (ruling Z32, deviation 30): an interrupt is answered once the
+        // archive is whole, and never says "attempting to restore" after it
+        let r = crate::compat::host::with_zip_signals_held(|| {
+            let r = replace(&to, &tmp);
+            if r.is_ok() {
+                z.restoring = None;
+                crate::compat::host::zip_abort_extra(&z.host, None);
+                if zip_attributes != 0 {
+                    set_mode(&to, zip_attributes);
+                }
+            }
+            r
+        });
         if let Some(mut sp) = split {
             // published or left as the new archive: not removed
             sp.published = true;
@@ -804,9 +818,6 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
             // the new archive stays, under the temporary name
             z.zipwarn(m::NEW_ZIP_LEFT_AS.as_bytes(), &tempzip);
             return zerr(z, code, m::WAS_REPLACING.as_bytes(), Some(&err));
-        }
-        if zip_attributes != 0 {
-            set_mode(&z.host.path(&out_path), zip_attributes);
         }
         if z.o.show_what_doing {
             z.mesg_write(m::SD_SETTING_TYPE.as_bytes());
@@ -899,12 +910,6 @@ pub(crate) fn check_zipfile(z: &mut Zr, name: &[u8]) -> Result<(), Exit> {
     check_zipfile_64(z, name, false)
 }
 
-/// zip.c:check_zipfile: test `name` with `unzip -t` (or `-TT`'s command):
-/// Apple through `posix_spawnp` (no shell; `{}` refused), Ubuntu through
-/// `system()` (`/bin/sh -c`, the name quoted). A failure is
-/// `ZE_TEST`, "original files unmodified": ruling Z3 (deviation 15), as
-/// Apple answers in both flavours, where Ubuntu's build frees the
-/// temporary's stream twice and aborts.
 /// Ubuntu's `-TT` command (zip.c:check_zipfile): the first `{}` replaced
 /// by the quoted temporary name, or the quoted name appended. Built as a
 /// string: patch 13's buffer (`strlen(cmd) + strlen(name) + 3`, one byte
@@ -931,6 +936,12 @@ pub(crate) fn tt_command(up: &[u8], name: &[u8]) -> Vec<u8> {
     cmd
 }
 
+/// zip.c:check_zipfile: test `name` with `unzip -t` (or `-TT`'s command):
+/// Apple through `posix_spawnp` (no shell; `{}` refused), Ubuntu through
+/// `system()` (`/bin/sh -c`, the name quoted). A failure is
+/// `ZE_TEST`, "original files unmodified": ruling Z3 (deviation 15), as
+/// Apple answers in both flavours, where Ubuntu's build frees the
+/// temporary's stream twice and aborts.
 // port: zip.c:check_zipfile
 fn check_zipfile_64(z: &mut Zr, name: &[u8], zip64_archive: bool) -> Result<(), Exit> {
     let _ = z.out.flush();
