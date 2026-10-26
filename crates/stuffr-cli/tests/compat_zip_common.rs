@@ -408,8 +408,11 @@ mod unix {
                 "\tzip warning: reading archive fseek: Invalid argument\n\nzip error: Zip file structure invalid (t.zip)\n", "")
                 .tree(with_archive(&[(b"a.txt", b"hello\n")])),
             // ---- Task 8: fix and splits ----
-            // zip_with's archive (no extra fields, version needed 2.0): -F
-            // cannot seek back to its central directory
+            // -F looks for the central directory from the end record back
+            // by its size plus 80 bytes (a Zip64 end record and locator
+            // assumed): the seek fails (EINVAL) for any archive whose
+            // entries take less than 80 bytes, zip's own `zip t.zip a.txt`
+            // too (measured, Task 8): not the harness's archive's fault
             row(Both, 8, "fix a zip_with archive", "zip", &["-F", "t.zip", "--out", "f.zip"], 3,
                 "Fix archive (-F) - assume mostly intact archive\n\
                  \tzip warning: could not seek back to start of central directory: Invalid argument\n\
@@ -546,6 +549,14 @@ mod unix {
     #[test]
     fn task7_rows_match_the_reference() {
         differential(7);
+    }
+
+    /// Task 8's rows: `-F` (the `zip_with` archive is too small for -F's
+    /// look back from the end record: a quirk of zip's, not of the
+    /// harness's archive), a missing archive, `--out` onto itself, `-s`.
+    #[test]
+    fn task8_rows_match_the_reference() {
+        differential(8);
     }
 
     /// Ruling Z3 (deviation 15): a failing `-T` answers as Apple's zip in

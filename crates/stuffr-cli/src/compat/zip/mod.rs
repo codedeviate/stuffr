@@ -39,9 +39,18 @@
 //! `-g`, `-U`, `--out`, `-A`, `-J`, `-c`/`-z` over old entries, `-T`/`-TT`
 //! (`check_zipfile`), and zip's interrupt handler (INT, TERM, ABRT, BUS,
 //! ILL, SEGV: the temporary removed, `Interrupted (aborting)`, exit 9;
-//! `host::install_zip_abort`). `-F`/`-FF` and split archives (Task 8),
-//! encryption (Task 9), bzip2 (Task 11) and the helpers' work still answer
-//! `messages::NOT_BUILT` (exit 1).
+//! `host::install_zip_abort`). Encryption (Task 9), bzip2 (Task 11) and
+//! the helpers' work still answer `messages::NOT_BUILT` (exit 1).
+//!
+//! **Task 8 (`split.rs`, `fix.rs`, `readzip.rs`):** split archives read
+//! (every part through `Host::track`, zip's questions when a part cannot be
+//! opened) and written (`-s`, `-sp`, `-sb`, `-sv`: `bfwrite`'s other half,
+//! the local header's split kept open for its rewrite, a split archive
+//! read and copied split as its first part is); `-F` (`scanzipf_regnew`'s
+//! fix mode: the offset of bytes before the archive, damaged central
+//! records skipped, a bad entry written over) and `-FF` (`scanzipf_fixnew`:
+//! the archive read from its first byte, every local header copied as it
+//! is met, a central header found later filling in what only it has).
 //!
 //! **Zr is `G`:** zip's globals are one value per run (`Zr`, with its
 //! options `o`), so a sandboxed run ([`run_in_counted`]) touches nothing of
@@ -169,6 +178,30 @@
 //!     without writing an archive, and zip's `finish()` then deletes the
 //!     files of the entries the names marked, though nothing holds them.
 //!     stuffr deletes nothing after `-sf`.
+//! 18. Ruling Z5: zip reads the answers to its questions about split parts
+//!     with `fgets` and never looks at what it returns. At the end of
+//!     standard input its buffer keeps what it held (uninitialised at the
+//!     first question), and `-FF` (both builds; also `-F` and a copy of a
+//!     split archive whose part is missing) asks again for ever, gigabytes
+//!     of prompts; so does Ubuntu's `-sp`. stuffr never loops: the end of
+//!     standard input at a question about a part to READ answers `q`
+//!     (abort: as an explicit `q`, measured on both references: `-FF` goes
+//!     on and writes what it has, `could not find split` and exit 0 when
+//!     the part was the one to scan, `Interrupted (Could not find split)`,
+//!     exit 9, when an entry was being copied), and at `-sp`'s question
+//!     about where to WRITE the next split it answers ENTER (that question
+//!     has no way out but an interrupt; ENTER is what Apple's build does).
+//! 19. `-FF`, undefined behaviour of the C, not reproduced: the central
+//!     extra field of an entry `-FF` found by its local header is the local
+//!     one copied with `strcpy`, which stops at the first NUL (almost always
+//!     the second byte of the first block's size) and leaves the rest of
+//!     the `malloc`ed field as it was: zeros on Apple, heap garbage that
+//!     changes from run to run on Ubuntu. stuffr copies up to and with the
+//!     first NUL and writes zeros after it (Apple's bytes). The entry's
+//!     `lflg`, never set, is read as 0 (it only sizes `tempzn`); a data
+//!     descriptor signature split across two 16 KiB reads (the C then
+//!     writes `kk - 3`, wrapped, bytes) is not taken for one; a Zip64 extra
+//!     field shorter than its sizes is read as zeros past its end.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -182,11 +215,13 @@ use super::CountedRun;
 use super::host::{self, Host, SANDBOX_OUTPUT_CAP, Sandbox};
 
 pub(crate) mod cli;
+pub(crate) mod fix;
 pub(crate) mod flavour;
 mod messages;
 pub(crate) mod readzip;
 pub(crate) mod scan;
 pub(crate) mod sink;
+pub(crate) mod split;
 pub(crate) mod unix;
 pub(crate) mod update;
 pub(crate) mod write;
@@ -272,6 +307,15 @@ pub(crate) struct Zr<'a> {
     /// `-g` is writing (zip.c's `tempzip == zipfile`): `ziperr` then says
     /// it is restoring this archive.
     pub(crate) restoring: Option<Vec<u8>>,
+    /// zip's `current_in_disk`: the part of a split archive being read.
+    pub(crate) current_in_disk: u64,
+    /// zip's `total_disks`: the parts of the archive being read.
+    pub(crate) total_disks: u64,
+    /// zip's `skip_this_disk`: 1 + the part `-F` was told to skip (0: none).
+    pub(crate) skip_this_disk: u64,
+    /// Standard input as zip's prompts read it (`fgets(..., stdin)`: one
+    /// stdio stream for every prompt of the run), once first asked for.
+    pub(crate) prompt: Option<split::Prompt>,
 }
 
 impl<'a> Zr<'a> {
@@ -297,6 +341,10 @@ impl<'a> Zr<'a> {
             seen_doubledash: false,
             program,
             restoring: None,
+            current_in_disk: 0,
+            total_disks: 1,
+            skip_this_disk: 0,
+            prompt: None,
         }
     }
 
@@ -371,6 +419,32 @@ impl<'a> Zr<'a> {
             }
             self.log_write(&line);
             self.log_line_started = false;
+        }
+    }
+
+    /// zip.c:zipmessage_nl: `a` to `mesg` (when noisy) and the log, then,
+    /// with `nl`, a newline if a line was started.
+    // port: zip.c:zipmessage_nl
+    pub(crate) fn zipmessage_nl(&mut self, a: &[u8], nl: bool) {
+        if self.o.noisy {
+            if !a.is_empty() {
+                self.mesg_write(a);
+                self.set_line(true);
+            }
+            if nl && self.mesg_line_started {
+                self.mesg_write(b"\n");
+                self.set_line(false);
+            }
+        }
+        if self.log.is_some() {
+            if !a.is_empty() {
+                self.log_write(a);
+                self.log_line_started = true;
+            }
+            if nl && self.log_line_started {
+                self.log_write(b"\n");
+                self.log_line_started = false;
+            }
         }
     }
 

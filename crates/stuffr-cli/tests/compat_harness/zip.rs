@@ -2109,3 +2109,293 @@ pub fn zip_interrupts_match(flavour: &'static str) {
         }
     }
 }
+
+// ---- Task 8: -F, -FF and split archives ----
+
+/// A committed damaged archive of `tests/data/zip/` (its README says how
+/// each was made).
+pub fn zip_data(name: &str) -> Vec<u8> {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data/zip")
+        .join(name);
+    std::fs::read(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+}
+
+/// The files `names` that stuffr's `zip args` over `tree` leaves (a split
+/// set: `t.z01`, ..., `t.zip`), made in `flavour`.
+pub fn zip_made_parts(
+    flavour: &str,
+    tree: &ZipTree,
+    args: &[&str],
+    names: &[&str],
+) -> Vec<(String, Vec<u8>)> {
+    use std::os::unix::process::CommandExt;
+    let s = ScratchDir::unique("zip-parts");
+    std::fs::create_dir_all(&*s).unwrap();
+    tree.materialise(&s);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_stuffr"));
+    cmd.arg0("zip")
+        .args(args)
+        .current_dir(&*s)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C")
+        .env("TZ", "UTC")
+        .env("STUFFR_ZIP_FLAVOR", flavour)
+        .stdin(Stdio::null());
+    let o = output(&mut cmd).unwrap();
+    assert!(o.status.success(), "zip {args:?}: {o:?}");
+    names
+        .iter()
+        .map(|n| (n.to_string(), std::fs::read(s.join(n)).unwrap()))
+        .collect()
+}
+
+/// The standard tree plus `big`, 140000 bytes of `random(_, 7)` (three
+/// 64 KiB splits).
+pub fn zip_split_tree() -> ZipTree {
+    ZipTree::standard().file("big", random(140_000, 7))
+}
+
+/// `zip -X -s 64k s.zip big a.txt` over [`zip_split_tree`]: `s.z01`,
+/// `s.z02`, `s.zip`, as `(name, bytes)`.
+pub fn zip_split_set(flavour: &str) -> Vec<(String, Vec<u8>)> {
+    zip_made_parts(
+        flavour,
+        &zip_split_tree(),
+        &["-X", "-s", "64k", "s.zip", "big", "a.txt"],
+        &["s.z01", "s.z02", "s.zip"],
+    )
+}
+
+/// `tree` with the parts of `set` added, but those named in `leave_out`.
+pub fn with_parts(mut tree: ZipTree, set: &[(String, Vec<u8>)], leave_out: &[&str]) -> ZipTree {
+    for (n, b) in set {
+        if !leave_out.contains(&n.as_str()) {
+            tree = tree.file(n, b.clone());
+        }
+    }
+    tree
+}
+
+/// Task 8: `-F` and `-FF` over the committed damaged archives and over
+/// split sets (whole, a part missing, a part in another directory), with
+/// the answers zip's questions take. Stdin always ends with an answer the
+/// reference takes: at the end of standard input `-FF`'s questions spin
+/// for ever in the C (ruling Z5, pinned stuffr-only).
+pub fn zip_fix_matrix(flavour: &'static str) -> Vec<Case<'static>> {
+    let mut out: Vec<Case<'static>> = Vec::new();
+    let mut add = |args: &[&'static str], tree: ZipTree, stdin: &[u8]| {
+        let mut c = zip_case("zip", args, tree);
+        c.zip_flavour = Some(flavour);
+        c.stdin = Some(stdin.to_vec());
+        out.push(c);
+    };
+    let with = |name: &str| ZipTree::standard().file("in.zip", zip_data(name));
+    let damaged = [
+        "intact.zip",
+        "cut-central.zip",
+        "cut-data.zip",
+        "bad-central.zip",
+        "preamble.zip",
+        "descriptors.zip",
+        "descriptors-cut.zip",
+        "comment-cut.zip",
+        "junk.zip",
+        "bad-version.zip",
+    ];
+    for name in damaged {
+        add(&["-F", "in.zip", "--out", "f.zip"], with(name), b"");
+        add(&["-F", "-v", "in.zip", "--out", "f.zip"], with(name), b"");
+        // `y`: a single-disk archive, where the end record is missing
+        add(&["-FF", "in.zip", "--out", "f.zip"], with(name), b"y\n");
+        add(
+            &["-FF", "-v", "in.zip", "--out", "f.zip"],
+            with(name),
+            b"y\n",
+        );
+        add(&["-FF", "-q", "in.zip", "--out", "f.zip"], with(name), b"");
+    }
+    // Apple's -FF copies the local extra field as zeros after its first NUL
+    // (ruling Z19: Ubuntu's are heap garbage)
+    if flavour == "apple" {
+        add(
+            &["-FF", "in.zip", "--out", "f.zip"],
+            with("extra-cut.zip"),
+            b"y\n",
+        );
+    }
+    let cut = || with("cut-central.zip");
+    // the questions about a part that is not there
+    add(&["-FF", "in.zip", "--out", "f.zip"], cut(), b"n\nq\n");
+    add(&["-FF", "in.zip", "--out", "f.zip"], cut(), b"n\ne\n");
+    add(&["-FF", "in.zip", "--out", "f.zip"], cut(), b"n\ns\nq\n");
+    add(&["-FF", "in.zip", "--out", "f.zip"], cut(), b"n\nz\n\n");
+    add(&["-FF", "in.zip", "--out", "f.zip"], cut(), b"n\nQ\n");
+    add(&["-FF", "in.zip", "--out", "f.zip"], cut(), b"n\nc\n\nq\n");
+    add(
+        &["-FF", "in.zip", "--out", "f.zip"],
+        cut(),
+        b"n\nc\nnodir/\nq\n",
+    );
+    add(&["-FF", "in.zip", "--out", "f.zip"], cut(), b"n\nx\nq\n");
+    add(&["-FF", "nosuch.zip", "--out", "f.zip"], cut(), b"q\n");
+    add(&["-F", "nosuch.zip", "--out", "f.zip"], cut(), b"");
+    add(&["-F", "in.zip", "--out", "in.zip"], cut(), b"");
+    add(
+        &["-FF", "-b", "nodir", "in.zip", "--out", "f.zip"],
+        cut(),
+        b"y\n",
+    );
+    // split sets
+    let set = zip_split_set(flavour);
+    let parts = |leave: &[&str]| with_parts(zip_split_tree(), &set, leave);
+    add(&["-F", "s.zip", "--out", "f.zip"], parts(&[]), b"");
+    add(&["-FF", "s.zip", "--out", "f.zip"], parts(&[]), b"");
+    add(&["-FF", "-v", "s.zip", "--out", "f.zip"], parts(&[]), b"");
+    add(&["s.zip", "--out", "f.zip"], parts(&[]), b"");
+    add(&["-s", "0", "s.zip", "--out", "f.zip"], parts(&[]), b"");
+    add(&["-sv", "s.zip", "--out", "f.zip"], parts(&[]), b"");
+    add(&["-U", "s.zip", "a.txt", "--out", "f.zip"], parts(&[]), b"");
+    // (every answer list ends in one the reference takes: a reference
+    // asking again at the end of standard input never stops)
+    for answer in [&b"q\n"[..], b"s\n", b"Q\n", b"c\n\nq\n", b"\nq\n"] {
+        add(
+            &["-F", "s.zip", "--out", "f.zip"],
+            parts(&["s.z02"]),
+            answer,
+        );
+        add(
+            &["-FF", "s.zip", "--out", "f.zip"],
+            parts(&["s.z02"]),
+            answer,
+        );
+        if answer != b"s\n" {
+            // without -F, `s` is a name of a directory
+            add(&["s.zip", "--out", "f.zip"], parts(&["s.z02"]), answer);
+        }
+    }
+    add(
+        &["-FF", "s.zip", "--out", "f.zip"],
+        parts(&["s.z02"]),
+        b"e\n",
+    );
+    add(
+        &["-FF", "s.zip", "--out", "f.zip"],
+        parts(&["s.z01"]),
+        b"s\n",
+    );
+    add(
+        &["-F", "s.zip", "--out", "f.zip"],
+        parts(&["s.z01"]),
+        b"s\n",
+    );
+    // quiet: the first part's open is an error, the next part's a question
+    add(&["-q", "s.zip", "--out", "f.zip"], parts(&["s.z01"]), b"");
+    add(
+        &["-q", "s.zip", "--out", "f.zip"],
+        parts(&["s.z02"]),
+        b"q\n",
+    );
+    // the missing part in another directory: `c`, the directory, ENTER
+    let mut moved = parts(&["s.z02"]);
+    let z02 = set.iter().find(|(n, _)| n == "s.z02").unwrap().1.clone();
+    moved = moved.file("sub/s.z02", z02);
+    add(
+        &["-F", "s.zip", "--out", "f.zip"],
+        moved.clone(),
+        b"c\nsub/\n\nq\n",
+    );
+    add(
+        &["-FF", "s.zip", "--out", "f.zip"],
+        moved,
+        b"c\nsub/\n\nq\n",
+    );
+    out
+}
+
+/// Task 8: writing split archives (`-s`, `-sp`, `-sb`, `-sv`) and the
+/// archives zip refuses to change.
+pub fn zip_split_matrix(flavour: &'static str) -> Vec<Case<'static>> {
+    let mut out: Vec<Case<'static>> = Vec::new();
+    let mut add = |args: &[&'static str], tree: ZipTree, stdin: &[u8]| {
+        let mut c = zip_case("zip", args, tree);
+        c.zip_flavour = Some(flavour);
+        c.stdin = Some(stdin.to_vec());
+        out.push(c);
+    };
+    let big = || ZipTree::standard().file("big", random(200_000, 7));
+    let enter = b"\n\n\n\n\n\n";
+    for args in [
+        &["-s", "64k", "t.zip", "big"][..],
+        &["-s", "64k", "-sv", "t.zip", "big"],
+        &["-s", "64k", "-sb", "t.zip", "big"],
+        &["-s", "1m", "t.zip", "big"],
+        &["-s", "1", "t.zip", "big"],
+        &["-s", "64k", "t.zip", "a.txt", "b.txt"],
+        &["-s", "64k", "t.zip", "a.txt", "big", "b.txt", "d"],
+        &["-s", "64k", "-r", "t.zip", "."],
+        &["-s", "64k", "-0", "t.zip", "big", "a.txt"],
+        &["-s", "64k", "-fd", "t.zip", "big"],
+        &["-s", "64k", "-fz", "t.zip", "big"],
+        &["-s", "64k", "-X", "t.zip", "big", "a.txt"],
+        &["-s", "64k", "-v", "t.zip", "big"],
+        &["-s", "64k", "-dg", "-ds", "32k", "t.zip", "big"],
+        &["-s", "64k", "-dv", "-dc", "t.zip", "big", "a.txt"],
+        &["-s", "64k", "-b", "tmp", "t.zip", "big"],
+        &["-s", "64k", "-sv", "-sb", "t.zip", "a.txt"],
+        &["-sp", "t.zip", "a.txt", "big"],
+        &["-s", "64k", "-sp", "t.zip", "big"],
+        &["-s", "64k", "-sp", "-sb", "t.zip", "big"],
+        &["-s", "64k", "-sp", "-sv", "t.zip", "big"],
+        &[
+            "-s", "64k", "-sp", "-sb", "-sv", "t.zip", "a.txt", "big", "b.txt",
+        ],
+        &["-s", "64k", "-s-", "t.zip", "big"],
+        &["-s", "0", "t.zip", "big"],
+    ] {
+        add(args, big().dir("tmp"), enter);
+    }
+    // a comment after the splits (an empty first line would be Ubuntu's
+    // heap overflow, `strcpy(p, "\r\n")` into one byte: not split-related)
+    add(
+        &["-s", "64k", "-z", "t.zip", "big"],
+        big(),
+        b"a comment\n.\n",
+    );
+    // -sp: the next split's directory, a directory or a bare name (the
+    // archive's name must have a directory: without one zip's split names
+    // index before their buffer)
+    add(
+        &["-s", "64k", "-sp", "w/t.zip", "big"],
+        big().dir("w").dir("o"),
+        b"o/\n\n\n\n",
+    );
+    add(
+        &["-s", "64k", "-sp", "w/t.zip", "big"],
+        big().dir("w"),
+        b"x\n\n\n\n",
+    );
+    // archives zip refuses to change: an update or a deletion of a split
+    // archive in place, a split to standard output, a grown split archive
+    let set = zip_split_set(flavour);
+    let parts = || with_parts(zip_split_tree(), &set, &[]);
+    add(&["s.zip", "b.txt"], parts(), b"");
+    add(&["-d", "s.zip", "a.txt"], parts(), b"");
+    add(&["-g", "s.zip", "b.txt"], parts(), b"");
+    add(&["-g", "s.zip", "b.txt", "--out", "f.zip"], parts(), b"");
+    add(&["-s", "64k", "-", "big"], big(), b"");
+    add(&["-sf", "s.zip"], parts(), b"");
+    add(&["s.zip", "b.txt", "--out", "f.zip"], parts(), b"");
+    add(
+        &["-s", "64k", "s.zip", "b.txt", "--out", "f.zip"],
+        parts(),
+        b"",
+    );
+    add(
+        &["-s", "64k", "t.zip", "big"],
+        big().file("t.z01", b"old"),
+        b"",
+    );
+    out
+}

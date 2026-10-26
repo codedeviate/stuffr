@@ -1327,10 +1327,6 @@ fn heading(z: &Zr) -> &'static str {
 /// zip does with the names it was given. Returns the exit code the run
 /// ends with.
 pub(crate) fn run(z: &mut Zr) -> Exit {
-    // Task 8: -F and -FF
-    if z.o.fix != 0 {
-        return z.not_built();
-    }
     // zip.c:main installs its handler for INT, TERM, ABRT, BUS, ILL, SEGV
     // (the run so far only parsed: nothing a signal could find half done)
     crate::compat::host::install_zip_abort(&z.host, m::INTERRUPTED_ABORTING);
@@ -1339,12 +1335,45 @@ pub(crate) fn run(z: &mut Zr) -> Exit {
     if z.o.show_what_doing {
         z.mesg_write(m::SD_READING_ARCHIVE.as_bytes());
     }
+    // -FF: done here, all of it
+    if z.o.fix == 2 {
+        return super::fix::run(z);
+    }
     let zipfile = z.o.zipfile.clone().unwrap_or_default();
     // read the zip file if it exists (zipfile.c:readzipfile)
     let ar = match readzip::read_archive(z) {
         Ok(a) => a,
         Err(e) => return e,
     };
+    if z.o.split_method == -1 {
+        z.o.split_method = 0;
+    } else if z.o.fix == 0 && z.o.split_method == 0 && z.total_disks > 1 {
+        // a split archive read and splitting neither asked for nor refused:
+        // split as its first part is
+        let ip = z.o.in_path.clone().unwrap_or_default();
+        let first = match super::split::get_in_split_path(z, &ip, 0) {
+            Ok(p) => p,
+            Err(x) => return x,
+        };
+        match std::fs::metadata(z.host.path(&first)) {
+            Ok(md) => {
+                z.o.split_method = 1;
+                z.o.split_size = md.len();
+            }
+            Err(_) => {
+                z.zipwarn(m::NO_INFO_INPUT_SPLIT.as_bytes(), &first);
+                return Exit { code: ZE_OPEN };
+            }
+        }
+    }
+    if z.o.noisy_splits && z.o.split_size > 0 {
+        z.zipmessage(
+            m::SPLITSIZE.as_bytes(),
+            z.o.split_size.to_string().as_bytes(),
+        );
+    }
+    // so the disk display starts at 1
+    z.current_in_disk = 0;
     // no input zip file and showing contents
     if !ar.exists && z.o.show_files != 0 && (z.o.kk == 3 || z.o.action == Action::Archive) {
         // the stale errno of the failed open

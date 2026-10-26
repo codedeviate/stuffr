@@ -10,10 +10,12 @@
 //! `fread`, `fseeko`, `feof`, `ferror`); [`CFile`] keeps those semantics,
 //! the `errno` of the last failure included (the C's messages print it).
 //!
-//! Not here: `-F`/`-FF` (`scanzipf_fixnew`) and the reading of split
-//! archives' other parts (Task 8): a run that needs another part answers
-//! `messages::NOT_BUILT`. Ubuntu's `UNICODE_SUPPORT` reading of bit-11 and
-//! Unicode Path names is Task 11's.
+//! Split archives are read here too: `scanzipf_regnew` reads the central
+//! directory from as many parts as it spans, `zipcopy`, `readlocal` and
+//! `bfcopy` open the part an entry is on and go on to the next at a part's
+//! end, asking where a part is when it cannot be opened (`split.rs`).
+//! `-F` is `scanzipf_regnew`'s fix mode; `-FF` is `fix.rs`. Ubuntu's
+//! `UNICODE_SUPPORT` reading of bit-11 and Unicode Path names is Task 11's.
 //!
 //! Undefined behaviour in the C, not reproduced (deviation 13 in
 //! `mod.rs`): a short read of the end record or the Zip64 records leaves
@@ -38,16 +40,16 @@ pub(crate) const ZE_EOF: i32 = 2;
 pub(crate) const ZE_FORM: i32 = 3;
 pub(crate) const ZE_READ: i32 = 11;
 /// zip.h:ENDHEAD and friends.
-const ENDHEAD: usize = 18;
+pub(crate) const ENDHEAD: usize = 18;
 const EC64LOC: usize = 16;
 const EC64REC: usize = 52;
-const CENHEAD: usize = 42;
+pub(crate) const CENHEAD: usize = 42;
 /// zip.h's general-purpose bit 11.
 const UTF8_BIT: u16 = 1 << 11;
 /// tailor.h:NUM_HOSTS
 const NUM_HOSTS: u16 = 31;
 /// tailor.h:CBSZ, bfcopy's buffer.
-const CBSZ: usize = 16384;
+pub(crate) const CBSZ: usize = 16384;
 const ZIP_UWORD32_MAX: u64 = 0xffff_ffff;
 const ZIP_UWORD16_MAX: u64 = 0xffff;
 
@@ -157,7 +159,7 @@ impl CFile {
     }
 
     /// `ungetc`, which also clears the end-of-file flag.
-    fn ungetc(&mut self, c: u8) {
+    pub(crate) fn ungetc(&mut self, c: u8) {
         self.back = Some(c);
         self.eof = false;
     }
@@ -211,7 +213,7 @@ impl CFile {
     }
 
     /// `fseeko(f, 0, SEEK_END)`'s position: the file's size.
-    fn end(&mut self) -> Option<u64> {
+    pub(crate) fn end(&mut self) -> Option<u64> {
         self.back = None;
         match self.f.seek(SeekFrom::End(0)) {
             Ok(p) => Some(p),
@@ -245,7 +247,7 @@ impl CFile {
 /// zipfile.c:find_next_signature: the next `PK` followed by two bytes below
 /// 16 (`sigbuf`), the stream left after it.
 // port: zipfile.c:find_next_signature
-fn find_next_signature(f: &mut CFile, sigbuf: &mut [u8; 4]) -> bool {
+pub(crate) fn find_next_signature(f: &mut CFile, sigbuf: &mut [u8; 4]) -> bool {
     let mut m = f.getc();
     while let Some(c) = m {
         if c == 0x50 {
@@ -289,7 +291,7 @@ fn find_next_signature(f: &mut CFile, sigbuf: &mut [u8; 4]) -> bool {
 
 /// zipfile.c:find_signature: the next `sig`.
 // port: zipfile.c:find_signature
-fn find_signature(f: &mut CFile, sig: &[u8; 4], sigbuf: &mut [u8; 4]) -> bool {
+pub(crate) fn find_signature(f: &mut CFile, sig: &[u8; 4], sigbuf: &mut [u8; 4]) -> bool {
     while !f.feof() {
         if !find_next_signature(f, sigbuf) {
             return false;
@@ -302,23 +304,23 @@ fn find_signature(f: &mut CFile, sig: &[u8; 4], sigbuf: &mut [u8; 4]) -> bool {
 }
 
 /// zipfile.c:at_signature: the next four bytes are `sig`.
-fn at_signature(f: &mut CFile, sig: &[u8; 4]) -> bool {
+pub(crate) fn at_signature(f: &mut CFile, sig: &[u8; 4]) -> bool {
     let b = f.fread(4);
     b.len() == 4 && b == sig
 }
 
-fn sh(b: &[u8], at: usize) -> u16 {
+pub(crate) fn sh(b: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([b[at], b[at + 1]])
 }
-fn lg(b: &[u8], at: usize) -> u32 {
+pub(crate) fn lg(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
 }
-fn llg(b: &[u8], at: usize) -> u64 {
+pub(crate) fn llg(b: &[u8], at: usize) -> u64 {
     u64::from(lg(b, at)) | (u64::from(lg(b, at + 4)) << 32)
 }
 
 /// `buf` padded with zeros to `n` (a short read into the C's buffer).
-fn padded(mut buf: Vec<u8>, n: usize) -> Vec<u8> {
+pub(crate) fn padded(mut buf: Vec<u8>, n: usize) -> Vec<u8> {
     buf.resize(n.max(buf.len()), 0);
     buf
 }
@@ -327,8 +329,8 @@ fn padded(mut buf: Vec<u8>, n: usize) -> Vec<u8> {
 pub(crate) enum Fail {
     /// `return ZE_*` (the `errno` for the codes that print one).
     Code(i32, Option<io::Error>),
-    /// Another split part is needed (Task 8).
-    NotBuilt,
+    /// The run already ended (a `ZIPERR` inside, as for too many parts).
+    Exit(Exit),
 }
 
 fn code(c: i32) -> Fail {
@@ -344,7 +346,7 @@ fn read_fail(f: &CFile) -> Fail {
 }
 
 /// `strerror(errno)` as the C's messages print it.
-fn strerror(errno: i32) -> Vec<u8> {
+pub(crate) fn strerror(errno: i32) -> Vec<u8> {
     crate::compat::host::strerror(&io::Error::from_raw_os_error(errno))
 }
 
@@ -369,6 +371,9 @@ pub(crate) fn read_archive(z: &mut Zr) -> Result<Archive, Exit> {
         Some(Err(e)) => {
             if !z.o.zip_to_stdout && z.o.fix != 2 && in_path != out_path {
                 // if -O is used then in_path must exist
+                if z.o.fix == 1 {
+                    z.zipwarn(m::NO_ZIP_FOUND_1.as_bytes(), m::NO_ZIP_FOUND_2.as_bytes());
+                }
                 return Err(z.ziperr_os(ZE_OPEN, &zipfile, &e));
             }
             return Ok(ar);
@@ -377,7 +382,7 @@ pub(crate) fn read_archive(z: &mut Zr) -> Result<Archive, Exit> {
     }
     match scanzipf_regnew(z, &mut ar, &in_path, &out_path) {
         Ok(()) => {}
-        Err(Fail::NotBuilt) => return Err(z.not_built()),
+        Err(Fail::Exit(x)) => return Err(x),
         Err(Fail::Code(c, e)) => {
             return Err(super::zipup::zerr(z, c, &zipfile, e.as_ref()));
         }
@@ -416,8 +421,40 @@ pub(crate) fn zsearch(ar: &Archive, n: &[u8]) -> Option<usize> {
     None
 }
 
+/// `%02x ` of each of a signature's four bytes.
+fn sig_hex(sig: &[u8; 4]) -> Vec<u8> {
+    let mut v = Vec::new();
+    for c in sig {
+        v.extend_from_slice(format!("{c:02x} ").as_bytes());
+    }
+    v
+}
+
+/// `zipwarn(fix == 1 ? fixed : plain, ...)` and `(try -FF)` after it under
+/// `-F`.
+fn warn_fix(z: &mut Zr, fixed: &str, plain: &str, b: &[u8]) {
+    if z.o.fix == 1 {
+        z.zipwarn(fixed.as_bytes(), b);
+        z.zipwarn(m::TRY_FF.as_bytes(), b"");
+    } else {
+        z.zipwarn(plain.as_bytes(), b);
+    }
+}
+
+/// The path of disk `disk` while reading the central directory: the
+/// archive's own name for the last disk, else `.zNN` from `base`.
+fn disk_path(z: &mut Zr, base: &[u8], disk: u64) -> Result<Vec<u8>, Fail> {
+    if disk == z.total_disks.wrapping_sub(1) {
+        return Ok(z.o.in_path.clone().unwrap_or_default());
+    }
+    super::split::get_in_split_path(z, base, disk).map_err(Fail::Exit)
+}
+
 /// zipfile.c:scanzipf_regnew: the end record (and the Zip64 ones), then the
-/// central directory into `ar.zfiles`.
+/// central directory into `ar.zfiles`, from as many parts of a split
+/// archive as it takes (asking where a part is when it cannot be opened).
+/// Under `-F` (`fix` 1) damaged records are warned about and skipped, and
+/// the offsets are corrected for bytes before the archive.
 // port: zipfile.c:scanzipf_regnew
 fn scanzipf_regnew(
     z: &mut Zr,
@@ -425,6 +462,7 @@ fn scanzipf_regnew(
     in_path: &[u8],
     out_path: &[u8],
 ) -> Result<(), Fail> {
+    let fix = z.o.fix;
     let mut sigbuf = [0u8; 4];
     let mut f = match CFile::open(z, in_path) {
         Ok(f) => f,
@@ -447,9 +485,16 @@ fn scanzipf_regnew(
         return Err(Fail::Code(ZE_READ, Some(f.error())));
     }
     if !find_signature(&mut f, b"PK\x05\x06", &mut sigbuf) {
-        z.zipwarn(m::MISSING_END_1.as_bytes(), b"");
-        z.zipwarn(m::MISSING_END_2.as_bytes(), b"");
-        z.zipwarn(m::MISSING_END_3.as_bytes(), b"");
+        if fix == 1 {
+            z.zipwarn(m::F_MISSING_END_1.as_bytes(), b"");
+            z.zipwarn(m::F_MISSING_END_2.as_bytes(), b"");
+            z.zipwarn(m::F_MISSING_END_3.as_bytes(), b"");
+            z.zipwarn(m::F_MISSING_END_4.as_bytes(), b"");
+        } else {
+            z.zipwarn(m::MISSING_END_1.as_bytes(), b"");
+            z.zipwarn(m::MISSING_END_2.as_bytes(), b"");
+            z.zipwarn(m::MISSING_END_3.as_bytes(), b"");
+        }
         return Err(code(ZE_FORM));
     }
     let mut eocdr_offset = f.tell();
@@ -462,13 +507,13 @@ fn scanzipf_regnew(
     }
     let scbuf = padded(f.fread(ENDHEAD), ENDHEAD);
     let eocdr_disk = u64::from(sh(&scbuf, 0));
-    let mut total_disks = eocdr_disk + 1;
-    let mut current_in_disk = total_disks.wrapping_sub(1);
+    z.total_disks = eocdr_disk + 1;
+    z.current_in_disk = z.total_disks - 1;
     let mut in_cd_start_disk = u64::from(sh(&scbuf, 2));
     let mut in_cd_start_offset = u64::from(lg(&scbuf, 12));
     let mut cd_total_entries = u64::from(sh(&scbuf, 6));
     let cd_total_size = u64::from(lg(&scbuf, 8));
-    ar.total_disks = total_disks;
+    ar.total_disks = z.total_disks;
     let zcomlen = usize::from(sh(&scbuf, 16));
     if zcomlen > 0 {
         let c = f.fread(zcomlen);
@@ -481,7 +526,7 @@ fn scanzipf_regnew(
         // empty archive
         return Ok(());
     }
-    if total_disks != 1 {
+    if z.total_disks != 1 {
         // the archive's name must end in .zip for split archives
         if z.o.adjust {
             z.zipwarn(m::ADJUST_SPLITS.as_bytes(), b"");
@@ -497,16 +542,28 @@ fn scanzipf_regnew(
         }
     }
     // if input or output are split archives, they must be different
-    if (total_disks != 1 || z.o.split_method != 0) && z.o.show_files == 0 && in_path == out_path {
+    if (z.total_disks != 1 || z.o.split_method != 0) && z.o.show_files == 0 && in_path == out_path {
         z.zipwarn(m::CANNOT_UPDATE_SPLIT.as_bytes(), b"");
         return Err(code(ZE_PARMS));
     }
+    // if fixing, input and output must be different archives
+    if fix == 1 && in_path == out_path {
+        z.zipwarn(m::MUST_USE_OUT.as_bytes(), b"");
+        return Err(code(ZE_PARMS));
+    }
     let mut adjust_offset: u64 = 0;
-    if z.o.adjust {
+    // the offset of the archive in the file: adjusting, or fixing one disk
+    if (fix == 1 && z.total_disks == 1) || z.o.adjust {
         if in_cd_start_offset != ZIP_UWORD32_MAX && cd_total_size != ZIP_UWORD32_MAX {
+            // (a Zip64 end record of version 1, 56 bytes, is assumed)
             let cd_start = i128::from(eocdr_offset) - i128::from(cd_total_size) - 24 - 56;
             if !f.seek(cd_start) {
-                z.zipwarn(m::READING_ARCHIVE_FSEEK.as_bytes(), &strerror(f.errno));
+                warn_fix(
+                    z,
+                    m::F_SEEK_CENTRAL,
+                    m::READING_ARCHIVE_FSEEK,
+                    &strerror(f.errno),
+                );
                 return Err(code(ZE_FORM));
             }
             if find_signature(&mut f, b"PK\x01\x02", &mut sigbuf) {
@@ -518,7 +575,12 @@ fn scanzipf_regnew(
             }
         } else {
             if !f.seek(i128::from(eocdr_offset) - 24) {
-                z.zipwarn(m::READING_ARCHIVE_FSEEK.as_bytes(), &strerror(f.errno));
+                warn_fix(
+                    z,
+                    m::F_SEEK_EOCDL,
+                    m::READING_ARCHIVE_FSEEK,
+                    &strerror(f.errno),
+                );
                 return Err(code(ZE_FORM));
             }
             if at_signature(&mut f, b"PK\x06\x07") {
@@ -533,7 +595,9 @@ fn scanzipf_regnew(
                     return Err(Fail::Code(ZE_READ, Some(f.error())));
                 }
                 let z64eocdr_offset = llg(&loc, 4);
-                if lg(&loc, 12) != 1 {
+                z.total_disks = u64::from(lg(&loc, 12));
+                ar.total_disks = z.total_disks;
+                if z.total_disks != 1 {
                     z.zipwarn(m::ADJUST_SPLITS_NOT_SUPPORTED.as_bytes(), in_path);
                     z.zipwarn(m::TRY_FF.as_bytes(), b"");
                     return Err(code(ZE_FORM));
@@ -545,7 +609,12 @@ fn scanzipf_regnew(
                 if !at_signature(&mut f, b"PK\x06\x06") {
                     let start = i128::from(z64eocdl_offset) - 24 - 56;
                     if !f.seek(start) {
-                        z.zipwarn(m::READING_ARCHIVE_FSEEK.as_bytes(), &strerror(f.errno));
+                        warn_fix(
+                            z,
+                            m::F_SEEK_EOCDR,
+                            m::READING_ARCHIVE_FSEEK,
+                            &strerror(f.errno),
+                        );
                         return Err(code(ZE_FORM));
                     }
                     if find_next_signature(&mut f, &mut sigbuf) && &sigbuf == b"PK\x06\x06" {
@@ -575,51 +644,93 @@ fn scanzipf_regnew(
 
     // a Zip64 end of central directory locator?
     if !f.seek(i128::from(eocdr_offset) - 24) {
-        z.zipwarn(m::READING_ARCHIVE_FSEEK.as_bytes(), &strerror(f.errno));
+        warn_fix(
+            z,
+            m::F_BAD_SEEK_EOCDL,
+            m::READING_ARCHIVE_FSEEK,
+            &strerror(f.errno),
+        );
         return Err(code(ZE_FORM));
     }
-    if at_signature(&mut f, b"PK\x06\x07") {
+    let mut in_file = Some(f);
+    if at_signature(in_file.as_mut().expect("open"), b"PK\x06\x07") {
+        let f = in_file.as_mut().expect("open");
         let z64eocdl_offset = f.tell().wrapping_sub(4);
         let loc = f.fread(EC64LOC);
         if loc.len() != EC64LOC {
             z.zipwarn(m::READING_ARCHIVE.as_bytes(), &strerror(f.errno));
             return Err(Fail::Code(ZE_READ, Some(f.error())));
         }
-        if !at_signature(&mut f, b"PK\x05\x06") {
+        if !at_signature(f, b"PK\x05\x06") {
             z.zipwarn(m::UNABLE_TO_READ_EOCD.as_bytes(), in_path);
             return Err(Fail::Code(ZE_READ, Some(f.error())));
         }
         let z64eocdr_disk = u64::from(lg(&loc, 0));
         let z64eocdr_offset = llg(&loc, 4).wrapping_add(adjust_offset);
-        total_disks = u64::from(lg(&loc, 12));
-        ar.total_disks = total_disks;
-        if z64eocdr_disk != total_disks.wrapping_sub(1) {
-            // the Zip64 end record is on another part
-            return Err(Fail::NotBuilt);
+        z.total_disks = u64::from(lg(&loc, 12));
+        ar.total_disks = z.total_disks;
+        z.current_in_disk = z.total_disks.wrapping_sub(1);
+        if z64eocdr_disk != z.total_disks.wrapping_sub(1) {
+            // the Zip64 end record is on another part: done with this one
+            drop(in_file.take());
+            let mut split_path =
+                super::split::get_in_split_path(z, in_path, z64eocdr_disk).map_err(Fail::Exit)?;
+            loop {
+                if let Ok(f) = CFile::open(z, &split_path) {
+                    in_file = Some(f);
+                    break;
+                }
+                // ask where this part is (updates in_path)
+                let r =
+                    super::split::ask_for_split_read_path(z, z64eocdr_disk).map_err(Fail::Exit)?;
+                if r != super::split::ZE_OK {
+                    return Err(code(super::cli::ZE_ABORT));
+                }
+                let ip = z.o.in_path.clone().unwrap_or_default();
+                split_path =
+                    super::split::get_in_split_path(z, &ip, z64eocdr_disk).map_err(Fail::Exit)?;
+            }
         }
-        current_in_disk = z64eocdr_disk;
+        z.current_in_disk = z64eocdr_disk;
+        let f = in_file.as_mut().expect("open");
         if !f.seek(i128::from(z64eocdr_offset)) {
             z.zipwarn(m::READING_ARCHIVE_FSEEK.as_bytes(), &strerror(f.errno));
             return Err(code(ZE_FORM));
         }
-        if !at_signature(&mut f, b"PK\x06\x06") {
+        if !at_signature(f, b"PK\x06\x06") {
             let start = i128::from(z64eocdl_offset) - 24 - 56;
             if !f.seek(start) {
-                z.zipwarn(m::READING_ARCHIVE_FSEEK.as_bytes(), &strerror(f.errno));
+                warn_fix(
+                    z,
+                    m::F_BAD_SEEK_EOCDR,
+                    m::READING_ARCHIVE_FSEEK,
+                    &strerror(f.errno),
+                );
                 return Err(code(ZE_FORM));
             }
-            if find_next_signature(&mut f, &mut sigbuf) && &sigbuf == b"PK\x06\x06" {
+            if find_next_signature(f, &mut sigbuf) && &sigbuf == b"PK\x06\x06" {
                 adjust_offset = f.tell().wrapping_sub(4).wrapping_sub(z64eocdr_offset);
                 z.zipwarn(m::Z64_COMPENSATING.as_bytes(), b"");
                 z.zipwarn(m::TRY_A.as_bytes(), b"");
             } else {
-                z.zipwarn(m::Z64_EOCDR_NOT_FOUND.as_bytes(), in_path);
+                let ip = z.o.in_path.clone().unwrap_or_default();
+                if fix == 1 {
+                    z.zipwarn(m::F_Z64_NOT_IN_SPLIT.as_bytes(), &ip);
+                    z.zipwarn(m::TRY_FF.as_bytes(), b"");
+                } else {
+                    z.zipwarn(m::Z64_EOCDR_NOT_FOUND.as_bytes(), &ip);
+                }
                 return Err(code(ZE_FORM));
             }
         }
         let rec = f.fread(EC64REC);
         if rec.len() < EC64REC {
-            z.zipwarn(m::Z64_EOCDR_TRUNCATED.as_bytes(), b"");
+            if fix == 1 {
+                z.zipwarn(m::F_Z64_TRUNCATED.as_bytes(), b"");
+                z.zipwarn(m::TRY_FF.as_bytes(), b"");
+            } else {
+                z.zipwarn(m::Z64_EOCDR_TRUNCATED.as_bytes(), b"");
+            }
             return Err(code(ZE_FORM));
         }
         let version_needed = sh(&rec, 10);
@@ -638,8 +749,14 @@ fn scanzipf_regnew(
             z.zipwarn(&s, b"");
             z.zipwarn(m::SUPPORTS_UP_TO_46.as_bytes(), b"");
             z.zipwarn(m::UP_TO_45.as_bytes(), b"");
-            z.zipwarn(m::TRY_F_READ_ANYWAY.as_bytes(), b"");
-            return Err(code(ZE_FORM));
+            if fix == 1 {
+                z.zipwarn(m::F_TRY_FF_SALVAGE.as_bytes(), b"");
+            } else if fix == 2 {
+                z.zipwarn(m::FF_SALVAGING.as_bytes(), b"");
+            } else {
+                z.zipwarn(m::TRY_F_READ_ANYWAY.as_bytes(), b"");
+                return Err(code(ZE_FORM));
+            }
         }
     }
 
@@ -649,55 +766,110 @@ fn scanzipf_regnew(
     let mut zipbegset = false;
     ar.zipbeg = 0;
     let mut first_cd = true;
-    let mut in_file = Some(f);
-    if current_in_disk != in_cd_start_disk {
+    let mut skipped_disk = false;
+    // if the central directory starts on another disk, close this one
+    if z.current_in_disk != in_cd_start_disk {
         in_file = None;
     }
-    let mut disk = in_cd_start_disk;
-    while disk < total_disks {
-        if disk != total_disks - 1 {
-            // archive.z01, ...: another part
-            return Err(Fail::NotBuilt);
+    let zipfile = z.o.zipfile.clone().unwrap_or_default();
+    z.current_in_disk = in_cd_start_disk;
+    while z.current_in_disk < z.total_disks {
+        let disk = z.current_in_disk;
+        // the base is in_path as the questions left it
+        let base = z.o.in_path.clone().unwrap_or_default();
+        let mut split_path = disk_path(z, &base, disk)?;
+        if in_file.is_none() {
+            let mut skip_disk = false;
+            loop {
+                if let Ok(f) = CFile::open(z, &split_path) {
+                    in_file = Some(f);
+                    break;
+                }
+                // ask for the directory with the part (updates in_path)
+                let r = super::split::ask_for_split_read_path(z, disk).map_err(Fail::Exit)?;
+                if super::split::is_abort(r) {
+                    z.zipwarn(m::COULD_NOT_FIND_SPLIT.as_bytes(), &split_path);
+                    return Err(code(super::cli::ZE_ABORT));
+                } else if r == super::split::ANSWER_SKIP {
+                    // skip this disk
+                    let mut s = Vec::new();
+                    printf(&mut s, m::SKIPPING_DISK, &[disk.to_string().as_bytes()]);
+                    z.zipwarn(&s, b"");
+                    skip_disk = true;
+                    break;
+                }
+                // (the C makes the next try's name from the archive's name)
+                split_path = disk_path(z, &zipfile, disk)?;
+            }
+            if skip_disk {
+                // central headers are never split across disks
+                skipped_disk = true;
+                z.current_in_disk += 1;
+                continue;
+            }
         }
-        let split_path = in_path;
-        let mut f = match in_file.take() {
-            Some(f) => f,
-            None => match CFile::open(z, split_path) {
-                Ok(f) => f,
-                // the C asks where the part is (Task 8)
-                Err(_) => return Err(Fail::NotBuilt),
-            },
-        };
-        if first_cd {
+        let f = in_file.as_mut().expect("open");
+        if skipped_disk {
+            // the start disk was skipped: search from the start of this one
+            first_cd = false;
+        } else if first_cd {
             if !f.seek(i128::from(in_cd_start_offset)) {
-                z.zipwarn(m::UNABLE_TO_SEEK.as_bytes(), split_path);
+                z.zipwarn(m::UNABLE_TO_SEEK.as_bytes(), &split_path);
                 return Err(Fail::Code(ZE_READ, Some(f.error())));
             }
             first_cd = false;
         }
-        while find_next_signature(&mut f, &mut sigbuf) {
+        while find_next_signature(f, &mut sigbuf) {
             let current_in_offset = f.tell();
             if &sigbuf == b"PK\x05\x06" || &sigbuf == b"PK\x06\x06" {
                 break;
             } else if &sigbuf != b"PK\x01\x02" {
+                // this signature should not be here
+                let at = current_in_offset.wrapping_sub(4).to_string();
+                if fix == 1 {
+                    let mut s = m::F_UNEXPECTED_SIGNATURE.as_bytes().to_vec();
+                    s.extend_from_slice(&sig_hex(&sigbuf));
+                    printf(
+                        &mut s,
+                        m::SIG_ON_DISK,
+                        &[disk.to_string().as_bytes(), at.as_bytes()],
+                    );
+                    z.zipwarn(&s, b"");
+                    z.zipwarn(m::SKIPPING_SIGNATURE.as_bytes(), b"");
+                    continue;
+                }
                 let mut s = Vec::new();
                 printf(
                     &mut s,
                     m::UNEXPECTED_SIGNATURE,
+                    &[disk.to_string().as_bytes(), at.as_bytes()],
+                );
+                z.zipwarn(&s, b"");
+                z.zipwarn(m::NOT_IN_CORRECT_FORMAT.as_bytes(), &split_path);
+                z.zipwarn(m::TRY_F.as_bytes(), b"");
+                return Err(code(ZE_FORM));
+            }
+            if z.o.verbose > 0 && fix == 1 {
+                let mut s = Vec::new();
+                printf(
+                    &mut s,
+                    m::CENTRAL_SIG_ON_DISK,
                     &[
                         disk.to_string().as_bytes(),
                         current_in_offset.wrapping_sub(4).to_string().as_bytes(),
                     ],
                 );
-                z.zipwarn(&s, b"");
-                z.zipwarn(m::NOT_IN_CORRECT_FORMAT.as_bytes(), split_path);
-                z.zipwarn(m::TRY_F.as_bytes(), b"");
-                return Err(code(ZE_FORM));
+                z.mesg_write(&s);
             }
             let cen = f.fread(CENHEAD);
             if cen.len() != CENHEAD {
                 z.zipwarn(m::READING_CENTRAL.as_bytes(), &strerror(f.errno));
-                return Err(read_fail(&f));
+                if fix == 1 {
+                    z.zipwarn(m::F_ERROR_READING_CENTRAL.as_bytes(), b"");
+                    z.zipwarn(m::SKIPPING_ENTRY.as_bytes(), b"");
+                    continue;
+                }
+                return Err(read_fail(f));
             }
             let mut e = ZEntry {
                 vem: sh(&cen, 0),
@@ -723,27 +895,34 @@ fn scanzipf_regnew(
                     m::ZERO_LENGTH_NAME.as_bytes(),
                     (ar.zfiles.len() + 1).to_string().as_bytes(),
                 );
+                if fix == 1 {
+                    z.zipwarn(m::SKIPPING_ENTRY.as_bytes(), b"");
+                    continue;
+                }
                 return Err(code(ZE_FORM));
             }
             e.iname = f.fread(nam);
-            if e.iname.len() != nam {
-                return Err(read_fail(&f));
-            }
-            if cext > 0 {
+            let mut ok = e.iname.len() == nam;
+            if ok && cext > 0 {
                 e.cextra = f.fread(cext);
-                if e.cextra.len() != cext {
-                    return Err(read_fail(&f));
-                }
+                ok = e.cextra.len() == cext;
             }
-            if com > 0 {
+            if ok && com > 0 {
                 e.comment = f.fread(com);
-                if e.comment.len() != com {
-                    return Err(read_fail(&f));
+                ok = e.comment.len() == com;
+            }
+            if !ok {
+                if fix == 1 {
+                    z.zipwarn(m::ERROR_READING_ENTRY.as_bytes(), &strerror(f.errno));
+                    z.zipwarn(m::SKIPPING_ENTRY.as_bytes(), b"");
+                    continue;
                 }
+                return Err(read_fail(f));
             }
             // ubuntu: UNICODE_SUPPORT's bit-11 and Unicode Path names (Task 11)
             adjust_zip_central_entry(&mut e);
-            if z.o.adjust {
+            // adjusting for a prefix: add the offset
+            if (fix == 1 && z.total_disks == 1) || z.o.adjust {
                 e.off = e.off.wrapping_add(adjust_offset);
             }
             if e.dsk == 0 && (!zipbegset || e.off < ar.zipbeg) {
@@ -753,7 +932,7 @@ fn scanzipf_regnew(
             let zname = cstr(&e.iname).to_vec();
             e.name = zname.clone();
             e.oname = super::scan::display(z, &zname);
-            if z.o.verbose > 0 && z.o.fix == 0 {
+            if z.o.verbose > 0 && fix == 0 {
                 zipoddities(z, &e);
             }
             ar.zfiles.push(ZFile {
@@ -765,10 +944,13 @@ fn scanzipf_regnew(
                 dosflag,
             });
         }
+        // close this disk, on to the next
+        in_file = None;
         if &sigbuf != b"PK\x01\x02" {
+            // the Zip64 end record or the end record: done
             break;
         }
-        disk += 1;
+        z.current_in_disk += 1;
     }
     if ar.zfiles.len() as u64 != cd_total_entries {
         let mut s = Vec::new();
@@ -816,7 +998,7 @@ fn adjust_zip_central_entry(e: &mut ZEntry) {
 }
 
 /// zipfile.c:get_extra_field: the offset of the block tagged `tag`.
-fn get_extra_field(tag: u16, extra: &[u8]) -> Option<usize> {
+pub(crate) fn get_extra_field(tag: u16, extra: &[u8]) -> Option<usize> {
     let mut p = 0usize;
     while p + 4 < extra.len() {
         if sh(extra, p) == tag {
@@ -855,7 +1037,7 @@ pub(crate) fn copy_nondup_extra_fields(old: &[u8], new: &[u8]) -> Vec<u8> {
 
 /// zipfile.c:zipoddities: `-v`'s warnings about an entry read.
 // port: zipfile.c:zipoddities
-fn zipoddities(z: &mut Zr, e: &ZEntry) {
+pub(crate) fn zipoddities(z: &mut Zr, e: &ZEntry) {
     let oname = e.oname.clone();
     let warn = |z: &mut Zr, fmt: &str, args: &[&[u8]]| {
         let mut s = Vec::new();
@@ -910,17 +1092,60 @@ fn zipoddities(z: &mut Zr, e: &ZEntry) {
 /// opened when first needed and kept).
 pub(crate) struct InArchive {
     pub(crate) f: Option<CFile>,
-    pub(crate) path: Vec<u8>,
 }
 
-impl InArchive {
-    /// The stream, opened at the first use (`zfopen(split_path, FOPR)`).
-    fn get(&mut self, z: &mut Zr) -> Result<&mut CFile, io::Error> {
-        if self.f.is_none() {
-            self.f = Some(CFile::open(z, &self.path)?);
-        }
-        Ok(self.f.as_mut().expect("opened above"))
+/// Why the disk an entry starts on could not be opened: the answer to
+/// zip's question (`ZE_ABORT`, `ZE_FORM` to skip it), or the run's end.
+pub(crate) enum OpenFail {
+    Code(i32),
+    Exit(Exit),
+}
+
+/// zipfile.c:zipcopy's and readlocal's open of the disk an entry starts
+/// on (`start_disk`): the part already open if it is that one, else the
+/// part's file, asking where it is when it cannot be opened. `zipcopy`
+/// (`copying`) ends a quiet run there (`ZIPERR(ZE_OPEN, split_path)`).
+fn open_entry_disk(
+    z: &mut Zr,
+    ia: &mut InArchive,
+    start_disk: u64,
+    copying: bool,
+) -> Result<(), OpenFail> {
+    // don't assume reading the right disk
+    if start_disk != z.current_in_disk {
+        ia.f = None;
     }
+    z.current_in_disk = start_disk;
+    let ip = z.o.in_path.clone().unwrap_or_default();
+    let mut split_path =
+        super::split::get_in_split_path(z, &ip, start_disk).map_err(OpenFail::Exit)?;
+    while ia.f.is_none() {
+        match CFile::open(z, &split_path) {
+            Ok(f) => ia.f = Some(f),
+            Err(e) => {
+                if copying && !z.o.noisy {
+                    return Err(OpenFail::Exit(z.ziperr_os(ZE_OPEN, &split_path, &e)));
+                }
+                // ask for the directory with the part (updates in_path)
+                let r =
+                    super::split::ask_for_split_read_path(z, start_disk).map_err(OpenFail::Exit)?;
+                if !copying {
+                    if r != super::split::ZE_OK {
+                        return Err(OpenFail::Code(super::cli::ZE_ABORT));
+                    }
+                } else if super::split::is_abort(r) {
+                    return Err(OpenFail::Code(super::cli::ZE_ABORT));
+                } else if (z.o.fix == 1 || z.o.fix == 2) && r == super::split::ANSWER_SKIP {
+                    // skip this disk
+                    return Err(OpenFail::Code(ZE_FORM));
+                }
+                let ip = z.o.in_path.clone().unwrap_or_default();
+                split_path =
+                    super::split::get_in_split_path(z, &ip, start_disk).map_err(OpenFail::Exit)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What `readlocal` read of a local header.
@@ -934,12 +1159,13 @@ pub(crate) struct Local {
 /// the `ZE_*` code (the caller warns).
 // port: zipfile.c:readlocal
 pub(crate) fn readlocal(z: &mut Zr, ia: &mut InArchive, zf: &ZFile) -> Result<Local, i32> {
+    match open_entry_disk(z, ia, zf.e.dsk, false) {
+        Ok(()) => {}
+        Err(OpenFail::Code(c)) => return Err(c),
+        Err(OpenFail::Exit(x)) => return Err(x.code),
+    }
     let e = &zf.e;
-    let f = match ia.get(z) {
-        Ok(f) => f,
-        // the C asks where the part is (Task 8); its answer at EOF aborts
-        Err(_) => return Err(super::cli::ZE_ABORT),
-    };
+    let f = ia.f.as_mut().expect("opened above");
     if !f.seek(i128::from(e.off)) {
         let s = strerror(f.errno);
         ia.f = None;
@@ -994,7 +1220,7 @@ pub(crate) fn readlocal(z: &mut Zr, ia: &mut InArchive, zf: &ZFile) -> Result<Lo
 }
 
 /// The dots of `-U`'s copies (bfcopy, `copy_only` without `-dg`).
-fn copy_dot(z: &mut Zr, k: usize) {
+pub(crate) fn copy_dot(z: &mut Zr, k: usize) {
     if z.o.dot_size > 0 {
         if z.o.noisy && z.o.dot_count == -1 {
             z.mesg_write(b" ");
@@ -1019,17 +1245,78 @@ pub(crate) enum CopyFail {
     Exit(Exit),
 }
 
-/// fileio.c:bfcopy: `n` bytes from the archive to the new one (fewer when
-/// it ends first, as there).
+/// fileio.c:bfcopy's move to the next part of a split archive at the end
+/// of one: `Ok(false)` past the last part (the copy is done).
+// port: fileio.c:bfcopy (open next split)
+pub(crate) fn next_in_split(z: &mut Zr, ia: &mut InArchive) -> Result<bool, CopyFail> {
+    z.current_in_disk += 1;
+    if z.current_in_disk >= z.total_disks {
+        return Ok(false);
+    }
+    let ip = z.o.in_path.clone().unwrap_or_default();
+    let mut split_path = if z.current_in_disk == z.total_disks - 1 {
+        // the last disk is archive.zip
+        ip
+    } else {
+        super::split::get_in_split_path(z, &ip, z.current_in_disk).map_err(CopyFail::Exit)?
+    };
+    ia.f = None;
+    loop {
+        if let Ok(f) = CFile::open(z, &split_path) {
+            ia.f = Some(f);
+            break;
+        }
+        if z.o.fix == 1 && z.skip_this_disk != 0 {
+            return Err(CopyFail::Code(ZE_FORM, None));
+        }
+        // ask where the part is (updates in_path)
+        let r =
+            super::split::ask_for_split_read_path(z, z.current_in_disk).map_err(CopyFail::Exit)?;
+        if super::split::is_abort(r) {
+            z.zipwarn(m::COULD_NOT_FIND_SPLIT.as_bytes(), &split_path);
+            return Err(CopyFail::Code(super::cli::ZE_ABORT, None));
+        }
+        if r == super::split::ANSWER_EOF {
+            z.zipmessage_nl(b"", true);
+            z.zipwarn(m::USER_ENDED_READING.as_bytes(), b"");
+            return Err(CopyFail::Code(ZE_EOF, None));
+        }
+        if z.o.fix == 2 && z.skip_this_disk != 0 {
+            z.zipwarn(m::SKIPPING_SPLIT_FILE.as_bytes(), &split_path);
+            z.current_in_disk += 1;
+        }
+        split_path = if z.current_in_disk == z.total_disks.wrapping_sub(1) {
+            z.o.in_path.clone().unwrap_or_default()
+        } else {
+            // (the C makes this name from the archive's name)
+            let zf = z.o.zipfile.clone().unwrap_or_default();
+            super::split::get_in_split_path(z, &zf, z.current_in_disk).map_err(CopyFail::Exit)?
+        };
+    }
+    if z.o.fix == 2 && z.skip_this_disk != 0 {
+        return Err(CopyFail::Code(ZE_FORM, None));
+    }
+    Ok(true)
+}
+
+/// fileio.c:bfcopy: `n` bytes from the archive to the new one, on from
+/// one part of a split archive to the next at a part's end (fewer when the
+/// archive ends first, as there).
 // port: fileio.c:bfcopy
-pub(crate) fn bfcopy(z: &mut Zr, f: &mut CFile, out: &mut ZOut, n: u64) -> Result<(), CopyFail> {
+pub(crate) fn bfcopy(
+    z: &mut Zr,
+    ia: &mut InArchive,
+    out: &mut ZOut,
+    n: u64,
+) -> Result<(), CopyFail> {
     let copy_dots = z.o.copy_only && !z.o.display_globaldots;
     if copy_dots {
         z.o.dot_count = -1;
     }
-    let mut done: u64 = 0;
-    while done < n {
-        let brd = (n - done).min(CBSZ as u64) as usize;
+    let mut m: u64 = 0;
+    while m < n {
+        let brd = (n - m).min(CBSZ as u64) as usize;
+        let Some(f) = ia.f.as_mut() else { break };
         let b = f.fread(brd);
         if b.is_empty() {
             if f.ferror() {
@@ -1040,12 +1327,11 @@ pub(crate) fn bfcopy(z: &mut Zr, f: &mut CFile, out: &mut ZOut, n: u64) -> Resul
         let r = out.bfwrite(&b, Bf::Data);
         super::zipup::drain_dots(z, out);
         r.map_err(CopyFail::Write)?;
-        done += b.len() as u64;
+        m += b.len() as u64;
         if copy_dots {
             copy_dot(z, b.len());
         }
-        if f.feof() {
-            // one disk: past its end the copy is done
+        if m < n && ia.f.as_ref().is_some_and(CFile::feof) && !next_in_split(z, ia)? {
             break;
         }
     }
@@ -1065,17 +1351,12 @@ pub(crate) fn zipcopy(
     tempzn: &mut u64,
     zf: &mut ZFile,
 ) -> Result<(), CopyFail> {
-    let noisy = z.o.noisy;
-    let f = match ia.get(z) {
-        Ok(f) => f,
-        Err(e) => {
-            // ruling: the C asks where the part is when noisy (Task 8's
-            // prompt); stuffr answers as quiet zip does
-            let _ = noisy;
-            let p = ia.path.clone();
-            return Err(CopyFail::Exit(z.ziperr_os(ZE_OPEN, &p, &e)));
-        }
-    };
+    match open_entry_disk(z, ia, zf.e.dsk, true) {
+        Ok(()) => {}
+        Err(OpenFail::Code(c)) => return Err(CopyFail::Code(c, None)),
+        Err(OpenFail::Exit(x)) => return Err(CopyFail::Exit(x)),
+    }
+    let f = ia.f.as_mut().expect("opened above");
     if !f.seek(i128::from(zf.e.off)) {
         let (s, err) = (strerror(f.errno), f.error());
         ia.f = None;
@@ -1133,8 +1414,9 @@ pub(crate) fn zipcopy(
     // the sizes from the central directory
     lz.len = zf.e.len;
     lz.siz = zf.e.siz;
-    // the disk and offset in the new archive
-    zf.e.dsk = 0;
+    // the disk and offset in the new archive (before putlocal: a header
+    // moved to the next split leaves them as they were, as in the C)
+    zf.e.dsk = out.current_disk;
     zf.e.off = out.w.offset();
     if zf.e.flg & 1 == 0 {
         // not encrypted: no data descriptor
@@ -1163,12 +1445,35 @@ pub(crate) fn zipcopy(
             return Err(CopyFail::Exit(super::zipup::put_failed(z, &lz, pe)));
         }
     }
-    let f = ia.f.as_mut().expect("opened above");
-    bfcopy(z, f, out, lz.siz)?;
+    let r = bfcopy(z, ia, out, lz.siz);
+    if let Err(CopyFail::Code(super::cli::ZE_ABORT, _)) = r {
+        return Err(CopyFail::Exit(z.ziperr(
+            super::cli::ZE_ABORT,
+            m::COULD_NOT_FIND_SPLIT_ABORT.as_bytes(),
+        )));
+    }
+    let (code, err) = match r {
+        Ok(()) => (0, None),
+        Err(CopyFail::Code(c, e)) => (c, e),
+        Err(e) => return Err(e),
+    };
+    if code == ZE_EOF || z.skip_this_disk != 0 {
+        // missing disk
+        z.zipwarn(m::ABORTING_ENTRY.as_bytes(), &zf.e.oname.clone());
+        // tell the scan to skip this entry
+        return Err(CopyFail::Code(if code == 0 { ZE_FORM } else { code }, None));
+    }
     if zf.e.flg & 8 != 0 {
         let r = super::zipfile::putextended(&lz, out);
         super::zipup::drain_dots(z, out);
         r.map_err(CopyFail::Write)?;
+    }
+    // now the split with the local header can be closed
+    let r = out.close_local_split();
+    super::zipup::drain_dots(z, out);
+    r.map_err(CopyFail::Write)?;
+    if code != 0 {
+        return Err(CopyFail::Code(code, err));
     }
     Ok(())
 }

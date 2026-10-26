@@ -117,8 +117,8 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
         bytes_total,
         ..
     } = c;
-    // Tasks 8 (splits), 9 (encryption) and 11 (bzip2)
-    if z.o.key.is_some() || z.o.key_needed || z.o.split_method > 0 || z.o.method == Method::Bzip2 {
+    // Tasks 9 (encryption) and 11 (bzip2)
+    if z.o.key.is_some() || z.o.key_needed || z.o.method == Method::Bzip2 {
         return z.not_built();
     }
     let zipfile = z.o.zipfile.clone().unwrap_or_default();
@@ -128,6 +128,10 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
     let has_files = !ar.zfiles.is_empty();
     // d is true if appending (-g)
     let d = z.o.grow && k == 0 && (ar.zipbeg != 0 || has_files);
+    // just ignore the spanning signature of a multi-disk archive
+    if has_files && z.total_disks != 1 && ar.zipbeg == 4 {
+        ar.zipbeg = 0;
+    }
     let mut zip_attributes: u32 = 0;
     // Make sure the zip file is writeable (the C leaves the check to the
     // end when -b names the temp's directory and there is no archive).
@@ -164,13 +168,42 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
     if z.o.show_what_doing {
         z.mesg_write(m::SD_OPEN_ZIP.as_bytes());
     }
-    let mut ia = InArchive {
-        f: None,
-        path: in_path.clone(),
-    };
+    let mut ia = InArchive { f: None };
     let mut temp = Temp { path: None };
     let mut _armed = None;
     let mut tempzip: Vec<u8> = b"-".to_vec();
+    let mut temp_dir: Vec<u8> = Vec::new();
+    if d && !to_stdout && z.total_disks > 1 {
+        return z.ziperr(ZE_PARMS, m::CANNOT_GROW_SPLIT.as_bytes());
+    }
+    // something at the beginning of disk 1 to copy: open that disk now
+    if !to_stdout && !d && ar.zipbeg != 0 {
+        let ip = z.o.in_path.clone().unwrap_or_default();
+        let mut p = match super::split::get_in_split_path(z, &ip, 0) {
+            Ok(p) => p,
+            Err(x) => return x,
+        };
+        loop {
+            if let Ok(f) = readzip::CFile::open(z, &p) {
+                ia.f = Some(f);
+                break;
+            }
+            // ask for the directory with the part (updates in_path)
+            match super::split::ask_for_split_read_path(z, 0) {
+                Err(x) => return x,
+                Ok(super::split::ZE_OK) => {}
+                Ok(_) => {
+                    return z.ziperr(super::cli::ZE_ABORT, m::COULD_NOT_OPEN_TO_READ.as_bytes());
+                }
+            }
+            // (the C tries disk 1's name next)
+            let ip = z.o.in_path.clone().unwrap_or_default();
+            p = match super::split::get_in_split_path(z, &ip, 1) {
+                Ok(p) => p,
+                Err(x) => return x,
+            };
+        }
+    }
     let sink: Box<dyn ZWrite> = if to_stdout {
         stdout_sink(&z.host)
     } else {
@@ -190,6 +223,7 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
                 None => Vec::new(),
             },
         };
+        temp_dir = dir.clone();
         let (name, r) = mkstemp(&z.host, &dir);
         tempzip = name;
         match r {
@@ -221,8 +255,31 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
         dot_size: z.o.dot_size,
         dot_count: z.o.dot_count,
     });
+    let mut out = ZOut::new(sink, z.o.force_zip64, gdots);
+    out.split_size = z.o.split_size;
+    if z.o.split_method > 0 && !to_stdout {
+        // the splits own the temporary from here
+        temp.path = None;
+        let prompt = super::split::prompt(z);
+        out.split = Some(Box::new(super::split::SplitW {
+            method: z.o.split_method,
+            bell: z.o.split_bell,
+            noisy_splits: z.o.noisy_splits,
+            out_path: out_path.clone(),
+            temp_dir: temp_dir.clone(),
+            env: super::split::SplitEnv::of(&z.host),
+            tempzip: tempzip.clone(),
+            guard: _armed.take(),
+            published: false,
+            local: None,
+            lost: Vec::new(),
+            zip_attributes,
+            prompt,
+            fnmax: flavour::fnmax(z.flavour),
+        }));
+    }
     let mut w = Wr {
-        out: ZOut::new(sink, z.o.force_zip64, gdots),
+        out,
         deflater: None,
         use_descriptors,
         tempzn: 0,
@@ -238,19 +295,33 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
     // central directory)
     if !to_stdout {
         let upto = if d { ar.cenbeg } else { ar.zipbeg };
-        if upto > 0 {
+        if d && upto > 0 {
             let f = match readzip::CFile::open(z, &in_path) {
                 Ok(f) => f,
-                // the C asks where the first part is (Task 8)
                 Err(e) => return z.ziperr_os(ZE_OPEN, &in_path, &e),
             };
             ia.f = Some(f);
-            let f = ia.f.as_mut().expect("opened above");
-            if let Err(fail) = readzip::bfcopy(z, f, &mut w.out, upto) {
-                return copy_failed_plain(z, fail, &zipfile);
-            }
         }
+        if upto > 0
+            && ia.f.is_some()
+            && let Err(fail) = readzip::bfcopy(z, &mut ia, &mut w.out, upto)
+        {
+            return copy_failed_plain(z, fail, &zipfile);
+        }
+        ia.f = None;
         w.tempzn = upto;
+        if z.o.split_method > 0 && !d {
+            // the spanning signature at the top of the archive
+            if z.o.show_what_doing {
+                z.mesg_write(m::SD_SPANNING.as_bytes());
+            }
+            let r = w.out.bfwrite(b"PK\x07\x08", zipfile::Bf::Data);
+            drain_dots(z, &mut w.out);
+            if let Err(err) = r {
+                return write_failed(z, &err);
+            }
+            w.tempzn += 4;
+        }
     }
     let mut o = false;
 
@@ -355,29 +426,77 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
                 }
                 Action::Archive => {
                     display_running_stats(z, &w);
+                    let fix = z.o.fix;
+                    // moved to another disk: copy again
+                    if z.skip_this_disk.wrapping_sub(1) != zf.e.dsk {
+                        z.skip_this_disk = 0;
+                    }
+                    let skipping = z.skip_this_disk.wrapping_sub(1) == zf.e.dsk;
                     let oname = zf.e.oname.clone();
                     let mut l = Vec::new();
-                    printf(&mut l, m::COPYING, &[&oname]);
-                    l.extend_from_slice(&usize_text(z, zf.e.len));
+                    if skipping {
+                        printf(&mut l, m::SKIPPING_ENTRY_NAME, &[&oname]);
+                    } else {
+                        printf(&mut l, m::COPYING, &[&oname]);
+                        l.extend_from_slice(&usize_text(z, zf.e.len));
+                    }
                     let (noisy, logall) = (z.o.noisy, z.o.logall);
                     start_line(z, &l, noisy, logall);
                     let siz = zf.e.siz;
-                    if let Err(f) = zipcopy(z, &mut ia, &mut w.out, &mut w.tempzn, &mut zf) {
-                        z.zipwarn(m::TRY_F_TO_FIX.as_bytes(), b"");
-                        return copy_failed(z, f, &oname);
+                    let mut ok = true;
+                    if skipping {
+                        // skip the entries on this disk
+                        zf.mark = 0;
+                    } else if let Err(f) = zipcopy(z, &mut ia, &mut w.out, &mut w.tempzn, &mut zf) {
+                        match f {
+                            // ZIPERR inside zipcopy or bfwrite: already ended
+                            CopyFail::Exit(x) => return x,
+                            CopyFail::Write(err) => return write_failed(z, &err),
+                            CopyFail::Code(super::cli::ZE_ABORT, _) => {
+                                return z.ziperr(
+                                    super::cli::ZE_ABORT,
+                                    m::USER_REQUESTED_ABORT.as_bytes(),
+                                );
+                            }
+                            CopyFail::Code(code, _) if fix == 1 => {
+                                // back over the entry in the output, to write
+                                // the next over it
+                                let at = w.out.current_local_offset;
+                                if w.out.w.seek_raw(at).is_err() {
+                                    return z.ziperr(code, m::COULD_NOT_SEEK_OUTPUT.as_bytes());
+                                }
+                                z.zipwarn(m::BAD_SKIPPING.as_bytes(), &oname);
+                                w.tempzn = at;
+                                w.out.w.set_offset(at);
+                                ok = false;
+                            }
+                            f => {
+                                z.zipwarn(m::TRY_F_TO_FIX.as_bytes(), b"");
+                                return copy_failed(z, f, &oname);
+                            }
+                        }
                     }
-                    if z.o.noisy && z.mesg_line_started {
-                        z.mesg_write(b"\n");
-                        z.set_line(false);
-                    }
-                    if z.o.logall && z.log_line_started {
-                        z.log_write(b"\n");
-                        z.log_line_started = false;
+                    if z.skip_this_disk != 0 || fix != 1 || ok {
+                        if z.o.noisy && z.mesg_line_started {
+                            z.mesg_write(b"\n");
+                            z.set_line(false);
+                        }
+                        if z.o.logall && z.log_line_started {
+                            z.log_write(b"\n");
+                            z.log_line_started = false;
+                        }
                     }
                     w.files_so_far += 1;
-                    w.good_bytes_so_far = w.good_bytes_so_far.wrapping_add(siz);
+                    if ok {
+                        w.good_bytes_so_far = w.good_bytes_so_far.wrapping_add(siz);
+                    } else {
+                        w.bad_bytes_so_far = w.bad_bytes_so_far.wrapping_add(siz);
+                    }
                     w.bytes_so_far = w.bytes_so_far.wrapping_add(siz);
-                    zfiles.push(zf);
+                    if ok || fix != 1 {
+                        zfiles.push(zf);
+                    }
+                    // (-F: a bad entry is removed from the list)
                 }
                 Action::Delete => {
                     display_running_stats(z, &w);
@@ -633,9 +752,19 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
     for (i, e) in picked.into_iter().zip(central) {
         zfiles[i].e = e;
     }
+    // the last split is the temporary published as the archive
+    let split = w.out.split.take();
+    if let Some(sp) = &split {
+        tempzip = sp.tempzip.clone();
+    }
     // fclose(y)
     if let Err(err) = w.out.w.flush() {
-        return z.ziperr_os(if d { ZE_WRITE } else { ZE_TEMP }, &shown_temp, &err);
+        let shown = if split.is_some() {
+            tempzip.clone()
+        } else {
+            shown_temp.clone()
+        };
+        return z.ziperr_os(if d { ZE_WRITE } else { ZE_TEMP }, &shown, &err);
     }
     let zip64_archive = w.out.zip64_archive;
     let good = w.good_bytes_so_far;
@@ -657,8 +786,16 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
         if !d && z.o.show_what_doing {
             z.mesg_write(m::SD_REPLACING.as_bytes());
         }
-        let tmp = temp.path.take().unwrap_or_default();
-        if let Err((code, err)) = replace(&z.host.path(&out_path), &tmp) {
+        let (tmp, out_path) = match &split {
+            Some(sp) => (sp.env.path(&sp.tempzip), sp.out_path.clone()),
+            None => (temp.path.take().unwrap_or_default(), out_path.clone()),
+        };
+        let r = replace(&z.host.path(&out_path), &tmp);
+        if let Some(mut sp) = split {
+            // published or left as the new archive: not removed
+            sp.published = true;
+        }
+        if let Err((code, err)) = r {
             // the new archive stays, under the temporary name
             z.zipwarn(m::NEW_ZIP_LEFT_AS.as_bytes(), &tempzip);
             return zerr(z, code, m::WAS_REPLACING.as_bytes(), Some(&err));

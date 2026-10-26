@@ -10,8 +10,8 @@
 //! the archive cannot be rewound (a pipe) or `-fd` asks for data
 //! descriptors.
 //!
-//! Splits (`-s`, `bfwrite`'s other half) are Task 8's; this writer is one
-//! disk, number 0.
+//! Splits (`-s`, `-sp`): `bfwrite` moves to the next split where one is
+//! full (`split.rs` keeps the splits).
 
 use std::io::{self, Write};
 
@@ -103,6 +103,18 @@ pub(crate) trait ZWrite: Write {
     /// `ferror(y)`: the error a write of the stream met (sticky, as stdio's
     /// error flag), with the `errno` it left.
     fn ferror(&self) -> Option<io::Error>;
+    /// `zfseeko(y, at, SEEK_SET)` that leaves `bytes_this_split` (the
+    /// count [`ZWrite::offset`] gives) as it is: `-F`/`-FF` move back over
+    /// an entry they drop and write the next over it.
+    fn seek_raw(&mut self, _at: u64) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(29))
+    }
+    /// `zftello(y)`: where the stream really is.
+    fn tell_raw(&mut self) -> io::Result<u64> {
+        Err(io::Error::from_raw_os_error(29))
+    }
+    /// `bytes_this_split = at`.
+    fn set_offset(&mut self, _at: u64) {}
 }
 
 /// What `bfwrite` is writing (fileio.c's `BFWRITE_*`).
@@ -125,17 +137,41 @@ pub(crate) struct GlobalDots {
     pub(crate) dot_count: i64,
 }
 
+/// What `bfwrite` printed to `mesg` (or rang) where its caller holds the
+/// message layer, passed on in order by `zipup::drain_dots`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Pend {
+    /// `-dg`'s dots and their leading space (a dot starts a line).
+    Dots(Vec<u8>),
+    /// `fprintf(mesg, ...)`: written as it is, the line state untouched.
+    Raw(Vec<u8>),
+    /// `if (mesg_line_started) fprintf(mesg, "\n")`.
+    NlIfLine,
+    /// `zipmessage(text, "")`.
+    Message(Vec<u8>),
+}
+
 /// The archive being written and `bfwrite`'s globals (fileio.c, zip.c).
 pub(crate) struct ZOut {
+    /// `y`: the archive, or the split being written.
     pub(crate) w: Box<dyn ZWrite>,
     /// `bytes_this_entry`: data bytes of the current entry.
     pub(crate) bytes_this_entry: u64,
     /// `current_local_offset`
     pub(crate) current_local_offset: u64,
-    /// `cd_start_offset`, once the first central header is written.
-    cd_start_offset: Option<u64>,
-    /// `cd_entries_this_disk`, `total_cd_entries`.
-    cd_entries: u64,
+    /// `current_local_disk`: the split the last local header went to.
+    pub(crate) current_local_disk: u64,
+    /// `current_disk`: the split being written (0 without splits).
+    pub(crate) current_disk: u64,
+    /// `bytes_prev_splits`
+    pub(crate) bytes_prev_splits: u64,
+    /// `cd_start_disk` and `cd_start_offset`, once the first central header
+    /// is written.
+    cd_start: Option<(u64, u64)>,
+    /// `cd_entries_this_disk`
+    pub(crate) cd_entries_this_disk: u64,
+    /// `total_cd_entries`
+    total_cd_entries: u64,
     /// `zip64_entry`: the current entry's headers use Zip64.
     pub(crate) zip64_entry: bool,
     /// `zip64_archive`: an entry needed Zip64.
@@ -144,9 +180,13 @@ pub(crate) struct ZOut {
     pub(crate) force_zip64: i8,
     /// `-dg`'s state, when it is on.
     pub(crate) gdots: Option<GlobalDots>,
-    /// Dots (and the leading space) `bfwrite` printed and the caller has
-    /// not yet passed to `mesg`.
-    pub(crate) dots: Vec<u8>,
+    /// What `bfwrite` printed that the caller has not yet passed to `mesg`.
+    pub(crate) pending: Vec<Pend>,
+    /// `-s`/`-sp`: the splits (`split_method` 1 or 2), when splitting.
+    pub(crate) split: Option<Box<super::split::SplitW>>,
+    /// `split_size`, also when not splitting (`-s 64k -s-`: what does not
+    /// fit is not written, as in the C).
+    pub(crate) split_size: u64,
 }
 
 impl ZOut {
@@ -155,43 +195,97 @@ impl ZOut {
             w,
             bytes_this_entry: 0,
             current_local_offset: 0,
-            cd_start_offset: None,
-            cd_entries: 0,
+            current_local_disk: 0,
+            current_disk: 0,
+            bytes_prev_splits: 0,
+            cd_start: None,
+            cd_entries_this_disk: 0,
+            total_cd_entries: 0,
             zip64_entry: false,
             zip64_archive: false,
             force_zip64,
             gdots,
-            dots: Vec::new(),
+            pending: Vec::new(),
+            split: None,
+            split_size: 0,
         }
     }
 
-    /// fileio.c:bfwrite for an archive of one disk: writes `b` whole and
-    /// keeps the counts; `-dg` prints its dots here.
+    /// The dots `bfwrite` has printed and not yet passed on (tests).
+    #[cfg(test)]
+    pub(crate) fn pending_dots(&self) -> Vec<u8> {
+        let mut d = Vec::new();
+        for p in &self.pending {
+            if let Pend::Dots(b) = p {
+                d.extend_from_slice(b);
+            }
+        }
+        d
+    }
+
+    fn dot(&mut self, c: u8) {
+        if let Some(Pend::Dots(d)) = self.pending.last_mut() {
+            d.push(c);
+        } else {
+            self.pending.push(Pend::Dots(vec![c]));
+        }
+    }
+
+    /// fileio.c:bfwrite: writes `b`, keeps the counts, and with splits
+    /// moves to the next split where this one is full (a header is never
+    /// split: it goes whole to the next); `-dg` prints its dots here.
     // port: fileio.c:bfwrite
     pub(crate) fn bfwrite(&mut self, b: &[u8], mode: Bf) -> io::Result<()> {
         if mode == Bf::LocalHeader {
             self.bytes_this_entry = 0;
+            // the local header's split is the current one from now on
+            if let Some(s) = self.split.as_mut() {
+                s.local_header_starts();
+            }
+            self.current_local_disk = self.current_disk;
             self.current_local_offset = self.w.offset();
         }
-        if mode == Bf::CentralHeader {
-            if self.cd_start_offset.is_none() {
-                self.cd_start_offset = Some(self.w.offset());
-            }
-            self.cd_entries += 1;
-        }
-        let r = if b.is_empty() {
-            Ok(())
+        let header = mode != Bf::Data;
+        let split_size = self.split_size;
+        let left = if split_size == 0 {
+            b.len() as u64
         } else {
-            self.w.write_all(b)
+            split_size.saturating_sub(self.w.offset())
         };
-        if r.is_ok() && mode == Bf::Data {
-            self.bytes_this_entry += b.len() as u64;
+        let mut to_write = b.len();
+        if to_write as u64 > left {
+            // a header that does not fit goes whole to the next split; data
+            // fills this one
+            to_write = if header { 0 } else { left as usize };
+        }
+        if mode == Bf::CentralHeader {
+            if self.cd_start.is_none() {
+                self.cd_start = Some((self.current_disk, self.w.offset()));
+            }
+            self.cd_entries_this_disk += 1;
+            self.total_cd_entries += 1;
+        }
+        let mut written = 0usize;
+        let mut result = Ok(());
+        if to_write > 0 {
+            match self.w.write_all(&b[..to_write]) {
+                Ok(()) => written = to_write,
+                Err(e) => result = Err(e),
+            }
+            if mode == Bf::Data {
+                self.bytes_this_entry += written as u64;
+            }
+        }
+        // without splits the rest is not written (a write error is
+        // `ferror(y)`'s, answered by the caller)
+        if written < b.len() && self.split.is_some() {
+            result = self.next_split(&b[written..], mode, result.err());
         }
         // display dots for the archive instead of for each file
-        if let Some(g) = self.gdots.as_mut() {
+        if let Some(mut g) = self.gdots {
             if g.dot_size > 0 {
                 if g.dot_count == -1 {
-                    self.dots.push(b' ');
+                    self.dot(b' ');
                     // assume a header will be written first, so avoid 0
                     g.dot_count = 1;
                 }
@@ -205,10 +299,18 @@ impl ZOut {
             }
             if g.dot_size != 0 && g.dot_count == 0 {
                 g.dot_count += 1;
-                self.dots.push(b'.');
+                self.dot(b'.');
             }
+            self.gdots = Some(g);
         }
-        r
+        result
+    }
+
+    /// The end record's disk fields: `current_disk`, `cd_start_disk` (0
+    /// when no central header was written), `cd_start_offset`.
+    fn end_disks(&self) -> (u64, u64, u64) {
+        let (d, o) = self.cd_start.unwrap_or((0, 0));
+        (self.current_disk, d, o)
     }
 }
 
@@ -461,6 +563,11 @@ pub(crate) fn putlocal(z: &mut ZEntry, out: &mut ZOut) -> Result<(), PutError> {
 /// the first, where the caller has seeked (`z.off`).
 pub(crate) fn putlocal_rewrite(z: &mut ZEntry, out: &mut ZOut) -> Result<(), PutError> {
     let b = local_header(z, out, true)?;
+    if out.split.as_ref().is_some_and(|s| s.method == 1) {
+        // also when splitting: to the split with the local header, which
+        // can be closed now if it is not the current one
+        return out.rewrite_in_local_split(&b).map_err(PutError::Write);
+    }
     out.w.write_here(&b).map_err(PutError::Write)
 }
 
@@ -530,12 +637,23 @@ pub(crate) fn putcentral(z: &mut ZEntry, out: &mut ZOut) -> Result<(), PutError>
 /// central directory of `s` bytes at `c`, the archive comment.
 // port: zipfile.c:putend
 pub(crate) fn putend(out: &mut ZOut, n: u64, s: u64, c: u64, comment: &[u8]) -> io::Result<()> {
-    let _ = c; // the C writes `cd_start_offset`, the same on one disk
-    let current_disk: u64 = 0;
+    putend_with(out, n, s, c, comment.len(), comment)
+}
+
+/// [`putend`] with the comment's length `m` given apart: `-FF` keeps the
+/// length of a comment it could not read (`zcomlen`) and writes no bytes
+/// for it (`append_string_to_mem` of NULL).
+pub(crate) fn putend_with(
+    out: &mut ZOut,
+    n: u64,
+    s: u64,
+    c: u64,
+    m: usize,
+    comment: &[u8],
+) -> io::Result<()> {
+    let (current_disk, cd_start_disk, cd_start_offset) = out.end_disks();
+    let zip64_eocd_disk = current_disk;
     let zip64_eocd_offset = out.w.offset();
-    let cd_start_disk: u64 = 0;
-    let cd_start_offset = out.cd_start_offset.unwrap_or(0);
-    let cd_entries = out.cd_entries;
     let mut b = Vec::with_capacity(98 + comment.len());
     if n > ZIP_UWORD16_MAX || s > ZIP_UWORD32_MAX || c > ZIP_UWORD32_MAX || out.zip64_archive {
         put32(&mut b, ZIP64_CENTRAL_DIR_TAIL_SIG);
@@ -545,27 +663,27 @@ pub(crate) fn putend(out: &mut ZOut, n: u64, s: u64, c: u64, comment: &[u8]) -> 
         put16(&mut b, ZIP64_MIN_VER);
         put32(&mut b, current_disk as u32);
         put32(&mut b, cd_start_disk as u32);
-        put64(&mut b, cd_entries);
+        put64(&mut b, out.cd_entries_this_disk);
         put64(&mut b, n);
         put64(&mut b, s);
         put64(&mut b, cd_start_offset);
         put32(&mut b, ZIP64_CENTRAL_DIR_TAIL_END_SIG);
-        put32(&mut b, current_disk as u32);
+        put32(&mut b, zip64_eocd_disk as u32);
         put64(&mut b, zip64_eocd_offset);
         put32(&mut b, (current_disk + 1) as u32);
     }
     put32(&mut b, ENDSIG);
     put16(&mut b, current_disk.min(0xffff) as u16);
     put16(&mut b, cd_start_disk.min(0xffff) as u16);
-    put16(&mut b, cd_entries.min(0xffff) as u16);
-    put16(&mut b, cd_entries.min(0xffff) as u16);
+    put16(&mut b, out.cd_entries_this_disk.min(0xffff) as u16);
+    put16(&mut b, out.total_cd_entries.min(0xffff) as u16);
     put32(&mut b, s.min(ZIP_UWORD32_MAX) as u32);
     if out.force_zip64 == 1 || cd_start_offset > ZIP_UWORD32_MAX {
         put32(&mut b, 0xffff_ffff);
     } else {
         put32(&mut b, cd_start_offset as u32);
     }
-    put16(&mut b, comment.len() as u16);
+    put16(&mut b, m as u16);
     b.extend_from_slice(comment);
     out.bfwrite(&b, Bf::Header)
 }

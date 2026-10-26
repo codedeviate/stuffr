@@ -1337,3 +1337,153 @@ pub(super) const BLANK_DC: &str = "   /    ";
 pub(super) const BLANK_DB: &str = "     /      ";
 /// zip.c:ziperr under `-g` (`tempzip == zipfile`).
 pub(super) const ATTEMPTING_RESTORE: &str = "attempting to restore %s to its previous state\n";
+
+// ---- Task 8: -F, -FF and split archives ----
+
+/// fileio.c:ask_for_split_read_path, the part not found (`%s` its path).
+pub(super) const COULD_NOT_FIND: &str = "\n\nCould not find:\n  %s\n";
+/// fileio.c:ask_for_split_read_path, the choices (each starts a line).
+pub(super) const HIT_C: &str = "\nHit c      (change path to where this split file is)";
+pub(super) const HIT_S: &str = "\n    s      (skip this split)";
+pub(super) const HIT_Q: &str = "\n    q      (abort archive - quit)";
+pub(super) const HIT_E: &str = "\n    e      (end this archive - no more splits)";
+pub(super) const HIT_Z: &str = "\n    z      (look for .zip split - the last split)";
+pub(super) const HIT_ENTER_CONTINUE: &str = "\n or ENTER  (continue with this split): ";
+pub(super) const HIT_ENTER_AGAIN: &str = "\n or ENTER  (try reading this split again): ";
+/// fileio.c:ask_for_split_read_path, after `c`.
+pub(super) const ENTER_SPLIT_PATH: &str =
+    "\nEnter path where this split is (ENTER = same dir, . = current dir)\n: ";
+/// fileio.c:ask_for_split_read_path and ask_for_split_write_path, the
+/// directory of a bare name.
+pub(super) const CURRENT_DIRECTORY: &str = "(current directory)";
+/// fileio.c:ask_for_split_read_path, the path tried again.
+pub(super) const COULD_NOT_FIND_OR_OPEN: &str = "\nCould not find or open\n  %s\n";
+/// fileio.c:ask_for_split_read_path, after a new path.
+pub(super) const FOUND_SPLIT: &str = "Found:  %s\n";
+/// fileio.c:ask_for_split_read_path, the path as it was.
+pub(super) const FOUND_SPLIT_NL: &str = "\nFound:  %s\n";
+/// fileio.c:ask_for_split_write_path (`%s`: the disk, then the directory).
+pub(super) const OPENING_DISK: &str = "\nOpening disk %s\nHit ENTER to write to default path of\n  %s\nor enter a new directory path (. for cur dir) and hit ENTER\n";
+pub(super) const SPLIT_PATH_PROMPT: &str = "\nPath (or hit ENTER to continue): ";
+pub(super) const WRITING_TO: &str = "Writing to:\n  %s\n";
+/// fileio.c:close_split, under `-sv`.
+pub(super) const CLOSING_SPLIT: &str = "\tClosing split ";
+/// fileio.c:bfwrite's errors.
+pub(super) const COULD_NOT_WRITE_SPLIT: &str = "Could not write split";
+pub(super) const NOT_ENOUGH_SPACE_SPLIT: &str = "Not enough space to write split";
+pub(super) const NOT_ENOUGH_ROOM: &str = "Not enough room on disk";
+/// fileio.c:get_in_split_path, get_out_split_path.
+pub(super) const MORE_THAN_99999: &str = "More than 99999 splits needed";
+/// zip.c:rename_split
+pub(super) const WAS_REPLACING_SPLIT: &str = "was replacing split file";
+/// fileio.c:bfcopy, zipfile.c:scanzipf_regnew and scanzipf_fixnew.
+pub(super) const COULD_NOT_FIND_SPLIT: &str = "could not find split: ";
+pub(super) const USER_ENDED_READING: &str = "user ended reading - closing archive";
+pub(super) const SKIPPING_SPLIT_FILE: &str = "skipping split file: ";
+pub(super) const SEEK_FAILED_DESCRIPTOR: &str = "seek failed reading descriptor";
+/// zipfile.c:scanzipf_regnew and scanzipf_fixnew (`%s` the disk number).
+pub(super) const SKIPPING_DISK: &str = "skipping disk %s ...\n";
+/// zipfile.c:scanzipf_regnew under -F.
+pub(super) const F_MISSING_END_1: &str = "bad archive - missing end signature";
+pub(super) const F_MISSING_END_2: &str = "(If downloaded, was binary mode used?  If not, the";
+pub(super) const F_MISSING_END_3: &str = " archive may be scrambled and not recoverable)";
+pub(super) const F_MISSING_END_4: &str = "Can't use -F to fix (try -FF)";
+pub(super) const MUST_USE_OUT: &str = "must use --out when fixing an archive";
+pub(super) const F_SEEK_CENTRAL: &str = "could not seek back to start of central directory: ";
+pub(super) const F_SEEK_EOCDL: &str = "could not seek back to Zip64 EOCDL: ";
+pub(super) const F_BAD_SEEK_EOCDL: &str = "bad archive - could not seek back to Zip64 EOCDL: ";
+pub(super) const F_SEEK_EOCDR: &str = "could not seek back to Zip64 EOCDR: ";
+pub(super) const F_BAD_SEEK_EOCDR: &str = "bad archive - could not seek back to Zip64 EOCDR: ";
+pub(super) const F_Z64_NOT_IN_SPLIT: &str = "bad archive - Zip64 EOCDR not found in split:  ";
+pub(super) const F_Z64_TRUNCATED: &str = "bad archive - Zip64 EOCDR bad or truncated";
+pub(super) const F_TRY_FF_SALVAGE: &str = "If -F fails try -FF to try to salvage something";
+pub(super) const FF_SALVAGING: &str = "Attempting to salvage what can";
+/// zipfile.c:scanzipf_regnew under -F (`%s` the four bytes as `%02x `).
+pub(super) const F_UNEXPECTED_SIGNATURE: &str = "bad archive - unexpected signature ";
+/// zipfile.c:scanzipf_regnew and scanzipf_fixnew, after the bytes.
+pub(super) const SIG_ON_DISK: &str = "on disk %s at %s\n";
+pub(super) const SKIPPING_SIGNATURE: &str = "skipping this signature...";
+pub(super) const CENTRAL_SIG_ON_DISK: &str =
+    "central directory header signature on disk %s at %s\n";
+pub(super) const F_ERROR_READING_CENTRAL: &str = "bad archive - error reading central directory";
+pub(super) const SKIPPING_ENTRY: &str = "skipping this entry...";
+pub(super) const ERROR_READING_ENTRY: &str = "error reading entry:  ";
+/// zipfile.c:scanzipf_fixnew
+pub(super) const FF_NEED_ZIP: &str = "if archive to fix is split archive, need to provide\n      path of the last split with .zip extension,\n      even if it doesn't exist (zip will ask for splits)";
+pub(super) const FF_COULD_NOT_OPEN: &str = "could not open input archive: ";
+pub(super) const FF_MISSING_EOCDR: &str = "Missing end (EOCDR) signature - either this archive\n                     is not readable or the end is damaged";
+pub(super) const FF_EOCDR_SHORT: &str = "End record (EOCDR) only %s bytes - assume truncated";
+pub(super) const FF_EOCDR_BAD_DISKS: &str =
+    "End record (EOCDR) has bad disk numbers - ignoring EOCDR";
+pub(super) const FF_COMMENT_TRUNCATED: &str = "zipfile comment truncated - ignoring";
+pub(super) const FF_EXPECT_SPLITS: &str = " Found end record (EOCDR) - says expect %s splits";
+pub(super) const FF_EXPECT_SINGLE: &str =
+    " Found end record (EOCDR) - says expect single disk archive";
+pub(super) const FF_FOUND_COMMENT: &str = "  Found archive comment";
+pub(super) const FF_SINGLE_DISK_Q: &str = "Is this a single-disk archive?  (y/n): ";
+pub(super) const FF_ASSUMING_SINGLE: &str = "  Assuming single-disk archive";
+pub(super) const FF_SCANNING: &str = "Scanning for entries...";
+/// zipfile.c:scanzipf_fixnew (`%s`: the disk, `%2lu`, then the offset,
+/// `%6s`).
+pub(super) const FF_EOCDR_FOUND: &str = "EOCDR found (%s %s)...";
+pub(super) const FF_Z64_EOCDR_FOUND: &str = "Zip64 EOCDR found (%s %s)...";
+pub(super) const FF_Z64_EOCDL_FOUND: &str = "Zip64 EOCDL found (%s %s)...";
+pub(super) const FF_LOCAL: &str = " Local (%s %s):";
+pub(super) const FF_ENTRY_AFTER_CENTRAL: &str = "Entry after central directory found (%s %s)...";
+pub(super) const FF_CENTRAL_FOUND: &str = "Central Directory found...";
+pub(super) const FF_CEN: &str = " Cen   (%s %s): ";
+pub(super) const FF_CEN_UPDATING: &str = "updating: %s";
+pub(super) const FF_CRC_MISMATCH: &str = "local (%s) and cen (%s) crc mismatch";
+pub(super) const FF_WRITING_SEEK: &str = "writing archive seek: ";
+pub(super) const FF_ERROR_REWRITING: &str = "Error rewriting local header";
+pub(super) const FF_WRITE_SEEK: &str = "write archive seek: ";
+pub(super) const FF_SEEK_AFTER_LOCAL: &str = "seek after local: ";
+pub(super) const FF_NO_LOCAL_ENTRY: &str = "no local entry: %s";
+pub(super) const FF_SPAN_NOT_EXPECTED: &str =
+    "  Found spanning marker, but did not expect split (multi-disk) archive...";
+pub(super) const FF_SPAN_EXPECTED: &str =
+    "  Found spanning marker - expected as this is split (multi-disk) archive...";
+pub(super) const FF_SPAN_MAYBE: &str = "  Found spanning marker - could be split archive...";
+pub(super) const FF_UNEXPECTED_SIGNATURE: &str = "unexpected signature ";
+/// zipfile.c:zipcopy under -FF (`%s`: the number).
+pub(super) const FF_ILLEGAL_HOST: &str = "Illegal host system mapping in local header:  %s";
+pub(super) const FF_ILLEGAL_PKVER: &str = "Illegal PK version mapping in local header:  %s";
+pub(super) const FF_UNRECOGNIZED_METHOD: &str =
+    "Unrecognized compression method in local header:  %s";
+pub(super) const FF_SKIPPING: &str = "Skipping:  ";
+pub(super) const FF_COPYING: &str = " copying: %s ";
+pub(super) const FF_BYTES: &str = " (%s bytes)";
+pub(super) const FF_ENTRY_TRUNCATED: &str = "entry truncated: ";
+pub(super) const FF_EXPECTED_SIZE: &str = "expected compressed/stored size %s, actual %s";
+pub(super) const FF_NO_END_OF_STREAM: &str = "no end of stream entry found: ";
+pub(super) const FF_REWINDING: &str = "rewinding and scanning for later entries";
+/// zipfile.c:zipcopy
+pub(super) const COULD_NOT_FIND_SPLIT_ABORT: &str = "Could not find split";
+pub(super) const ABORTING_ENTRY: &str = "aborting: ";
+pub(super) const SEEK_FAILED_OUTPUT: &str = "seek failed on output file";
+/// zip.c:main, `-F`'s copy loop.
+pub(super) const SKIPPING_ENTRY_NAME: &str = " skipping: %s";
+pub(super) const BAD_SKIPPING: &str = "bad - skipping: ";
+pub(super) const COULD_NOT_SEEK_OUTPUT: &str = "could not seek in output file";
+pub(super) const USER_REQUESTED_ABORT: &str = "user requested abort";
+/// zip.c:main, an input split archive's first part.
+pub(super) const NO_INFO_INPUT_SPLIT: &str = "Could not get info for input split: ";
+/// zip.c:main, `-sv`.
+pub(super) const SPLITSIZE: &str = "splitsize = ";
+/// zip.c:main, -FF's `sd:` lines.
+pub(super) const SD_OPEN_FF: &str = "sd: Open zip file and create temp file (-FF)\n";
+pub(super) const SD_CREATING_FF: &str = "sd: Creating new zip file (-FF)\n";
+pub(super) const SD_WRITING_CENTRAL_FF: &str = "sd: Writing central directory (-FF)\n";
+/// zip.c:main, the spanning signature's `sd:` line.
+pub(super) const SD_SPANNING: &str = "sd: Adding spanning/splitting signature at top of archive\n";
+/// zip.c:main, `-g` over a split archive.
+pub(super) const CANNOT_GROW_SPLIT: &str = "cannot grow split archive";
+/// zip.c:main, the first part of the archive could not be opened.
+pub(super) const COULD_NOT_OPEN_TO_READ: &str = "could not open archive to read";
+/// zipfile.c:readzipfile, `-F` with no archive.
+pub(super) const NO_ZIP_FOUND_1: &str = "No .zip file found\n        ";
+pub(super) const NO_ZIP_FOUND_2: &str =
+    "(If all you have are splits (.z01, .z02, ...) and no .zip, try -FF)";
+/// zipup.c:zipup, the data written is not the size counted.
+pub(super) const SIZE_ACTUAL: &str = " s=%s, actual=%s ";
+pub(super) const INCORRECT_COMPRESSED_SIZE: &str = "incorrect compressed size";

@@ -43,7 +43,14 @@ pub(crate) fn display_running_stats(z: &mut Zr, w: &Wr) {
     let mut parts: Vec<Vec<u8>> = Vec::new();
     if z.o.display_volume {
         let mut s = Vec::new();
-        printf(&mut s, m::DV, &[b"1", b"1"]);
+        printf(
+            &mut s,
+            m::DV,
+            &[
+                (z.current_in_disk + 1).to_string().as_bytes(),
+                (w.out.current_disk + 1).to_string().as_bytes(),
+            ],
+        );
         parts.push(s);
     }
     if z.o.display_counts {

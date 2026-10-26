@@ -519,7 +519,7 @@ pub(crate) fn create_excl_armed(host: &Host, path: &Path) -> io::Result<(File, C
         }
         #[cfg(not(unix))]
         {
-            let _ = host;
+            let _ = real;
             Ok((f, CleanupGuard {}))
         }
     })
@@ -598,7 +598,7 @@ pub(crate) fn zip_mesg_state(host: &Host, to_stderr: bool, line_started: bool) {
 /// ([`on_zip_abort`]) writes `\n`, another `\n` when a line was started
 /// ([`zip_mesg_state`]), then `text` (`\nzip error: Interrupted
 /// (aborting)\n`) to `mesg`, removes the temporary armed with
-/// [`create_new_armed`] if any, and exits 9. Installed for the whole run;
+/// [`create_new_armed_if`] if any, and exits 9. Installed for the whole run;
 /// under `Host::Sandbox` nothing is installed.
 ///
 /// As zip's, the handler takes SIGSEGV and SIGBUS too, without
@@ -667,8 +667,11 @@ extern "C" fn on_zip_abort(_sig: libc::c_int) {
 /// [`install_zip_abort`]); the signals are held back between the create
 /// and the arm. Dropping the guard only disarms. Under `Host::Sandbox`,
 /// for a path the slot cannot hold, and off unix, nothing is armed.
-pub(crate) fn create_new_armed(
-    host: &Host,
+///
+/// `real` is false for a sandboxed run (`Host::Sandbox`), which arms
+/// nothing: the caller may hold no [`Host`] (zip's split writer).
+pub(crate) fn create_new_armed_if(
+    real: bool,
     path: &Path,
     signals: Signals,
 ) -> io::Result<(File, CleanupGuard)> {
@@ -686,7 +689,7 @@ pub(crate) fn create_new_armed(
             use std::os::unix::ffi::OsStrExt;
             let bytes = path.as_os_str().as_bytes();
             let kind = GuardKind::Abort;
-            if matches!(host, Host::Sandbox(_)) || bytes.len() >= SLOT_LEN || bytes.contains(&0) {
+            if !real || bytes.len() >= SLOT_LEN || bytes.contains(&0) {
                 return Ok((f, CleanupGuard { armed: false, kind }));
             }
             fill_slot(bytes, signals);
@@ -694,7 +697,7 @@ pub(crate) fn create_new_armed(
         }
         #[cfg(not(unix))]
         {
-            let _ = host;
+            let _ = real;
             Ok((f, CleanupGuard {}))
         }
     })

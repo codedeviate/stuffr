@@ -26,7 +26,7 @@ use super::messages::{self as m, printf};
 use super::scan::Found;
 use super::unix::{self, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
 use super::zipfile::{
-    Bf, LOCHEAD, PutError, ZEntry, ZOut, putextended, putlocal, putlocal_rewrite,
+    Bf, LOCHEAD, Pend, PutError, ZEntry, ZOut, putextended, putlocal, putlocal_rewrite,
 };
 use super::{Exit, Zr};
 use crate::compat::host::{self, Host};
@@ -320,14 +320,25 @@ enum Data {
     Read(Src),
 }
 
-/// Pass on the dots `bfwrite` printed for `-dg`.
+/// Pass on what `bfwrite` printed: `-dg`'s dots, and the split messages,
+/// bells and questions (`-sv`, `-sb`, `-sp`), in order.
 pub(crate) fn drain_dots(z: &mut Zr, out: &mut ZOut) {
-    if !out.dots.is_empty() {
-        let d = std::mem::take(&mut out.dots);
-        z.mesg_write(&d);
-        // the leading space does not start a line; a dot does
-        if d.contains(&b'.') {
-            z.set_line(true);
+    for p in std::mem::take(&mut out.pending) {
+        match p {
+            Pend::Dots(d) => {
+                z.mesg_write(&d);
+                // the leading space does not start a line; a dot does
+                if d.contains(&b'.') {
+                    z.set_line(true);
+                }
+            }
+            Pend::Raw(b) => z.mesg_write(&b),
+            Pend::NlIfLine => {
+                if z.mesg_line_started {
+                    z.mesg_write(b"\n");
+                }
+            }
+            Pend::Message(b) => z.zipmessage(&b, b""),
         }
     }
 }
@@ -596,8 +607,9 @@ pub(crate) fn add_entry(
     if let Some(err) = w.out.w.ferror() {
         return Err(z.ziperr_os(ZE_WRITE, m::UNEXPECTED_ERROR_ON_ZIP.as_bytes(), &err));
     }
+    // now get split information set by bfwrite()
     e.off = w.out.current_local_offset;
-    e.dsk = 0;
+    e.dsk = w.out.current_local_disk;
     w.tempzn += 4 + LOCHEAD + e.iname.len() as u64 + e.extra.len() as u64;
 
     // Write stored or deflated file to zip file
@@ -717,6 +729,8 @@ pub(crate) fn add_entry(
         e.len = isize;
         // zfseeko() flushes the stream: a write that fails there makes the
         // seek fail, and zip writes a descriptor instead
+        // (with splits zip seeks the current split too, wherever the local
+        // header is)
         if w.use_descriptors || w.out.w.seek_to(e.off).is_err() {
             if e.how != m_ {
                 return Err(z.ziperr(ZE_LOGIC, m::CANT_REWRITE_METHOD.as_bytes()));
@@ -734,6 +748,20 @@ pub(crate) fn add_entry(
             // level bits 1-2 cleared)
             e.flg = e.lflg;
         } else {
+            // ftell() is not as useful across splits
+            if w.out.bytes_this_entry != s {
+                let mut l = Vec::new();
+                printf(
+                    &mut l,
+                    m::SIZE_ACTUAL,
+                    &[
+                        s.to_string().as_bytes(),
+                        w.out.bytes_this_entry.to_string().as_bytes(),
+                    ],
+                );
+                z.mesg_write(&l);
+                return Err(z.ziperr(ZE_LOGIC, m::INCORRECT_COMPRESSED_SIZE.as_bytes()));
+            }
             e.how = m_;
             e.ver = if m_ == STORE { 10 } else { 20 };
             // not encrypting, so no extended local header
@@ -741,7 +769,13 @@ pub(crate) fn add_entry(
                 e.flg &= !8;
             }
             e.lflg = e.flg;
-            match putlocal_rewrite(&mut e, &mut w.out) {
+            // the split with the local header, if it is not the current one
+            if let Err(err) = w.out.seek_local_split(e.off) {
+                return Err(was_zipping(z, ZE_READ, &e, &err));
+            }
+            let r = putlocal_rewrite(&mut e, &mut w.out);
+            drain_dots(z, &mut w.out);
+            match r {
                 Ok(()) => {}
                 // putlocal's own `return ZE_TEMP` for its fwrite
                 Err(PutError::Write(err)) => return Err(was_zipping(z, ZE_TEMP, &e, &err)),
@@ -805,6 +839,9 @@ pub(crate) fn put_failed(z: &mut Zr, e: &ZEntry, pe: PutError) -> Exit {
 
 /// zip.c:main, `ZIPERR(r, "was zipping <name>")` for a code zipup returns.
 fn was_zipping(z: &mut Zr, code: i32, e: &ZEntry, err: &io::Error) -> Exit {
+    if let Some(x) = super::split::split_fail_exit(z, err) {
+        return x;
+    }
     let mut h = Vec::new();
     printf(&mut h, m::WAS_ZIPPING, &[&e.oname]);
     zerr(z, code, &h, Some(err))
@@ -815,6 +852,9 @@ fn was_zipping(z: &mut Zr, code: i32, e: &ZEntry, err: &io::Error) -> Exit {
 /// file")`, whatever was being written (zipup's own `return ZE_TEMP` after
 /// a failed `zfwrite` is never reached in the C).
 pub(crate) fn write_failed(z: &mut Zr, err: &io::Error) -> Exit {
+    if let Some(x) = super::split::split_fail_exit(z, err) {
+        return x;
+    }
     z.ziperr_os(ZE_WRITE, m::WRITE_ERROR_ON_ZIP.as_bytes(), err)
 }
 

@@ -44,6 +44,128 @@ mod unix {
         );
     }
 
+    /// Task 8: `-F` and `-FF` over damaged archives and split sets, with
+    /// the answers to zip's questions.
+    #[test]
+    fn fix_modes_match_the_reference() {
+        let f = platform_zip_flavour();
+        let cases = zip_fix_matrix(f);
+        assert!(cases.len() >= 80, "{} cases", cases.len());
+        run_group(
+            &format!("zip fix ({f})"),
+            &cases,
+            Skipped::none(),
+            &assert_same_zip,
+        );
+    }
+
+    /// Task 8: split archives written (`-s`, `-sp`, `-sb`, `-sv`), and the
+    /// split archives zip refuses to change.
+    #[test]
+    fn splits_are_byte_identical() {
+        let f = platform_zip_flavour();
+        let mut cases = zip_split_matrix(f);
+        if f == "apple" {
+            // `-sp` at the end of standard input: Apple's build goes on as
+            // with ENTER, which is ruling Z5's answer (Ubuntu's asks again
+            // for ever: pinned stuffr-only below)
+            let mut c = zip_case(
+                "zip",
+                &["-s", "64k", "-sp", "t.zip", "big"],
+                ZipTree::standard().file("big", random(200_000, 7)),
+            );
+            c.stdin = Some(Vec::new());
+            cases.push(c);
+        }
+        assert!(cases.len() >= 30, "{} cases", cases.len());
+        run_group(
+            &format!("zip splits ({f})"),
+            &cases,
+            Skipped::none(),
+            &assert_same_zip,
+        );
+    }
+
+    /// Rulings Z5 and Z19, stuffr only, both flavours: the end of standard
+    /// input at a question about a part to read answers `q`, at `-sp`'s
+    /// question ENTER; `-FF` copies a local extra field into the central one
+    /// up to its first NUL, zeros after.
+    #[test]
+    fn fix_and_split_rulings_hold_in_both_flavours() {
+        for flavour in ["apple", "ubuntu"] {
+            let run = |args: &[&'static str], tree: ZipTree, stdin: &[u8]| {
+                let mut c = zip_case("zip", args, tree);
+                c.zip_flavour = Some(flavour);
+                c.stdin = Some(stdin.to_vec());
+                stuffr_zip(&c)
+            };
+            let cut = || ZipTree::standard().file("in.zip", zip_data("cut-central.zip"));
+            // -FF: the questions end as `q` does
+            let eof = run(&["-FF", "in.zip", "--out", "f.zip"], cut(), b"");
+            let q = run(&["-FF", "in.zip", "--out", "f.zip"], cut(), b"n\nq\n");
+            assert_eq!(eof.code, 0, "{flavour}");
+            assert_eq!(eof.code, q.code, "{flavour}");
+            assert_eq!(eof.stdout, q.stdout, "{flavour}");
+            let text = String::from_utf8_lossy(&eof.stdout);
+            assert!(
+                text.ends_with(
+                    "or ENTER  (try reading this split again): \tzip warning: could not find split: in.z01\n\tzip warning: zip file empty\n"
+                ),
+                "{flavour}: {text}"
+            );
+            let f = |r: &ZipRun| match r.tree.get(&b"f.zip"[..]) {
+                Some(UnzipNode::File { bytes, .. }) => bytes.clone(),
+                other => panic!("{flavour}: f.zip is {other:?}"),
+            };
+            assert_eq!(f(&eof).len(), 22, "{flavour}: an empty archive");
+            // -F, a part missing: as `q` (exit 9, could not find split)
+            let set = zip_split_set(flavour);
+            let missing = || with_parts(zip_split_tree(), &set, &["s.z02"]);
+            let eof = run(&["-F", "s.zip", "--out", "f.zip"], missing(), b"");
+            let q = run(&["-F", "s.zip", "--out", "f.zip"], missing(), b"q\n");
+            assert_eq!((eof.code, &eof.stdout), (q.code, &q.stdout), "{flavour}");
+            assert_eq!(eof.code, 9, "{flavour}");
+            assert!(
+                String::from_utf8_lossy(&eof.stdout)
+                    .ends_with("\nzip error: Interrupted (Could not find split)\n"),
+                "{flavour}"
+            );
+            // -sp: the end of standard input is ENTER
+            let big = || ZipTree::standard().file("big", random(200_000, 7));
+            let args = &["-s", "64k", "-sp", "t.zip", "big"][..];
+            let eof = run(args, big(), b"");
+            let enter = run(args, big(), b"\n\n\n\n");
+            assert_eq!(eof.code, 0, "{flavour}");
+            assert_eq!(
+                (eof.code, &eof.stdout),
+                (enter.code, &enter.stdout),
+                "{flavour}"
+            );
+            for part in ["t.z01", "t.z02", "t.z03", "t.zip"] {
+                assert!(eof.tree.contains_key(part.as_bytes()), "{flavour}: {part}");
+            }
+            // ruling Z19: the central extra field is the local one up to its
+            // first NUL, then zeros
+            let r = run(
+                &["-FF", "in.zip", "--out", "f.zip"],
+                ZipTree::standard().file("in.zip", zip_data("extra-cut.zip")),
+                b"y\n",
+            );
+            assert_eq!(r.code, 0, "{flavour}");
+            let b = f(&r);
+            let cen = b
+                .windows(4)
+                .position(|w| w == b"PK\x01\x02")
+                .expect("a central header");
+            let nam = usize::from(u16::from_le_bytes([b[cen + 28], b[cen + 29]]));
+            let ext = usize::from(u16::from_le_bytes([b[cen + 30], b[cen + 31]]));
+            assert_eq!((nam, ext), (5, 28), "{flavour}");
+            let extra = &b[cen + 46 + nam..cen + 46 + nam + ext];
+            assert_eq!(&extra[..4], b"UT\x09\x00", "{flavour}");
+            assert!(extra[4..].iter().all(|&x| x == 0), "{flavour}: {extra:?}");
+        }
+    }
+
     /// `zip - names` with standard output a file that is not at its start:
     /// appended to (`>>`, `O_APPEND`) and positioned after other output
     /// (`{ printf pre; zip - ...; } > file`). zip rewrites a local header at

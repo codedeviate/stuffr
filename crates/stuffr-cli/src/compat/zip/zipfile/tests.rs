@@ -114,9 +114,9 @@ fn global_dots_follow_bfwrite() {
     };
     let mut out = ZOut::new(Box::new(Mem(Vec::new())), -1, Some(g));
     out.bfwrite(b"header", Bf::LocalHeader).unwrap();
-    assert_eq!(out.dots, b" ");
+    assert_eq!(out.pending_dots(), b" ");
     for _ in 0..40 {
         out.bfwrite(&[0u8; 1024], Bf::Data).unwrap();
     }
-    assert_eq!(out.dots, b" .");
+    assert_eq!(out.pending_dots(), b" .");
 }

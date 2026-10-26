@@ -161,6 +161,54 @@ impl ZWrite for FileSink {
             None => io::Error::from(kind),
         })
     }
+    fn seek_raw(&mut self, at: u64) -> io::Result<()> {
+        self.flush()?;
+        self.f.get_mut().f.seek(SeekFrom::Start(at)).map(|_| ())
+    }
+    fn tell_raw(&mut self) -> io::Result<u64> {
+        self.flush()?;
+        self.f.get_mut().f.stream_position()
+    }
+    fn set_offset(&mut self, at: u64) {
+        self.pos = at;
+    }
+}
+
+/// The archive while no split is open (between closing one and opening the
+/// next): every call fails.
+pub(crate) struct Closed;
+
+impl Write for Closed {
+    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+        Err(io::Error::from_raw_os_error(9))
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl ZWrite for Closed {
+    fn seekable(&self) -> bool {
+        false
+    }
+    fn offset(&self) -> u64 {
+        0
+    }
+    fn seek_to(&mut self, _at: u64) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(9))
+    }
+    fn write_here(&mut self, _bytes: &[u8]) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(9))
+    }
+    fn seek_end(&mut self) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(9))
+    }
+    fn seek_here(&mut self) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(9))
+    }
+    fn ferror(&self) -> Option<io::Error> {
+        None
+    }
 }
 
 /// A stream the archive is written to that cannot be rewound (a pipe, a
@@ -261,6 +309,16 @@ impl Drop for Temp {
 /// if the run is interrupted before the guard drops). The name tried last
 /// is returned with the error.
 pub(crate) fn mkstemp(host: &Host, dir: &[u8]) -> (Vec<u8>, io::Result<(File, CleanupGuard)>) {
+    mkstemp_with(matches!(host, Host::Real), &|b: &[u8]| host.path(b), dir)
+}
+
+/// [`mkstemp`] for a caller without a [`Host`]: `real` arms the handler,
+/// `resolve` makes a name a path.
+pub(crate) fn mkstemp_with(
+    real: bool,
+    resolve: &dyn Fn(&[u8]) -> PathBuf,
+    dir: &[u8],
+) -> (Vec<u8>, io::Result<(File, CleanupGuard)>) {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     let mut seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -276,7 +334,7 @@ pub(crate) fn mkstemp(host: &Host, dir: &[u8]) -> (Vec<u8>, io::Result<(File, Cl
             seed ^= seed << 17;
             name.push(CHARS[(seed % CHARS.len() as u64) as usize]);
         }
-        match host::create_new_armed(host, &host.path(&name), host::ZIP_SIGNALS) {
+        match host::create_new_armed_if(real, &resolve(&name), host::ZIP_SIGNALS) {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             r => return (name, r),
         }

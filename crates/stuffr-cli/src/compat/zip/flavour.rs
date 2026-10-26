@@ -104,6 +104,17 @@ pub(crate) fn stale_errno_after_warning(f: Flavour) -> bool {
     f == Flavour::Ubuntu
 }
 
+/// tailor.h:FNMAX (`PATH_MAX`): macOS's 1024, glibc's 4096. The split
+/// prompts read lines of this size (`fgets(buf, FNMAX, stdin)` for `-sp`,
+/// `FNMAX + 4010` when asking where a part to read is), so a longer answer
+/// is read in pieces, each its own answer.
+pub(crate) fn fnmax(f: Flavour) -> usize {
+    match f {
+        Flavour::Apple => 1024,
+        Flavour::Ubuntu => 4096,
+    }
+}
+
 /// Ubuntu sets general-purpose bit 11 for any valid non-ASCII UTF-8 name in
 /// every locale and writes no Unicode path field for it; Apple never sets
 /// it. For Task 11.
