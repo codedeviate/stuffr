@@ -460,6 +460,19 @@ read list.
 > **3165** tests under `--all-features`, **3052** on the default tier —
 > measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
+> `0.19.0` adds the zip family: `zip`, `zipcloak`, `zipnote` and `zipsplit`
+> answer as Info-ZIP Zip 3.0 does, in two flavours — Apple's `/usr/bin/zip`
+> (the default on macOS and the BSDs) and Ubuntu's `zip 3.0-13ubuntu0.2`
+> (elsewhere), or `STUFFR_ZIP_FLAVOR=apple|ubuntu`. stdout, stderr, exit
+> codes and every archive byte are the reference's; encrypted entries are
+> compatible, identical outside their 12-byte headers and encrypted data.
+> Thirty deviations are listed in "The zip family" below; the ones that
+> matter most keep your data where zip can lose it (an archive that is its
+> own input, `-m` before the archive is written, an interrupt while the new
+> archive replaces the old). `install-links` makes thirty-one names.
+> **3364** tests under `--all-features`, **3251** on the default tier —
+> measured from this bump's own `make check`, `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own

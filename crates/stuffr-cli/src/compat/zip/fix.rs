@@ -585,10 +585,7 @@ fn scanzipf_fixnew(
                                         name: &name,
                                     },
                                 );
-                                match u {
-                                    Ok(u) => sc.ar.zfiles[i].e.uname = u,
-                                    Err(x) => return Err(x),
-                                }
+                                sc.ar.zfiles[i].e.uname = u?;
                             }
                         }
                         let zf = &mut sc.ar.zfiles[i];
