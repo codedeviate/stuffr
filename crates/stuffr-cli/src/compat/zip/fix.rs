@@ -24,8 +24,8 @@
 //! is distinct; once two entries share a name the flavour's `qsort` runs
 //! over all entries at each central header met after new entries, as in
 //! the C (an unstable `qsort` orders equal names its own way): quadratic
-//! then in the number of local headers alternating with central ones. In a sandbox every byte `-FF` reads is
-//! charged to the output budget. The parts of a split archive are opened
+//! then in the number of local headers alternating with central ones. In a
+//! sandbox every byte `-FF` reads is charged to the output budget. The parts of a split archive are opened
 //! through `Host::track`.
 //!
 //! Undefined behaviour in the C, not reproduced (deviation 19):

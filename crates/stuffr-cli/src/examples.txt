@@ -472,14 +472,14 @@ CONVERTING BETWEEN FORMATS
   status says so. Check it.
 
   A codec with no magic bytes (brotli, raw deflate) nested INSIDE another
-  codec cannot be detected by content, so it is not peeled and stays in
-  the output: gzip over brotli named `x.gz`, converted to `x.xz`, is xz
-  over brotli. unpack and cat behave the same way, and so does entry
-  mode: such a layer beneath the container is not peeled either. And whatever sits
-  beneath it is invisible too — gzip over brotli over tar reads as a plain
-  gzip stream, so converting it to `.tar.xz` is the plain -> container
-  refusal above. As the OUTERMOST layer such a codec is still found by
-  IN's extension (`.br`).
+  codec cannot be detected by content, so it is not peeled and stays in the
+  output: gzip over brotli named `x.gz`, converted to `x.xz`, is xz over
+  brotli. unpack and cat behave the same way, and so does entry mode: such a
+  layer beneath the container is not peeled either. And whatever sits beneath
+  it is invisible too — gzip over brotli over tar reads as a plain gzip
+  stream, so converting it to `.tar.xz` is the plain -> container refusal
+  above. As the OUTERMOST layer such a codec is still found by IN's extension
+  (`.br`).
 
 STDIN AND STDOUT VIA `-`
 
@@ -1325,9 +1325,9 @@ BENCHMARKING FORMATS ON YOUR OWN DATA
       read-only format or one this build only has a weak fallback encoder
       for is refused (exit 2) with the reason. zstd can be benchmarked only
       in a build with the zstd-c feature (part of c-backed, and in the
-      Homebrew build): the pure tier's zstd encoder is a weak fallback. --levels runs every level of each format instead of
-      the default only; lz4 and snappy have no levels and keep their one
-      row.
+      Homebrew build): the pure tier's zstd encoder is a weak fallback.
+      --levels runs every level of each format instead of the default only;
+      lz4 and snappy have no levels and keep their one row.
 
   stuffr bench --per-file a.log b.log
       --per-file compresses each file as its own stream and sums the
@@ -1410,10 +1410,11 @@ COMPATIBILITY LINKS (INSTALL-LINKS)
       funzip, compress, uncompress, zip, zipcloak, zipnote and zipsplit in
       that directory, each pointing at this stuffr binary. Run under one of
       those names, the binary behaves as that tool, with its flags, messages
-      and exit codes. This is
-      opt-in: nothing creates these links unless you run this verb. The
-      directory must exist (exit 2 if not); one that cannot be written to
-      is exit 1, naming the link and the operating system's reason. A second run reports "already present" and changes nothing.
+      and exit codes. This is opt-in: nothing creates these links unless you
+      run this verb. The directory must exist (exit 2 if not); one that
+      cannot be written to is exit 1, naming the link and the operating
+      system's reason. A second run reports "already present" and changes
+      nothing.
       Under Homebrew the links point at the stable opt/stuffr path, not the
       versioned Cellar one, so they survive `brew upgrade`. As bzip2recover
       does, the bzip2recover link writes its rec* files through a symlink
@@ -1653,14 +1654,14 @@ EXIT CODES
      nesting deeper than the depth stuffr will peel through, or a container's
      fixed metadata ceiling (not configurable): a tar pax header or GNU long
      name/link over 16 MiB, an ar GNU name table over 16 MiB or BSD name over
-     64 KiB, a cpio name or symlink target over 64 KiB or more than 65536
-     held hard-link names, a zip central-directory name or symlink target
-     (seekable input) over 64 KiB, an ARC/ARJ/ZOO entry over 256 MiB. NOT a `salvage` entry
-     over --max-entry: that is reported per entry as `Unverified (over the
-     ceiling)` and lands in 3, because one oversized declaration must never
-     cost a caller the rest of the archive. Nor any of `salvage`'s own scan
-     work caps (tar's per-header and scan-wide extension-chain budgets; the
-     scan-wide verdict budget of zip, zoo, lha, arj and cpio): what a cap
+     64 KiB, a cpio name or symlink target over 64 KiB or more than 65536 held
+     hard-link names, a zip central-directory name or symlink target (seekable
+     input) over 64 KiB, an ARC/ARJ/ZOO entry over 256 MiB. NOT a `salvage`
+     entry over --max-entry: that is reported per entry as `Unverified (over
+     the ceiling)` and lands in 3, because one oversized declaration must
+     never cost a caller the rest of the archive. Nor any of `salvage`'s own
+     scan work caps (tar's per-header and scan-wide extension-chain budgets;
+     the scan-wide verdict budget of zip, zoo, lha, arj and cpio): what a cap
      skips is reported as a sighting, and a work cap never gives exit 6: the
      run exits by its ordinary rule (4, 3, 7 or 5 as the entries and the
      shapes it could not gate dictate)
@@ -1672,21 +1673,20 @@ EXIT CODES
 
 NOT YET
 
-  A `--no-default-features --features pure` build has eleven pure-tier
-  codecs and four pure-tier
-  containers: gzip, zlib, deflate, bzip2, brotli, lz4, snappy, zstd, xz, lzma
-  and lzip, plus tar, ar, cpio and zip. (It is no longer what a plain
-  `cargo build` gives you — `legacy` joined `default`, so the default build
-  adds the five legacy formats on top; see "LEGACY FORMATS" above.) zstd's pure backend (`ruzstd`) is a weak fallback (see
-  "USING A WEAK FALLBACK ENCODER" above); xz's and lzma's pure backends are
-  not — both read and write full-ratio output with no C toolchain, just
-  slower than `--features c-backed`'s `liblzma` (roughly 1.2-1.3x to
-  encode, 2-2.2x to decode, measured on a 6.5 MB payload). `--features
-  c-backed` upgrades all three: zstd to the real `libzstd`, and xz/lzma to
-  `liblzma` for speed. lzip has no such upgrade path at all — it has
-  exactly one backend (the same pure-Rust `lzma-rust2` xz and lzma use), so
-  `--features c-backed` changes nothing about it, and there is no
-  weak-fallback distinction for it either.
+  A `--no-default-features --features pure` build has eleven pure-tier codecs
+  and four pure-tier containers: gzip, zlib, deflate, bzip2, brotli, lz4,
+  snappy, zstd, xz, lzma and lzip, plus tar, ar, cpio and zip. (It is no
+  longer what a plain `cargo build` gives you — `legacy` joined `default`, so
+  the default build adds the five legacy formats on top; see "LEGACY FORMATS"
+  above.) zstd's pure backend (`ruzstd`) is a weak fallback (see "USING A WEAK
+  FALLBACK ENCODER" above); xz's and lzma's pure backends are not — both read
+  and write full-ratio output with no C toolchain, just slower than
+  `--features c-backed`'s `liblzma` (roughly 1.2-1.3x to encode, 2-2.2x to
+  decode, measured on a 6.5 MB payload). `--features c-backed` upgrades all
+  three: zstd to the real `libzstd`, and xz/lzma to `liblzma` for speed. lzip
+  has no such upgrade path at all — it has exactly one backend (the same
+  pure-Rust `lzma-rust2` xz and lzma use), so `--features c-backed` changes
+  nothing about it, and there is no weak-fallback distinction for it either.
 
   All four pure-tier containers read and write, and all four entry-aware
   subcommands work on each of them identically: `list` and `test` read
@@ -1877,25 +1877,25 @@ LEGACY FORMATS
       way is worth more than anything in this repository.
 
       A symlink is SKIPPED with a fidelity warning — not stored, and not
-      refused. ARJ's own entry-type table has no value for a link, so
-      writing one would put the target text in a regular file's contents;
-      `pack` names the entry it skipped, writes the rest, and exits 0.
-      --strict-fidelity turns that into exit 4, with the archive still on
-      disk. Exactly what `lha` says above, and what `ar` says about
-      directories: a kind a container cannot store is a fidelity loss, never
-      a refusal. (This paragraph said "refused rather than stored (exit 3)"
-      until Phase 3c's final review measured the binary and found no path to
-      exit 3 at all. It matters more than an ordinary typo because this page
-      ships INSIDE the binary, and `cli.rs`'s
+      refused. ARJ's own entry-type table has no value for a link, so writing
+      one would put the target text in a regular file's contents; `pack` names
+      the entry it skipped, writes the rest, and exits 0. --strict-fidelity
+      turns that into exit 4, with the archive still on disk. Exactly what
+      `lha` says above, and what `ar` says about directories: a kind a
+      container cannot store is a fidelity loss, never a refusal. (This
+      paragraph said "refused rather than stored (exit 3)" until Phase 3c's
+      final review measured the binary and found no path to exit 3 at all. It
+      matters more than an ordinary typo because this page ships INSIDE the
+      binary, and `cli.rs`'s
       `a_symlink_in_a_walked_tree_is_never_refused_and_the_page_may_not_say_it_is`
       now runs the case on every writable container rather than trusting the
-      sentence.) Directories ARE stored, as themselves. Every entry carries its own CRC-32, checked once
-      its payload has been decoded, and a mismatch is `Error::Corrupt` (exit
-      5) — the same promise every other checksum-carrying format here
-      makes. `by_index` has exactly one answer on this container, unlike
-      `lha`'s two: ARJ carries no entry index of its own on any source
-      shape it is ever opened over, so `Error::Unsupported` routes straight
-      to a forward count instead.
+      sentence.) Directories ARE stored, as themselves. Every entry carries
+      its own CRC-32, checked once its payload has been decoded, and a
+      mismatch is `Error::Corrupt` (exit 5) — the same promise every other
+      checksum-carrying format here makes. `by_index` has exactly one answer
+      on this container, unlike `lha`'s two: ARJ carries no entry index of its
+      own on any source shape it is ever opened over, so `Error::Unsupported`
+      routes straight to a forward count instead.
 
   stuffr list old.arc
       ARC (and its PAK descendant — both `.arc` and `.pak` are read by this

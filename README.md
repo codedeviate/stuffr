@@ -1765,7 +1765,8 @@ before the command line, as the reference does.
    the recorded reference build's, so another macOS build prints a different
    one.
 3. **Undefined behaviour and endless loops are not reproduced**; the code's
-   `// ruling:` comments record each decision.
+   `// ruling:` comments record each decision. 5 and 6 are the ones the
+   command line meets.
 4. **Encryption is compatible, not identical.** The ten random bytes of each
    12-byte encryption header come from the system's generator (`getentropy`,
    `getrandom` or `/dev/urandom`; a system with none ends the run, `Internal
@@ -1774,8 +1775,10 @@ before the command line, as the reference does.
    reference's do; every other byte is the same and it decrypts the same.
 5. **Long option-error text.** `get_option` builds its error in a 50-byte
    buffer; an error about an option whose `'name' (description)` needs 50
-   bytes or more (`-lf`, `--output-file`, `--junk-paths=x`, ...: 59 forms)
-   aborts both references (Apple SIGTRAP, Ubuntu SIGABRT, exit 9). stuffr
+   bytes or more (`-lf`, `--output-file`, `--junk-paths=x`,
+   `--recurse-patterns-`: 59 forms in all, listed by `cli/tests.rs`) aborts
+   both references (Apple: SIGTRAP from `__sprintf_chk`; Ubuntu: glibc's
+   "buffer overflow detected" and zip's SIGABRT handler, exit 9). stuffr
    prints the whole message, exit 16, as the C would with room.
 6. **`-O` with no archive name** dereferences NULL in the C (SIGSEGV, answered
    by zip's handler with a blank line and `zip error: Interrupted
@@ -1815,19 +1818,31 @@ before the command line, as the reference does.
     a Zip64 extra field shorter than its sizes is read as zeros past its end;
     `-X-` stops copying old extra blocks at one that runs past its field.
     `-g` writes a copy up to the central directory, appends, adds what the old
-    file had past the new end, and renames the copy into place; the bytes of
-    a successful run are zip's. A failure leaves the archive as it was and
-    prints `attempting to restore <zip> to its previous state`, rewriting the
-    old central directory in place; a failed `-T -g` is undefined in the C
-    and ends with the restore line, exit 8. `-T -g` tests the copy, so a
-    `-TT` command is given the temporary's name.
+    file had past the new end (zip writes in place and never truncates, so a
+    shorter `-z` comment leaves the old tail), and renames the copy into
+    place; the bytes of a successful run are zip's. Except under `--out`
+    (ruling Z33): zip truncates the `--out` file to nothing, grows the input
+    archive in place and never replaces, so `zip -g in.zip --out out.zip f`
+    leaves `out.zip` empty and `in.zip` grown; stuffr leaves `in.zip`
+    untouched and publishes the grown copy as `out.zip`. A failure leaves the
+    archive as it was: zip prints `attempting to restore <zip> to its previous
+    state` (so does stuffr, on every failure and interrupt under `-g`) and
+    rewrites the old central directory in place, leaving what it appended
+    after it (a write failure there can even leave no readable archive). A
+    failed `-T -g` is undefined behaviour in the C (`fseeko` on the closed
+    stream: Apple exits 5 after a blank line); stuffr answers with the
+    restore line, exit 8. `-T -g` tests the copy, so a `-TT` command is given
+    the temporary's name, not the archive's.
 14. **The output is not truncated up front.** zip opens it with `fopen "wb"`
     to check it can write it when it is `--out`'s or the archive has no
     entries, then removes an entry-less archive; stuffr opens without
     truncating and removes nothing it did not create. A run that fails or is
-    interrupted leaves an `--out` target or an entry-less archive as it was.
-    On success, an entry-less archive that is a link: zip renames a new file
-    over it; stuffr writes through the link.
+    interrupted leaves an `--out` target or an entry-less archive as it was
+    (zip leaves the first empty and the second gone). On success, an
+    entry-less archive that is a symbolic or hard link: zip, having removed
+    the link, renames a new file into its place (the link's target left
+    empty); stuffr writes through the link, as `replace` does for any linked
+    archive.
 15. **A failing `-T` in Ubuntu's build** closes the temporary's stream twice
     and glibc aborts (ruling Z3); stuffr answers as Apple does in both
     flavours: `test of t.zip FAILED`, `zip error: Zip file invalid, could not
@@ -1849,10 +1864,12 @@ before the command line, as the reference does.
 19. **`-FF`, undefined behaviour not reproduced.** The central extra field of
     an entry found by its local header is copied with `strcpy`, which stops at
     the first NUL and leaves the rest of a `malloc`ed field as it was (zeros on
-    Apple, heap garbage on Ubuntu); stuffr copies up to and with the first NUL
-    and writes zeros after (Apple's bytes). A data descriptor signature split
-    across two 16 KiB reads is not taken for one; a Zip64 extra field shorter
-    than its sizes is read as zeros past its end.
+    Apple, heap garbage that changes from run to run on Ubuntu); stuffr
+    copies up to and with the first NUL and writes zeros after (Apple's
+    bytes). The entry's `lflg`, never set, is read as 0 (it only sizes
+    `tempzn`); a data descriptor signature split across two 16 KiB reads (the
+    C then writes `kk - 3`, wrapped, bytes) is not taken for one; a Zip64
+    extra field shorter than its sizes is read as zeros past its end.
 20. **`-F`/`-FF` with `--out` the damaged archive under another name**
     (`./a.zip`, a link; ruling Z21) is refused as the same name is (`--out
     path must be different than in path`, exit 16), before anything is
@@ -1874,10 +1891,13 @@ before the command line, as the reference does.
     entry)`), the temporary removed and the archive untouched. A split
     archive under `-O` meets it at the first entry: the UTIL build's
     `readlocal()` looks in the last part only and warns `Did not find entry
-    for <name>`; Ubuntu then dies of SIGSEGV (exit 9); stuffr warns the same
-    and ends `Zip file structure invalid`, exit 3. A central name longer than
-    the local one makes the C write past the local name's buffer; stuffr keeps
-    the local name.
+    for <name>`; Ubuntu then dies of SIGSEGV (`Interrupted (aborting)`, exit
+    9, or killed by the signal from its handler; measured with a terminal in
+    Docker); stuffr warns the same and ends `Zip file structure invalid`, exit
+    3. (Without `-O` both refuse a split archive: `cannot update a split
+    archive`, exit 16.) A central name longer than the local one makes the C
+    write past the local name's buffer; stuffr keeps the local name as it is
+    (a shorter central name cuts it with a NUL, as the C does).
 25. **`zipnote` and `zipsplit` never set `out_path`**, so `strcmp(in_path,
     out_path)` over a NULL ends in SIGSEGV for an archive that does not exist
     (or is named ``) and for a split archive: both references print
@@ -1911,6 +1931,16 @@ before the command line, as the reference does.
     short text file after a longer text file is text). The buffer's first
     contents are uninitialised in the C; stuffr takes them as zeros (a short
     first text file is binary, `iattr` 0, as measured).
+30. **An interrupt while the new archive replaces the old one** (ruling Z32).
+    zip unlinks the archive and renames the temporary, or, for a linked
+    archive or a temporary on another device (`-b`), truncates the archive
+    and copies the temporary into it; a SIGINT or SIGTERM in that window makes
+    zip's handler remove the temporary, leaving the archive gone or cut short
+    and no whole copy anywhere. stuffr holds both signals back for the length
+    of the replace (`zip`, its split parts and `-F`/`-FF`, `zipcloak`,
+    `zipnote -w`) and answers them as zip does once the archive is whole:
+    `Interrupted (aborting)`, exit 9, the new archive in place. A long
+    cross-device copy answers Ctrl-C when it ends.
 
 The full set is in the code's module docs
 (`crates/stuffr-cli/src/compat/zip/mod.rs`), which is the source of truth.

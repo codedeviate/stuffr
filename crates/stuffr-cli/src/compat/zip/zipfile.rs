@@ -6,9 +6,9 @@
 //!
 //! Each record is built in memory and written whole, as the C's
 //! `append_*_to_mem` and one `bfwrite` do; a local header is rewritten in
-//! place ([`ZWrite::seek_to`], [`ZWrite::write_here`], [`ZWrite::seek_end`]) once its sizes and CRC are known, unless
-//! the archive cannot be rewound (a pipe) or `-fd` asks for data
-//! descriptors.
+//! place ([`ZWrite::seek_to`], [`ZWrite::write_here`],
+//! [`ZWrite::seek_end`]) once its sizes and CRC are known, unless the
+//! archive cannot be rewound (a pipe) or `-fd` asks for data descriptors.
 //!
 //! Splits (`-s`, `-sp`): `bfwrite` moves to the next split where one is
 //! full (`split.rs` keeps the splits).

@@ -1,5 +1,5 @@
 //! The zip family's read-back, shared by the `compat` fuzz target and the
-//! test that pins it (`crates/stuffr-cli/tests/zip_readback.rs` includes this
+//! test that pins it (`crates/stuffr/tests/zip_readback.rs` includes this
 //! file by path): an independent walk of an archive's records, held to the
 //! `zip` crate as a second reader.
 

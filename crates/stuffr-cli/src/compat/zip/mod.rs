@@ -23,8 +23,8 @@
 //! (`fileio.c`, `util.c`'s matcher, `unix/unix.c`); also the unix extra
 //! fields (`unix::extra_fields`).
 //!
-//! **Task 6 (`zipup.rs`, `zipfile.rs`, `write.rs`, `sink.rs`):** writing a new archive, byte for
-//! byte as the references write it: `zipup.c` (the method, stored or
+//! **Task 6 (`zipup.rs`, `zipfile.rs`, `write.rs`, `sink.rs`):** writing a
+//! new archive, byte for byte as the references write it: `zipup.c` (the method, stored or
 //! deflated through `stuffr::infozip::ZipDeflater`, `-l`/`-ll`, the
 //! descriptor or the rewritten local header), `zipfile.c`'s writing half
 //! (local and central headers, Zip64 fields and end records, the end
@@ -171,7 +171,13 @@
 //!     the old file had past the new end (zip writes in place and never
 //!     truncates, so a shorter `-z` comment leaves the old tail), and
 //!     renames the copy into place: the bytes of a successful run are
-//!     zip's. A failure leaves the archive as it was: zip prints
+//!     zip's. Except under `--out` (ruling Z33): zip opens the `--out` file
+//!     with `FOPW` (truncating it to nothing), grows the input archive in
+//!     place and skips `replace`, so `zip -g in.zip --out out.zip f` leaves
+//!     `out.zip` empty and `in.zip` grown; stuffr leaves `in.zip` untouched
+//!     and publishes the grown copy as `out.zip` (pinned by
+//!     `update::tests::growing_with_out_publishes_the_copy`). A failure
+//!     leaves the archive as it was: zip prints
 //!     `attempting to restore <zip> to its previous state` (so does
 //!     stuffr, on every failure and interrupt under `-g`) and rewrites the
 //!     old central directory in place, leaving what it appended after it
@@ -189,7 +195,8 @@
 //!     second gone). And on success, an entry-less archive that is a
 //!     symbolic or hard link: zip, having removed the link, renames a new
 //!     file into its place (the link's target left empty); stuffr writes
-//!     through the link, as `replace` does for any linked archive.
+//!     through the link, as `replace` does for any linked archive. Pinned by
+//!     `update::tests::a_failed_run_leaves_the_output_as_it_was`.
 //! 15. Ruling Z3: a failing `-T` in Ubuntu's build closes the temporary's
 //!     stream twice (`ziperr` after `fclose(y)`) and glibc aborts on the
 //!     double free (exit 5, a blank line, glibc's message); stuffr answers
@@ -262,8 +269,9 @@
 //!     (`Interrupted (aborting)`, exit 9, or killed by the signal from its
 //!     handler; measured with a terminal in Docker); stuffr warns the same
 //!     and ends with `Zip file structure invalid`, exit 3. (Without `-O` both
-//!     refuse a split archive: `cannot update a split archive`, exit 16.) A central name longer than the
-//!     local one makes `readlocal()` write past the local name's buffer;
+//!     refuse a split archive: `cannot update a split archive`, exit 16.)
+//!     A central name longer than the local one makes `readlocal()` write
+//!     past the local name's buffer;
 //!     stuffr keeps the local name as it is (a shorter central name cuts it
 //!     with a NUL, as the C does).
 //! 25. `zipnote` and `zipsplit` never set `out_path`, so `readzipfile()`'s
@@ -280,9 +288,9 @@
 //!     `compat_zip_helpers::zipnote_w_is_the_same_in_both_flavours`
 //!     (stuffr's two flavours agree and exit 0) and, on Ubuntu, against the
 //!     reference. A comment's length wraps at 65536 as the C's `ush` does.
-//! 27. `zipsplit`: a `%` in the archive's name is a conversion in the C's name
-//!     template (`sprintf(name, template, n)`, undefined behaviour); stuffr takes it
-//!     as a character. After an error writing the index under `-p` and a
+//! 27. `zipsplit`: a `%` in the archive's name is a conversion in the C's
+//!     name template (`sprintf(name, template, n)`, undefined behaviour);
+//!     stuffr takes it as a character. After an error writing the index under `-p` and a
 //!     yes to "redo entire disk?", the C goes back to the wrong disk (its
 //!     loop variable holds the failure flag); stuffr redoes disk 1. An
 //!     interrupt removes the parts only when `-b`'s directory is shorter
@@ -316,6 +324,19 @@
 //!     uninitialised in the C; stuffr takes them as zeros (a short first
 //!     text file is binary, `iattr` 0, as measured). Pinned by
 //!     `compat_zip_common::ub_rulings`.
+//! 30. Ruling Z32: an interrupt (SIGINT, SIGTERM) while the new archive
+//!     replaces the old one (`fileio.c:replace`: the archive unlinked, then
+//!     the temporary renamed; or, for a linked archive or a temporary on
+//!     another device such as `-b`'s, the archive truncated and the
+//!     temporary copied into it) makes zip's handler remove the temporary,
+//!     which leaves the archive gone or cut short and no whole copy
+//!     anywhere. stuffr holds both signals back for the length of the
+//!     replace (`zip`, its split parts and `-F`/`-FF`, `zipcloak`, `zipnote
+//!     -w`; `-g`'s restore state is cleared in the same window) and answers
+//!     them as zip does once the archive is whole: `Interrupted
+//!     (aborting)`, exit 9, the new archive in place. A long cross-device
+//!     copy answers Ctrl-C when it ends. Pinned by
+//!     `tests::an_interrupt_during_replace_leaves_a_whole_archive`.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
