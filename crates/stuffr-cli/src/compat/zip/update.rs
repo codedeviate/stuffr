@@ -208,6 +208,14 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
     // the name zip's messages give the archive being written: under -g the
     // archive itself (deviation 13: stuffr grows a copy)
     let shown_temp = if d { zipfile.clone() } else { tempzip.clone() };
+    if d && !to_stdout {
+        // zip.c: tempzip = zipfile; ziperr now says it restores the archive
+        let mut l = Vec::new();
+        printf(&mut l, m::ATTEMPTING_RESTORE, &[&zipfile]);
+        let l: &'static [u8] = Box::leak(l.into_boxed_slice());
+        crate::compat::host::zip_abort_extra(&z.host, Some(l));
+        z.restoring = Some(zipfile.clone());
+    }
     let use_descriptors = z.o.use_descriptors || !sink.seekable();
     let gdots = z.o.display_globaldots.then_some(GlobalDots {
         dot_size: z.o.dot_size,
@@ -341,8 +349,8 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
                         zf.mark = 0;
                     }
                     w.files_so_far += 1;
-                    w.good_bytes_so_far += zf.e.len;
-                    w.bytes_so_far += len;
+                    w.good_bytes_so_far = w.good_bytes_so_far.wrapping_add(zf.e.len);
+                    w.bytes_so_far = w.bytes_so_far.wrapping_add(len);
                     zfiles.push(zf);
                 }
                 Action::Archive => {
@@ -367,8 +375,8 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
                         z.log_line_started = false;
                     }
                     w.files_so_far += 1;
-                    w.good_bytes_so_far += siz;
-                    w.bytes_so_far += siz;
+                    w.good_bytes_so_far = w.good_bytes_so_far.wrapping_add(siz);
+                    w.bytes_so_far = w.bytes_so_far.wrapping_add(siz);
                     zfiles.push(zf);
                 }
                 Action::Delete => {
@@ -384,8 +392,8 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
                         z.log_write(&l);
                     }
                     w.files_so_far += 1;
-                    w.good_bytes_so_far += zf.e.siz;
-                    w.bytes_so_far += zf.e.siz;
+                    w.good_bytes_so_far = w.good_bytes_so_far.wrapping_add(zf.e.siz);
+                    w.bytes_so_far = w.bytes_so_far.wrapping_add(zf.e.siz);
                     // deleted from the list
                 }
             }
@@ -453,23 +461,23 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
                     return z.ziperr_os(ZE_OPEN, &h, &shown);
                 }
                 w.files_so_far += 1;
-                w.bytes_so_far += len;
+                w.bytes_so_far = w.bytes_so_far.wrapping_add(len);
                 w.bad_files_so_far += 1;
-                w.bad_bytes_so_far += len;
+                w.bad_bytes_so_far = w.bad_bytes_so_far.wrapping_add(len);
             }
             Zipped::Miss => {
                 o = true;
                 end_line(z);
                 z.zipwarn(m::FILE_AND_DIR.as_bytes(), &f.oname);
                 w.files_so_far += 1;
-                w.bytes_so_far += len;
+                w.bytes_so_far = w.bytes_so_far.wrapping_add(len);
                 w.bad_files_so_far += 1;
-                w.bad_bytes_so_far += len;
+                w.bad_bytes_so_far = w.bad_bytes_so_far.wrapping_add(len);
             }
             Zipped::Entry(e) => {
                 w.files_so_far += 1;
-                w.good_bytes_so_far += e.len;
-                w.bytes_so_far += len;
+                w.good_bytes_so_far = w.good_bytes_so_far.wrapping_add(e.len);
+                w.bytes_so_far = w.bytes_so_far.wrapping_add(len);
                 zfiles.push(ZFile {
                     e,
                     zname: f.zname.clone(),
@@ -633,6 +641,11 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
     let good = w.good_bytes_so_far;
     drop(w);
     ia.f = None;
+    // -g: zip wrote into the archive and never truncates it, so the old
+    // bytes past the new end stay; the copy gets them too (deviation 13)
+    if d && let Err(x) = keep_old_tail(z, &in_path, &tempzip, &shown_temp) {
+        return x;
+    }
     // Test new zip file before overwriting old one or removing input files
     if z.o.test
         && let Err(x) = check_zipfile_64(z, &tempzip, zip64_archive)
@@ -657,6 +670,8 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
             z.mesg_write(m::SD_SETTING_TYPE.as_bytes());
         }
     }
+    z.restoring = None;
+    crate::compat::host::zip_abort_extra(&z.host, None);
     drop(_armed);
     // finish the log file
     if z.log.is_some() {
@@ -689,6 +704,40 @@ fn perror_named(z: &mut Zr, name: &[u8], e: &io::Error) {
     let _ = z.err.write_all(&line);
     let _ = z.err.flush();
     z.log_write(&line);
+}
+
+/// `-g`'s in-place write leaves what the old archive had past the new
+/// end: append `old[new_len..old_len]` to the copy at `tempzip`. A failure
+/// is the C's `fclose` failing (`ZE_WRITE`, the archive's name).
+fn keep_old_tail(z: &mut Zr, in_path: &[u8], tempzip: &[u8], shown: &[u8]) -> Result<(), Exit> {
+    let tmp = z.host.path(tempzip);
+    let new_len = std::fs::metadata(&tmp).map_or(0, |m| m.len());
+    let mut f = match readzip::CFile::open(z, in_path) {
+        Ok(f) => f,
+        Err(e) => return Err(z.ziperr_os(ZE_WRITE, shown, &e)),
+    };
+    if !f.seek(i128::from(new_len)) {
+        return Ok(());
+    }
+    let mut out = match std::fs::OpenOptions::new().append(true).open(&tmp) {
+        Ok(o) => o,
+        Err(e) => return Err(z.ziperr_os(ZE_WRITE, shown, &e)),
+    };
+    loop {
+        let b = f.fread(16384);
+        if b.is_empty() {
+            break;
+        }
+        if let Host::Sandbox(s) = &z.host
+            && let Err(e) = crate::compat::host::take(&s.budget, b.len() as u64)
+        {
+            return Err(z.ziperr_os(ZE_WRITE, shown, &e));
+        }
+        if let Err(e) = out.write_all(&b) {
+            return Err(z.ziperr_os(ZE_WRITE, shown, &e));
+        }
+    }
+    Ok(())
 }
 
 /// `ZIPERR(r, zipfile)` for a failed copy of what is before the archive
@@ -799,18 +848,74 @@ fn os(b: &[u8]) -> &OsStr {
     }
 }
 
-/// `posix_spawnp(argv[0], argv)` and `waitpid`: true when the program ran
-/// and exited 0. A program that cannot be run, or one killed by a signal,
-/// is a failure. A sandbox spawns nothing (deviation 16): a failure.
+/// `posix_spawnp(argv[0], argv)` with a NULL environment (apple.diff) and
+/// `waitpid`: true when the program ran and exited 0. The child gets an
+/// empty environment; the program is looked up on zip's own `PATH`. A
+/// program that cannot be run, or one killed by a signal, is a failure. A
+/// sandbox spawns nothing (deviation 16): a failure.
 fn spawn(z: &Zr, argv: &[Vec<u8>]) -> bool {
     if matches!(z.host, Host::Sandbox(_)) {
         return false;
     }
-    let mut cmd = Command::new(os(&argv[0]));
+    let Some(prog) = spawnp_lookup(&argv[0]) else {
+        return false;
+    };
+    let mut cmd = Command::new(prog);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.arg0(os(&argv[0]));
+    }
+    cmd.env_clear();
     for a in &argv[1..] {
         cmd.arg(os(a));
     }
     matches!(cmd.status(), Ok(s) if s.code() == Some(0))
+}
+
+/// `posix_spawnp`'s search: a name with a `/` as it is, else the first
+/// executable regular file of that name in a `PATH` directory (an empty
+/// entry is the current directory; no `PATH`: `/usr/bin:/bin`).
+fn spawnp_lookup(name: &[u8]) -> Option<std::path::PathBuf> {
+    let p = crate::compat::host::path(name);
+    if name.contains(&b'/') {
+        return Some(p);
+    }
+    if name.is_empty() {
+        return None;
+    }
+    let path = std::env::var_os("PATH")
+        .map_or_else(|| b"/usr/bin:/bin".to_vec(), |v| v.into_encoded_bytes());
+    for dir in path.split(|&b| b == b':') {
+        let mut full = if dir.is_empty() {
+            b".".to_vec()
+        } else {
+            dir.to_vec()
+        };
+        full.push(b'/');
+        full.extend_from_slice(name);
+        let fp = crate::compat::host::path(&full);
+        if let Ok(md) = std::fs::metadata(&fp)
+            && md.is_file()
+            && executable(&md)
+        {
+            return Some(fp);
+        }
+    }
+    None
+}
+
+fn executable(md: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        md.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = md;
+        true
+    }
 }
 
 /// `/bin/sh -c cmd` as `sh` (popen's and system()'s shell, so its messages

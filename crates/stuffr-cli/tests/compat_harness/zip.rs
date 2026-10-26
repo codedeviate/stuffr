@@ -10,6 +10,12 @@
 use super::unzip::{ZipKeys, mask_compiled_with, mask_work};
 use super::*;
 
+/// Every [`ZipTree`] item's access time unless set: after its
+/// modification time and after the change time materialising gives it (now),
+/// so a `relatime` mount never stamps it when a run reads the file (zip
+/// stores the access time; two runs reading a second apart would differ).
+pub const INPUT_ATIME: i64 = 2_000_000_000;
+
 /// The Ubuntu reference: apt's `zip` on ubuntu 24.04 (`dpkg-query -W -f
 /// '${Version}' zip`).
 pub const UBUNTU_ZIP_VERSION: &str = "3.0-13ubuntu0.2";
@@ -138,8 +144,8 @@ pub struct ZipItem {
 }
 
 /// A zip case's input tree: what both sides get in their work directory,
-/// identical in bytes, modes, mtimes and atimes (all [`INPUT_MTIME`]
-/// unless set), directories and symlinks. A parent directory not listed is
+/// identical in bytes, modes, mtimes and atimes (all [`INPUT_MTIME`] and
+/// [`INPUT_ATIME`] unless set), directories and symlinks. A parent directory not listed is
 /// made 0755 and pinned too, so `zip -r` sees the same tree on both sides.
 /// The owner is the user running the tests, the same on both sides.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -176,7 +182,7 @@ impl ZipTree {
             path: path.to_vec(),
             node,
             mtime: INPUT_MTIME as i64,
-            atime: INPUT_MTIME as i64,
+            atime: INPUT_ATIME,
         });
         self
     }
@@ -244,7 +250,7 @@ impl ZipTree {
                 path: p.to_vec(),
                 node: ZipNode::Dir { mode: 0o755 },
                 mtime: INPUT_MTIME as i64,
-                atime: INPUT_MTIME as i64,
+                atime: INPUT_ATIME,
             });
         }
         items
@@ -1523,6 +1529,18 @@ pub fn zip_bytes_matrix(flavour: &'static str) -> Vec<Case<'static>> {
 /// returned as written there). An input for the update cases, the same on
 /// both sides.
 pub fn zip_made(flavour: &str, tree: &ZipTree, args: &[&str], out: &str) -> Vec<u8> {
+    zip_made_with(flavour, tree, args, out, b"")
+}
+
+/// [`zip_made`] with `stdin` piped in (`-z`'s comment).
+pub fn zip_made_with(
+    flavour: &str,
+    tree: &ZipTree,
+    args: &[&str],
+    out: &str,
+    stdin: &[u8],
+) -> Vec<u8> {
+    use std::io::Write as _;
     use std::os::unix::process::CommandExt;
     let s = ScratchDir::unique("zip-made");
     std::fs::create_dir_all(&*s).unwrap();
@@ -1536,8 +1554,14 @@ pub fn zip_made(flavour: &str, tree: &ZipTree, args: &[&str], out: &str) -> Vec<
         .env("LANG", "C")
         .env("TZ", "UTC")
         .env("STUFFR_ZIP_FLAVOR", flavour)
-        .stdin(Stdio::null());
-    let o = output(&mut cmd).unwrap();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = spawn(&mut cmd).unwrap();
+    let mut pipe = child.stdin.take().unwrap();
+    let _ = pipe.write_all(stdin);
+    drop(pipe);
+    let o = child.wait_with_output().unwrap();
     assert!(o.status.success(), "zip {args:?}: {o:?}");
     if out == "-" {
         o.stdout
@@ -1582,6 +1606,17 @@ pub fn with_fake_unzip(tree: ZipTree, version: &str, code: i32) -> ZipTree {
     tree.file_mode("fb/unzip", script, 0o755)
 }
 
+/// A `-TT` program `fb/probe` that prints its arguments and its
+/// environment (less stuffr's `STUFFR_` variables, which only stuffr's side
+/// has), with `PATH=fb:...` ([`FAKE_UNZIP_PATH`]).
+pub fn env_probe(tree: ZipTree) -> ZipTree {
+    tree.file_mode(
+        "fb/probe",
+        "#!/bin/sh\necho args: \"$@\"\nenv | grep -v '^STUFFR_' | sort\nexit 0\n",
+        0o755,
+    )
+}
+
 /// The PATH that finds [`with_fake_unzip`]'s script first.
 pub const FAKE_UNZIP_PATH: (&str, &str) = ("PATH", "fb:/usr/bin:/bin");
 
@@ -1618,7 +1653,20 @@ pub fn zip_update_matrix(flavour: &'static str, failing_tests: bool) -> Vec<Case
         &["t.zip", "a.txt", "b.txt", "x.txt"],
         "t.zip",
     );
-    let commented = zip_made(flavour, &std(), &["-z", "t.zip", "a.txt"], "t.zip");
+    let commented = zip_made_with(
+        flavour,
+        &std(),
+        &["-z", "t.zip", "a.txt"],
+        "t.zip",
+        b"a long comment line here\nand a second one\n.\n",
+    );
+    let commented_entries = zip_made_with(
+        flavour,
+        &std(),
+        &["-c", "t.zip", "a.txt", "b.txt"],
+        "t.zip",
+        b"a long entry comment for a\nanother for b\n",
+    );
     let streamed = zip_made(flavour, &std(), &["-", "a.txt", "b.txt"], "-");
     let fz = zip_made(
         flavour,
@@ -1638,7 +1686,7 @@ pub fn zip_update_matrix(flavour: &'static str, failing_tests: bool) -> Vec<Case
     prefixed.extend_from_slice(&ab);
     let a = || std().file("t.zip", ab.clone());
     // b.txt newer than its entry
-    let newer = || a().times("b.txt", 1_100_000_000, 1_100_000_000);
+    let newer = || a().times("b.txt", 1_100_000_000, INPUT_ATIME);
 
     // add, update, freshen, delete
     for (args, tree) in [
@@ -1837,6 +1885,27 @@ pub fn zip_update_matrix(flavour: &'static str, failing_tests: bool) -> Vec<Case
             std().file("t.zip", commented.clone()),
             b"q\n.\n",
         ),
+        // -g writes in place: a shorter comment leaves the old tail
+        (
+            &["-g", "-z", "t.zip"],
+            std().file("t.zip", commented.clone()),
+            b"x\n.\n",
+        ),
+        (
+            &["-g", "-z", "t.zip", "d/c.txt"],
+            std().file("t.zip", commented.clone()),
+            b"x\n.\n",
+        ),
+        (
+            &["-g", "-c", "t.zip", "d/c.txt"],
+            std().file("t.zip", commented_entries.clone()),
+            b"c\n",
+        ),
+        (
+            &["-c", "t.zip", "d/c.txt"],
+            std().file("t.zip", commented_entries.clone()),
+            b"c\n",
+        ),
         (
             &["-z", "t.zip"],
             std().file("t.zip", commented.clone()),
@@ -1871,6 +1940,8 @@ pub fn zip_update_matrix(flavour: &'static str, failing_tests: bool) -> Vec<Case
         (&["-TT", "false", "t.zip", "d/c.txt"], a()),
         (&["-T", "-TT", "true {}", "t.zip", "d/c.txt"], a()),
         (&["-T", "-b", "d", "t.zip", "a.txt"], fake("", 0)),
+        // Apple spawns with an empty environment, Ubuntu's system() keeps it
+        (&["-T", "-TT", "probe", "t.zip", "a.txt"], env_probe(a())),
     ] {
         add(args, tree, None, &[FAKE_UNZIP_PATH]);
     }
@@ -1923,9 +1994,10 @@ pub fn zip_update_matrix(flavour: &'static str, failing_tests: bool) -> Vec<Case
 /// `signal()` overrides it). HUP and QUIT: killed by the signal, the
 /// temporary left, the old archive untouched. Both sides must agree.
 pub fn zip_interrupts_match(flavour: &'static str) {
+    use super::interrupt::*;
+    use std::os::unix::process::ExitStatusExt;
     /// Exit code, signal, standard output, standard error, what is left.
     type Seen = (Option<i32>, Option<i32>, Vec<u8>, Vec<u8>, Vec<String>);
-    use super::interrupt::*;
     let _serial = interrupt_lock();
     let Some(dir) = zip_dir() else {
         return;
@@ -1947,16 +2019,25 @@ pub fn zip_interrupts_match(flavour: &'static str) {
         libc::SIGILL,
         libc::SIGSEGV,
     ];
-    let mut rows: Vec<(i32, bool, Inherit)> = Vec::new();
+    // (signal, an archive at the path, SIGINT inherited, -g)
+    let mut rows: Vec<(i32, bool, Inherit, bool)> = Vec::new();
     for &sig in &caught {
-        rows.push((sig, true, Inherit::Default));
+        rows.push((sig, true, Inherit::Default, false));
     }
-    rows.push((libc::SIGINT, false, Inherit::Default));
-    rows.push((libc::SIGINT, true, Inherit::IgnoreInt));
-    rows.push((libc::SIGHUP, true, Inherit::Default));
-    rows.push((libc::SIGQUIT, false, Inherit::Default));
-    for (sig, existing, inherit) in rows {
+    rows.push((libc::SIGINT, false, Inherit::Default, false));
+    rows.push((libc::SIGINT, true, Inherit::IgnoreInt, false));
+    rows.push((libc::SIGHUP, true, Inherit::Default, false));
+    rows.push((libc::SIGQUIT, false, Inherit::Default, false));
+    rows.push((libc::SIGINT, true, Inherit::Default, true));
+    rows.push((libc::SIGTERM, true, Inherit::Default, true));
+    for (sig, existing, inherit, grow) in rows {
+        let args: &[&str] = if grow {
+            &["-g", "t.zip", "big"]
+        } else {
+            &["t.zip", "big"]
+        };
         let mut seen: Vec<Seen> = Vec::new();
+        let mut reference_hung = false;
         for exe in [&reference, &stuffr] {
             let s = ScratchDir::unique("zip-intr");
             let prepare = |mib: usize| {
@@ -1965,26 +2046,25 @@ pub fn zip_interrupts_match(flavour: &'static str) {
                     std::fs::write(s.join("t.zip"), &old).unwrap();
                 }
             };
-            let named = |n: &str| is_temp_name(n.as_bytes());
-            let ready = has_data(&s, &named);
-            let Some(r) = interrupt_prepared(
-                exe,
-                "zip",
-                &["t.zip", "big"],
-                &s,
-                &env,
-                &prepare,
-                inherit,
-                sig,
-                &ready,
-            ) else {
+            // zip grows the archive itself under -g, stuffr a temporary
+            let grown = old.len() as u64 + 100_000;
+            let dir: &Path = &s;
+            let ready = |n: &str| {
+                let len = std::fs::metadata(dir.join(n)).map_or(0, |m| m.len());
+                (is_temp_name(n.as_bytes()) && len > 0) || (grow && n == "t.zip" && len > grown)
+            };
+            let Some(r) =
+                interrupt_prepared(exe, "zip", args, &s, &env, &prepare, inherit, sig, &ready)
+            else {
+                // a hung stuffr panics inside: only the reference gets here
+                reference_hung = true;
                 continue;
             };
-            let why = format!("{exe:?} signal {sig} existing {existing}");
-            if existing {
+            let why = format!("{exe:?} signal {sig} existing {existing} -g {grow}");
+            // zip's -g rewrites the archive in place (deviation 13)
+            if existing && !(grow && exe == &reference) {
                 assert_eq!(std::fs::read(s.join("t.zip")).unwrap(), old, "{why}");
             }
-            use std::os::unix::process::ExitStatusExt;
             let left: Vec<String> = r
                 .left
                 .iter()
@@ -1998,24 +2078,34 @@ pub fn zip_interrupts_match(flavour: &'static str) {
                 .collect();
             seen.push((r.status.code(), r.status.signal(), r.stdout, r.stderr, left));
         }
-        if seen.len() == 2 {
-            assert_eq!(
-                seen[0], seen[1],
-                "signal {sig}, existing archive {existing}"
-            );
-            let (code, signal, stdout, stderr, left) = &seen[1];
-            if caught.contains(&sig) {
-                assert_eq!(*code, Some(9), "signal {sig}");
-                assert_eq!(
-                    String::from_utf8_lossy(stdout),
-                    "  adding: big\n\n\nzip error: Interrupted (aborting)\n"
-                );
-                assert!(stderr.is_empty());
-                assert!(!left.iter().any(|n| n == "zi??????"), "{left:?}");
+        assert!(
+            seen.len() == 2 || (seen.len() == 1 && reference_hung),
+            "signal {sig}: stuffr's side did not run"
+        );
+        if seen.len() != 2 {
+            continue;
+        }
+        assert_eq!(
+            seen[0], seen[1],
+            "signal {sig}, existing archive {existing}, -g {grow}"
+        );
+        let (code, signal, stdout, stderr, left) = &seen[1];
+        if caught.contains(&sig) {
+            assert_eq!(*code, Some(9), "signal {sig}");
+            let restore = if grow {
+                "attempting to restore t.zip to its previous state\n"
             } else {
-                assert_eq!(*signal, Some(sig));
-                assert!(left.iter().any(|n| n == "zi??????"), "{left:?}");
-            }
+                ""
+            };
+            assert_eq!(
+                String::from_utf8_lossy(stdout),
+                format!("  adding: big\n\n\nzip error: Interrupted (aborting)\n{restore}")
+            );
+            assert!(stderr.is_empty());
+            assert!(!left.iter().any(|n| n == "zi??????"), "{left:?}");
+        } else {
+            assert_eq!(*signal, Some(sig));
+            assert!(left.iter().any(|n| n == "zi??????"), "{left:?}");
         }
     }
 }

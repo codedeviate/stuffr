@@ -1278,7 +1278,7 @@ pub(crate) fn show_files(z: &mut Zr, c: &mut Collected) -> Exit {
     for (oname, len) in lines {
         count += 1;
         if (len as i64) > 0 {
-            bytes += len;
+            bytes = bytes.wrapping_add(len);
         }
         // Task 11: `-sU` with Ubuntu's escaped Unicode names
         let mut line = Vec::new();
@@ -1302,6 +1302,9 @@ pub(crate) fn show_files(z: &mut Zr, c: &mut Collected) -> Exit {
     if z.log.is_some() {
         z.log_write(&line);
     }
+    // deviation 17 (ruling Z16): -sf publishes nothing, so -m deletes
+    // nothing (zip.c's finish() deletes the entries' files)
+    z.o.dispose = false;
     super::write::finish(z, ZE_OK, &mut c.ar.zfiles)
 }
 

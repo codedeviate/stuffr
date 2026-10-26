@@ -1335,3 +1335,5 @@ pub(super) const BLANK_DV: &str = "1>1: ";
 pub(super) const BLANK_DC: &str = "   /    ";
 /// zip.c:BlankRunningStats, `-db`.
 pub(super) const BLANK_DB: &str = "     /      ";
+/// zip.c:ziperr under `-g` (`tempzip == zipfile`).
+pub(super) const ATTEMPTING_RESTORE: &str = "attempting to restore %s to its previous state\n";

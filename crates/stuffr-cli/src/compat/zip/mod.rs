@@ -132,17 +132,29 @@
 //!     empty archive); a Zip64 extra field shorter than the sizes it should
 //!     hold is read as zeros past its end; `-X-` stops copying old extra
 //!     blocks at one that runs past its field. And `-g` (grow) writes a copy
-//!     of the archive up to its central directory and renames it into
-//!     place, where zip writes into the archive itself: the bytes are the
-//!     same, but a failure leaves the archive as it was (zip, on a failed
-//!     `-T`, rewrites the old central directory in place and exits 5 with
-//!     `attempting to restore ...`), and `-T -g` tests the temporary, so a
-//!     `-TT` command is given its name, not the archive's.
-//! 14. zip truncates the output (`fopen "wb"`) when it checks that it can
-//!     write it, and removes an existing archive without entries there;
-//!     stuffr opens it without truncating and leaves an existing file, so a
-//!     run that fails before the new archive is in place leaves the output
-//!     as it was. The archive written is the same.
+//!     of the archive up to its central directory, appends, adds whatever
+//!     the old file had past the new end (zip writes in place and never
+//!     truncates, so a shorter `-z` comment leaves the old tail), and
+//!     renames the copy into place: the bytes of a successful run are
+//!     zip's. A failure leaves the archive as it was: zip prints
+//!     `attempting to restore <zip> to its previous state` (so does
+//!     stuffr, on every failure and interrupt under `-g`) and rewrites the
+//!     old central directory in place, leaving what it appended after it
+//!     (a write failure there can even leave no readable archive). A
+//!     failed `-T -g` is undefined behaviour in the C (`fseeko` on the
+//!     closed stream: Apple exits 5 after a blank line); stuffr answers
+//!     with the restore line, exit 8. `-T -g` tests the copy, so a `-TT`
+//!     command is given the temporary's name, not the archive's.
+//! 14. zip opens the output to check that it can write it with `fopen
+//!     "wb"` (truncating it) when it is `--out`'s or the archive has no
+//!     entries, and then removes an archive without entries; stuffr opens
+//!     it without truncating and removes nothing it did not create. So a
+//!     run that fails or is interrupted leaves an `--out` target or an
+//!     entry-less archive as it was (zip leaves the first empty and the
+//!     second gone). And on success, an entry-less archive that is a
+//!     symbolic or hard link: zip, having removed the link, renames a new
+//!     file into its place (the link's target left empty); stuffr writes
+//!     through the link, as `replace` does for any linked archive.
 //! 15. Ruling Z3: a failing `-T` in Ubuntu's build closes the temporary's
 //!     stream twice (`ziperr` after `fclose(y)`) and glibc aborts on the
 //!     double free (exit 5, a blank line, glibc's message); stuffr answers
@@ -153,6 +165,10 @@
 //!     command: `-T` fails there as without an `unzip` on `PATH`. The
 //!     interrupt handler writes `Interrupted (aborting)` to `mesg` only; a
 //!     `-lf` log does not get it.
+//! 17. Ruling Z16: `-sf -m` (`--show-files` with move) lists and ends
+//!     without writing an archive, and zip's `finish()` then deletes the
+//!     files of the entries the names marked, though nothing holds them.
+//!     stuffr deletes nothing after `-sf`.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -253,6 +269,9 @@ pub(crate) struct Zr<'a> {
     pub(crate) seen_doubledash: bool,
     /// The program, as `ziperr` of a helper names it.
     pub(crate) program: &'static str,
+    /// `-g` is writing (zip.c's `tempzip == zipfile`): `ziperr` then says
+    /// it is restoring this archive.
+    pub(crate) restoring: Option<Vec<u8>>,
 }
 
 impl<'a> Zr<'a> {
@@ -277,6 +296,7 @@ impl<'a> Zr<'a> {
             log_line_started: false,
             seen_doubledash: false,
             program,
+            restoring: None,
         }
     }
 
@@ -396,6 +416,14 @@ impl<'a> Zr<'a> {
             }
             self.log_write(&line);
             self.log_line_started = false;
+        }
+        if let Some(name) = self.restoring.take() {
+            // -g: the C rewrites the old central directory in place;
+            // stuffr's archive was never touched (deviation 13)
+            let mut l = Vec::new();
+            printf(&mut l, m::ATTEMPTING_RESTORE, &[&name]);
+            self.mesg_write(&l);
+            self.log_write(&l);
         }
         Exit { code }
     }

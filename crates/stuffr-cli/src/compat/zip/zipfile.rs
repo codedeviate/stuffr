@@ -598,8 +598,9 @@ pub(crate) fn write_central(
         putcentral(e, out)?;
         *tempzn +=
             4 + CENHEAD + e.iname.len() as u64 + e.cextra.len() as u64 + e.comment.len() as u64;
-        tot.n += e.len;
-        tot.t += e.siz;
+        // an old entry's declared sizes wrap as the C's uzoff_t
+        tot.n = tot.n.wrapping_add(e.len);
+        tot.t = tot.t.wrapping_add(e.siz);
         tot.k += 1;
     }
     before_end(out, tot);

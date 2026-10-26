@@ -106,8 +106,16 @@ fn a_failed_write_mid_update_keeps_the_old_archive() {
         let (code, out, _, _) = run(&s.0, Flavour::Apple, args);
         FILE_SIZE_LIMIT.with(|l| l.set(None));
         assert_eq!(code, 14, "{args:?}: {out}");
+        // under -g zip's ziperr says it restores the archive (deviation 13)
+        let restore = if args[0] == "-g" {
+            "attempting to restore t.zip to its previous state\n"
+        } else {
+            ""
+        };
         assert!(
-            out.ends_with("zip error: Output file write failure (write error on zip file)\n"),
+            out.ends_with(&format!(
+                "zip error: Output file write failure (write error on zip file)\n{restore}"
+            )),
             "{args:?}: {out:?}"
         );
         assert_eq!(std::fs::read(s.0.join("t.zip")).unwrap(), old, "{args:?}");
@@ -189,4 +197,95 @@ fn the_unzip_version_is_read_as_sscanf_reads_it() {
     assert_eq!(scan_unzip_version(b"UnZip x"), None);
     assert_eq!(scan_unzip_version(b"unzip 6.00"), None);
     assert_eq!(scan_unzip_version(b""), None);
+}
+
+/// An archive of stored one-byte entries whose central headers declare
+/// `(name, siz, len)` through a Zip64 extra field (both all-ones in the
+/// header): hostile sizes.
+fn declared_sizes(entries: &[(&[u8], u64, u64)]) -> Vec<u8> {
+    let mut b = Vec::new();
+    let mut offs = Vec::new();
+    for (name, _, _) in entries {
+        offs.push(b.len() as u32);
+        b.extend_from_slice(b"PK\x03\x04");
+        b.extend_from_slice(&[10, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b.extend_from_slice(&[0u8; 4]); // crc
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(name);
+        b.push(b'x');
+    }
+    let cd = b.len();
+    for ((name, siz, len), off) in entries.iter().zip(&offs) {
+        b.extend_from_slice(b"PK\x01\x02");
+        b.extend_from_slice(&[0x1e, 3, 45, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b.extend_from_slice(&[0u8; 4]);
+        b.extend_from_slice(&u32::MAX.to_le_bytes());
+        b.extend_from_slice(&u32::MAX.to_le_bytes());
+        b.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        b.extend_from_slice(&20u16.to_le_bytes());
+        b.extend_from_slice(&[0u8; 8]); // comment, disk, internal
+        b.extend_from_slice(&0x81a4_0000u32.to_le_bytes());
+        b.extend_from_slice(&off.to_le_bytes());
+        b.extend_from_slice(name);
+        b.extend_from_slice(&[1, 0, 16, 0]);
+        b.extend_from_slice(&len.to_le_bytes());
+        b.extend_from_slice(&siz.to_le_bytes());
+    }
+    let cd_len = b.len() - cd;
+    b.extend_from_slice(b"PK\x05\x06\0\0\0\0");
+    let n = entries.len() as u16;
+    b.extend_from_slice(&n.to_le_bytes());
+    b.extend_from_slice(&n.to_le_bytes());
+    b.extend_from_slice(&(cd_len as u32).to_le_bytes());
+    b.extend_from_slice(&(cd as u32).to_le_bytes());
+    b.extend_from_slice(&0u16.to_le_bytes());
+    b
+}
+
+/// Sizes an archive declares are the C's `uzoff_t`: added up they wrap,
+/// never panic (debug builds and the fuzz target check overflow).
+#[test]
+fn declared_sizes_near_the_top_wrap() {
+    let hostile = declared_sizes(&[
+        (b"a", u64::MAX, u64::MAX),
+        (b"b", u64::MAX - 1, i64::MAX as u64),
+        (b"c", i64::MAX as u64, i64::MAX as u64),
+    ]);
+    for args in [
+        &["t.zip", "n.txt"][..],
+        &["-v", "t.zip", "n.txt"],
+        &["-sf", "t.zip"],
+        &["-d", "-dc", "-db", "t.zip", "a"],
+        &["-U", "-v", "t.zip", "*", "--out", "o.zip"],
+        &["-g", "-v", "t.zip", "n.txt"],
+        &["-u", "t.zip"],
+        &["-o", "-z", "t.zip"],
+    ] {
+        let s = Scratch::new("hostile");
+        std::fs::write(s.0.join("t.zip"), &hostile).unwrap();
+        std::fs::write(s.0.join("n.txt"), b"new\n").unwrap();
+        let (code, _, _, _) = run(&s.0, Flavour::Apple, args);
+        assert!(
+            crate::compat::zip::EXIT_CODES.contains(&code),
+            "{args:?}: {code}"
+        );
+    }
+}
+
+/// Deviation 17 (ruling Z16): `-sf -m` writes no archive, so it deletes no
+/// input (zip's finish() deletes the files of the entries named).
+#[test]
+fn show_files_with_move_deletes_nothing() {
+    let s = with_archive("sfm");
+    let (code, out, _, _) = run(
+        &s.0,
+        Flavour::Apple,
+        &["-sf", "-m", "t.zip", "a.txt", "big"],
+    );
+    assert_eq!(code, 0, "{out}");
+    assert!(out.starts_with("Would Add/Update:\n"), "{out}");
+    assert_eq!(names(&s.0), ["a.txt", "big", "t.zip"]);
 }

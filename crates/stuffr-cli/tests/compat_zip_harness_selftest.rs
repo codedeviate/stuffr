@@ -308,7 +308,7 @@ mod unix {
         );
         assert_eq!(
             (md("d/c.txt").mtime(), md("d/c.txt").atime()),
-            (1_000_000_000, 1_000_000_000)
+            (1_000_000_000, INPUT_ATIME)
         );
         // an unlisted parent is made and pinned too
         assert_eq!(
@@ -373,7 +373,7 @@ mod unix {
             panic!("no t.zip: {:?}", r.stdout);
         };
         // a.txt's local header: version 10, stored, 2001-09-09 01:46:40
-        // UTC, then the UT field with mtime and atime 1e9
+        // UTC, then the UT field with mtime 1e9 and atime 2e9 (INPUT_ATIME)
         let a = bytes.windows(5).position(|w| w == b"a.txt").unwrap() - 30;
         assert_eq!(
             &bytes[a + 4..a + 14],
@@ -381,7 +381,7 @@ mod unix {
         );
         assert_eq!(
             &bytes[a + 35..a + 48],
-            b"UT\x09\x00\x03\x00\xca\x9a\x3b\x00\xca\x9a\x3b"
+            b"UT\x09\x00\x03\x00\xca\x9a\x3b\x00\x94\x35\x77"
         );
         // with standard input: the entry's time is the run's own
         let mut c = zip_case("zip", &["-"], ZipTree::new());

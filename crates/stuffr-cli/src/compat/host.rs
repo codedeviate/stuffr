@@ -555,6 +555,31 @@ static ZIP_ABORT_TEXT: std::sync::atomic::AtomicPtr<u8> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 #[cfg(unix)]
 static ZIP_ABORT_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// A line the handler prints after the error (`-g`'s "attempting to
+/// restore"), or null.
+#[cfg(unix)]
+static ZIP_ABORT_EXTRA: std::sync::atomic::AtomicPtr<u8> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+#[cfg(unix)]
+static ZIP_ABORT_EXTRA_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The line [`install_zip_abort`]'s handler prints after its error text
+/// (`None`: nothing). A no-op under a sandbox.
+pub(crate) fn zip_abort_extra(host: &Host, extra: Option<&'static [u8]>) {
+    #[cfg(unix)]
+    if matches!(host, Host::Real) {
+        match extra {
+            Some(t) => {
+                ZIP_ABORT_EXTRA.store(std::ptr::null_mut(), Ordering::SeqCst);
+                ZIP_ABORT_EXTRA_LEN.store(t.len(), Ordering::SeqCst);
+                ZIP_ABORT_EXTRA.store(t.as_ptr().cast_mut(), Ordering::SeqCst);
+            }
+            None => ZIP_ABORT_EXTRA.store(std::ptr::null_mut(), Ordering::SeqCst),
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (host, extra);
+}
 
 /// zip's `mesg` and `mesg_line_started` as the run has them, for the
 /// interrupt handler ([`install_zip_abort`]). A no-op under a sandbox.
@@ -575,6 +600,11 @@ pub(crate) fn zip_mesg_state(host: &Host, to_stderr: bool, line_started: bool) {
 /// (aborting)\n`) to `mesg`, removes the temporary armed with
 /// [`create_new_armed`] if any, and exits 9. Installed for the whole run;
 /// under `Host::Sandbox` nothing is installed.
+///
+/// As zip's, the handler takes SIGSEGV and SIGBUS too, without
+/// `SA_ONSTACK`: it replaces the Rust runtime's stack-overflow reporter, so
+/// a stack overflow or memory fault in stuffr would read as `Interrupted
+/// (aborting)`, exit 9 (or die silently, the handler having no stack).
 pub(crate) fn install_zip_abort(host: &Host, text: &'static [u8]) {
     #[cfg(unix)]
     {
@@ -620,6 +650,10 @@ extern "C" fn on_zip_abort(_sig: libc::c_int) {
         let p = ZIP_ABORT_TEXT.load(Ordering::Acquire);
         if !p.is_null() {
             libc::write(fd, p.cast(), ZIP_ABORT_LEN.load(Ordering::Acquire));
+        }
+        let x = ZIP_ABORT_EXTRA.load(Ordering::Acquire);
+        if !x.is_null() {
+            libc::write(fd, x.cast(), ZIP_ABORT_EXTRA_LEN.load(Ordering::Acquire));
         }
         if ARMED.load(Ordering::Acquire) {
             libc::unlink(SLOT.0.get().cast::<libc::c_char>());

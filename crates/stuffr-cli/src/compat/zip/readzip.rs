@@ -964,12 +964,15 @@ pub(crate) fn readlocal(z: &mut Zr, ia: &mut InArchive, zf: &ZFile) -> Result<Lo
     let nam = usize::from(sh(&buf, 22));
     let ext = usize::from(sh(&buf, 24));
     let name = f.fread(nam);
-    if name.len() != nam {
-        return Err(if f.ferror() { ZE_READ } else { ZE_EOF });
-    }
-    let extra = f.fread(ext);
-    if extra.len() != ext {
-        return Err(if f.ferror() { ZE_READ } else { ZE_EOF });
+    let extra = if name.len() == nam {
+        f.fread(ext)
+    } else {
+        Vec::new()
+    };
+    if name.len() != nam || extra.len() != ext {
+        let err = f.ferror();
+        ia.f = None;
+        return Err(if err { ZE_READ } else { ZE_EOF });
     }
     let iname = cstr(&e.iname).to_vec();
     if ver != e.ver {
@@ -1144,7 +1147,10 @@ pub(crate) fn zipcopy(
     } else {
         0
     };
-    *tempzn += 4 + LOCHEAD + nam as u64 + ext as u64 + e + zf.e.siz;
+    // uzoff_t arithmetic: a declared size wraps as in the C
+    *tempzn = tempzn
+        .wrapping_add(4 + LOCHEAD + nam as u64 + ext as u64 + e)
+        .wrapping_add(zf.e.siz);
     lz.crc = zf.e.crc;
     // the C's localz->oname is NULL: zipwarn prints `(null)`
     lz.oname = b"(null)".to_vec();

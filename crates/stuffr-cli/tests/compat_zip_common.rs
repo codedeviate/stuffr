@@ -585,6 +585,25 @@ mod unix {
         }
     }
 
+    /// Deviation 13: `-T -g` tests stuffr's copy, so the test program is
+    /// given the temporary's name (zip, writing in place, gives the
+    /// archive's), and the grown archive is in place after the test.
+    #[test]
+    fn a_grown_archive_is_tested_under_the_temporarys_name() {
+        for flavour in ["apple", "ubuntu"] {
+            let old = zip_made(flavour, &ZipTree::standard(), &["t.zip", "a.txt"], "t.zip");
+            let tree = env_probe(ZipTree::standard().file("t.zip", old));
+            let mut c = zip_case("zip", &["-T", "-TT", "probe", "-g", "t.zip", "b.txt"], tree);
+            c.zip_flavour = Some(flavour);
+            c.env = vec![FAKE_UNZIP_PATH];
+            let r = stuffr_zip(&c);
+            assert_eq!(r.code, 0, "{flavour}");
+            let out = String::from_utf8_lossy(&mask_temp_names(&r.stdout)).into_owned();
+            assert!(out.contains("args: zi??????\n"), "{flavour}: {out}");
+            assert!(out.ends_with("test of t.zip OK\n"), "{flavour}: {out}");
+        }
+    }
+
     #[test]
     fn zip_recorded_rows_hold_on_the_reference() {
         let rows: Vec<Row> = rows().into_iter().filter(Row::runs_here).collect();
