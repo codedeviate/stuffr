@@ -1938,9 +1938,12 @@ before the command line, as the reference does.
     zip's handler remove the temporary, leaving the archive gone or cut short
     and no whole copy anywhere. stuffr holds both signals back for the length
     of the replace (`zip`, its split parts and `-F`/`-FF`, `zipcloak`,
-    `zipnote -w`) and answers them as zip does once the archive is whole:
-    `Interrupted (aborting)`, exit 9, the new archive in place. A long
-    cross-device copy answers Ctrl-C when it ends.
+    `zipnote -w`; `-g`'s restore state is cleared in the same window) and
+    answers them as zip does once the archive is whole: `Interrupted
+    (aborting)`, exit 9, the new archive in place. A long cross-device copy
+    answers Ctrl-C when it ends. When the replace fails after the archive
+    was unlinked or cut (ruling Z34), the temporary is the only whole copy:
+    it is kept under its own name, where zip's handler would remove it.
 
 The full set is in the code's module docs
 (`crates/stuffr-cli/src/compat/zip/mod.rs`), which is the source of truth.

@@ -306,3 +306,81 @@ fn an_interrupt_during_replace_leaves_a_whole_archive() {
         );
     }
 }
+
+/// Ruling Z34: when `replace()` fails after the archive was truncated (the
+/// copy path over a hard-linked archive, the copy cut by `RLIMIT_FSIZE`),
+/// the temporary is the only whole copy. A SIGINT held meanwhile is answered
+/// as zip's handler answers it (`\n` + the text, exit 9), but the temporary
+/// is kept under its own name.
+#[cfg(unix)]
+#[test]
+fn an_interrupt_after_a_failed_replace_keeps_the_temporary() {
+    use crate::compat::host;
+    use crate::compat::zip::sink;
+    use std::os::unix::io::AsRawFd;
+    use std::sync::atomic::Ordering;
+
+    let s = SigScratch::new("failed");
+    let real = s.0.join("real.zip");
+    let archive = s.0.join("a.zip");
+    let tmp = s.0.join("zi654321");
+    std::fs::write(&real, b"OLD ARCHIVE BYTES").unwrap();
+    std::fs::hard_link(&real, &archive).unwrap();
+    let new = vec![b'N'; 300_000];
+    let capture = std::fs::File::create(s.0.join("mesg")).unwrap();
+    let cfd = capture.as_raw_fd();
+    // SAFETY: as in `an_interrupt_during_replace_leaves_a_whole_archive`;
+    // setrlimit and signal(SIGXFSZ, SIG_IGN) only change this child.
+    let status = unsafe {
+        let pid = libc::fork();
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            host::disarm_inherited();
+            libc::dup2(cfd, 1);
+            host::install_zip_abort(&Host::Real, messages::INTERRUPTED_ABORTING);
+            host::zip_mesg_state(&Host::Real, false, false);
+            let made = host::create_new_armed_if(true, &tmp, host::ZIP_SIGNALS);
+            let Ok((mut f, _armed)) = made else {
+                libc::_exit(20);
+            };
+            if std::io::Write::write_all(&mut f, &new).is_err() {
+                libc::_exit(21);
+            }
+            drop(f);
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let limit = libc::rlimit {
+                rlim_cur: 4096,
+                rlim_max: libc::RLIM_INFINITY,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+                libc::_exit(24);
+            }
+            sink::RAISE_MID_REPLACE.store(true, Ordering::SeqCst);
+            let r = sink::replace(&archive, &tmp);
+            libc::_exit(if r.is_ok() { 22 } else { 23 });
+        }
+        let mut status = 0;
+        while libc::waitpid(pid, &mut status, 0) < 0 {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EINTR)
+            );
+        }
+        status
+    };
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 9,
+        "status {status:#x}"
+    );
+    assert!(
+        std::fs::read(&tmp).ok().as_deref() == Some(&new[..]),
+        "the temporary, the only whole copy, is gone or cut"
+    );
+    let mut want = b"\n".to_vec();
+    want.extend_from_slice(messages::INTERRUPTED_ABORTING);
+    assert_eq!(
+        String::from_utf8_lossy(&std::fs::read(s.0.join("mesg")).unwrap()),
+        String::from_utf8_lossy(&want),
+        "zip's answer"
+    );
+}

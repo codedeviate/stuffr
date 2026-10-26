@@ -24,8 +24,9 @@
 //! fields (`unix::extra_fields`).
 //!
 //! **Task 6 (`zipup.rs`, `zipfile.rs`, `write.rs`, `sink.rs`):** writing a
-//! new archive, byte for byte as the references write it: `zipup.c` (the method, stored or
-//! deflated through `stuffr::infozip::ZipDeflater`, `-l`/`-ll`, the
+//! new archive, byte for byte as the references write it: `zipup.c` (the
+//! method, stored or deflated through `stuffr::infozip::ZipDeflater`,
+//! `-l`/`-ll`, the
 //! descriptor or the rewritten local header), `zipfile.c`'s writing half
 //! (local and central headers, Zip64 fields and end records, the end
 //! record) and `zip.c:main` from the temporary archive to `finish()`
@@ -290,8 +291,9 @@
 //!     reference. A comment's length wraps at 65536 as the C's `ush` does.
 //! 27. `zipsplit`: a `%` in the archive's name is a conversion in the C's
 //!     name template (`sprintf(name, template, n)`, undefined behaviour);
-//!     stuffr takes it as a character. After an error writing the index under `-p` and a
-//!     yes to "redo entire disk?", the C goes back to the wrong disk (its
+//!     stuffr takes it as a character. After an error writing the index
+//!     under `-p` and a yes to "redo entire disk?", the C goes back to the
+//!     wrong disk (its
 //!     loop variable holds the failure flag); stuffr redoes disk 1. An
 //!     interrupt removes the parts only when `-b`'s directory is shorter
 //!     than half of `PATH_MAX` (the handler's static holds that much;
@@ -335,8 +337,12 @@
 //!     -w`; `-g`'s restore state is cleared in the same window) and answers
 //!     them as zip does once the archive is whole: `Interrupted
 //!     (aborting)`, exit 9, the new archive in place. A long cross-device
-//!     copy answers Ctrl-C when it ends. Pinned by
-//!     `tests::an_interrupt_during_replace_leaves_a_whole_archive`.
+//!     copy answers Ctrl-C when it ends. When the replace fails after the
+//!     archive was unlinked or cut (ruling Z34), the temporary is the only
+//!     whole copy: it is kept under its own name, where zip's handler would
+//!     remove it. Pinned by
+//!     `tests::an_interrupt_during_replace_leaves_a_whole_archive` and
+//!     `tests::an_interrupt_after_a_failed_replace_keeps_the_temporary`.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};

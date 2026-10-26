@@ -419,10 +419,19 @@ pub(crate) fn mkstemp_with(
 /// between the archive's unlink and the rename, or while the copy rewrites
 /// it, zip's handler would remove the armed temporary and leave no whole
 /// archive at all. Held, the interrupt is answered once this returns, when
-/// the temporary is the archive (or, after a failure, still named).
+/// the temporary is the archive. After a failure the temporary is disarmed
+/// inside the hold (ruling Z34), so it survives under its own name even
+/// when the archive was already unlinked or truncated: the handler then
+/// removes nothing (zip's would remove it).
 // port: fileio.c:replace
 pub(crate) fn replace(d: &Path, s: &Path) -> Result<(), (i32, io::Error)> {
-    host::with_zip_signals_held(|| replace_now(d, s))
+    host::with_zip_signals_held(|| {
+        let r = replace_now(d, s);
+        if r.is_err() {
+            host::disarm_cleanup();
+        }
+        r
+    })
 }
 
 /// In a test's forked child: raise SIGINT at the two points of [`replace`]

@@ -1533,6 +1533,15 @@ pub(crate) fn with_zip_signals_held<T>(f: impl FnOnce() -> T) -> T {
     held_back(ZIP_OUTSIDE_SIGNALS, f)
 }
 
+/// Disarm the armed output without dropping its guard: a handler that runs
+/// later unlinks nothing. For a failed `replace()`, where the temporary may
+/// be the only whole copy of the archive (ruling Z34). The guard's drop
+/// disarms again, harmlessly.
+pub(crate) fn disarm_cleanup() {
+    #[cfg(unix)]
+    ARMED.store(false, Ordering::SeqCst);
+}
+
 /// Run `f` with `signals` blocked on this thread, then restore the mask; a
 /// signal that arrived meanwhile is delivered on the restore. Off unix, just
 /// `f`.
