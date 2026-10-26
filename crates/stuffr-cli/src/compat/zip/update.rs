@@ -239,11 +239,15 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
     // archive itself (deviation 13: stuffr grows a copy)
     let shown_temp = if d { zipfile.clone() } else { tempzip.clone() };
     if d && !to_stdout {
-        // zip.c: tempzip = zipfile; ziperr now says it restores the archive
-        let mut l = Vec::new();
-        printf(&mut l, m::ATTEMPTING_RESTORE, &[&zipfile]);
-        let l: &'static [u8] = Box::leak(l.into_boxed_slice());
-        crate::compat::host::zip_abort_extra(&z.host, Some(l));
+        // zip.c: tempzip = zipfile; ziperr now says it restores the archive.
+        // The handler's line is leaked once per run, and only for a real
+        // run: a sandbox installs no handler, so it would leak per call.
+        if matches!(z.host, Host::Real) {
+            let mut l = Vec::new();
+            printf(&mut l, m::ATTEMPTING_RESTORE, &[&zipfile]);
+            let l: &'static [u8] = Box::leak(l.into_boxed_slice());
+            crate::compat::host::zip_abort_extra(&z.host, Some(l));
+        }
         z.restoring = Some(zipfile.clone());
     }
     let use_descriptors = z.o.use_descriptors || !sink.seekable();
