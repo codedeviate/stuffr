@@ -86,6 +86,90 @@ mod unix {
         );
     }
 
+    /// Ruling Z22's sort: entries with equal names (more than 7, where
+    /// Apple's `qsort` is no longer stable) met before a central header,
+    /// then entries with new names and more central headers: `-FF` finds
+    /// the same one of the equal entries for each central header as the
+    /// reference, whose `qsort` runs over all entries each time.
+    #[test]
+    fn ff_matches_equal_names_as_the_reference_does() {
+        fn local(name: &[u8], data: &[u8]) -> Vec<u8> {
+            let crc = crc32(data);
+            let mut b = b"PK\x03\x04\x0a\x00\x00\x00\x00\x00".to_vec();
+            b.extend_from_slice(&0x2b29_0dd4u32.to_le_bytes());
+            b.extend_from_slice(&crc.to_le_bytes());
+            b.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            b.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            b.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            b.extend_from_slice(&[0, 0]);
+            b.extend_from_slice(name);
+            b.extend_from_slice(data);
+            b
+        }
+        fn central(name: &[u8], comment: &[u8], atx: u32) -> Vec<u8> {
+            let mut b = b"PK\x01\x02\x1e\x03\x0a\x00\x00\x00\x00\x00".to_vec();
+            b.extend_from_slice(&0x2b29_0dd4u32.to_le_bytes());
+            b.extend_from_slice(&[0; 12]);
+            b.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            b.extend_from_slice(&[0, 0]);
+            b.extend_from_slice(&(comment.len() as u16).to_le_bytes());
+            b.extend_from_slice(&[0, 0, 0, 0]);
+            b.extend_from_slice(&atx.to_le_bytes());
+            b.extend_from_slice(&[0; 4]);
+            b.extend_from_slice(name);
+            b.extend_from_slice(comment);
+            b
+        }
+        fn crc32(d: &[u8]) -> u32 {
+            let mut c = !0u32;
+            for &x in d {
+                c ^= u32::from(x);
+                for _ in 0..8 {
+                    c = if c & 1 != 0 {
+                        (c >> 1) ^ 0xedb8_8320
+                    } else {
+                        c >> 1
+                    };
+                }
+            }
+            !c
+        }
+        let mut cases = Vec::new();
+        for dups in [7usize, 9, 13, 20] {
+            let mut b = Vec::new();
+            for i in 0..dups {
+                b.extend_from_slice(&local(b"dup.txt", format!("data {i}\n").as_bytes()));
+            }
+            b.extend_from_slice(&local(b"aaa.txt", b"a\n"));
+            for (j, c) in [&b"one"[..], b"two"].iter().enumerate() {
+                b.extend_from_slice(&central(b"dup.txt", c, 0x81a4_0000 + j as u32));
+            }
+            // new names, then the central directory again
+            for n in [&b"b.txt"[..], b"c.txt", b"zzz.txt", b"dup.tx"] {
+                b.extend_from_slice(&local(n, b"new\n"));
+            }
+            for (j, c) in [&b"three"[..], b"four"].iter().enumerate() {
+                b.extend_from_slice(&central(b"dup.txt", c, 0x81ed_0000 + j as u32));
+            }
+            // and once more with one more equal name
+            b.extend_from_slice(&local(b"dup.txt", b"late\n"));
+            b.extend_from_slice(&central(b"dup.txt", b"five", 0x81b6_0000));
+            let mut c = zip_case(
+                "zip",
+                &["-FF", "in.zip", "--out", "f.zip"],
+                ZipTree::standard().file("in.zip", b),
+            );
+            c.stdin = Some(b"y\n".to_vec());
+            cases.push(c);
+        }
+        run_group(
+            &format!("zip -FF equal names ({})", platform_zip_flavour()),
+            &cases,
+            Skipped::none(),
+            &assert_same_zip,
+        );
+    }
+
     /// Rulings Z5 and Z19, stuffr only, both flavours: the end of standard
     /// input at a question about a part to read answers `q`, at `-sp`'s
     /// question ENTER; `-FF` copies a local extra field into the central one

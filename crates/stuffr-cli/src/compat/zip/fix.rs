@@ -20,10 +20,11 @@
 //! so a run of fake descriptor signatures costs a few bytes each, not a
 //! 16 KiB read. The sort of the entries at each central header met (the
 //! C's `qsort` of all of them) is skipped when nothing was added and is an
-//! insertion when a few entries with new names were; only entries with
-//! equal names alternating with central headers are sorted again each
-//! time (their order is the flavour's `qsort`'s, as in the C): quadratic
-//! in the number of such entries. In a sandbox every byte `-FF` reads is
+//! insertion when a few entries with new names were, while every name met
+//! is distinct; once two entries share a name the flavour's `qsort` runs
+//! over all entries at each central header met after new entries, as in
+//! the C (an unstable `qsort` orders equal names its own way): quadratic
+//! then in the number of local headers alternating with central ones. In a sandbox every byte `-FF` reads is
 //! charged to the output budget. The parts of a split archive are opened
 //! through `Host::track`.
 //!
@@ -251,8 +252,8 @@ fn scanzipf_fixnew(
     let mut errno = Errno::default();
     let mut sigbuf = [0u8; 4];
     let mut in_central_directory = false;
-    // how many entries `zsort` holds (ruling Z22)
-    let mut sorted_upto = 0usize;
+    // how far `zsort` is made (ruling Z22)
+    let mut sorted = SortState::default();
     let mut r: i32 = 0;
     z.total_disks = 1_000_000;
     let in_path = z.o.in_path.clone().unwrap_or_default();
@@ -481,7 +482,7 @@ fn scanzipf_fixnew(
                 if !in_central_directory {
                     z.zipmessage(m::FF_CENTRAL_FOUND.as_bytes(), b"");
                     // sort what there is by name
-                    resort(z, &mut sc.ar, &mut sorted_upto);
+                    resort(z, &mut sc.ar, &mut sorted);
                 }
                 if z.o.verbose > 0 {
                     message(z, m::FF_CEN, &[&d1, &o1], false);
@@ -641,55 +642,65 @@ fn scanzipf_fixnew(
     Ok(0)
 }
 
+/// How far `zsort` is made, and whether two entries have ever had equal
+/// names (sticky: from then on the flavour's `qsort` decides their order,
+/// and an insertion could not reproduce it).
+#[derive(Default)]
+struct SortState {
+    upto: usize,
+    has_equal: bool,
+}
+
 /// zipfile.c:scanzipf_fixnew's sort of the entries met so far, at each
 /// central directory met (`qsort(zsort, zcount, ..., zqcmp)`), with the
 /// same `zsort` and less work (ruling Z22): nothing when no entry was
-/// added since the last sort; a few new entries whose names are all
-/// distinct inserted where they go; many, or any equal names, sorted again
-/// (with names all distinct any sort gives the one order; with equal names
-/// the flavour's `qsort` decides their order, as in the C).
-fn resort(z: &Zr, ar: &mut Archive, sorted_upto: &mut usize) {
+/// added since the last sort; while every name met is distinct, a few new
+/// entries inserted where they go, or many sorted (with names all distinct
+/// any sort gives the one order); once two names are equal, the flavour's
+/// `qsort` over all entries in their order, every time, as in the C (an
+/// unstable `qsort` orders equal names its own way).
+fn resort(z: &Zr, ar: &mut Archive, st: &mut SortState) {
     let n = ar.zfiles.len();
-    if n == *sorted_upto {
+    if n == st.upto {
         return;
     }
-    let key = |zf: &[ZFile], i: usize| cstr(&zf[i].zname).to_vec();
-    let mut distinct = true;
-    if n - *sorted_upto <= 64 {
-        for i in *sorted_upto..n {
-            let k = key(&ar.zfiles, i);
-            match ar
-                .zsort
-                .binary_search_by(|&j| cstr(&ar.zfiles[j].zname).cmp(&k))
-            {
-                Ok(_) => {
-                    distinct = false;
-                    break;
+    if !st.has_equal {
+        if n - st.upto <= 64 {
+            let mut zsort = ar.zsort.clone();
+            for i in st.upto..n {
+                let k = cstr(&ar.zfiles[i].zname);
+                match zsort.binary_search_by(|&j| cstr(&ar.zfiles[j].zname).cmp(k)) {
+                    Ok(_) => {
+                        st.has_equal = true;
+                        break;
+                    }
+                    Err(pos) => zsort.insert(pos, i),
                 }
-                Err(pos) => ar.zsort.insert(pos, i),
             }
-        }
-        if distinct {
-            *sorted_upto = n;
-            return;
-        }
-    } else {
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by(|&a, &b| cstr(&ar.zfiles[a].zname).cmp(cstr(&ar.zfiles[b].zname)));
-        if order
-            .windows(2)
-            .all(|w| cstr(&ar.zfiles[w[0]].zname) != cstr(&ar.zfiles[w[1]].zname))
-        {
-            ar.zsort = order;
-            *sorted_upto = n;
-            return;
+            if !st.has_equal {
+                ar.zsort = zsort;
+                st.upto = n;
+                return;
+            }
+        } else {
+            let mut order: Vec<usize> = (0..n).collect();
+            order.sort_by(|&a, &b| cstr(&ar.zfiles[a].zname).cmp(cstr(&ar.zfiles[b].zname)));
+            if order
+                .windows(2)
+                .all(|w| cstr(&ar.zfiles[w[0]].zname) != cstr(&ar.zfiles[w[1]].zname))
+            {
+                ar.zsort = order;
+                st.upto = n;
+                return;
+            }
+            st.has_equal = true;
         }
     }
     let names: Vec<&[u8]> = ar.zfiles.iter().map(|f| cstr(&f.zname)).collect();
     let mut order: Vec<usize> = (0..n).collect();
     super::scan::qsort(z.flavour, &mut order, &|a, b| names[a].cmp(names[b]));
     ar.zsort = order;
-    *sorted_upto = n;
+    st.upto = n;
 }
 
 /// `strerror` of an error the output stream met.
