@@ -1167,7 +1167,7 @@ pub(crate) fn run(z: &mut Zr) -> Exit {
         }
         return z.ziperr(ZE_NONE, &zipfile);
     }
-    super::zipup::write_new(z, found)
+    super::write::write_new(z, found)
 }
 
 #[cfg(test)]

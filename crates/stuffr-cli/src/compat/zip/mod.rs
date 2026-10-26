@@ -23,7 +23,7 @@
 //! (`fileio.c`, `util.c`'s matcher, `unix/unix.c`); also the unix extra
 //! fields (`unix::extra_fields`).
 //!
-//! **Task 6 (`zipup.rs`, `zipfile.rs`):** writing a new archive, byte for
+//! **Task 6 (`zipup.rs`, `zipfile.rs`, `write.rs`, `sink.rs`):** writing a new archive, byte for
 //! byte as the references write it: `zipup.c` (the method, stored or
 //! deflated through `stuffr::infozip::ZipDeflater`, `-l`/`-ll`, the
 //! descriptor or the rewritten local header), `zipfile.c`'s writing half
@@ -97,6 +97,26 @@
 //!    removed. stuffr gives that answer without the dereference (as 6 and
 //!    8), at the first question, and a sandbox's standard error is never
 //!    readable.
+//! 10. A `-c` or `-z` line is cut at its first NUL, as the C's `strlen` and
+//!     `strcpy` cut it; a line that BEGINS with a NUL makes the C read the
+//!     byte before its buffer (`p[k-1]`, `e[r-1]` with a length of 0).
+//!     stuffr takes it for an empty line.
+//! 11. A symbolic link stored under `-y` that is removed between zip's
+//!     `stat` and its `readlink` makes the C pass `readlink`'s -1 on as a
+//!     length to `crc32` and `zfwrite`. stuffr stores the link with no
+//!     text (0 bytes, CRC 0), exit 0.
+//! 12. A write to the archive that fails is answered where and as zip's
+//!     stdio stream answers it (`zipup.rs`, `sink.rs`; measured under
+//!     `ulimit -f` on both references). Two Ubuntu answers are not
+//!     reproduced: when only `fclose` meets the failure, Ubuntu's `ziperr`
+//!     closes the stream a second time and glibc aborts on the double free
+//!     (exit 5, the temporary left; undefined behaviour, as ruling Z3's);
+//!     stuffr answers as Apple does ("Temporary file failure", exit 10, the
+//!     temporary removed). And the `zip I/O error:` line of "unexpected
+//!     error on zip file" shows whatever `errno` glibc's later calls left
+//!     (`No such file or directory` from the time zone lookup in a
+//!     container without tzdata); stuffr shows the write's own error, as
+//!     Apple does.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -113,7 +133,9 @@ pub(crate) mod cli;
 pub(crate) mod flavour;
 mod messages;
 pub(crate) mod scan;
+pub(crate) mod sink;
 pub(crate) mod unix;
+pub(crate) mod write;
 pub(crate) mod zipfile;
 pub(crate) mod zipup;
 

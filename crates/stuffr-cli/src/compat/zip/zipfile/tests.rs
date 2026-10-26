@@ -20,10 +20,17 @@ impl ZWrite for Mem {
     fn offset(&self) -> u64 {
         self.0.len() as u64
     }
-    fn rewrite(&mut self, at: u64, bytes: &[u8]) -> io::Result<()> {
-        let at = at as usize;
-        self.0[at..at + bytes.len()].copy_from_slice(bytes);
+    fn seek_to(&mut self, _at: u64) -> io::Result<()> {
         Ok(())
+    }
+    fn write_here(&mut self, _bytes: &[u8]) -> io::Result<()> {
+        Ok(())
+    }
+    fn seek_end(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    fn ferror(&self) -> Option<io::Error> {
+        None
     }
 }
 

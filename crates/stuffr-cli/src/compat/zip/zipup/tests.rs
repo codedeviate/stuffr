@@ -2,7 +2,10 @@ use super::*;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::sync::Mutex;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 
 use crate::compat::host::{InputReads, Sandbox};
 use crate::compat::zip::Flavour;
@@ -30,14 +33,26 @@ impl Drop for Scratch {
 /// `zip args` in a sandbox over `dir`, the input `name` given `reads`'
 /// test limits: (exit, stdout, stderr).
 fn run(dir: &Path, args: &[&str], name: &str, reads: InputReads) -> (i32, String, String) {
+    run_with(dir, args, name, reads, b"", u64::MAX)
+}
+
+/// [`run`] with standard input and an output budget.
+fn run_with(
+    dir: &Path,
+    args: &[&str],
+    name: &str,
+    reads: InputReads,
+    stdin: &[u8],
+    budget: u64,
+) -> (i32, String, String) {
     let log = Arc::new(Mutex::new(BTreeMap::new()));
     log.lock().unwrap().insert(dir.join(name), reads);
     let stdout = Arc::new(Mutex::new(Vec::new()));
     let host = Host::Sandbox(Sandbox {
         dir: dir.to_path_buf(),
-        stdin: Some(Vec::new()),
+        stdin: Some(stdin.to_vec()),
         stdout: stdout.clone(),
-        budget: Arc::new(AtomicU64::new(u64::MAX)),
+        budget: Arc::new(AtomicU64::new(budget)),
         reads: log,
     });
     let args: Vec<OsString> = args.iter().map(OsString::from).collect();
@@ -47,7 +62,7 @@ fn run(dir: &Path, args: &[&str], name: &str, reads: InputReads) -> (i32, String
     let out = stdout.lock().unwrap().clone();
     (
         code,
-        String::from_utf8(out).unwrap(),
+        String::from_utf8_lossy(&out).into_owned(),
         String::from_utf8(err).unwrap(),
     )
 }
@@ -320,4 +335,134 @@ fn file_read_translates_each_request() {
     let n = r.file_read(&mut buf);
     assert_eq!(&buf[..n], b"\x00\n\x01");
     assert_eq!(r.file_binary, 1);
+}
+
+/// Important 1 of the review: a write to the archive that fails ends the
+/// run where zip's stdio stream shows it, with zip's code (48 cases under
+/// `ulimit -f` 1, 2 and 20 KiB identical to Apple's zip, fix report 1):
+/// `bfwrite`'s "write error on zip file" (14) when a buffered write must
+/// flush and cannot; a failed flush inside `fseeko` (the local header's
+/// rewrite) sends the entry to a data descriptor, and the next local
+/// header finds the stream's error flag: "unexpected error on zip file"
+/// (14); deflate's `seekable()` flushes too; and what only `fclose` cannot
+/// flush is "Temporary file failure" (10). Nothing is left behind.
+#[test]
+fn a_failed_write_is_zips_write_error() {
+    let efbig = "zip I/O error: File too large\n";
+    let write_error = "zip error: Output file write failure (write error on zip file)\n";
+    let unexpected = "zip error: Output file write failure (unexpected error on zip file)\n";
+    // (args, files, KiB of `ulimit -f`, exit, standard output as measured)
+    let b_txt: Vec<u8> = (1..=600)
+        .flat_map(|i| format!("{i}\n").into_bytes())
+        .collect();
+    let cases: Vec<(&[&str], u64, i32, String)> = vec![
+        (
+            &["-0", "t.zip", "big"],
+            4,
+            14,
+            format!("  adding: big\n{efbig}{write_error}"),
+        ),
+        (
+            &["t.zip", "big"],
+            4,
+            14,
+            format!("  adding: big\n{efbig}{write_error}"),
+        ),
+        (
+            &["-0", "t.zip", "b.txt", "a.txt"],
+            1,
+            14,
+            format!("  adding: b.txt (stored 0%)\n  adding: a.txt\n{efbig}{unexpected}"),
+        ),
+        (
+            &["-fd", "t.zip", "b.txt", "a.txt"],
+            1,
+            14,
+            format!("  adding: b.txt (deflated 53%)\n  adding: a.txt\n{efbig}{write_error}"),
+        ),
+        (
+            &["t.zip", "b.txt"],
+            1,
+            10,
+            format!("  adding: b.txt (deflated 53%)\n{efbig}zip error: Temporary file failure (zi"),
+        ),
+        (
+            &["t.zip", "a.txt"],
+            1,
+            0,
+            "  adding: a.txt (stored 0%)\n".to_owned(),
+        ),
+    ];
+    for (args, kib, want_code, want) in cases {
+        let s = Scratch::new("wfail");
+        std::fs::write(s.0.join("big"), big(400_000)).unwrap();
+        std::fs::write(s.0.join("a.txt"), b"hello\n").unwrap();
+        std::fs::write(s.0.join("b.txt"), &b_txt).unwrap();
+        crate::compat::zip::sink::FILE_SIZE_LIMIT.with(|l| l.set(Some(kib * 1024)));
+        let (code, out, _) = run(&s.0, args, "a.txt", InputReads::default());
+        crate::compat::zip::sink::FILE_SIZE_LIMIT.with(|l| l.set(None));
+        assert_eq!(code, want_code, "{args:?}: {out}");
+        assert!(out.starts_with(&want), "{args:?}: {out:?}");
+        let left = std::fs::read_dir(&s.0).unwrap().count();
+        assert_eq!(left, 3 + usize::from(code == 0), "{args:?}: something left");
+    }
+}
+
+/// Important 2 of the review: `-c` and `-z` lines end at their first NUL,
+/// as the C's `strlen`/`strcpy` take them; deviation 10, a line that starts
+/// with NUL is an empty line.
+#[test]
+fn comment_lines_are_cut_at_nul() {
+    let s = Scratch::new("nul");
+    std::fs::write(s.0.join("a"), b"x").unwrap();
+    std::fs::write(s.0.join("b"), b"y").unwrap();
+    let (code, out, err) = run_with(
+        &s.0,
+        &["-c", "-z", "t.zip", "a", "b"],
+        "a",
+        InputReads::default(),
+        b"ab\0cd\n\0lost\n\0\nzip\0x\n.\n",
+        u64::MAX,
+    );
+    assert_eq!(code, 0, "{out} {err}");
+    let zip = std::fs::read(s.0.join("t.zip")).unwrap();
+    let le16 = |at: usize| usize::from(u16::from_le_bytes([zip[at], zip[at + 1]]));
+    let mut comments = Vec::new();
+    let mut at = zip.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+    while zip[at..].starts_with(b"PK\x01\x02") {
+        let (n, x, c) = (le16(at + 28), le16(at + 30), le16(at + 32));
+        comments.push(zip[at + 46 + n + x..at + 46 + n + x + c].to_vec());
+        at += 46 + n + x + c;
+    }
+    assert_eq!(comments, [b"ab".to_vec(), Vec::new()]);
+    let end = zip.windows(4).rposition(|w| w == b"PK\x05\x06").unwrap();
+    // an empty first line is "\r\n", the next joined with "\r\n"
+    assert_eq!(&zip[end + 22..], b"\r\n\r\nzip");
+}
+
+/// Deviation 11 (the review's Minor 4): a link removed between
+/// zip's stat and its `readlink` (the C's `k = -1` into `crc32` and
+/// `zfwrite` is undefined behaviour) is stored as an empty link, exit 0.
+#[cfg(unix)]
+#[test]
+fn a_link_gone_before_readlink_is_stored_empty() {
+    let s = Scratch::new("link");
+    std::fs::write(s.0.join("a"), b"x").unwrap();
+    std::os::unix::fs::symlink("a", s.0.join("l")).unwrap();
+    AFTER_OPEN.with(|h| {
+        *h.borrow_mut() = Some(Box::new(|p: &Path| {
+            std::fs::remove_file(p).unwrap();
+        }));
+    });
+    let r = run(&s.0, &["-y", "t.zip", "l"], "l", InputReads::default());
+    AFTER_OPEN.with(|h| *h.borrow_mut() = None);
+    assert_eq!(
+        (r.0, r.1.as_str()),
+        (0, "  adding: l (stored 0%)\n"),
+        "{}",
+        r.2
+    );
+    let zip = std::fs::read(s.0.join("t.zip")).unwrap();
+    let (local, _) = sizes(&zip);
+    assert_eq!(local, [0, 0, 0, 0]);
 }

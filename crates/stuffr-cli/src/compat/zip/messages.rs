@@ -1077,7 +1077,12 @@ pub(super) const NO_STORE_ON_PIPES: &str = "zip -0 not supported for I/O on pipe
 pub(super) const BAD_PACK_LEVEL: &str = "bad pack level";
 /// trees.c:flush_block, `error("block vanished")`.
 pub(super) const BLOCK_VANISHED: &str = "block vanished";
-/// zipup.c:flush_outbuf, `ziperr(ZE_WRITE, ...)`.
+/// zipup.c:zipup, the stream's error flag after a local header.
+pub(super) const UNEXPECTED_ERROR_ON_ZIP: &str = "unexpected error on zip file";
+/// zipup.c:zipup, `error()` when a descriptor follows an entry deflate
+/// stored.
+pub(super) const CANT_REWRITE_METHOD: &str = "can't rewrite method";
+/// fileio.c:bfwrite and zipup.c:flush_outbuf, `ziperr(ZE_WRITE, ...)`.
 pub(super) const WRITE_ERROR_ON_ZIP: &str = "write error on zip file";
 /// zip.c:main, the summary after unreadable inputs.
 pub(super) const NOT_ALL_READABLE: &str = "\nzip warning: Not all files were readable\n";

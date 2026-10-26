@@ -154,6 +154,33 @@ pub struct DeflateSummary {
     pub slides: u64,
 }
 
+/// Where [`ZipDeflater::compress_to`] writes: the archive, which
+/// `flush_block` asks once per entry whether it can be rewound (trees.c's
+/// `seekable()`, zip's `fseekable(y)`), when an entry is one block that does
+/// not pay.
+pub trait ZipOut: Write {
+    /// `seekable()`.
+    fn seekable(&mut self) -> bool;
+}
+
+/// A plain `Write`, always seekable ([`ZipDeflater::compress`]).
+struct Seekable<'a>(&'a mut dyn Write);
+
+impl Write for Seekable<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl ZipOut for Seekable<'_> {
+    fn seekable(&mut self) -> bool {
+        true
+    }
+}
+
 /// The C's `error("block vanished")` (`ZE_LOGIC`): a stored entry's only
 /// block has left the window. The error [`ZipDeflater::compress`] returns
 /// for it carries this, so a caller can tell it from a read or write error
@@ -182,7 +209,7 @@ const OUT_SIZE: usize = 1024;
 /// `-dg` counts its dots by those writes.
 struct Io<'a> {
     input: &'a mut dyn Read,
-    out: &'a mut dyn Write,
+    out: &'a mut dyn ZipOut,
     /// The running CRC register (inverted, as `crc32()` keeps it inside).
     crc: u32,
     isize: u64,
@@ -772,8 +799,10 @@ impl ZipDeflater {
     }
 
     /// Whether `flush_block` may rewrite a one-block entry that does not
-    /// pay as stored: zip's `seekable() && !use_descriptors`. True by
-    /// default; false for an archive on a pipe or under `-fd`.
+    /// pay as stored: the `!use_descriptors` half of zip's `seekable() &&
+    /// !use_descriptors` (the other half is [`ZipOut::seekable`], asked
+    /// first). True by default; false for an archive on a pipe or under
+    /// `-fd`.
     pub fn set_store_fallback(&mut self, allowed: bool) {
         self.store_fallback = allowed;
     }
@@ -800,6 +829,17 @@ impl ZipDeflater {
         &mut self,
         input: &mut dyn Read,
         out: &mut dyn Write,
+    ) -> io::Result<DeflateSummary> {
+        self.compress_to(input, &mut Seekable(out))
+    }
+
+    /// [`ZipDeflater::compress`] into an archive `flush_block` asks whether
+    /// it can be rewound (zip's `seekable()`, which flushes its stdio
+    /// buffer: a write can fail there).
+    pub fn compress_to(
+        &mut self,
+        input: &mut dyn Read,
+        out: &mut dyn ZipOut,
     ) -> io::Result<DeflateSummary> {
         let mut io = Io {
             input,
@@ -1238,6 +1278,7 @@ impl ZipDeflater {
             && eof
             && self.cmpr_bytelen == 0
             && self.cmpr_len_bits == 0
+            && io.out.seekable()
             && self.store_fallback
         {
             let Some(at) = buf else {

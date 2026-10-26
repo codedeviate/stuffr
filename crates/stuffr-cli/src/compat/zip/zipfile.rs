@@ -6,7 +6,7 @@
 //!
 //! Each record is built in memory and written whole, as the C's
 //! `append_*_to_mem` and one `bfwrite` do; a local header is rewritten in
-//! place with [`ZWrite::rewrite`] once its sizes and CRC are known, unless
+//! place ([`ZWrite::seek_to`], [`ZWrite::write_here`], [`ZWrite::seek_end`]) once its sizes and CRC are known, unless
 //! the archive cannot be rewound (a pipe) or `-fd` asks for data
 //! descriptors.
 //!
@@ -88,10 +88,17 @@ pub(crate) trait ZWrite: Write {
     fn seekable(&self) -> bool;
     /// Bytes written so far: the offset of the next one.
     fn offset(&self) -> u64;
-    /// Writes `bytes` over what is at `at`, then goes back to the end
-    /// (`zfseeko(y, z->off, SEEK_SET)`, `fwrite`, `zfseeko(y,
-    /// bytes_this_split, SEEK_SET)`).
-    fn rewrite(&mut self, at: u64, bytes: &[u8]) -> io::Result<()>;
+    /// `zfseeko(y, at, SEEK_SET)`, which flushes the stream first: an
+    /// error is the seek failing (zip then writes a data descriptor).
+    fn seek_to(&mut self, at: u64) -> io::Result<()>;
+    /// `fwrite` where the stream is, outside `bfwrite`'s count (the local
+    /// header's rewrite).
+    fn write_here(&mut self, bytes: &[u8]) -> io::Result<()>;
+    /// `zfseeko(y, bytes_this_split, SEEK_SET)`: back to the end.
+    fn seek_end(&mut self) -> io::Result<()>;
+    /// `ferror(y)`: the error a write of the stream met (sticky, as stdio's
+    /// error flag), with the `errno` it left.
+    fn ferror(&self) -> Option<io::Error>;
 }
 
 /// What `bfwrite` is writing (fileio.c's `BFWRITE_*`).
@@ -343,7 +350,7 @@ fn add_central_zip64_extra_field(z: &mut ZEntry, force_zip64: i8) -> Result<(), 
 }
 
 /// Why a header could not be written: `ZE_BIG` with zip's warning and
-/// message, or `ZE_TEMP` (the write failed).
+/// message, or a failed write.
 #[derive(Debug)]
 pub(crate) enum PutError {
     /// `zipwarn(warn, oname)` (when `warn` is not empty), then
@@ -352,8 +359,8 @@ pub(crate) enum PutError {
         warn: &'static str,
         why: &'static str,
     },
-    /// `ZE_TEMP`: the write failed with this error.
-    Temp(io::Error),
+    /// The write failed (`bfwrite`'s `ZE_WRITE`).
+    Write(io::Error),
 }
 
 /// The local header of `z` as `putlocal` builds it, Zip64 decided as it
@@ -443,14 +450,14 @@ fn local_header(z: &mut ZEntry, out: &mut ZOut, rewrite: bool) -> Result<Vec<u8>
 /// `bfwrite`, which remembers where it is).
 pub(crate) fn putlocal(z: &mut ZEntry, out: &mut ZOut) -> Result<(), PutError> {
     let b = local_header(z, out, false)?;
-    out.bfwrite(&b, Bf::LocalHeader).map_err(PutError::Temp)
+    out.bfwrite(&b, Bf::LocalHeader).map_err(PutError::Write)
 }
 
-/// zipfile.c:putlocal, the rewrite (`PUTLOCAL_REWRITE`): over the first,
-/// at `z.off`, then back to the end.
+/// zipfile.c:putlocal, the rewrite (`PUTLOCAL_REWRITE`): `fwrite` over
+/// the first, where the caller has seeked (`z.off`).
 pub(crate) fn putlocal_rewrite(z: &mut ZEntry, out: &mut ZOut) -> Result<(), PutError> {
     let b = local_header(z, out, true)?;
-    out.w.rewrite(z.off, &b).map_err(PutError::Temp)
+    out.w.write_here(&b).map_err(PutError::Write)
 }
 
 /// zipfile.c:putextended: the data descriptor (Zip64 sizes when the entry
@@ -511,7 +518,7 @@ pub(crate) fn putcentral(z: &mut ZEntry, out: &mut ZOut) -> Result<(), PutError>
     b.extend_from_slice(&z.iname);
     b.extend_from_slice(&z.cextra);
     b.extend_from_slice(&z.comment);
-    out.bfwrite(&b, Bf::CentralHeader).map_err(PutError::Temp)
+    out.bfwrite(&b, Bf::CentralHeader).map_err(PutError::Write)
 }
 
 /// zipfile.c:putend: the end of central directory record, after the Zip64
@@ -557,6 +564,44 @@ pub(crate) fn putend(out: &mut ZOut, n: u64, s: u64, c: u64, comment: &[u8]) -> 
     put16(&mut b, comment.len() as u16);
     b.extend_from_slice(comment);
     out.bfwrite(&b, Bf::Header)
+}
+
+/// What [`write_central`] wrote: zip.c's `n` (uncompressed bytes), `t`
+/// (compressed bytes) and `k` (entries) for `-v`'s totals and the empty
+/// warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Totals {
+    pub(crate) n: u64,
+    pub(crate) t: u64,
+    pub(crate) k: u64,
+}
+
+/// zip.c:main, "Write central directory and end header": a central header
+/// for each of `entries`, then `before_end` (the C prints the empty
+/// warning and `-v`'s totals there), then the end records with the archive
+/// `comment`. `tempzn` is zip's running count of bytes written, kept.
+// port: zip.c:main (the central directory and putend)
+pub(crate) fn write_central(
+    entries: &mut [ZEntry],
+    comment: &[u8],
+    out: &mut ZOut,
+    tempzn: &mut u64,
+    before_end: &mut dyn FnMut(&mut ZOut, Totals),
+) -> Result<Totals, PutError> {
+    let c = *tempzn;
+    let mut tot = Totals { n: 0, t: 0, k: 0 };
+    for e in entries.iter_mut() {
+        putcentral(e, out)?;
+        *tempzn +=
+            4 + CENHEAD + e.iname.len() as u64 + e.cextra.len() as u64 + e.comment.len() as u64;
+        tot.n += e.len;
+        tot.t += e.siz;
+        tot.k += 1;
+    }
+    before_end(out, tot);
+    let size = *tempzn - c;
+    putend(out, tot.k, size, c, comment).map_err(PutError::Write)?;
+    Ok(tot)
 }
 
 #[cfg(test)]

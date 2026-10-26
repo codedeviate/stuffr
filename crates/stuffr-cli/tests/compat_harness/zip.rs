@@ -1439,6 +1439,7 @@ pub fn zip_bytes_matrix(flavour: &'static str) -> Vec<Case<'static>> {
         (&["-", "-"], hello),
         (&["-q", "-", "-"], long),
         (&["-l", "t.zip", "-"], b"a\nb\n"),
+        (&["-db", "-dc", "-du", "t.zip", "-", "a.txt"], hello),
     ] {
         add(args, zip_bytes_tree(), Some(stdin));
     }
@@ -1454,6 +1455,9 @@ pub fn zip_bytes_matrix(flavour: &'static str) -> Vec<Case<'static>> {
         // after -@ the questions read standard error (a pipe here: nothing)
         (&["-c", "-@", "t.zip"], b"a.txt\nb.txt\n"),
         (&["-z", "-@", "t.zip"], b"a.txt\n"),
+        // a NUL ends a line for the C's strlen
+        (&["-c", "t.zip", "a.txt", "b.txt"], b"ab\0cd\nsecond\n"),
+        (&["-z", "t.zip", "a.txt"], b"one\0two\nthree\n.\n"),
         // a line longer than MAXCOM is two answers
         (&["-c", "t.zip", "a.txt", "b.txt"], LONG_LINE),
         (&["-z", "t.zip", "a.txt"], LONG_LINE),
