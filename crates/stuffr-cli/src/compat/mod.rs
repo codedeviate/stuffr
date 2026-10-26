@@ -229,6 +229,16 @@ pub fn run_in_counted(
     })
 }
 
+/// A name as a sandboxed run resolves it, before the run's directory is
+/// joined on: leading `/`s dropped, a component that is exactly `..` made an
+/// ordinary name. For the fuzz target's read bounds, which must compare the
+/// names a payload supplies with the files a run opened; not a stable
+/// interface.
+#[doc(hidden)]
+pub fn sandbox_name(b: &[u8]) -> Vec<u8> {
+    host::confine_name(b)
+}
+
 /// Whether stdin is a terminal.
 pub(crate) fn stdin_is_tty() -> bool {
     io::stdin().is_terminal()

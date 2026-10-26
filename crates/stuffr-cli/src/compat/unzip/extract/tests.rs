@@ -730,3 +730,34 @@ fn a_taken_unicode_path_makes_the_descriptor_skip_zip64() {
         assert_eq!(code, 0, "{f:?}: {out}{err}");
     }
 }
+
+/// Apple's root is an absolute real path and every name built on it goes
+/// back through the sandbox's `Host::path` (`check_for_newer`, the SGID
+/// stat): `-n` must leave an existing file alone and `-f` must see an older
+/// one and update it, in the sandbox as in a real run (0.19.0 Task 12: the
+/// sandbox's confinement once stripped the root of such a path).
+#[test]
+fn apple_overwrite_checks_see_the_existing_file_in_a_sandbox() {
+    let z = zip(&[stored(b"a.txt", b"from the archive\n", 0o100644 << 16)]);
+    let d = Dir::new("newer");
+    std::fs::write(d.0.join("root/a.zip"), &z).unwrap();
+    std::fs::write(d.0.join("root/a.txt"), b"mine\n").unwrap();
+    let (code, _, err) = run_piped(&d, Flavour::Apple, &["-n", "a.zip"], b"");
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(std::fs::read(d.0.join("root/a.txt")).unwrap(), b"mine\n");
+    // an older existing file: -f freshens it
+    let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(946_684_800);
+    let f = std::fs::File::options()
+        .write(true)
+        .open(d.0.join("root/a.txt"))
+        .unwrap();
+    f.set_modified(old).unwrap();
+    drop(f);
+    let (code, _, err) = run_piped(&d, Flavour::Apple, &["-fo", "a.zip"], b"");
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        std::fs::read(d.0.join("root/a.txt")).unwrap(),
+        b"from the archive\n"
+    );
+    assert!(!err.contains("directory attributes"), "{err}");
+}

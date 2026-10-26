@@ -2610,18 +2610,16 @@ fn verify_zip(bytes: &[u8]) -> Result<(usize, usize), String> {
             .get(at..at + 8)
             .map(|b| u64::from_le_bytes(b.try_into().expect("eight bytes")))
     };
-    let eocd = bytes
-        .windows(4)
-        .rposition(|w| w == b"PK\x05\x06")
-        .ok_or("no end record")?;
-    let comment = le16(eocd + 20).ok_or("end record cut")? as usize;
-    if eocd + 22 + comment != bytes.len() {
-        return Err(format!(
-            "end record at {eocd} with a {comment}-byte comment ends at {}, not {}",
-            eocd + 22 + comment,
-            bytes.len()
-        ));
-    }
+    // The end record is the last `PK\5\6` whose comment length reaches
+    // exactly the end of the file, as a reader looks for it: a comment may
+    // hold those four bytes itself.
+    let eocd = (0..bytes.len().saturating_sub(21))
+        .rev()
+        .find(|&p| {
+            bytes[p..].starts_with(b"PK\x05\x06")
+                && le16(p + 20).is_some_and(|c| p as u64 + 22 + c == bytes.len() as u64)
+        })
+        .ok_or("no end record that ends the file")?;
     let (mut entries, mut cd_size, mut cd_off) = (
         le16(eocd + 10).ok_or("cut")?,
         le32(eocd + 12).ok_or("cut")?,
@@ -2649,6 +2647,9 @@ fn verify_zip(bytes: &[u8]) -> Result<(usize, usize), String> {
     }
     let mut seen = 0u64;
     let mut unchecked = 0usize;
+    // Each entry's bytes as the walk read them (stored entries only), for
+    // the `zip` crate to be held to.
+    let mut stored_plain: Vec<Option<Vec<u8>>> = Vec::new();
     while seen < entries {
         if le32(at) != Some(0x0201_4b50) {
             return Err(format!("entry {seen}: no central record at {at}"));
@@ -2705,6 +2706,7 @@ fn verify_zip(bytes: &[u8]) -> Result<(usize, usize), String> {
         if flags & 1 != 0 || !matches!(method, 0 | 8) {
             // Encrypted, or a method the walk does not decode: structure only.
             unchecked += 1;
+            stored_plain.push(None);
         } else {
             let plain: Vec<u8> = if method == 0 {
                 data.to_vec()
@@ -2751,6 +2753,7 @@ fn verify_zip(bytes: &[u8]) -> Result<(usize, usize), String> {
                     !crc_now
                 ));
             }
+            stored_plain.push((method == 0).then_some(plain));
         }
         at += 46 + n + e + c;
         seen += 1;
@@ -2761,13 +2764,38 @@ fn verify_zip(bytes: &[u8]) -> Result<(usize, usize), String> {
             cd_off + cd_size
         ));
     }
-    let counted = ::zip::ZipArchive::new(Cursor::new(bytes))
-        .map_err(|e| format!("the zip crate refuses it: {e}"))?
-        .len();
+    // The `zip` crate takes the last `PK\5\6` it finds, so an archive whose
+    // comment holds that signature is whole to the walk above (and to a
+    // reader that checks the comment length) and unreadable to the crate: it
+    // is not held to the crate's count or bytes.
+    if bytes[eocd + 22..].windows(4).any(|w| w == b"PK\x05\x06") {
+        return Ok((entries as usize, unchecked));
+    }
+    let mut archive = ::zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|e| format!("the zip crate refuses it: {e}"))?;
+    let counted = archive.len();
     if counted as u64 != entries {
         return Err(format!(
             "the zip crate counts {counted} entries, the end record {entries}"
         ));
+    }
+    // The `zip` crate (no codecs built in) reads every stored entry the walk
+    // checked, and must give the same bytes.
+    for (i, plain) in stored_plain.iter().enumerate() {
+        let Some(plain) = plain else { continue };
+        let mut got = Vec::new();
+        let mut f = archive
+            .by_index(i)
+            .map_err(|e| format!("the zip crate cannot open entry {i}: {e}"))?;
+        std::io::Read::read_to_end(&mut f, &mut got)
+            .map_err(|e| format!("the zip crate cannot read entry {i}: {e}"))?;
+        if got != *plain {
+            return Err(format!(
+                "the zip crate reads {} bytes of entry {i}, the walk {}",
+                got.len(),
+                plain.len()
+            ));
+        }
     }
     Ok((counted, unchecked))
 }
@@ -2805,8 +2833,13 @@ fn check_zip_reads(
     reads: &BTreeMap<PathBuf, compat::InputReads>,
 ) {
     let from_payload = zip_names_from_payload(args);
-    let lines = if from_payload {
+    // The names the payload supplies, as the sandbox resolves them (a root
+    // dropped, `..` made an ordinary name): what a run opens for them.
+    let lines: Vec<String> = if from_payload {
         zip_payload_names(payload)
+            .into_iter()
+            .map(|l| String::from_utf8_lossy(&compat::sandbox_name(l)).into_owned())
+            .collect()
     } else {
         Vec::new()
     };
@@ -2821,15 +2854,25 @@ fn check_zip_reads(
                 panic!("{name} ({flavour}) {args:?}: opened {path:?}, outside {dir:?}")
             });
         // A token names a file as itself, as the archive zip appends `.zip`
-        // to, or as the `@file` of a pattern list.
+        // to, or as the `@file` of a pattern list. Both sides go through `Path`'s components, which is how the system
+        // sees `a//b`, `a/` and `./a`.
+        let norm = |s: &str| Path::new(s).components().collect::<PathBuf>();
+        let file = norm(file);
         let named = |t: &str| {
-            file == t || file.strip_suffix(".zip") == Some(t) || t.strip_prefix('@') == Some(file)
+            let t = norm(t);
+            file == t
+                || file
+                    .to_str()
+                    .and_then(|f| f.strip_suffix(".zip"))
+                    .is_some_and(|f| Path::new(f) == t)
+                || t.to_str()
+                    .and_then(|t| t.strip_prefix('@'))
+                    .map(norm)
+                    .as_ref()
+                    == Some(&file)
         };
         let m = args.iter().filter(|t| named(t)).count() as u64
-            + lines
-                .iter()
-                .filter(|l| named(&String::from_utf8_lossy(l)))
-                .count() as u64
+            + lines.iter().filter(|l| named(l)).count() as u64
             + dots;
         assert!(
             m > 0,
@@ -2954,11 +2997,7 @@ fn run_zip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8], pay
             why()
         );
         assert!(
-            zip_name_ok(rel, COMPAT_TOKENS) || {
-                // A name the payload gave (`-@`) or the archive holds is
-                // made by no zip program: only tokens name outputs.
-                false
-            },
+            zip_name_ok(rel, args),
             "{name} ({flavour_name}) {args:?}: made a stray {rel:?}\n{}",
             why()
         );
@@ -2973,15 +3012,16 @@ fn run_zip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8], pay
 
     // Read back what was written, if the run's own inputs were whole.
     let repair = args.iter().any(|t| matches!(*t, "-F" | "-FF"));
+    // An input archive is any file the run could have read that holds a
+    // record signature, however far from the start (a preamble, a cut head)
+    // and whatever it is called: `a.Z`, `a.out` and `a` all hold the payload
+    // and zip does not append `.zip` to a name that has an extension.
     let inputs_whole = before
         .iter()
-        .filter(|(p, b)| {
-            // An input archive is a `.zip` file with any record in it,
-            // however far from the start (a preamble, a cut head).
-            p.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip"))
-                && [b"PK\x03\x04", b"PK\x01\x02", b"PK\x05\x06"]
-                    .iter()
-                    .any(|sig| signature_count(b, sig) > 0)
+        .filter(|(_, b)| {
+            [b"PK\x03\x04", b"PK\x01\x02", b"PK\x05\x06"]
+                .iter()
+                .any(|sig| signature_count(b, sig) > 0)
         })
         .all(|(_, b)| {
             // A repair (`-F`, `-FF`) walks the local headers, not the

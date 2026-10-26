@@ -1626,23 +1626,51 @@ pub(crate) fn publish(tmp: &Path, out: &Path, force: bool) -> io::Result<Publish
     Ok(Published::Done)
 }
 
-/// A sandbox's operand kept inside its directory: a root (or drive prefix) is
-/// dropped, so `/etc/x` is `dir/etc/x`, and a `..` component becomes an
-/// ordinary name nothing has, so no name (an operand, a line of a names file,
-/// an archive's own entry name) reaches a file outside `dir`. Everything the
-/// fuzz tokens produce is already relative and `..`-free, so this changes
-/// nothing for them; it is what keeps a name a payload supplies in.
-fn confined(p: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for c in p.components() {
-        match c {
-            Component::Prefix(_) | Component::RootDir => {}
-            Component::ParentDir => out.push("..stuffr-parent"),
-            other => out.push(other.as_os_str()),
+/// A name kept inside a sandbox, on its bytes: the leading `/`s are dropped
+/// and a component that is exactly `..` becomes the ordinary name
+/// `..stuffr-parent`, so no name (an operand, a line of a names file, an
+/// archive's own entry name) reaches a file outside the directory. Nothing
+/// else changes (a trailing `/`, `.`, `//` and `a..b` stay as they are): the
+/// system then answers `a/` and `a//b` exactly as for a real run. Everything
+/// the fuzz tokens produce is already relative and `..`-free.
+pub(crate) fn confine_name(b: &[u8]) -> Vec<u8> {
+    let b = &b[b.iter().take_while(|&&c| c == b'/').count()..];
+    let mut out = Vec::with_capacity(b.len() + 16);
+    for (i, comp) in b.split(|&c| c == b'/').enumerate() {
+        if i > 0 {
+            out.push(b'/');
+        }
+        if comp == b".." {
+            out.extend_from_slice(b"..stuffr-parent");
+        } else {
+            out.extend_from_slice(comp);
         }
     }
     out
+}
+
+/// A sandbox's operand as a path under `dir`. A name already under `dir`
+/// (or under its canonical form: unzip's root is `realpath`ed and every name
+/// built on it comes back through here) keeps that prefix and has only its
+/// remainder confined; any other absolute name is confined and joined.
+fn sandbox_path(dir: &Path, b: &[u8]) -> PathBuf {
+    if b.first() == Some(&b'/') {
+        let canonical = std::fs::canonicalize(dir).ok();
+        for base in std::iter::once(dir.to_path_buf()).chain(canonical) {
+            let base_bytes = base.as_os_str().as_encoded_bytes();
+            let base_bytes = base_bytes.strip_suffix(b"/").unwrap_or(base_bytes);
+            if let Some(rest) = b.strip_prefix(base_bytes)
+                && (rest.is_empty() || rest[0] == b'/')
+            {
+                let mut full = base_bytes.to_vec();
+                full.push(b'/');
+                full.extend_from_slice(&confine_name(rest));
+                // `confine_name` dropped the separator it started with
+                return path(&full);
+            }
+        }
+    }
+    dir.join(path(&confine_name(b)))
 }
 
 /// Bytes to a path. On unix this is exact.
@@ -2216,7 +2244,7 @@ impl Host {
     pub(crate) fn path(&self, b: &[u8]) -> PathBuf {
         match self {
             Host::Real => path(b),
-            Host::Sandbox(s) => s.dir.join(confined(&path(b))),
+            Host::Sandbox(s) => sandbox_path(&s.dir, b),
         }
     }
 
@@ -2426,6 +2454,20 @@ mod tests {
             Path::new("/box/a/..stuffr-parent/..stuffr-parent/x")
         );
         assert!(host.path(b"/").starts_with("/box"));
+        // Only a root and an exact `..` are rewritten: the rest of the
+        // bytes stay as they are.
+        assert_eq!(host.path(b"a/"), Path::new("/box/a/"));
+        assert_eq!(host.path(b"a//b/./c/."), Path::new("/box/a//b/./c/."));
+        assert_eq!(host.path(b"//a"), Path::new("/box/a"));
+        assert_eq!(host.path(b"a..b/..c/d.."), Path::new("/box/a..b/..c/d.."));
+        // A path already under the sandbox directory passes through.
+        assert_eq!(host.path(b"/box/a/b"), Path::new("/box/a/b"));
+        assert_eq!(
+            host.path(b"/box/a/../x"),
+            Path::new("/box/a/..stuffr-parent/x")
+        );
+        assert_eq!(host.path(b"/box"), Path::new("/box"));
+        assert_eq!(host.path(b"/boxer/x"), Path::new("/box/boxer/x"));
         // The real process's paths are untouched.
         assert_eq!(Host::Real.path(b"/etc/passwd"), Path::new("/etc/passwd"));
     }

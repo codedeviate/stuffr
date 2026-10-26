@@ -1143,6 +1143,8 @@ const COMPAT_SHAPES: &[&str] = &[
     "zip-apple-add-unicode",
     "zip-ubuntu-add-unicode",
     "zip-apple-update",
+    "zip-apple-update-fake-end-record",
+    "zip-ubuntu-update-fake-end-record",
     "zip-ubuntu-update",
     "zip-apple-freshen",
     "zip-ubuntu-freshen",
@@ -2630,6 +2632,16 @@ fn zip_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> {
         ("zip", "add-show") => (&["-sf", "b.zip", "a"], a, false, text),
         ("zip", "add-unicode") => (&["-UN=u", "b.zip", "a"], a, false, text),
         ("zip", "update") => (&["-u", "a.zip", "a"], both, false, src),
+        // The archive's own comment holds a fake end record (all-ones
+        // fields): a reader finds the true one by its comment length.
+        ("zip", "update-fake-end-record") => {
+            let mut p = src.clone();
+            let n = p.len();
+            p[n - 2..].copy_from_slice(&22u16.to_le_bytes());
+            p.extend_from_slice(b"PK\x05\x06");
+            p.extend_from_slice(&[0xff; 18]);
+            (&["-u", "a.zip", "a"], both, false, p)
+        }
         ("zip", "freshen") => (&["-f", "a.zip"], az, false, src),
         ("zip", "delete") => (&["-d", "a.zip", "a.txt"], az, false, src),
         ("zip", "grow") => (&["-g", "a.zip", "a"], both, false, src),

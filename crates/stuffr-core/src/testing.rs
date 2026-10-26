@@ -1930,9 +1930,6 @@ mod tests {
         assert!(case.stdin);
     }
 
-    /// A seed written by the 0.11.0 generator decodes as it did then, and
-    /// as GNU: its name byte is below the first four names' count, its
-    /// tokens below the 0.11.0 table's length, and its mask uses bits 0-4.
     /// No token a case can draw names a path outside the run's directory
     /// (0.19.0): none is absolute, holds a `/`, or is or holds `..`. The zip
     /// family reads names a payload supplies (`-@`, `@a`), and the sandbox's
@@ -1961,6 +1958,9 @@ mod tests {
         }
     }
 
+    /// A seed written by the 0.11.0 generator decodes as it did then, and
+    /// as GNU: its name byte is below the first four names' count, its
+    /// tokens below the 0.11.0 table's length, and its mask uses bits 0-4.
     /// The 0.11.0 decoder is restated here from that release's tables.
     /// Then the same for the 0.12.0 generator's seeds
     /// (`seeds_of_0_12_0_decode_unchanged`).
