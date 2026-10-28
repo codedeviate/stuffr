@@ -3,3 +3,5 @@
 pub mod identify;
 
 pub mod format;
+
+pub mod walk;

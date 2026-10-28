@@ -18,9 +18,8 @@ pub enum Identified {
     NotOpenable,
 }
 
-/// Reads up to `PROBE_LEN` bytes of `path` (following symlinks).
-fn read_prefix(path: &Path) -> io::Result<Vec<u8>> {
-    let mut f = File::open(path)?;
+/// Reads up to `PROBE_LEN` bytes from `f`.
+fn read_prefix(mut f: impl Read) -> io::Result<Vec<u8>> {
     let mut buf = vec![0u8; PROBE_LEN];
     let mut n = 0;
     while n < PROBE_LEN {
@@ -43,8 +42,19 @@ fn magicless_by_extension(reg: &Registry, path: &Path) -> bool {
     reg.by_extension(ext).is_some_and(|id| !reg.has_magic(id))
 }
 
+/// Identifies `path` (following symlinks), reading at most `PROBE_LEN` bytes.
 pub fn identify(reg: &Registry, path: &Path) -> io::Result<Identified> {
-    let prefix = read_prefix(path)?;
+    identify_with_reader(reg, path, File::open(path)?)
+}
+
+/// `identify` over an already-opened reader for `path` (the path still
+/// supplies the extension). Lets a test count the bytes read.
+pub(crate) fn identify_with_reader(
+    reg: &Registry,
+    path: &Path,
+    reader: impl Read,
+) -> io::Result<Identified> {
+    let prefix = read_prefix(reader)?;
     let worth_resolving = !reg.match_magic(&prefix).is_empty() || magicless_by_extension(reg, path);
     if !worth_resolving {
         return Ok(Identified::NotOpenable);
