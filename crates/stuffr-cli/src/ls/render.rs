@@ -81,7 +81,9 @@ pub fn render_text(listing: &Listing, now: SystemTime, out: &mut dyn Write) -> i
 }
 
 /// `{entries, shown, skipped, warnings}`; each entry's `path` is relative to
-/// the listed folder and escaped as the rows are.
+/// the listed folder and is the real name (lossy only for non-UTF-8), not
+/// the escaped display form: JSON's own escaping keeps it unambiguous, as
+/// `list --json` treats entry names.
 pub fn render_json(listing: &Listing) -> serde_json::Value {
     let mut entries = Vec::new();
     for block in &listing.blocks {
@@ -96,7 +98,7 @@ pub fn render_json(listing: &Listing) -> serde_json::Value {
                 RowKind::Folder => ("folder", serde_json::Value::Null, serde_json::Value::Null),
             };
             entries.push(serde_json::json!({
-                "path": shown_name(path.as_os_str()),
+                "path": path.to_string_lossy(),
                 "kind": kind,
                 "format": format,
                 "size": size,

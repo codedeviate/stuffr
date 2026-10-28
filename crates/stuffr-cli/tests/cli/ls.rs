@@ -452,7 +452,7 @@ fn unreadable_inside_is_exit_4() {
 
 #[cfg(unix)]
 #[test]
-fn odd_names_are_escaped() {
+fn odd_names_are_escaped_in_rows_and_real_in_json() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
     let dir = tmp_dir();
@@ -460,9 +460,11 @@ fn odd_names_are_escaped() {
     // EILSEQ); a bidi override, which fmt_name escapes too, where it does not.
     let mut p = dir.join(OsStr::from_bytes(b"a\nb\xff.gz"));
     let mut shown = "a\\nb\u{fffd}.gz";
+    let mut real = "a\nb\u{fffd}.gz";
     if std::fs::write(&p, GZ).is_err() {
         p = dir.join("a\nb\u{202e}.gz");
         shown = "a\\nb\\u{202e}.gz";
+        real = "a\nb\u{202e}.gz";
         std::fs::write(&p, GZ).unwrap();
     }
     set_mtime(&p, utc(2020, 6, 15));
@@ -482,5 +484,7 @@ fn odd_names_are_escaped() {
     assert!(listed.ends_with("  a\\nb\n"), "{listed:?}");
     let o = run_in_dir_output(&dir, &["ls", "--json"]);
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-    assert_eq!(v["entries"][1]["path"], shown);
+    // JSON carries the real name (lossy only for non-UTF-8), as `list --json`
+    // does: JSON's own escaping keeps it unambiguous (ruling T4-d).
+    assert_eq!(v["entries"][1]["path"], real);
 }
