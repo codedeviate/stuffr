@@ -174,17 +174,21 @@ mod tests {
         };
         let t = text(&l);
         let d = ls_date(old(), old() + Duration::from_secs(400 * 86_400));
-        assert_eq!(
-            t,
-            format!(
-                "gzip       10B  {d}  a.gz\n\
-                 [FOLDER]        {d}  sub/\n\
-                 \n\
-                 x/y/:\n\
-                 gzip      4.2M  {d}  b.gz\n\
-                 2 of 5 files shown, 3 not openable\n"
-            )
-        );
+        // Built with padding rather than spelled out: a literal holding the
+        // aligned columns would trip the collapsed-indentation guard.
+        let row = |f: &str, s: &str, n: &str| format!("{f:<8}  {s:>4}  {d}  {n}\n");
+        let want = [
+            row("gzip", "10B", "a.gz"),
+            row("[FOLDER]", "", "sub/"),
+            "\nx/y/:\n".to_string(),
+            row("gzip", "4.2M", "b.gz"),
+            "2 of 5 files shown, 3 not openable\n".to_string(),
+        ]
+        .concat();
+        assert_eq!(t, want);
+        // The widths themselves, so the padded `row` cannot hide a drift.
+        assert!(t.starts_with("gzip  "), "{t}");
+        assert!(t.contains(" 10B  "), "{t}");
     }
 
     #[test]
