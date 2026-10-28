@@ -1,6 +1,7 @@
-//! Every string the brotli command line prints that parsing, help and
-//! version reach, as `c/tools/brotli.c` of brotli 1.2.1 (MIT) words it. Later
-//! tasks add the compression and decompression messages here.
+//! Every string the brotli command line prints, as `c/tools/brotli.c` of
+//! brotli 1.2.1 (MIT) words it: parsing, help and version, then the file
+//! handling and compression (`%s`/`%d` formats for `host::printf`, named
+//! after the function that prints them). Task 5 adds decompression's.
 
 use stuffr::brotli_opts::{LARGE_MAX_WINDOW_BITS, MAX_WINDOW_BITS, MIN_WINDOW_BITS};
 
@@ -26,6 +27,58 @@ pub(super) const COMMENT_SET: &str = "comment already set\n";
 pub(super) const BAD_COMMENT: &str = "invalid base64-encoded comment\n";
 pub(super) const DICTIONARY_SET: &str = "dictionary path already set\n";
 pub(super) const SUFFIX_SET: &str = "suffix already set\n";
+
+// ---- OpenInputFile, OpenOutputFile, CloseFiles, CopyStat ----
+
+pub(super) const OPEN_INPUT_FAILED: &str = "failed to open input file [%s]: %s\n";
+pub(super) const OPEN_OUTPUT_FAILED: &str = "failed to open output file [%s]: %s\n";
+pub(super) const FCLOSE_FAILED: &str = "fclose failed [%s]: %s\n";
+pub(super) const ACCESS_BITS_FAILED: &str = "setting access bits failed for [%s]: %s\n";
+pub(super) const GROUP_FAILED: &str = "setting group failed for [%s]: %s\n";
+pub(super) const USER_FAILED: &str = "setting user failed for [%s]: %s\n";
+/// stuffr's own (ruling T1-f, deviation 4): the output named is the input
+/// itself (same device and inode), which the reference truncates.
+pub(super) const SAME_FILE: &str = "input file [%s] is the same as the output file\n";
+
+// ---- ReadDictionary ----
+
+pub(super) const OPEN_DICTIONARY_FAILED: &str = "failed to open dictionary file [%s]: %s\n";
+/// No newline: the reference's own.
+pub(super) const DICTIONARY_SIZE_UNKNOWN: &str = "could not get size of dictionary file [%s]";
+pub(super) const DICTIONARY_TOO_LARGE: &str =
+    "dictionary [%s] is larger than maximum allowed: %d\n";
+pub(super) const READ_DICTIONARY_FAILED: &str = "failed to read dictionary [%s]: %s\n";
+pub(super) const PREPARE_DICTIONARY_FAILED: &str = "failed to prepare dictionary [%s]\n";
+/// stuffr's own (ruling T1-b): the pure tier has no raw dictionaries.
+pub(super) const DICTIONARY_PURE_TIER: &str =
+    "-D is not supported by this build (pure tier); build with --features brotli-c\n";
+
+// ---- NextFile ----
+
+pub(super) const EMPTY_OUTPUT_NAME: &str = "empty output file name for [%s] input file\n";
+pub(super) const SUFFIX_MISMATCH: &str = "input file [%s] suffix mismatch\n";
+
+// ---- ProvideInput, WriteOutput ----
+
+pub(super) const READ_INPUT_FAILED: &str = "failed to read input [%s]: %s\n";
+pub(super) const WRITE_OUTPUT_FAILED: &str = "failed to write output [%s]: %s\n";
+
+// ---- PrintFileProcessingProgress, PrintBytes ----
+
+pub(super) const PROGRESS_NAME: &str = "[%s]: ";
+pub(super) const PROGRESS_ARROW: &str = " -> ";
+/// ` in %1.2f sec`, the figure already formatted.
+pub(super) const PROGRESS_TIME: &str = " in %s sec";
+
+// ---- CompressFiles, CompressFile, DecompressFiles, InitDecoder ----
+
+pub(super) const OUT_OF_MEMORY: &str = "out of memory\n";
+pub(super) const FORCE_OUTPUT_TTY: &str = "Use -h help. Use -f to force output to a terminal.\n";
+pub(super) const FORCE_INPUT_TTY: &str = "Use -h help. Use -f to force input from a terminal.\n";
+pub(super) const EMIT_METADATA_FAILED: &str = "failed to emit metadata [%s]\n";
+pub(super) const COMPRESS_FAILED: &str = "failed to compress data [%s]\n";
+pub(super) const COMPRESSED: &str = "Compressed ";
+pub(super) const OUTPUT_LARGER: &str = "Output is larger than input\n";
 
 /// `command already set when parsing <what>`.
 pub(super) fn command_set(what: &str) -> String {

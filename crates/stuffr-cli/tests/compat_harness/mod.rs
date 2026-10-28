@@ -1070,6 +1070,12 @@ pub enum Roundtrip {
     /// dictionary (see `lz4_decode_args`). The kind of stream (the magic) is
     /// compared, not the frame's own header.
     Lz4 { ref_lz4: &'static str },
+    /// brotli streams, decoded by `ref_brotli -dc` (an absolute path; the
+    /// tool decodes large-window streams itself). A brotli stream has no
+    /// magic: a case compresses when it is invoked as `brotli` with no
+    /// `-d`/`-t` ([`brotli_compresses`]), and then every output it writes
+    /// that differs from the reference's is judged by decoding it.
+    Brotli { ref_brotli: &'static str },
     /// Nothing is decoded: the case promises its compressed bytes identical
     /// to the reference's everywhere (the compress family's suites, whose
     /// streams no single reference decoder reads at every bit count), so
@@ -2067,6 +2073,7 @@ fn ref_decompress_args(rt: &Roundtrip, extra: &[String], data: &[u8]) -> Result<
         Roundtrip::Xz { ref_xz } => (PathBuf::from(ref_xz), "xz"),
         Roundtrip::Zstd { ref_zstd } => (PathBuf::from(ref_zstd), "zstd"),
         Roundtrip::Lz4 { ref_lz4 } => (PathBuf::from(ref_lz4), "lz4"),
+        Roundtrip::Brotli { ref_brotli } => (PathBuf::from(ref_brotli), "brotli"),
         Roundtrip::Exact => panic!("Roundtrip::Exact decodes nothing; its bytes are compared"),
     };
     let mut child = spawn(
@@ -2101,7 +2108,7 @@ fn has_magic(rt: &Roundtrip, b: &[u8]) -> bool {
         Roundtrip::Xz { .. } => b.starts_with(&XZ_MAGIC),
         Roundtrip::Zstd { .. } => zstd_stream_kind(b).is_some(),
         Roundtrip::Lz4 { .. } => lz4_stream_kind(b).is_some(),
-        Roundtrip::Exact => false,
+        Roundtrip::Brotli { .. } | Roundtrip::Exact => false,
     }
 }
 
@@ -2121,6 +2128,55 @@ fn xz_magicless_stdout(c: &Case) -> bool {
                 && a[1..].chars().any(|ch| matches!(ch, 'd' | 't' | 'l')))
     });
     !decodes && !xz_decode_args(c).is_empty()
+}
+
+/// Whether case `c` is a brotli compression (its outputs are brotli
+/// streams, which have no magic): invoked as `brotli`, and no word before
+/// `--` is `-d`, `-t`, `--decompress`, `--test` or a short cluster holding
+/// `d` or `t`.
+pub fn brotli_compresses(c: &Case) -> bool {
+    if !matches!(c.roundtrip, Roundtrip::Brotli { .. }) || c.name != "brotli" {
+        return false;
+    }
+    !c.args.iter().take_while(|a| **a != "--").any(|a| {
+        matches!(*a, "--decompress" | "--test")
+            || (a.starts_with('-')
+                && !a.starts_with("--")
+                && a[1..].chars().any(|ch| matches!(ch, 'd' | 't')))
+    })
+}
+
+/// [`original_for`] for a brotli output `name`: the case file it is named
+/// after (`-S`/`.br` stripped), else the case's first file that is neither
+/// this output nor the `-D` dictionary, else standard input.
+fn brotli_original(c: &Case, name: &str) -> Option<Vec<u8>> {
+    let mut suffix = ".br";
+    let mut dict = None;
+    let mut it = c.args.iter();
+    while let Some(a) = it.next() {
+        if *a == "--" {
+            break;
+        }
+        if let Some(v) = a.strip_prefix("--suffix=") {
+            suffix = v;
+        } else if let Some(v) = a.strip_prefix("--dictionary=") {
+            dict = Some(v);
+        } else if *a == "-S" {
+            suffix = it.next().copied().unwrap_or(suffix);
+        } else if *a == "-D" {
+            dict = it.next().copied();
+        }
+    }
+    if let Some(base) = name.strip_suffix(suffix)
+        && let Some((_, b)) = c.files.iter().find(|(n, _)| *n == base)
+    {
+        return Some(b.clone());
+    }
+    c.files
+        .iter()
+        .find(|(n, _)| *n != name && Some(*n) != dict)
+        .map(|(_, b)| b.clone())
+        .or_else(|| c.stdin.clone())
 }
 
 /// The magic of an `.xz` stream header. `.lzma` and raw streams have none:
@@ -2311,6 +2367,7 @@ fn is_compressed_name(c: &Case, n: &str) -> bool {
                 || zstd_suffix(&c.args).is_some_and(|s| !s.is_empty() && n.ends_with(s))
         }
         Roundtrip::Lz4 { .. } => n.ends_with(".lz4"),
+        Roundtrip::Brotli { .. } => brotli_compresses(c),
         Roundtrip::Exact => false,
     }
 }
@@ -2414,6 +2471,7 @@ fn original_for(c: &Case, name: &str) -> Option<Vec<u8>> {
         // An explicit output name (`lz4 a x.lz4`) may carry no `.lz4`; the
         // case's one file is then its original (below).
         Roundtrip::Lz4 { .. } => name.strip_suffix(".lz4").unwrap_or_default().to_owned(),
+        Roundtrip::Brotli { .. } => return brotli_original(c, name),
         Roundtrip::Exact => return None,
     };
     let found = c.files.iter().find(|(n, _)| *n == base);
@@ -2524,6 +2582,7 @@ fn tool_name(rt: &Roundtrip) -> &'static str {
         Roundtrip::Xz { .. } => "xz",
         Roundtrip::Zstd { .. } => "zstd",
         Roundtrip::Lz4 { .. } => "lz4",
+        Roundtrip::Brotli { .. } => "brotli",
         Roundtrip::Exact => "nothing",
     }
 }
@@ -2538,7 +2597,7 @@ fn stream_mismatch(rt: &Roundtrip, reference: &[u8], ours: &[u8]) -> Option<Stri
         Roundtrip::Xz { .. } => xz_header_mismatch(reference, ours),
         Roundtrip::Zstd { .. } => zstd_kind_mismatch(reference, ours),
         Roundtrip::Lz4 { .. } => lz4_kind_mismatch(reference, ours),
-        Roundtrip::Exact => None,
+        Roundtrip::Brotli { .. } | Roundtrip::Exact => None,
     }
 }
 
@@ -2582,7 +2641,8 @@ pub fn assert_same(c: &Case, r: &Run, s: &Run) {
     // stream, text a magicless case also prints (`lzma --version`), or a
     // failed run's partial output.
     let compressed = r.stdout != s.stdout
-        && (has_magic(&c.roundtrip, &s.stdout) || (!s.stdout.is_empty() && xz_magicless_stdout(c)));
+        && (has_magic(&c.roundtrip, &s.stdout)
+            || (!s.stdout.is_empty() && (xz_magicless_stdout(c) || brotli_compresses(c))));
     if c.compare_output_bytes || !compressed {
         if r.stdout != s.stdout {
             d.push(format!(

@@ -1826,7 +1826,7 @@ mod unix {
             tty_stdin,
             tty_stdout,
             env: vec![("LC_ALL", "C")],
-            compare_output_bytes: true,
+            compare_output_bytes: EXACT,
             tz: None,
             unzip_flavour: None,
             zip_flavour: None,
@@ -1835,8 +1835,132 @@ mod unix {
             tty_signal: None,
             expect_stdout_plain: None,
             setup: Some(mkdir_d),
-            roundtrip: Roundtrip::Exact,
+            roundtrip: Roundtrip::Brotli {
+                ref_brotli: ref_brotli(),
+            },
         }
+    }
+
+    /// The C tier promises the reference's bytes; the pure tier's streams
+    /// are judged by the reference decoding them.
+    const EXACT: bool = cfg!(feature = "brotli-c");
+
+    /// The reference `brotli`, for decoding the pure tier's streams.
+    fn ref_brotli() -> &'static str {
+        static P: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        P.get_or_init(|| format!("{}/brotli", brotli_dir().unwrap_or("/nonexistent")))
+    }
+
+    /// Ruling T1-b: the pure tier refuses `-D` (both directions) once the
+    /// dictionary has been read.
+    pub const PURE_DICTIONARY_REFUSAL: &str =
+        "-D is not supported by this build (pure tier); build with --features brotli-c\n";
+
+    /// The dictionary a row names with `-D f` or `--dictionary=f`, when the
+    /// row makes that file (so it is read and the pure tier refuses it).
+    fn dictionary_fixture(r: &Row) -> Option<&'static str> {
+        let mut it = r.args.iter();
+        while let Some(a) = it.next() {
+            let name = if *a == "-D" {
+                it.next().copied()
+            } else {
+                a.strip_prefix("--dictionary=")
+            };
+            if let Some(n) = name
+                && r.fixtures.iter().any(|(f, _)| *f == n)
+            {
+                return Some(n);
+            }
+        }
+        None
+    }
+
+    /// The decoded length of a row's `-C`/`--comment=` value.
+    fn comment_len(r: &Row) -> Option<usize> {
+        let mut it = r.args.iter();
+        while let Some(a) = it.next() {
+            let v = if *a == "-C" {
+                it.next().copied()
+            } else {
+                a.strip_prefix("--comment=")
+            };
+            if let Some(v) = v {
+                return Some(v.trim_end_matches('=').len() * 3 / 4);
+            }
+        }
+        None
+    }
+
+    /// What the pure tier says instead of doing the row, if it refuses it:
+    /// a `-D` file that exists (ruling T1-b), or a comment of one byte when
+    /// compressing (the `brotli` crate writes that metadata block's header
+    /// wrong, so the seam refuses it: `failed to emit metadata`). Only for
+    /// a command line that parses.
+    fn pure_refusal(name: &str, r: &Row) -> Option<String> {
+        if EXACT || r.stderr.ends_with(HELP) {
+            return None;
+        }
+        if dictionary_fixture(r).is_some() {
+            return Some(PURE_DICTIONARY_REFUSAL.to_owned());
+        }
+        if !decodes(name, r) && comment_len(r) == Some(1) {
+            let input = first_operand(r).unwrap_or("con");
+            return Some(format!("failed to emit metadata [{input}]\n"));
+        }
+        None
+    }
+
+    /// Whether the invoked name and arguments decompress or test.
+    fn decodes(name: &str, r: &Row) -> bool {
+        name != "brotli"
+            || r.args.iter().take_while(|a| **a != "--").any(|a| {
+                matches!(*a, "--decompress" | "--test")
+                    || (a.starts_with('-')
+                        && !a.starts_with("--")
+                        && a[1..].chars().any(|c| matches!(c, 'd' | 't')))
+            })
+    }
+
+    /// Whether a row gets as far as decoding a stream: a decompression or
+    /// test that is not stopped first by its command line, its dictionary,
+    /// its names, an open or a terminal (Task 4's code) — Task 5's rows.
+    fn reaches_decoder(name: &str, r: &Row) -> bool {
+        const BEFORE: [&str; 4] = [
+            "failed to open ",
+            "empty output file name for [",
+            "input file [",
+            "Use -h help. ",
+        ];
+        // A failure before decoding counts only when it is the first
+        // input's: an earlier input would have been decoded first.
+        let first = first_operand(r).unwrap_or("con");
+        let stopped_first = BEFORE.iter().any(|b| r.stderr.starts_with(b))
+            && (r.stderr.contains(&format!("[{first}]"))
+                || !r.stderr.contains('[')
+                || r.stderr.starts_with("failed to open dictionary"));
+        decodes(name, r) && !(r.code == 1 && (r.stderr.ends_with(HELP) || stopped_first))
+    }
+
+    /// A row's first input operand (`-` and no operand: `None`), skipping
+    /// the values of the options that take one.
+    fn first_operand(r: &Row) -> Option<&'static str> {
+        let mut it = r.args.iter();
+        let mut dash_dash = false;
+        while let Some(a) = it.next() {
+            if dash_dash {
+                return Some(a);
+            }
+            match *a {
+                "--" => dash_dash = true,
+                "-" => return None,
+                "-o" | "-S" | "-D" | "-C" | "-q" | "-w" => {
+                    it.next();
+                }
+                _ if a.starts_with('-') => {}
+                _ => return Some(a),
+            }
+        }
+        None
     }
 
     /// `in 0.00 sec` becomes `in X sec`: the reference reads the processor
@@ -1866,6 +1990,29 @@ mod unix {
             i += ch.len_utf8();
         }
         out
+    }
+
+    /// Off the C tier the compressed size in a `Compressed [f]: A -> B in X
+    /// sec` line is the tier's own: `B` becomes `N` (the input size and every
+    /// other line are compared).
+    fn blank_sizes(s: &str) -> String {
+        if EXACT {
+            return s.to_owned();
+        }
+        s.split_inclusive('\n')
+            .map(|line| {
+                match (
+                    line.strip_prefix("Compressed ["),
+                    line.find(" -> "),
+                    line.rfind(" in X sec"),
+                ) {
+                    (Some(_), Some(a), Some(b)) if a < b => {
+                        format!("{} -> N{}", &line[..a], &line[b..])
+                    }
+                    _ => line.to_owned(),
+                }
+            })
+            .collect()
     }
 
     /// What `r.stderr` is for the program called `name`: the help text's
@@ -2033,17 +2180,33 @@ mod unix {
 
     /// Every row of `rows` against the reference and stuffr.
     fn check_rows(label: &str, rows: &[(&str, &Row)]) {
+        let rows: Vec<_> = rows.iter().map(|(n, r)| (*n, false, false, *r)).collect();
+        check_tty_rows(label, &rows);
+    }
+
+    /// [`check_rows`] with `(name, stdin a tty, stdout a tty, row)`.
+    fn check_tty_rows(label: &str, rows: &[(&str, bool, bool, &Row)]) {
         let Some(dir) = brotli_dir() else { return };
         assert!(!rows.is_empty(), "no rows for {label}");
         let mut bad = Vec::new();
-        for (name, r) in rows {
-            let c = case(name, r, false, false);
+        for (name, tty_in, tty_out, r) in rows {
+            let c = case(name, r, *tty_in, *tty_out);
+            if let Some(refusal) = pure_refusal(name, r) {
+                let got = stuffr_as(&c);
+                if got.code != 1 || got.stderr != refusal || !got.stdout.is_empty() {
+                    bad.push(format!(
+                        "{name} {:?}: the pure tier should refuse with {refusal:?}, got exit {} {:?}",
+                        r.args, got.code, got.stderr
+                    ));
+                }
+                continue;
+            }
             let Some(mut want) = reference(dir, &c) else {
                 return;
             };
             let mut got = stuffr_as(&c);
-            want.stderr = blank_timing(&want.stderr);
-            got.stderr = blank_timing(&got.stderr);
+            want.stderr = blank_sizes(&blank_timing(&want.stderr));
+            got.stderr = blank_sizes(&blank_timing(&got.stderr));
             let outcome = std::panic::catch_unwind(|| assert_same(&c, &want, &got));
             if let Err(p) = outcome {
                 bad.push(panic_text(p));
@@ -2086,9 +2249,9 @@ mod unix {
         check_rows("Task 3", &rows);
     }
 
-    #[test]
-    #[ignore = "Task 4"]
-    fn task4_rows_match_the_reference() {
+    /// Every file-handling row: Task 4 runs those that stop before a
+    /// stream is decoded, Task 5 the rest ([`reaches_decoder`]).
+    fn io_rows() -> Vec<(&'static str, &'static Row)> {
         let mut rows = plain(COMPRESS_ROWS);
         rows.extend(plain(DECOMPRESS_ROWS));
         rows.extend(plain(USAGE_ROWS).into_iter().filter(|(_, r)| needs_io(r)));
@@ -2098,12 +2261,359 @@ mod unix {
                 .filter(|(_, r)| !r.fixtures.is_empty() || needs_io(r))
                 .map(|(n, r)| (*n, r)),
         );
+        rows
+    }
+
+    #[test]
+    fn task4_rows_match_the_reference() {
+        let rows: Vec<_> = io_rows()
+            .into_iter()
+            .filter(|(n, r)| !reaches_decoder(n, r) || pure_refusal(n, r).is_some())
+            .collect();
         check_rows("Task 4", &rows);
     }
 
     #[test]
     #[ignore = "Task 5"]
     fn task5_rows_match_the_reference() {
-        check_rows("Task 5", &plain(VERBOSE_ROWS));
+        let mut rows: Vec<_> = io_rows()
+            .into_iter()
+            .filter(|(n, r)| reaches_decoder(n, r) && pure_refusal(n, r).is_none())
+            .collect();
+        rows.extend(plain(VERBOSE_ROWS));
+        check_rows("Task 5", &rows);
+        let tty: Vec<_> = TTY_ROWS
+            .iter()
+            .filter(|(_, _, r)| reaches_decoder("brotli", r))
+            .map(|(i, o, r)| ("brotli", *i, *o, r))
+            .collect();
+        check_tty_rows("Task 5 terminals", &tty);
+    }
+
+    /// The terminal refusals (and the rows beside them that stop before
+    /// decoding) through the pty harness.
+    #[test]
+    fn task4_terminal_rows_match_the_reference() {
+        let rows: Vec<_> = TTY_ROWS
+            .iter()
+            .filter(|(_, _, r)| !reaches_decoder("brotli", r))
+            .map(|(i, o, r)| ("brotli", *i, *o, r))
+            .collect();
+        check_tty_rows("Task 4 terminals", &rows);
+    }
+
+    // ---- Task 4: file handling beyond the recorded rows ----
+
+    /// A fixture or row made at run time, kept for the test's life.
+    fn leak<T: ?Sized>(v: Box<T>) -> &'static T {
+        Box::leak(v)
+    }
+
+    fn row(
+        args: &[&'static str],
+        fixtures: Vec<(&'static str, Vec<u8>)>,
+        code: i32,
+        stderr: &'static str,
+    ) -> &'static Row {
+        let fixtures: Vec<(&'static str, &'static [u8])> = fixtures
+            .into_iter()
+            .map(|(n, b)| (n, leak(b.into_boxed_slice())))
+            .collect();
+        leak(Box::new(r(
+            leak(args.to_vec().into_boxed_slice()),
+            leak(fixtures.into_boxed_slice()),
+            code,
+            stderr,
+        )))
+    }
+
+    /// The window a stream's header declares (RFC 7932 9.1, `WBITS`);
+    /// `None` for the large-window header.
+    fn stream_lgwin(b: &[u8]) -> Option<u32> {
+        let b = *b.first()?;
+        if b & 1 == 0 {
+            return Some(16);
+        }
+        let n = u32::from((b >> 1) & 7);
+        if n != 0 {
+            return Some(17 + n);
+        }
+        match u32::from((b >> 4) & 7) {
+            0 => Some(17),
+            1 => None,
+            m => Some(8 + m),
+        }
+    }
+
+    /// Standard input's length is unknown: the window is 24, whatever the
+    /// input's size, where the same bytes from a file get the smallest
+    /// window that holds them.
+    #[test]
+    fn stdin_uses_the_default_window() {
+        let data = text(100_000, 41);
+        let piped = row(&["-c"], vec![(STDIN, data.clone())], 0, "");
+        let file = row(&["-c", "f"], vec![("f", data)], 0, "");
+        check_rows(
+            "stdin_uses_the_default_window",
+            &[("brotli", piped), ("brotli", file)],
+        );
+        let out = stuffr_as(&case("brotli", piped, false, false)).stdout;
+        assert_eq!(stream_lgwin(&out), Some(24));
+        let out = stuffr_as(&case("brotli", file, false, false)).stdout;
+        assert_eq!(stream_lgwin(&out), Some(17));
+    }
+
+    fn hard_link_b_to_a(w: &Path) {
+        mkdir_d(w);
+        fs::hard_link(w.join("a"), w.join("b")).unwrap();
+    }
+
+    fn hard_link_a_to_a_br(w: &Path) {
+        mkdir_d(w);
+        fs::hard_link(w.join("a.br"), w.join("a")).unwrap();
+    }
+
+    fn symlink_a_br_to_a(w: &Path) {
+        mkdir_d(w);
+        std::os::unix::fs::symlink("a", w.join("a.br")).unwrap();
+    }
+
+    /// `(args, input bytes, setup, message, files that must keep them)`.
+    type SelfCase = (
+        &'static [&'static str],
+        &'static [u8],
+        Option<fn(&Path)>,
+        &'static str,
+        &'static [&'static str],
+    );
+
+    /// Ruling T1-f (deviation 4): an output that is the input itself (the
+    /// same name, a hard link, a symlink) is refused before it is opened for
+    /// writing, compressing and decompressing alike; the reference truncates
+    /// the input. Without `-f` the reference's own `O_EXCL` refusal stands.
+    #[test]
+    fn self_output_never_loses_the_input() {
+        const SAME_A: &str = "input file [a] is the same as the output file\n";
+        const SAME_A_BR: &str = "input file [a.br] is the same as the output file\n";
+        let cases: [SelfCase; 6] = [
+            (&["-f", "-o", "a", "a"], A, None, SAME_A, &["a"]),
+            (
+                &["-f", "-o", "b", "a"],
+                A,
+                Some(hard_link_b_to_a),
+                SAME_A,
+                &["a", "b"],
+            ),
+            (&["-f", "a"], A, Some(symlink_a_br_to_a), SAME_A, &["a"]),
+            (&["-df", "-o", "a", "a"], BR, None, SAME_A, &["a"]),
+            (
+                &["-df", "-o", "b", "a"],
+                BR,
+                Some(hard_link_b_to_a),
+                SAME_A,
+                &["a", "b"],
+            ),
+            (&["-df", "a.br"], BR, None, SAME_A_BR, &["a.br", "a"]),
+        ];
+        for (i, (args, data, setup, msg, kept)) in cases.into_iter().enumerate() {
+            // The last case's input is `a.br`, hard-linked as `a`.
+            let (name, setup) = if i == 5 {
+                ("a.br", Some(hard_link_a_to_a_br as fn(&Path)))
+            } else {
+                ("a", setup)
+            };
+            let rw = row(args, vec![(name, data.to_vec())], 1, msg);
+            let mut c = case("brotli", rw, false, false);
+            if let Some(f) = setup {
+                c.setup = Some(f);
+            }
+            let got = stuffr_as(&c);
+            assert_eq!((got.code, got.stderr.as_str()), (1, msg), "{args:?}");
+            assert!(got.stdout.is_empty(), "{args:?}");
+            for k in kept {
+                let (bytes, _, _) = got
+                    .tree
+                    .get(*k)
+                    .unwrap_or_else(|| panic!("{args:?}: {k} gone"));
+                assert_eq!(bytes, data, "{args:?}: {k} changed");
+            }
+        }
+        // Without `-f`: the reference's own refusal, input intact.
+        let rw = row(
+            &["-o", "a", "a"],
+            vec![("a", A.to_vec())],
+            1,
+            "failed to open output file [a]: File exists\n",
+        );
+        let rw2 = row(
+            &["-d", "-o", "a", "a"],
+            vec![("a", BR.to_vec())],
+            1,
+            "failed to open output file [a]: File exists\n",
+        );
+        check_rows(
+            "self_output_without_force",
+            &[("brotli", rw), ("brotli", rw2)],
+        );
+    }
+
+    fn b_unreadable(w: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        mkdir_d(w);
+        fs::set_permissions(w.join("b"), fs::Permissions::from_mode(0o000)).unwrap();
+    }
+
+    /// The second input cannot be opened: the first one's output is kept,
+    /// the run stops there, exit 1.
+    #[test]
+    fn second_file_fails_keeps_the_first() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root reads a mode-000 file");
+            return;
+        }
+        let Some(dir) = brotli_dir() else { return };
+        let rw = row(
+            &["a", "b", "c"],
+            vec![("a", A.to_vec()), ("b", A.to_vec()), ("c", A.to_vec())],
+            1,
+            "failed to open input file [b]: Permission denied\n",
+        );
+        let mut c = case("brotli", rw, false, false);
+        c.setup = Some(b_unreadable);
+        let want = reference(dir, &c).unwrap();
+        let got = stuffr_as(&c);
+        assert_same(&c, &want, &got);
+        assert!(got.tree.contains_key("a.br") && !got.tree.contains_key("c.br"));
+        assert_eq!(got.stderr, rw.stderr);
+    }
+
+    /// `(mode, atime, mtime)`, times as `(seconds, nanoseconds)`.
+    type Stat = (u32, (i64, i64), (i64, i64));
+
+    fn stat_of(p: &Path) -> Stat {
+        use std::os::unix::fs::MetadataExt;
+        let m = fs::metadata(p).unwrap();
+        (
+            m.mode() & 0o7777,
+            (m.atime(), m.atime_nsec()),
+            (m.mtime(), m.mtime_nsec()),
+        )
+    }
+
+    /// Run `exe` in a fresh work directory holding `a` (mode 0640, fixed
+    /// times with nanoseconds); the stat of `a.br` afterwards.
+    fn run_for_stat(exe: &Path, args: &[&str]) -> (i32, Stat) {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, SystemTime};
+        let s = Scratch::new();
+        let w = s.0.join("work");
+        fs::write(w.join("a"), text(5000, 3)).unwrap();
+        let t = |secs, nanos| SystemTime::UNIX_EPOCH + Duration::new(secs, nanos);
+        let f = fs::File::options().write(true).open(w.join("a")).unwrap();
+        f.set_times(
+            fs::FileTimes::new()
+                .set_accessed(t(1_100_000_000, 123_456_789))
+                .set_modified(t(1_000_000_000, 987_654_321)),
+        )
+        .unwrap();
+        drop(f);
+        fs::set_permissions(w.join("a"), fs::Permissions::from_mode(0o640)).unwrap();
+        let out = output(
+            std::process::Command::new(exe)
+                .args(args)
+                .current_dir(&w)
+                .env_clear()
+                .env("LC_ALL", "C")
+                .stdin(std::process::Stdio::null()),
+        )
+        .unwrap();
+        (out.status.code().unwrap_or(-1), stat_of(&w.join("a.br")))
+    }
+
+    /// CopyStat: the output gets the input's permission bits and its
+    /// access and modification times to the nanosecond; `-n` copies none.
+    #[test]
+    fn copy_stat_matches() {
+        let Some(dir) = brotli_dir() else { return };
+        let reference = Path::new(dir).join("brotli");
+        let rw = row(&[], vec![], 0, "");
+        let (_guard, ours) = stuffr_link(&case("brotli", rw, false, false));
+        let (rc, want) = run_for_stat(&reference, &["a"]);
+        let (sc, got) = run_for_stat(&ours, &["a"]);
+        assert_eq!((rc, sc), (0, 0));
+        assert_eq!(got, want);
+        assert_eq!(got.0, 0o640);
+        // Seconds only where the reference was built without
+        // `utimensat` (macOS: no `_POSIX_C_SOURCE`), nanoseconds on glibc.
+        assert_eq!(got.2.0, 1_000_000_000);
+        let (rc, want) = run_for_stat(&reference, &["-n", "a"]);
+        let (sc, got) = run_for_stat(&ours, &["-n", "a"]);
+        assert_eq!((rc, sc), (0, 0));
+        assert_eq!(got.0, want.0, "-n: the mode is the created file's");
+        assert_ne!(got.2, (1_000_000_000, 987_654_321), "-n copied the time");
+    }
+
+    /// `-s`: an output not smaller than its input is removed (the input
+    /// stays); `-v` says so after the usual line.
+    #[test]
+    fn squash_removes_larger_output() {
+        let noise = random(4096, 77);
+        let rows = [
+            row(&["-s", "r"], vec![("r", noise.clone())], 0, ""),
+            row(&["-s", "-j", "r"], vec![("r", noise.clone())], 0, ""),
+            row(
+                &["-v", "-s", "r"],
+                vec![("r", noise.clone())],
+                0,
+                "Compressed [r]: 4.000 KiB -> 4.005 KiB in X sec\nOutput is larger than input\n",
+            ),
+            row(&["-s", "t"], vec![("t", text(4096, 78))], 0, ""),
+        ];
+        let rows: Vec<_> = rows.iter().map(|r| ("brotli", *r)).collect();
+        check_rows("squash_removes_larger_output", &rows);
+        let got = stuffr_as(&case("brotli", rows[0].1, false, false));
+        assert!(got.tree.contains_key("r") && !got.tree.contains_key("r.br"));
+        let got = stuffr_as(&case("brotli", rows[2].1, false, false));
+        assert!(
+            got.stderr.ends_with("\nOutput is larger than input\n"),
+            "{}",
+            got.stderr
+        );
+    }
+
+    /// `-j`: the input is removed only after its output is complete; a
+    /// failure (output exists, the next input missing) keeps it.
+    #[test]
+    fn rm_removes_only_after_success() {
+        let rows = [
+            row(&["-j", "a"], vec![("a", A.to_vec())], 0, ""),
+            row(
+                &["-j", "a"],
+                vec![("a", A.to_vec()), ("a.br", b"x".to_vec())],
+                1,
+                "failed to open output file [a.br]: File exists\n",
+            ),
+            row(
+                &["-j", "a", "nosuch", "b"],
+                vec![("a", A.to_vec()), ("b", A.to_vec())],
+                1,
+                "failed to open input file [nosuch]: No such file or directory\n",
+            ),
+            row(&["-j", "-c", "a"], vec![("a", A.to_vec())], 0, ""),
+            row(&["-j"], vec![(STDIN, A.to_vec())], 0, ""),
+            row(
+                &["-j", "d"],
+                vec![],
+                1,
+                "failed to read input [d]: Is a directory\n",
+            ),
+        ];
+        let rows: Vec<_> = rows.iter().map(|r| ("brotli", *r)).collect();
+        check_rows("rm_removes_only_after_success", &rows);
+        let got = stuffr_as(&case("brotli", rows[1].1, false, false));
+        assert!(got.tree.contains_key("a"), "a removed after a failure");
+        let got = stuffr_as(&case("brotli", rows[2].1, false, false));
+        assert!(!got.tree.contains_key("a") && got.tree.contains_key("b"));
     }
 }

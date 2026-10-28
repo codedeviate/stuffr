@@ -11,8 +11,10 @@
 //! error, the help text to standard output and exits 1; `-V` writes
 //! `brotli 1.2.1` to standard output. Exit codes are 0 and 1 only.
 //!
-//! Compressing, decompressing and testing are not here yet: they end with
-//! exit 1 and no output until the tasks that port them land.
+//! `files.rs` is the file handling (`NextFile`, `OpenFiles`, `CloseFiles`,
+//! `CopyStat`, `ReadDictionary`), `codec.rs` compression and the
+//! decompression loop. Decoding a stream is not here yet (Task 5): a
+//! decompression or test that gets that far fails silently, exit 1.
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
@@ -23,6 +25,8 @@ use super::CountedRun;
 use super::host::{self, Host, SANDBOX_OUTPUT_CAP, Sandbox};
 
 pub(crate) mod cli;
+mod codec;
+mod files;
 mod messages;
 
 use cli::Command;
@@ -91,8 +95,22 @@ fn main(argv0: &[u8], args: &[OsString], host: &mut Host, err: &mut dyn Write) -
             let _ = out.write_all(&messages::help_text(name));
             1
         }
-        // Compress, decompress and test: a later task.
-        Ok(_) => 1,
+        Ok(params) => {
+            // `main`: the dictionary first, then the buffers and the files.
+            let mut ctx = files::Ctx::new(&params, host, err);
+            let mut is_ok = files::read_dictionary(&mut ctx, params.command);
+            if is_ok {
+                let mut bufs = codec::Buffers::new();
+                is_ok = match params.command {
+                    Command::Compress => codec::compress_files(&mut ctx, &mut bufs),
+                    _ => codec::decompress_files(&mut ctx, &mut bufs),
+                };
+            }
+            if ctx.iterator_error {
+                is_ok = false;
+            }
+            i32::from(!is_ok)
+        }
     };
     let _ = out.flush();
     code
@@ -132,5 +150,127 @@ mod tests {
             run("unbrotli", &["-V"]),
             (0, "brotli 1.2.1\n".into(), String::new())
         );
+    }
+
+    /// A scratch directory `stuffr-brotli-<pid>-<n>`, removed on drop.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let d = std::env::temp_dir().join(format!(
+                "stuffr-brotli-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            Scratch(d)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn run_at(dir: &Path, args: &[&str], stdin: &[u8]) -> (i32, Vec<u8>, String) {
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let (code, out, err, _) = run_in_counted(dir, "brotli", &args, stdin);
+        (code, out, String::from_utf8(err).unwrap())
+    }
+
+    /// `brotli -c a` of `hello\n`, as the reference writes it (lgwin 16).
+    const BR: &[u8] = b"\x21\x14\x00\x04hello\n\x03";
+
+    #[test]
+    fn compresses_a_file_and_standard_input_in_the_sandbox() {
+        let s = Scratch::new();
+        std::fs::write(s.0.join("a"), b"hello\n").unwrap();
+        assert_eq!(run_at(&s.0, &["a"], b""), (0, Vec::new(), String::new()));
+        let written = std::fs::read(s.0.join("a.br")).unwrap();
+        let (code, out, err) = run_at(&s.0, &["-c"], b"hello\n");
+        assert_eq!((code, err.as_str()), (0, ""));
+        if cfg!(feature = "brotli-c") {
+            assert_eq!(written, BR);
+            // Standard input: window 24, so another header.
+            assert_ne!(out, BR);
+        }
+        // `-j` removes the input once its output is complete.
+        assert_eq!(run_at(&s.0, &["-jf", "a"], b"").0, 0);
+        assert!(!s.0.join("a").exists() && s.0.join("a.br").exists());
+    }
+
+    #[test]
+    fn an_output_that_is_the_input_is_refused() {
+        let s = Scratch::new();
+        std::fs::write(s.0.join("a"), b"hello\n").unwrap();
+        for args in [&["-f", "-o", "a", "a"][..], &["-df", "-o", "a", "a"]] {
+            let (code, out, err) = run_at(&s.0, args, b"");
+            assert_eq!(
+                (code, out.as_slice(), err.as_str()),
+                (
+                    1,
+                    &b""[..],
+                    "input file [a] is the same as the output file\n"
+                ),
+                "{args:?}"
+            );
+            assert_eq!(std::fs::read(s.0.join("a")).unwrap(), b"hello\n");
+        }
+        // Without `-f`: the reference's own refusal.
+        let (code, _, err) = run_at(&s.0, &["-o", "a", "a"], b"");
+        assert_eq!(
+            (code, err.as_str()),
+            (1, "failed to open output file [a]: File exists\n")
+        );
+    }
+
+    #[test]
+    fn names_map_as_next_file_maps_them() {
+        let s = Scratch::new();
+        std::fs::write(s.0.join("x"), BR).unwrap();
+        let (code, _, err) = run_at(&s.0, &["-d", "x"], b"");
+        assert_eq!(
+            (code, err.as_str()),
+            (1, "empty output file name for [x] input file\n")
+        );
+        std::fs::write(s.0.join("abcd"), BR).unwrap();
+        let (code, _, err) = run_at(&s.0, &["-d", "abcd"], b"");
+        assert_eq!(
+            (code, err.as_str()),
+            (1, "input file [abcd] suffix mismatch\n")
+        );
+        let (code, _, err) = run_at(&s.0, &["-S", ".x", "nosuch"], b"");
+        assert_eq!(
+            (code, err.as_str()),
+            (
+                1,
+                "failed to open input file [nosuch]: No such file or directory\n"
+            )
+        );
+    }
+
+    #[test]
+    fn verbose_and_squash_lines() {
+        let s = Scratch::new();
+        std::fs::write(s.0.join("a"), b"hello\n").unwrap();
+        let (code, _, err) = run_at(&s.0, &["-v", "-s", "a"], b"");
+        assert_eq!(code, 0);
+        // The sandbox's clock is frozen.
+        let size = if cfg!(feature = "brotli-c") {
+            "11 B"
+        } else {
+            ""
+        };
+        assert!(err.starts_with("Compressed [a]: 6 B -> "), "{err}");
+        assert!(err.contains(size));
+        assert!(
+            err.ends_with(" in 0.00 sec\nOutput is larger than input\n"),
+            "{err}"
+        );
+        assert!(!s.0.join("a.br").exists());
     }
 }

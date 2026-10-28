@@ -24,7 +24,7 @@ const MAX_OPTIONS: usize = 24;
 
 /// The fields of `Context` that parsing fills.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Tasks 4 and 5 read the rest.
+#[allow(dead_code)] // `large_window` is dead, as in the reference.
 pub(crate) struct Params {
     pub command: Command,
     pub quality: u32,
@@ -154,22 +154,22 @@ fn parse_base64(s: &[u8], max: usize) -> Option<Vec<u8>> {
 }
 
 #[cfg(unix)]
-fn bytes(s: &std::ffi::OsStr) -> &[u8] {
+pub(super) fn bytes(s: &std::ffi::OsStr) -> &[u8] {
     std::os::unix::ffi::OsStrExt::as_bytes(s)
 }
 
 #[cfg(not(unix))]
-fn bytes(s: &std::ffi::OsStr) -> &[u8] {
+pub(super) fn bytes(s: &std::ffi::OsStr) -> &[u8] {
     s.as_encoded_bytes()
 }
 
 #[cfg(unix)]
-fn os(b: &[u8]) -> OsString {
+pub(super) fn os(b: &[u8]) -> OsString {
     std::os::unix::ffi::OsStringExt::from_vec(b.to_vec())
 }
 
 #[cfg(not(unix))]
-fn os(b: &[u8]) -> OsString {
+pub(super) fn os(b: &[u8]) -> OsString {
     String::from_utf8_lossy(b).into_owned().into()
 }
 
