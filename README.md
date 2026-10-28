@@ -2219,7 +2219,8 @@ about the archive.*
 ```
 stuffr pack     [-o out.tar.zst] [--format F] [--level N] PATHS...
 stuffr unpack   [-C dir] ARCHIVE [PATTERNS... | --index N...]
-stuffr list     ARCHIVE                    # alias: ls; first column is the index
+stuffr list     ARCHIVE                    # first column is the index
+stuffr ls       [-r] [-a] [-n] [FOLDER]    # alias: files; what a folder holds that stuffr opens
 stuffr cat      ARCHIVE [PATTERNS... | --index N...]  # entry data; works on a pipe
 stuffr info     ARCHIVE                    # resolved chain, ladder rung, fidelity
 stuffr formats                             # capability matrix for THIS build
@@ -2246,6 +2247,31 @@ argv[0]-dispatch into the same binary, so the tools they are named for drop
 into existing scripts unchanged: `bzip2`, `bunzip2`, `bzcat` and
 `bzip2recover`, `gzip`, `xz`, `zstd`, `lz4`, `unzip` with its siblings,
 `compress`/`uncompress` and `zip` with its siblings today, one family per release — see [Compatibility links](#compatibility-links).
+
+### Finding archives: `stuffr ls`
+
+`stuffr ls` on a folder (or with no argument, the current one) lists the
+files stuffr can open, newest first, `ls -l` style with the name last:
+
+```
+$ stuffr ls ~/Downloads
+tar+gzip  4.2M  Oct 27 14:03  backup-2026.tar.gz
+gzip      812K  Oct 25 22:10  export
+zip        18M  Oct 21 09:41  photos.zip
+[FOLDER]        Oct 20 11:02  old/
+3 of 5 files shown, 2 not openable
+```
+
+A file is listed when its first 4096 bytes carry the magic of a format this
+build reads, so an extensionless gzip is found and a `.zip` that is really an
+HTML page is not; nothing is decoded. Sizes are `ls -lh`'s, dates `ls -l`'s
+in local time, and the footer (left out when it would say 0) counts the
+files that are not openable. `-r` adds one block per subfolder holding
+something openable, `-a` includes hidden names, `-n` sorts by name, and
+`--json` prints `{entries, shown, skipped, warnings}`. `stuffr files` is the
+same folder listing. Given a file or `-`, `stuffr ls` is `stuffr list`,
+unchanged. A file or subfolder that cannot be read is named on stderr and
+the exit is 4; the listing itself never exits 1.
 
 ### `stuffr bench`
 
