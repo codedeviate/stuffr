@@ -1075,7 +1075,8 @@ behaves as **bzip2 1.0.8**; invoked as `gzip`, `gunzip`, `zcat` or `gzcat`
 `0.16.0`), as **Info-ZIP UnZip 6.00**; invoked as `compress` or `uncompress`
 (from `0.18.0`), as **compress**, Apple's 487.0.1 or ncompress 5.0; invoked as
 `zip`, `zipcloak`, `zipnote` or `zipsplit` (from `0.19.0`), as **Info-ZIP Zip
-3.0**. In every
+3.0**; invoked as `brotli`, `unbrotli` or `brcat` (from `0.20.0`), as
+**brotli** 1.2.1. In every
 case that tool's flags, files, exit codes and messages, not stuffr's. The binary reads the name from
 `argv[0]`, the file name only, before parsing anything. Any other name,
 `stuffr` included, runs the stuffr CLI unchanged. So does a link you make by
@@ -1087,7 +1088,7 @@ hand under a name stuffr does not handle: `zcat2 -> stuffr` runs `stuffr`.
 Homebrew. One verb makes them:
 
 ```sh
-stuffr install-links --dir ~/.local/bin                  # all thirty-one names
+stuffr install-links --dir ~/.local/bin                  # all thirty-four names
 stuffr install-links --dir ~/.local/bin --names bzcat,zcat   # comma-separated subset
 stuffr install-links --dir ~/.local/bin --dry-run        # "would create ...", changes nothing
 stuffr install-links --dir ~/.local/bin --force          # replace what is already there
@@ -1960,6 +1961,72 @@ before the command line, as the reference does.
 
 The full set is in the code's module docs
 (`crates/stuffr-cli/src/compat/zip/mod.rs`), which is the source of truth.
+
+### The brotli family
+
+`brotli`, `unbrotli` and `brcat`, from `0.20.0`. They behave as the **brotli
+command line tool, version 1.2.1**, and only that version: one personality,
+one reference. The reference reads no environment variable. `unbrotli` and
+`brcat` decompress (`brcat` to standard output, as `-dc`); `-V` prints
+`brotli 1.2.1` and `-h` writes the help to standard error (exit 0), a usage
+error its message to standard error and the help to standard output (exit 1).
+The exit codes are 0 and 1 only, and the first failing file ends the run.
+
+**The promise:**
+
+- **Stdout, stderr and exit codes are those of brotli 1.2.1**, on both build
+  tiers: every option (`-#`, `-q`, `-w`, `--large_window`, `-C`, `-D`, `-K`,
+  `-t`, `-s`, `-o`, `-S`, `-f`, `-k`, `-j`, `-n`), every usage error, the
+  decoder's `reason:` lines, concatenated and truncated streams. A
+  differential suite runs each case through a real brotli 1.2.1 and a stuffr
+  link and compares those streams, the file tree, modes and mtimes.
+- **Compressed output.** With `--features brotli-c` (also in `c-backed`),
+  which builds libbrotli 1.2.1 (vendored, `LICENSE-brotli`), `.br` bytes are
+  **byte-identical to brotli 1.2.1** for every option. On the default pure
+  tier the output is **compatible**: brotli 1.2.1 decodes it to the input.
+
+**Known deviations:**
+
+1. **Pure tier: the `.br` bytes are compatible, not identical.** brotli
+   1.2.1 decodes them to the input; the C tier's are the reference's.
+2. **Pure tier: `-D` is refused in both directions** (`-D is not supported
+   by this build (pure tier); build with --features brotli-c`, exit 1, once
+   the dictionary file has been read), **and so is a one-byte `-C` comment**
+   when compressing (`failed to emit metadata [NAME]`, exit 1; the pure
+   encoder writes a corrupt stream for it). Every other `-C` length, and
+   `--large_window`, work.
+3. **Pure tier: a corrupt stream's `reason:` line can differ.** The decoder
+   cannot tell `-10` (`BLOCK_LENGTH_2`) from `-9` (`BLOCK_LENGTH_1`) and
+   reports `-9`, and it accepts some streams libbrotli rejects with `-9`.
+   `-15` is reported as `-14` where the decoder is at a metablock header.
+4. **An input that is also the output is refused,** where the reference
+   truncates it, and with `-d` deletes it: `brotli -f -o a a`, a hard link
+   or a symlink to the input as the output. stuffr prints `input file [NAME]
+   is the same as the output file` and exits 1 before opening the output.
+5. **A later input operand that an earlier output would overwrite is
+   refused** before the output is opened (`brotli -f a a.br`, `-df a.br a`;
+   `input file [NAME] would be overwritten by the output of [NAME]`, exit
+   1), where the reference overwrites that input before reading it.
+6. **`-j` removes the source only after the output closed without error;**
+   the reference removes it even when `fclose` failed (ENOSPC, EIO), leaving
+   a truncated output and no input.
+7. **`brotli - -` (standard input named twice) writes both streams;** the
+   reference closes standard output after the first file and crashes on the
+   second.
+8. **`could not read dictionary: out of memory` is never printed.** The
+   dictionary buffer (at most `MAX_DICTIONARY_SIZE`, about 1 GiB, as the
+   reference's own limit) is a plain allocation; when the allocator cannot
+   give it, Rust aborts the process (SIGABRT, status 134) where the
+   reference prints that line and exits 1.
+9. **No signal handler, as the reference:** an interrupt leaves the partial
+   output where it was written (outputs are created directly under their
+   names, never through a temporary).
+10. **A closed pipe kills stuffr by SIGPIPE,** as it kills brotli under the
+    default disposition. Where the parent ignores SIGPIPE brotli answers
+    `failed to write output [NAME]: Broken pipe` and exits 1; stuffr still
+    dies of the signal, because the Rust runtime ignores SIGPIPE before
+    `main` and the inherited setting cannot be told apart. A permanent
+    deviation, as in every family.
 
 ### Roadmap
 

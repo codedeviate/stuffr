@@ -11,6 +11,58 @@
 //! error, the help text to standard output and exits 1; `-V` writes
 //! `brotli 1.2.1` to standard output. Exit codes are 0 and 1 only.
 //!
+//! **The promise.** Stdout, stderr and exit codes (0 and 1) are those of
+//! brotli 1.2.1 on both build tiers, and the `.br` bytes are identical on
+//! the C tier (`brotli-c`, libbrotli 1.2.1 vendored; also in `c-backed`).
+//! `-V` prints `brotli 1.2.1`; there is no stuffr banner.
+//!
+//! Known deviations (the source of truth; the README mirrors it with the
+//! same numbers and words):
+//!
+//! 1. Pure tier: the `.br` bytes are compatible, not identical. brotli 1.2.1
+//!    decodes them to the input; the C tier's are the reference's.
+//! 2. Pure tier: `-D` is refused in both directions (`-D is not supported
+//!    by this build (pure tier); build with --features brotli-c`, exit 1,
+//!    once the dictionary file has been read), and so is a one-byte `-C`
+//!    comment when compressing (`failed to emit metadata [NAME]`, exit 1;
+//!    the pure encoder writes a corrupt stream for it). Every other `-C`
+//!    length, and `--large_window`, work.
+//! 3. Pure tier: a corrupt stream's `reason:` line can differ. The decoder
+//!    cannot tell `-10` (`BLOCK_LENGTH_2`) from `-9` (`BLOCK_LENGTH_1`) and
+//!    reports `-9`, and it accepts some streams libbrotli rejects with `-9`.
+//!    `-15` is reported as `-14` where the decoder is at a metablock
+//!    header.
+//! 4. An input that is also the output is refused, where the reference
+//!    truncates it, and with `-d` deletes it: `brotli -f -o a a`, a hard
+//!    link or a symlink to the input as the output. stuffr prints `input file
+//!    [NAME] is the same as the output file` and exits 1 before opening the
+//!    output.
+//! 5. A later input operand that an earlier output would overwrite is
+//!    refused before the output is opened (`brotli -f a a.br`, `-df a.br
+//!    a`; `input file [NAME] would be overwritten by the output of
+//!    [NAME]`, exit 1), where the reference overwrites that input before
+//!    reading it.
+//! 6. `-j` removes the source only after the output closed without error;
+//!    the reference removes it even when `fclose` failed (ENOSPC, EIO),
+//!    leaving a truncated output and no input.
+//! 7. `brotli - -` (standard input named twice) writes both streams; the
+//!    reference closes standard output after the first file and crashes on
+//!    the second.
+//! 8. `could not read dictionary: out of memory` is never printed. The
+//!    dictionary buffer (at most `MAX_DICTIONARY_SIZE`, about 1 GiB, as
+//!    the reference's own limit) is a plain allocation; when the allocator
+//!    cannot give it, Rust aborts the process (SIGABRT, status 134) where
+//!    the reference prints that line and exits 1.
+//! 9. No signal handler, as the reference: an interrupt leaves the partial
+//!    output where it was written (outputs are created directly under their
+//!    names, never through a temporary).
+//! 10. A closed pipe kills stuffr by SIGPIPE, as it kills brotli under the
+//!     default disposition. Where the parent ignores SIGPIPE brotli answers
+//!     `failed to write output [NAME]: Broken pipe` and exits 1; stuffr still dies of the
+//!     signal, because the Rust runtime ignores SIGPIPE before `main` and
+//!     the inherited setting cannot be told apart. A permanent deviation,
+//!     as in every family.
+//!
 //! `files.rs` is the file handling (`NextFile`, `OpenFiles`, `CloseFiles`,
 //! `CopyStat`, `ReadDictionary`), `codec.rs` compression and the
 //! decompression loop, decoding (with `-t`, `-K` and the comment check).

@@ -1407,8 +1407,8 @@ COMPATIBILITY LINKS (INSTALL-LINKS)
       Creates symlinks named bzip2, bunzip2, bzcat, bzip2recover, gzip,
       gunzip, zcat, gzcat, xz, unxz, xzcat, lzma, unlzma, lzcat, zstd,
       unzstd, zstdcat, zstdmt, lz4, unlz4, lz4cat, lz4c, unzip, zipinfo,
-      funzip, compress, uncompress, zip, zipcloak, zipnote and zipsplit in
-      that directory, each pointing at this stuffr binary. Run under one of
+      funzip, compress, uncompress, zip, zipcloak, zipnote, zipsplit, brotli,
+      unbrotli and brcat in that directory, each pointing at this stuffr binary. Run under one of
       those names, the binary behaves as that tool, with its flags, messages
       and exit codes. This is opt-in: nothing creates these links unless you
       run this verb. The directory must exist (exit 2 if not); one that
@@ -1474,6 +1474,14 @@ COMPATIBILITY LINKS (INSTALL-LINKS)
       -d; zcat stays with the gzip names. Stdout, stderr, exit codes and
       compressed bytes match the real tool wherever its output is a valid
       stream.
+
+      The brotli, unbrotli and brcat names behave as the brotli command line
+      1.2.1: unbrotli decompresses, brcat decompresses to standard output.
+      Stdout, stderr and exit codes (0 and 1) match brotli 1.2.1 on every
+      build; compressed bytes are identical to it on a --features brotli-c
+      (or c-backed) build and merely compatible otherwise, where -D and a
+      one-byte -C comment are refused. An input that is also the output is
+      refused rather than truncated.
 
   stuffr install-links --dir ~/.local/bin --names bzcat,zcat
       Only the named links; --names takes a comma-separated list. A name that
