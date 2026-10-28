@@ -377,3 +377,14 @@ oxiarc-lzhuf = { version = "=0.4.2", default-features = false }
 # per-run timeout. Release builds are unaffected.
 [profile.dev.package.lzma-rust2]
 opt-level = 3
+
+# Likewise the pure brotli codec and its decoder. Unoptimised, the pure-tier
+# differential cases (`compat_brotli_bytes`: `bytes_match_every_quality_and_window`,
+# `large_input_bytes_match`, `comment_bytes_match`) ran past the harness's 30 s
+# per-run timeout on CI's x86-64 runners (CI 40698365117). Release builds are
+# unaffected.
+[profile.dev.package.brotli]
+opt-level = 3
+
+[profile.dev.package.brotli-decompressor]
+opt-level = 3
