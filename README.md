@@ -473,6 +473,18 @@ read list.
 > **3364** tests under `--all-features`, **3251** on the default tier —
 > measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
+> `0.20.0` adds the brotli family: `brotli`, `unbrotli` and `brcat` answer
+> as Google's brotli 1.2.1 does. stdout, stderr and exit codes are the
+> reference's on both tiers; the `.br` bytes are identical on the C tier
+> (`brotli-c`, in `c-backed`, which builds the vendored libbrotli 1.2.1)
+> and compatible on the pure tier, which also refuses `-D`. Ten deviations
+> are listed in "The brotli family" below; the ones that matter most keep
+> your data where brotli can lose it (an input that is its own output, a
+> later input an earlier output would overwrite, `-j` after a failed
+> close). `install-links` makes thirty-four names.
+> **3423** tests under `--all-features`, **3308** on the default tier —
+> measured from this bump's own `make check`, `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
