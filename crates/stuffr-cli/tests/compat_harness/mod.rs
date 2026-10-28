@@ -565,6 +565,78 @@ pub fn lz4_dir() -> Option<&'static str> {
     }
 }
 
+const BROTLI_LINKS: [&str; 2] = ["unbrotli", "brcat"];
+
+/// Whether `<dir>/brotli`'s `-V` prints exactly `brotli 1.2.1`.
+fn is_brotli_1_2_1(dir: &Path) -> bool {
+    output(
+        Command::new(dir.join("brotli"))
+            .arg("-V")
+            .env_clear()
+            .stdin(Stdio::null()),
+    )
+    .is_ok_and(|o| o.status.success() && o.stdout == b"brotli 1.2.1\n")
+}
+
+/// `brotli` on `PATH`, like a shell's lookup.
+fn brotli_on_path() -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|d| d.join("brotli"))
+        .find(|p| p.is_file())
+}
+
+/// The directory holding brotli 1.2.1's `brotli` and its links `unbrotli`
+/// and `brcat`.
+///
+/// Looked up in this order, the first one that [`is_brotli_1_2_1`] accepts
+/// winning:
+/// 1. `$STUFFR_BROTLI_REFERENCE`, the path of a `brotli` (CI builds the tag
+///    archive there; if the two links are not beside it they are made in a
+///    temp dir);
+/// 2. Homebrew's keg, `/opt/homebrew/opt/brotli/bin`;
+/// 3. `brotli` on `PATH`.
+///
+/// `None` when there is none: a skip with a note locally, a panic under `CI`
+/// (the rule of [`require_reference`]), so every test that skips on it would
+/// otherwise pass vacuously. Another release is no reference: stuffr
+/// promises 1.2.1's behaviour.
+pub fn brotli_dir() -> Option<&'static str> {
+    static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let found = DIR.get_or_init(|| {
+        let candidates = [
+            std::env::var_os("STUFFR_BROTLI_REFERENCE")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
+            Some(PathBuf::from("/opt/homebrew/opt/brotli/bin/brotli")),
+            brotli_on_path(),
+        ];
+        for exe in candidates.into_iter().flatten() {
+            if !exe.is_file() {
+                continue;
+            }
+            let Some(dir) = dir_with_links_for(&exe, "brotli", &BROTLI_LINKS) else {
+                continue;
+            };
+            if is_brotli_1_2_1(&dir) {
+                return dir.to_str().map(str::to_owned);
+            }
+        }
+        None
+    });
+    match found {
+        Some(d) => Some(d.as_str()),
+        None => {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI is set but there is no brotli 1.2.1 reference \
+                 (looked at $STUFFR_BROTLI_REFERENCE, /opt/homebrew/opt/brotli/bin, PATH)"
+            );
+            eprintln!("skipped: brotli 1.2.1 not installed");
+            None
+        }
+    }
+}
+
 // ---- ncompress 5.0 (the compress family's ncompress personality) ----
 
 /// The apt package `make compat-ubuntu` and CI's ubuntu-24.04 runners have:

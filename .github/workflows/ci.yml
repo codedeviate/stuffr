@@ -96,6 +96,7 @@ jobs:
       - uses: ./.github/actions/zstd-reference
       # lz4 1.10.0 from the release tarball: the compat_lz4* oracle (see the action).
       - uses: ./.github/actions/lz4-reference
+      - uses: ./.github/actions/brotli-reference
       - run: sudo apt-get update && sudo apt-get install -y lzip cpio zip unzip ncompress lhasa
       # The unzip family's Ubuntu oracle is this exact package (`unzip_dir()`
       # requires 6.0-28ubuntu4.1 and panics under CI otherwise): print it.
@@ -143,6 +144,7 @@ jobs:
       - uses: ./.github/actions/zstd-reference
       # lz4 1.10.0 from the release tarball: the compat_lz4* oracle (see the action).
       - uses: ./.github/actions/lz4-reference
+      - uses: ./.github/actions/brotli-reference
       - run: sudo apt-get update && sudo apt-get install -y lzip cpio zip unzip ncompress lhasa
       # The unzip family's Ubuntu oracle is this exact package (`unzip_dir()`
       # requires 6.0-28ubuntu4.1 and panics under CI otherwise): print it.
@@ -208,6 +210,7 @@ jobs:
       - uses: ./.github/actions/zstd-reference
       # lz4 1.10.0 from the release tarball: the compat_lz4* oracle (see the action).
       - uses: ./.github/actions/lz4-reference
+      - uses: ./.github/actions/brotli-reference
       - run: sudo apt-get update && sudo apt-get install -y lzip cpio zip unzip ncompress lhasa
       # The unzip family's Ubuntu oracle is this exact package (`unzip_dir()`
       # requires 6.0-28ubuntu4.1 and panics under CI otherwise): print it.
@@ -469,6 +472,7 @@ jobs:
       - uses: ./.github/actions/zstd-reference
       # lz4 1.10.0 from the release tarball: the compat_lz4* oracle (see the action).
       - uses: ./.github/actions/lz4-reference
+      - uses: ./.github/actions/brotli-reference
       # Which releases this run compares against: the logs said neither.
       - run: |
           sw_vers
