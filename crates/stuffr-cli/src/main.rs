@@ -11,6 +11,10 @@ use stuffr::{Chain, FormatId};
 use stuffr_cli::cli::{Cli, Command};
 use stuffr_cli::format_by_name;
 
+// Task 4 wires `ls` into the CLI and removes this allow.
+#[allow(dead_code)]
+mod ls;
+
 /// The `--examples` page. A static asset rather than an inline literal so it
 /// reads (and diffs) like the terminal page it is, not like Rust source.
 const EXAMPLES: &str = include_str!("examples.txt");
