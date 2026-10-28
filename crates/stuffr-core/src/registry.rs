@@ -170,6 +170,12 @@ impl Registry {
         hits.into_iter().map(|(_, id)| id).collect()
     }
 
+    /// True when any registered magic rule names `id`. A format without one
+    /// (brotli, raw deflate) can only be recognised by its extension.
+    pub fn has_magic(&self, id: FormatId) -> bool {
+        self.magics.iter().any(|m| m.format == id)
+    }
+
     /// The priority of a registered format, or 0 if unknown.
     pub fn priority_of(&self, id: FormatId) -> i16 {
         self.metas.get(&id).map_or(0, |m| m.priority)
@@ -369,6 +375,18 @@ mod tests {
             "a stale extension must not survive re-registration"
         );
         assert_eq!(r.by_extension("mock"), None);
+    }
+
+    #[test]
+    fn has_magic_is_true_for_gzip_and_false_for_an_unregistered_magicless_format() {
+        let mut r = Registry::new();
+        r.register_codec(Arc::new(MockCodec), codec_meta());
+        // A second codec registered with no magic at all.
+        const NONE: FormatId = FormatId::new("nomagic");
+        r.register_codec(Arc::new(MockCodec), FormatMeta::codec(NONE, &["nm"], &[]));
+        assert!(r.has_magic(MOCK_CODEC));
+        assert!(!r.has_magic(NONE));
+        assert!(!r.has_magic(FormatId::new("unregistered")));
     }
 
     #[test]
