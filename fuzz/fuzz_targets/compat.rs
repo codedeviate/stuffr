@@ -111,6 +111,11 @@
 //!   budget. The lz4 family's tokens bring `a.lz4`, the sixteenth
 //!   `COMPAT_FILES` entry, which takes a third mask byte (present when the
 //!   argument-count byte is at least 18); `-D` takes `d.dict`.
+//! - the brotli family exits 0 or 1 (`run_brotli`), leaves no `.stuffr-*`
+//!   temporary and no name `could_be_written` does not allow (every non-flag
+//!   token is a base), and keeps the 8 MiB output budget. Its tokens bring
+//!   `a.br`, the twenty-first `COMPAT_FILES` entry (third mask byte, bit 21),
+//!   and the `-q`/`-w`/`-K`/`-C` forms.
 //! - the unzip family exits with one of its flavour's reference codes
 //!   (`unzip::EXIT_CODES_APPLE`, `unzip::EXIT_CODES_UBUNTU`), reads each
 //!   archive within `check_unzip_reads`' bound (not linear: Apple's build
@@ -228,7 +233,7 @@ fn sandbox() -> &'static Path {
 /// `-S`'s suffix): bzip2's, `.out`, both gzips' tables and `.tar`.
 const SUFFIXES: &[&str] = &[
     ".bz2", ".bz", ".tbz2", ".tbz", ".out", ".gz", ".tgz", ".taz", ".z", ".Z", "-gz", "-z", "_z",
-    ".xz", ".lz", ".tar", ".txz", ".lzma", ".tlz", ".zst", ".tzst", ".lz4", ".tlz4",
+    ".xz", ".lz", ".tar", ".txz", ".lzma", ".tlz", ".zst", ".tzst", ".lz4", ".tlz4", ".br",
 ];
 
 /// Suffixes a decompressor maps to `.tar` rather than strip.
@@ -460,17 +465,41 @@ fn run_bzip2(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
     );
 }
 
-/// The brotli family: exit 0 or 1 only. Minimal arm (0.20.0 Task 3); the
-/// read bounds and the stream oracle come with the family's fuzz task.
+/// The brotli family: exit 0 or 1 only (`brotli.c` has no other), no stray
+/// name in the run's directory (every non-flag token is a base, as an
+/// operand after `-o` or `-S`'s value names a file) and no stuffr temporary.
+/// The 8 MiB output budget of `run_in` binds here too, `-t`'s decoded bytes
+/// included (a sandbox bound, not the tool's: it ends `failed to write
+/// output`, exit 1).
 fn run_brotli(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
-    let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-    let (code, _out, err) = compat::run_in(dir, name, args, stdin, Flavour::Gnu)
+    let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
+    let (code, _out, err) = compat::run_in(dir, name, os_args, stdin, Flavour::Gnu)
         .expect("a COMPAT_NAMES entry is a compat name");
     assert!(
         (0..=1).contains(&code),
-        "{name}: exit {code} is not 0 or 1\n{}",
+        "{name} {args:?}: exit {code} is not 0 or 1\n{}",
         String::from_utf8_lossy(&err)
     );
+    let bases: Vec<&str> = args
+        .iter()
+        .copied()
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    let Ok(listing) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in listing.flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        assert!(
+            !n.starts_with(".stuffr-"),
+            "{name} {args:?}: left its temporary {n:?}"
+        );
+        assert!(
+            could_be_written_with(&n, false, &bases)
+                || (case_insensitive_fs() && could_be_written_with(&n, true, &bases)),
+            "{name} {args:?}: left a stray {n:?}"
+        );
+    }
 }
 
 /// The arguments in operand position: after `--`, everything; before it,

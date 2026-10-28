@@ -896,6 +896,15 @@ const COMPAT_SHAPES: &[&str] = &[
     // so the header read meets the end of the file and the walk seeks back
     // into the bytes it read (re-read once: 17 bytes of a 16-byte file).
     "zstd-list-skippable-near-end",
+    // The brotli family (0.20.0): compress at quality 0, decode, `-K` over two
+    // streams and garbage, a comment (`-C foo`), `-t`, `brcat` and `unbrotli`.
+    "brotli-q0",
+    "brotli-d",
+    "brotli-K",
+    "brotli-C",
+    "brotli-t",
+    "brcat",
+    "unbrotli",
     // The lz4 family (0.15.0 Task 3): one argument-surface seed per name,
     // so every name has a seed; Task 8 adds the coder's shapes.
     "lz4-help",
@@ -2695,6 +2704,9 @@ fn compat_seed(work: &Path, shape: &str) -> stuffr_core::Result<Vec<u8>> {
     if let Some(seed) = lz4_seed(work, shape)? {
         return Ok(seed);
     }
+    if let Some(seed) = brotli_seed(work, shape)? {
+        return Ok(seed);
+    }
     if let Some(seed) = unzip_seed(work, shape)? {
         return Ok(seed);
     }
@@ -2772,6 +2784,39 @@ fn compat_seed(work: &Path, shape: &str) -> stuffr_core::Result<Vec<u8>> {
         "bzip2recover-usage" => e("bzip2recover", &[], &[], false, b""),
         other => unreachable!("COMPAT_SHAPES lists an unhandled shape {other:?}"),
     })
+}
+
+/// The `compat` seed for a brotli-family `shape` (0.20.0), or `None` for
+/// another family's. Flavour 0: the family has one personality.
+fn brotli_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> {
+    if !matches!(
+        shape,
+        "brotli-q0" | "brotli-d" | "brotli-K" | "brotli-C" | "brotli-t" | "brcat" | "unbrotli"
+    ) {
+        return Ok(None);
+    }
+    let tool = shape.split('-').next().unwrap_or(shape);
+    let z = |args: &[&str], files: &[&str], stdin: bool, payload: &[u8]| {
+        encode_compat_case(tool, 0, args, files, stdin, payload)
+    };
+    let text = compat_text(4000);
+    let stream = encoded(work, &text, "brotli", None)?;
+    Ok(Some(match shape {
+        "brotli-q0" => z(&["-q0", "-c", "a"], &["a"], false, &text),
+        "brotli-d" => z(&["-dc", "a.br"], &["a.br"], false, &stream),
+        // Two streams and trailing garbage: `-K` reads on past the first.
+        "brotli-K" => {
+            let mut two = stream.clone();
+            two.extend_from_slice(&stream);
+            two.extend_from_slice(b"trailing garbage");
+            z(&["-d", "-K", "-c", "a.br"], &["a.br"], false, &two)
+        }
+        "brotli-C" => z(&["-C", "Zm9v", "-c", "a"], &["a"], false, &text),
+        "brotli-t" => z(&["-t", "a.br"], &["a.br"], false, &stream),
+        "brcat" => z(&["a.br"], &["a.br"], false, &stream),
+        "unbrotli" => z(&["a.br"], &["a.br"], false, &stream),
+        other => unreachable!("brotli_seed handles {other:?}"),
+    }))
 }
 
 /// The `compat` seed for a gzip-family `shape` (`<tool>-<flavour>-<case>`),

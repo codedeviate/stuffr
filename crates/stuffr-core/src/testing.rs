@@ -237,7 +237,8 @@ pub const COMPAT_FILES: &[&str] = &[
     "a.zst", "a.tzst", "d.dict", // 0.14.0: the zstd family
     "a.lz4",  // 0.15.0: the lz4 family (a third mask byte; its dictionary is `d.dict`)
     "a.zip", "b.zip", // 0.16.0: the unzip family (third mask byte, bits 17 and 18)
-    "a.Z", "b.Z", // 0.18.0: the compress family (third mask byte, bits 19 and 20)
+    "a.Z", "b.Z",  // 0.18.0: the compress family (third mask byte, bits 19 and 20)
+    "a.br", // 0.20.0: the brotli family (third mask byte, bit 21)
 ];
 
 /// The `compat` target's argument vocabulary: byte `n % len` is one argument.
@@ -515,6 +516,33 @@ pub const COMPAT_TOKENS: &[&str] = &[
     // `zipnote`.
     "a.txt",
     "b.txt",
+    // 0.20.0: the brotli family (`-#`, `-c`, `-d`, `-f`, `-j`, `-k`, `-n`, `-o`,
+    // `-q`, `-s`, `-t`, `-v`, `-V`, `-h`, `-C`, `-D`, `-S`, `-Z`, `--stdout`,
+    // `--decompress`, `--force`, `--keep`, `--help`, `--version`, `--best`,
+    // `--verbose`, `--test`, `--squash`, `--suffix`, `d.dict`, `.x`, the digits
+    // and the files are above). `-K` is its concatenated-streams switch; `-C`
+    // takes a base64 text (`Zm9v` is `foo`); `-w`, `-q` and `--large_window`
+    // take a number, in the `=` or the attached spelling.
+    "-K",
+    "-q0",
+    "-q5",
+    "-q11",
+    "-w0",
+    "-w10",
+    "-w16",
+    "-w24",
+    "--large_window=24",
+    "--concatenated",
+    "--squash",
+    "--no-copy-stat",
+    "--quality=3",
+    "--lgwin=12",
+    "--comment=Zm9v",
+    "--dictionary=d.dict",
+    "--output=a.out",
+    "Zm9v",
+    "!!!!",
+    "a.br",
 ];
 
 /// The largest input the `compat` target runs. Here, not in the target, so
@@ -2368,8 +2396,19 @@ mod tests {
     /// twentieth files, bits 19 and 20, still in the third mask byte, so no
     /// fourth byte exists and every earlier seed decodes as it did.
     #[test]
+    fn dot_br_takes_bit_21() {
+        assert_eq!(COMPAT_FILES[20], "a.br");
+        let seed = encode_compat_case("brotli", 0, &["-d", "a.br"], &["a.br"], false, b"p");
+        let case = decode_compat_case(&seed).unwrap();
+        assert_eq!((case.name, case.flavour), ("brotli", 0));
+        assert_eq!(case.args, ["-d", "a.br"]);
+        assert_eq!(case.files, ["a.br"]);
+        assert_eq!(seed[4..7], [0, 0, 0b10_0000]);
+    }
+
+    #[test]
     fn dot_z_files_take_bits_19_and_20() {
-        assert_eq!(&COMPAT_FILES[18..], ["a.Z", "b.Z"]);
+        assert_eq!(&COMPAT_FILES[18..20], ["a.Z", "b.Z"]);
         let t = |s: &str| COMPAT_TOKENS.iter().position(|t| *t == s).unwrap() as u8;
         let argc = 2 * (COMPAT_MAX_ARGS as u8 + 1) + 2;
         for (file, top) in [("a.Z", 1u8 << 3), ("b.Z", 1 << 4)] {
@@ -2380,12 +2419,12 @@ mod tests {
             assert_eq!(case.args, ["-d", file]);
             assert_eq!(case.files, [file]);
         }
-        // All twenty files and standard input fit three mask bytes, and the
-        // third byte's top three bits stay unused.
+        // All twenty-one files and standard input fit three mask bytes, and
+        // the third byte's top two bits stay unused (`a.br` is bit 21).
         let all: Vec<&str> = COMPAT_FILES.to_vec();
         let seed = encode_compat_case("uncompress", 0, &[], &all, true, b"xy");
         assert_eq!(seed[1], 18);
-        assert_eq!(&seed[2..5], [0xff, 0xff, 0x1f]);
+        assert_eq!(&seed[2..5], [0xff, 0xff, 0x3f]);
         assert_eq!(decode_compat_case(&seed).unwrap().files, COMPAT_FILES);
         // The unzip family's seeds (`a.zip` and `b.zip` in the third byte)
         // are unchanged, and the wire format is exactly three mask bytes

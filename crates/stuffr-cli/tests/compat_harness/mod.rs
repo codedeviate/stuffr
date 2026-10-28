@@ -85,8 +85,10 @@ fn is_xz_5_8_4(dir: &Path) -> bool {
 
 /// A directory holding `xz` and its five links. `xz` itself is `exe`; when
 /// the links are not all beside it (a bare binary), they are made, as
-/// symlinks to it, in a temporary directory that lives as long as the test
-/// process's temp dir (a few inodes; never removed).
+/// symlinks to it, in a temporary directory removed when the test process
+/// exits (an `atexit` hook: the directory outlives every test, and a
+/// leftover would fail the gate's temp-folder leak check; Homebrew's brotli
+/// has no links beside it, so its run always makes them).
 fn dir_with_links(exe: &Path) -> Option<PathBuf> {
     dir_with_links_for(exe, "xz", &XZ_LINKS)
 }
@@ -100,6 +102,7 @@ fn dir_with_links_for(exe: &Path, main: &str, links: &[&str]) -> Option<PathBuf>
     }
     let dir = std::env::temp_dir().join(format!("stuffr-{main}-links-{}", std::process::id()));
     fs::create_dir_all(&dir).ok()?;
+    remove_at_exit(&dir);
     let target = fs::canonicalize(exe).ok()?;
     for name in std::iter::once(main).chain(links.iter().copied()) {
         let l = dir.join(name);
@@ -107,6 +110,25 @@ fn dir_with_links_for(exe: &Path, main: &str, links: &[&str]) -> Option<PathBuf>
         std::os::unix::fs::symlink(&target, &l).ok()?;
     }
     Some(dir)
+}
+
+/// Removes `dir` (and what is in it) when the process exits normally.
+fn remove_at_exit(dir: &Path) {
+    use std::sync::Mutex;
+    static DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    extern "C" fn sweep() {
+        if let Ok(dirs) = DIRS.lock() {
+            for d in dirs.iter() {
+                let _ = fs::remove_dir_all(d);
+            }
+        }
+    }
+    let mut dirs = DIRS.lock().unwrap_or_else(|p| p.into_inner());
+    if dirs.is_empty() {
+        // SAFETY: `sweep` is an `extern "C"` fn that only removes files.
+        unsafe { libc::atexit(sweep) };
+    }
+    dirs.push(dir.to_path_buf());
 }
 
 /// `xz` on `PATH`, like a shell's lookup.
