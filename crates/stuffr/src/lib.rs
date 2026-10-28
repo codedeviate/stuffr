@@ -79,6 +79,16 @@ pub mod zlib_c {
 pub mod lz4_opts {
     pub use stuffr_formats::lz4_opts::*;
 }
+/// The `brotli` tool's options seam — quality, window, size hint, the
+/// large-window extension, raw dictionaries and metadata (`-C`) — and the
+/// streaming coder over them, what the `stuffr` binary's brotli
+/// compatibility family runs: libbrotli 1.2.1 (vendored) under `brotli-c`,
+/// else the `brotli` crate. Not part of the stable API.
+#[cfg(any(feature = "brotli", feature = "brotli-c"))]
+#[doc(hidden)]
+pub mod brotli_opts {
+    pub use stuffr_formats::brotli_opts::*;
+}
 pub mod entries;
 mod link_cache;
 pub mod ops;

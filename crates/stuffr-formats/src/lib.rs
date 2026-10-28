@@ -228,6 +228,12 @@ pub mod ar;
 pub mod ar_salvage;
 #[cfg(feature = "brotli")]
 pub mod brotli;
+// The `brotli` compatibility family's options seam over libbrotli 1.2.1
+// (C tier, `brotli-c`) and the `brotli` crate (pure tier), reached through
+// `stuffr-cli` only; not part of the public surface.
+#[cfg(any(feature = "brotli", feature = "brotli-c"))]
+#[doc(hidden)]
+pub mod brotli_opts;
 #[cfg(feature = "bzip2")]
 pub mod bzip2;
 #[cfg(feature = "cpio")]

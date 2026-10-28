@@ -430,13 +430,19 @@ jobs:
       # Structural, not environmental: this cannot prove `cc` is absent from
       # a runner (runners have compilers), only that a default `pure` build
       # never reaches for `zstd-sys`, `liblzma-sys` or `libz-sys` in the first
-      # place.
+      # place, and never builds anything with `cc` (stuffr-formats' own
+      # `build.rs` compiles the vendored libbrotli only under `brotli-c`).
       # The exit code is inverted on purpose: `grep` succeeding means it
       # FOUND a C-compiling crate, which is the failure.
       - name: pure builds pull in no C-compiling crate
         run: |
           cargo tree -p stuffr --no-default-features --features pure -e normal \
             | grep -E 'zstd-sys|liblzma-sys|libz-sys' && exit 1
+          # `-e normal,build`, not `-e build` alone: build edges only would
+          # stop at `stuffr`, which has no build-dependencies, and pass
+          # vacuously.
+          cargo tree -p stuffr --no-default-features --features pure -e normal,build \
+            | grep ' cc v' && exit 1
           echo "pure graph is free of C-compiling crates"
 
   compat-macos:

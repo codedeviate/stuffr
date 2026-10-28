@@ -63,7 +63,7 @@ pure = ["stuffr/pure"]
 # its integration tests can see it; `c-backed` implies it, and `full` names
 # `c-backed` itself — `stuffr/full` alone would turn on stuffr's `zlib-c` but
 # not this crate's, and the byte suite would silently run the compatible tier.
-c-backed = ["stuffr/c-backed", "zlib-c", "xz-c", "lzma-c", "zstd-c", "lz4-c"]
+c-backed = ["stuffr/c-backed", "zlib-c", "xz-c", "lzma-c", "zstd-c", "lz4-c", "brotli-c"]
 zlib-c = ["stuffr/zlib-c"]
 # The Apple gzip personality's `unxz` runs over liblzma itself on the C
 # tier (`stuffr::xz_stream`), as Apple's does; elsewhere over the
@@ -80,6 +80,10 @@ zstd-c = ["stuffr/zstd-c"]
 # The lz4 family's C tier (liblz4 through `stuffr::lz4_opts`); a passthrough
 # so this crate's `cfg(feature = "lz4-c")` and its byte suite see the tier.
 lz4-c = ["stuffr/lz4-c"]
+# The brotli family's C tier (libbrotli 1.2.1, vendored in stuffr-formats,
+# through `stuffr::brotli_opts`); a passthrough so this crate's
+# `cfg(feature = "brotli-c")` and its byte suite see the tier.
+brotli-c = ["stuffr/brotli-c"]
 legacy = ["stuffr/legacy"]
 full = ["stuffr/full", "c-backed"]
 lha = ["stuffr/lha"]

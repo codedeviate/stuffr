@@ -865,6 +865,7 @@ dependencies = [
  "ar",
  "brotli",
  "bzip2",
+ "cc",
  "cpio",
  "delharc",
  "flate2",

@@ -13,7 +13,10 @@ rust-version.workspace = true
 license = "MIT AND BSD-2-Clause AND 0BSD AND BSD-3-Clause AND Info-ZIP"
 # Apache-2.0/MIT/BSD-2-Clause fixtures from other projects; see
 # tests/data/infozip/README. Tests read them from CARGO_MANIFEST_DIR.
-exclude = ["tests/data/infozip/"]
+# tests/data/brotli/ holds ~750 KiB of reference `.br` files that only
+# `brotli_opts`' tests read (Ruling P2: kept out of the package). The
+# vendored libbrotli under `c/` is not excluded: `brotli-c` builds it.
+exclude = ["tests/data/infozip/", "tests/data/brotli/"]
 repository.workspace = true
 keywords = ["compression", "archive", "gzip", "zstd", "tar"]
 categories = ["compression", "encoding", "filesystem"]
@@ -26,6 +29,12 @@ zlib = ["dep:flate2"]
 deflate = ["dep:flate2"]
 bzip2 = ["dep:bzip2"]
 brotli = ["dep:brotli"]
+# The brotli compatibility family's C tier: `brotli_opts` over libbrotli
+# 1.2.1, vendored under `c/brotli-1.2.1/` (upstream's `c/common`, `c/enc`,
+# `c/dec`, `c/include` and `LICENSE`, unmodified) and compiled by this
+# crate's `build.rs` with `cc`, so its `.br` output is byte-identical to the
+# brotli tool's. Without it `brotli_opts` runs over the `brotli` crate.
+brotli-c = ["brotli", "dep:cc"]
 lz4 = ["dep:lz4_flex", "dep:twox-hash"]
 # The lz4 compatibility family's C tier: `lz4_opts` over liblz4 1.10.0
 # (`lz4-sys`), byte-identical to the lz4 CLI. Without it `lz4_opts` runs its
@@ -127,6 +136,11 @@ time = { workspace = true, optional = true }
 delharc = { workspace = true, optional = true }
 unarj-rs = { workspace = true, optional = true }
 oxiarc-lzhuf = { workspace = true, optional = true }
+
+# Only `brotli-c` reaches it (`build.rs` compiles the vendored libbrotli);
+# the `pure` graph has no `cc`, which the `purity` CI job asserts.
+[build-dependencies]
+cc = { version = "1", optional = true }
 
 [dev-dependencies]
 stuffr-core = { workspace = true, features = ["testing"] }

@@ -22,6 +22,7 @@ zlib = ["stuffr-formats/zlib"]
 deflate = ["stuffr-formats/deflate"]
 bzip2 = ["stuffr-formats/bzip2"]
 brotli = ["stuffr-formats/brotli"]
+brotli-c = ["stuffr-formats/brotli-c"]
 lz4 = ["stuffr-formats/lz4"]
 lz4-c = ["stuffr-formats/lz4-c"]
 snappy = ["stuffr-formats/snappy"]
@@ -64,7 +65,7 @@ pure = ["gzip", "zlib", "deflate", "bzip2", "brotli", "lz4", "snappy", "zstd-pur
 # only when `zip` is ALSO enabled (which `pure` does) and never pulls the
 # container in on its own. This is the one capability difference `c-backed`
 # makes to a container: reading and writing a zstd-compressed zip entry.
-c-backed = ["zstd-c", "xz-c", "lzma-c", "zlib-c", "lz4-c", "stuffr-formats/zip-zstd"]
+c-backed = ["zstd-c", "xz-c", "lzma-c", "zlib-c", "lz4-c", "brotli-c", "stuffr-formats/zip-zstd"]
 lha = ["stuffr-formats/lha"]
 arj = ["stuffr-formats/arj"]
 compress = ["stuffr-formats/compress"]
