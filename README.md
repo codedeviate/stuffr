@@ -485,6 +485,16 @@ read list.
 > **3423** tests under `--all-features`, **3308** on the default tier —
 > measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
+> `0.21.0` teaches `stuffr ls` (also `stuffr files`) to list a folder: every
+> file in it that stuffr can open, newest first, as format, size, date and
+> name, judged by the file's own first bytes, so a download with no
+> extension is found and a misnamed one is not. `-r` goes into subfolders,
+> `-a` shows hidden names, `-n` sorts by name, `--json` is for scripts.
+> `stuffr ls archive.zip` still lists the archive's entries, exactly as
+> `stuffr list` does. Nothing is ever downloaded or changed to look.
+> **3472** tests under `--all-features`, **3357** on the default tier —
+> measured from this bump's own `make check FULL=1`, `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
