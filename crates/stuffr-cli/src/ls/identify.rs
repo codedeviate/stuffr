@@ -42,6 +42,34 @@ fn magicless_by_extension(reg: &Registry, path: &Path) -> bool {
     reg.by_extension(ext).is_some_and(|id| !reg.has_magic(id))
 }
 
+/// macOS's `SF_DATALESS` `st_flags` bit: the file's data lives with a
+/// cloud provider (iCloud "Optimise Mac Storage", a File Provider), and
+/// reading any byte of it makes macOS download the whole file.
+#[cfg(any(target_os = "macos", test))]
+const SF_DATALESS: u32 = 0x4000_0000;
+
+/// Whether `st_flags` mark a dataless placeholder.
+#[cfg(any(target_os = "macos", test))]
+fn flags_are_dataless(flags: u32) -> bool {
+    flags & SF_DATALESS != 0
+}
+
+/// Whether `md` (followed, `fs::metadata`) is a macOS dataless placeholder,
+/// which `stuffr ls` must never open: it counts as not openable, with no
+/// warning. Always `false` elsewhere.
+pub fn is_dataless(md: &std::fs::Metadata) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt;
+        flags_are_dataless(md.st_flags())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = md;
+        false
+    }
+}
+
 /// Identifies `path` (following symlinks), reading at most `PROBE_LEN` bytes.
 pub fn identify(reg: &Registry, path: &Path) -> io::Result<Identified> {
     identify_with_reader(reg, path, File::open(path)?)
@@ -75,6 +103,24 @@ pub(crate) fn identify_with_reader(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_dataless_flag_is_bit_0x40000000_alone() {
+        assert!(flags_are_dataless(0x4000_0000));
+        // Alongside other flags (UF_HIDDEN 0x8000, SF_ARCHIVED 0x1_0000).
+        assert!(flags_are_dataless(0x4000_0000 | 0x8000 | 0x1_0000));
+        assert!(!flags_are_dataless(0));
+        assert!(!flags_are_dataless(
+            0x8000 | 0x1_0000 | 0x2000_0000 | 0x8000_0000
+        ));
+    }
+
+    /// A real file on any test machine is not a placeholder.
+    #[test]
+    fn an_ordinary_file_is_not_dataless() {
+        let md = std::fs::metadata(env!("CARGO_MANIFEST_DIR")).unwrap();
+        assert!(!is_dataless(&md));
+    }
     use std::path::PathBuf;
 
     /// A scratch directory `stuffr-ls-<pid>-<n>` that removes itself.

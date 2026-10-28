@@ -413,6 +413,52 @@ fn missing_path_is_exit_2() {
 
 #[cfg(unix)]
 #[test]
+fn unreadable_folder_argument_is_exit_2() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root can read a mode-000 folder");
+        return;
+    }
+    let dir = tmp_dir();
+    let locked = dir.join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    put(&locked, "a.gz", GZ, 10, utc(2020, 6, 15));
+    struct Restore<'a>(&'a Path);
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    // Write and search but no read: `read_dir` fails, yet a child can still
+    // chdir into it for the implicit `.` case.
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o300)).unwrap();
+    let _restore = Restore(&locked);
+    let e = std::fs::read_dir(&locked).unwrap_err();
+    let want = format!("stuffr: usage error: cannot read locked: {e}\n");
+    for args in [
+        &["ls", "locked"][..],
+        &["ls", "-r", "locked"],
+        &["files", "locked"],
+    ] {
+        let (out, err, code) = ls(&dir, args);
+        assert_eq!(
+            (out.as_str(), err.as_str(), code),
+            ("", want.as_str(), Some(2)),
+            "{args:?}"
+        );
+    }
+    // The implicit `.` too.
+    let (out, err, code) = ls(&locked, &["ls"]);
+    let want = format!("stuffr: usage error: cannot read .: {e}\n");
+    assert_eq!(
+        (out.as_str(), err.as_str(), code),
+        ("", want.as_str(), Some(2))
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn unreadable_inside_is_exit_4() {
     use std::os::unix::fs::PermissionsExt;
     // SAFETY: geteuid has no preconditions.
@@ -446,7 +492,7 @@ fn unreadable_inside_is_exit_4() {
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(
         v["warnings"],
-        serde_json::json!([format!("stuffr: cannot read secret.gz: {e}")])
+        serde_json::json!([format!("cannot read secret.gz: {e}")])
     );
 }
 

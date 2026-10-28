@@ -2128,6 +2128,30 @@ fn entry_kind_str(kind: &stuffr::EntryKind) -> &'static str {
     }
 }
 
+/// `stuffr list`, as `Command::List` runs it and as `stuffr ls` runs it on a
+/// file or `-`: one code path, so the two cannot differ.
+fn run_list(
+    input: &str,
+    json: bool,
+    max_ratio: Option<u64>,
+    memory_limit: Option<String>,
+    strict_fidelity: bool,
+) -> stuffr::Result<()> {
+    // `list` advertises reading nothing and extracting nothing, but
+    // reaching the container's first header still decodes whatever
+    // codec sits above it — so it needs the same bound every other
+    // decoding verb has, defaulted the same way.
+    let memory_limit =
+        Some(parse_memory_limit(memory_limit)?.unwrap_or_else(stuffr::default_memory_limit));
+    print_list(
+        input_of(input),
+        json,
+        max_ratio.unwrap_or(stuffr::DEFAULT_MAX_RATIO),
+        memory_limit,
+        strict_fidelity,
+    )
+}
+
 /// `list`'s output. Written through `std::io::stdout()` and propagated with
 /// `?` rather than `println!`, matching `print_formats`/`Info` above — the
 /// same reason: `println!` panics on a write error, which would defeat
@@ -2153,30 +2177,6 @@ fn entry_kind_str(kind: &stuffr::EntryKind) -> &'static str {
 /// Warnings go to stderr AFTER the listing goes to stdout, so `stuffr list a
 /// | head` is unaffected by them and a redirected listing keeps the warning
 /// visible on the terminal.
-/// `stuffr list`, as `Command::List` runs it and as `stuffr ls` runs it on a
-/// file or `-`: one code path, so the two cannot differ.
-fn run_list(
-    input: &str,
-    json: bool,
-    max_ratio: Option<u64>,
-    memory_limit: Option<String>,
-    strict_fidelity: bool,
-) -> stuffr::Result<()> {
-    // `list` advertises reading nothing and extracting nothing, but
-    // reaching the container's first header still decodes whatever
-    // codec sits above it — so it needs the same bound every other
-    // decoding verb has, defaulted the same way.
-    let memory_limit =
-        Some(parse_memory_limit(memory_limit)?.unwrap_or_else(stuffr::default_memory_limit));
-    print_list(
-        input_of(input),
-        json,
-        max_ratio.unwrap_or(stuffr::DEFAULT_MAX_RATIO),
-        memory_limit,
-        strict_fidelity,
-    )
-}
-
 fn print_list(
     src: Input,
     json: bool,

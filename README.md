@@ -2264,7 +2264,9 @@ zip        18M  Oct 21 09:41  photos.zip
 
 A file is listed when its first 4096 bytes carry the magic of a format this
 build reads, so an extensionless gzip is found and a `.zip` that is really an
-HTML page is not; nothing is decoded. Sizes are `ls -lh`'s, dates `ls -l`'s
+HTML page is not; nothing is decoded. On macOS, a file kept only in iCloud
+or another cloud provider (not downloaded) is never opened, since reading it
+would download it, so it is not identified and counts as not openable. Sizes are `ls -lh`'s, dates `ls -l`'s
 in local time, and the footer (left out when it would say 0) counts the
 files that are not openable. `-r` adds one block per subfolder holding
 something openable, `-a` includes hidden names, `-n` sorts by name, and

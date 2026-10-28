@@ -890,7 +890,9 @@ FINDING ARCHIVES IN A FOLDER
       `photos.zip` that is really an HTML error page is not. Only a format
       with no magic at all (brotli) is recognised by its extension. Nothing
       is decoded: the format column is what `stuffr info` names without
-      decoding, ` over ` written `+`. Sizes are `ls -lh`'s; dates `ls -l`'s,
+      decoding, ` over ` written `+`. On macOS, a file kept only in iCloud
+      or another cloud provider (not downloaded) is never opened, since
+      reading it would download it, so it is not identified. Sizes are `ls -lh`'s; dates `ls -l`'s,
       in local time. The footer counts the files that are not openable and
       is left out when there are none; hidden names and folders never
       count. Exit 0 even when nothing is listed.

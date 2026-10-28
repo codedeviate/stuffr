@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use stuffr::Registry;
 use stuffr::probe::Chain;
 
-use super::identify::{Identified, identify};
+use super::identify::{Identified, identify, is_dataless};
 
 pub struct WalkOptions {
     pub recursive: bool,
@@ -37,7 +37,8 @@ pub struct Listing {
     pub blocks: Vec<Block>,
     pub shown: u64,
     pub not_openable: u64,
-    /// Full stderr lines, in encounter order.
+    /// Bare messages (`cannot read <path>: <error>`), in encounter order;
+    /// `stuffr ls` adds `stuffr: ` when it prints them to stderr.
     pub warnings: Vec<String>,
 }
 
@@ -67,7 +68,7 @@ fn warn(acc: &mut Acc, root: &Path, path: &Path, e: &std::io::Error) {
         rel
     };
     acc.warnings.push(format!(
-        "stuffr: cannot read {}: {e}",
+        "cannot read {}: {e}",
         stuffr::fmt_name(&shown.to_string_lossy())
     ));
 }
@@ -130,6 +131,11 @@ fn visit_entry(
         });
     }
     if !md.is_file() {
+        return None;
+    }
+    // Opening an iCloud/File Provider placeholder downloads it: never.
+    if is_dataless(&md) {
+        acc.not_openable += 1;
         return None;
     }
     match identify(reg, path) {
@@ -483,7 +489,7 @@ mod tests {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
         let l = run(&d, opts(false, false, true));
         assert_eq!(l.warnings.len(), 1, "{:?}", l.warnings);
-        assert!(l.warnings[0].starts_with("stuffr: cannot read via.gz: "));
+        assert!(l.warnings[0].starts_with("cannot read via.gz: "));
         assert_eq!((l.shown, l.not_openable), (0, 0));
         assert_eq!(names(&l.blocks[0]), ["locked"]);
     }
@@ -509,12 +515,12 @@ mod tests {
         assert!(
             l.warnings
                 .iter()
-                .any(|w| w.starts_with("stuffr: cannot read x.gz: "))
+                .any(|w| w.starts_with("cannot read x.gz: "))
         );
         assert!(
             l.warnings
                 .iter()
-                .any(|w| w.starts_with("stuffr: cannot read locked: "))
+                .any(|w| w.starts_with("cannot read locked: "))
         );
         assert_eq!(rels(&l), [""]);
     }
@@ -537,7 +543,7 @@ mod tests {
         );
         assert!(e.is_none());
         assert_eq!(acc.warnings.len(), 1);
-        assert!(acc.warnings[0].starts_with("stuffr: cannot read gone.gz: "));
+        assert!(acc.warnings[0].starts_with("cannot read gone.gz: "));
         assert_eq!(acc.not_openable, 1);
         // a vanished non-file is a warning only
         let mut acc = Acc::default();
@@ -567,7 +573,7 @@ mod tests {
             &opts(false, false, false),
             &mut acc,
         );
-        assert!(acc.warnings[0].starts_with("stuffr: cannot read bad\\nname.gz: "));
+        assert!(acc.warnings[0].starts_with("cannot read bad\\nname.gz: "));
     }
 
     #[test]

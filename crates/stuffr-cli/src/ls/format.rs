@@ -90,8 +90,19 @@ pub fn ls_date_with_offset(mtime: SystemTime, now: SystemTime, offset_secs: i64)
     }
 }
 
-/// UTC offset in seconds of the local zone at the instant `mtime`.
-#[cfg(unix)]
+/// UTC offset in seconds of the local zone at the instant `mtime`. Only on
+/// the targets whose libc `tm` carries `tm_gmtoff` (solaris/illumos's does
+/// not).
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
 fn local_offset(t: SystemTime) -> i64 {
     // `time_t` is i64 on 64-bit unix; on 32-bit it is the platform range.
     let tt = epoch_secs(t) as libc::time_t;
@@ -106,14 +117,24 @@ fn local_offset(t: SystemTime) -> i64 {
     }
 }
 
-/// Non-unix: no portable local-zone lookup without a new dependency, so
-/// dates are shown in UTC.
-#[cfg(not(unix))]
+/// Elsewhere (Windows, solaris/illumos): no portable local-zone lookup
+/// without a new dependency, so dates are shown in UTC.
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+)))]
 fn local_offset(_t: SystemTime) -> i64 {
     0
 }
 
-/// [`ls_date_with_offset`] in the local time zone (UTC on non-unix).
+/// [`ls_date_with_offset`] in the local time zone (UTC where the platform
+/// gives no offset: Windows, solaris/illumos).
 pub fn ls_date(mtime: SystemTime, now: SystemTime) -> String {
     ls_date_with_offset(mtime, now, local_offset(mtime))
 }

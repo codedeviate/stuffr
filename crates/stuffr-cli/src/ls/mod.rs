@@ -60,7 +60,18 @@ pub fn run(args: LsArgs, invoked_as: &str) -> stuffr::Result<LsStatus> {
         },
     };
     match folder {
-        Some(root) => list_folder(args, &root),
+        Some(root) => {
+            // The argument itself (or `.`) must be listable: an unreadable
+            // folder is a usage error naming it (exit 2), not an empty,
+            // degraded listing.
+            if let Err(e) = std::fs::read_dir(&root) {
+                return Err(Error::Usage(format!(
+                    "cannot read {}: {e}",
+                    stuffr::fmt_name(&root.to_string_lossy())
+                )));
+            }
+            list_folder(args, &root)
+        }
         None => {
             if invoked_as == "files" {
                 return Err(Error::Usage(
@@ -115,7 +126,7 @@ fn list_folder(args: LsArgs, root: &std::path::Path) -> stuffr::Result<LsStatus>
     out.flush()?;
     drop(out);
     for w in &listing.warnings {
-        eprintln!("{w}");
+        eprintln!("stuffr: {w}");
     }
     Ok(if listing.warnings.is_empty() {
         LsStatus::Complete

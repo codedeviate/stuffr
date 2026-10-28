@@ -245,7 +245,7 @@ mod tests {
             ],
             shown: 1,
             not_openable: 2,
-            warnings: vec!["stuffr: cannot read x: nope".into()],
+            warnings: vec!["cannot read x: nope".into()],
         };
         let v = render_json(&l);
         assert_eq!(
@@ -259,7 +259,7 @@ mod tests {
                 ],
                 "shown": 1,
                 "skipped": 2,
-                "warnings": ["stuffr: cannot read x: nope"],
+                "warnings": ["cannot read x: nope"],
             })
         );
     }
