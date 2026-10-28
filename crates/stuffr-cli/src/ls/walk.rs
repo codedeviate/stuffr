@@ -72,6 +72,18 @@ fn warn(acc: &mut Acc, root: &Path, path: &Path, e: &std::io::Error) {
     ));
 }
 
+/// A symlink target stat error meaning "nothing there": NotFound or ELOOP.
+fn link_is_dangling(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        return true;
+    }
+    #[cfg(unix)]
+    if e.raw_os_error() == Some(libc::ELOOP) {
+        return true;
+    }
+    false
+}
+
 /// Classifies one entry. `listed_was_file` is what the directory listing said
 /// (a vanished file still counts as not openable).
 fn visit_entry(
@@ -86,10 +98,15 @@ fn visit_entry(
     let md = match fs::metadata(path) {
         Ok(md) => md,
         Err(e) => {
-            // A dangling symlink is skipped silently; anything else (a
-            // vanished entry, a refused stat) is a warning.
-            let dangling = fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
-            if !dangling {
+            let is_symlink = fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+            if is_symlink {
+                // Dangling (target NotFound) or a link loop (ELOOP) is
+                // skipped silently; any other error warns. Not counted:
+                // the target may not have been a file.
+                if !link_is_dangling(&e) {
+                    warn(acc, root, path, &e);
+                }
+            } else {
                 warn(acc, root, path, &e);
                 if listed_was_file {
                     acc.not_openable += 1;
@@ -442,12 +459,33 @@ mod tests {
     fn dangling_symlink_and_fifo_are_skipped_silently() {
         let d = Dir::new();
         std::os::unix::fs::symlink("nowhere", d.root.join("dangling")).unwrap();
+        std::os::unix::fs::symlink("selfloop", d.root.join("selfloop")).unwrap();
         let fifo = std::ffi::CString::new(d.root.join("pipe").to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         let l = run(&d, opts(false, false, true));
         assert!(l.blocks[0].rows.is_empty());
         assert_eq!((l.shown, l.not_openable), (0, 0));
         assert!(l.warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_into_unreadable_folder_warns_uncounted() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let d = Dir::new();
+        d.file("locked/a.gz", GZ, 1);
+        let locked = d.root.join("locked");
+        d.restore.borrow_mut().push(locked.clone());
+        std::os::unix::fs::symlink(locked.join("a.gz"), d.root.join("via.gz")).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let l = run(&d, opts(false, false, true));
+        assert_eq!(l.warnings.len(), 1, "{:?}", l.warnings);
+        assert!(l.warnings[0].starts_with("stuffr: cannot read via.gz: "));
+        assert_eq!((l.shown, l.not_openable), (0, 0));
+        assert_eq!(names(&l.blocks[0]), ["locked"]);
     }
 
     #[cfg(unix)]
