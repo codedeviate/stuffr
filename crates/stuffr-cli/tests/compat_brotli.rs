@@ -2503,7 +2503,10 @@ mod unix {
 
     /// Run `exe` in a fresh work directory holding `a` (mode 0640, fixed
     /// times with nanoseconds); the stat of `a.br` afterwards.
-    fn run_for_stat(exe: &Path, args: &[&str]) -> (i32, Stat) {
+    /// Also the input's own stat after the run: under Linux `relatime` the
+    /// tool's read moves the input's access time (its ctime is newer), and
+    /// CopyStat copies what it finds after the read.
+    fn run_for_stat(exe: &Path, args: &[&str]) -> (i32, Stat, Stat) {
         use std::os::unix::fs::PermissionsExt;
         use std::time::{Duration, SystemTime};
         let s = Scratch::new();
@@ -2528,7 +2531,11 @@ mod unix {
                 .stdin(std::process::Stdio::null()),
         )
         .unwrap();
-        (out.status.code().unwrap_or(-1), stat_of(&w.join("a.br")))
+        (
+            out.status.code().unwrap_or(-1),
+            stat_of(&w.join("a.br")),
+            stat_of(&w.join("a")),
+        )
     }
 
     /// CopyStat: the output gets the input's permission bits and its
@@ -2539,19 +2546,99 @@ mod unix {
         let reference = Path::new(dir).join("brotli");
         let rw = row(&[], vec![], 0, "");
         let (_guard, ours) = stuffr_link(&case("brotli", rw, false, false));
-        let (rc, want) = run_for_stat(&reference, &["a"]);
-        let (sc, got) = run_for_stat(&ours, &["a"]);
+        let (rc, want, want_in) = run_for_stat(&reference, &["a"]);
+        let (sc, got, got_in) = run_for_stat(&ours, &["a"]);
         assert_eq!((rc, sc), (0, 0));
-        assert_eq!(got, want);
+        // Mode and modification time exactly as the reference's.
+        assert_eq!((got.0, got.2), (want.0, want.2));
         assert_eq!(got.0, 0o640);
         // Seconds only where the reference was built without
         // `utimensat` (macOS: no `_POSIX_C_SOURCE`), nanoseconds on glibc.
         assert_eq!(got.2.0, 1_000_000_000);
-        let (rc, want) = run_for_stat(&reference, &["-n", "a"]);
-        let (sc, got) = run_for_stat(&ours, &["-n", "a"]);
+        // The access time is each tool's own input's, after its read; the
+        // nanoseconds copied where the reference copies them.
+        assert_eq!(want.1.0, want_in.1.0, "reference atime");
+        assert_eq!(got.1.0, got_in.1.0, "stuffr atime");
+        let ns = |out: (i64, i64), input: (i64, i64)| out.1 == input.1 && out.1 != 0;
+        assert_eq!(
+            ns(got.1, got_in.1),
+            ns(want.1, want_in.1),
+            "atime nanoseconds"
+        );
+        if want.1.1 == 0 {
+            assert_eq!(got.1.1, 0);
+        }
+        let (rc, want, _) = run_for_stat(&reference, &["-n", "a"]);
+        let (sc, got, _) = run_for_stat(&ours, &["-n", "a"]);
         assert_eq!((rc, sc), (0, 0));
         assert_eq!(got.0, want.0, "-n: the mode is the created file's");
         assert_ne!(got.2, (1_000_000_000, 987_654_321), "-n copied the time");
+    }
+
+    /// `(args, fixtures, message, the later input that must survive)`.
+    type LaterCase = (
+        &'static [&'static str],
+        &'static [(&'static str, &'static [u8])],
+        &'static str,
+        &'static str,
+    );
+
+    /// Ruling T4-f: an output that is a later input operand is refused
+    /// before it is opened (the reference overwrites that input unread),
+    /// compressing and decompressing; the later input keeps its bytes.
+    #[test]
+    fn a_later_input_is_never_overwritten() {
+        let cases: [LaterCase; 3] = [
+            (
+                &["-f", "a", "a.br"],
+                &[("a", A), ("a.br", BR)],
+                "input file [a.br] would be overwritten by the output of [a]\n",
+                "a.br",
+            ),
+            (
+                &["-df", "a.br", "a"],
+                &[("a.br", BR), ("a", A)],
+                "input file [a] would be overwritten by the output of [a.br]\n",
+                "a",
+            ),
+            (
+                &["-f", "-S", ".x", "b", "c", "b.x"],
+                &[("b", A), ("c", A), ("b.x", BR)],
+                "input file [b.x] would be overwritten by the output of [b]\n",
+                "b.x",
+            ),
+        ];
+        for (args, files, msg, kept) in cases {
+            let fixtures = files.iter().map(|(n, b)| (*n, b.to_vec())).collect();
+            let rw = row(args, fixtures, 1, msg);
+            let got = stuffr_as(&case("brotli", rw, false, false));
+            assert_eq!((got.code, got.stderr.as_str()), (1, msg), "{args:?}");
+            let want = files.iter().find(|(n, _)| *n == kept).unwrap().1;
+            assert_eq!(
+                got.tree.get(kept).map(|t| t.0.as_slice()),
+                Some(want),
+                "{args:?}"
+            );
+        }
+    }
+
+    /// Ruling T4-g: `-j` keeps the input when the output could not be
+    /// written out at its close (here `/dev/full`'s ENOSPC at the flush).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rm_keeps_the_input_when_the_close_fails() {
+        let rw = row(
+            &["-jf", "-o", "/dev/full", "a"],
+            vec![("a", A.to_vec())],
+            1,
+            "",
+        );
+        let got = stuffr_as(&case("brotli", rw, false, false));
+        assert_eq!(
+            (got.code, got.stderr.as_str()),
+            (1, "fclose failed [/dev/full]: No space left on device\n")
+        );
+        assert_eq!(got.tree.get("a").map(|t| t.0.as_slice()), Some(A));
     }
 
     /// `-s`: an output not smaller than its input is removed (the input

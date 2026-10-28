@@ -273,4 +273,63 @@ mod tests {
         );
         assert!(!s.0.join("a.br").exists());
     }
+
+    /// `main` in a sandbox whose output budget is `budget` bytes.
+    fn run_capped(dir: &Path, args: &[&str], budget: u64) -> (i32, String) {
+        use std::collections::BTreeMap;
+        use std::sync::atomic::AtomicU64;
+        use std::sync::{Arc, Mutex};
+        let mut host = Host::Sandbox(Sandbox {
+            dir: dir.to_path_buf(),
+            stdin: Some(Vec::new()),
+            stdout: Arc::new(Mutex::new(Vec::new())),
+            budget: Arc::new(AtomicU64::new(budget)),
+            reads: Arc::new(Mutex::new(BTreeMap::new())),
+        });
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let mut err = Vec::new();
+        let code = main(b"brotli", &args, &mut host, &mut err);
+        (code, String::from_utf8(err).unwrap())
+    }
+
+    /// Ruling T4-g: the output fits the buffer, so the full disk shows only
+    /// at the close; `-j` must keep the input then (the reference unlinks
+    /// it), compressing and decompressing.
+    #[test]
+    fn rm_keeps_the_input_when_the_close_fails() {
+        let s = Scratch::new();
+        std::fs::write(s.0.join("a"), b"hello\n").unwrap();
+        let (code, err) = run_capped(&s.0, &["-j", "a"], 5);
+        assert_eq!(code, 1);
+        assert!(err.starts_with("fclose failed [a.br]: "), "{err}");
+        assert_eq!(std::fs::read(s.0.join("a")).unwrap(), b"hello\n");
+        std::fs::write(s.0.join("b.br"), BR).unwrap();
+        let (code, _) = run_capped(&s.0, &["-dj", "b.br"], 3);
+        assert_eq!(code, 1);
+        assert_eq!(std::fs::read(s.0.join("b.br")).unwrap(), BR);
+        // With room, `-j` removes it.
+        assert_eq!(run_capped(&s.0, &["-jf", "a"], 1 << 20).0, 0);
+        assert!(!s.0.join("a").exists());
+    }
+
+    /// Ruling T4-f: an output that is a later input operand is refused.
+    #[test]
+    fn a_later_input_operand_is_never_overwritten() {
+        let s = Scratch::new();
+        std::fs::write(s.0.join("a"), b"hello\n").unwrap();
+        std::fs::write(s.0.join("a.br"), b"keep").unwrap();
+        let (code, _, err) = run_at(&s.0, &["-f", "a", "a.br"], b"");
+        assert_eq!(
+            (code, err.as_str()),
+            (
+                1,
+                "input file [a.br] would be overwritten by the output of [a]\n"
+            )
+        );
+        assert_eq!(std::fs::read(s.0.join("a.br")).unwrap(), b"keep");
+        // An earlier operand is not protected (it has been read), nor is
+        // `-` (standard input is no file name).
+        let (code, _, _) = run_at(&s.0, &["-f", "a", "-"], b"");
+        assert_eq!(code, 0);
+    }
 }

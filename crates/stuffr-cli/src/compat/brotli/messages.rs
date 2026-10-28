@@ -39,6 +39,9 @@ pub(super) const USER_FAILED: &str = "setting user failed for [%s]: %s\n";
 /// stuffr's own (ruling T1-f, deviation 4): the output named is the input
 /// itself (same device and inode), which the reference truncates.
 pub(super) const SAME_FILE: &str = "input file [%s] is the same as the output file\n";
+/// stuffr's own (ruling T4-f): the output is a later input operand, which
+/// the reference overwrites before reading it (`brotli -f a a.br`).
+pub(super) const LATER_INPUT: &str = "input file [%s] would be overwritten by the output of [%s]\n";
 
 // ---- ReadDictionary ----
 

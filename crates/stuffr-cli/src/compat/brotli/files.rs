@@ -16,7 +16,13 @@
 //!   it. stuffr compares the two by device and inode before the output is
 //!   opened for writing and prints [`m::SAME_FILE`], exit 1. Without `-f`
 //!   the reference's `O_EXCL` refusal already protects the input and is
-//!   kept as it is.
+//!   kept as it is. Likewise an output that is a later input operand
+//!   (`brotli -f a a.br`, `-df a.br a`) is refused before it is opened
+//!   ([`m::LATER_INPUT`], ruling T4-f): the reference overwrites that input
+//!   before reading it.
+//! - **`-j` keeps the input when closing the output failed** (ruling T4-g):
+//!   the reference unlinks it even after `fclose` reported ENOSPC or EIO,
+//!   leaving only a truncated output.
 //! - **Standard output is never closed.** The reference `fclose`s it after
 //!   a file, so `brotli - -` (two inputs both standard input, both written
 //!   to standard output) dies of a null `FILE*` on the second; stuffr
@@ -273,6 +279,21 @@ fn open_input(ctx: &mut Ctx) -> Option<Option<Metadata>> {
     }
 }
 
+/// The first input operand after the current one (not `-`) that is the
+/// file `output` describes (ruling T4-f).
+fn later_input_at(ctx: &Ctx, output: &Metadata) -> Option<OsString> {
+    ctx.p
+        .inputs
+        .iter()
+        .skip(ctx.iterator)
+        .filter(|a| cli::bytes(a) != b"-")
+        .find(|a| {
+            fs::metadata(ctx.host.path(cli::bytes(a)))
+                .is_ok_and(|i| host::same_file(&i, output) == Some(true))
+        })
+        .cloned()
+}
+
 /// `OpenOutputFile`: standard output, or `open(O_CREAT | O_WRONLY |
 /// O_TRUNC, 0600)` with `O_EXCL` unless `-f`. Before a forced open the
 /// output is checked against the input (module doc).
@@ -290,6 +311,14 @@ fn open_output(ctx: &mut Ctx, input: Option<&Metadata>) -> bool {
     {
         let input_name = ctx.input_name();
         ctx.say(m::SAME_FILE, &[&input_name]);
+        return false;
+    }
+    if force
+        && let Ok(o) = fs::metadata(&path)
+        && let Some(later) = later_input_at(ctx, &o)
+    {
+        let input_name = ctx.input_name();
+        ctx.say(m::LATER_INPUT, &[cli::bytes(&later), &input_name]);
         return false;
     }
     let mut opts = File::options();
@@ -321,7 +350,8 @@ fn open_output(ctx: &mut Ctx, input: Option<&Metadata>) -> bool {
 
 /// `CloseFiles`: close the output (unlink it when `rm_output`, else copy
 /// the input's attributes unless `-n`), close the input, unlink it when
-/// `rm_input`. `false` if closing the output failed.
+/// `rm_input` and the output closed cleanly (T4-g). `false` if closing the
+/// output failed.
 pub(super) fn close_files(ctx: &mut Ctx, rm_input: bool, rm_output: bool) -> bool {
     let mut is_ok = true;
     if !ctx.p.test_integrity
@@ -345,7 +375,12 @@ pub(super) fn close_files(ctx: &mut Ctx, rm_input: bool, rm_output: bool) -> boo
     }
     ctx.fout = None;
     ctx.fin = None;
-    if rm_input && let Some(i) = &ctx.input_path {
+    // Ruling T4-g: the input goes only once its output is safely closed
+    // (the reference unlinks it even after a failed `fclose`).
+    if rm_input
+        && is_ok
+        && let Some(i) = &ctx.input_path
+    {
         let _ = fs::remove_file(ctx.host.path(cli::bytes(i)));
     }
     is_ok
