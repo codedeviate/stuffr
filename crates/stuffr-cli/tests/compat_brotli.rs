@@ -114,6 +114,31 @@ mod unix {
     /// Not brotli: the first meta-block header is invalid.
     const JUNK: &[u8] = b"this is not brotli\n";
     const FF: &[u8] = b"\xff\xff\xff\xff\xff\xff";
+    /// `BR` with the stream header flipped (probed 2026-10-28): each fails
+    /// with the error its name says (`reason: <name> (<n>)`).
+    const E_EXUBERANT_NIBBLE: &[u8] = b"\xa1\x14\x00\x04hello\n\x03";
+    const E_RESERVED: &[u8] = b"\x1c";
+    const E_HUFFMAN_SAME: &[u8] = b"\x23\x14\x00\x04hello\n\x03";
+    const E_CL_SPACE: &[u8] = b"\x21\x15\x00\x04hello\n\x03";
+    const E_WINDOW_BITS: &[u8] = b"\x91";
+    /// One bit flipped in a 33-byte `-q 11` stream: libbrotli fails with the
+    /// names below. The pure tier names all but `BLOCK_LENGTH_2` the same
+    /// (Ruling T1-e), which is compared on the C tier only
+    /// ([`C_REASON_ROWS`]).
+    const E_TRANSFORM: &[u8] = b"\x1f\x42\x00\x00\x05\xdc\x60\x98\xb2\xbf\xe6\x81\x69\x88\x2c\xfb\x64\x8f\x11\x3c\xc8\xc8\xe8\x03\x80\x02\x14\xfc\xa0\x91\xd5\xb3\x07";
+    const E_BLOCK_LENGTH_2: &[u8] = b"\x1f\x40\x00\x08\x05\xdc\x60\x98\xb2\xbf\xe6\x81\x69\x88\x2c\xfb\x64\x8f\x11\x3c\xc8\xc8\xe8\x03\x80\x02\x14\xfc\xa0\x91\xd5\xb3\x07";
+    const E_BLOCK_LENGTH_1: &[u8] = b"\x1f\x42\x00\x08\x04\xdc\x60\x98\xb2\xbf\xe6\x81\x69\x88\x2c\xfb\x64\x8f\x11\x3c\xc8\xc8\xe8\x03\x80\x02\x14\xfc\xa0\x91\xd5\xb3\x07";
+    const E_HUFFMAN_SPACE: &[u8] = b"\x1f\x42\x00\x0a\x05\xdc\x60\x98\xb2\xbf\xe6\x81\x69\x88\x2c\xfb\x64\x8f\x11\x3c\xc8\xc8\xe8\x03\x80\x02\x14\xfc\xa0\x91\xd5\xb3\x07";
+    const E_SIMPLE_HUFFMAN_ALPHABET: &[u8] = b"\x1f\x42\x00\x28\x05\xdc\x60\x98\xb2\xbf\xe6\x81\x69\x88\x2c\xfb\x64\x8f\x11\x3c\xc8\xc8\xe8\x03\x80\x02\x14\xfc\xa0\x91\xd5\xb3\x07";
+    /// `BR` twice, then a byte that starts no stream.
+    const BR2_X: &[u8] = b"\x21\x14\x00\x04hello\n\x03\x21\x14\x00\x04hello\n\x03x";
+    /// `BR`, then `BR_CUT`.
+    const BR_BR_CUT: &[u8] = b"\x21\x14\x00\x04hello\n\x03\x21\x14\x00\x04hell";
+    /// `BR`, then `E_RESERVED`.
+    const BR_RESERVED: &[u8] = b"\x21\x14\x00\x04hello\n\x03\x1c";
+    /// `BR` three times.
+    const BR3: &[u8] =
+        b"\x21\x14\x00\x04hello\n\x03\x21\x14\x00\x04hello\n\x03\x21\x14\x00\x04hello\n\x03";
 
     /// The one fixture every row lists by name.
     const STDIN: &str = "<stdin>";
@@ -1467,7 +1492,132 @@ mod unix {
             1,
             "corrupt input [a.br]\nreason: FORMAT_DICTIONARY (-12)\n",
         ),
+        // Task 5: the reason lines (corrupt_reason_lines).
+        r(
+            &["-vdc", "a.br"],
+            &[("a.br", E_EXUBERANT_NIBBLE)],
+            1,
+            "corrupt input [a.br]\nreason: FORMAT_EXUBERANT_NIBBLE (-1)\n",
+        ),
+        r(
+            &["-vdc", "a.br"],
+            &[("a.br", E_RESERVED)],
+            1,
+            "corrupt input [a.br]\nreason: FORMAT_RESERVED (-2)\n",
+        ),
+        r(
+            &["-vdc", "a.br"],
+            &[("a.br", E_HUFFMAN_SAME)],
+            1,
+            "corrupt input [a.br]\nreason: FORMAT_SIMPLE_HUFFMAN_SAME (-5)\n",
+        ),
+        r(
+            &["-vdc", "a.br"],
+            &[("a.br", E_CL_SPACE)],
+            1,
+            "corrupt input [a.br]\nreason: FORMAT_CL_SPACE (-6)\n",
+        ),
+        r(
+            &["-vdc", "a.br"],
+            &[("a.br", E_WINDOW_BITS)],
+            1,
+            "corrupt input [a.br]\nreason: FORMAT_WINDOW_BITS (-13)\n",
+        ),
+        r(
+            &["-vt"],
+            &[("<stdin>", E_RESERVED)],
+            1,
+            "corrupt input [con]\nreason: FORMAT_RESERVED (-2)\n",
+        ),
+        r(
+            &["-vdc", "a.br"],
+            &[("a.br", E_SIMPLE_HUFFMAN_ALPHABET)],
+            1,
+            "corrupt input [a.br]\nreason: FORMAT_SIMPLE_HUFFMAN_ALPHABET (-4)\n",
+        ),
+        r(
+            &["-vdc", "a.br"],
+            &[("a.br", E_HUFFMAN_SPACE)],
+            1,
+            "corrupt input [a.br]\nreason: FORMAT_HUFFMAN_SPACE (-7)\n",
+        ),
+        r(
+            &["-vdc", "a.br"],
+            &[("a.br", E_BLOCK_LENGTH_1)],
+            1,
+            "corrupt input [a.br]\nreason: FORMAT_BLOCK_LENGTH_1 (-9)\n",
+        ),
+        r(
+            &["-vdc", "a.br"],
+            &[("a.br", E_TRANSFORM)],
+            1,
+            "corrupt input [a.br]\nreason: FORMAT_TRANSFORM (-11)\n",
+        ),
+        // -K: a fresh decoder on what follows each stream
+        // (concatenated_then_garbage).
+        r(
+            &["-vdcK", "a.br"],
+            &[("a.br", BR2_X)],
+            1,
+            "extra input\nextra input\ncorrupt input [a.br]\nreason: truncated input\n",
+        ),
+        r(
+            &["-vdcK", "a.br"],
+            &[("a.br", BR_BR_CUT)],
+            1,
+            "extra input\ncorrupt input [a.br]\nreason: truncated input\n",
+        ),
+        r(
+            &["-vdcK", "a.br"],
+            &[("a.br", BR_EXTRA)],
+            1,
+            "extra input\ncorrupt input [a.br]\nreason: truncated input\n",
+        ),
+        r(
+            &["-vdcK", "a.br"],
+            &[("a.br", BR_RESERVED)],
+            1,
+            "extra input\ncorrupt input [a.br]\nreason: FORMAT_RESERVED (-2)\n",
+        ),
+        r(
+            &["-vdK", "a.br"],
+            &[("a.br", BR_EXTRA)],
+            1,
+            "extra input\ncorrupt input [a.br]\nreason: truncated input\n",
+        ),
+        r(&["-dcK", "a.br"], &[("a.br", BR3)], 0, ""),
+        r(&["-dK", "a.br"], &[("a.br", BR3)], 0, ""),
+        r(
+            &["-vdK", "a.br"],
+            &[("a.br", BR3)],
+            0,
+            "extra input\nextra input\nDecompressed [a.br]: 33 B -> 18 B in X sec\n",
+        ),
+        // second_file_fails_on_decode, verbose: the first output kept.
+        r(
+            &["-vd", "a.br", "b.br"],
+            &[("a.br", BR), ("b.br", JUNK)],
+            1,
+            "Decompressed [a.br]: 11 B -> 6 B in X sec\ncorrupt input [b.br]\nreason: FORMAT_PADDING_1 (-14)\n",
+        ),
+        r(
+            &["-vt", "a.br", "b.br"],
+            &[("a.br", BR), ("b.br", BR_CUT)],
+            1,
+            "Decompressed [a.br]: 11 B -> 6 B in X sec\ncorrupt input [b.br]\nreason: truncated input\n",
+        ),
     ];
+
+    /// Reason lines the pure tier's decoder does not reproduce (Ruling T1-e:
+    /// it has no `BLOCK_LENGTH_2` check and fails this stream with
+    /// `FORMAT_BLOCK_LENGTH_1 (-9)`). The C tier is compared in full; the
+    /// pure tier only for exit 1 and its first line, `corrupt input [a.br]`.
+    pub const C_REASON_ROWS: &[Row] = &[r(
+        &["-vdc", "a.br"],
+        &[("a.br", E_BLOCK_LENGTH_2)],
+        1,
+        "corrupt input [a.br]\nreason: FORMAT_BLOCK_LENGTH_2 (-10)\n",
+    )];
 
     /// Rows run under another name: `(invoked name, row)`.
     pub const ALIAS_ROWS: &[(&str, Row)] = &[
@@ -1790,6 +1940,9 @@ mod unix {
         }
         for r in VERBOSE_ROWS {
             v.push(("verbose", "brotli", false, false, r));
+        }
+        for r in C_REASON_ROWS {
+            v.push(("reason", "brotli", false, false, r));
         }
         for (name, r) in ALIAS_ROWS {
             v.push(("alias", *name, false, false, r));
@@ -2274,13 +2427,15 @@ mod unix {
     }
 
     #[test]
-    #[ignore = "Task 5"]
     fn task5_rows_match_the_reference() {
         let mut rows: Vec<_> = io_rows()
             .into_iter()
             .filter(|(n, r)| reaches_decoder(n, r) && pure_refusal(n, r).is_none())
             .collect();
         rows.extend(plain(VERBOSE_ROWS));
+        if EXACT {
+            rows.extend(plain(C_REASON_ROWS));
+        }
         check_rows("Task 5", &rows);
         let tty: Vec<_> = TTY_ROWS
             .iter()
@@ -2288,6 +2443,28 @@ mod unix {
             .map(|(i, o, r)| ("brotli", *i, *o, r))
             .collect();
         check_tty_rows("Task 5 terminals", &tty);
+    }
+
+    /// Ruling T1-e: off the C tier, a corruption whose reason line the
+    /// pure decoder does not reproduce still fails: exit 1, `corrupt input
+    /// [a.br]` first, nothing on standard output.
+    #[test]
+    fn pure_tier_still_refuses_what_it_names_differently() {
+        if EXACT {
+            return;
+        }
+        let mut bad = Vec::new();
+        for r in C_REASON_ROWS {
+            let c = case("brotli", r, false, false);
+            let got = stuffr_as(&c);
+            if got.code != 1 || !got.stderr.starts_with("corrupt input [a.br]\n") {
+                bad.push(format!(
+                    "{:?}: exit {} {:?}",
+                    r.stderr, got.code, got.stderr
+                ));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
     }
 
     /// The terminal refusals (and the rows beside them that stop before

@@ -13,8 +13,7 @@
 //!
 //! `files.rs` is the file handling (`NextFile`, `OpenFiles`, `CloseFiles`,
 //! `CopyStat`, `ReadDictionary`), `codec.rs` compression and the
-//! decompression loop. Decoding a stream is not here yet (Task 5): a
-//! decompression or test that gets that far fails silently, exit 1.
+//! decompression loop, decoding (with `-t`, `-K` and the comment check).
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
@@ -331,5 +330,98 @@ mod tests {
         // `-` (standard input is no file name).
         let (code, _, _) = run_at(&s.0, &["-f", "a", "-"], b"");
         assert_eq!(code, 0);
+    }
+
+    /// `DecompressFile` in the sandbox: a stream, `-K`, the comment check
+    /// and the reason lines (the clock is frozen).
+    #[test]
+    fn decodes_tests_and_checks_comments() {
+        let s = Scratch::new();
+        let mut two = BR.to_vec();
+        two.extend_from_slice(BR);
+        std::fs::write(s.0.join("two.br"), &two).unwrap();
+        assert_eq!(
+            run_at(&s.0, &["-vdcK", "two.br"], b""),
+            (
+                0,
+                b"hello\nhello\n".to_vec(),
+                "extra input\nDecompressed [two.br]: 22 B -> 12 B in 0.00 sec\n".into()
+            )
+        );
+        let (code, out, err) = run_at(&s.0, &["-vdc", "two.br"], b"");
+        assert_eq!(
+            (code, out.as_slice(), err.as_str()),
+            (
+                1,
+                &b"hello\n"[..],
+                "corrupt input [two.br]\nreason: extra input\n"
+            )
+        );
+        // Truncation is the end of input inside a stream.
+        let (code, _, err) = run_at(&s.0, &["-vt"], &BR[..8]);
+        assert_eq!(
+            (code, err.as_str()),
+            (1, "corrupt input [con]\nreason: truncated input\n")
+        );
+        // A decoder error, its name without the `_ERROR_` prefix.
+        let (code, _, err) = run_at(&s.0, &["-vt"], b"\x1c");
+        assert_eq!(
+            (code, err.as_str()),
+            (1, "corrupt input [con]\nreason: FORMAT_RESERVED (-2)\n")
+        );
+        // The comment `foo`: right, wrong, and absent (printed, exit 0).
+        let foo = b"\x21\x4b\x00foo\x28\x00\x08hello\n\x03";
+        assert_eq!(run_at(&s.0, &["-t", "-C", "Zm9v"], foo).0, 0);
+        let (code, _, err) = run_at(&s.0, &["-vt", "-C", "Zm9x"], foo);
+        assert_eq!(
+            (code, err.as_str()),
+            (1, "corrupt input [con]\nreason: comment mismatch\n")
+        );
+        let (code, _, err) = run_at(&s.0, &["-t", "-C", "Zm9v"], BR);
+        assert_eq!((code, err.as_str()), (0, "corrupt input [con]\n"));
+    }
+
+    /// `-t` writes nothing, but in a sandbox what it decodes counts against
+    /// the output budget: a small bomb cannot decode without bound.
+    #[test]
+    fn test_mode_is_charged_in_the_sandbox() {
+        let s = Scratch::new();
+        // 2 MiB of zeros, compressed.
+        let mut enc = stuffr::brotli_opts::Encoder::new(
+            &stuffr::brotli_opts::EncoderParams {
+                quality: 5,
+                lgwin: 22,
+                large_window: false,
+                size_hint: None,
+            },
+            None,
+        )
+        .unwrap();
+        let zeros = vec![0u8; 2 << 20];
+        let mut input = &zeros[..];
+        let mut buf = vec![0u8; 1 << 16];
+        let mut outv = Vec::new();
+        while !enc.is_finished() {
+            let mut out = &mut buf[..];
+            let room = out.len();
+            assert!(enc.compress_stream(
+                stuffr::brotli_opts::Operation::Finish,
+                &mut input,
+                &mut out
+            ));
+            let n = room - out.len();
+            outv.extend_from_slice(&buf[..n]);
+        }
+        std::fs::write(s.0.join("z.br"), &outv).unwrap();
+        assert_eq!(run_capped(&s.0, &["-t", "z.br"], 4 << 20).0, 0);
+        let (code, err) = run_capped(&s.0, &["-t", "z.br"], 1 << 20);
+        assert_eq!(code, 1);
+        // `current_output_path` under `-t` is the name compression would
+        // give (`NextFile` appends the suffix): never opened, only named.
+        assert!(
+            err.starts_with("failed to write output [z.br.br]: "),
+            "{err}"
+        );
+        assert!(!s.0.join("z.br.br").exists());
     }
 }

@@ -83,6 +83,19 @@ pub(super) const COMPRESS_FAILED: &str = "failed to compress data [%s]\n";
 pub(super) const COMPRESSED: &str = "Compressed ";
 pub(super) const OUTPUT_LARGER: &str = "Output is larger than input\n";
 
+// ---- DecompressFile ----
+
+pub(super) const CORRUPT_INPUT: &str = "corrupt input [%s]\n";
+pub(super) const REASON: &str = "reason: %s\n";
+/// `reason: %s (%d)`, the number already formatted.
+pub(super) const REASON_CODE: &str = "reason: %s (%s)\n";
+pub(super) const REASON_COMMENT: &str = "comment mismatch";
+pub(super) const REASON_TRUNCATED: &str = "truncated input";
+pub(super) const REASON_EXTRA: &str = "extra input";
+/// `-K`, at `-v`: another stream follows.
+pub(super) const EXTRA_INPUT: &str = "extra input\n";
+pub(super) const DECOMPRESSED: &str = "Decompressed ";
+
 /// `command already set when parsing <what>`.
 pub(super) fn command_set(what: &str) -> String {
     format!("command already set when parsing {what}\n")

@@ -11,13 +11,23 @@
 //! once, as a metadata block before the data. That is what makes the C
 //! tier's `.br` bytes the reference's.
 //!
-//! Decoding a stream (`DecompressFile`) is Task 5's: [`decompress_file`] is
-//! a stand-in that fails silently.
+//! Decoding is `InitDecoder`, `OnMetadataStart`/`OnMetadataChunk` (the
+//! comment check, `-C`), `DecompressFile` and `PrettyDecoderErrorString`:
+//! the same buffers, a decoder call per step, `corrupt input [f]` (with a
+//! `reason:` line at `-v`) for an error, input that ends inside a stream
+//! (`truncated input`), input left after it without `-K` (`extra input`)
+//! and a comment that is not the one given. With `-K` a fresh decoder
+//! starts on what follows a stream, as the tool's does: without the
+//! metadata callbacks and with the comment state left as it was. A stream
+//! with no comment at all where one is given prints `corrupt input` at the
+//! end but succeeds (the tool's "final check" does not fail the run).
 
+use std::cell::RefCell;
 use std::io::Write;
+use std::rc::Rc;
 
 use stuffr::brotli_opts::{
-    Decoder, Encoder, EncoderParams, MAX_WINDOW_BITS, Operation, window_for_length,
+    Decoder, Encoder, EncoderParams, MAX_WINDOW_BITS, Operation, StreamResult, window_for_length,
 };
 
 use super::files::{self, Ctx};
@@ -102,7 +112,17 @@ fn has_more_input(ctx: &Ctx) -> bool {
 /// `WriteOutput`: `data` counted, and written unless testing.
 pub(super) fn write_output(ctx: &mut Ctx, data: &[u8]) -> bool {
     ctx.total_out += data.len() as u64;
-    if data.is_empty() || ctx.p.test_integrity {
+    if data.is_empty() {
+        return true;
+    }
+    if ctx.p.test_integrity {
+        // Nothing is written; a sandbox still counts what `-t` decodes
+        // against its output budget, so a bomb cannot run unbounded.
+        if let Err(e) = ctx.host.charge(data.len() as u64) {
+            let name = ctx.output_name();
+            ctx.say(m::WRITE_OUTPUT_FAILED, &[&name, &host::strerror(&e)]);
+            return false;
+        }
         return true;
     }
     let Some(out) = ctx.fout.as_mut() else {
@@ -281,9 +301,213 @@ fn init_decoder(ctx: &mut Ctx) -> Option<Decoder> {
     }
 }
 
-/// `DecompressFile`: Task 5. Until then it fails without a word.
-fn decompress_file(_ctx: &mut Ctx, _dec: &mut Decoder, _bufs: &mut Buffers) -> bool {
-    false
+/// `CommentState`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommentState {
+    Init,
+    Read,
+    Ok,
+    Bad,
+}
+
+/// The comment check's part of `Context`: what `OnMetadataStart` and
+/// `OnMetadataChunk` read and change.
+struct CommentCheck {
+    comment: Vec<u8>,
+    pos: usize,
+    state: CommentState,
+}
+
+impl CommentCheck {
+    /// `OnMetadataStart`.
+    fn on_start(&mut self, size: usize) {
+        if self.state == CommentState::Init {
+            if self.comment.len() != size {
+                self.state = CommentState::Bad;
+                return;
+            }
+            self.pos = 0;
+            self.state = CommentState::Read;
+        }
+    }
+
+    /// `OnMetadataChunk`.
+    fn on_chunk(&mut self, data: &[u8]) {
+        if self.state == CommentState::Read {
+            for &b in data {
+                if self.pos >= self.comment.len() {
+                    self.state = CommentState::Bad;
+                    return;
+                }
+                let want = self.comment[self.pos];
+                self.pos += 1;
+                if want != b {
+                    self.state = CommentState::Bad;
+                    return;
+                }
+            }
+            if self.pos == self.comment.len() {
+                self.state = CommentState::Ok;
+            }
+        }
+    }
+}
+
+/// `PrettyDecoderErrorString`: the name without its `_ERROR_` prefix.
+fn pretty_decoder_error(name: &str) -> &str {
+    const PREFIX: &str = "_ERROR_";
+    if name.len() > PREFIX.len() {
+        name.strip_prefix(PREFIX).unwrap_or(name)
+    } else {
+        name
+    }
+}
+
+/// `corrupt input [f]`, and at `-v` the reason line.
+fn corrupt(ctx: &mut Ctx, reason: &[u8]) {
+    let name = ctx.input_name();
+    ctx.say(m::CORRUPT_INPUT, &[&name]);
+    if ctx.p.verbosity > 0 {
+        ctx.say(m::REASON, &[reason]);
+    }
+}
+
+/// `fgetc(fin)`: one more byte, `None` at the end of the input (or after
+/// a read error, which `fgetc` also reports as `EOF`).
+fn get_byte(ctx: &mut Ctx) -> Option<u8> {
+    let fin = ctx.fin.as_mut()?;
+    let mut b = [0u8; 1];
+    match fin.fill(&mut b) {
+        (1, _) => Some(b[0]),
+        _ => None,
+    }
+}
+
+/// `DecompressFile`.
+fn decompress_file(ctx: &mut Ctx, dec: &mut Decoder, bufs: &mut Buffers) -> bool {
+    let check = Rc::new(RefCell::new(CommentCheck {
+        comment: ctx.p.comment.clone(),
+        pos: 0,
+        state: CommentState::Ok,
+    }));
+    if !ctx.p.comment.is_empty() {
+        check.borrow_mut().state = CommentState::Init;
+        let (a, b) = (Rc::clone(&check), Rc::clone(&check));
+        // Set before the first call: the pure tier reads metadata only
+        // from a decoder that has had them from the start.
+        let _ = dec.set_metadata_callbacks(
+            Box::new(move |size| a.borrow_mut().on_start(size)),
+            Box::new(move |data| b.borrow_mut().on_chunk(data)),
+        );
+    }
+    let state = || check.borrow().state;
+
+    // `InitializeBuffers`.
+    let (mut in_pos, mut in_end) = (0usize, 0usize);
+    let mut out_pos = 0usize;
+    let mut out_end = FILE_BUFFER_SIZE;
+    initialize(ctx);
+
+    // The decoder `-K` starts on what follows a stream, in place of `dec`.
+    let mut fresh: Option<Decoder> = None;
+    let mut result = StreamResult::NeedsMoreInput;
+    loop {
+        // Early check.
+        if state() == CommentState::Bad {
+            corrupt(ctx, m::REASON_COMMENT.as_bytes());
+            return false;
+        }
+        match result {
+            StreamResult::NeedsMoreInput => {
+                if !has_more_input(ctx) {
+                    corrupt(ctx, m::REASON_TRUNCATED.as_bytes());
+                    return false;
+                }
+                let Some(n) = provide_input(ctx, &mut bufs.input) else {
+                    return false;
+                };
+                (in_pos, in_end) = (0, n);
+            }
+            StreamResult::NeedsMoreOutput => {
+                // `ProvideOutput`.
+                if !write_output(ctx, &bufs.output[..out_pos]) {
+                    return false;
+                }
+                (out_pos, out_end) = (0, FILE_BUFFER_SIZE);
+            }
+            StreamResult::Success => {
+                // `FlushOutput`.
+                if !write_output(ctx, &bufs.output[..out_pos]) {
+                    return false;
+                }
+                // (`available_out` 0: every way on from here resets it.)
+                out_pos = 0;
+                let mut has_more_input = in_pos != in_end;
+                if !has_more_input && let Some(b) = get_byte(ctx) {
+                    has_more_input = true;
+                    bufs.input[0] = b;
+                    (in_pos, in_end) = (0, 1);
+                }
+                if has_more_input {
+                    if ctx.p.allow_concatenated {
+                        if ctx.p.verbosity > 0 {
+                            ctx.say(m::EXTRA_INPUT, &[]);
+                        }
+                        // `ProvideOutput` (nothing is pending).
+                        if !write_output(ctx, &bufs.output[..out_pos]) {
+                            return false;
+                        }
+                        (out_pos, out_end) = (0, FILE_BUFFER_SIZE);
+                        // `BrotliDecoderDestroyInstance`, then `InitDecoder`.
+                        drop(fresh.take());
+                        let Some(d) = init_decoder(ctx) else {
+                            return false;
+                        };
+                        fresh = Some(d);
+                    } else {
+                        corrupt(ctx, m::REASON_EXTRA.as_bytes());
+                        return false;
+                    }
+                } else {
+                    if ctx.p.verbosity > 0 {
+                        ctx.end_time = clock(ctx.host);
+                        let mut line = m::DECOMPRESSED.as_bytes().to_vec();
+                        print_file_processing_progress(&mut line, ctx);
+                        line.push(b'\n');
+                        let _ = ctx.err.write_all(&line);
+                    }
+                    // Final check: printed, but the run goes on.
+                    if state() != CommentState::Ok {
+                        corrupt(ctx, m::REASON_COMMENT.as_bytes());
+                    }
+                    return true;
+                }
+            }
+            StreamResult::Error => {
+                let d = fresh.as_ref().unwrap_or(&*dec);
+                let e = d.error();
+                let name = ctx.input_name();
+                ctx.say(m::CORRUPT_INPUT, &[&name]);
+                if ctx.p.verbosity > 0 {
+                    let reason = pretty_decoder_error(e.name);
+                    let code = e.code.to_string();
+                    ctx.say(m::REASON_CODE, &[reason.as_bytes(), code.as_bytes()]);
+                }
+                return false;
+            }
+        }
+
+        let d = match fresh.as_mut() {
+            Some(d) => d,
+            None => &mut *dec,
+        };
+        let mut input = &bufs.input[in_pos..in_end];
+        let mut output = &mut bufs.output[out_pos..out_end];
+        let room = output.len();
+        result = d.decompress_stream(&mut input, &mut output);
+        in_pos = in_end - input.len();
+        out_pos += room - output.len();
+    }
 }
 
 /// `DecompressFiles` (also `-t`): each input in turn; the first failure
