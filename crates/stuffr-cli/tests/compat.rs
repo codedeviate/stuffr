@@ -36,7 +36,7 @@ mod unix {
     }
 
     const STUFFR: &str = env!("CARGO_BIN_EXE_stuffr");
-    const ALL: [&str; 31] = [
+    const ALL: [&str; 34] = [
         "bzip2",
         "bunzip2",
         "bzcat",
@@ -68,6 +68,9 @@ mod unix {
         "zipcloak",
         "zipnote",
         "zipsplit",
+        "brotli",
+        "unbrotli",
+        "brcat",
     ];
 
     /// A scratch directory removed on drop.
@@ -152,10 +155,10 @@ mod unix {
         assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
         assert!(s.0.join("bzcat").symlink_metadata().is_ok());
         assert!(s.0.join("bzip2").symlink_metadata().is_err());
-        // lz4 became a compatibility name in 0.15.0; brotli is none.
-        let o = il(&s.0, &["--names", "brotli"]);
+        // lz4 became a compatibility name in 0.15.0; `brotliz` is none.
+        let o = il(&s.0, &["--names", "brotliz"]);
         assert_eq!(o.status.code(), Some(2));
-        assert!(stderr(&o).contains("brotli"));
+        assert!(stderr(&o).contains("brotliz"));
     }
 
     #[test]
@@ -544,7 +547,7 @@ mod unix {
         assert_eq!(std::fs::read_dir(&one.0).unwrap().count(), 2);
     }
 
-    /// The four lz4 names are links like the rest (thirty-one in all), and
+    /// The four lz4 names are links like the rest (thirty-four in all now), and
     /// a link runs as its name: `-h` prints its own name in the usage line
     /// (to standard error, as lz4 does), `lz4c`'s lists the legacy
     /// arguments, and `-V` prints stuffr's banner (spec deviation 1).
@@ -553,7 +556,7 @@ mod unix {
         let s = Scratch::new("lz4");
         let o = il(&s.0, &[]);
         assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-        assert_eq!(std::fs::read_dir(&s.0).unwrap().count(), 31);
+        assert_eq!(std::fs::read_dir(&s.0).unwrap().count(), 34);
         let dir = s.0.canonicalize().unwrap();
         let banner = format!(
             "*** lz4 v1.10.0 64-bit multithread (stuffr {}), by Yann Collet ***\n",
@@ -638,17 +641,17 @@ mod unix {
         }
     }
 
-    /// The two compress names (0.18.0) are among the 31 links. Each runs as
+    /// The two compress names (0.18.0) are among the 34 links. Each runs as
     /// its name in the flavour `STUFFR_COMPRESS_FLAVOR` picks (Apple's
     /// usage line names the program), and any other value of it is refused,
     /// exit 1, in stuffr's words.
     #[test]
-    fn install_links_makes_31_names() {
+    fn install_links_makes_thirty_four_names() {
         use std::os::unix::process::CommandExt;
         let s = Scratch::new("compress");
         let o = il(&s.0, &[]);
         assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-        assert_eq!(std::fs::read_dir(&s.0).unwrap().count(), 31);
+        assert_eq!(std::fs::read_dir(&s.0).unwrap().count(), 34);
         let dir = s.0.canonicalize().unwrap();
         let run = |n: &str, flavor: &str| {
             let link = dir.join(n);

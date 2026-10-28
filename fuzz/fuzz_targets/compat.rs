@@ -460,6 +460,19 @@ fn run_bzip2(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
     );
 }
 
+/// The brotli family: exit 0 or 1 only. Minimal arm (0.20.0 Task 3); the
+/// read bounds and the stream oracle come with the family's fuzz task.
+fn run_brotli(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
+    let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+    let (code, _out, err) = compat::run_in(dir, name, args, stdin, Flavour::Gnu)
+        .expect("a COMPAT_NAMES entry is a compat name");
+    assert!(
+        (0..=1).contains(&code),
+        "{name}: exit {code} is not 0 or 1\n{}",
+        String::from_utf8_lossy(&err)
+    );
+}
+
 /// The arguments in operand position: after `--`, everything; before it,
 /// `-` alone (standard input; no file name starts with it, so it names no
 /// path in the read bound) and anything not starting with `-` that is not
@@ -2903,6 +2916,7 @@ fuzz_target!(|data: &[u8]| {
         "bzip2" | "bunzip2" | "bzcat" => run_bzip2(&dir, case.name, &case.args, stdin),
         "zstd" | "unzstd" | "zstdcat" | "zstdmt" => run_zstd(&dir, case.name, &case.args, stdin),
         "lz4" | "unlz4" | "lz4cat" | "lz4c" => run_lz4(&dir, case.name, &case.args, stdin),
+        "brotli" | "unbrotli" | "brcat" => run_brotli(&dir, case.name, &case.args, stdin),
         "unzip" | "zipinfo" | "funzip" => {
             run_unzip(&dir, case.name, case.flavour, &case.args, stdin)
         }

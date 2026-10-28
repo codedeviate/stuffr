@@ -8,6 +8,7 @@ use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+pub mod brotli;
 pub mod bzip2;
 pub mod bzip2recover;
 pub mod compress;
@@ -53,6 +54,8 @@ pub enum Family {
     Zstd,
     /// `lz4`, `unlz4`, `lz4cat`, `lz4c`.
     Lz4,
+    /// `brotli`, `unbrotli`, `brcat`.
+    Brotli,
     /// `unzip`, `zipinfo`, `funzip`, in the flavour
     /// [`unzip::default_flavour`] or `STUFFR_UNZIP_FLAVOR` picks.
     Unzip,
@@ -98,6 +101,9 @@ const NAMES: &[(&str, Family)] = &[
     ("zipcloak", Family::Zip),
     ("zipnote", Family::Zip),
     ("zipsplit", Family::Zip),
+    ("brotli", Family::Brotli),
+    ("unbrotli", Family::Brotli),
+    ("brcat", Family::Brotli),
 ];
 
 /// Every compatibility name, from the one table `family_for` also reads.
@@ -143,6 +149,7 @@ pub fn dispatch(args: Vec<OsString>) -> Option<ExitCode> {
         Family::Xz => xz::run(name, &argv0, rest),
         Family::Zstd => zstd::run(name, &argv0, rest),
         Family::Lz4 => lz4::run(name, &argv0, rest),
+        Family::Brotli => brotli::run(name, &argv0, rest),
         Family::Unzip => unzip::run(name, &argv0, rest),
         Family::Compress => compress::run(name, rest),
         Family::Zip => zip::run(name, &argv0, rest),
@@ -219,6 +226,7 @@ pub fn run_in_counted(
         Family::Xz => xz::run_in_counted(dir, canonical, &args, stdin, &|_| None),
         Family::Zstd => zstd::run_in_counted(dir, canonical, &args, stdin, &|_| None),
         Family::Lz4 => lz4::run_in_counted(dir, canonical, &args, stdin, &|_| None),
+        Family::Brotli => brotli::run_in_counted(dir, canonical, &args, stdin),
         Family::Unzip => {
             unzip::run_in_counted(unzip_flavour, dir, canonical, &args, stdin, &|_| None)
         }
@@ -645,6 +653,11 @@ mod tests {
     }
 
     #[test]
+    fn names_has_thirty_four_entries() {
+        assert_eq!(names().len(), 34);
+    }
+
+    #[test]
     fn names_lists_the_table() {
         assert_eq!(
             names(),
@@ -679,7 +692,10 @@ mod tests {
                 "zip",
                 "zipcloak",
                 "zipnote",
-                "zipsplit"
+                "zipsplit",
+                "brotli",
+                "unbrotli",
+                "brcat"
             ]
         );
     }

@@ -16,9 +16,10 @@
 //!   against stuffr and compares everything (`assert_same`). They are
 //!   `#[ignore = "Task N"]`: un-ignoring the one for your task is the whole
 //!   enablement. Task 3 owns [`USAGE_ROWS`] (parsing and usage, no file is
-//!   touched), Task 4 [`COMPRESS_ROWS`], [`DECOMPRESS_ROWS`] and
-//!   [`FILE_ROWS`], Task 5 the verbose, comment and error-name rows (the
-//!   rows whose message ends in a `reason:` line or a timing figure).
+//!   touched; four rows that go on to open an input or compress standard
+//!   input are Task 4's, `needs_io`), Task 4 [`COMPRESS_ROWS`] and
+//!   [`DECOMPRESS_ROWS`], Task 5 the verbose, comment and error-name rows
+//!   (the rows whose message ends in a `reason:` line or a timing figure).
 //!
 //! Conventions of the tables:
 //! - A fixture named `<stdin>` is not a file: its bytes are fed to standard
@@ -1934,7 +1935,7 @@ mod unix {
     /// `-h` writes the help text to standard error, `-V` the version line to
     /// standard output.
     #[test]
-    fn help_and_version_go_to_standard_output() {
+    fn help_goes_to_standard_error_and_version_to_standard_output() {
         let Some(dir) = brotli_dir() else { return };
         // `-h` writes the help text to standard error (exit 0).
         for (name, args) in [
@@ -2061,14 +2062,25 @@ mod unix {
         rows.iter().map(|r| ("brotli", r)).collect()
     }
 
+    /// The usage and alias rows that, once the command line parses, go on
+    /// to open an input or compress standard input: they pass with Task 4.
+    fn needs_io(r: &Row) -> bool {
+        matches!(
+            r.args,
+            ["-C", "Zm9v="] | ["--=1"] | ["a", "b", "-o", "x"] | ["nosuch.br"]
+        )
+    }
+
     #[test]
-    #[ignore = "Task 3"]
     fn task3_rows_match_the_reference() {
-        let mut rows = plain(USAGE_ROWS);
+        let mut rows: Vec<_> = plain(USAGE_ROWS)
+            .into_iter()
+            .filter(|(_, r)| !needs_io(r))
+            .collect();
         rows.extend(
             ALIAS_ROWS
                 .iter()
-                .filter(|(_, r)| r.fixtures.is_empty())
+                .filter(|(_, r)| r.fixtures.is_empty() && !needs_io(r))
                 .map(|(n, r)| (*n, r)),
         );
         check_rows("Task 3", &rows);
@@ -2079,10 +2091,11 @@ mod unix {
     fn task4_rows_match_the_reference() {
         let mut rows = plain(COMPRESS_ROWS);
         rows.extend(plain(DECOMPRESS_ROWS));
+        rows.extend(plain(USAGE_ROWS).into_iter().filter(|(_, r)| needs_io(r)));
         rows.extend(
             ALIAS_ROWS
                 .iter()
-                .filter(|(_, r)| !r.fixtures.is_empty())
+                .filter(|(_, r)| !r.fixtures.is_empty() || needs_io(r))
                 .map(|(n, r)| (*n, r)),
         );
         check_rows("Task 4", &rows);
