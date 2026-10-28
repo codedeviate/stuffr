@@ -34,6 +34,10 @@ brotli = ["dep:brotli"]
 # `c/dec`, `c/include` and `LICENSE`, unmodified) and compiled by this
 # crate's `build.rs` with `cc`, so its `.br` output is byte-identical to the
 # brotli tool's. Without it `brotli_opts` runs over the `brotli` crate.
+# The vendored libbrotli exports libbrotli's public symbols unprefixed, so a
+# downstream graph that also links another libbrotli (`brotli-sys`,
+# `brotlic-sys`, or the `brotli` crate's `ffi-api` feature) together with
+# `brotli-c` can fail to link or bind to the wrong implementation.
 brotli-c = ["brotli", "dep:cc"]
 lz4 = ["dep:lz4_flex", "dep:twox-hash"]
 # The lz4 compatibility family's C tier: `lz4_opts` over liblz4 1.10.0

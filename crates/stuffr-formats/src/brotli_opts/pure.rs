@@ -289,6 +289,12 @@ impl Decoder {
                 *input = &input[1..];
             }
             self.observe(Some(byte).filter(|_| consumed), consumed);
+            // A decoder that asks for more input while refusing the byte it
+            // was given would spin here for ever: answered as an error, so
+            // hostile input cannot hang the loop whatever the crate does.
+            if !consumed && matches!(next, BrotliResult::NeedsMoreInput) {
+                return StreamResult::Error;
+            }
             r = next;
         }
     }
