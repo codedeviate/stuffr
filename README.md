@@ -2033,8 +2033,8 @@ The exit codes are 0 and 1 only, and the first failing file ends the run.
 One family per release, each with its own spec stating its byte-identity
 promise: **bzip2 (`0.11.0`), gzip (`0.12.0`), xz/lzma (`0.13.0`), zstd
 (`0.14.0`), lz4 (`0.15.0`), `unzip`/`zipinfo`/`funzip` (`0.16.0`),
-`compress`/`uncompress` (`0.18.0`) and `zip`/`zipcloak`/`zipnote`/`zipsplit`
-(`0.19.0`) are done.**
+`compress`/`uncompress` (`0.18.0`), `zip`/`zipcloak`/`zipnote`/`zipsplit`
+(`0.19.0`) and `brotli`/`unbrotli`/`brcat` (`0.20.0`) are done.**
 `tar` is excluded (see [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md)). The planned
 tiers:
 
@@ -2044,7 +2044,8 @@ tiers:
   via libzstd, against zstd 1.5.7 (done; `--train-cover` and `--adapt`
   excepted, as stated above); lz4 on the `lz4-c` tier (in `c-backed`), via
   liblz4, against lz4 1.10.0 (done), which also makes zstd's `--format=lz4`
-  byte-identical there.
+  byte-identical there; brotli on the `brotli-c` tier (in `c-backed`), via
+  the vendored libbrotli 1.2.1, against brotli 1.2.1 (done).
 - **Compatible behaviour only** (the same flags, files, exit codes and
   messages, and output the real tool reads): GNU gzip's exact bytes;
   every family except bzip2 on the pure tier.
@@ -2082,6 +2083,11 @@ and Debian's patches) under the Info-ZIP licence, in
 [`crates/stuffr-cli/LICENSE-infozip`](crates/stuffr-cli/LICENSE-infozip).
 The zip family is ported from Info-ZIP Zip 3.0 (Apple's `zip-33` tree and
 Debian's patches) under the same Info-ZIP licence.
+The brotli family is ported from brotli 1.2.1's `c/tools/brotli.c` (MIT), and
+on the `brotli-c` tier libbrotli 1.2.1 (Google, MIT) is vendored and built;
+its notice is in
+[`crates/stuffr-cli/LICENSE-brotli`](crates/stuffr-cli/LICENSE-brotli), under
+the `MIT` already in the expression below.
 The compress family's Apple personality is ported from Apple's `compress.c` and
 `zopen.c` (`file_cmds`, 4.4BSD's, copyright the Regents of the University of
 California), BSD-3-Clause, in
@@ -2507,6 +2513,9 @@ Since `0.19.0` the zip family is ported from Info-ZIP Zip 3.0 (Apple's
 `zip-33` tree, and Debian's patch series for the Ubuntu flavour) and is under
 the same **Info-ZIP licence**; the banner lines name stuffr and say "altered"
 as for unzip.
+Since `0.20.0` the brotli family is ported from brotli 1.2.1's
+`c/tools/brotli.c` (MIT), with libbrotli 1.2.1 vendored under `brotli-c`; the
+notice is `crates/stuffr-cli/LICENSE-brotli`, and the expression is unchanged.
 Since `0.18.0` the compress family is ported too: Apple's `compress.c` and
 `zopen.c` (the Regents of the University of California's BSD-3-Clause, already
 in the expression; notice in
