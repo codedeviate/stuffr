@@ -2009,13 +2009,16 @@ The exit codes are 0 and 1 only, and the first failing file ends the run.
    1), where the reference overwrites that input before reading it.
 6. **`-j` removes the source only after the output closed without error;**
    the reference removes it even when `fclose` failed (ENOSPC, EIO), leaving
-   a truncated output and no input.
+   a truncated output and no input. stuffr buffers its output in 64 KiB, the
+   reference in stdio's buffer, so on a full disk the failure may be
+   reported as `fclose failed [x]` where the reference says `failed to write
+   output [x]`. The output is removed either way.
 7. **`brotli - -` (standard input named twice) writes both streams;** the
    reference closes standard output after the first file and crashes on the
    second.
 8. **`could not read dictionary: out of memory` is never printed.** The
-   dictionary buffer (at most `MAX_DICTIONARY_SIZE`, about 1 GiB, as the
-   reference's own limit) is a plain allocation; when the allocator cannot
+   dictionary buffer (at most `MAX_DICTIONARY_SIZE`, 50331660 bytes, about
+   48 MiB, the reference's own limit) is a plain allocation; when the allocator cannot
    give it, Rust aborts the process (SIGABRT, status 134) where the
    reference prints that line and exits 1.
 9. **No signal handler, as the reference:** an interrupt leaves the partial

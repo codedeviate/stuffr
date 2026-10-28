@@ -90,8 +90,55 @@ impl InputFile {
     }
 }
 
-/// An open output: a file or standard output, buffered as stdio buffers.
-pub(super) type OutputFile = BufWriter<Box<dyn Write + Send>>;
+/// An open output, buffered as stdio buffers (64 KiB).
+pub(super) enum OutputFile {
+    /// A file the real process opened: kept typed, so that its `close(2)`
+    /// is made and checked (`fclose`'s result: a network file system can
+    /// report a delayed write error only there).
+    File(BufWriter<File>),
+    /// Standard output, or any output of a sandboxed run (`Host::out_writer`).
+    Other(BufWriter<Box<dyn Write + Send>>),
+}
+
+impl Write for OutputFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            OutputFile::File(w) => w.write(buf),
+            OutputFile::Other(w) => w.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            OutputFile::File(w) => w.flush(),
+            OutputFile::Other(w) => w.flush(),
+        }
+    }
+}
+
+/// How an output file is closed: [`close_file`], or a test's stand-in.
+pub(super) type CloseFile = fn(File) -> io::Result<()>;
+
+/// `close(2)` of an output file, its result kept.
+pub(super) fn close_file(f: File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::IntoRawFd;
+        let fd = f.into_raw_fd();
+        // SAFETY: `fd` was just taken out of its `File`, so it is open,
+        // owned here alone, and closed exactly once.
+        if unsafe { libc::close(fd) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        drop(f);
+        Ok(())
+    }
+}
 
 /// The parts of the reference's `Context` the file loop keeps.
 pub(super) struct Ctx<'a> {
@@ -110,6 +157,8 @@ pub(super) struct Ctx<'a> {
     pub(super) input_file_length: i64,
     pub(super) fin: Option<InputFile>,
     pub(super) fout: Option<OutputFile>,
+    /// Closes an output file ([`close_file`]; a test injects a failure).
+    pub(super) close_output: CloseFile,
     /// The raw dictionary (`-D`), read once.
     pub(super) dictionary: Option<Vec<u8>>,
     /// The dictionary prepared for the encoder (compression only).
@@ -133,6 +182,7 @@ impl<'a> Ctx<'a> {
             input_file_length: -1,
             fin: None,
             fout: None,
+            close_output: close_file,
             dictionary: None,
             prepared: None,
             total_in: 0,
@@ -299,7 +349,7 @@ fn later_input_at(ctx: &Ctx, output: &Metadata) -> Option<OsString> {
 /// output is checked against the input (module doc).
 fn open_output(ctx: &mut Ctx, input: Option<&Metadata>) -> bool {
     let Some(name) = ctx.output_path.clone() else {
-        ctx.fout = Some(ctx.host.out_writer(None));
+        ctx.fout = Some(OutputFile::Other(ctx.host.out_writer(None)));
         return true;
     };
     let path = ctx.host.path(cli::bytes(&name));
@@ -335,7 +385,10 @@ fn open_output(ctx: &mut Ctx, input: Option<&Metadata>) -> bool {
     }
     match opts.open(&path) {
         Ok(f) => {
-            ctx.fout = Some(ctx.host.out_writer(Some(f)));
+            ctx.fout = Some(match ctx.host {
+                Host::Real => OutputFile::File(BufWriter::with_capacity(64 * 1024, f)),
+                Host::Sandbox(_) => OutputFile::Other(ctx.host.out_writer(Some(f))),
+            });
             true
         }
         Err(e) => {
@@ -363,10 +416,31 @@ pub(super) fn close_files(ctx: &mut Ctx, rm_input: bool, rm_output: bool) -> boo
             is_ok = false;
         }
         // The buffer is flushed (or its failure reported): what is left is
-        // dropped with the descriptor.
-        drop(out.into_parts());
-        if rm_output && let Some(o) = &ctx.output_path {
-            let _ = fs::remove_file(ctx.host.path(cli::bytes(o)));
+        // dropped, and the descriptor closed with its result checked.
+        let closed = match out {
+            OutputFile::File(w) => (ctx.close_output)(w.into_parts().0),
+            OutputFile::Other(w) => {
+                drop(w.into_parts());
+                Ok(())
+            }
+        };
+        if let Err(e) = closed
+            && is_ok
+        {
+            let name = ctx.output_name();
+            ctx.say(m::FCLOSE_FAILED, &[&name, &host::strerror(&e)]);
+            is_ok = false;
+        }
+        if let Some(o) = &ctx.output_path {
+            let path = ctx.host.path(cli::bytes(o));
+            // A failed close leaves an incomplete file: removed too (the
+            // reference removes the output after a failed write; deviation
+            // 6), but only a regular file, never a device such as
+            // `/dev/full`.
+            let incomplete = !is_ok && fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
+            if rm_output || incomplete {
+                let _ = fs::remove_file(&path);
+            }
         }
         // TOCTOU, as in the reference: the times can only be set by path.
         if !rm_output && is_ok && ctx.p.copy_stat {
@@ -515,4 +589,94 @@ pub(super) fn read_dictionary(ctx: &mut Ctx, command: Command) -> bool {
     }
     ctx.dictionary = Some(buffer);
     true
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::super::codec;
+    use super::*;
+
+    /// A scratch directory `stuffr-brotli-close-<pid>-<n>`, removed on drop.
+    struct Scratch(std::path::PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch() -> Scratch {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "stuffr-brotli-close-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        Scratch(d)
+    }
+
+    fn eio(f: File) -> io::Result<()> {
+        drop(f);
+        Err(io::Error::from_raw_os_error(libc::EIO))
+    }
+
+    /// `close` failing on a real file output (a network file system's
+    /// delayed write error): `fclose failed`, the file fails, `-j` keeps the
+    /// input and the incomplete output is removed. Compressing and
+    /// decompressing; with a working close the same runs succeed.
+    #[test]
+    fn a_failing_close_fails_the_file_and_keeps_the_input() {
+        let s = scratch();
+        let a = s.0.join("a");
+        fs::write(&a, b"hello\n").unwrap();
+        let run = |args: &[&std::ffi::OsStr], close: CloseFile| -> (bool, String) {
+            let args: Vec<OsString> = args.iter().map(|a| a.to_os_string()).collect();
+            let p = cli::parse(b"brotli", &args, &mut Vec::new()).unwrap();
+            let mut host = Host::Real;
+            let mut err = Vec::new();
+            let mut ctx = Ctx::new(&p, &mut host, &mut err);
+            ctx.close_output = close;
+            let mut bufs = codec::Buffers::new();
+            let ok = if p.decompress {
+                codec::decompress_files(&mut ctx, &mut bufs)
+            } else {
+                codec::compress_files(&mut ctx, &mut bufs)
+            };
+            drop(ctx);
+            (ok, String::from_utf8(err).unwrap())
+        };
+        let j = std::ffi::OsStr::new("-j");
+        let dj = std::ffi::OsStr::new("-dj");
+        let eio_text = String::from_utf8(host::errno_text(libc::EIO)).unwrap();
+
+        let (ok, err) = run(&[j, a.as_os_str()], eio);
+        assert!(!ok);
+        assert_eq!(
+            err,
+            format!("fclose failed [{}.br]: {eio_text}\n", a.display())
+        );
+        assert_eq!(fs::read(&a).unwrap(), b"hello\n");
+        assert!(!s.0.join("a.br").exists(), "the incomplete output stays");
+
+        assert_eq!(run(&[j, a.as_os_str()], close_file), (true, String::new()));
+        assert!(!a.exists());
+        let br = s.0.join("a.br");
+        let (ok, err) = run(&[dj, br.as_os_str()], eio);
+        assert!(!ok);
+        assert_eq!(
+            err,
+            format!("fclose failed [{}]: {eio_text}\n", a.display())
+        );
+        assert!(br.exists() && !a.exists());
+
+        assert_eq!(
+            run(&[dj, br.as_os_str()], close_file),
+            (true, String::new())
+        );
+        assert_eq!(fs::read(&a).unwrap(), b"hello\n");
+        assert!(!br.exists());
+    }
 }
