@@ -29,7 +29,7 @@ fn list_names_every_entry_and_extracts_nothing() {
 }
 
 #[test]
-fn ls_is_an_alias_for_list() {
+fn ls_on_an_archive_lists_its_entries() {
     let dir = tmp_dir();
     let archive = write_fixture_tar(&dir, &[("a.txt", b"alpha")]);
     let out = run_output(&["ls", archive.to_str().unwrap()]);

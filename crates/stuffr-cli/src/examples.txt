@@ -540,8 +540,9 @@ LISTING AND TESTING AN ARCHIVE
 
   stuffr list backup.tar
       Prints one line per entry — index, size, then name — and extracts
-      nothing at all: no file is written, no directory created. `ls` is an
-      alias for `list`, for the muscle memory. Both work on `backup.tar.gz`
+      nothing at all: no file is written, no directory created. `stuffr ls`
+      given a file runs exactly this (given a folder it lists the folder;
+      see "FINDING ARCHIVES IN A FOLDER" below). Both work on `backup.tar.gz`
       and `backup.tgz` exactly as they do on a bare `.tar`: the codec layer
       (gzip) is resolved and decoded first, then `list` walks the tar
       layer underneath it — on a real file or over a pipe (`stuffr list -`)
@@ -868,6 +869,55 @@ EXTRACTING AN ARCHIVE'S ENTRIES
       (cgroup-aware) on `list`, `test`, `cat` and `unpack -C` alike — the
       bound is on by default, since a bound that defaults off closes
       nothing. Raise it to decode a file that genuinely needs more.
+
+
+FINDING ARCHIVES IN A FOLDER
+
+  stuffr ls ~/Downloads
+      Lists the files in the folder that stuffr can open, newest first, one
+      row each: format, size, date, name. Every subfolder gets a `[FOLDER]`
+      row with no size and a trailing `/`. With no argument, `stuffr ls`
+      lists the current folder.
+
+        tar+gzip  4.2M  Oct 27 14:03  backup-2026.tar.gz
+        gzip      812K  Oct 25 22:10  export
+        zip        18M  Oct 21 09:41  photos.zip
+        [FOLDER]        Oct 20 11:02  old/
+        3 of 5 files shown, 2 not openable
+
+      A file is listed when its first 4096 bytes carry the magic of a format
+      this build reads, so `export` above is found with no extension and a
+      `photos.zip` that is really an HTML error page is not. Only a format
+      with no magic at all (brotli) is recognised by its extension. Nothing
+      is decoded: the format column is what `stuffr info` names without
+      decoding, ` over ` written `+`. Sizes are `ls -lh`'s; dates `ls -l`'s,
+      in local time. The footer counts the files that are not openable and
+      is left out when there are none; hidden names and folders never
+      count. Exit 0 even when nothing is listed.
+
+  stuffr ls --recursive ~/Downloads
+      -r/--recursive also lists inside subfolders, `ls -lR` style: the
+      folder's own rows first, then a blank line and a `sub/folder/:` header
+      for every subfolder holding something openable. No `[FOLDER]` rows,
+      and a symlinked folder is never followed.
+
+  stuffr ls --all --by-name .
+      -a/--all includes names starting with `.` (and, with -r, descends into
+      hidden folders). -n/--by-name sorts by name instead of newest first.
+
+  stuffr files --json ~/Downloads
+      `files` is a second name for the folder listing. --json prints one
+      object: `entries` (each `{path, kind, format, size, modified}`; `kind`
+      is `file` or `folder`, `format` the full chain such as `tar over gzip`
+      and null for a folder, `modified` RFC 3339 UTC), `shown`, `skipped`
+      and `warnings`.
+
+  stuffr ls photos.zip
+      A file, or `-`, is `stuffr list` exactly, with list's options
+      (--max-ratio, --memory-limit, --strict-fidelity). Folder flags with a
+      file, list's options with a folder, and `stuffr files` given a file
+      are usage errors (exit 2). A file or subfolder inside that cannot be
+      read is named on stderr, the listing goes on, and the exit is 4.
 
 
 RECOVERING A DAMAGED ARCHIVE (SALVAGE)

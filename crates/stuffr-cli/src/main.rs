@@ -11,8 +11,6 @@ use stuffr::{Chain, FormatId};
 use stuffr_cli::cli::{Cli, Command};
 use stuffr_cli::format_by_name;
 
-// Task 4 wires `ls` into the CLI and removes this allow.
-#[allow(dead_code)]
 mod ls;
 
 /// The `--examples` page. A static asset rather than an inline literal so it
@@ -65,8 +63,31 @@ fn main() -> ExitCode {
         }
     };
 
+    let command = match command {
+        Command::Ls(ls_args) => return run_ls(ls_args, ls::invoked_as(&args)),
+        c => c,
+    };
+
     match run(command) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("stuffr: {e}");
+            ExitCode::from(e.exit_code() as u8)
+        }
+    }
+}
+
+/// `stuffr ls`/`files`: exit 4 when the folder listing is incomplete.
+///
+/// Every byte `ls` writes goes to stdout, in both modes, so a closed pipe is
+/// the reader's decision and ends the run quietly, as it does for `list`.
+fn run_ls(args: stuffr_cli::cli::LsArgs, invoked_as: &str) -> ExitCode {
+    match ls::run(args, invoked_as) {
+        Ok(ls::LsStatus::Complete) => ExitCode::SUCCESS,
+        Ok(ls::LsStatus::Degraded) => ExitCode::from(4),
+        Err(stuffr::Error::Io(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("stuffr: {e}");
             ExitCode::from(e.exit_code() as u8)
@@ -723,22 +744,9 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             max_ratio,
             memory_limit,
             strict_fidelity,
-        } => {
-            // `list` advertises reading nothing and extracting nothing, but
-            // reaching the container's first header still decodes whatever
-            // codec sits above it — so it needs the same bound every other
-            // decoding verb has, defaulted the same way.
-            let memory_limit = Some(
-                parse_memory_limit(memory_limit)?.unwrap_or_else(stuffr::default_memory_limit),
-            );
-            print_list(
-                input_of(&input),
-                json,
-                max_ratio.unwrap_or(stuffr::DEFAULT_MAX_RATIO),
-                memory_limit,
-                strict_fidelity,
-            )
-        }
+        } => run_list(&input, json, max_ratio, memory_limit, strict_fidelity),
+        // `main` runs `ls` itself: its exit 4 is a status, not an error.
+        Command::Ls(_) => unreachable!("main dispatches ls before run"),
         Command::Test {
             input,
             max_ratio,
@@ -2145,6 +2153,30 @@ fn entry_kind_str(kind: &stuffr::EntryKind) -> &'static str {
 /// Warnings go to stderr AFTER the listing goes to stdout, so `stuffr list a
 /// | head` is unaffected by them and a redirected listing keeps the warning
 /// visible on the terminal.
+/// `stuffr list`, as `Command::List` runs it and as `stuffr ls` runs it on a
+/// file or `-`: one code path, so the two cannot differ.
+fn run_list(
+    input: &str,
+    json: bool,
+    max_ratio: Option<u64>,
+    memory_limit: Option<String>,
+    strict_fidelity: bool,
+) -> stuffr::Result<()> {
+    // `list` advertises reading nothing and extracting nothing, but
+    // reaching the container's first header still decodes whatever
+    // codec sits above it — so it needs the same bound every other
+    // decoding verb has, defaulted the same way.
+    let memory_limit =
+        Some(parse_memory_limit(memory_limit)?.unwrap_or_else(stuffr::default_memory_limit));
+    print_list(
+        input_of(input),
+        json,
+        max_ratio.unwrap_or(stuffr::DEFAULT_MAX_RATIO),
+        memory_limit,
+        strict_fidelity,
+    )
+}
+
 fn print_list(
     src: Input,
     json: bool,

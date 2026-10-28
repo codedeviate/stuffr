@@ -220,6 +220,17 @@ pub(crate) fn run_output(args: &[&str]) -> std::process::Output {
     Command::new(STUFFR).args(args).output().unwrap()
 }
 
+/// Runs stuffr in `dir` (its working directory) with `TZ=UTC`, so a date
+/// `stuffr ls` prints in local time is fixed text in a test.
+pub(crate) fn run_in_dir_output(dir: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(STUFFR)
+        .args(args)
+        .current_dir(dir)
+        .env("TZ", "UTC")
+        .output()
+        .unwrap()
+}
+
 pub(crate) fn run_with_stdin_output(args: &[&str], input: &[u8]) -> std::process::Output {
     let mut child = Command::new(STUFFR)
         .args(args)

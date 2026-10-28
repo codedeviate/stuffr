@@ -306,7 +306,6 @@ pub enum Command {
     ///
     /// The first column is the entry's 0-based position in archive order,
     /// which is what `cat --index` and `unpack --index` select by.
-    #[command(alias = "ls")]
     List {
         /// Archive path, or `-` for stdin.
         input: String,
@@ -333,6 +332,20 @@ pub enum Command {
         #[arg(long)]
         strict_fidelity: bool,
     },
+    /// List what a folder holds that stuffr can open, or an archive's entries.
+    ///
+    /// Given a folder, or nothing (the current folder): one row per file
+    /// stuffr can open, newest first, as `FORMAT  SIZE  DATE  NAME`, plus
+    /// every subfolder as a `[FOLDER]` row. A file is listed when its first
+    /// bytes carry a readable format's magic; nothing is decoded. A footer
+    /// `N of M files shown, K not openable` counts the rest. A file or
+    /// subfolder that cannot be read is named on stderr and the exit is 4.
+    ///
+    /// Given an archive or compressed file, or `-`: exactly `stuffr list`,
+    /// with its options. `files` is a second name for the folder listing
+    /// only.
+    #[command(alias = "files")]
+    Ls(LsArgs),
     /// Verify every entry's integrity without extracting.
     Test {
         /// Archive path, or `-` for stdin.
@@ -456,6 +469,46 @@ pub enum Command {
         #[arg(long)]
         format: Option<String>,
     },
+}
+
+/// The arguments of `stuffr ls` (alias `files`).
+#[derive(Args, Debug)]
+pub struct LsArgs {
+    /// A folder (default: the current one), or an archive path or `-` to
+    /// list its entries as `stuffr list` does.
+    #[arg(value_name = "PATH")]
+    pub path: Option<String>,
+    /// Folder: also list inside subfolders, one block per folder that holds
+    /// something stuffr can open. Symlinked folders are not followed.
+    #[arg(short, long)]
+    pub recursive: bool,
+    /// Folder: include names starting with `.`.
+    #[arg(short, long)]
+    pub all: bool,
+    /// Folder: sort by name instead of newest first.
+    #[arg(short = 'n', long = "by-name")]
+    pub by_name: bool,
+    /// Emit machine-readable JSON: for a folder one object
+    /// `{entries, shown, skipped, warnings}`; for an archive what `list
+    /// --json` prints.
+    #[arg(long)]
+    pub json: bool,
+    /// Archive only: refuse a codec layer beneath the container expanding
+    /// by more than this ratio (e.g. a `.tar.gz` bomb).
+    #[arg(long)]
+    pub max_ratio: Option<u64>,
+    /// Archive only: cap the memory stuffr will ask for, e.g. 512M or 2G.
+    ///
+    /// Bounds the codec layer beneath the container, which `--max-ratio`
+    /// cannot see: a pure xz/lzma/lzip decoder sizes its dictionary from
+    /// a value the file declares in its own header, before producing any
+    /// output. Defaults to 25% of available RAM, honouring cgroup limits.
+    #[arg(long, value_name = "SIZE")]
+    pub memory_limit: Option<String>,
+    /// Archive only: fail (exit 4) if the read approximated or lost
+    /// anything.
+    #[arg(long)]
+    pub strict_fidelity: bool,
 }
 
 /// The arguments of `stuffr bench`.

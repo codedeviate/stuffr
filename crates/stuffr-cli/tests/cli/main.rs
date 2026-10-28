@@ -10,6 +10,7 @@ mod index;
 mod infozip;
 mod list_fidelity;
 mod list_test;
+mod ls;
 mod max_ratio;
 mod pack_edges;
 mod pack_findings;
