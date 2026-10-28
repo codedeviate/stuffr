@@ -7,9 +7,11 @@
 //! prepared dictionary points into its raw bytes, an encoder at the prepared
 //! dictionary attached to it, a decoder into its raw dictionary and at the
 //! metadata callbacks' context. Each of those lives in a heap allocation
-//! owned beside the pointer that uses it ([`PreparedDictionary`] behind an
-//! `Arc` the encoder clones), and every `Drop` destroys the libbrotli object
-//! before its fields are freed.
+//! held as a raw pointer ([`Owned`], from `Box::leak`) beside the
+//! libbrotli object that uses it, so moving the owner never retags the
+//! memory libbrotli points at ([`PreparedDictionary`] sits behind an `Arc`
+//! the encoder clones), and every `Drop` destroys the libbrotli object
+//! before its fields free those allocations.
 //!
 //! Every `unsafe` block is an FFI call into libbrotli and states the
 //! invariant it relies on.
@@ -134,10 +136,52 @@ pub(super) fn libbrotli_error_name(code: i32) -> &'static str {
     s.to_str().unwrap_or("INVALID")
 }
 
-/// The prepared dictionary and the raw bytes it points into.
+/// A heap allocation owned through a raw pointer: `Box::leak` on the
+/// way in, `Box::from_raw` in `Drop`. libbrotli keeps pointers into what it
+/// is handed; a `Box` moved after such a pointer was taken from it would
+/// assert unique access again (a retag under Stacked Borrows) and
+/// invalidate that pointer. Moving an `Owned` moves only the pointer.
+struct Owned<T: ?Sized> {
+    ptr: NonNull<T>,
+}
+
+impl<T: ?Sized> Owned<T> {
+    fn new(value: Box<T>) -> Self {
+        Owned {
+            ptr: NonNull::from(Box::leak(value)),
+        }
+    }
+
+    fn as_ptr(&self) -> *mut T {
+        self.ptr.as_ptr()
+    }
+}
+
+impl Owned<[u8]> {
+    fn data(&self) -> *const u8 {
+        self.ptr.as_ptr().cast::<u8>()
+    }
+
+    fn len(&self) -> usize {
+        self.ptr.len()
+    }
+}
+
+impl<T: ?Sized> Drop for Owned<T> {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` came from `Box::leak` in `new` and is freed only
+        // here; every owner drops it after destroying the libbrotli object
+        // that pointed into it.
+        drop(unsafe { Box::from_raw(self.ptr.as_ptr()) });
+    }
+}
+
+/// The prepared dictionary and the raw bytes it points into. Field order
+/// does not matter: `Drop` destroys the dictionary before any field is
+/// dropped.
 struct Prepared {
     ptr: NonNull<PreparedState>,
-    _raw: Box<[u8]>,
+    _raw: Owned<[u8]>,
 }
 
 // SAFETY: a prepared dictionary is immutable once made; libbrotli only reads
@@ -165,15 +209,16 @@ impl PreparedDictionary {
     /// Prepares `raw` at `quality` (the tool passes `BROTLI_MAX_QUALITY`).
     /// The bytes are copied: libbrotli keeps pointing into them.
     pub fn new(raw: &[u8], quality: u32) -> Result<Self, Refused> {
-        let raw: Box<[u8]> = raw.into();
-        // SAFETY: `raw` is valid for `raw.len()` bytes and outlives the
-        // prepared dictionary (both live in `Prepared`, which destroys the
-        // dictionary first); default allocator.
+        let raw = Owned::<[u8]>::new(raw.into());
+        // SAFETY: `raw` is valid for `raw.len()` bytes, held through a raw
+        // pointer that moving `Owned` does not retag, and freed only after
+        // the prepared dictionary is destroyed (`Prepared`'s `Drop`);
+        // default allocator. On failure `raw` is simply freed.
         let ptr = unsafe {
             BrotliEncoderPrepareDictionary(
                 SHARED_DICTIONARY_RAW,
                 raw.len(),
-                raw.as_ptr(),
+                raw.data(),
                 quality.min(c_int::MAX as u32) as c_int,
                 None,
                 None,
@@ -295,10 +340,11 @@ struct Callbacks {
 }
 
 unsafe extern "C" fn on_metadata_start(opaque: *mut c_void, size: usize) {
-    // SAFETY: `opaque` is the `Callbacks` box the decoder owns, registered
-    // with this function and alive for as long as the decoder state is; it
+    // SAFETY: `opaque` is the decoder's `Owned<Callbacks>` pointer, registered
+    // with this function and freed only after libbrotli stops using it; it
     // is called only during `BrotliDecoderDecompressStream`, while no other
-    // reference to it exists.
+    // reference to the `Callbacks` exists (the decoder reaches it through
+    // the same raw pointer, and only between calls).
     let cb = unsafe { &mut *opaque.cast::<Callbacks>() };
     if cb.panic.is_some() {
         return;
@@ -328,8 +374,8 @@ unsafe extern "C" fn on_metadata_chunk(opaque: *mut c_void, data: *const u8, siz
 /// `BrotliDecoderState` as `brotli.c` sets it up.
 pub struct Decoder {
     state: NonNull<DecoderState>,
-    _dictionary: Option<Box<[u8]>>,
-    callbacks: Option<Box<Callbacks>>,
+    _dictionary: Option<Owned<[u8]>>,
+    callbacks: Option<Owned<Callbacks>>,
 }
 
 impl Decoder {
@@ -350,16 +396,18 @@ impl Decoder {
             unsafe { BrotliDecoderSetParameter(state.as_ptr(), DECODER_PARAM_LARGE_WINDOW, 1) };
         }
         if let Some(d) = dict {
-            let raw: Box<[u8]> = d.into();
+            let raw = Owned::<[u8]>::new(d.into());
             // SAFETY: a live, unused decoder state; `raw` is valid for its
-            // length and stored beside the state, which is destroyed first.
-            // The tool ignores the result; so do we.
+            // length, held through a raw pointer that moving it into
+            // `decoder` does not retag, and freed only after the state is
+            // destroyed (`Decoder`'s `Drop`). The tool ignores the result;
+            // so do we.
             unsafe {
                 BrotliDecoderAttachDictionary(
                     state.as_ptr(),
                     SHARED_DICTIONARY_RAW,
                     raw.len(),
-                    raw.as_ptr(),
+                    raw.data(),
                 )
             };
             decoder._dictionary = Some(raw);
@@ -375,15 +423,16 @@ impl Decoder {
         on_start: OnMetadataStart,
         on_chunk: OnMetadataChunk,
     ) -> Result<(), Refused> {
-        let mut cb = Box::new(Callbacks {
+        let cb = Owned::new(Box::new(Callbacks {
             on_start,
             on_chunk,
             panic: None,
-        });
-        let opaque = ptr::from_mut::<Callbacks>(&mut *cb).cast::<c_void>();
-        // SAFETY: a live decoder state; `opaque` points into a box stored in
-        // `self` (replacing any earlier one only after libbrotli has been
-        // pointed at the new one), alive until the state is destroyed.
+        }));
+        let opaque = cb.as_ptr().cast::<c_void>();
+        // SAFETY: a live decoder state; `opaque` is `cb`'s raw pointer, which
+        // moving `cb` into `self` does not retag, freed only once libbrotli
+        // has been pointed elsewhere (the assignment below drops any earlier
+        // `Owned<Callbacks>` after this call) or the state is destroyed.
         unsafe {
             BrotliDecoderSetMetadataCallbacks(
                 self.state.as_ptr(),
@@ -405,8 +454,8 @@ impl Decoder {
         let mut next_out = output.as_mut_ptr();
         // SAFETY: the pointers and counts describe `input` and `output`,
         // valid for the call; libbrotli copies what it must keep into its
-        // own buffers. The callbacks' box is alive and not otherwise
-        // borrowed during the call.
+        // own buffers. The callbacks are alive and not otherwise borrowed
+        // during the call.
         let r = unsafe {
             BrotliDecoderDecompressStream(
                 self.state.as_ptr(),
@@ -420,7 +469,13 @@ impl Decoder {
         *input = &input[input.len() - available_in..];
         let produced = output.len() - available_out;
         advance_out(output, produced);
-        if let Some(p) = self.callbacks.as_mut().and_then(|cb| cb.panic.take()) {
+        // SAFETY: libbrotli has returned, so no trampoline holds a reference
+        // to the callbacks; this is the only one, through the owning pointer.
+        let panic = self
+            .callbacks
+            .as_ref()
+            .and_then(|cb| unsafe { (*cb.as_ptr()).panic.take() });
+        if let Some(p) = panic {
             resume_unwind(p);
         }
         match r {
