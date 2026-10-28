@@ -546,3 +546,19 @@ fn a_comment_with_data_round_trips_on_this_tier() {
     assert_eq!(seen.borrow().0, [4]);
     assert_eq!(seen.borrow().1, b"tier");
 }
+
+/// The crate cannot write a one-byte metadata block (its header says zero
+/// bytes): the pure tier refuses it rather than write a corrupt stream; the
+/// C tier writes it. Two bytes work on both.
+#[test]
+fn a_one_byte_metadata_block() {
+    let p = params_for(b"hello\n", 11);
+    let mut enc = Encoder::new(&p, None).expect("encoder");
+    let mut buf = vec![0u8; 64];
+    let mut meta: &[u8] = b"f";
+    let mut o: &mut [u8] = &mut buf;
+    let ok = enc.compress_stream(Operation::EmitMetadata, &mut meta, &mut o);
+    assert_eq!(ok, cfg!(feature = "brotli-c"));
+    let two = compress(b"hello\n", &p, Some(b"fo"));
+    assert!(two.windows(2).any(|w| w == b"fo"));
+}

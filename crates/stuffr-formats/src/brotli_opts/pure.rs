@@ -64,6 +64,14 @@ impl Encoder {
         input: &mut &[u8],
         output: &mut &mut [u8],
     ) -> bool {
+        // The crate writes a one-byte metadata block's header as a
+        // zero-byte one (`nbits` 0 where libbrotli 1.2.1 has 1), so the
+        // byte that follows corrupts the stream: refused instead, which the
+        // tool reports as `failed to emit metadata` (the pure tier's `-C`
+        // with a comment of one byte).
+        if op == Operation::EmitMetadata && input.len() == 1 {
+            return false;
+        }
         let op = match op {
             Operation::Process => BrotliEncoderOperation::BROTLI_OPERATION_PROCESS,
             Operation::Flush => BrotliEncoderOperation::BROTLI_OPERATION_FLUSH,
