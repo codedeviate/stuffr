@@ -300,6 +300,13 @@ mod tests {
     }
 
     #[test]
+    fn zstd_c_only_skippable_frames_decode_to_nothing() {
+        let mut bytes = skippable(0x184D_2A5E, &[7; 33]);
+        bytes.extend(skippable(0x184D_2A50, &[]));
+        assert_eq!(decompress(bytes), b"");
+    }
+
+    #[test]
     fn zstd_c_skips_skippable_frames_before_between_and_after() {
         let (a, b) = (b"first frame ".repeat(500), b"second frame".repeat(50));
         let mut bytes = skippable(0x184D_2A50, &[1; 5]);
