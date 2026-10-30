@@ -1409,14 +1409,26 @@ pub struct Inspection {
 
 /// Identifies a stream without decoding it (beyond the probe prefix, which
 /// [`Inspection::unconfirmed_layer`] decodes to judge the inner layers),
-/// using the build's default registry.
+/// using the build's default registry and memory limit.
 pub fn inspect(src: Input) -> Result<Inspection> {
     inspect_with(crate::registry(), src)
 }
 
-/// Identifies a stream without decoding it, consulting `registry` rather
-/// than the build's default.
+/// [`inspect`], consulting `registry` rather than the build's default.
 pub fn inspect_with(registry: &Registry, src: Input) -> Result<Inspection> {
+    inspect_with_limit(registry, src, crate::default_memory_limit())
+}
+
+/// [`inspect_with`] under the caller's `memory_limit` (bytes) for the probe
+/// prefix's decode: the bound `--memory-limit` sets for every other verb. A
+/// codec layer whose decoder the limit refuses (a `.lzma` header asking for
+/// a 240 MiB dictionary under `--memory-limit 4M`) is not decoded, so the
+/// layers beneath it are not judged; nothing else changes.
+pub fn inspect_with_limit(
+    registry: &Registry,
+    src: Input,
+    memory_limit: u64,
+) -> Result<Inspection> {
     refuse_directory_for(&src, "info")?;
     let path = src.path().map(Path::to_path_buf);
 
@@ -1468,7 +1480,7 @@ pub fn inspect_with(registry: &Registry, src: Input) -> Result<Inspection> {
     // Decodes nothing beyond the prefix already in memory, under the bound
     // every verb given this file would use.
     let opts = DecodeOpts {
-        memory_limit: Some(crate::default_memory_limit()),
+        memory_limit: Some(memory_limit),
         ..Default::default()
     };
     let unconfirmed_layer = stuffr_core::first_unconfirmed_layer(registry, &chain, &prefix, &opts);

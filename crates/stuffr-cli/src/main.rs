@@ -686,7 +686,9 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             // `default_memory_limit()`'s 25%-of-available-RAM reading).
             let memory_limit =
                 parse_memory_limit(memory_limit)?.unwrap_or_else(stuffr::default_memory_limit);
-            let i = ops::inspect(input_of(&input))?;
+            // The same bound governs the probe prefix's decode, which judges
+            // the inner layers.
+            let i = ops::inspect_with_limit(stuffr::registry(), input_of(&input), memory_limit)?;
             let mut out = std::io::stdout();
             if json {
                 let mut v = serde_json::to_value(&i).expect("Inspection serializes");
@@ -698,8 +700,9 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 writeln!(out, "format:   {}", i.format)?;
                 writeln!(out, "chain:    {}", i.chain)?;
                 writeln!(out, "detected: {}", i.detected_by)?;
-                // Only when a layer did not check out, so a file whose every
-                // layer confirms prints exactly what it always printed.
+                // Only when a layer did not check out: a file whose every
+                // layer confirms gets no `checks:` line (the `detected:` line
+                // above is printed for every file).
                 if let Some(layer) = i.unconfirmed_layer {
                     writeln!(out, "checks:   {layer} did not check out")?;
                 }

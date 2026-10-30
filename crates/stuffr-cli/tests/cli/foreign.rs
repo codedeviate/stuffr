@@ -406,3 +406,98 @@ fn info_names_the_inner_layer_that_did_not_check_out() {
     let text = String::from_utf8(run_output(&["info", x.to_str().unwrap()]).stdout).unwrap();
     assert!(text.contains("checks:   arc did not check out\n"), "{text}");
 }
+
+/// `info` agrees with `ls` on a magicless inner layer: a v7 tar under gzip
+/// and the empty archive tar writes (ten zero blocks, bare and gzipped)
+/// all check out — no `checks:` line — while text named `.tar.gz` is named
+/// as the layer that did not.
+#[test]
+fn info_passes_v7_and_empty_tars() {
+    let dir = tmp_dir();
+    let v7 = dir.join("v7.tar.gz");
+    std::fs::write(&v7, gzip_wrap(&crate::ls::v7_tar())).unwrap();
+    let empty = dir.join("empty.tar");
+    std::fs::write(&empty, vec![0u8; 10240]).unwrap();
+    let empty_gz = dir.join("empty.tar.gz");
+    std::fs::write(&empty_gz, gzip_wrap(&[0u8; 10240])).unwrap();
+    for (path, chain) in [
+        (&v7, "tar over gzip"),
+        (&empty, "tar"),
+        (&empty_gz, "tar over gzip"),
+    ] {
+        let o = run_output(&["info", path.to_str().unwrap()]);
+        let (code, err) = outcome(&o);
+        assert_eq!(code, Some(0), "{err}");
+        let text = String::from_utf8(o.stdout).unwrap();
+        assert!(text.contains(&format!("chain:    {chain}\n")), "{text}");
+        assert!(!text.contains("checks:"), "{}: {text}", path.display());
+    }
+    let y = dir.join("y.tar.gz");
+    std::fs::write(&y, gzip_wrap(&b"not a tar, just words\n".repeat(30))).unwrap();
+    let text = String::from_utf8(run_output(&["info", y.to_str().unwrap()]).stdout).unwrap();
+    assert!(text.contains("checks:   tar did not check out\n"), "{text}");
+}
+
+/// `info --memory-limit` bounds the prefix decode that judges inner layers.
+/// A small `.tar.lzma` whose header asks for a 32 MiB dictionary (the
+/// review's file asked for 240 MiB and peaked at 263 MB under `4M`), over a
+/// tar whose checksum is broken: under a roomy limit the inner tar is
+/// decoded and named; under `--memory-limit 4M` the lzma decoder is
+/// refused, the tar is not judged, and nothing else changes.
+#[test]
+fn info_decodes_inner_layers_under_the_memory_limit() {
+    let dir = tmp_dir();
+    let mut tar = crate::common::small_tar();
+    tar[0] ^= 0x01;
+    let raw = dir.join("inner.bin");
+    std::fs::write(&raw, &tar).unwrap();
+    let packed = dir.join("inner.lzma");
+    let o = run_output(&[
+        "pack",
+        raw.to_str().unwrap(),
+        "-o",
+        packed.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let mut lzma = std::fs::read(&packed).unwrap();
+    lzma[1..5].copy_from_slice(&(32u32 << 20).to_le_bytes());
+    let big = dir.join("b.tar.lzma");
+    std::fs::write(&big, &lzma).unwrap();
+    let bs = big.to_str().unwrap();
+
+    let o = run_output(&["info", "--memory-limit", "1G", bs]);
+    let (code, err) = outcome(&o);
+    assert_eq!(code, Some(0), "{err}");
+    let roomy = String::from_utf8(o.stdout).unwrap();
+    assert!(
+        roomy.contains("checks:   tar did not check out\n"),
+        "{roomy}"
+    );
+
+    // The C tier's lzma decoder (liblzma's alone decoder, `lzma_c.rs`) is
+    // built with no memory limit at all, for every verb: `info` hands it the
+    // limit and it does not look. Only the pure tier refuses here.
+    if cfg!(feature = "lzma-c") {
+        return;
+    }
+
+    let o = run_output(&["info", "--memory-limit", "4M", bs]);
+    let (code, err) = outcome(&o);
+    assert_eq!(code, Some(0), "{err}");
+    let tight = String::from_utf8(o.stdout).unwrap();
+    assert!(!tight.contains("checks:"), "{tight}");
+    assert!(tight.contains("chain:    tar over lzma\n"), "{tight}");
+    // Everything but the `checks:` and `memory:` lines is the same report.
+    let keep = |t: &str| {
+        t.lines()
+            .filter(|l| !l.starts_with("checks:") && !l.starts_with("memory:"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(keep(&roomy), keep(&tight));
+}

@@ -799,7 +799,9 @@ fn a_corrupt_tar_inside_a_named_gzip_is_still_corrupt() {
 
 /// Review Focus 2: a small real `.tar.gz` (the whole file inside the probe
 /// window) lists as `tar+gzip`; a `.tar.xz` whose first 4096 bytes decode
-/// to less than one tar header lists as `xz` — neither is ever hidden.
+/// to less than one tar header (no `ustar` yet in sight) lists as `tar+xz`,
+/// as 0.21.0 listed it: the name says tar and tar's check refuses nothing it
+/// can see of a header cut short — neither is ever hidden.
 #[test]
 fn small_and_slow_archives_stay_listed() {
     let dir = tmp_dir();
@@ -825,7 +827,10 @@ fn small_and_slow_archives_stay_listed() {
         .collect();
     assert_eq!(
         formats,
-        [("slow.tar.xz", "xz"), ("small.tar.gz", "tar over gzip")],
+        [
+            ("slow.tar.xz", "tar over xz"),
+            ("small.tar.gz", "tar over gzip")
+        ],
         "{v}"
     );
     // The verbs still read it whole.
@@ -882,4 +887,118 @@ fn one_byte_block_xz(data: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&footer);
     out.extend_from_slice(b"YZ");
     out
+}
+
+/// `small_tar` as a v7 archive: the `ustar` magic and version cleared, the
+/// header checksum recomputed. A real tar nothing but its checksum and its
+/// name identify.
+pub(crate) fn v7_tar() -> Vec<u8> {
+    let mut t = small_tar();
+    t[257..265].fill(0);
+    t[148..156].copy_from_slice(b"        ");
+    let sum: u32 = t[..512].iter().map(|&b| u32::from(b)).sum();
+    t[148..155].copy_from_slice(format!("{sum:06o}\0").as_bytes());
+    t
+}
+
+/// `(path, format)` for every entry of `ls -n --json` in `dir`.
+fn listed(dir: &Path) -> Vec<(String, String)> {
+    let o = run_in_dir_output(dir, &["ls", "-n", "--json"]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    v["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["path"].as_str().unwrap().to_string(),
+                e["format"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The final review's measurements: whole files shorter than the header
+/// their magic begins. `stuffr list` calls each corrupt, so `ls` must not
+/// list them; 0.21.0's `ls` and this branch's first cut both did.
+#[test]
+fn ls_hides_whole_files_cut_inside_their_first_header() {
+    let dir = tmp_dir();
+    let mut tar300 = small_tar();
+    tar300.truncate(300);
+    let shapes: [(&str, Vec<u8>); 7] = [
+        ("x.arc", vec![0x1a, 0x08, 0x58, 0x60]),
+        ("x.cpio", b"070701".to_vec()),
+        ("x.arj", vec![0x60, 0xea, 0x00]),
+        ("x.zip", b"PK\x03\x04\x14".to_vec()),
+        ("x.a", b"!<arch>\n!".to_vec()),
+        ("headers.js", tar300),
+        ("x.gz", vec![0x1f, 0x8b]),
+    ];
+    for (name, bytes) in &shapes {
+        std::fs::write(dir.join(name), bytes).unwrap();
+    }
+    let (out, err, code) = ls(&dir, &["ls"]);
+    assert_eq!(
+        (out.as_str(), err.as_str(), code),
+        (footer(0, shapes.len()).as_str(), "", Some(0))
+    );
+    // The verbs, given one by name, still reach a reader and call it corrupt.
+    for (name, _) in &shapes {
+        let (_, err, code) = ls(&dir, &["list", name]);
+        assert_eq!(code, Some(5), "{name}: {err}");
+    }
+    // A complete, empty ar archive is one.
+    std::fs::write(dir.join("empty.a"), b"!<arch>\n").unwrap();
+    assert_eq!(listed(&dir), [("empty.a".to_string(), "ar".to_string())]);
+}
+
+/// A codec over decoded bytes with no magic: the name's inner container is
+/// taken when its own check accepts the bytes, as 0.21.0 listed it, and
+/// never on the name alone.
+#[test]
+fn ls_names_a_magicless_inner_layer_only_when_it_checks_out() {
+    let dir = tmp_dir();
+    std::fs::write(dir.join("v7.tar.gz"), gzip_wrap(&v7_tar())).unwrap();
+    let text = b"not a tar at all, just some words\n".repeat(30);
+    std::fs::write(dir.join("y.tar.gz"), gzip_wrap(&text)).unwrap();
+    // `tar -cf x.tar -T /dev/null`: ten zero blocks.
+    std::fs::write(dir.join("empty.tar"), vec![0u8; 10240]).unwrap();
+    std::fs::write(dir.join("empty.tar.gz"), gzip_wrap(&[0u8; 10240])).unwrap();
+    // brotli inside xz: packed as the CLI packs it.
+    let plain = dir.join("plain.txt");
+    std::fs::write(&plain, b"hello hello hello hello brotli").unwrap();
+    let br = dir.join("x.br");
+    let brxz = dir.join("x.br.xz");
+    for (from, to) in [(&plain, &br), (&br, &brxz)] {
+        let o = run_output(&["pack", from.to_str().unwrap(), "-o", to.to_str().unwrap()]);
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+    std::fs::remove_file(&plain).unwrap();
+    std::fs::remove_file(&br).unwrap();
+
+    let want: Vec<(String, String)> = [
+        ("empty.tar", "tar"),
+        ("empty.tar.gz", "tar over gzip"),
+        ("v7.tar.gz", "tar over gzip"),
+        ("x.br.xz", "xz"),
+        ("y.tar.gz", "gzip"),
+    ]
+    .iter()
+    .map(|(p, f)| (p.to_string(), f.to_string()))
+    .collect();
+    assert_eq!(listed(&dir), want);
+    let (out, _, _) = ls(&dir, &["ls", "-n"]);
+    assert!(out.contains("tar+gzip"), "{out}");
 }
