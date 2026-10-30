@@ -2258,6 +2258,17 @@ into existing scripts unchanged: `bzip2`, `bunzip2`, `bzcat` and
 `bzip2recover`, `gzip`, `xz`, `zstd`, `lz4`, `unzip` with its siblings,
 `compress`/`uncompress` and `zip` with its siblings today, one family per release — see [Compatibility links](#compatibility-links).
 
+`info`'s `detected:` line says how the outer format was decided: `magic`
+(its signature, with a header that checks out), `extension` (no signature
+matched; the file name decided), or `magic-unconfirmed` /
+`extension-unconfirmed` when the format's header check refused the bytes —
+a damaged file, or one that is not that format at all. The verbs still read
+such a file (a damaged archive you name is reported corrupt, exit 5, and
+`salvage` can scan it). When a layer did not check out, `info` adds
+`checks:   tar did not check out` naming it — an inner one too, such as the
+tar of a `.tar.gz` whose first header fails its checksum — and `--json`
+adds `unconfirmed_layer`; a file whose every layer checks out prints neither.
+
 ### Finding archives: `stuffr ls`
 
 `stuffr ls` on a folder (or with no argument, the current one) lists the
@@ -2272,9 +2283,17 @@ zip        18M  Oct 21 09:41  photos.zip
 3 of 5 files shown, 2 not openable
 ```
 
-A file is listed when its first 4096 bytes carry the magic of a format this
-build reads, so an extensionless gzip is found and a `.zip` that is really an
-HTML page is not; nothing is decoded. On macOS, a file kept only in iCloud
+A file is listed only when its header checks out behind its signature: its
+first 4096 bytes carry the magic of a format this build reads, and the
+format's own header check accepts what follows (a format with no magic,
+brotli, is listed by its extension). So an extensionless gzip is found, while
+a `.zip` that is really an HTML page, or text that happens to begin with a
+format's magic bytes, is not. A compressed file's inner layer is decoded from
+those 4096 bytes alone to name it (`tar+gzip`); `ls` reads nothing more than
+that and the last 512 bytes. Apple disk images (`.dmg`, recognised by their
+`koly` trailer) are not listed, and every verb but `salvage` refuses one with
+exit 3 (`--format` overrides that); a disk image piped in on stdin cannot be
+recognised, and stuffr may decode its first chunk. On macOS, a file kept only in iCloud
 or another cloud provider (not downloaded) is never opened, since reading it
 would download it, so it is not identified and counts as not openable. Sizes are `ls -lh`'s, dates `ls -l`'s
 in local time, and the footer (left out when it would say 0) counts the

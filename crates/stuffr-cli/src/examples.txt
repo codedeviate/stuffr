@@ -508,8 +508,8 @@ INSPECTING A STREAM WITHOUT DECODING IT
   stream can only be read once, so this is the tool telling you the format
   was inferred from bytes it saw going by, not confirmed by looking back.
 
-  The heading is literal: info does not decode, and it does not OPEN an
-  archive either. So it reports `fidelity: not evaluated` instead of
+  The heading is nearly literal: info decodes nothing past the first 4096
+  bytes (see `detected:` below), and it does not OPEN an archive either. So it reports `fidelity: not evaluated` instead of
   "nothing approximated" wherever a forward read of that container could
   genuinely have lost something and info has not looked. Today that means
   zip, the only container here that keeps its index at the END of the
@@ -530,10 +530,22 @@ INSPECTING A STREAM WITHOUT DECODING IT
   container at all. In `--json` the same distinction is the
   `fidelity_evaluated` field, because `"warnings": []` cannot carry it.
 
+  The `detected:` line says how the outer format was decided: `magic`,
+  `extension` (no magic matched; the name decided), or `magic-unconfirmed`
+  / `extension-unconfirmed` when that format's header check refused the
+  bytes. Such a file is still read by every verb, so a damaged archive you
+  name is reported corrupt (exit 5) and stays reachable by salvage. When a
+  layer did not check out, a `checks:` line names it — `checks:   tar did
+  not check out` for a `.tar.gz` whose tar header fails its checksum —
+  and --json adds `unconfirmed_layer`. To judge an inner layer info
+  decodes the first 4096 bytes and nothing more; a file whose every layer
+  checks out shows neither.
+
   One limit worth knowing: on a PIPE with no filename, info resolves only
   the outer layer. `cat bundle.zip.gz | stuffr info -` reports `chain:
-  gzip`, because seeing the zip inside would mean running the decoder,
-  which info does not do. It reports honestly on what it identified.
+  gzip`, because seeing the zip inside would mean resolving a layer from
+  decoded bytes, which info does not do (it decodes only to check a layer
+  the name already gave). It reports honestly on what it identified.
 
 
 LISTING AND TESTING AN ARCHIVE
@@ -885,12 +897,17 @@ FINDING ARCHIVES IN A FOLDER
         [FOLDER]        Oct 20 11:02  old/
         3 of 5 files shown, 2 not openable
 
-      A file is listed when its first 4096 bytes carry the magic of a format
-      this build reads, so `export` above is found with no extension and a
-      `photos.zip` that is really an HTML error page is not. Only a format
-      with no magic at all (brotli) is recognised by its extension. Nothing
-      is decoded: the format column is what `stuffr info` names without
-      decoding, ` over ` written `+`. On macOS, a file kept only in iCloud
+      A file is listed only when its header checks out behind its
+      signature: its first 4096 bytes carry the magic of a format this
+      build reads, and that format's own header check accepts what follows.
+      So `export` above is found with no extension, while a `photos.zip`
+      that is really an HTML error page, or text that happens to begin with
+      a format's magic, is not. Only a format with no magic at all (brotli)
+      is recognised by its extension. A compressed file's inner layer is
+      decoded from those 4096 bytes alone to name it (` over ` written
+      `+`); nothing past them is read but the last 512 bytes. Apple disk
+      images (their `koly` trailer) are not listed: every verb but salvage
+      refuses one, exit 3. On macOS, a file kept only in iCloud
       or another cloud provider (not downloaded) is never opened, since
       reading it would download it, so it is not identified. Sizes are `ls -lh`'s; dates `ls -l`'s,
       in local time. The footer counts the files that are not openable and

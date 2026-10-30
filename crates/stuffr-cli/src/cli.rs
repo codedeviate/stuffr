@@ -336,10 +336,12 @@ pub enum Command {
     ///
     /// Given a folder, or nothing (the current folder): one row per file
     /// stuffr can open, newest first, as `FORMAT  SIZE  DATE  NAME`, plus
-    /// every subfolder as a `[FOLDER]` row. A file is listed when its first
-    /// bytes carry a readable format's magic; nothing is decoded. A footer
-    /// `N of M files shown, K not openable` counts the rest. A file or
-    /// subfolder that cannot be read is named on stderr and the exit is 4.
+    /// every subfolder as a `[FOLDER]` row. A file is listed when its header
+    /// checks out behind a readable format's signature; a compressed file's
+    /// inner layer is decoded from its first 4 KiB to name it. Apple disk
+    /// images are recognised and not listed. A footer `N of M files shown,
+    /// K not openable` counts the rest. A file or subfolder that cannot be
+    /// read is named on stderr and the exit is 4.
     ///
     /// Given an archive or compressed file, or `-`: exactly `stuffr list`,
     /// with its options. `files` is a second name for the folder listing
