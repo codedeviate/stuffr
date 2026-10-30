@@ -486,7 +486,11 @@ fn a_weak_encoder_is_refused_without_explicit_consent() {
                 ..CodecCaps::round_trip()
             }
         }
-        fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> Result<Box<dyn Source>> {
+        fn decoder<'a>(
+            &self,
+            src: Box<dyn Source + 'a>,
+            o: &DecodeOpts,
+        ) -> Result<Box<dyn Source + 'a>> {
             stuffr_core::testing::MockCodec.decoder(src, o)
         }
         fn encoder(&self, d: Box<dyn Write + Send>, o: &EncodeOpts) -> Result<Box<dyn Sink>> {

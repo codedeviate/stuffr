@@ -53,7 +53,11 @@ impl Codec for Deflate {
         }
     }
 
-    fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+    fn decoder<'a>(
+        &self,
+        src: Box<dyn Source + 'a>,
+        _o: &DecodeOpts,
+    ) -> Result<Box<dyn Source + 'a>> {
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
             DeflateDecoder::new(src),
             MALFORMED_AS_INVALID_INPUT_EOF,

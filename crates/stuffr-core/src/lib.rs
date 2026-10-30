@@ -51,8 +51,9 @@ pub use probe::{
 pub use registry::{FormatRow, Registry};
 pub use size::format_size;
 pub use source::{
-    Counting, CountingWriter, DEFAULT_MAX_RATIO, FileSource, PeekSource, RATIO_FLOOR, RatioGuard,
-    ReaderSource, SeekRead, Source, SourceCaps, SpillPolicy, SpillSource, SpillWriter, StreamOnly,
+    BorrowedSource, Counting, CountingWriter, DEFAULT_MAX_RATIO, FileSource, PeekSource,
+    RATIO_FLOOR, RatioGuard, ReaderSource, SeekRead, Source, SourceCaps, SpillPolicy, SpillSource,
+    SpillWriter, StreamOnly, decode_reader,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

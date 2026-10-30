@@ -168,6 +168,11 @@ impl EntryMeta {
 /// this tree does either: entries are read on the thread that asked for
 /// them. Dropping the bound is strictly more permissive, so a container whose
 /// reader IS `Send` is unaffected.
+///
+/// Since 0.23.0 a codec decodes straight from it: `Source` is no longer
+/// `Send` and [`Codec::decoder`] takes a borrowed `Box<dyn Source + 'a>`, so
+/// `decode_reader(&codec, entry.reader(), &opts)` decodes a `.Z` or `.gz`
+/// member in place, without copying it out first.
 pub struct Entry<'a> {
     meta: EntryMeta,
     reader: Box<dyn Read + 'a>,
@@ -318,7 +323,15 @@ pub trait Codec: Send + Sync {
     /// Decodes `src`. Returns a [`Source`] rather than a bare reader so a codec
     /// carrying a frame index can advertise seekability to the layer above;
     /// forward-only codecs wrap their reader in [`crate::StreamOnly`].
-    fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> Result<Box<dyn Source>>;
+    ///
+    /// `src` may borrow (`'a`) and need not be `Send`: an archive member's
+    /// reader is both, and the decoder over it lives no longer than it. A
+    /// caller holding a plain reader uses [`crate::decode_reader`].
+    fn decoder<'a>(
+        &self,
+        src: Box<dyn Source + 'a>,
+        o: &DecodeOpts,
+    ) -> Result<Box<dyn Source + 'a>>;
     fn encoder(&self, dst: Box<dyn Write + Send>, o: &EncodeOpts) -> Result<Box<dyn Sink>>;
 }
 

@@ -63,21 +63,21 @@ const GZIP_MAGIC: &[MagicRule] = &[MagicRule {
 /// `bufread` variant, operating directly on a caller-owned `BufReader`,
 /// consumes precisely what the deflate stream needs and leaves the rest
 /// sitting in that same `BufReader` for `fill_buf` to see.
-struct MultiMemberGzip {
+struct MultiMemberGzip<'a> {
     /// `None` only once a clean stop has been decided; every further read
     /// returns `Ok(0)` without repeating the peek.
-    cur: Option<GzMemberDecoder<BufReader<Box<dyn Source>>>>,
+    cur: Option<GzMemberDecoder<BufReader<Box<dyn Source + 'a>>>>,
 }
 
-impl MultiMemberGzip {
-    fn new(src: Box<dyn Source>) -> Self {
+impl<'a> MultiMemberGzip<'a> {
+    fn new(src: Box<dyn Source + 'a>) -> Self {
         Self {
             cur: Some(GzMemberDecoder::new(BufReader::new(src))),
         }
     }
 }
 
-impl std::io::Read for MultiMemberGzip {
+impl std::io::Read for MultiMemberGzip<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
             let Some(dec) = self.cur.as_mut() else {
@@ -154,7 +154,11 @@ impl Codec for Gzip {
     ///
     /// `MultiMemberGzip` is wrapped again in `NormalizeDecodeErrors` first:
     /// see `crate::normalize` for why.
-    fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+    fn decoder<'a>(
+        &self,
+        src: Box<dyn Source + 'a>,
+        _o: &DecodeOpts,
+    ) -> Result<Box<dyn Source + 'a>> {
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
             MultiMemberGzip::new(src),
             MALFORMED_AS_INVALID_INPUT_EOF,

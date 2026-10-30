@@ -1,8 +1,10 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
 
 use stuffr_core::{
     ArchiveRead, ArchiveWrite, Chain, Codec, Container, ContainerCaps, Counting, CountingWriter,
@@ -224,20 +226,15 @@ impl Source for RatioGuardedSource {
 /// Never seekable, and that is not a loss: it is installed only over a codec
 /// layer, and a decoded stream is forward-only (`StreamOnly`) — the ladder
 /// spools it when a container needs a seek. `as_seek` could not hand out a
-/// reference through the lock anyway, so `caps` says the same thing.
-struct SharedSource(Arc<Mutex<Box<dyn Source>>>);
-
-impl SharedSource {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Box<dyn Source>> {
-        // A panic mid-read leaves nothing half-updated that a later read
-        // could misinterpret: the stream is simply wherever it stopped.
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
+/// reference through the `RefCell` anyway, so `caps` says the same thing.
+///
+/// `Rc<RefCell<..>>`, not `Arc<Mutex<..>>`: a `Source` is not `Send`
+/// (0.23.0), and both handles live on the thread that opened the archive.
+struct SharedSource(Rc<RefCell<Box<dyn Source>>>);
 
 impl std::io::Read for SharedSource {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.lock().read(buf)
+        self.0.borrow_mut().read(buf)
     }
 }
 
@@ -245,7 +242,7 @@ impl Source for SharedSource {
     fn caps(&self) -> SourceCaps {
         SourceCaps {
             seekable: false,
-            ..self.lock().caps()
+            ..self.0.borrow().caps()
         }
     }
 
@@ -278,7 +275,7 @@ struct DrainAtEnd {
     inner: Box<dyn ArchiveRead>,
     /// `None` once drained, so the check runs once however often the walk is
     /// asked for its end.
-    rest: Option<Arc<Mutex<Box<dyn Source>>>>,
+    rest: Option<Rc<RefCell<Box<dyn Source>>>>,
 }
 
 impl ArchiveRead for DrainAtEnd {
@@ -398,8 +395,8 @@ fn open_resolved(
     // container needs none: no codec check is waiting at its end, and a
     // seekable one (zip) must keep its `as_seek`.
     let (source, rest) = if matches!(chain, Chain::Codec { .. }) {
-        let shared = Arc::new(Mutex::new(source));
-        let source: Box<dyn Source> = Box::new(SharedSource(Arc::clone(&shared)));
+        let shared = Rc::new(RefCell::new(source));
+        let source: Box<dyn Source> = Box::new(SharedSource(Rc::clone(&shared)));
         (source, Some(shared))
     } else {
         (source, None)

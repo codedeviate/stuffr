@@ -245,7 +245,11 @@ impl Codec for CompressZ {
     /// See the module doc for why this is `LzwZReader`, a from-scratch
     /// incremental port of `newtua-lzw-z`'s own algorithm, rather than a
     /// wrapper over that crate's `Decoder`.
-    fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+    fn decoder<'a>(
+        &self,
+        src: Box<dyn Source + 'a>,
+        _o: &DecodeOpts,
+    ) -> Result<Box<dyn Source + 'a>> {
         Ok(Box::new(StreamOnly::new(LzwZReader::new(src))))
     }
 

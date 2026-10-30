@@ -147,7 +147,11 @@ impl Codec for Snappy {
     /// it. See that constant's doc comment in `normalize.rs` for the full
     /// measurement and the argument for why folding `Other` onto
     /// `InvalidData` is safe specifically for this backend.
-    fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+    fn decoder<'a>(
+        &self,
+        src: Box<dyn Source + 'a>,
+        _o: &DecodeOpts,
+    ) -> Result<Box<dyn Source + 'a>> {
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
             FrameDecoder::new(src),
             SNAPPY_MALFORMED_AS_OTHER_EOF,

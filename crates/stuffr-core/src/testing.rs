@@ -712,9 +712,9 @@ pub const MOCK_CONTAINER: FormatId = FormatId::new("mock-container");
 /// round-trip bug cannot hide behind a matching pair of mistakes.
 pub struct MockCodec;
 
-struct XorReader(Box<dyn Read + Send>);
+struct XorReader<'a>(Box<dyn Read + 'a>);
 
-impl Read for XorReader {
+impl Read for XorReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.0.read(buf)?;
         for b in &mut buf[..n] {
@@ -758,7 +758,11 @@ impl Codec for MockCodec {
         }
     }
 
-    fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+    fn decoder<'a>(
+        &self,
+        src: Box<dyn Source + 'a>,
+        _o: &DecodeOpts,
+    ) -> Result<Box<dyn Source + 'a>> {
         Ok(Box::new(crate::source::StreamOnly::new(XorReader(
             Box::new(src),
         ))))

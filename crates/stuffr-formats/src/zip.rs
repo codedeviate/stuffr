@@ -158,7 +158,6 @@
 use std::cell::RefCell;
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use stuffr_core::{
@@ -576,29 +575,27 @@ fn method_hint(id: u16) -> &'static str {
 /// entry's payload) under `&mut self`, so no `ZipFile` is alive then, and the
 /// archive repositions itself on every `by_index*` before reading.
 #[derive(Clone)]
-struct SeekAdapter(Arc<Mutex<Box<dyn Source>>>);
+struct SeekAdapter(Rc<RefCell<Box<dyn Source>>>);
 
 impl SeekAdapter {
     fn new(source: Box<dyn Source>) -> Self {
-        Self(Arc::new(Mutex::new(source)))
+        Self(Rc::new(RefCell::new(source)))
     }
 
-    fn lock(&self) -> io::Result<std::sync::MutexGuard<'_, Box<dyn Source>>> {
-        self.0
-            .lock()
-            .map_err(|_| io::Error::other("zip: source lock poisoned"))
+    fn lock(&self) -> std::cell::RefMut<'_, Box<dyn Source>> {
+        self.0.borrow_mut()
     }
 }
 
 impl Read for SeekAdapter {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.lock()?.read(buf)
+        self.lock().read(buf)
     }
 }
 
 impl Seek for SeekAdapter {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let mut guard = self.lock()?;
+        let mut guard = self.lock();
         let seek: &mut dyn SeekRead = guard
             .as_seek()
             .ok_or_else(|| io::Error::other("zip: source reported seekable but cannot seek"))?;

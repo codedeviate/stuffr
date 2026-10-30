@@ -14,19 +14,19 @@ use super::{SeekRead, Source, SourceCaps};
 /// the ladder can run between codec and container.
 pub struct StreamOnly<R>(R);
 
-impl<R: Read + Send> StreamOnly<R> {
+impl<R: Read> StreamOnly<R> {
     pub fn new(inner: R) -> Self {
         Self(inner)
     }
 }
 
-impl<R: Read + Send> Read for StreamOnly<R> {
+impl<R: Read> Read for StreamOnly<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.0.read(buf)
     }
 }
 
-impl<R: Read + Send> Source for StreamOnly<R> {
+impl<R: Read> Source for StreamOnly<R> {
     fn caps(&self) -> SourceCaps {
         SourceCaps {
             seekable: false,

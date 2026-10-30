@@ -390,7 +390,11 @@ impl Codec for Xz {
     /// instead returns straight out of THIS `decoder()` call as a bare
     /// `Error::Io` (exit 1, "stuffr failed", for input that is actually
     /// corrupt): 7d157b9's bug again, at a different call site.
-    fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> Result<Box<dyn Source>> {
+    fn decoder<'a>(
+        &self,
+        src: Box<dyn Source + 'a>,
+        o: &DecodeOpts,
+    ) -> Result<Box<dyn Source + 'a>> {
         let mut buffered = BufReader::new(src);
         if let Some(limit) = o.memory_limit {
             let prefix = buffered.fill_buf().unwrap_or(&[]);

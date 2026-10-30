@@ -564,7 +564,11 @@ impl Codec for Lzip {
     /// instead returns straight out of THIS `decoder()` call as a bare
     /// `Error::Io` (exit 1, "stuffr failed", for input that is actually
     /// corrupt): 7d157b9's bug again, at a different call site.
-    fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> Result<Box<dyn Source>> {
+    fn decoder<'a>(
+        &self,
+        src: Box<dyn Source + 'a>,
+        o: &DecodeOpts,
+    ) -> Result<Box<dyn Source + 'a>> {
         let mut buffered = BufReader::new(src);
         if let Some(limit) = o.memory_limit {
             let prefix = buffered.fill_buf().unwrap_or(&[]);
@@ -1000,8 +1004,8 @@ impl<R: BufRead> Read for LzipPureDecoder<R> {
 /// tool's trailing-data rule" for why the trailing-bytes check is not a
 /// blanket "any leftover byte is corrupt" — that was Review Round 1's
 /// finding: it rejected files the reference `lzip` accepts.
-struct GuardedLzipReader {
-    inner: LzipPureDecoder<BufReader<Box<dyn Source>>>,
+struct GuardedLzipReader<'a> {
+    inner: LzipPureDecoder<BufReader<Box<dyn Source + 'a>>>,
     state: GuardState,
 }
 
@@ -1029,9 +1033,9 @@ enum TrailingVerdict {
     Reject(&'static str),
 }
 
-impl GuardedLzipReader {
+impl<'a> GuardedLzipReader<'a> {
     /// Takes an already-constructed `BufReader` rather than a bare
-    /// `Box<dyn Source>` so `Codec::decoder` can peek the header's declared
+    /// `Box<dyn Source + 'a>` so `Codec::decoder` can peek the header's declared
     /// dictionary size (via one non-destructive `fill_buf` call — see the
     /// module doc's "Decode memory bound" section) *before* this type, and
     /// the [`LzipPureDecoder`] it wraps, ever exist — nothing already
@@ -1041,7 +1045,7 @@ impl GuardedLzipReader {
     /// `memory_limit` is handed straight down to `LzipStream::new_mem_limit`,
     /// which is what bounds the SECOND and every later member; the
     /// pre-flight in `Codec::decoder` only ever sees the first.
-    fn new(buffered: BufReader<Box<dyn Source>>, memory_limit: Option<u64>) -> Self {
+    fn new(buffered: BufReader<Box<dyn Source + 'a>>, memory_limit: Option<u64>) -> Self {
         Self {
             inner: LzipPureDecoder::new(buffered, memory_limit),
             state: GuardState::Unchecked,
@@ -1222,7 +1226,7 @@ impl GuardedLzipReader {
     }
 }
 
-impl Read for GuardedLzipReader {
+impl Read for GuardedLzipReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         // Same guard every codec in this crate that wraps a stateful
         // decoder uses: an empty read must not be misread as genuine

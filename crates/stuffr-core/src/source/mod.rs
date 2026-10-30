@@ -1,6 +1,7 @@
 //! Input abstraction. A container never opens a file — it asks a `Source` what
 //! it can do, and the ladder (see [`crate::ladder`]) supplies the best rung.
 
+mod borrowed;
 pub mod decode_side;
 mod file;
 pub mod limit;
@@ -9,6 +10,7 @@ mod seek_guard;
 pub mod spill;
 pub mod stream_only;
 
+pub use borrowed::{BorrowedSource, decode_reader};
 pub use decode_side::{DecodeSideSource, is_decode_side, mark_decode_side};
 pub use file::FileSource;
 pub use limit::{Counting, CountingWriter, DEFAULT_MAX_RATIO, RATIO_FLOOR, RatioGuard};
@@ -20,8 +22,11 @@ pub use stream_only::StreamOnly;
 use std::io::{Read, Seek};
 
 /// Blanket-implemented marker so `&mut dyn SeekRead` is usable as a trait object.
-pub trait SeekRead: Read + Seek + Send {}
-impl<T: Read + Seek + Send> SeekRead for T {}
+///
+/// Not `Send`, like [`Source`] (since 0.23.0): a seek adapter over a
+/// `Box<dyn Source>` is no longer `Send`, and nothing sends one.
+pub trait SeekRead: Read + Seek {}
+impl<T: Read + Seek> SeekRead for T {}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct SourceCaps {
@@ -31,7 +36,12 @@ pub struct SourceCaps {
 }
 
 /// An input stream that reports its own capabilities.
-pub trait Source: Read + Send {
+///
+/// Not `Send` (since 0.23.0). A decoder must be able to sit over an archive
+/// member's reader, which borrows the archive and is `!Send` (see
+/// [`crate::Entry`]); nothing in the tree moves a `Source` across threads.
+/// A site that does need to asks for `Box<dyn Source + Send>` locally.
+pub trait Source: Read {
     fn caps(&self) -> SourceCaps;
 
     /// Returns a seekable view, or `None` if this source cannot seek.

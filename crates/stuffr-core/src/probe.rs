@@ -1633,7 +1633,11 @@ mod tests {
             }
         }
 
-        fn decoder(&self, mut src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+        fn decoder<'a>(
+            &self,
+            mut src: Box<dyn Source + 'a>,
+            _o: &DecodeOpts,
+        ) -> Result<Box<dyn Source + 'a>> {
             let mut discard = vec![0u8; NESTED_MAGIC.len()];
             src.read_exact(&mut discard)?;
             Ok(Box::new(StreamOnly::new(src)))
@@ -1840,7 +1844,11 @@ mod tests {
             }
         }
 
-        fn decoder(&self, _src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+        fn decoder<'a>(
+            &self,
+            _src: Box<dyn Source + 'a>,
+            _o: &DecodeOpts,
+        ) -> Result<Box<dyn Source + 'a>> {
             Ok(Box::new(AlwaysInvalidData))
         }
 
@@ -1919,7 +1927,11 @@ mod tests {
                 }
             }
 
-            fn decoder(&self, _src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+            fn decoder<'a>(
+                &self,
+                _src: Box<dyn Source + 'a>,
+                _o: &DecodeOpts,
+            ) -> Result<Box<dyn Source + 'a>> {
                 Err(Error::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "the header is malformed and I will not build a decoder for it",
@@ -2323,7 +2335,11 @@ mod truthful_identification_tests {
             CodecCaps::round_trip()
         }
 
-        fn decoder(&self, mut src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+        fn decoder<'a>(
+            &self,
+            mut src: Box<dyn Source + 'a>,
+            _o: &DecodeOpts,
+        ) -> Result<Box<dyn Source + 'a>> {
             let mut discard = [0u8; 4];
             src.read_exact(&mut discard)?;
             Ok(Box::new(StreamOnly::new(src)))
@@ -2496,7 +2512,11 @@ mod truthful_identification_tests {
             CodecCaps::decode_only()
         }
 
-        fn decoder(&self, _src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+        fn decoder<'a>(
+            &self,
+            _src: Box<dyn Source + 'a>,
+            _o: &DecodeOpts,
+        ) -> Result<Box<dyn Source + 'a>> {
             Ok(Box::new(ScriptedSource {
                 rest: self.yields,
                 then_error: self.then_error,
@@ -2573,7 +2593,11 @@ mod truthful_identification_tests {
             CodecCaps::decode_only()
         }
 
-        fn decoder(&self, mut src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+        fn decoder<'a>(
+            &self,
+            mut src: Box<dyn Source + 'a>,
+            _o: &DecodeOpts,
+        ) -> Result<Box<dyn Source + 'a>> {
             let mut all = Vec::new();
             src.read_to_end(&mut all)?;
             Ok(Box::new(ScriptedSource {

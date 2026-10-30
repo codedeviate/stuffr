@@ -48,21 +48,21 @@ const BZIP2_MAGIC: &[MagicRule] = &[MagicRule {
 /// output, unchanged from before); anything else — a mismatch, or fewer
 /// than three bytes because the source is genuinely exhausted — stops
 /// cleanly, matching the reference tools.
-struct MultiMemberBzip2 {
+struct MultiMemberBzip2<'a> {
     /// `None` only once a clean stop has been decided; every further read
     /// returns `Ok(0)` without repeating the peek.
-    cur: Option<BzMemberDecoder<BufReader<Box<dyn Source>>>>,
+    cur: Option<BzMemberDecoder<BufReader<Box<dyn Source + 'a>>>>,
 }
 
-impl MultiMemberBzip2 {
-    fn new(src: Box<dyn Source>) -> Self {
+impl<'a> MultiMemberBzip2<'a> {
+    fn new(src: Box<dyn Source + 'a>) -> Self {
         Self {
             cur: Some(BzMemberDecoder::new(BufReader::new(src))),
         }
     }
 }
 
-impl std::io::Read for MultiMemberBzip2 {
+impl std::io::Read for MultiMemberBzip2<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
             let Some(dec) = self.cur.as_mut() else {
@@ -148,7 +148,11 @@ impl Codec for Bzip2 {
     /// own vocabulary for malformed input turned out to be the same pair,
     /// `InvalidInput` and `UnexpectedEof`, independently measured against
     /// this crate rather than assumed from gzip's.
-    fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+    fn decoder<'a>(
+        &self,
+        src: Box<dyn Source + 'a>,
+        _o: &DecodeOpts,
+    ) -> Result<Box<dyn Source + 'a>> {
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
             MultiMemberBzip2::new(src),
             MALFORMED_AS_INVALID_INPUT_EOF,

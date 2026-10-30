@@ -159,7 +159,11 @@ impl Codec for Zstd {
     /// ("both are weak without the checksum"), not by ratio. See
     /// `corruption_sweep_on_a_checksumless_foreign_stream` for the sweep
     /// this cites.
-    fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+    fn decoder<'a>(
+        &self,
+        src: Box<dyn Source + 'a>,
+        _o: &DecodeOpts,
+    ) -> Result<Box<dyn Source + 'a>> {
         let normalized = crate::normalize::NormalizeDecodeErrors::new(
             LazyRuzstdDecoder::new(src),
             crate::normalize::RUZSTD_MALFORMED_AS_OTHER_EOF,
@@ -323,9 +327,9 @@ impl Sink for RuzstdSink {
 ///   first frame followed by a TRUNCATED second one is still rejected, not
 ///   waved through as "just the first frame, nothing more". See
 ///   `a_truncated_second_frame_in_a_concatenated_stream_is_rejected`.
-enum LazyRuzstdDecoder {
-    Pending(Box<dyn Source>),
-    Ready(Box<RuzstdFrame>),
+enum LazyRuzstdDecoder<'a> {
+    Pending(Box<dyn Source + 'a>),
+    Ready(Box<RuzstdFrame<'a>>),
     /// Every frame has ended, and the underlying source confirmed
     /// genuinely empty (not merely a `Ok(0)` from one frame's own end).
     /// Every further `read` keeps returning `Ok(0)` without re-probing.
@@ -336,13 +340,13 @@ enum LazyRuzstdDecoder {
     Failed,
 }
 
-impl LazyRuzstdDecoder {
-    fn new(src: Box<dyn Source>) -> Self {
+impl<'a> LazyRuzstdDecoder<'a> {
+    fn new(src: Box<dyn Source + 'a>) -> Self {
         Self::Pending(src)
     }
 }
 
-impl Read for LazyRuzstdDecoder {
+impl Read for LazyRuzstdDecoder<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         // A zero-length buffer conventionally yields `Ok(0)` with no I/O
         // attempted at all — see `lz4.rs`'s `EnforceEndMark::read` for the
@@ -443,19 +447,19 @@ impl Read for LazyRuzstdDecoder {
     }
 }
 
-type RuzstdFrame = StreamingDecoder<Replay, ruzstd::decoding::FrameDecoder>;
+type RuzstdFrame<'a> = StreamingDecoder<Replay<'a>, ruzstd::decoding::FrameDecoder>;
 
 /// The source plus bytes read ahead and pushed back. One `Replay` lives for
 /// the whole stream (`StreamingDecoder::into_inner` hands it back after each
 /// frame), so wrapper depth stays constant however many frames follow.
-struct Replay {
+struct Replay<'a> {
     head: Vec<u8>,
     pos: usize,
-    inner: Box<dyn Source>,
+    inner: Box<dyn Source + 'a>,
 }
 
-impl Replay {
-    fn new(inner: Box<dyn Source>) -> Self {
+impl<'a> Replay<'a> {
+    fn new(inner: Box<dyn Source + 'a>) -> Self {
         Self {
             head: Vec::new(),
             pos: 0,
@@ -483,7 +487,7 @@ impl Replay {
     }
 }
 
-impl Read for Replay {
+impl Read for Replay<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.pos < self.head.len() {
             let n = (self.head.len() - self.pos).min(buf.len());
@@ -508,7 +512,7 @@ impl Read for Replay {
 /// payload — is `InvalidData` (exit 5), never an I/O failure. Skipping reads
 /// through the one source, so a stream of millions of empty skippable frames
 /// costs time, never stack.
-fn open_frame(mut src: Replay, first: bool) -> std::io::Result<Option<RuzstdFrame>> {
+fn open_frame(mut src: Replay<'_>, first: bool) -> std::io::Result<Option<RuzstdFrame<'_>>> {
     let mut skipped = false;
     loop {
         let mut buf = [0u8; 8];

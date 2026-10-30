@@ -107,7 +107,11 @@ impl Codec for Zstd {
     /// different payload — never complete, and the exact count is
     /// payload-dependent. There is no way for this decoder to tell, ahead of
     /// reading, whether an incoming stream carries the checksum at all.
-    fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+    fn decoder<'a>(
+        &self,
+        src: Box<dyn Source + 'a>,
+        _o: &DecodeOpts,
+    ) -> Result<Box<dyn Source + 'a>> {
         let dec = zstd::stream::read::Decoder::new(src)?;
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
             dec,

@@ -132,7 +132,11 @@ impl Codec for Xz {
     /// checkless streams are routine (see `zstd_c.rs`'s `decoder`). So the
     /// honest statement is narrower than zstd's: a checkless `.xz` is
     /// possible but unusual, where a checkless `.zst` is ordinary.
-    fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+    fn decoder<'a>(
+        &self,
+        src: Box<dyn Source + 'a>,
+        _o: &DecodeOpts,
+    ) -> Result<Box<dyn Source + 'a>> {
         let dec = liblzma::read::XzDecoder::new_multi_decoder(src);
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
             dec,

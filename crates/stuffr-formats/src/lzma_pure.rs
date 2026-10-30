@@ -258,7 +258,11 @@ impl Codec for Lzma {
     /// `NormalizeDecodeErrors` untouched and reaches `Error::from_decode_io`
     /// as `ResourceLimit` (exit 6), not `Corrupt` (exit 5) — see
     /// `DecodeOpts::memory_limit`'s doc.
-    fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> Result<Box<dyn Source>> {
+    fn decoder<'a>(
+        &self,
+        src: Box<dyn Source + 'a>,
+        o: &DecodeOpts,
+    ) -> Result<Box<dyn Source + 'a>> {
         // The crate's parameter is KiB in a u32. `u32::MAX` KiB is ~4 TiB, so
         // saturating there is equivalent to "unbounded" for any real limit.
         let mem_limit_kb = match o.memory_limit {
@@ -343,8 +347,8 @@ const PLAUSIBLE_UNCOMPRESSED_SIZE_MAX: u64 = 1 << 48;
 /// the crate's own `LzmaReader` cannot be asked directly — see the module
 /// doc's "Truncation by exactly one byte" section for why both are needed
 /// and why neither alone is enough.
-struct GuardedReader {
-    inner: BufReader<Box<dyn Source>>,
+struct GuardedReader<'a> {
+    inner: BufReader<Box<dyn Source + 'a>>,
     /// Set the moment any `read()` call on this wrapper genuinely returns
     /// `Ok(0)` — real exhaustion of the underlying source, never the
     /// crate's own internal sentinel substitution, which does not go
@@ -352,8 +356,8 @@ struct GuardedReader {
     hit_eof: bool,
 }
 
-impl GuardedReader {
-    fn new(src: Box<dyn Source>) -> Self {
+impl<'a> GuardedReader<'a> {
+    fn new(src: Box<dyn Source + 'a>) -> Self {
         Self {
             inner: BufReader::new(src),
             hit_eof: false,
@@ -420,7 +424,7 @@ impl GuardedReader {
     }
 }
 
-impl Read for GuardedReader {
+impl Read for GuardedReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
         if n == 0 {
@@ -436,16 +440,16 @@ impl Read for GuardedReader {
 /// failure modes the raw crate cannot itself detect — see the module doc's
 /// "Truncation by exactly one byte" and "No concatenation convention"
 /// sections.
-enum LazyLzmaDecoder {
+enum LazyLzmaDecoder<'a> {
     /// The source, and the caller's `DecodeOpts::memory_limit` already
     /// converted to the crate's KiB unit — see `Codec::decoder`.
-    Pending(Box<dyn Source>, u32),
+    Pending(Box<dyn Source + 'a>, u32),
     Ready {
         // Boxed because `LzmaReader` is ~3,969 bytes while every other variant
         // here is at most 16, and this enum is assigned through `*self = ...`
         // on each state transition. Unboxed, `clippy::large_enum_variant` fails
         // the build, and rightly: every transition would move ~4 KiB.
-        inner: Box<LzmaReader<GuardedReader>>,
+        inner: Box<LzmaReader<GuardedReader<'a>>>,
         finished: bool,
     },
     /// The crate's own decode loop reported success, and both post-decode
@@ -457,13 +461,13 @@ enum LazyLzmaDecoder {
     Failed,
 }
 
-impl LazyLzmaDecoder {
-    fn new(src: Box<dyn Source>, mem_limit_kb: u32) -> Self {
+impl<'a> LazyLzmaDecoder<'a> {
+    fn new(src: Box<dyn Source + 'a>, mem_limit_kb: u32) -> Self {
         Self::Pending(src, mem_limit_kb)
     }
 }
 
-impl Read for LazyLzmaDecoder {
+impl Read for LazyLzmaDecoder<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         // Same guard `zstd_pure.rs`'s `LazyRuzstdDecoder` and `lz4.rs`'s
         // `EnforceEndMark` use: an empty read must not be misread as a

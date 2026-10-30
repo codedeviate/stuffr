@@ -114,7 +114,11 @@ impl Codec for Brotli {
     /// — the accounting the high-level reader never exposes — at the same
     /// buffer size (4096 bytes) the high-level reader used, so there is no
     /// throughput cost to pay for it.
-    fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+    fn decoder<'a>(
+        &self,
+        src: Box<dyn Source + 'a>,
+        _o: &DecodeOpts,
+    ) -> Result<Box<dyn Source + 'a>> {
         Ok(Box::new(StreamOnly::new(BrotliStreamDecoder::new(src))))
     }
 
@@ -153,8 +157,8 @@ type DecoderState = BrotliState<HeapAlloc<u8>, HeapAlloc<u32>, HeapAlloc<Huffman
 /// the high-level `brotli::Decompressor` — see the trailing-data section of
 /// `Codec::decoder`'s doc comment above for why. Reports malformed input,
 /// truncation, and trailing data as `io::ErrorKind::InvalidData`.
-struct BrotliStreamDecoder {
-    src: Box<dyn Source>,
+struct BrotliStreamDecoder<'a> {
+    src: Box<dyn Source + 'a>,
     dec: DecoderState,
     in_buf: [u8; DECODE_BUF_SIZE],
     /// Start of the unconsumed region of `in_buf`.
@@ -169,8 +173,8 @@ struct BrotliStreamDecoder {
     done: bool,
 }
 
-impl BrotliStreamDecoder {
-    fn new(src: Box<dyn Source>) -> Self {
+impl<'a> BrotliStreamDecoder<'a> {
+    fn new(src: Box<dyn Source + 'a>) -> Self {
         Self {
             src,
             dec: BrotliState::new(
@@ -244,7 +248,7 @@ fn corrupt_stream_error() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, "brotli stream is corrupt")
 }
 
-impl Read for BrotliStreamDecoder {
+impl Read for BrotliStreamDecoder<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() || self.done {
             return Ok(0);

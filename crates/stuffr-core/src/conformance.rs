@@ -1179,7 +1179,11 @@ mod framed_mock {
             }
         }
 
-        fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> crate::Result<Box<dyn Source>> {
+        fn decoder<'a>(
+            &self,
+            src: Box<dyn Source + 'a>,
+            _o: &DecodeOpts,
+        ) -> crate::Result<Box<dyn Source + 'a>> {
             Ok(Box::new(crate::source::StreamOnly::new(FramedReader {
                 inner: src,
                 pending: std::collections::VecDeque::new(),
@@ -1395,7 +1399,11 @@ mod tests {
             }
         }
 
-        fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> crate::Result<Box<dyn Source>> {
+        fn decoder<'a>(
+            &self,
+            src: Box<dyn Source + 'a>,
+            _o: &DecodeOpts,
+        ) -> crate::Result<Box<dyn Source + 'a>> {
             Ok(Box::new(crate::source::StreamOnly::new(
                 AppendSentinelReader {
                     inner: src,
@@ -1463,11 +1471,11 @@ mod tests {
             }
         }
 
-        fn decoder(
+        fn decoder<'a>(
             &self,
-            mut src: Box<dyn Source>,
+            mut src: Box<dyn Source + 'a>,
             _o: &DecodeOpts,
-        ) -> crate::Result<Box<dyn Source>> {
+        ) -> crate::Result<Box<dyn Source + 'a>> {
             let mut buf = Vec::new();
             src.read_to_end(&mut buf)?;
             let out = if buf.len() == self.full_len {
@@ -1561,11 +1569,11 @@ mod tests {
             }
         }
 
-        fn decoder(
+        fn decoder<'a>(
             &self,
-            mut src: Box<dyn Source>,
+            mut src: Box<dyn Source + 'a>,
             _o: &DecodeOpts,
-        ) -> crate::Result<Box<dyn Source>> {
+        ) -> crate::Result<Box<dyn Source + 'a>> {
             let mut buf = Vec::new();
             src.read_to_end(&mut buf)?;
             let n = buf.len();
@@ -1667,11 +1675,11 @@ mod tests {
                     ..Default::default()
                 }
             }
-            fn decoder(
+            fn decoder<'a>(
                 &self,
-                src: Box<dyn Source>,
+                src: Box<dyn Source + 'a>,
                 o: &DecodeOpts,
-            ) -> crate::Result<Box<dyn Source>> {
+            ) -> crate::Result<Box<dyn Source + 'a>> {
                 FramedMock.decoder(src, o)
             }
             fn encoder(
@@ -1707,11 +1715,11 @@ mod tests {
                     ..Default::default()
                 }
             }
-            fn decoder(
+            fn decoder<'a>(
                 &self,
-                src: Box<dyn Source>,
+                src: Box<dyn Source + 'a>,
                 o: &DecodeOpts,
-            ) -> crate::Result<Box<dyn Source>> {
+            ) -> crate::Result<Box<dyn Source + 'a>> {
                 MockCodec.decoder(src, o)
             }
             fn encoder(
@@ -1789,7 +1797,11 @@ mod broken_codecs {
         fn caps(&self) -> CodecCaps {
             MockCodec.caps()
         }
-        fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> crate::Result<Box<dyn Source>> {
+        fn decoder<'a>(
+            &self,
+            src: Box<dyn Source + 'a>,
+            o: &DecodeOpts,
+        ) -> crate::Result<Box<dyn Source + 'a>> {
             MockCodec.decoder(src, o)
         }
         fn encoder(
@@ -1857,7 +1869,11 @@ mod broken_codecs {
         fn caps(&self) -> CodecCaps {
             MockCodec.caps()
         }
-        fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> crate::Result<Box<dyn Source>> {
+        fn decoder<'a>(
+            &self,
+            src: Box<dyn Source + 'a>,
+            o: &DecodeOpts,
+        ) -> crate::Result<Box<dyn Source + 'a>> {
             MockCodec.decoder(src, o)
         }
         fn encoder(
@@ -1912,7 +1928,11 @@ mod broken_codecs {
                 ..MockCodec.caps()
             }
         }
-        fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> crate::Result<Box<dyn Source>> {
+        fn decoder<'a>(
+            &self,
+            src: Box<dyn Source + 'a>,
+            o: &DecodeOpts,
+        ) -> crate::Result<Box<dyn Source + 'a>> {
             MockCodec.decoder(src, o)
         }
         fn encoder(
@@ -1947,7 +1967,11 @@ mod broken_codecs {
         fn caps(&self) -> CodecCaps {
             MockCodec.caps()
         }
-        fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> crate::Result<Box<dyn Source>> {
+        fn decoder<'a>(
+            &self,
+            src: Box<dyn Source + 'a>,
+            o: &DecodeOpts,
+        ) -> crate::Result<Box<dyn Source + 'a>> {
             MockCodec.decoder(src, o)
         }
         fn encoder(
@@ -1981,11 +2005,11 @@ mod broken_codecs {
         fn caps(&self) -> CodecCaps {
             MockCodec.caps()
         }
-        fn decoder(
+        fn decoder<'a>(
             &self,
-            mut src: Box<dyn Source>,
+            mut src: Box<dyn Source + 'a>,
             _o: &DecodeOpts,
-        ) -> crate::Result<Box<dyn Source>> {
+        ) -> crate::Result<Box<dyn Source + 'a>> {
             let mut all = Vec::new();
             src.read_to_end(&mut all)?; // BUG: eager, whole-stream read.
             for b in &mut all {
@@ -2023,7 +2047,11 @@ mod broken_codecs {
                 ..MockCodec.caps()
             }
         }
-        fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> crate::Result<Box<dyn Source>> {
+        fn decoder<'a>(
+            &self,
+            src: Box<dyn Source + 'a>,
+            o: &DecodeOpts,
+        ) -> crate::Result<Box<dyn Source + 'a>> {
             MockCodec.decoder(src, o)
         }
         fn encoder(
@@ -2064,15 +2092,15 @@ mod broken_codecs {
     /// only property it can fail.
     struct OverNormalizingDecoder;
 
-    struct FoldsEveryErrorToInvalidData(Box<dyn Source>);
-    impl Read for FoldsEveryErrorToInvalidData {
+    struct FoldsEveryErrorToInvalidData<'a>(Box<dyn Source + 'a>);
+    impl Read for FoldsEveryErrorToInvalidData<'_> {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             self.0
                 .read(buf)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
         }
     }
-    impl Source for FoldsEveryErrorToInvalidData {
+    impl Source for FoldsEveryErrorToInvalidData<'_> {
         fn caps(&self) -> crate::source::SourceCaps {
             self.0.caps()
         }
@@ -2088,7 +2116,11 @@ mod broken_codecs {
         fn caps(&self) -> CodecCaps {
             super::framed_mock::FramedMock.caps()
         }
-        fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> crate::Result<Box<dyn Source>> {
+        fn decoder<'a>(
+            &self,
+            src: Box<dyn Source + 'a>,
+            o: &DecodeOpts,
+        ) -> crate::Result<Box<dyn Source + 'a>> {
             // BUG: every error from the source, including a real disk
             // failure, is reclassified as InvalidData before FramedMock's
             // own decoder ever sees it.
@@ -2133,7 +2165,11 @@ mod broken_codecs {
                 ..super::framed_mock::FramedMock.caps()
             }
         }
-        fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> crate::Result<Box<dyn Source>> {
+        fn decoder<'a>(
+            &self,
+            src: Box<dyn Source + 'a>,
+            o: &DecodeOpts,
+        ) -> crate::Result<Box<dyn Source + 'a>> {
             super::framed_mock::FramedMock.decoder(src, o)
         }
         fn encoder(

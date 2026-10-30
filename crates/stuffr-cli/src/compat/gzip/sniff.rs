@@ -116,12 +116,7 @@ fn codec_id(d: Detected) -> Option<&'static str> {
 /// input that ends in the header or the tables, `InvalidData` for one that
 /// contradicts itself, the reader's own error for a failed read. (The
 /// bitstream's failures come from the reader, `PackError` inside `Other`.)
-///
-/// `r` is `Send + 'static` because stuffr's codecs own their source.
-pub(crate) fn foreign_reader(
-    d: Detected,
-    r: Box<dyn BufRead + Send>,
-) -> io::Result<Box<dyn Read + Send>> {
+pub(crate) fn foreign_reader(d: Detected, r: Box<dyn BufRead + Send>) -> io::Result<Box<dyn Read>> {
     if d == Detected::Pack {
         return match PackReader::new(r) {
             Ok(p) => Ok(Box::new(p)),

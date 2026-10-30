@@ -148,7 +148,9 @@
 //! declared is streamed and then verified; a mismatch is refused rather than
 //! written.
 
+use std::cell::RefCell;
 use std::io::{self, Read};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -352,9 +354,9 @@ impl Container for Tar {
         let seekable = source.caps().seekable;
 
         let trailer = TrailerState::new();
-        let shared: SharedSource = Arc::new(std::sync::Mutex::new(source));
+        let shared: SharedSource = Rc::new(RefCell::new(source));
         let watched = TrailerWatch {
-            inner: Arc::clone(&shared),
+            inner: Rc::clone(&shared),
             state: Arc::clone(&trailer),
         };
 
@@ -463,25 +465,21 @@ impl TrailerState {
 /// more, and not offering `Seek` is what makes it impossible for this module
 /// to reach `entries_with_seek` by accident (see the module doc).
 ///
-/// The source sits behind an `Arc<Mutex<..>>` because `tar::Archive` takes it
-/// by value while [`TarRead::verify_end_of_archive`] must read the tail tar
-/// stopped short of. The lock is never contended — tar has no read in flight
-/// at the moment iteration ends — and costs one uncontended acquisition per
-/// read of a 512-byte or 32 KiB chunk.
+/// The source sits behind an `Rc<RefCell<..>>` because `tar::Archive` takes
+/// it by value while [`TarRead::verify_end_of_archive`] must read the tail tar
+/// stopped short of. The borrow never overlaps — tar has no read in flight at
+/// the moment iteration ends. Not an `Arc<Mutex<..>>`: a `Source` is not
+/// `Send` (0.23.0), and nothing here leaves the thread.
 struct TrailerWatch {
     inner: SharedSource,
     state: Arc<TrailerState>,
 }
 
-type SharedSource = Arc<std::sync::Mutex<Box<dyn Source>>>;
+type SharedSource = Rc<RefCell<Box<dyn Source>>>;
 
 impl Read for TrailerWatch {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self
-            .inner
-            .lock()
-            .expect("tar source mutex poisoned")
-            .read(buf)?;
+        let n = self.inner.borrow_mut().read(buf)?;
         self.state.record(&buf[..n]);
         Ok(n)
     }
@@ -1043,7 +1041,7 @@ impl TarRead {
     /// Fills `buf` from the source, returning how many bytes were actually
     /// available. Short only at end of stream.
     fn read_block(&self, buf: &mut [u8]) -> Result<usize> {
-        let mut source = self.source.lock().expect("tar source mutex poisoned");
+        let mut source = self.source.borrow_mut();
         let mut filled = 0;
         while filled < buf.len() {
             match source

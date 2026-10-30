@@ -144,13 +144,13 @@ use crate::normalize::{LZ4_MALFORMED_AS_OTHER_EOF, NormalizeDecodeErrors};
 /// two cases apart: zero bytes served during the probe really does mean no
 /// more frames; any bytes served during the probe, followed by genuine
 /// exhaustion, means a following frame's header was cut short.
-struct TrackedRead {
-    inner: Box<dyn Source>,
+struct TrackedRead<'a> {
+    inner: Box<dyn Source + 'a>,
     hit_eof: Arc<AtomicBool>,
     served_since_probe: Arc<AtomicBool>,
 }
 
-impl std::io::Read for TrackedRead {
+impl std::io::Read for TrackedRead<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
         if n == 0 {
@@ -211,12 +211,12 @@ fn skippable_frame_len(err: &std::io::Error) -> Option<u32> {
 /// on a file the reference reads whole. Only a genuine mid-payload EOF
 /// during the discard itself is left to surface as an ordinary I/O error,
 /// which is the truncation it actually is.
-struct SkipSkippableFrames {
-    dec: Option<FrameDecoder<TrackedRead>>,
+struct SkipSkippableFrames<'a> {
+    dec: Option<FrameDecoder<TrackedRead<'a>>>,
     served_since_probe: Arc<AtomicBool>,
 }
 
-impl std::io::Read for SkipSkippableFrames {
+impl std::io::Read for SkipSkippableFrames<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
             let dec = self
@@ -518,7 +518,11 @@ impl Codec for Lz4 {
     /// re-encoded with `--no-frame-crc` (`0x60`) had only 10 of 26 error, 16
     /// silently wrong, which is the one case left where this decoder cannot
     /// help: a foreign writer that deliberately turns the checksum off.
-    fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+    fn decoder<'a>(
+        &self,
+        src: Box<dyn Source + 'a>,
+        _o: &DecodeOpts,
+    ) -> Result<Box<dyn Source + 'a>> {
         let hit_eof = Arc::new(AtomicBool::new(false));
         let served_since_probe = Arc::new(AtomicBool::new(false));
         let tracked = TrackedRead {

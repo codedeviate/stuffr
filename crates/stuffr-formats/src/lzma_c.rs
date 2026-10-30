@@ -136,7 +136,11 @@ impl Codec for Lzma {
     /// in `NormalizeDecodeErrors` — see `crate::normalize`'s
     /// `LZMA_MALFORMED_AS_INVALID_DATA_EOF` doc for the measurement backing
     /// the kinds folded here.
-    fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+    fn decoder<'a>(
+        &self,
+        src: Box<dyn Source + 'a>,
+        _o: &DecodeOpts,
+    ) -> Result<Box<dyn Source + 'a>> {
         let stream = liblzma::stream::Stream::new_lzma_decoder(u64::MAX)
             .expect("a memlimit of u64::MAX is always a valid decoder configuration");
         let dec = liblzma::bufread::XzDecoder::new_stream(BufReader::new(src), stream);

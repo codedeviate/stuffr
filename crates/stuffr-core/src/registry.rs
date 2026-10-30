@@ -489,7 +489,11 @@ mod tests {
             fn caps(&self) -> CodecCaps {
                 CodecCaps::decode_only()
             }
-            fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> Result<Box<dyn Source>> {
+            fn decoder<'a>(
+                &self,
+                src: Box<dyn Source + 'a>,
+                o: &DecodeOpts,
+            ) -> Result<Box<dyn Source + 'a>> {
                 MockCodec.decoder(src, o)
             }
             fn encoder(&self, _d: Box<dyn Write + Send>, _o: &EncodeOpts) -> Result<Box<dyn Sink>> {
