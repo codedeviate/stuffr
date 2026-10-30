@@ -503,7 +503,7 @@ read list.
 > says what it is; `salvage` always tries. `info` names the layer whose
 > header did not check out. Blender's `.blend` files (zstd with skippable
 > frames) now decode on the pure tier too.
-> **3628** tests under `--all-features`, **3507** on the default tier —
+> **3630** tests under `--all-features`, **3509** on the default tier —
 > measured from this bump's own `make check FULL=1`, `GATE_EXIT=0`.
 >
 > Two user-visible changes on archives that already exist. First, `salvage
