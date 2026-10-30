@@ -495,6 +495,17 @@ read list.
 > **3472** tests under `--all-features`, **3357** on the default tier —
 > measured from this bump's own `make check FULL=1`, `GATE_EXIT=0`.
 >
+> `0.22.0` makes identification truthful. Every format now checks its own
+> header behind its magic bytes, so `stuffr ls` lists only files that really
+> are what it says: an Apple disk image is no longer shown as `zlib`, `bzip2`
+> or `xz`, and a colour cube or a JavaScript file no longer passes as `arc`
+> or `tar`. Every verb but `salvage` refuses a disk image with exit 3 and
+> says what it is; `salvage` always tries. `info` names the layer whose
+> header did not check out. Blender's `.blend` files (zstd with skippable
+> frames) now decode on the pure tier too.
+> **3628** tests under `--all-features`, **3507** on the default tier —
+> measured from this bump's own `make check FULL=1`, `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
