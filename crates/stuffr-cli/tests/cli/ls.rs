@@ -12,9 +12,26 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::common::*;
 
-const GZ: &[u8] = &[0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 3];
-const ZIP: &[u8] = b"PK\x03\x04\x14\0\0\0\0\0";
-const XZ: &[u8] = &[0xfd, b'7', b'z', b'X', b'Z', 0, 0, 0, 0, 0];
+/// What a fixture file holds: a real stream of its format (`ls` lists only
+/// what confirms, so a magic followed by zeros, as 0.21.0's fixtures were,
+/// no longer stands in for one), or plain bytes.
+#[derive(Clone, Copy)]
+enum Fixture<'a> {
+    /// A gzip of zeros (stored blocks), exactly the given size.
+    Gz,
+    /// A gzip of a real tar padded with zeros, exactly the given size.
+    TarGz,
+    /// A stored zip of one entry, exactly the given size (at least 100).
+    Zip,
+    /// The empty xz stream; always 32 bytes.
+    Xz,
+    /// These bytes as they are.
+    Bytes(&'a [u8]),
+}
+use Fixture::{Bytes, Gz, TarGz, Xz, Zip};
+
+/// The size of `Xz`.
+const XZ_LEN: usize = 32;
 
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -74,9 +91,27 @@ fn set_mtime(p: &Path, t: SystemTime) {
     f.set_modified(t).unwrap();
 }
 
-fn put(dir: &Path, name: &str, magic: &[u8], len: usize, t: SystemTime) {
-    let mut bytes = magic.to_vec();
-    bytes.resize(len.max(magic.len()), 0);
+fn fixture(what: Fixture<'_>, len: usize) -> Vec<u8> {
+    match what {
+        Gz => stored_gzip(&[], len),
+        TarGz => stored_gzip(&small_tar(), len),
+        Zip => stored_zip(len),
+        Xz => {
+            assert_eq!(len, XZ_LEN, "the xz fixture has one size");
+            EMPTY_XZ.to_vec()
+        }
+        Bytes(b) => b.to_vec(),
+    }
+}
+
+/// One `ls` row, its columns padded as `ls` pads them: FORMAT to `fw`
+/// left-aligned, SIZE to `sw` right-aligned.
+fn row(format: &str, size: &str, date: &str, name: &str, fw: usize, sw: usize) -> String {
+    format!("{format:<fw$}  {size:>sw$}  {date}  {name}\n")
+}
+
+fn put(dir: &Path, name: &str, what: Fixture<'_>, len: usize, t: SystemTime) {
+    let bytes = fixture(what, len);
     let p = dir.join(name);
     std::fs::write(&p, bytes).unwrap();
     set_mtime(&p, t);
@@ -98,10 +133,16 @@ fn ls(dir: &Path, args: &[&str]) -> (String, String, Option<i32>) {
 fn sample_tree(dir: &Path) -> (SystemTime, SystemTime) {
     let t_backup = days_ago(1);
     let t_export = days_ago(2);
-    put(dir, "backup.tar.gz", GZ, 4_404_019, t_backup);
-    put(dir, "photos.zip", ZIP, 1_153_434, utc(2020, 6, 15));
-    put(dir, "export", GZ, 831_488, t_export);
-    put(dir, "notes.txt", b"hello, world\n", 0, utc(2021, 3, 1));
+    put(dir, "backup.tar.gz", TarGz, 4_404_019, t_backup);
+    put(dir, "photos.zip", Zip, 1_153_434, utc(2020, 6, 15));
+    put(dir, "export", Gz, 831_488, t_export);
+    put(
+        dir,
+        "notes.txt",
+        Bytes(b"hello, world\n"),
+        0,
+        utc(2021, 3, 1),
+    );
     let old = dir.join("old");
     std::fs::create_dir(&old).unwrap();
     set_mtime(&old, utc(2019, 1, 5));
@@ -165,23 +206,21 @@ fn files_refuses_a_file() {
 #[test]
 fn recursive_blocks() {
     let dir = tmp_dir();
-    put(&dir, "a.gz", GZ, 10, utc(2020, 6, 15));
-    put(&dir, "notes.txt", b"text", 0, utc(2020, 6, 15));
+    put(&dir, "a.gz", Gz, 30, utc(2020, 6, 15));
+    put(&dir, "notes.txt", Bytes(b"text"), 0, utc(2020, 6, 15));
     std::fs::create_dir_all(dir.join("old/deeper")).unwrap();
     std::fs::create_dir_all(dir.join("empty")).unwrap();
     std::fs::create_dir_all(dir.join(".hidden")).unwrap();
-    put(&dir.join("old"), "b.xz", XZ, 10, utc(2019, 1, 5));
-    put(&dir.join("old/deeper"), "c.zip", ZIP, 2048, utc(2018, 2, 3));
-    put(&dir.join(".hidden"), "d.gz", GZ, 10, utc(2018, 2, 3));
+    put(&dir.join("old"), "b.xz", Xz, XZ_LEN, utc(2019, 1, 5));
+    put(&dir.join("old/deeper"), "c.zip", Zip, 2048, utc(2018, 2, 3));
+    put(&dir.join(".hidden"), "d.gz", Gz, 30, utc(2018, 2, 3));
     let (out, err, code) = ls(&dir, &["ls", "-r"]);
-    let want = "gzip   10B  Jun 15  2020  a.gz\n\
-                \n\
-                old/:\n\
-                xz     10B  Jan  5  2019  b.xz\n\
-                \n\
-                old/deeper/:\n\
-                zip   2.0K  Feb  3  2018  c.zip\n\
-                3 of 4 files shown, 1 not openable\n";
+    let want = format!(
+        "{}\nold/:\n{}\nold/deeper/:\n{}3 of 4 files shown, 1 not openable\n",
+        row("gzip", "30B", "Jun 15  2020", "a.gz", 4, 4),
+        row("xz", "32B", "Jan  5  2019", "b.xz", 4, 4),
+        row("zip", "2.0K", "Feb  3  2018", "c.zip", 4, 4),
+    );
     assert_eq!(out, want);
     assert_eq!(err, "");
     assert_eq!(code, Some(0));
@@ -190,15 +229,14 @@ fn recursive_blocks() {
 #[test]
 fn by_name_sorts_by_name() {
     let dir = tmp_dir();
-    put(&dir, "a.gz", GZ, 10, utc(2019, 1, 1));
-    put(&dir, "b.zip", ZIP, 10, utc(2020, 1, 1));
-    put(&dir, "c.xz", XZ, 10, utc(2018, 1, 1));
-    let newest = "zip   10B  Jan  1  2020  b.zip\n\
-                  gzip  10B  Jan  1  2019  a.gz\n\
-                  xz    10B  Jan  1  2018  c.xz\n";
-    let by_name = "gzip  10B  Jan  1  2019  a.gz\n\
-                   zip   10B  Jan  1  2020  b.zip\n\
-                   xz    10B  Jan  1  2018  c.xz\n";
+    put(&dir, "a.gz", Gz, 30, utc(2019, 1, 1));
+    put(&dir, "b.zip", Zip, 100, utc(2020, 1, 1));
+    put(&dir, "c.xz", Xz, XZ_LEN, utc(2018, 1, 1));
+    let a = row("gzip", "30B", "Jan  1  2019", "a.gz", 4, 4);
+    let b = row("zip", "100B", "Jan  1  2020", "b.zip", 4, 4);
+    let c = row("xz", "32B", "Jan  1  2018", "c.xz", 4, 4);
+    let newest = format!("{b}{a}{c}");
+    let by_name = format!("{a}{b}{c}");
     assert_eq!(ls(&dir, &["ls"]).0, newest);
     assert_eq!(ls(&dir, &["ls", "-n"]).0, by_name);
     assert_eq!(ls(&dir, &["ls", "--by-name"]).0, by_name);
@@ -207,10 +245,16 @@ fn by_name_sorts_by_name() {
 #[test]
 fn footer_omitted_when_everything_openable() {
     let dir = tmp_dir();
-    put(&dir, "a.gz", GZ, 10, utc(2019, 1, 1));
-    put(&dir, ".hidden.txt", b"not counted", 0, utc(2019, 1, 1));
+    put(&dir, "a.gz", Gz, 30, utc(2019, 1, 1));
+    put(
+        &dir,
+        ".hidden.txt",
+        Bytes(b"not counted"),
+        0,
+        utc(2019, 1, 1),
+    );
     let (out, err, code) = ls(&dir, &["ls"]);
-    assert_eq!(out, "gzip  10B  Jan  1  2019  a.gz\n");
+    assert_eq!(out, row("gzip", "30B", "Jan  1  2019", "a.gz", 4, 3));
     assert_eq!((err.as_str(), code), ("", Some(0)));
 }
 
@@ -260,7 +304,7 @@ fn json_shape() {
     assert_eq!(v["warnings"], serde_json::json!([]));
 
     // With -r the path is relative to the listed folder.
-    put(&dir.join("old"), "b.xz", XZ, 10, utc(2019, 1, 5));
+    put(&dir.join("old"), "b.xz", Xz, XZ_LEN, utc(2019, 1, 5));
     let o = run_in_dir_output(&dir, &["ls", "-r", "--json"]);
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     let paths: Vec<&str> = v["entries"]
@@ -423,7 +467,7 @@ fn unreadable_folder_argument_is_exit_2() {
     let dir = tmp_dir();
     let locked = dir.join("locked");
     std::fs::create_dir(&locked).unwrap();
-    put(&locked, "a.gz", GZ, 10, utc(2020, 6, 15));
+    put(&locked, "a.gz", Gz, 30, utc(2020, 6, 15));
     struct Restore<'a>(&'a Path);
     impl Drop for Restore<'_> {
         fn drop(&mut self) {
@@ -467,8 +511,8 @@ fn unreadable_inside_is_exit_4() {
         return;
     }
     let dir = tmp_dir();
-    put(&dir, "a.gz", GZ, 10, utc(2020, 6, 15));
-    put(&dir, "secret.gz", GZ, 10, utc(2020, 6, 15));
+    put(&dir, "a.gz", Gz, 30, utc(2020, 6, 15));
+    put(&dir, "secret.gz", Gz, 30, utc(2020, 6, 15));
     let secret = dir.join("secret.gz");
     struct Restore<'a>(&'a Path);
     impl Drop for Restore<'_> {
@@ -482,7 +526,7 @@ fn unreadable_inside_is_exit_4() {
     let (out, err, code) = ls(&dir, &["ls"]);
     assert_eq!(
         out,
-        "gzip  10B  Jun 15  2020  a.gz\n1 of 2 files shown, 1 not openable\n"
+        row("gzip", "30B", "Jun 15  2020", "a.gz", 4, 3) + "1 of 2 files shown, 1 not openable\n"
     );
     assert_eq!(err, format!("stuffr: cannot read secret.gz: {e}\n"));
     assert_eq!(code, Some(4));
@@ -507,22 +551,21 @@ fn odd_names_are_escaped_in_rows_and_real_in_json() {
     let mut p = dir.join(OsStr::from_bytes(b"a\nb\xff.gz"));
     let mut shown = "a\\nb\u{fffd}.gz";
     let mut real = "a\nb\u{fffd}.gz";
-    if std::fs::write(&p, GZ).is_err() {
+    let gz = fixture(Gz, 30);
+    if std::fs::write(&p, &gz).is_err() {
         p = dir.join("a\nb\u{202e}.gz");
         shown = "a\\nb\\u{202e}.gz";
         real = "a\nb\u{202e}.gz";
-        std::fs::write(&p, GZ).unwrap();
+        std::fs::write(&p, &gz).unwrap();
     }
     set_mtime(&p, utc(2020, 6, 15));
-    put(&dir, "plain.zip", ZIP, 2048, utc(2019, 6, 15));
+    put(&dir, "plain.zip", Zip, 2048, utc(2019, 6, 15));
     let (out, _, code) = ls(&dir, &["ls"]);
     assert_eq!(code, Some(0));
     assert_eq!(
         out,
-        format!(
-            "gzip   10B  Jun 15  2020  {shown}\n\
-             zip   2.0K  Jun 15  2019  plain.zip\n"
-        )
+        row("gzip", "30B", "Jun 15  2020", shown, 4, 4)
+            + &row("zip", "2.0K", "Jun 15  2019", "plain.zip", 4, 4)
     );
     // The same escaping `list` gives an entry name.
     let a = write_fixture_tar_gz(&dir, "x.tgz", &[("a\nb", b"")]);
@@ -533,4 +576,310 @@ fn odd_names_are_escaped_in_rows_and_real_in_json() {
     // JSON carries the real name (lossy only for non-UTF-8), as `list --json`
     // does: JSON's own escaping keeps it unambiguous (ruling T4-d).
     assert_eq!(v["entries"][1]["path"], real);
+}
+
+// ---------------------------------------------------------------------------
+// Truthful identification: `ls` lists only what confirms.
+// ---------------------------------------------------------------------------
+
+/// The footer `ls` prints when something was not openable.
+fn footer(shown: usize, files: usize) -> String {
+    format!(
+        "{shown} of {files} files shown, {} not openable\n",
+        files - shown
+    )
+}
+
+#[test]
+fn ls_hides_disk_images() {
+    let dir = tmp_dir();
+    std::fs::write(dir.join("synthetic.dmg"), crate::foreign::synthetic_dmg()).unwrap();
+    let images = 1 + crate::foreign::real_disk_images(&dir).len();
+    put(&dir, "a.gz", Gz, 30, utc(2020, 6, 15));
+    let (out, err, code) = ls(&dir, &["ls"]);
+    let want = row("gzip", "30B", "Jun 15  2020", "a.gz", 4, 3) + &footer(1, images + 1);
+    assert_eq!(
+        (out.as_str(), err.as_str(), code),
+        (want.as_str(), "", Some(0))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ls_hides_a_symlink_to_a_disk_image() {
+    let elsewhere = tmp_dir();
+    let image = elsewhere.join("x.dmg");
+    std::fs::write(&image, crate::foreign::synthetic_dmg()).unwrap();
+    let dir = tmp_dir();
+    std::os::unix::fs::symlink(&image, dir.join("link.dmg")).unwrap();
+    std::os::unix::fs::symlink(&image, dir.join("link")).unwrap();
+    put(&dir, "a.gz", Gz, 30, utc(2020, 6, 15));
+    let (out, err, code) = ls(&dir, &["ls"]);
+    let want = row("gzip", "30B", "Jun 15  2020", "a.gz", 4, 3) + &footer(1, 3);
+    assert_eq!(
+        (out.as_str(), err.as_str(), code),
+        (want.as_str(), "", Some(0))
+    );
+}
+
+/// recon's `headers.js`: source text with `ustar` at offset 257 (the shape
+/// `tar_rejects_ustar_in_source_code` pins).
+fn ustar_in_source() -> Vec<u8> {
+    let line = "export function headers(req, res) {\n  return { 'content-type': 'text/x' };\n}\n";
+    let mut text = line.repeat(600 / line.len() + 1).into_bytes();
+    text.truncate(600);
+    text[257..262].copy_from_slice(b"ustar");
+    text
+}
+
+#[test]
+fn ls_hides_recon_false_positives() {
+    let dir = tmp_dir();
+    put(
+        &dir,
+        "pixels.scube",
+        Bytes(&crate::foreign::arc_pixel_like()),
+        0,
+        utc(2020, 1, 1),
+    );
+    put(
+        &dir,
+        "headers.js",
+        Bytes(&ustar_in_source()),
+        0,
+        utc(2020, 1, 1),
+    );
+    put(
+        &dir,
+        "pixels.arc",
+        Bytes(&crate::foreign::arc_pixel_like()),
+        0,
+        utc(2020, 1, 1),
+    );
+    put(
+        &dir,
+        "headers.tar",
+        Bytes(&ustar_in_source()),
+        0,
+        utc(2020, 1, 1),
+    );
+    let (out, err, code) = ls(&dir, &["ls"]);
+    assert_eq!(
+        (out.as_str(), err.as_str(), code),
+        (footer(0, 4).as_str(), "", Some(0))
+    );
+}
+
+#[test]
+fn ls_lists_gzip_not_tar_gzip_for_a_gzipped_non_tar() {
+    let dir = tmp_dir();
+    let gz = gzip_wrap(&ustar_in_source());
+    put(&dir, "headers.js.gz", Bytes(&gz), 0, utc(2020, 1, 1));
+    put(&dir, "x.tar.gz", Bytes(&gz), 0, utc(2019, 1, 1));
+    let size = human(gz.len());
+    let (out, err, code) = ls(&dir, &["ls"]);
+    let want = row(
+        "gzip",
+        &size,
+        "Jan  1  2020",
+        "headers.js.gz",
+        4,
+        size.len(),
+    ) + &row("gzip", &size, "Jan  1  2019", "x.tar.gz", 4, size.len());
+    assert_eq!(
+        (out.as_str(), err.as_str(), code),
+        (want.as_str(), "", Some(0))
+    );
+}
+
+/// `ls`'s size cell for a size under 1 KiB.
+fn human(len: usize) -> String {
+    assert!(len < 1000, "{len}");
+    format!("{len}B")
+}
+
+#[test]
+fn ls_keeps_zip_documents() {
+    let dir = tmp_dir();
+    let src = tmp_dir();
+    let zip = std::fs::read(write_zip_via_pack(&src, &[("doc.xml", b"<doc/>\n")])).unwrap();
+    for name in ["model.3mf", "letter.docx", "app.jar"] {
+        put(&dir, name, Bytes(&zip), 0, utc(2020, 1, 1));
+    }
+    let o = run_in_dir_output(&dir, &["ls", "--json"]);
+    assert_eq!(o.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let got: Vec<(String, String)> = v["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["path"].as_str().unwrap().to_string(),
+                e["format"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    let want: Vec<(String, String)> = ["app.jar", "letter.docx", "model.3mf"]
+        .iter()
+        .map(|n| (n.to_string(), "zip".to_string()))
+        .collect();
+    assert_eq!(got, want);
+    assert_eq!(v["skipped"], 0);
+}
+
+#[test]
+fn ls_lists_brotli_by_name() {
+    let dir = tmp_dir();
+    let src = dir.join("plain.txt");
+    std::fs::write(&src, b"hello hello hello hello brotli").unwrap();
+    let br = dir.join("out.br");
+    let o = run_output(&["pack", src.to_str().unwrap(), "-o", br.to_str().unwrap()]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    std::fs::remove_file(&src).unwrap();
+    let o = run_in_dir_output(&dir, &["ls", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["entries"][0]["path"], "out.br");
+    assert_eq!(v["entries"][0]["format"], "brotli");
+}
+
+#[test]
+fn ls_lists_lzma_only_when_its_header_checks_out() {
+    let dir = tmp_dir();
+    let src = dir.join("plain.txt");
+    std::fs::write(&src, b"hello hello hello hello lzma").unwrap();
+    let lzma = dir.join("real.lzma");
+    let o = run_output(&["pack", src.to_str().unwrap(), "-o", lzma.to_str().unwrap()]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    std::fs::remove_file(&src).unwrap();
+    // Properties byte 0xff is past 224: no lzma tool writes it.
+    let mut bad = std::fs::read(&lzma).unwrap();
+    bad[0] = 0xff;
+    std::fs::write(dir.join("fake.lzma"), bad).unwrap();
+    std::fs::write(dir.join("text.lzma"), b"just some text, named lzma\n").unwrap();
+    let o = run_in_dir_output(&dir, &["ls", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let entries = v["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "{v}");
+    assert_eq!(entries[0]["path"], "real.lzma");
+    assert_eq!(entries[0]["format"], "lzma");
+    assert_eq!(v["skipped"], 2);
+}
+
+#[test]
+fn a_corrupt_tar_inside_a_named_gzip_is_still_corrupt() {
+    let dir = tmp_dir();
+    let mut tar = small_tar();
+    // Break the header checksum (offset 148, eight octal digits).
+    tar[148] = if tar[148] == b'1' { b'2' } else { b'1' };
+    put(
+        &dir,
+        "x.tar.gz",
+        Bytes(&gzip_wrap(&tar)),
+        0,
+        utc(2020, 1, 1),
+    );
+    let (_, _, code) = ls(&dir, &["list", "x.tar.gz"]);
+    assert_eq!(code, Some(5));
+    let o = run_in_dir_output(&dir, &["ls", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["entries"][0]["path"], "x.tar.gz");
+    assert_eq!(v["entries"][0]["format"], "gzip");
+}
+
+/// Review Focus 2: a small real `.tar.gz` (the whole file inside the probe
+/// window) lists as `tar+gzip`; a `.tar.xz` whose first 4096 bytes decode
+/// to less than one tar header lists as `xz` — neither is ever hidden.
+#[test]
+fn small_and_slow_archives_stay_listed() {
+    let dir = tmp_dir();
+    let tgz = write_fixture_tar_gz(&dir, "small.tar.gz", &[("a.txt", b"alpha")]);
+    let tgz_len = std::fs::metadata(&tgz).unwrap().len();
+    assert!(tgz_len < 4096, "{tgz_len}");
+    let o = run_in_dir_output(&dir, &["ls", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["entries"][0]["format"], "tar over gzip", "{v}");
+
+    // One-byte xz blocks: each costs 23 bytes of framing, so the window
+    // decodes to well under 512 bytes of the tar.
+    let xz = one_byte_block_xz(&small_tar());
+    assert!(xz.len() > 4096, "{}", xz.len());
+    std::fs::write(dir.join("slow.tar.xz"), &xz).unwrap();
+    let o = run_in_dir_output(&dir, &["ls", "-n", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let formats: Vec<(&str, &str)> = v["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["path"].as_str().unwrap(), e["format"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        formats,
+        [("slow.tar.xz", "xz"), ("small.tar.gz", "tar over gzip")],
+        "{v}"
+    );
+    // The verbs still read it whole.
+    let (out, _, code) = ls(&dir, &["list", "slow.tar.xz"]);
+    assert_eq!(code, Some(0));
+    assert!(out.contains("a.txt"), "{out}");
+}
+
+/// The xz varint: seven bits at a time, low first, high bit = more.
+fn xz_varint(out: &mut Vec<u8>, mut n: u64) {
+    while n >= 0x80 {
+        out.push((n as u8) | 0x80);
+        n >>= 7;
+    }
+    out.push(n as u8);
+}
+
+/// A real xz stream (per the .xz file format 1.2.0) holding `data` one byte
+/// per block: LZMA2 with an uncompressed chunk per block, CRC32 checks.
+/// `xz --block-size=1` writes this shape; built by hand so the test needs no
+/// tool and both tiers read the same bytes.
+fn one_byte_block_xz(data: &[u8]) -> Vec<u8> {
+    let flags = [0u8, 1]; // check type 1: CRC32
+    let mut out = vec![0xfd, b'7', b'z', b'X', b'Z', 0];
+    out.extend_from_slice(&flags);
+    out.extend_from_slice(&salvage_fixture_crc32(&flags).to_le_bytes());
+    // Block header: size byte (12 / 4 - 1), block flags (one filter, no
+    // sizes), LZMA2 (0x21) with one property byte (dictionary 0 = 4 KiB),
+    // padding to 8, CRC32.
+    let mut header = vec![2u8, 0, 0x21, 1, 0, 0, 0, 0];
+    header.extend_from_slice(&salvage_fixture_crc32(&header.clone()).to_le_bytes());
+    for &b in data {
+        out.extend_from_slice(&header);
+        // An uncompressed chunk with a dictionary reset, one byte, the end
+        // marker; padded to four; the check.
+        out.extend_from_slice(&[1, 0, 0, b, 0, 0, 0, 0]);
+        out.extend_from_slice(&salvage_fixture_crc32(&[b]).to_le_bytes());
+    }
+    let mut index = vec![0u8];
+    xz_varint(&mut index, data.len() as u64);
+    for _ in data {
+        xz_varint(&mut index, 12 + 5 + 4); // unpadded size
+        xz_varint(&mut index, 1); // uncompressed size
+    }
+    while index.len() % 4 != 0 {
+        index.push(0);
+    }
+    index.extend_from_slice(&salvage_fixture_crc32(&index.clone()).to_le_bytes());
+    let backward = (index.len() / 4 - 1) as u32;
+    out.extend_from_slice(&index);
+    let mut footer = backward.to_le_bytes().to_vec();
+    footer.extend_from_slice(&flags);
+    out.extend_from_slice(&salvage_fixture_crc32(&footer).to_le_bytes());
+    out.extend_from_slice(&footer);
+    out.extend_from_slice(b"YZ");
+    out
 }

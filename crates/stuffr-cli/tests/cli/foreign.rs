@@ -1,0 +1,330 @@
+//! Foreign formats: a file that begins like one of ours and is not.
+//!
+//! An Apple disk image (UDIF) is the case in point: its first chunk is a
+//! zlib (or bzip2, lzfse…) stream, and its last 512 bytes are the `koly`
+//! trailer. Every verb given one by name refuses it (exit 3) and names it;
+//! `--format` overrides the check, `salvage` never refuses, and a piped image
+//! (no tail to read) is a corrupt stream of its first chunk, never exit 1.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use crate::common::*;
+
+/// The UDIF trailer: `koly`, version 4, header size 512, all big-endian,
+/// then zeros to 512 bytes.
+fn koly_block() -> Vec<u8> {
+    let mut koly = vec![0u8; 512];
+    koly[..4].copy_from_slice(b"koly");
+    koly[4..8].copy_from_slice(&4u32.to_be_bytes());
+    koly[8..12].copy_from_slice(&512u32.to_be_bytes());
+    koly
+}
+
+/// 2 KiB that zlib cannot shrink much (a linear congruential sequence), so
+/// the stream is about 2 KiB.
+fn first_chunk_text() -> Vec<u8> {
+    let mut x: u32 = 0x1234_5678;
+    (0..2048)
+        .map(|_| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (x >> 24) as u8
+        })
+        .collect()
+}
+
+/// A synthetic disk image that any platform can build: a real zlib stream
+/// (`78 9c`), then `payload`, then 4 KiB of zeros, then the `koly` block.
+pub(crate) fn synthetic_dmg_with(payload: &[u8]) -> Vec<u8> {
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(&first_chunk_text()).unwrap();
+    let mut out = enc.finish().unwrap();
+    assert_eq!(out[..2], [0x78, 0x9c]);
+    out.extend_from_slice(payload);
+    out.resize(out.len() + 4096, 0);
+    out.extend_from_slice(&koly_block());
+    out
+}
+
+pub(crate) fn synthetic_dmg() -> Vec<u8> {
+    synthetic_dmg_with(&[])
+}
+
+/// Real disk images made by `hdiutil` from a one-file folder, one per
+/// format, written into `dir`. Empty (with a printed note) where `hdiutil`
+/// is missing or refuses — CI's macOS runner may not be allowed to make
+/// disk images, and hdiutil's own failure is not stuffr's.
+#[cfg(target_os = "macos")]
+pub(crate) fn real_disk_images(dir: &Path) -> Vec<PathBuf> {
+    let Some(hdiutil) = which("hdiutil") else {
+        eprintln!("note: hdiutil is missing; real disk images skipped");
+        return Vec::new();
+    };
+    let src = tmp_dir();
+    std::fs::write(src.join("hello.txt"), b"hello from a disk image\n").unwrap();
+    let mut made = Vec::new();
+    for format in ["UDZO", "UDBZ", "ULMO", "UDRO", "ULFO"] {
+        let out = dir.join(format!("image-{format}.dmg"));
+        let run = std::process::Command::new(&hdiutil)
+            .args([
+                "create", "-quiet", "-ov", "-volname", "stuffr", "-format", format,
+            ])
+            .arg("-srcfolder")
+            .arg(&*src)
+            .arg("-o")
+            .arg(&out)
+            .output();
+        match run {
+            Ok(o) if o.status.success() && out.is_file() => {
+                let bytes = std::fs::read(&out).unwrap();
+                assert_eq!(
+                    bytes[bytes.len() - 512..][..4],
+                    *b"koly",
+                    "hdiutil's {format} image has no koly trailer"
+                );
+                made.push(out);
+            }
+            Ok(o) => {
+                eprintln!(
+                    "note: hdiutil create -format {format} failed ({}): {}; skipped",
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+                let _ = std::fs::remove_file(&out);
+            }
+            Err(e) => {
+                eprintln!("note: hdiutil could not run ({e}); real disk images skipped");
+                return made;
+            }
+        }
+    }
+    made
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn real_disk_images(_dir: &Path) -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// Every disk image this machine can offer: the synthetic one always, and
+/// hdiutil's where it works.
+fn every_disk_image(dir: &Path) -> Vec<PathBuf> {
+    let synthetic = dir.join("synthetic.dmg");
+    std::fs::write(&synthetic, synthetic_dmg()).unwrap();
+    let mut all = vec![synthetic];
+    all.extend(real_disk_images(dir));
+    all
+}
+
+fn outcome(o: &std::process::Output) -> (Option<i32>, String) {
+    (
+        o.status.code(),
+        String::from_utf8_lossy(&o.stderr).into_owned(),
+    )
+}
+
+/// The names in `dir`, sorted.
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn every_verb_refuses_a_disk_image() {
+    let dir = tmp_dir();
+    for image in every_disk_image(&dir) {
+        let work = tmp_dir();
+        let x = work.join("x.dmg");
+        std::fs::copy(&image, &x).unwrap();
+        let xs = x.to_str().unwrap();
+        let unpack_dir = work.join("out");
+        let ud = unpack_dir.to_str().unwrap();
+        let y = work.join("y.tar");
+        let ys = y.to_str().unwrap();
+        let single = work.join("single");
+        let ss = single.to_str().unwrap();
+        let want =
+            format!("stuffr: {xs}: this is an Apple disk image (UDIF), which stuffr cannot open\n");
+        for args in [
+            vec!["info", xs],
+            vec!["info", "--json", xs],
+            vec!["cat", xs],
+            vec!["cat", xs, "hello.txt"],
+            vec!["list", xs],
+            vec!["ls", xs],
+            vec!["test", xs],
+            vec!["unpack", xs, "-C", ud],
+            vec!["unpack", xs, "-o", ss],
+            vec!["convert", xs, "-o", ys],
+            vec!["convert", xs, ys],
+        ] {
+            let o = run_output(&args);
+            let (code, err) = outcome(&o);
+            assert_eq!(code, Some(3), "{image:?} {args:?}: {err}");
+            assert_eq!(err, want, "{image:?} {args:?}");
+            assert!(o.stdout.is_empty(), "{image:?} {args:?} wrote to stdout");
+            assert_eq!(names_in(&work), ["x.dmg"], "{image:?} {args:?} left output");
+        }
+    }
+}
+
+/// The path in the message is shown as `ls` and `list` show names: escaped.
+#[cfg(unix)]
+#[test]
+fn the_refusal_escapes_the_path() {
+    let dir = tmp_dir();
+    let x = dir.join("a\nb.dmg");
+    std::fs::write(&x, synthetic_dmg()).unwrap();
+    let (code, err) = outcome(&run_output(&["info", x.to_str().unwrap()]));
+    assert_eq!(code, Some(3));
+    let shown = format!("{}/a\\nb.dmg", dir.display());
+    assert_eq!(
+        err,
+        format!("stuffr: {shown}: this is an Apple disk image (UDIF), which stuffr cannot open\n")
+    );
+}
+
+#[test]
+fn salvage_tries_a_disk_image() {
+    let dir = tmp_dir();
+    let x = dir.join("x.dmg");
+    std::fs::write(&x, synthetic_dmg()).unwrap();
+    let out = dir.join("out");
+    let (code, err) = outcome(&run_output(&[
+        "salvage",
+        x.to_str().unwrap(),
+        "-C",
+        out.to_str().unwrap(),
+    ]));
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("not an archive"), "{err}");
+    assert!(!err.contains("Apple disk image"), "{err}");
+
+    // With the container named, the image is scanned like any other file
+    // and the zip stored inside it is recovered.
+    let zdir = tmp_dir();
+    let zip = std::fs::read(write_zip_via_pack(
+        &zdir,
+        &[("inside.txt", b"recovered from a disk image\n")],
+    ))
+    .unwrap();
+    let x = dir.join("with-zip.dmg");
+    std::fs::write(&x, synthetic_dmg_with(&zip)).unwrap();
+    let out = dir.join("zip-out");
+    let o = run_output(&[
+        "salvage",
+        "--format",
+        "zip",
+        x.to_str().unwrap(),
+        "-C",
+        out.to_str().unwrap(),
+    ]);
+    let (code, err) = outcome(&o);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(
+        std::fs::read(out.join("inside.txt")).unwrap(),
+        b"recovered from a disk image\n"
+    );
+}
+
+#[test]
+fn format_flag_overrides_the_foreign_check() {
+    let dir = tmp_dir();
+    let x = dir.join("x.dmg");
+    std::fs::write(&x, synthetic_dmg()).unwrap();
+    let o = run_output(&["cat", "--format", "zlib", x.to_str().unwrap()]);
+    let (code, err) = outcome(&o);
+    assert!(matches!(code, Some(0 | 5)), "{code:?} {err}");
+    assert!(!err.contains("Apple disk image"), "{err}");
+    // What came out is the first chunk, as far as it went.
+    let text = first_chunk_text();
+    assert!(
+        text.starts_with(&o.stdout) && !o.stdout.is_empty(),
+        "{} bytes",
+        o.stdout.len()
+    );
+
+    let y = dir.join("y");
+    let o = run_output(&[
+        "unpack",
+        "--format",
+        "zlib",
+        x.to_str().unwrap(),
+        "-o",
+        y.to_str().unwrap(),
+    ]);
+    let (code, err) = outcome(&o);
+    assert!(matches!(code, Some(0 | 5)), "{code:?} {err}");
+    assert!(!err.contains("Apple disk image"), "{err}");
+}
+
+/// A pipe has no end to read, so the trailer cannot be seen: the image is
+/// its first chunk's codec, and whatever that yields is never exit 1. The
+/// brief's set was {2, 3, 5}; zlib stops at its own stream's end and does
+/// not look at what follows, so `cat -` decodes the first chunk and exits 0
+/// — the same as for any zlib stream with bytes after it.
+#[test]
+fn a_piped_disk_image_never_exits_1() {
+    let o = run_with_stdin_output(&["cat", "-"], &synthetic_dmg());
+    let (code, err) = outcome(&o);
+    assert!(matches!(code, Some(0 | 2 | 3 | 5)), "{code:?} {err}");
+    assert!(first_chunk_text().starts_with(&o.stdout));
+    for verb in ["info", "list", "test"] {
+        let o = run_with_stdin_output(&[verb, "-"], &synthetic_dmg());
+        let (code, err) = outcome(&o);
+        assert!(
+            matches!(code, Some(0 | 2 | 3 | 5)),
+            "{verb}: {code:?} {err}"
+        );
+    }
+}
+
+/// recon's `.scube`: pixel-like data starting `1A 01`, arc's magic, with no
+/// arc header behind it (the shape `arc_rejects_pixel_like_data` pins).
+pub(crate) fn arc_pixel_like() -> Vec<u8> {
+    let start: [u8; 32] = [
+        0x1a, 0x01, 0x00, 0xff, 0x1b, 0x01, 0x00, 0xff, 0x1d, 0x01, 0x00, 0xff, 0x1f, 0x01, 0x00,
+        0xff, 0x21, 0x01, 0x00, 0xff, 0x24, 0x01, 0x00, 0xff, 0x28, 0x01, 0x00, 0xff, 0x2d, 0x01,
+        0x00, 0xff,
+    ];
+    start.iter().copied().cycle().take(4096).collect()
+}
+
+#[test]
+fn info_says_when_the_header_did_not_check_out() {
+    let dir = tmp_dir();
+    let x = dir.join("pixels.scube");
+    std::fs::write(&x, arc_pixel_like()).unwrap();
+    let o = run_output(&["info", x.to_str().unwrap()]);
+    let (code, err) = outcome(&o);
+    assert_eq!(code, Some(0), "{err}");
+    let text = String::from_utf8(o.stdout).unwrap();
+    assert!(text.contains("format:   arc\n"), "{text}");
+    assert!(text.contains("detected: magic-unconfirmed\n"), "{text}");
+
+    let o = run_output(&["info", "--json", x.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["format"], "arc");
+    assert_eq!(v["detected_by"], "magic-unconfirmed");
+
+    // Text with no magic, named `.gz`: the name decided, and gzip's check
+    // refused the bytes.
+    let t = dir.join("notes.gz");
+    std::fs::write(&t, b"just plain text, no gzip magic here").unwrap();
+    let o = run_output(&["info", "--json", t.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["detected_by"], "extension-unconfirmed");
+
+    // A real gzip still says `magic`, in both forms.
+    let g = dir.join("real.gz");
+    std::fs::write(&g, gzip_wrap(b"hello")).unwrap();
+    let o = run_output(&["info", g.to_str().unwrap()]);
+    let text = String::from_utf8(o.stdout).unwrap();
+    assert!(text.contains("detected: magic\n"), "{text}");
+}

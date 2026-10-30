@@ -311,9 +311,24 @@ mod tests {
         f.set_modified(base() - Duration::from_secs(age)).unwrap();
     }
 
-    const GZ: &[u8] = &[0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 3];
-    const ZIP: &[u8] = b"PK\x03\x04\x14\0\0\0\0\0";
-    const XZ: &[u8] = &[0xfd, b'7', b'z', b'X', b'Z', 0, 0, 0, 0, 0];
+    // Real, minimal streams: `ls` lists only what confirms, and a bare
+    // magic is not that. An empty gzip (`gzip -cn </dev/null`), an empty xz
+    // (`xz -c </dev/null`) and a stored zip of one empty file `a`
+    // (`zip -X -0`).
+    const GZ: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    const ZIP: &[u8] = &[
+        0x50, 0x4b, 0x3, 0x4, 0xa, 0, 0, 0, 0, 0, 0xa1, 0x82, 0x5e, 0x5d, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0x1, 0, 0, 0, 0x61, 0x50, 0x4b, 0x1, 0x2, 0x1e, 0x3, 0xa, 0, 0, 0, 0, 0, 0xa1,
+        0x82, 0x5e, 0x5d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0xa4, 0x81, 0, 0, 0, 0, 0x61, 0x50, 0x4b, 0x5, 0x6, 0, 0, 0, 0, 0x1, 0, 0x1, 0, 0x2f, 0, 0,
+        0, 0x1f, 0, 0, 0, 0, 0,
+    ];
+    const XZ: &[u8] = &[
+        0xfd, 0x37, 0x7a, 0x58, 0x5a, 0, 0, 0x04, 0xe6, 0xd6, 0xb4, 0x46, 0, 0, 0, 0, 0x1c, 0xdf,
+        0x44, 0x21, 0x1f, 0xb6, 0xf3, 0x7d, 0x01, 0, 0, 0, 0, 0x04, 0x59, 0x5a,
+    ];
 
     fn opts(recursive: bool, all: bool, by_name: bool) -> WalkOptions {
         WalkOptions {
@@ -577,29 +592,60 @@ mod tests {
     }
 
     #[test]
-    fn reads_at_most_probe_len_per_file() {
-        use std::io::Read;
-        struct Counting<R>(R, std::rc::Rc<std::cell::Cell<usize>>);
+    fn reads_at_most_probe_len_and_the_tail_per_file() {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use stuffr::{SeekRead, Source, SourceCaps};
+        /// Counts every byte read, through `Read` and through the seek view.
+        struct Counting<R>(R, Arc<AtomicUsize>);
         impl<R: Read> Read for Counting<R> {
             fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
                 let n = self.0.read(b)?;
-                self.1.set(self.1.get() + n);
+                self.1.fetch_add(n, Ordering::Relaxed);
                 Ok(n)
+            }
+        }
+        impl<R: Seek> Seek for Counting<R> {
+            fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+                self.0.seek(to)
+            }
+        }
+        struct Src(Counting<fs::File>, u64);
+        impl Read for Src {
+            fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+                self.0.read(b)
+            }
+        }
+        impl Source for Src {
+            fn caps(&self) -> SourceCaps {
+                SourceCaps {
+                    seekable: true,
+                    len: Some(self.1),
+                }
+            }
+            fn as_seek(&mut self) -> Option<&mut dyn SeekRead> {
+                Some(&mut self.0)
             }
         }
         let d = Dir::new();
         let mut big = GZ.to_vec();
         big.resize(1 << 20, 0);
         let p = d.file("big.gz", &big, 1);
-        let count = std::rc::Rc::new(std::cell::Cell::new(0));
-        let r = Counting(fs::File::open(&p).unwrap(), count.clone());
-        let v = super::super::identify::identify_with_reader(stuffr::registry(), &p, r).unwrap();
-        assert!(matches!(v, Identified::Openable(_)));
-        assert!(
-            count.get() <= stuffr::probe::PROBE_LEN,
-            "read {}",
-            count.get()
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut src = Src(
+            Counting(fs::File::open(&p).unwrap(), count.clone()),
+            1 << 20,
         );
-        assert!(count.get() > 0);
+        let v =
+            super::super::identify::identify_with_reader(stuffr::registry(), &p, &mut src).unwrap();
+        assert!(matches!(v, Identified::Openable(_)), "{v:?}");
+        let read = count.load(Ordering::Relaxed);
+        let bound = stuffr::probe::PROBE_LEN + stuffr::probe::TAIL_LEN;
+        assert!(read <= bound, "read {read}");
+        assert!(
+            read > stuffr::probe::PROBE_LEN,
+            "the tail was not read: {read}"
+        );
     }
 }

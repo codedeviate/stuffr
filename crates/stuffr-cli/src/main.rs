@@ -68,12 +68,41 @@ fn main() -> ExitCode {
         c => c,
     };
 
+    let input = named_input(&command).map(str::to_owned);
     match run(command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("stuffr: {e}");
+            report_error(&e, input.as_deref());
             ExitCode::from(e.exit_code() as u8)
         }
+    }
+}
+
+/// The input file a command names, for the errors that are about the file
+/// itself rather than about anything inside it. `-` (stdin) has no name.
+fn named_input(cmd: &Command) -> Option<&str> {
+    let input = match cmd {
+        Command::Unpack { input, .. }
+        | Command::Convert { input, .. }
+        | Command::Cat { input, .. }
+        | Command::Info { input, .. }
+        | Command::List { input, .. }
+        | Command::Test { input, .. } => input,
+        _ => return None,
+    };
+    (input != "-").then_some(input.as_str())
+}
+
+/// Prints `e` as `stuffr: …`. A foreign file (an Apple disk image) is a
+/// verdict on the input as a whole, so its path leads the message, escaped
+/// as `ls` and `list` show names: `stuffr: x.dmg: this is an Apple disk
+/// image (UDIF), which stuffr cannot open`.
+fn report_error(e: &stuffr::Error, input: Option<&str>) {
+    match (e, input) {
+        (stuffr::Error::ForeignFormat(_), Some(path)) => {
+            eprintln!("stuffr: {}: {e}", stuffr::fmt_name(path));
+        }
+        _ => eprintln!("stuffr: {e}"),
     }
 }
 
@@ -82,6 +111,8 @@ fn main() -> ExitCode {
 /// Every byte `ls` writes goes to stdout, in both modes, so a closed pipe is
 /// the reader's decision and ends the run quietly, as it does for `list`.
 fn run_ls(args: stuffr_cli::cli::LsArgs, invoked_as: &str) -> ExitCode {
+    // A file argument is `list`'s, and so are its errors' paths.
+    let input = args.path.clone().filter(|p| p != "-");
     match ls::run(args, invoked_as) {
         Ok(ls::LsStatus::Complete) => ExitCode::SUCCESS,
         Ok(ls::LsStatus::Degraded) => ExitCode::from(4),
@@ -89,7 +120,7 @@ fn run_ls(args: stuffr_cli::cli::LsArgs, invoked_as: &str) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("stuffr: {e}");
+            report_error(&e, input.as_deref());
             ExitCode::from(e.exit_code() as u8)
         }
     }
@@ -666,6 +697,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             } else {
                 writeln!(out, "format:   {}", i.format)?;
                 writeln!(out, "chain:    {}", i.chain)?;
+                writeln!(out, "detected: {}", i.detected_by)?;
                 writeln!(out, "rung:     {}", i.fidelity.rung)?;
                 match i.bytes_in {
                     Some(n) => writeln!(out, "size:     {n} bytes")?,

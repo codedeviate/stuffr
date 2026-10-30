@@ -878,10 +878,16 @@ pub fn decompress_with(
         Rung::ForwardOnly
     };
 
-    let (prefix, source) = stuffr_core::probe(source)?;
-    let format = match o.format {
-        Some(f) => f,
-        None => codec_for(registry, path.as_deref(), &prefix)?,
+    // `--format` overrides identification entirely, the foreign check
+    // included: an explicit format never goes through `probe`, which would
+    // refuse a disk image before the caller's choice was consulted. The
+    // source is freshly opened, so it already stands at byte zero.
+    let (format, source) = match o.format {
+        Some(f) => (f, source),
+        None => {
+            let (prefix, source) = stuffr_core::probe(source)?;
+            (codec_for(registry, path.as_deref(), &prefix)?, source)
+        }
     };
     let codec = registry.require_decoder(format)?;
 
@@ -1291,12 +1297,41 @@ fn write_recompressed(
 #[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 #[non_exhaustive]
 pub enum Detection {
-    /// Leading bytes matched a registered magic rule.
+    /// Leading bytes matched a registered magic rule, and the format's own
+    /// header check accepted them.
     Magic,
-    /// No magic matched; the path's extension decided.
+    /// No magic matched; the path's extension decided (and the format's
+    /// header check, if it has one, accepted the bytes).
     Extension,
     /// The caller named the format and detection was not consulted.
     Explicit,
+    /// Leading bytes matched a magic rule, but the format's header check
+    /// refused what follows: a damaged file, or one that is not this format
+    /// at all. Still the answer, so a verb reaches the reader and reports
+    /// it corrupt; `stuffr ls` does not list it.
+    MagicUnconfirmed,
+    /// No magic matched; the extension named a format whose header check
+    /// refused the bytes.
+    ExtensionUnconfirmed,
+}
+
+impl Detection {
+    /// The spelling `stuffr info` prints, the same as the JSON value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Detection::Magic => "magic",
+            Detection::Extension => "extension",
+            Detection::Explicit => "explicit",
+            Detection::MagicUnconfirmed => "magic-unconfirmed",
+            Detection::ExtensionUnconfirmed => "extension-unconfirmed",
+        }
+    }
+}
+
+impl std::fmt::Display for Detection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// What `stuffr info` reports.
@@ -1387,19 +1422,23 @@ pub fn inspect_with(registry: &Registry, src: Input) -> Result<Inspection> {
     };
 
     let (prefix, _rest) = stuffr_core::probe(source)?;
-    // Mirrors the first branch of `resolve_chain`'s own decision: the outer
-    // format comes from the magic-hit set whenever that set is non-empty
-    // (even when a tie among magic hits was later broken by the extension),
-    // and only falls back to the path's extension when nothing matched by
-    // magic at all. `inspect` takes no explicit format today, so `Explicit`
-    // is unreachable from here — that is correct; it exists for the
-    // `--format` override arriving in 1d.
-    let detected_by = if registry.match_magic(&prefix).is_empty() {
-        Detection::Extension
-    } else {
-        Detection::Magic
+    // The same lenient resolution every verb given a file uses, plus how its
+    // outer layer was reached. Mirrors the first branch of that resolution:
+    // the outer format comes from the magic-hit set whenever that set is
+    // non-empty (even when a tie among magic hits was later broken by the
+    // extension), and only falls back to the path's extension when nothing
+    // matched by magic at all. Either way, a format whose own header check
+    // refused the bytes is still named (a damaged archive must stay
+    // reachable), and the `-unconfirmed` spelling says so. `inspect` takes
+    // no explicit format today, so `Explicit` is unreachable from here.
+    let (chain, evidence) = stuffr_core::resolve_chain_checked(registry, path.as_deref(), &prefix)?;
+    let unconfirmed = evidence == stuffr_core::Evidence::Unconfirmed;
+    let detected_by = match (registry.match_magic(&prefix).is_empty(), unconfirmed) {
+        (false, false) => Detection::Magic,
+        (false, true) => Detection::MagicUnconfirmed,
+        (true, false) => Detection::Extension,
+        (true, true) => Detection::ExtensionUnconfirmed,
     };
-    let chain = stuffr_core::resolve_chain(registry, path.as_deref(), &prefix)?;
     let format = match &chain {
         Chain::Codec { codec, .. } => *codec,
         Chain::Container { container } => *container,

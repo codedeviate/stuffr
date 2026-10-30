@@ -2394,3 +2394,88 @@ pub(crate) fn bench_err(args: &[&str]) -> (Option<i32>, String) {
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
 }
+
+/// A real gzip stream of exactly `len` bytes whose decoded content is
+/// `content` followed by zeros: stored deflate blocks, so the size is exact.
+/// `stuffr ls` lists only streams whose header checks out, and a magic
+/// followed by noise is not one; this is how a test gets a real `.gz` of the
+/// size its expected row prints. `len` must leave room for `content` and the
+/// 23 bytes of framing (header, one block header, trailer).
+pub(crate) fn stored_gzip(content: &[u8], len: usize) -> Vec<u8> {
+    const BLOCK: usize = 65_535;
+    let body = len.checked_sub(18).expect("room for the gzip framing");
+    let blocks = body.div_ceil(BLOCK + 5).max(1);
+    let data_len = body - 5 * blocks;
+    assert!(
+        data_len >= content.len(),
+        "{len} bytes cannot hold the content"
+    );
+    let mut data = content.to_vec();
+    data.resize(data_len, 0);
+    let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+    let mut chunks: Vec<&[u8]> = data.chunks(BLOCK).collect();
+    while chunks.len() < blocks {
+        chunks.push(&[]);
+    }
+    let last = chunks.len() - 1;
+    for (i, chunk) in chunks.iter().enumerate() {
+        let n = chunk.len() as u16;
+        out.push(u8::from(i == last));
+        out.extend_from_slice(&n.to_le_bytes());
+        out.extend_from_slice(&(!n).to_le_bytes());
+        out.extend_from_slice(chunk);
+    }
+    out.extend_from_slice(&salvage_fixture_crc32(&data).to_le_bytes());
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    assert_eq!(out.len(), len);
+    out
+}
+
+/// A real tar holding one file, `a.txt` = `alpha` (GNU header, via the `tar`
+/// crate).
+pub(crate) fn small_tar() -> Vec<u8> {
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = Builder::new(&mut tar_bytes);
+        append_tar_entry(&mut builder, "a.txt", b"alpha");
+        builder.finish().unwrap();
+    }
+    tar_bytes
+}
+
+/// A real stored zip of exactly `len` bytes: one entry `a` holding zeros.
+/// `len` must be at least 100 (the framing of a one-letter name).
+pub(crate) fn stored_zip(len: usize) -> Vec<u8> {
+    let data = vec![0u8; len.checked_sub(100).expect("room for the zip framing")];
+    let crc = salvage_fixture_crc32(&data);
+    let size = data.len() as u32;
+    let mut out = Vec::with_capacity(len);
+    // Local header: version 10, no flags, stored, a fixed DOS time.
+    out.extend_from_slice(b"PK\x03\x04\x0a\0\0\0\0\0\xa1\x82\x5e\x5d");
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&[1, 0, 0, 0, b'a']);
+    out.extend_from_slice(&data);
+    let central = out.len() as u32;
+    out.extend_from_slice(b"PK\x01\x02\x1e\x03\x0a\0\0\0\0\0\xa1\x82\x5e\x5d");
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&size.to_le_bytes());
+    // Name length 1, no extra, no comment, disk 0, internal 0, external
+    // 0o100644 << 16, local header at 0.
+    out.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xa4, 0x81]);
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.push(b'a');
+    out.extend_from_slice(b"PK\x05\x06\0\0\0\0\x01\0\x01\0\x2f\0\0\0");
+    out.extend_from_slice(&central.to_le_bytes());
+    out.extend_from_slice(&[0, 0]);
+    assert_eq!(out.len(), len);
+    out
+}
+
+/// `xz -c </dev/null`: the smallest real xz stream (32 bytes).
+pub(crate) const EMPTY_XZ: &[u8] = &[
+    0xfd, 0x37, 0x7a, 0x58, 0x5a, 0, 0, 0x04, 0xe6, 0xd6, 0xb4, 0x46, 0, 0, 0, 0, 0x1c, 0xdf, 0x44,
+    0x21, 0x1f, 0xb6, 0xf3, 0x7d, 0x01, 0, 0, 0, 0, 0x04, 0x59, 0x5a,
+];

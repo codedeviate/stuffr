@@ -108,7 +108,9 @@ fn inspect_of_a_seekable_file_reports_exact() {
 ///
 /// The fallback is real and reachable, not a hypothetical: `stuffr info` still
 /// identifies such a file (by name) even though `unpack` would then fail on
-/// it when the bytes turn out not to be gzip after all.
+/// it when the bytes turn out not to be gzip after all. Since gzip gained a
+/// header check, `info` also says the name's format refused the bytes:
+/// `ExtensionUnconfirmed`, where 0.21.0 said `Extension`.
 #[test]
 fn a_non_gzip_file_named_dot_gz_is_detected_by_extension_not_magic() {
     let path = tmp("not-actually-gzip.gz");
@@ -122,8 +124,9 @@ fn a_non_gzip_file_named_dot_gz_is_detected_by_extension_not_magic() {
     );
     assert_eq!(
         inspection.detected_by,
-        Detection::Extension,
-        "no magic matched; only the name decided"
+        Detection::ExtensionUnconfirmed,
+        "no magic matched; only the name decided, and gzip's header check \
+         refused the bytes"
     );
 
     let _ = std::fs::remove_file(&path);

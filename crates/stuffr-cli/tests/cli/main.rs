@@ -3,6 +3,7 @@ mod common;
 mod convert;
 mod entries;
 mod fidelity;
+mod foreign;
 mod hard_links;
 mod hygiene;
 mod indentation_guard;
