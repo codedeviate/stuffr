@@ -31,7 +31,7 @@ macro_rules! skippable_rules {
 pub(crate) use skippable_rules;
 
 /// `true` when `bytes` begins with one of the sixteen skippable magics.
-fn starts_skippable(bytes: &[u8]) -> bool {
+pub(crate) fn starts_skippable(bytes: &[u8]) -> bool {
     bytes.len() >= 4 && bytes[0] & 0xf0 == 0x50 && bytes[1..4] == [0x2a, 0x4d, 0x18]
 }
 

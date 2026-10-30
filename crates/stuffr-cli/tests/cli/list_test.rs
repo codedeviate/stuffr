@@ -695,3 +695,55 @@ fn a_ratio_refusal_below_a_container_is_a_resource_limit_not_an_io_failure() {
         );
     }
 }
+
+/// Blender's `.blend.zst` ends with a skippable frame (magic `0x184D2A5E`,
+/// 33-byte payload). `zstd -t` accepts it; the pure tier used to refuse it as
+/// `SkipFrame`. The data frame is a hand-built single raw block, so no encoder
+/// (weak or otherwise) is needed.
+#[test]
+fn cat_and_test_accept_a_zstd_stream_with_a_trailing_skippable_frame() {
+    let text = b"BLENDER-v400 pretend scene data\n";
+    let mut bytes = vec![0x28, 0xb5, 0x2f, 0xfd, 0x20, text.len() as u8];
+    let block = ((text.len() as u32) << 3) | 1; // last block, raw
+    bytes.extend_from_slice(&block.to_le_bytes()[..3]);
+    bytes.extend_from_slice(text);
+    bytes.extend_from_slice(&0x184D_2A5Eu32.to_le_bytes());
+    bytes.extend_from_slice(&33u32.to_le_bytes());
+    bytes.extend_from_slice(&[0u8; 33]);
+
+    let dir = tmp_dir();
+    let blend = dir.join("scene.blend.zst");
+    std::fs::write(&blend, &bytes).unwrap();
+    let path = blend.to_str().unwrap();
+
+    let cat = run_output(&["cat", path]);
+    assert_eq!(
+        cat.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&cat.stderr)
+    );
+    assert_eq!(cat.stdout, text);
+    // `stuffr test` refuses a bare codec stream ("not an archive", exit 2),
+    // so `unpack` is the whole-stream integrity check here.
+    let unpacked = dir.join("scene.blend");
+    let un = run_output(&["unpack", path, "-o", unpacked.to_str().unwrap()]);
+    assert_eq!(
+        un.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&un.stderr)
+    );
+    assert_eq!(std::fs::read(&unpacked).unwrap(), text);
+
+    // Cut inside the skippable payload: corrupt (5), never exit 1.
+    let cut = dir.join("cut.zst");
+    std::fs::write(&cut, &bytes[..bytes.len() - 10]).unwrap();
+    let out = run_output(&["cat", cut.to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

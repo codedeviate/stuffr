@@ -284,6 +284,34 @@ mod tests {
         out
     }
 
+    fn skippable(magic: u32, payload: &[u8]) -> Vec<u8> {
+        let mut out = magic.to_le_bytes().to_vec();
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn zstd_c_skips_a_trailing_skippable_frame() {
+        let plain = b"blender-like text, line after line of it. ".repeat(2500);
+        let mut bytes = compress(&plain);
+        bytes.extend(skippable(0x184D_2A5E, &[7; 33]));
+        assert_eq!(decompress(bytes), plain);
+    }
+
+    #[test]
+    fn zstd_c_skips_skippable_frames_before_between_and_after() {
+        let (a, b) = (b"first frame ".repeat(500), b"second frame".repeat(50));
+        let mut bytes = skippable(0x184D_2A50, &[1; 5]);
+        bytes.extend(compress(&a));
+        bytes.extend(skippable(0x184D_2A5F, &[]));
+        bytes.extend(compress(&b));
+        bytes.extend(skippable(0x184D_2A5E, &[7; 33]));
+        let mut want = a;
+        want.extend(b);
+        assert_eq!(decompress(bytes), want);
+    }
+
     #[test]
     fn round_trips_real_data() {
         let plain = b"the quick brown fox jumps over the lazy dog".repeat(100);

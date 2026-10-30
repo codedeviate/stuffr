@@ -406,19 +406,14 @@ impl Read for LazyRuzstdDecoder {
                         unreachable!("just matched Ready above")
                     };
                     let remaining = dec.into_inner();
-                    let peeked = match stuffr_core::PeekSource::fill(remaining, 1) {
-                        Ok(p) => p,
-                        Err(e) => return Err(std::io::Error::other(e)),
-                    };
-                    if peeked.prefix().is_empty() {
-                        // Genuinely nothing left: the whole stream — one
-                        // frame or several — is done.
-                        *self = LazyRuzstdDecoder::Done;
-                        return Ok(0);
-                    }
-                    match StreamingDecoder::new(Box::new(peeked) as Box<dyn Source>) {
-                        Ok(next) => *self = LazyRuzstdDecoder::Ready(Box::new(next)),
-                        Err(e) => return Err(frame_decoder_error_to_io(e)),
+                    match open_frame(remaining, false)? {
+                        Some(next) => *self = LazyRuzstdDecoder::Ready(Box::new(next)),
+                        None => {
+                            // Genuinely nothing left (skippable frames
+                            // included): the whole stream is done.
+                            *self = LazyRuzstdDecoder::Done;
+                            return Ok(0);
+                        }
                     }
                     // Loop back around: the state is now Ready(next), and
                     // the top of the loop serves its bytes like any other
@@ -436,13 +431,75 @@ impl Read for LazyRuzstdDecoder {
                     else {
                         unreachable!("just matched Pending above")
                     };
-                    match StreamingDecoder::new(src) {
-                        Ok(dec) => *self = LazyRuzstdDecoder::Ready(Box::new(dec)),
-                        Err(e) => return Err(frame_decoder_error_to_io(e)),
+                    match open_frame(src, true)? {
+                        Some(dec) => *self = LazyRuzstdDecoder::Ready(Box::new(dec)),
+                        // Nothing but skippable frames: an empty stream,
+                        // as `zstd -d` reads it.
+                        None => *self = LazyRuzstdDecoder::Done,
                     }
                 }
             }
         }
+    }
+}
+
+type RuzstdFrame = StreamingDecoder<Box<dyn Source>, ruzstd::decoding::FrameDecoder>;
+
+/// Steps over every skippable frame (magic `0x184D2A50..=5F`, a `u32` length,
+/// then that many bytes) at the head of `src`, then opens a decoder on the
+/// real frame behind them. `ruzstd` refuses a skippable frame outright
+/// (`ReadFrameHeaderError::SkipFrame`), and consumes the source doing so, so
+/// the header is peeked here first. `None` means the source ended — `first`
+/// says whether this is the stream's first frame, where an empty source is
+/// still handed to `ruzstd` so it fails exactly as it always did.
+///
+/// A skippable frame cut short — inside its magic, its length or its
+/// payload — is `InvalidData` (exit 5), never an I/O failure.
+fn open_frame(mut src: Box<dyn Source>, first: bool) -> std::io::Result<Option<RuzstdFrame>> {
+    let mut skipped = false;
+    loop {
+        let peeked = stuffr_core::PeekSource::fill(src, 8).map_err(|e| match e {
+            // A failing source keeps its kind (conformance property 11).
+            Error::Io(io) => io,
+            other => std::io::Error::other(other),
+        })?;
+        let head = peeked.prefix();
+        if head.is_empty() && (skipped || !first) {
+            return Ok(None);
+        }
+        let cut_magic = !head.is_empty()
+            && head.len() < 4
+            && head[0] & 0xf0 == 0x50
+            && crate::skippable::magic_agrees(&head[1..], &[0x2a, 0x4d, 0x18]);
+        let is_skippable = crate::skippable::starts_skippable(head) || cut_magic;
+        if !is_skippable {
+            return match StreamingDecoder::new(Box::new(peeked) as Box<dyn Source>) {
+                Ok(dec) => Ok(Some(dec)),
+                Err(e) => Err(frame_decoder_error_to_io(e)),
+            };
+        }
+        let truncated = |what: &str| {
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("zstd: skippable frame cut short in its {what}"),
+            )
+        };
+        if head.len() < 8 {
+            return Err(truncated("header"));
+        }
+        let mut remaining = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as u64;
+        let mut rest: Box<dyn Source> = Box::new(peeked);
+        let mut scratch = [0u8; 4096];
+        rest.read_exact(&mut scratch[..8])?;
+        while remaining > 0 {
+            let want = remaining.min(scratch.len() as u64) as usize;
+            match rest.read(&mut scratch[..want])? {
+                0 => return Err(truncated("payload")),
+                n => remaining -= n as u64,
+            }
+        }
+        skipped = true;
+        src = rest;
     }
 }
 
@@ -593,6 +650,59 @@ mod tests {
             dec.read_to_end(&mut out).is_err(),
             "a complete frame followed by a truncated second one must not decode cleanly"
         );
+    }
+
+    /// A skippable frame as Blender writes one: magic `0x184D2A5E` and a
+    /// 33-byte payload.
+    fn skippable(magic: u32, payload: &[u8]) -> Vec<u8> {
+        let mut out = magic.to_le_bytes().to_vec();
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn text_100k() -> Vec<u8> {
+        b"blender-like text, line after line of it. ".repeat(2500)
+    }
+
+    fn try_decompress(bytes: Vec<u8>) -> std::io::Result<Vec<u8>> {
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(bytes)));
+        let mut dec = Zstd.decoder(src, &DecodeOpts::default()).unwrap();
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).map(|_| out)
+    }
+
+    #[test]
+    fn zstd_pure_skips_a_trailing_skippable_frame() {
+        let plain = text_100k();
+        let mut bytes = compress(&plain);
+        bytes.extend(skippable(0x184D_2A5E, &[7; 33]));
+        assert_eq!(decompress(bytes), plain);
+    }
+
+    #[test]
+    fn zstd_pure_skips_skippable_frames_before_between_and_after() {
+        let (a, b) = (text_100k(), b"second frame".repeat(50));
+        let mut bytes = skippable(0x184D_2A50, &[1; 5]);
+        bytes.extend(compress(&a));
+        bytes.extend(skippable(0x184D_2A5F, &[]));
+        bytes.extend(skippable(0x184D_2A55, &[2; 40]));
+        bytes.extend(compress(&b));
+        bytes.extend(skippable(0x184D_2A5E, &[7; 33]));
+        let mut want = a;
+        want.extend(b);
+        assert_eq!(decompress(bytes), want);
+    }
+
+    #[test]
+    fn a_truncated_skippable_frame_is_invalid_data() {
+        let mut whole = compress(b"payload");
+        whole.extend(skippable(0x184D_2A5E, &[7; 33]));
+        let real = whole.len() - 41;
+        for cut in real + 1..whole.len() {
+            let e = try_decompress(whole[..cut].to_vec()).expect_err(&format!("cut {cut}"));
+            assert_eq!(e.kind(), ErrorKind::InvalidData, "cut {cut}: {e}");
+        }
     }
 
     #[test]

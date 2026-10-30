@@ -649,6 +649,21 @@ mod tests {
         out
     }
 
+    /// Pins `SkipSkippableFrames`: the codec's decoder is `lz4_flex` on every
+    /// build, so one test covers both tiers.
+    #[test]
+    fn lz4_skips_skippable_frames_on_both_tiers() {
+        let (a, b) = (b"first frame ".repeat(500), b"second frame".repeat(50));
+        let mut bytes = skippable_frame(&[1; 5]);
+        bytes.extend(compress(&a));
+        bytes.extend(skippable_frame(&[]));
+        bytes.extend(compress(&b));
+        bytes.extend(skippable_frame(&[7; 33]));
+        let mut want = a;
+        want.extend(b);
+        assert_eq!(decompress(bytes), want);
+    }
+
     #[test]
     fn round_trips_real_data() {
         let plain = b"the quick brown fox jumps over the lazy dog".repeat(100);
