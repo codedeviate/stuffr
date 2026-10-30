@@ -376,9 +376,10 @@ pub struct MagicRule {
 /// A magic number is two to six bytes, and two bytes is a coin toss over a
 /// folder of ordinary files: an Apple disk image begins with zlib's `78 9c`,
 /// so `stuffr ls` listed one as `zlib`, and other application files that
-/// merely share a magic's few bytes were listed the same way. The function sees only the probe prefix (at most
-/// [`crate::probe::PROBE_LEN`] bytes, possibly fewer) and must be pure and
-/// cheap — it runs on every magic hit of every file a folder listing reads.
+/// merely share a magic's few bytes were listed the same way. The function
+/// sees only the probe prefix (at most [`crate::probe::PROBE_LEN`] bytes,
+/// possibly fewer) and must be pure and cheap — it runs on every magic hit
+/// of every file a folder listing reads.
 /// It must answer `true` for every stream the format's writers produce,
 /// including one cut short inside the prefix, because a damaged archive the
 /// user names must stay reachable; it may only refuse what no writer emits.

@@ -755,13 +755,29 @@ pub fn resolve_chain_deep_with(
 /// * A container is the answer.
 /// * A codec is decoded from the prefix itself — never from the file — up to
 ///   [`PROBE_LEN`] output bytes, keeping what arrives before any error (a
-///   prefix is a truncated stream, so an error at its end is expected). A
-///   decoder that fails before yielding a byte is `None`: the magic and the
-///   check agreed, and the bytes still decode to nothing. Otherwise the
-///   decoded bytes are resolved with no path; a confirmed codec or container
+///   prefix is a truncated stream, so an error at its end is expected). What
+///   came out is resolved with no path; a confirmed codec or container
 ///   becomes the inner layer (a codec recursively), anything else is
-///   [`Chain::Raw`]. The path's inner extensions are not consulted:
-///   `x.tar.gz` holding no tar is a gzip, whatever its name says.
+///   [`Chain::Raw`]. The path's inner extensions are not consulted when
+///   there are decoded bytes to look at: `x.tar.gz` holding no tar is a
+///   gzip, whatever its name says.
+/// * A codec that decodes **nothing** depends on whether the prefix was the
+///   whole file. A cut-off read (`prefix.len() == PROBE_LEN`) can simply be
+///   shorter than the codec's first block — measured on a real 168 KB `.bz2`
+///   and on `.zst`, and true of lz4 and framed snappy whenever the first
+///   block is larger than the window — so the codec, already confirmed by
+///   its magic and check, is kept, over the inner layer its path names
+///   (exactly what [`resolve_chain`] answers: `big.tar.bz2` stays tar over
+///   bzip2). The whole file decoding nothing before an error is `None`; the
+///   whole file decoding nothing and ending cleanly is an empty stream, a
+///   codec over `Raw`. A decoder refused at construction is `None` either
+///   way.
+///
+/// Nested layers follow the same rule, with "cut off" meaning the bytes fed
+/// in were themselves incomplete — the layer above filled the window or
+/// stopped on an error. Their fallback is `Raw`, not the path: a name speaks
+/// for the outermost layers, and which of its extensions belongs to a layer
+/// this deep is a guess.
 ///
 /// The nesting is bounded below [`MAX_CHAIN_DEPTH`] codec layers — the most
 /// [`resolve_chain_deep_with`] will open — and a deeper stack stops at
@@ -782,35 +798,69 @@ pub fn identify_strict(
     }
     match chain {
         Chain::Container { .. } => Some(chain),
-        Chain::Codec { codec, .. } => strict_codec_layer(reg, codec, prefix, opts, 1),
+        Chain::Codec { codec, inner } => {
+            let layer = StrictInput {
+                bytes: prefix,
+                cut: prefix.len() == PROBE_LEN,
+                unseen_inner: *inner,
+            };
+            strict_codec_layer(reg, codec, layer, opts, 1)
+        }
         // `resolve_chain_checked` answers a container or a codec; anything
         // added to `Chain` later is not something this function can vouch for.
         _ => None,
     }
 }
 
-/// One codec layer of [`identify_strict`]: decodes `bytes` through `codec`
-/// and resolves what comes out. `depth` counts the codec layers down to and
-/// including this one.
+/// What one codec layer of [`identify_strict`] is given to decode.
+struct StrictInput<'a> {
+    bytes: &'a [u8],
+    /// `bytes` stop short of the stream's real end.
+    cut: bool,
+    /// The inner layer to claim when `cut` and nothing decodes: the path's
+    /// answer for the outermost layer, `Raw` below it.
+    unseen_inner: Chain,
+}
+
+/// One codec layer of [`identify_strict`]: decodes `input.bytes` through
+/// `codec` and resolves what comes out. `depth` counts the codec layers down
+/// to and including this one.
 fn strict_codec_layer(
     reg: &Registry,
     codec: FormatId,
-    bytes: &[u8],
+    input: StrictInput<'_>,
     opts: &DecodeOpts,
     depth: usize,
 ) -> Option<Chain> {
-    let decoded = decode_prefix(reg, codec, bytes, opts)?;
-    let inner = match resolve_chain_checked(reg, None, &decoded) {
-        Ok((inner @ Chain::Container { .. }, Evidence::Confirmed)) => inner,
-        Ok((Chain::Codec { codec: nested, .. }, Evidence::Confirmed))
-            if depth + 1 < MAX_CHAIN_DEPTH =>
-        {
-            // A nested codec whose own bytes decode to nothing is not a
-            // reason to disown the layer above, which did decode: that layer
-            // is then a codec over opaque bytes.
-            strict_codec_layer(reg, nested, &decoded, opts, depth + 1).unwrap_or(Chain::Raw)
+    let decoded = decode_prefix(reg, codec, input.bytes, opts)?;
+    let inner = if decoded.bytes.is_empty() {
+        match (input.cut, decoded.failed) {
+            // Too little input for the codec's first block: the window, not
+            // the file, ran out.
+            (true, _) => input.unseen_inner,
+            // The whole stream, and it decodes to nothing but an error.
+            (false, true) => return None,
+            // The whole stream, cleanly empty.
+            (false, false) => Chain::Raw,
         }
-        _ => Chain::Raw,
+    } else {
+        match resolve_chain_checked(reg, None, &decoded.bytes) {
+            Ok((inner @ Chain::Container { .. }, Evidence::Confirmed)) => inner,
+            Ok((Chain::Codec { codec: nested, .. }, Evidence::Confirmed))
+                if depth + 1 < MAX_CHAIN_DEPTH =>
+            {
+                let nested_input = StrictInput {
+                    bytes: &decoded.bytes,
+                    cut: decoded.bytes.len() == PROBE_LEN || decoded.failed,
+                    unseen_inner: Chain::Raw,
+                };
+                // A nested codec whose own bytes decode to nothing is not a
+                // reason to disown the layer above, which did decode: that
+                // layer is then a codec over opaque bytes.
+                strict_codec_layer(reg, nested, nested_input, opts, depth + 1).unwrap_or(Chain::Raw)
+            }
+            _ => Chain::Raw,
+        }
     };
     Some(Chain::Codec {
         codec,
@@ -818,15 +868,31 @@ fn strict_codec_layer(
     })
 }
 
-/// Up to [`PROBE_LEN`] bytes of `codec`'s decoding of `bytes`, or `None` when
-/// the decoder fails before producing one (at construction or on its first
-/// read). A failure after some output keeps that output.
+/// What [`decode_prefix`] got out of a decoder.
+struct DecodedPrefix {
+    /// Up to [`PROBE_LEN`] decoded bytes.
+    bytes: Vec<u8>,
+    /// The read stopped on an error rather than at the window or at EOF.
+    failed: bool,
+}
+
+/// How many `Interrupted` reads in a row [`decode_prefix`] retries before
+/// taking the decoder at its word that it cannot make progress. A real
+/// `EINTR` clears on the next call; a decoder that answers `Interrupted`
+/// forever would otherwise hang a folder listing on one file.
+const MAX_INTERRUPTED_RETRIES: usize = 64;
+
+/// Up to [`PROBE_LEN`] bytes of `codec`'s decoding of `bytes`, keeping what
+/// arrives before any read error. `None` only when the decoder refuses at
+/// construction.
 fn decode_prefix(
     reg: &Registry,
     codec: FormatId,
     bytes: &[u8],
     opts: &DecodeOpts,
-) -> Option<Vec<u8>> {
+) -> Option<DecodedPrefix> {
+    // Copied because a decoder takes a `Box<dyn Source>`, which is `'static`:
+    // it cannot borrow the caller's prefix. At most `PROBE_LEN` bytes.
     let src = Box::new(crate::source::ReaderSource::new(std::io::Cursor::new(
         bytes.to_vec(),
     )));
@@ -834,22 +900,28 @@ fn decode_prefix(
     let mut out = vec![0u8; PROBE_LEN];
     let mut filled = 0;
     let mut failed = false;
+    let mut interrupted = 0;
     while filled < PROBE_LEN {
         match std::io::Read::read(&mut decoder, &mut out[filled..]) {
             Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Ok(n) => {
+                filled += n;
+                interrupted = 0;
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::Interrupted
+                    && interrupted < MAX_INTERRUPTED_RETRIES =>
+            {
+                interrupted += 1;
+            }
             Err(_) => {
                 failed = true;
                 break;
             }
         }
     }
-    if failed && filled == 0 {
-        return None;
-    }
     out.truncate(filled);
-    Some(out)
+    Some(DecodedPrefix { bytes: out, failed })
 }
 
 #[cfg(test)]
@@ -2380,5 +2452,138 @@ mod truthful_identification_tests {
             raw,
             "what arrived before the error is kept"
         );
+    }
+
+    /// A codec whose first block is larger than the probe window: its
+    /// decoder drains the source and, short of `NEEDS` bytes, yields nothing
+    /// and errors — bzip2's and zstd's behaviour on a 4096-byte prefix of a
+    /// real file.
+    struct NeedsMore;
+
+    const NEEDS: usize = PROBE_LEN * 2;
+    const SLOW: FormatId = FormatId::new("slow");
+    const TAR: FormatId = FormatId::new("tar");
+
+    impl Codec for NeedsMore {
+        fn id(&self) -> FormatId {
+            SLOW
+        }
+
+        fn caps(&self) -> CodecCaps {
+            CodecCaps::decode_only()
+        }
+
+        fn decoder(&self, mut src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+            let mut all = Vec::new();
+            src.read_to_end(&mut all)?;
+            Ok(Box::new(ScriptedSource {
+                rest: if all.len() >= NEEDS { b"payload" } else { b"" },
+                then_error: all.len() < NEEDS,
+            }))
+        }
+
+        fn encoder(&self, _dst: Box<dyn Write + Send>, _o: &EncodeOpts) -> Result<Box<dyn Sink>> {
+            unreachable!("identification never encodes")
+        }
+    }
+
+    fn needs_more_registry() -> Registry {
+        let mut r = strict_registry();
+        r.register_codec(
+            Arc::new(NeedsMore),
+            FormatMeta::codec(
+                SLOW,
+                &["slow"],
+                &[MagicRule {
+                    offset: 0,
+                    bytes: b"SLOW",
+                    format: SLOW,
+                }],
+            )
+            .with_confirm(yes),
+        );
+        r.register_container(
+            Arc::new(MockContainer),
+            FormatMeta::container(TAR, &["tar"], &[]),
+        );
+        r
+    }
+
+    fn slow_prefix(len: usize) -> Vec<u8> {
+        let mut p = b"SLOW".to_vec();
+        p.resize(len, 0x5a);
+        p
+    }
+
+    #[test]
+    fn a_cut_off_prefix_that_decodes_nothing_keeps_the_codec_over_the_paths_inner() {
+        let r = needs_more_registry();
+        assert_eq!(
+            strict(&r, Some("big.tar.slow"), &slow_prefix(PROBE_LEN), None),
+            Some(Chain::Codec {
+                codec: SLOW,
+                inner: Box::new(Chain::Container { container: TAR }),
+            }),
+            "the window ran out, not the file: as 0.21.0 listed it"
+        );
+        assert_eq!(
+            strict(&r, Some("big.slow"), &slow_prefix(PROBE_LEN), None),
+            Some(Chain::Codec {
+                codec: SLOW,
+                inner: Box::new(Chain::Raw),
+            }),
+        );
+    }
+
+    #[test]
+    fn a_whole_file_that_decodes_nothing_before_an_error_is_not_openable() {
+        let r = needs_more_registry();
+        assert_eq!(
+            strict(&r, Some("small.tar.slow"), &slow_prefix(100), None),
+            None,
+            "the prefix is the whole file, and it decodes to nothing but an error"
+        );
+    }
+
+    #[test]
+    fn an_extension_naming_a_refused_hit_falls_to_the_confirmed_ones() {
+        const ZIP: FormatId = FormatId::new("zip");
+        const JAR: FormatId = FormatId::new("jar");
+        const APK: FormatId = FormatId::new("apk");
+        const PK: &[MagicRule] = &[
+            MagicRule {
+                offset: 0,
+                bytes: b"PK",
+                format: ZIP,
+            },
+            MagicRule {
+                offset: 0,
+                bytes: b"PK",
+                format: JAR,
+            },
+            MagicRule {
+                offset: 0,
+                bytes: b"PK",
+                format: APK,
+            },
+        ];
+        let mut r = Registry::new();
+        r.register_container(
+            Arc::new(MockContainer),
+            FormatMeta::container(ZIP, &["zip"], PK)
+                .with_priority(1)
+                .with_confirm(yes),
+        );
+        r.register_container(
+            Arc::new(MockContainer),
+            FormatMeta::container(JAR, &["jar"], PK).with_confirm(yes),
+        );
+        r.register_container(
+            Arc::new(MockContainer),
+            FormatMeta::container(APK, &["apk"], PK).with_confirm(no),
+        );
+        let (chain, ev) = resolve_chain_checked(&r, Some(Path::new("x.apk")), b"PK..").unwrap();
+        assert_eq!(chain, Chain::Container { container: ZIP });
+        assert_eq!(ev, Evidence::Confirmed);
     }
 }
