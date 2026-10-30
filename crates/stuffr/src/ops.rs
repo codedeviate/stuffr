@@ -1396,10 +1396,20 @@ pub struct Inspection {
     pub bytes_in: Option<u64>,
     /// How the format above was decided.
     pub detected_by: Detection,
+    /// The outermost layer of `chain` whose header check refused its bytes,
+    /// when one did: the outer format itself for a `-unconfirmed`
+    /// `detected_by`, or an inner one — a `.tar.gz` whose tar header fails
+    /// its checksum names `tar` while gzip is `magic`. Absent (and left out
+    /// of the JSON) when every layer `inspect` can see checks out; a layer
+    /// decoded from the probe prefix only, so one beyond what the prefix
+    /// yields is not judged.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub unconfirmed_layer: Option<FormatId>,
 }
 
-/// Identifies a stream without decoding it, using the build's default
-/// registry.
+/// Identifies a stream without decoding it (beyond the probe prefix, which
+/// [`Inspection::unconfirmed_layer`] decodes to judge the inner layers),
+/// using the build's default registry.
 pub fn inspect(src: Input) -> Result<Inspection> {
     inspect_with(crate::registry(), src)
 }
@@ -1455,6 +1465,13 @@ pub fn inspect_with(registry: &Registry, src: Input) -> Result<Inspection> {
     };
 
     let fidelity_evaluated = fidelity_is_knowable_without_opening(registry, &chain, rung);
+    // Decodes nothing beyond the prefix already in memory, under the bound
+    // every verb given this file would use.
+    let opts = DecodeOpts {
+        memory_limit: Some(crate::default_memory_limit()),
+        ..Default::default()
+    };
+    let unconfirmed_layer = stuffr_core::first_unconfirmed_layer(registry, &chain, &prefix, &opts);
 
     Ok(Inspection {
         format,
@@ -1463,6 +1480,7 @@ pub fn inspect_with(registry: &Registry, src: Input) -> Result<Inspection> {
         fidelity_evaluated,
         bytes_in: caps.len,
         detected_by,
+        unconfirmed_layer,
     })
 }
 

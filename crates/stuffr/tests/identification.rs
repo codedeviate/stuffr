@@ -150,6 +150,20 @@ fn every_codec_fixture_confirms() {
             path.display(),
             outer(&chain)
         );
+        // And the layers its name puts beneath the codec check out too, so
+        // `stuffr info` names none of them.
+        assert_eq!(
+            stuffr::probe::first_unconfirmed_layer(
+                reg,
+                &chain,
+                prefix,
+                &stuffr::DecodeOpts::default()
+            ),
+            None,
+            "{} ({})",
+            path.display(),
+            chain.describe()
+        );
         checked += 1;
     }
     assert!(checked >= 10, "only {checked} codec fixtures found");
@@ -209,4 +223,73 @@ fn every_container_fixture_confirms() {
         checked += 1;
     }
     assert!(checked >= 20, "only {checked} container fixtures found");
+}
+
+/// A one-entry ustar archive, header checksum computed — or, with `break_it`,
+/// one byte of the name changed after it was.
+fn tiny_tar(break_it: bool) -> Vec<u8> {
+    let mut h = [0u8; 512];
+    h[..5].copy_from_slice(b"a.txt");
+    h[100..107].copy_from_slice(b"0000644");
+    h[108..115].copy_from_slice(b"0000000");
+    h[116..123].copy_from_slice(b"0000000");
+    h[124..135].copy_from_slice(b"00000000006");
+    h[136..147].copy_from_slice(b"00000000000");
+    h[156] = b'0';
+    h[257..263].copy_from_slice(b"ustar\0");
+    h[263..265].copy_from_slice(b"00");
+    h[148..156].copy_from_slice(b"        ");
+    let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
+    h[148..155].copy_from_slice(format!("{sum:06o}\0").as_bytes());
+    if break_it {
+        h[0] ^= 0x01;
+    }
+    let mut out = h.to_vec();
+    let mut data = b"hello\n".to_vec();
+    data.resize(512, 0);
+    out.extend_from_slice(&data);
+    out.resize(out.len() + 1024, 0);
+    out
+}
+
+/// `stuffr info`'s inner-layer verdict: a tar under each codec this build
+/// writes, named `x.tar.<ext>`, checks out whole and names `tar` when its
+/// header checksum is broken — the codec itself still confirmed.
+#[test]
+fn the_first_unconfirmed_layer_is_the_tar_under_a_good_codec() {
+    let reg = stuffr::registry();
+    const TAR: FormatId = FormatId::new("tar");
+    let mut checked = 0;
+    for (name, ext) in [
+        ("gzip", "gz"),
+        ("bzip2", "bz2"),
+        ("xz", "xz"),
+        ("lz4", "lz4"),
+        ("lzip", "lz"),
+        ("zstd", "zst"),
+        ("compress", "Z"),
+        ("snappy", "sz"),
+    ] {
+        let codec = FormatId::new(name);
+        if reg.codec(codec).is_none() {
+            continue;
+        }
+        let path = PathBuf::from(format!("x.tar.{ext}"));
+        for (broken, want) in [(false, None), (true, Some(TAR))] {
+            let bytes = encode(reg, codec, &tiny_tar(broken));
+            let prefix = &bytes[..bytes.len().min(stuffr::PROBE_LEN)];
+            let (chain, evidence) = resolve_chain_checked(reg, Some(&path), prefix).unwrap();
+            assert_eq!(evidence, Evidence::Confirmed, "{name}");
+            assert_eq!(chain.describe(), format!("tar over {name}"));
+            let got = stuffr::probe::first_unconfirmed_layer(
+                reg,
+                &chain,
+                prefix,
+                &stuffr::DecodeOpts::default(),
+            );
+            assert_eq!(got, want, "{name}, broken {broken}");
+        }
+        checked += 1;
+    }
+    assert!(checked >= 6, "only {checked} codecs checked");
 }

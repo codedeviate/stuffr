@@ -44,9 +44,9 @@ pub use format::{
 pub use governor::{BudgetInputs, Governor, LeaseSet, default_memory_limit, resolve_workers};
 pub use ladder::{Resolved, StreamPolicy, resolve};
 pub use probe::{
-    Chain, Evidence, Foreign, PROBE_LEN, TAIL_LEN, chain_for_new_path, foreign_from_tail,
-    identify_strict, probe, read_tail, resolve_chain, resolve_chain_checked, resolve_chain_deep,
-    resolve_chain_deep_with,
+    Chain, Evidence, Foreign, PROBE_LEN, TAIL_LEN, chain_for_new_path, first_unconfirmed_layer,
+    foreign_from_tail, identify_strict, probe, read_tail, resolve_chain, resolve_chain_checked,
+    resolve_chain_deep, resolve_chain_deep_with,
 };
 pub use registry::{FormatRow, Registry};
 pub use size::format_size;

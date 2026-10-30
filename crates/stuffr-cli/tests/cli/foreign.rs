@@ -354,3 +354,55 @@ fn info_says_when_the_header_did_not_check_out() {
     let text = String::from_utf8(o.stdout).unwrap();
     assert!(text.contains("detected: magic\n"), "{text}");
 }
+
+/// A tar inside a gzip whose first header fails its checksum: gzip checks
+/// out, tar does not, and `info` names the layer that did not. A chain where
+/// every layer checks out keeps `info`'s output exactly as it was.
+#[test]
+fn info_names_the_inner_layer_that_did_not_check_out() {
+    let dir = tmp_dir();
+    let good = write_fixture_tar_gz(&dir, "good.tar.gz", &[("a.txt", b"hello\n")]);
+    let mut tar = Vec::new();
+    {
+        let mut b = tar::Builder::new(&mut tar);
+        append_tar_entry(&mut b, "a.txt", b"hello\n");
+        b.finish().unwrap();
+    }
+    // One byte of the name changes; the recorded checksum no longer adds up.
+    tar[0] ^= 0x01;
+    let bad = dir.join("bad.tar.gz");
+    std::fs::write(&bad, gzip_wrap(&tar)).unwrap();
+    let bs = bad.to_str().unwrap();
+
+    let o = run_output(&["info", bs]);
+    let (code, err) = outcome(&o);
+    assert_eq!(code, Some(0), "{err}");
+    let text = String::from_utf8(o.stdout).unwrap();
+    assert!(text.contains("chain:    tar over gzip\n"), "{text}");
+    assert!(text.contains("detected: magic\n"), "{text}");
+    assert!(text.contains("checks:   tar did not check out\n"), "{text}");
+
+    let o = run_output(&["info", "--json", bs]);
+    assert_eq!(o.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["detected_by"], "magic");
+    assert_eq!(v["unconfirmed_layer"], "tar");
+
+    // The verbs still reach the reader and call it corrupt.
+    let (code, err) = outcome(&run_output(&["list", bs]));
+    assert_eq!(code, Some(5), "{err}");
+
+    // Every layer checks out: no new line, no new field.
+    let gs = good.to_str().unwrap();
+    let text = String::from_utf8(run_output(&["info", gs]).stdout).unwrap();
+    assert!(!text.contains("checks:"), "{text}");
+    let v: serde_json::Value =
+        serde_json::from_slice(&run_output(&["info", "--json", gs]).stdout).unwrap();
+    assert!(v.get("unconfirmed_layer").is_none(), "{v}");
+
+    // An outer layer that did not check out is named the same way.
+    let x = dir.join("pixels.scube");
+    std::fs::write(&x, arc_pixel_like()).unwrap();
+    let text = String::from_utf8(run_output(&["info", x.to_str().unwrap()]).stdout).unwrap();
+    assert!(text.contains("checks:   arc did not check out\n"), "{text}");
+}

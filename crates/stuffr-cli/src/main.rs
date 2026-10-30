@@ -698,6 +698,11 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 writeln!(out, "format:   {}", i.format)?;
                 writeln!(out, "chain:    {}", i.chain)?;
                 writeln!(out, "detected: {}", i.detected_by)?;
+                // Only when a layer did not check out, so a file whose every
+                // layer confirms prints exactly what it always printed.
+                if let Some(layer) = i.unconfirmed_layer {
+                    writeln!(out, "checks:   {layer} did not check out")?;
+                }
                 writeln!(out, "rung:     {}", i.fidelity.rung)?;
                 match i.bytes_in {
                     Some(n) => writeln!(out, "size:     {n} bytes")?,

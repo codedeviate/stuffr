@@ -812,6 +812,56 @@ pub fn identify_strict(
     }
 }
 
+/// The outermost layer of `chain` whose format's header check refuses the
+/// bytes that layer begins with, or `None` when every layer it can see
+/// checks out.
+///
+/// For `stuffr info`, which names a lenient chain (the one every verb given
+/// the file would read) and must still say which of its layers did not check
+/// out: a `.tar.gz` whose tar header fails its checksum resolves as tar over
+/// gzip, and this answers `tar`. Reads nothing — `prefix` is the probe
+/// prefix, and each codec layer is decoded from it as [`identify_strict`]
+/// decodes it, up to [`PROBE_LEN`] output bytes.
+///
+/// A layer it cannot see says nothing: a codec whose decoder refuses at
+/// construction, or whose prefix decodes to no bytes at all (a cut-off read
+/// shorter than its first block), ends the walk with `None`. A format with no
+/// check function counts as checking out, as it does everywhere else.
+pub fn first_unconfirmed_layer(
+    reg: &Registry,
+    chain: &Chain,
+    prefix: &[u8],
+    opts: &DecodeOpts,
+) -> Option<FormatId> {
+    let mut layer = chain;
+    let mut owned: Vec<u8>;
+    let mut bytes = prefix;
+    for _ in 0..MAX_CHAIN_DEPTH {
+        match layer {
+            Chain::Container { container } => {
+                return (reg.confirm(*container, bytes) == Some(false)).then_some(*container);
+            }
+            Chain::Codec { codec, inner } => {
+                if reg.confirm(*codec, bytes) == Some(false) {
+                    return Some(*codec);
+                }
+                if matches!(**inner, Chain::Raw) {
+                    return None;
+                }
+                let decoded = decode_prefix(reg, *codec, bytes, opts)?;
+                if decoded.bytes.is_empty() {
+                    return None;
+                }
+                owned = decoded.bytes;
+                bytes = &owned;
+                layer = inner;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// What one codec layer of [`identify_strict`] is given to decode.
 struct StrictInput<'a> {
     bytes: &'a [u8],
