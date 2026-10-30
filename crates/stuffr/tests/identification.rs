@@ -1,6 +1,7 @@
 //! Identification across the whole registry: every format with a magic
-//! confirms its hits, and the skippable frames zstd and lz4 share lead to
-//! the frame behind them.
+//! confirms its hits, every checked-in codec and container fixture still
+//! identifies, confirmed, and the skippable frames zstd and lz4 share lead
+//! to the frame behind them.
 
 use std::path::{Path, PathBuf};
 
@@ -11,9 +12,11 @@ use stuffr::{
 const ZSTD: FormatId = FormatId::new("zstd");
 const LZ4: FormatId = FormatId::new("lz4");
 
-/// The kinds whose magic formats must register a confirm function. Codecs
-/// today; containers join when they register theirs.
-const CONFIRMED_KINDS: &[FormatKind] = &[FormatKind::Codec];
+/// The kinds whose magic formats must register a confirm function: every
+/// kind there is. A derivative registered on another format's magic (a
+/// `jar` on zip's `PK`) must register that format's function; without one it
+/// would count as confirmed and win wherever the base format's check fails.
+const CONFIRMED_KINDS: &[FormatKind] = &[FormatKind::Codec, FormatKind::Container];
 
 #[test]
 fn every_magic_format_registers_a_confirm_function() {
@@ -150,4 +153,60 @@ fn every_codec_fixture_confirms() {
         checked += 1;
     }
     assert!(checked >= 10, "only {checked} codec fixtures found");
+}
+
+/// No true positive is lost on the container side either: every checked-in
+/// file a container's magic matches resolves, named and nameless, to one of
+/// the containers that matched, confirmed — and to what the lenient
+/// resolution (unchanged by confirmation) answers.
+#[test]
+fn every_container_fixture_confirms() {
+    let reg = stuffr::registry();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut files = Vec::new();
+    for dir in [
+        "stuffr-formats/fixtures",
+        "stuffr-formats/tests",
+        "stuffr-cli/tests/fixtures",
+        "stuffr/tests",
+    ] {
+        walk(&root.join(dir), &mut files);
+    }
+    let mut checked = 0;
+    for path in files {
+        let bytes = std::fs::read(&path).unwrap();
+        let prefix = &bytes[..bytes.len().min(stuffr::PROBE_LEN)];
+        let containers: Vec<FormatId> = reg
+            .match_magic(prefix)
+            .into_iter()
+            .filter(|id| reg.container(*id).is_some())
+            .collect();
+        if containers.is_empty() {
+            continue;
+        }
+        for name in [Some(path.as_path()), None] {
+            let (chain, evidence) = resolve_chain_checked(reg, name, prefix)
+                .unwrap_or_else(|e| panic!("{} ({name:?}): {e}", path.display()));
+            let got = outer(&chain);
+            assert!(
+                got.is_some_and(|id| containers.contains(&id)),
+                "{} ({name:?}) resolved to {got:?}, its magic says {containers:?}",
+                path.display()
+            );
+            assert_eq!(
+                evidence,
+                Evidence::Confirmed,
+                "{} ({name:?}) resolved to {got:?} unconfirmed",
+                path.display()
+            );
+            assert_eq!(
+                outer(&resolve_chain(reg, name, prefix).unwrap()),
+                got,
+                "{}",
+                path.display()
+            );
+        }
+        checked += 1;
+    }
+    assert!(checked >= 20, "only {checked} container fixtures found");
 }

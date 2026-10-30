@@ -354,7 +354,28 @@ const ZOO_MAGIC: &[MagicRule] = &[MagicRule {
 }];
 
 pub fn meta() -> FormatMeta {
-    FormatMeta::container(ZOO, &["zoo"], ZOO_MAGIC)
+    FormatMeta::container(ZOO, &["zoo"], ZOO_MAGIC).with_confirm(confirm)
+}
+
+/// The archive header around the tag: the 20-byte `text` is printable ASCII
+/// (at least one byte of it), ended by Ctrl-Z or NUL and padded with only
+/// those (`"ZOO 2.10 Archive.\x1a\0\0"`, whatever version wrote it), and
+/// `zoo_start` at 24, where the first directory entry sits, is at least
+/// `FIXED_OFFSET` (34, the smallest archive header) and below 2^24.
+fn confirm(prefix: &[u8]) -> bool {
+    let text = &prefix[..prefix.len().min(20)];
+    let end = text
+        .iter()
+        .position(|&b| b == 0x1A || b == 0)
+        .unwrap_or(text.len());
+    let text_ok = end > 0
+        && text[..end].iter().all(|&b| (0x20..=0x7E).contains(&b))
+        && text[end..].iter().all(|&b| b == 0x1A || b == 0);
+    text_ok
+        && prefix
+            .get(24..28)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .is_none_or(|start| (FIXED_OFFSET..1 << 24).contains(&start))
 }
 
 pub struct Zoo;
@@ -2638,5 +2659,80 @@ mod tests {
                 .count();
             assert_eq!(hits, 1, "{label} matched {hits} magic rules, expected 1");
         }
+    }
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::test_archives::{Spec, build_zoo};
+    use super::*;
+    use crate::confirm_test::{assert_every_cut_confirms, assert_never_panics_upto, matches_magic};
+    use stuffr_core::ConfirmFn;
+
+    const FIXTURES: &[(&str, &[u8])] = &[
+        (
+            "store.zoo",
+            include_bytes!("../../fixtures/legacy/zoo/store.zoo"),
+        ),
+        (
+            "default.zoo",
+            include_bytes!("../../fixtures/legacy/zoo/default.zoo"),
+        ),
+        (
+            "high_per.zoo",
+            include_bytes!("../../fixtures/legacy/zoo/high_per.zoo"),
+        ),
+        (
+            "wrongcrc16.zoo",
+            include_bytes!("../../fixtures/legacy/zoo/wrongcrc16.zoo"),
+        ),
+    ];
+
+    fn confirm() -> ConfirmFn {
+        meta().confirm.expect("zoo registers a confirm function")
+    }
+
+    /// Read-only: the borrowed corpus, and the module's own test builder.
+    #[test]
+    fn confirm_accepts_own_output() {
+        for (label, bytes) in FIXTURES {
+            assert_every_cut_confirms(label, confirm(), bytes, 24);
+        }
+        let built = build_zoo(&[Spec::stored("a.txt", b"alpha")]);
+        assert_every_cut_confirms("build_zoo", confirm(), &built, 24);
+        // Text written by another version, and filling all twenty bytes.
+        let mut other = built.clone();
+        other[..20].copy_from_slice(b"ZOO 1.50 Archive.\x1a\0\0");
+        assert!(confirm()(&other));
+        other[..20].copy_from_slice(b"Some Archiver v9.99!");
+        assert!(confirm()(&other));
+    }
+
+    #[test]
+    fn confirm_rejects_magic_plus_noise() {
+        let good = FIXTURES[0].1.to_vec();
+        let mut binary = good.clone();
+        binary[3] = 0x01;
+        assert!(!confirm()(&binary), "a control byte in the text");
+        let mut late = good.clone();
+        late[19] = b'x';
+        assert!(!confirm()(&late), "text after the Ctrl-Z that ends it");
+        let mut blank = good.clone();
+        blank[..20].fill(0);
+        assert!(!confirm()(&blank), "no text at all");
+        for start in [0u32, 33, 1 << 24] {
+            let mut bad = good.clone();
+            bad[24..28].copy_from_slice(&start.to_le_bytes());
+            assert!(!confirm()(&bad), "first entry at {start}");
+        }
+        let mut data: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(37)).collect();
+        data[20..24].copy_from_slice(&[0xDC, 0xA7, 0xC4, 0xFD]);
+        assert!(matches_magic(&meta(), &data));
+        assert!(!confirm()(&data));
+    }
+
+    #[test]
+    fn confirm_never_panics_on_short_input() {
+        assert_never_panics_upto(confirm(), FIXTURES[0].1, SIZ_ZOOH);
     }
 }

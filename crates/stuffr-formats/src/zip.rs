@@ -203,8 +203,46 @@ static ZIP_MAGIC: &[MagicRule] = &[
 /// `zip` while `foo.apk` reaches apk by extension. None of those derivatives is
 /// registered in this build, so there is nothing to outrank; the moment one is,
 /// it gets a lower priority than this and this gets a higher one than 0.
+///
+/// A derivative registered on these magics later (jar, apk, …) registers
+/// this module's `confirm` too: same bytes, same check. Without one it
+/// would count as confirmed and could win wherever zip's own check fails.
 pub fn meta() -> FormatMeta {
-    FormatMeta::container(ZIP, &["zip"], ZIP_MAGIC)
+    FormatMeta::container(ZIP, &["zip"], ZIP_MAGIC).with_confirm(confirm)
+}
+
+/// The record behind `PK`. A local file header (`PK\x03\x04`): the version
+/// needed is at most 6.3 (APPNOTE's latest; the field's upper byte is a host
+/// system, "mapped as" version made by, APPNOTE 4.4.3), the method is one
+/// APPNOTE 4.4.5 defines, and the name is at least one byte and fits the
+/// probe window. Sizes are not checked: a streamed entry records zeros and
+/// a zip64 one `0xFFFFFFFF`. An end-of-central-directory record
+/// (`PK\x05\x06`) at offset 0 is an empty zip, so it must be whole and
+/// list no entries and no directory bytes.
+fn confirm(prefix: &[u8]) -> bool {
+    let u16_at = |i: usize| {
+        prefix
+            .get(i..i + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+    };
+    if prefix.starts_with(&SIG_END_OF_CENTRAL_DIR) {
+        let fixed = 4 + END_OF_CENTRAL_DIR_FIXED;
+        return prefix.len() >= fixed
+            && u16_at(8) == Some(0)
+            && u16_at(10) == Some(0)
+            && prefix[12..16] == [0; 4];
+    }
+    prefix.get(4).is_none_or(|&version| version <= 63)
+        && u16_at(8).is_none_or(defined_method)
+        && u16_at(26).is_none_or(|n| n >= 1 && 30 + usize::from(n) <= stuffr_core::PROBE_LEN)
+}
+
+/// APPNOTE 4.4.5's methods: 0-10 (stored through the reserved 7 and
+/// Deflate64), 12 bzip2, 14 LZMA, 16 IBM z/OS CMPSC, 18 IBM TERSE, 19 LZ77,
+/// 20 the deprecated zstd number, 93-99 (zstd, MP3, xz, JPEG, WavPack,
+/// PPMd, AE-x). 11, 13, 15 and 17 are reserved.
+fn defined_method(method: u16) -> bool {
+    matches!(method, 0..=10 | 12 | 14 | 16 | 18..=20 | 93..=99)
 }
 
 /// Central-directory file header. Signature plus a 42-byte fixed block.
@@ -5494,5 +5532,115 @@ z.close()\n";
             assert_eq!(meta.size, Some(10));
             assert_eq!(read, Err(5), "method {method}");
         }
+    }
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+    use crate::confirm_test::{
+        assert_every_cut_confirms, assert_never_panics, assert_own_archives_confirm, matches_magic,
+        write_archive,
+    };
+    use stuffr_core::ConfirmFn;
+
+    fn confirm() -> ConfirmFn {
+        meta().confirm.expect("zip registers a confirm function")
+    }
+
+    fn one_entry() -> Vec<u8> {
+        write_archive(
+            &Zip,
+            &CreateOpts::default(),
+            &[(EntryMeta::file("a.txt"), b"alpha".to_vec())],
+        )
+        .unwrap()
+    }
+
+    /// Every entry codec this build writes, so each method number the
+    /// writer can put in a local header is seen; and the empty archive,
+    /// which is a bare end-of-central-directory record. That record must be
+    /// whole (22 bytes, always inside the window of a file long enough to
+    /// be one), so the cuts start at 22; a local header's shorter cuts are
+    /// checked on their own.
+    #[test]
+    fn confirm_accepts_own_output() {
+        assert_every_cut_confirms("one entry", confirm(), &one_entry(), 4);
+        let mut checked = 0;
+        for codec in ["store", "deflate", "bzip2", "xz", "zstd"] {
+            let opts = CreateOpts {
+                entry_codec: Some(FormatId::new(codec)),
+                ..Default::default()
+            };
+            if Zip
+                .create(PlainSink::new(Box::new(io::sink())), &opts)
+                .is_err()
+            {
+                continue;
+            }
+            checked += assert_own_archives_confirm(codec, &Zip, &opts, &meta(), 22);
+        }
+        assert!(checked >= 14, "only {checked} zip archives were checked");
+        let empty = write_archive(&Zip, &CreateOpts::default(), &[]).unwrap();
+        assert!(empty.starts_with(b"PK\x05\x06"));
+        assert!(confirm()(&empty));
+    }
+
+    #[test]
+    fn confirm_rejects_magic_plus_noise() {
+        let good = one_entry();
+        assert!(confirm()(&good));
+        let mut version = good.clone();
+        version[4] = 64;
+        assert!(!confirm()(&version), "version needed 6.4");
+        for method in [11u16, 13, 21, 92, 100, 0xffff] {
+            let mut bad = good.clone();
+            bad[8..10].copy_from_slice(&method.to_le_bytes());
+            assert!(!confirm()(&bad), "method {method}");
+        }
+        let mut nameless = good.clone();
+        nameless[26..28].fill(0);
+        assert!(!confirm()(&nameless), "an empty name");
+        let mut huge_name = good;
+        huge_name[26..28].copy_from_slice(&5000u16.to_le_bytes());
+        assert!(!confirm()(&huge_name), "a name longer than the window");
+    }
+
+    /// The version-needed field's upper byte is a host system in APPNOTE
+    /// 4.4.3 ("mapped as above", i.e. as version made by): only the lower
+    /// byte is a version. Every method APPNOTE 4.4.5 defines is accepted.
+    #[test]
+    fn confirm_accepts_every_defined_method_and_a_host_byte() {
+        let mut good = one_entry();
+        good[5] = 3;
+        assert!(confirm()(&good), "version needed with a Unix host byte");
+        for method in (0u16..=10).chain([12, 14, 16, 18, 19, 20]).chain(93..=99) {
+            good[8..10].copy_from_slice(&method.to_le_bytes());
+            assert!(confirm()(&good), "method {method}");
+        }
+    }
+
+    #[test]
+    fn the_empty_archive_record_must_be_whole_and_empty() {
+        let empty = write_archive(&Zip, &CreateOpts::default(), &[]).unwrap();
+        assert!(confirm()(&empty));
+        assert!(!confirm()(&empty[..21]), "a cut record");
+        let mut counted = empty.clone();
+        counted[10] = 1;
+        assert!(!confirm()(&counted), "an entry count of one");
+        let mut on_disk = empty;
+        on_disk[8] = 1;
+        assert!(!confirm()(&on_disk), "an entry count on this disk of one");
+        // `PK\x05\x06` then text: no empty archive.
+        let text = b"PK\x05\x06 is the end-of-central-directory signature".to_vec();
+        assert!(matches_magic(&meta(), &text));
+        assert!(!confirm()(&text));
+    }
+
+    #[test]
+    fn confirm_never_panics_on_short_input() {
+        assert_never_panics(confirm(), &one_entry());
+        let empty = write_archive(&Zip, &CreateOpts::default(), &[]).unwrap();
+        assert_never_panics(confirm(), &empty);
     }
 }

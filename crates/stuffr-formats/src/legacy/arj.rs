@@ -261,7 +261,28 @@ const ARJ_MAGIC: &[MagicRule] = &[MagicRule {
 }];
 
 pub fn meta() -> FormatMeta {
-    FormatMeta::container(ARJ, &["arj"], ARJ_MAGIC)
+    FormatMeta::container(ARJ, &["arj"], ARJ_MAGIC).with_confirm(confirm)
+}
+
+/// The main header behind `60 EA`: its basic-header size is 1 to 2600 (0 is
+/// the end-of-archive marker, which cannot open an archive), and the CRC-32
+/// after the basic header matches it. A header cut short by the prefix is
+/// not checked; at most 2608 bytes, it always fits the probe window of a
+/// file long enough to hold it.
+fn confirm(prefix: &[u8]) -> bool {
+    let Some(size) = prefix.get(2..4) else {
+        return true;
+    };
+    let size = usize::from(u16::from_le_bytes([size[0], size[1]]));
+    if size == 0 || size > MAX_ARJ_HEADER_SIZE {
+        return false;
+    }
+    match (prefix.get(4..4 + size), prefix.get(4 + size..8 + size)) {
+        (Some(header), Some(crc)) => {
+            crc32_ieee(header) == u32::from_le_bytes([crc[0], crc[1], crc[2], crc[3]])
+        }
+        _ => true,
+    }
 }
 
 pub struct Arj;
@@ -3710,5 +3731,67 @@ mod tests {
     fn dos_mtime_is_none_for_an_all_zero_packed_value() {
         // month == 0, which sample.arj's own entries use (see MANIFEST.md).
         assert_eq!(dos_mtime(DosDateTime::new(0)), None);
+    }
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+    use crate::confirm_test::{
+        assert_every_cut_confirms, assert_never_panics, assert_own_archives_confirm, matches_magic,
+        write_archive,
+    };
+    use stuffr_core::{ConfirmFn, CreateOpts};
+
+    const SAMPLE_ARJ: &[u8] = include_bytes!("../../fixtures/legacy/sample.arj");
+
+    fn confirm() -> ConfirmFn {
+        meta().confirm.expect("arj registers a confirm function")
+    }
+
+    fn one_entry() -> Vec<u8> {
+        write_archive(
+            &Arj,
+            &CreateOpts::default(),
+            &[(EntryMeta::file("a.txt"), b"alpha".to_vec())],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn confirm_accepts_own_output() {
+        let checked = assert_own_archives_confirm("arj", &Arj, &CreateOpts::default(), &meta(), 2);
+        assert!(checked >= 6, "only {checked} arj archives were checked");
+        assert_every_cut_confirms("sample.arj", confirm(), SAMPLE_ARJ, 2);
+    }
+
+    #[test]
+    fn confirm_rejects_magic_plus_noise() {
+        let good = one_entry();
+        assert!(confirm()(&good));
+        let size = usize::from(u16::from_le_bytes([good[2], good[3]]));
+        let mut crc = good.clone();
+        crc[4 + size] ^= 1;
+        assert!(!confirm()(&crc), "a basic-header CRC-32 off by one bit");
+        let mut body = good.clone();
+        body[4] ^= 1;
+        assert!(!confirm()(&body), "a header byte changed under the CRC-32");
+        let mut huge = good.clone();
+        huge[2..4].copy_from_slice(&2601u16.to_le_bytes());
+        assert!(!confirm()(&huge), "a basic header over 2600 bytes");
+        let mut end = good;
+        end[2..4].fill(0);
+        assert!(
+            !confirm()(&end),
+            "the end-of-archive marker where the main header belongs"
+        );
+        let text = b"`\xea is not text, but this is ARJ's header id in a note.".to_vec();
+        assert!(matches_magic(&meta(), &text));
+        assert!(!confirm()(&text));
+    }
+
+    #[test]
+    fn confirm_never_panics_on_short_input() {
+        assert_never_panics(confirm(), &one_entry());
     }
 }

@@ -184,7 +184,52 @@ const LHA_MAGIC: &[MagicRule] = &[
 ];
 
 pub fn meta() -> FormatMeta {
-    FormatMeta::container(LHA, &["lzh", "lha"], LHA_MAGIC)
+    FormatMeta::container(LHA, &["lzh", "lha"], LHA_MAGIC).with_confirm(confirm)
+}
+
+/// The base header behind `-lh`/`-lz`: a method LHA defines (`-lh0-` to
+/// `-lh7-`, `-lhd-`, `-lhx-`, `-lzs-`, `-lz4-`, `-lz5-`) and a header level
+/// `delharc` reads (0 to 3). Levels 0 and 1 carry a checksum byte at 1: the
+/// sum of the header's bytes from 2, `header_len` (byte 0, at least the 22
+/// a level-0 header with an empty name takes) of them. Level 2's first word
+/// is the whole header's length, at least its 26 fixed bytes; level 3's is
+/// the word size 4 (`delharc` refuses anything else). A cut-short header is
+/// checked as far as it goes.
+fn confirm(prefix: &[u8]) -> bool {
+    let method_ok = prefix.get(2..7).is_none_or(|m| {
+        matches!(
+            m,
+            b"-lh0-"
+                | b"-lh1-"
+                | b"-lh2-"
+                | b"-lh3-"
+                | b"-lh4-"
+                | b"-lh5-"
+                | b"-lh6-"
+                | b"-lh7-"
+                | b"-lhd-"
+                | b"-lhx-"
+                | b"-lzs-"
+                | b"-lz4-"
+                | b"-lz5-"
+        )
+    });
+    let Some(&level) = prefix.get(20) else {
+        return method_ok;
+    };
+    method_ok
+        && match level {
+            0 | 1 => {
+                let len = usize::from(prefix[0]);
+                len >= 22
+                    && prefix.get(2..2 + len).is_none_or(|header| {
+                        header.iter().fold(0u8, |sum, &b| sum.wrapping_add(b)) == prefix[1]
+                    })
+            }
+            2 => u16::from_le_bytes([prefix[0], prefix[1]]) >= 26,
+            3 => prefix[..2] == [4, 0],
+            _ => false,
+        }
 }
 
 pub struct Lha;
@@ -2383,5 +2428,109 @@ mod tests {
             out.join("adir").is_dir(),
             "{banner} must extract the -lhd- entry as a directory"
         );
+    }
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+    use crate::confirm_test::{
+        assert_every_cut_confirms, assert_never_panics, assert_own_archives_confirm, matches_magic,
+        write_archive,
+    };
+    use stuffr_core::{ConfirmFn, CreateOpts};
+
+    const SAMPLE_LZH: &[u8] = include_bytes!("../../fixtures/legacy/sample.lzh");
+
+    fn confirm() -> ConfirmFn {
+        meta().confirm.expect("lha registers a confirm function")
+    }
+
+    fn one_entry() -> Vec<u8> {
+        write_archive(
+            &Lha,
+            &CreateOpts::default(),
+            &[(EntryMeta::file("a.txt"), b"alpha".to_vec())],
+        )
+        .unwrap()
+    }
+
+    /// The first 24 bytes of a level-2 or level-3 header for `method`:
+    /// the length word(s), the method, sizes, time, attribute and level.
+    fn long_header(level: u8, method: &[u8; 5]) -> Vec<u8> {
+        let mut h = match level {
+            2 => 27u16.to_le_bytes().to_vec(),
+            _ => vec![4, 0],
+        };
+        h.extend_from_slice(method);
+        h.extend_from_slice(&[0; 12]);
+        h.push(0x20);
+        h.push(level);
+        h.extend_from_slice(&[0; 8]);
+        h
+    }
+
+    #[test]
+    fn confirm_accepts_own_output() {
+        let checked = assert_own_archives_confirm("lha", &Lha, &CreateOpts::default(), &meta(), 5);
+        assert!(checked >= 5, "only {checked} lha archives were checked");
+        assert_every_cut_confirms("sample.lzh", confirm(), SAMPLE_LZH, 5);
+    }
+
+    /// Levels 2 and 3 carry no base-header checksum (a CRC-16 sits in an
+    /// extension header instead), and `delharc` reads both; every method
+    /// it names in the `-lh`/`-lz` families is accepted.
+    #[test]
+    fn confirm_accepts_level_2_and_3_and_every_defined_method() {
+        for level in [2u8, 3] {
+            for method in [
+                b"-lh0-", b"-lh1-", b"-lh2-", b"-lh3-", b"-lh4-", b"-lh5-", b"-lh6-", b"-lh7-",
+                b"-lhd-", b"-lhx-", b"-lzs-", b"-lz4-", b"-lz5-",
+            ] {
+                let h = long_header(level, method);
+                assert!(
+                    confirm()(&h),
+                    "level {level} {:?}",
+                    String::from_utf8_lossy(method)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn confirm_rejects_magic_plus_noise() {
+        let good = one_entry();
+        assert!(confirm()(&good));
+        let mut summed = good.clone();
+        summed[1] = summed[1].wrapping_add(1);
+        assert!(!confirm()(&summed), "a level-1 checksum off by one");
+        let mut renamed = good.clone();
+        renamed[23] ^= 0x20;
+        assert!(
+            !confirm()(&renamed),
+            "a name byte changed under the checksum"
+        );
+        for method in [b"-lh8-", b"-lhz-", b"-lz0-", b"-lh5 "] {
+            let h = long_header(2, method);
+            assert!(!confirm()(&h), "{:?}", String::from_utf8_lossy(method));
+        }
+        let mut level4 = long_header(2, b"-lh5-");
+        level4[20] = 4;
+        assert!(!confirm()(&level4), "header level 4");
+        let mut level3 = long_header(3, b"-lh5-");
+        level3[0] = 5;
+        assert!(
+            !confirm()(&level3),
+            "a level-3 header whose word size is not 4"
+        );
+        let text = b"\r\n-lh5- is LHA's method name, and this is a note about it.".to_vec();
+        assert!(matches_magic(&meta(), &text));
+        assert!(!confirm()(&text));
+    }
+
+    #[test]
+    fn confirm_never_panics_on_short_input() {
+        assert_never_panics(confirm(), &one_entry());
+        assert_never_panics(confirm(), &long_header(3, b"-lh5-"));
     }
 }

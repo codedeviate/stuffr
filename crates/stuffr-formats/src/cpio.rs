@@ -251,7 +251,20 @@ const S_IFLNK: u32 = 0o120_000;
 const S_IFREG: u32 = 0o100_000;
 
 pub fn meta() -> FormatMeta {
-    FormatMeta::container(CPIO, &["cpio"], CPIO_MAGIC)
+    FormatMeta::container(CPIO, &["cpio"], CPIO_MAGIC).with_confirm(confirm)
+}
+
+/// Behind `070701`: all thirteen 8-byte header fields are hex digits (either
+/// case), and the name size (the twelfth) is at least one, since every
+/// entry, the trailer included, has a NUL-terminated name. A cut-short
+/// header is checked as far as it goes.
+fn confirm(prefix: &[u8]) -> bool {
+    let fields = prefix.get(6..).unwrap_or_default();
+    let fields = &fields[..fields.len().min(13 * 8)];
+    fields.iter().all(u8::is_ascii_hexdigit)
+        && fields
+            .get(88..96)
+            .is_none_or(|namesize| namesize != b"00000000")
 }
 
 pub struct CpioNewc;
@@ -2830,5 +2843,69 @@ mod tests {
             read_rows(&bytes).expect("reads"),
             vec![file_row("a", b"", None), link_row("b", "a", 0)]
         );
+    }
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+    use crate::confirm_test::{
+        assert_never_panics_upto, assert_own_archives_confirm, matches_magic, write_archive,
+    };
+    use stuffr_core::{ConfirmFn, CreateOpts};
+
+    fn confirm() -> ConfirmFn {
+        meta().confirm.expect("cpio registers a confirm function")
+    }
+
+    fn one_entry() -> Vec<u8> {
+        write_archive(
+            &CpioNewc,
+            &CreateOpts::default(),
+            &[(EntryMeta::file("a.txt"), b"alpha".to_vec())],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn confirm_accepts_own_output() {
+        let checked =
+            assert_own_archives_confirm("cpio", &CpioNewc, &CreateOpts::default(), &meta(), 6);
+        // The empty archive too: its TRAILER!!! header carries the magic.
+        assert!(checked >= 7, "only {checked} cpio archives were checked");
+    }
+
+    /// Writers differ in the case of their hex digits, and the format
+    /// allows either.
+    #[test]
+    fn confirm_accepts_either_case_of_hex() {
+        let mut upper = one_entry();
+        upper[6..110].make_ascii_uppercase();
+        assert!(confirm()(&upper));
+        let mut lower = one_entry();
+        lower[6..110].make_ascii_lowercase();
+        assert!(confirm()(&lower));
+    }
+
+    #[test]
+    fn confirm_rejects_magic_plus_noise() {
+        let good = one_entry();
+        assert!(confirm()(&good));
+        for at in [6usize, 50, 101, 109] {
+            let mut bad = good.clone();
+            bad[at] = b'g';
+            assert!(!confirm()(&bad), "a non-hex digit at {at}");
+        }
+        let mut nameless = good;
+        nameless[94..102].copy_from_slice(b"00000000");
+        assert!(!confirm()(&nameless), "a name size of zero");
+        let text = b"070701 is the newc magic; this line is documentation about it.".repeat(3);
+        assert!(matches_magic(&meta(), &text));
+        assert!(!confirm()(&text));
+    }
+
+    #[test]
+    fn confirm_never_panics_on_short_input() {
+        assert_never_panics_upto(confirm(), &one_entry(), 110);
     }
 }

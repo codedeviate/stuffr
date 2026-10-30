@@ -281,7 +281,45 @@ const ARC_MAGIC: &[MagicRule] = &[
 ];
 
 pub fn meta() -> FormatMeta {
-    FormatMeta::container(ARC, &["arc", "pak"], ARC_MAGIC)
+    FormatMeta::container(ARC, &["arc", "pak"], ARC_MAGIC).with_confirm(confirm)
+}
+
+/// The first entry header behind `1A` and its method. The 13-byte name
+/// field holds a name of at least one printable byte (code page 437 above
+/// 0x7F included; no control byte), NUL-terminated within the field; what
+/// follows the NUL is left-over garbage in real archives and is not read.
+/// Both sizes are at most 2^31 (a file's length is not knowable from a
+/// prefix), and a stored entry (method 2) is not larger than its original.
+/// Method 1 has no original-size field. `1A 00` (an empty archive) has no
+/// header to check. A cut-short header is checked as far as it goes.
+fn confirm(prefix: &[u8]) -> bool {
+    const LIMIT: u32 = 1 << 31;
+    let Some(&method) = prefix.get(1) else {
+        return true;
+    };
+    if method == 0 {
+        return true;
+    }
+    let field = &prefix[2.min(prefix.len())..(2 + NAME_LEN).min(prefix.len())];
+    let name = match field.iter().position(|&b| b == 0) {
+        Some(0) => return false,
+        Some(end) => &field[..end],
+        None if field.len() == NAME_LEN => return false,
+        None => field,
+    };
+    if !name.iter().all(|&b| b >= 0x20 && b != 0x7F) {
+        return false;
+    }
+    let u32_at = |i: usize| {
+        prefix
+            .get(i..i + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let compressed = u32_at(15);
+    let original = if method == 1 { None } else { u32_at(25) };
+    compressed.is_none_or(|c| c <= LIMIT)
+        && original.is_none_or(|o| o <= LIMIT)
+        && (method != 2 || compressed.zip(original).is_none_or(|(c, o)| o >= c))
 }
 
 pub struct Arc;
@@ -2008,5 +2046,142 @@ mod tests {
                 .count();
             assert_eq!(hits, 1, "{label} matched {hits} magic rules, expected 1");
         }
+    }
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+    use crate::confirm_test::{assert_every_cut_confirms, assert_never_panics, matches_magic};
+    use stuffr_core::ConfirmFn;
+
+    /// The ten borrowed archives; `tests` holds the same `include_bytes!`.
+    const FIXTURES: &[(&str, &[u8])] = &[
+        (
+            "cpm.arc",
+            include_bytes!("../../fixtures/legacy/arc/cpm.arc"),
+        ),
+        (
+            "store.arc",
+            include_bytes!("../../fixtures/legacy/arc/store.arc"),
+        ),
+        (
+            "wrongcrc16.arc",
+            include_bytes!("../../fixtures/legacy/arc/wrongcrc16.arc"),
+        ),
+        (
+            "crunch.arc",
+            include_bytes!("../../fixtures/legacy/arc/crunch.arc"),
+        ),
+        (
+            "crunch2.arc",
+            include_bytes!("../../fixtures/legacy/arc/crunch2.arc"),
+        ),
+        (
+            "squashed.arc",
+            include_bytes!("../../fixtures/legacy/arc/squashed.arc"),
+        ),
+        (
+            "license.pak",
+            include_bytes!("../../fixtures/legacy/arc/license.pak"),
+        ),
+        (
+            "license_crunched.pak",
+            include_bytes!("../../fixtures/legacy/arc/license_crunched.pak"),
+        ),
+        (
+            "license_squashed.pak",
+            include_bytes!("../../fixtures/legacy/arc/license_squashed.pak"),
+        ),
+        (
+            "license_crushed.pak",
+            include_bytes!("../../fixtures/legacy/arc/license_crushed.pak"),
+        ),
+    ];
+
+    fn confirm() -> ConfirmFn {
+        meta().confirm.expect("arc registers a confirm function")
+    }
+
+    /// A 29-byte entry header: marker, `method`, `name` NUL-padded to 13,
+    /// then the sizes, a zero date, time and CRC.
+    fn header(method: u8, name: &[u8], csize: u32, osize: u32) -> Vec<u8> {
+        let mut h = vec![MARKER, method];
+        let mut field = [0u8; NAME_LEN];
+        field[..name.len()].copy_from_slice(name);
+        h.extend_from_slice(&field);
+        h.extend_from_slice(&csize.to_le_bytes());
+        h.extend_from_slice(&[0; 6]);
+        h.extend_from_slice(&osize.to_le_bytes());
+        h
+    }
+
+    /// Read-only: the borrowed corpus is the output to accept. The bytes
+    /// after a name's NUL are left-over garbage in several of them
+    /// (`squashed.arc`'s `LICENSE\0$$$$$`), which the check must ignore.
+    #[test]
+    fn confirm_accepts_own_output() {
+        for (label, bytes) in FIXTURES {
+            assert_every_cut_confirms(label, confirm(), bytes, 2);
+        }
+        for method in 1..=11u8 {
+            let h = header(
+                method,
+                b"README.DOC",
+                100,
+                if method <= 2 { 100 } else { 300 },
+            );
+            assert!(confirm()(&h), "method {method}");
+        }
+        // A DOS name in code page 437 is still a printable name.
+        assert!(confirm()(&header(2, b"CAF\x90.TXT", 5, 5)));
+    }
+
+    /// recon's `.scube`: pixel-like data whose first two bytes happen to
+    /// be `1A 01`. The "name" behind them is empty, then `FF 1B`.
+    #[test]
+    fn arc_rejects_pixel_like_data() {
+        let start: [u8; 32] = [
+            0x1a, 0x01, 0x00, 0xff, 0x1b, 0x01, 0x00, 0xff, 0x1d, 0x01, 0x00, 0xff, 0x1f, 0x01,
+            0x00, 0xff, 0x21, 0x01, 0x00, 0xff, 0x24, 0x01, 0x00, 0xff, 0x28, 0x01, 0x00, 0xff,
+            0x2d, 0x01, 0x00, 0xff,
+        ];
+        let data: Vec<u8> = start.iter().copied().cycle().take(4096).collect();
+        assert!(matches_magic(&meta(), &data));
+        assert!(!confirm()(&data));
+    }
+
+    #[test]
+    fn confirm_rejects_magic_plus_noise() {
+        assert!(!confirm()(&header(2, b"", 5, 5)), "an entry with no name");
+        assert!(
+            !confirm()(&header(2, b"A\x01B", 5, 5)),
+            "a control byte in the name"
+        );
+        assert!(
+            !confirm()(&header(2, b"ABCDEFGHIJKLM", 5, 5)),
+            "a name filling all 13 bytes, no NUL"
+        );
+        assert!(
+            !confirm()(&header(8, b"A.TXT", 0x8000_0001, 5)),
+            "compressed size past 2^31"
+        );
+        assert!(
+            !confirm()(&header(8, b"A.TXT", 5, 0x8000_0001)),
+            "original size past 2^31"
+        );
+        assert!(
+            !confirm()(&header(2, b"A.TXT", 6, 5)),
+            "stored, yet larger than the original"
+        );
+        let text = b"\x1a\x02 then text: this is not an ARC archive at all.".to_vec();
+        assert!(matches_magic(&meta(), &text));
+        assert!(!confirm()(&text));
+    }
+
+    #[test]
+    fn confirm_never_panics_on_short_input() {
+        assert_never_panics(confirm(), FIXTURES[0].1);
+        assert_never_panics(confirm(), &header(1, b"A", 1, 1));
     }
 }

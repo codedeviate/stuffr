@@ -291,7 +291,23 @@ pub(crate) const GLOBAL_HEADER: &[u8; 8] = b"!<arch>\n";
 const DEFAULT_MODE: u32 = 0o100644;
 
 pub fn meta() -> FormatMeta {
-    FormatMeta::container(AR, &["a", "ar"], AR_MAGIC)
+    FormatMeta::container(AR, &["a", "ar"], AR_MAGIC).with_confirm(confirm)
+}
+
+/// Behind `!<arch>\n`: the end of the file (the empty archive), or a
+/// 60-byte member header whose size field (48..58) is decimal digits
+/// padded with spaces, as the reader parses it, and which ends `` `\n ``.
+/// The other fields are not checked: GNU's symbol table, BSD's `#1/` names
+/// and MSVC's blank uid, gid and mode all differ there. A cut-short header
+/// is checked as far as it goes.
+fn confirm(prefix: &[u8]) -> bool {
+    let header = prefix.get(GLOBAL_HEADER.len()..).unwrap_or_default();
+    let header = &header[..header.len().min(60)];
+    let size = header.get(48..58.min(header.len())).unwrap_or_default();
+    let digits = size.iter().take_while(|b| b.is_ascii_digit()).count();
+    let size_ok = size[digits..].iter().all(|&b| b == b' ') && (size.len() < 10 || digits > 0);
+    let end_ok = header.get(58..).is_none_or(|end| b"`\n".starts_with(end));
+    size_ok && end_ok
 }
 
 pub struct Ar;
@@ -3201,5 +3217,95 @@ mod tests {
         out.extend(ar_member("/0", b"body"));
         let cut = 8 + 60 + 10;
         assert_eq!(list_names(out[..cut].to_vec()).unwrap_err().exit_code(), 5);
+    }
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+    use crate::confirm_test::{
+        assert_never_panics_upto, assert_own_archives_confirm, matches_magic, write_archive,
+    };
+    use stuffr_core::{ConfirmFn, CreateOpts};
+
+    fn confirm() -> ConfirmFn {
+        meta().confirm.expect("ar registers a confirm function")
+    }
+
+    /// One 60-byte member header: `name` (16), date (12), uid (6), gid
+    /// (6), mode (8), `size` (10), then the terminator — built with
+    /// `format!` padding as every `ar` writes it.
+    fn header(name: &str, uid: &str, mode: &str, size: &str) -> Vec<u8> {
+        format!(
+            "{name:<16}{:<12}{uid:<6}{uid:<6}{mode:<8}{size:<10}`\n",
+            "0"
+        )
+        .into_bytes()
+    }
+
+    fn archive(members: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = GLOBAL_HEADER.to_vec();
+        for m in members {
+            out.extend_from_slice(m);
+        }
+        out
+    }
+
+    #[test]
+    fn confirm_accepts_own_output() {
+        let checked = assert_own_archives_confirm("ar", &Ar, &CreateOpts::default(), &meta(), 8);
+        assert!(checked >= 5, "only {checked} ar archives were checked");
+        // The empty archive: the global header and nothing after it.
+        let empty = write_archive(&Ar, &CreateOpts::default(), &[]).unwrap();
+        assert_eq!(empty, GLOBAL_HEADER);
+        assert!(confirm()(&empty));
+    }
+
+    /// The other writers' first members: a GNU symbol table (`/`), a GNU
+    /// long-name table (`//`), a BSD `#1/` long name, a BSD `__.SYMDEF`
+    /// and an MSVC-style member with blank uid, gid and mode.
+    #[test]
+    fn confirm_accepts_gnu_bsd_and_blank_field_members() {
+        let firsts = [
+            header("/", "0", "0", "42"),
+            header("//", "", "", "38"),
+            header("#1/20", "501", "100644", "26"),
+            header("__.SYMDEF SORTED", "501", "100644", "8"),
+            header("a.o/", "", "", "1234567890"),
+        ];
+        for first in firsts {
+            let mut bytes = archive(&[first]);
+            bytes.extend_from_slice(&[0u8; 64]);
+            assert!(
+                confirm()(&bytes),
+                "{:?}",
+                String::from_utf8_lossy(&bytes[8..68])
+            );
+        }
+    }
+
+    #[test]
+    fn confirm_rejects_a_member_header_that_is_not_one() {
+        let mut prose = GLOBAL_HEADER.to_vec();
+        prose.extend_from_slice(&b"this is a plain text file about ar archives, ".repeat(4));
+        assert!(matches_magic(&meta(), &prose));
+        assert!(!confirm()(&prose), "prose after the magic");
+
+        let mut unterminated = archive(&[header("a.txt", "0", "644", "5")]);
+        unterminated[66] = b'\n';
+        assert!(!confirm()(&unterminated), "no terminator");
+
+        let mut lettered = archive(&[header("a.txt", "0", "644", "5")]);
+        lettered[8 + 48] = b'x';
+        assert!(!confirm()(&lettered), "a size that is not decimal");
+
+        let blank = archive(&[header("a.txt", "0", "644", "")]);
+        assert!(!confirm()(&blank), "no size at all");
+    }
+
+    #[test]
+    fn confirm_never_panics_on_short_input() {
+        let bytes = archive(&[header("a.txt", "0", "644", "5")]);
+        assert_never_panics_upto(confirm(), &bytes, 68);
     }
 }

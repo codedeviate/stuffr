@@ -182,7 +182,55 @@ static TAR_MAGIC: &[MagicRule] = &[MagicRule {
 /// registering `tgz` here would make a `.tgz` file resolve to a bare tar
 /// instead of tar over gzip.
 pub fn meta() -> FormatMeta {
-    FormatMeta::container(TAR, &["tar"], TAR_MAGIC)
+    FormatMeta::container(TAR, &["tar"], TAR_MAGIC).with_confirm(confirm)
+}
+
+/// The checksum field of a tar header: offset and width.
+const CHKSUM: std::ops::Range<usize> = 148..156;
+
+/// The header's own checksum behind `ustar`: the octal number at 148 (any
+/// spelling POSIX, GNU and the `tar` crate write: leading spaces, six or
+/// seven digits, then NUL and/or space) equals the sum of the 512 header
+/// bytes with that field counted as spaces. Old Unix tars summed signed
+/// chars, and POSIX tells a reader to accept either sum. Base-256 is never
+/// used for this field. A prefix cut before the header ends keeps only the
+/// field's own spelling to check.
+fn confirm(prefix: &[u8]) -> bool {
+    let Some(field) = prefix.get(CHKSUM) else {
+        return true;
+    };
+    let Some(recorded) = parse_checksum(field) else {
+        return false;
+    };
+    let Some(header) = prefix.get(..BLOCK) else {
+        return true;
+    };
+    let (mut unsigned, mut signed) = (0i64, 0i64);
+    for (i, &b) in header.iter().enumerate() {
+        let b = if CHKSUM.contains(&i) { b' ' } else { b };
+        unsigned += i64::from(b);
+        signed += i64::from(i8::from_ne_bytes([b]));
+    }
+    recorded == unsigned || recorded == signed
+}
+
+/// The checksum field's octal number: optional leading spaces, at least one
+/// octal digit, then only NULs and spaces.
+fn parse_checksum(field: &[u8]) -> Option<i64> {
+    let start = field.iter().position(|&b| b != b' ')?;
+    let digits = &field[start..];
+    let count = digits
+        .iter()
+        .take_while(|b| (b'0'..=b'7').contains(b))
+        .count();
+    if count == 0 || !digits[count..].iter().all(|&b| b == 0 || b == b' ') {
+        return None;
+    }
+    Some(
+        digits[..count]
+            .iter()
+            .fold(0, |n, &d| n * 8 + i64::from(d - b'0')),
+    )
 }
 
 /// One tar block. Every header is one, and every payload is padded to a
@@ -3244,5 +3292,115 @@ mod tests {
         let resolved =
             stuffr_core::resolve(src, TAR, Tar.caps(), &StreamPolicy::default()).expect("resolve");
         Tar.open(resolved, &OpenOpts::default()).expect("open")
+    }
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+    use crate::confirm_test::{
+        assert_every_cut_confirms, assert_never_panics_upto, assert_own_archives_confirm,
+        matches_magic, write_archive,
+    };
+    use stuffr_core::{ConfirmFn, CreateOpts};
+
+    fn confirm() -> ConfirmFn {
+        meta().confirm.expect("tar registers a confirm function")
+    }
+
+    #[test]
+    fn confirm_accepts_own_output() {
+        let checked =
+            assert_own_archives_confirm("tar", &Tar, &CreateOpts::default(), &meta(), 262);
+        assert!(checked >= 6, "only {checked} tar archives were checked");
+    }
+
+    /// GNU (`ustar  \0`) and POSIX (`ustar\0` `00`) headers as the `tar`
+    /// crate writes them, with a name byte above 0x7f so a signed and an
+    /// unsigned sum differ.
+    #[test]
+    fn confirm_accepts_gnu_and_ustar_headers() {
+        for mut header in [tar::Header::new_gnu(), tar::Header::new_ustar()] {
+            header.set_path("caf\u{e9}/a.txt").unwrap();
+            header.set_size(5);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            header.set_cksum();
+            assert_every_cut_confirms("tar crate header", confirm(), header.as_bytes(), 262);
+        }
+    }
+
+    /// Old Unix tars summed the header as signed chars, and POSIX tells a
+    /// reader to accept either sum. Also the other spellings of the field:
+    /// seven digits then NUL, and leading spaces.
+    #[test]
+    fn confirm_accepts_a_signed_sum_and_every_field_spelling() {
+        let mut header = tar::Header::new_ustar();
+        header.set_path("caf\u{e9}\u{e9}.txt").unwrap();
+        header.set_size(5);
+        header.set_mtime(0);
+        let mut bytes = header.as_bytes().to_vec();
+        bytes[148..156].fill(b' ');
+        let unsigned: u32 = bytes.iter().map(|&b| u32::from(b)).sum();
+        let signed: i32 = bytes.iter().map(|&b| i32::from(b as i8)).sum();
+        assert_ne!(i64::from(unsigned), i64::from(signed));
+        let fields = [
+            format!("{signed:06o}\0 "),
+            format!("{unsigned:06o}\0 "),
+            format!("{unsigned:07o}\0"),
+            format!("{unsigned:>6o}\0 "),
+            format!("{unsigned:06o} \0"),
+        ];
+        for field in fields {
+            bytes[148..156].copy_from_slice(field.as_bytes());
+            assert!(confirm()(&bytes), "checksum field {field:?}");
+        }
+    }
+
+    #[test]
+    fn confirm_rejects_a_header_its_checksum_does_not_cover() {
+        let good = write_archive(
+            &Tar,
+            &CreateOpts::default(),
+            &[(EntryMeta::file("a.txt"), b"alpha".to_vec())],
+        )
+        .unwrap();
+        assert!(confirm()(&good));
+        let mut renamed = good.clone();
+        renamed[0] ^= 1;
+        assert!(
+            !confirm()(&renamed),
+            "a name byte changed under the checksum"
+        );
+        let mut miscounted = good.clone();
+        miscounted[153] = if miscounted[153] == b'0' { b'1' } else { b'0' };
+        assert!(!confirm()(&miscounted), "a checksum digit changed");
+        let mut not_octal = good;
+        not_octal[150] = b'9';
+        assert!(!confirm()(&not_octal), "a non-octal checksum");
+    }
+
+    /// recon's `headers.js`: source text that happens to carry `ustar` at
+    /// offset 257, with no tar header around it.
+    #[test]
+    fn tar_rejects_ustar_in_source_code() {
+        let line =
+            "export function headers(req, res) {\n  return { 'content-type': 'text/x' };\n}\n";
+        let mut text = line.repeat(600 / line.len() + 1).into_bytes();
+        text.truncate(600);
+        text[257..262].copy_from_slice(b"ustar");
+        assert!(matches_magic(&meta(), &text));
+        assert!(!confirm()(&text));
+    }
+
+    #[test]
+    fn confirm_never_panics_on_short_input() {
+        let bytes = write_archive(
+            &Tar,
+            &CreateOpts::default(),
+            &[(EntryMeta::file("a.txt"), b"alpha".to_vec())],
+        )
+        .unwrap();
+        assert_never_panics_upto(confirm(), &bytes, BLOCK);
     }
 }
