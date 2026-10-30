@@ -327,6 +327,46 @@ fn info(reg: &Registry, name: &str, bytes: &[u8]) -> (String, Option<FormatId>) 
     (chain.describe(), layer)
 }
 
+/// The name alone never confirms a format that has a magic: a Chromium
+/// resource pack is `.pak`, an arc extension, and begins `05 00 00 00`,
+/// which arc's own check — written for bytes behind arc's `1A` — read as
+/// method 0, an empty archive (the 0.22.0 release sweep listed 4,446 of
+/// them in `/Applications` as `arc`). Every extension of a format with a
+/// magic, bare and as an inner layer, over bytes no magic matches.
+#[test]
+fn a_name_never_confirms_a_format_whose_magic_is_absent() {
+    let reg = stuffr::registry();
+    const GZIP: FormatId = FormatId::new("gzip");
+    let pak = [
+        &[5, 0, 0, 0, 1, 0, 0, 0, 0xa1, 0, 0x1a, 0, 7, 1, 0x40, 4][..],
+        &[0u8; 64][..],
+    ]
+    .concat();
+    assert_eq!(strict(reg, "chrome_200_percent.pak", &pak), None);
+    assert_eq!(
+        info(reg, "chrome_200_percent.pak", &pak),
+        ("arc".into(), Some(FormatId::new("arc")))
+    );
+    let pak_gz = encode(reg, GZIP, &pak);
+    assert_eq!(strict(reg, "x.pak.gz", &pak_gz).as_deref(), Some("gzip"));
+
+    // Bytes that begin no registered magic, and are not all zeros (an
+    // empty tar is).
+    let plain = b"\x05plain words, no magic of any format here\n".repeat(40);
+    assert!(reg.match_magic(&plain).is_empty());
+    for ext in [
+        "gz", "zz", "bz2", "xz", "zst", "lz4", "sz", "lz", "z", "zip", "a", "ar", "cpio", "lzh",
+        "lha", "arj", "arc", "pak", "zoo",
+    ] {
+        let Some(id) = reg.by_extension(ext) else {
+            continue;
+        };
+        assert!(reg.has_magic(id), "{ext}: {id:?} has a magic");
+        let name = format!("x.{ext}");
+        assert_eq!(strict(reg, &name, &plain), None, "{name}");
+    }
+}
+
 /// Whole files shorter than the header their magic begins (the final
 /// review's measurements): each a magic hit that `stuffr list` calls corrupt,
 /// and none of them is identified — while the same bytes as the start of a

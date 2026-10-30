@@ -2384,6 +2384,7 @@ mod broken_containers {
             extensions: &[],
             priority: 0,
             confirm: None,
+            magic_optional: false,
         }
     }
 

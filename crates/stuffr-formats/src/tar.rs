@@ -182,7 +182,9 @@ static TAR_MAGIC: &[MagicRule] = &[MagicRule {
 /// registering `tgz` here would make a `.tgz` file resolve to a bare tar
 /// instead of tar over gzip.
 pub fn meta() -> FormatMeta {
-    FormatMeta::container(TAR, &["tar"], TAR_MAGIC).with_confirm(confirm)
+    FormatMeta::container(TAR, &["tar"], TAR_MAGIC)
+        .with_confirm(confirm)
+        .with_magic_optional()
 }
 
 /// The checksum field of a tar header: offset and width.

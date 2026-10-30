@@ -418,6 +418,17 @@ pub struct FormatMeta {
     /// the hook changes nothing for a format until it opts in with
     /// [`Self::with_confirm`].
     pub confirm: Option<ConfirmFn>,
+    /// The format's writers can emit a stream its magic does not match, so
+    /// a missing magic is not by itself a refusal: a v7 tar has no `ustar`
+    /// at 257, and an empty tar is zero blocks. Set by
+    /// [`Self::with_magic_optional`]; tar is the one format that needs it.
+    ///
+    /// Without it, [`crate::registry::Registry::confirm`] refuses any prefix
+    /// the format's own magic does not match before its [`ConfirmFn`] runs,
+    /// because that function judges only "a prefix its magic already
+    /// matched" — a `.pak` file named for arc but beginning `05 00` read as
+    /// arc's method 0, an empty archive, and passed.
+    pub magic_optional: bool,
 }
 
 impl CodecCaps {
@@ -501,6 +512,7 @@ impl FormatMeta {
             magics,
             priority: 0,
             confirm: None,
+            magic_optional: false,
         }
     }
 
@@ -516,6 +528,7 @@ impl FormatMeta {
             magics,
             priority: 0,
             confirm: None,
+            magic_optional: false,
         }
     }
 
@@ -527,6 +540,13 @@ impl FormatMeta {
     /// Registers `f` as this format's confirmation — see [`ConfirmFn`].
     pub const fn with_confirm(mut self, f: ConfirmFn) -> Self {
         self.confirm = Some(f);
+        self
+    }
+
+    /// Marks the format as one whose writers may omit its magic — see
+    /// [`Self::magic_optional`].
+    pub const fn with_magic_optional(mut self) -> Self {
+        self.magic_optional = true;
         self
     }
 }

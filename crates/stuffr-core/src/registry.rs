@@ -176,10 +176,15 @@ impl Registry {
         self.magics.iter().any(|m| m.format == id)
     }
 
-    /// The format's own verdict on a prefix its magic matched: `Some(true)`
-    /// or `Some(false)` from the function it registered
-    /// ([`FormatMeta::with_confirm`]), `None` when it registered none or is
-    /// not registered at all.
+    /// The format's own verdict on a prefix: `Some(true)` or `Some(false)`
+    /// from the function it registered ([`FormatMeta::with_confirm`]),
+    /// `None` when it registered none or is not registered at all.
+    ///
+    /// A format that registers a magic, and is not
+    /// [`FormatMeta::magic_optional`], answers `Some(false)` for a prefix
+    /// its own magic does not match, before its function runs: that
+    /// function judges only a prefix its magic matched, and callers reach
+    /// here by name too (an extension, an inner layer named by the path).
     ///
     /// `None` is deliberately not `Some(true)`: the resolver treats both as
     /// confirming (no behaviour change for a format that has not opted in),
@@ -189,10 +194,11 @@ impl Registry {
     /// `whole` is passed through to the function: the prefix is the entire
     /// stream (see [`crate::format::ConfirmFn`]).
     pub fn confirm(&self, id: FormatId, prefix: &[u8], whole: bool) -> Option<bool> {
-        self.metas
-            .get(&id)
-            .and_then(|m| m.confirm)
-            .map(|f| f(prefix, whole))
+        let meta = self.metas.get(&id)?;
+        if !meta.magic_optional && self.has_magic(id) && !self.match_magic(prefix).contains(&id) {
+            return Some(false);
+        }
+        meta.confirm.map(|f| f(prefix, whole))
     }
 
     /// The priority of a registered format, or 0 if unknown.
@@ -623,5 +629,39 @@ mod tests {
         // Re-registration replaces the function with the metadata.
         r.register_codec(Arc::new(MockCodec), codec_meta());
         assert_eq!(r.confirm(MOCK_CODEC, b"MOCK", false), None);
+    }
+
+    /// A format reached by name (an extension, an inner layer the path
+    /// names) is asked about bytes its magic never matched. Its function
+    /// judges only bytes behind its magic — arc's read `05 00`, a `.pak`
+    /// that is no arc, as method 0 and passed — so the registry refuses
+    /// first, unless the format's writers may omit the magic (tar).
+    #[test]
+    fn confirm_refuses_bytes_the_formats_own_magic_does_not_match() {
+        fn anything(_: &[u8], _: bool) -> bool {
+            true
+        }
+        let mut r = Registry::new();
+        r.register_codec(Arc::new(MockCodec), codec_meta().with_confirm(anything));
+        r.register_container(Arc::new(MockContainer), container_meta());
+        assert_eq!(r.confirm(MOCK_CODEC, b"MOCK....", false), Some(true));
+        assert_eq!(
+            r.confirm(MOCK_CODEC, b"\x05\x00\x00\x00", false),
+            Some(false)
+        );
+        assert_eq!(
+            r.confirm(MOCK_CONTAINER, b"xx", false),
+            Some(false),
+            "no function, but a magic that did not match"
+        );
+
+        r.register_codec(
+            Arc::new(MockCodec),
+            codec_meta().with_confirm(anything).with_magic_optional(),
+        );
+        assert_eq!(
+            r.confirm(MOCK_CODEC, b"\x05\x00\x00\x00", false),
+            Some(true)
+        );
     }
 }
