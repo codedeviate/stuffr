@@ -384,9 +384,17 @@ pub struct MagicRule {
 /// including one cut short inside the prefix, because a damaged archive the
 /// user names must stay reachable; it may only refuse what no writer emits.
 ///
+/// `whole` says the prefix is the entire stream, not a window onto a longer
+/// one: a file shorter than [`crate::probe::PROBE_LEN`], or a decoded layer
+/// that ended cleanly inside it. Then a field the check reads that is cut
+/// short is a refusal, not a pass — a cut window may end anywhere, but a
+/// whole stream that stops inside its own first header is not that format
+/// (`!<arch>\n!` is no ar archive, `1f 8b` alone no gzip). A complete
+/// stream that is validly empty (`!<arch>\n`) still passes.
+///
 /// Core supplies only the hook. Every real check lives beside its format in
 /// `stuffr-formats`, which is what keeps this crate free of format knowledge.
-pub type ConfirmFn = fn(prefix: &[u8]) -> bool;
+pub type ConfirmFn = fn(prefix: &[u8], whole: bool) -> bool;
 
 /// Registration metadata for one format.
 #[derive(Clone, Copy, Debug)]

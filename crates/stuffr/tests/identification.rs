@@ -25,7 +25,7 @@ fn every_magic_format_registers_a_confirm_function() {
         .matrix()
         .iter()
         .filter(|row| CONFIRMED_KINDS.contains(&row.kind) && reg.has_magic(row.id))
-        .filter(|row| reg.confirm(row.id, &[]).is_none())
+        .filter(|row| reg.confirm(row.id, &[], false).is_none())
         .map(|row| row.id.as_str())
         .collect();
     assert!(
@@ -82,7 +82,7 @@ fn only_skippable_frames_in_the_window_confirm_nothing() {
     let mut window = skippable(7, 5000);
     window.truncate(stuffr::PROBE_LEN);
     for id in [ZSTD, LZ4] {
-        assert_eq!(reg.confirm(id, &window), Some(false), "{id}");
+        assert_eq!(reg.confirm(id, &window, false), Some(false), "{id}");
     }
     // Nameless: two unconfirmed hits of equal rank, exit 2 as unknown was.
     let err = resolve_chain(reg, None, &window).unwrap_err();
@@ -292,4 +292,127 @@ fn the_first_unconfirmed_layer_is_the_tar_under_a_good_codec() {
         checked += 1;
     }
     assert!(checked >= 6, "only {checked} codecs checked");
+}
+
+/// `tiny_tar` as a v7 archive: no `ustar` magic at 257, the checksum
+/// recomputed — a real tar that only its checksum (and a name) identifies.
+fn v7_tar() -> Vec<u8> {
+    let mut t = tiny_tar(false);
+    t[257..265].fill(0);
+    t[148..156].copy_from_slice(b"        ");
+    let sum: u32 = t[..512].iter().map(|&b| u32::from(b)).sum();
+    t[148..155].copy_from_slice(format!("{sum:06o}\0").as_bytes());
+    t
+}
+
+fn strict(reg: &Registry, name: &str, bytes: &[u8]) -> Option<String> {
+    let prefix = &bytes[..bytes.len().min(stuffr::PROBE_LEN)];
+    stuffr::probe::identify_strict(
+        reg,
+        Some(Path::new(name)),
+        prefix,
+        None,
+        &stuffr::DecodeOpts::default(),
+    )
+    .map(|c| c.describe())
+}
+
+/// The lenient chain `stuffr info` prints, and the layer it names as not
+/// checking out.
+fn info(reg: &Registry, name: &str, bytes: &[u8]) -> (String, Option<FormatId>) {
+    let prefix = &bytes[..bytes.len().min(stuffr::PROBE_LEN)];
+    let (chain, _) = resolve_chain_checked(reg, Some(Path::new(name)), prefix).unwrap();
+    let layer =
+        stuffr::probe::first_unconfirmed_layer(reg, &chain, prefix, &stuffr::DecodeOpts::default());
+    (chain.describe(), layer)
+}
+
+/// Whole files shorter than the header their magic begins (the final
+/// review's measurements): each a magic hit that `stuffr list` calls corrupt,
+/// and none of them is identified — while the same bytes as the start of a
+/// longer file (a full window) still are, as a damaged archive must be.
+#[test]
+fn a_whole_file_cut_inside_its_first_header_is_not_identified() {
+    let reg = stuffr::registry();
+    let mut tar300 = tiny_tar(false);
+    tar300.truncate(300);
+    let shapes: [(&str, Vec<u8>); 7] = [
+        ("x.arc", vec![0x1a, 0x08, 0x58, 0x60]),
+        ("x.cpio", b"070701".to_vec()),
+        ("x.arj", vec![0x60, 0xea, 0x00]),
+        ("x.zip", b"PK\x03\x04\x14".to_vec()),
+        ("x.a", b"!<arch>\n!".to_vec()),
+        ("headers.js", tar300),
+        ("x.gz", vec![0x1f, 0x8b]),
+    ];
+    for (name, bytes) in shapes {
+        assert_eq!(strict(reg, name, &bytes), None, "{name}");
+        let (chain, evidence) = resolve_chain_checked(reg, Some(Path::new(name)), &bytes).unwrap();
+        assert_eq!(evidence, Evidence::Unconfirmed, "{name}");
+        // As a window onto something longer, the same start still counts.
+        let id = outer(&chain).unwrap();
+        assert_eq!(
+            reg.confirm(id, &bytes, false),
+            Some(true),
+            "{name} as a window"
+        );
+    }
+    // Complete and validly empty: still an ar archive.
+    assert_eq!(strict(reg, "e.a", b"!<arch>\n").as_deref(), Some("ar"));
+}
+
+/// A codec layer's decoded bytes with no magic take the container the name
+/// gives when its check accepts them: `ls` (strict) and `info` (lenient
+/// chain plus its check) agree on every one of these.
+#[test]
+fn a_magicless_inner_layer_is_named_by_the_path_when_it_checks_out() {
+    let reg = stuffr::registry();
+    const GZIP: FormatId = FormatId::new("gzip");
+    const TAR: FormatId = FormatId::new("tar");
+
+    let v7 = encode(reg, GZIP, &v7_tar());
+    assert_eq!(
+        strict(reg, "v7.tar.gz", &v7).as_deref(),
+        Some("tar over gzip")
+    );
+    assert_eq!(info(reg, "v7.tar.gz", &v7), ("tar over gzip".into(), None));
+
+    // Text named `.tar.gz`: tar's checksum refuses it, so a gzip.
+    let text = encode(
+        reg,
+        GZIP,
+        &b"not a tar at all, just some words\n".repeat(30),
+    );
+    assert_eq!(strict(reg, "y.tar.gz", &text).as_deref(), Some("gzip"));
+    assert_eq!(
+        info(reg, "y.tar.gz", &text),
+        ("tar over gzip".into(), Some(TAR))
+    );
+
+    // The empty archive tar writes (`tar -cf x.tar -T /dev/null`): ten
+    // blocks of zeros, bare and under gzip.
+    let empty = vec![0u8; 10240];
+    assert_eq!(strict(reg, "e.tar", &empty).as_deref(), Some("tar"));
+    assert_eq!(info(reg, "e.tar", &empty), ("tar".into(), None));
+    let empty_gz = encode(reg, GZIP, &empty);
+    assert_eq!(
+        strict(reg, "e.tar.gz", &empty_gz).as_deref(),
+        Some("tar over gzip")
+    );
+    assert_eq!(
+        info(reg, "e.tar.gz", &empty_gz),
+        ("tar over gzip".into(), None)
+    );
+
+    // A magicless codec inside (brotli in xz): listed, as 0.21.0 listed
+    // it — the xz layer over bytes nothing confirms, which is also the
+    // chain `info` prints.
+    let brotli = FormatId::new("brotli");
+    let xz = FormatId::new("xz");
+    if reg.codec(brotli).is_some() && reg.codec(xz).is_some() {
+        let br = encode(reg, brotli, b"hello hello hello brotli");
+        let brxz = encode(reg, xz, &br);
+        assert_eq!(strict(reg, "x.br.xz", &brxz).as_deref(), Some("xz"));
+        assert_eq!(info(reg, "x.br.xz", &brxz), ("xz".into(), None));
+    }
 }

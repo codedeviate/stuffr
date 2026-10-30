@@ -185,11 +185,14 @@ impl Registry {
     /// confirming (no behaviour change for a format that has not opted in),
     /// but a caller auditing coverage needs to tell "checked and passed" from
     /// "never checked".
-    pub fn confirm(&self, id: FormatId, prefix: &[u8]) -> Option<bool> {
+    ///
+    /// `whole` is passed through to the function: the prefix is the entire
+    /// stream (see [`crate::format::ConfirmFn`]).
+    pub fn confirm(&self, id: FormatId, prefix: &[u8], whole: bool) -> Option<bool> {
         self.metas
             .get(&id)
             .and_then(|m| m.confirm)
-            .map(|f| f(prefix))
+            .map(|f| f(prefix, whole))
     }
 
     /// The priority of a registered format, or 0 if unknown.
@@ -599,23 +602,26 @@ mod tests {
 
     #[test]
     fn confirm_answers_only_for_a_format_that_registered_a_function() {
-        fn starts_mock(p: &[u8]) -> bool {
-            p.starts_with(b"MOCK")
+        fn starts_mock(p: &[u8], whole: bool) -> bool {
+            p.starts_with(b"MOCK") && !(whole && p.len() < 8)
         }
         let mut r = Registry::new();
         r.register_codec(Arc::new(MockCodec), codec_meta().with_confirm(starts_mock));
         r.register_container(Arc::new(MockContainer), container_meta());
-        assert_eq!(r.confirm(MOCK_CODEC, b"MOCK...."), Some(true));
-        assert_eq!(r.confirm(MOCK_CODEC, b"MOCX...."), Some(false));
+        assert_eq!(r.confirm(MOCK_CODEC, b"MOCK....", false), Some(true));
+        assert_eq!(r.confirm(MOCK_CODEC, b"MOCX....", false), Some(false));
+        // `whole` reaches the function.
+        assert_eq!(r.confirm(MOCK_CODEC, b"MOCK", false), Some(true));
+        assert_eq!(r.confirm(MOCK_CODEC, b"MOCK", true), Some(false));
         assert_eq!(
-            r.confirm(MOCK_CONTAINER, b"ME"),
+            r.confirm(MOCK_CONTAINER, b"ME", true),
             None,
             "no function registered: no verdict, not a refusal"
         );
-        assert_eq!(r.confirm(FormatId::new("absent"), b""), None);
+        assert_eq!(r.confirm(FormatId::new("absent"), b"", false), None);
 
         // Re-registration replaces the function with the metadata.
         r.register_codec(Arc::new(MockCodec), codec_meta());
-        assert_eq!(r.confirm(MOCK_CODEC, b"MOCK"), None);
+        assert_eq!(r.confirm(MOCK_CODEC, b"MOCK", false), None);
     }
 }

@@ -437,10 +437,26 @@ pub enum Evidence {
 /// (if any) grades it: `Confirmed`, `Unconfirmed`, or [`Evidence::ByName`]
 /// when there is none. Every error is the one `resolve_chain` raised before
 /// confirmation existed.
+///
+/// `prefix` is a probe prefix: shorter than [`PROBE_LEN`] means it is the
+/// whole stream, which every confirmation is told (see
+/// [`crate::format::ConfirmFn`]).
 pub fn resolve_chain_checked(
     reg: &Registry,
     path: Option<&Path>,
     prefix: &[u8],
+) -> Result<(Chain, Evidence)> {
+    resolve_checked(reg, path, prefix, prefix.len() < PROBE_LEN)
+}
+
+/// [`resolve_chain_checked`] with the "these bytes are the whole stream"
+/// flag given rather than read off the length: a decoded layer that stopped
+/// on an error is short without being whole.
+fn resolve_checked(
+    reg: &Registry,
+    path: Option<&Path>,
+    prefix: &[u8],
+    whole: bool,
 ) -> Result<(Chain, Evidence)> {
     let hits = reg.match_magic(prefix);
     // `match_magic`'s order (priority descending) survives the filter, which
@@ -448,7 +464,7 @@ pub fn resolve_chain_checked(
     let confirmed: Vec<FormatId> = hits
         .iter()
         .copied()
-        .filter(|id| reg.confirm(*id, prefix) != Some(false))
+        .filter(|id| reg.confirm(*id, prefix, whole) != Some(false))
         .collect();
     let (mut candidates, mut evidence) = if confirmed.is_empty() {
         (hits, Evidence::Unconfirmed)
@@ -491,7 +507,7 @@ pub fn resolve_chain_checked(
             let by_name =
                 path.and_then(|p| extensions(p).iter().rev().find_map(|e| reg.by_extension(e)));
             if let Some(id) = by_name {
-                evidence = match reg.confirm(id, prefix) {
+                evidence = match reg.confirm(id, prefix, whole) {
                     Some(true) => Evidence::Confirmed,
                     Some(false) => Evidence::Unconfirmed,
                     None => Evidence::ByName,
@@ -758,9 +774,17 @@ pub fn resolve_chain_deep_with(
 ///   prefix is a truncated stream, so an error at its end is expected). What
 ///   came out is resolved with no path; a confirmed codec or container
 ///   becomes the inner layer (a codec recursively), anything else is
-///   [`Chain::Raw`]. The path's inner extensions are not consulted when
-///   there are decoded bytes to look at: `x.tar.gz` holding no tar is a
-///   gzip, whatever its name says.
+///   [`Chain::Raw`]. The decoded bytes are the whole inner stream when they
+///   stop short of [`PROBE_LEN`] without an error, and their confirmation is
+///   told so.
+/// * Decoded bytes that match no magic at all fall back to the container
+///   the path names for the outermost codec (`inner_from_path`, as
+///   [`resolve_chain`] answers), but only when that container's own check
+///   accepts the bytes (or it has none): a v7 tar carries no `ustar` magic
+///   and `v7.tar.gz` is still tar over gzip, while a text file named
+///   `y.tar.gz` fails tar's checksum and is a gzip, whatever its name says.
+///   Decoded bytes whose magic matched but did not confirm get no such
+///   fallback.
 /// * A codec that decodes **nothing** depends on whether the prefix was the
 ///   whole file. A cut-off read (`prefix.len() == PROBE_LEN`) can simply be
 ///   shorter than the codec's first block — measured on a real 168 KB `.bz2`
@@ -836,13 +860,17 @@ pub fn first_unconfirmed_layer(
     let mut layer = chain;
     let mut owned: Vec<u8>;
     let mut bytes = prefix;
+    // A probe prefix short of the window is the whole stream; a decoded
+    // layer is whole when it ended cleanly inside the window.
+    let mut whole = prefix.len() < PROBE_LEN;
     for _ in 0..MAX_CHAIN_DEPTH {
         match layer {
             Chain::Container { container } => {
-                return (reg.confirm(*container, bytes) == Some(false)).then_some(*container);
+                return (reg.confirm(*container, bytes, whole) == Some(false))
+                    .then_some(*container);
             }
             Chain::Codec { codec, inner } => {
-                if reg.confirm(*codec, bytes) == Some(false) {
+                if reg.confirm(*codec, bytes, whole) == Some(false) {
                     return Some(*codec);
                 }
                 if matches!(**inner, Chain::Raw) {
@@ -852,6 +880,7 @@ pub fn first_unconfirmed_layer(
                 if decoded.bytes.is_empty() {
                     return None;
                 }
+                whole = decoded.is_whole();
                 owned = decoded.bytes;
                 bytes = &owned;
                 layer = inner;
@@ -867,8 +896,9 @@ struct StrictInput<'a> {
     bytes: &'a [u8],
     /// `bytes` stop short of the stream's real end.
     cut: bool,
-    /// The inner layer to claim when `cut` and nothing decodes: the path's
-    /// answer for the outermost layer, `Raw` below it.
+    /// The path's answer for the outermost layer, `Raw` below it: claimed
+    /// when `cut` and nothing decodes, and the fallback (when its check
+    /// accepts) for decoded bytes that match no magic.
     unseen_inner: Chain,
 }
 
@@ -883,6 +913,7 @@ fn strict_codec_layer(
     depth: usize,
 ) -> Option<Chain> {
     let decoded = decode_prefix(reg, codec, input.bytes, opts)?;
+    let whole = decoded.is_whole();
     let inner = if decoded.bytes.is_empty() {
         match (input.cut, decoded.failed) {
             // Too little input for the codec's first block: the window, not
@@ -894,14 +925,14 @@ fn strict_codec_layer(
             (false, false) => Chain::Raw,
         }
     } else {
-        match resolve_chain_checked(reg, None, &decoded.bytes) {
+        match resolve_checked(reg, None, &decoded.bytes, whole) {
             Ok((inner @ Chain::Container { .. }, Evidence::Confirmed)) => inner,
             Ok((Chain::Codec { codec: nested, .. }, Evidence::Confirmed))
                 if depth + 1 < MAX_CHAIN_DEPTH =>
             {
                 let nested_input = StrictInput {
                     bytes: &decoded.bytes,
-                    cut: decoded.bytes.len() == PROBE_LEN || decoded.failed,
+                    cut: !whole,
                     unseen_inner: Chain::Raw,
                 };
                 // A nested codec whose own bytes decode to nothing is not a
@@ -909,6 +940,17 @@ fn strict_codec_layer(
                 // layer is then a codec over opaque bytes.
                 strict_codec_layer(reg, nested, nested_input, opts, depth + 1).unwrap_or(Chain::Raw)
             }
+            // No magic at all in what came out: the name may still speak for
+            // a magicless inner layer (a v7 tar has no `ustar`), but only
+            // where that layer's own check accepts the bytes.
+            _ if reg.match_magic(&decoded.bytes).is_empty() => match input.unseen_inner {
+                Chain::Container { container }
+                    if reg.confirm(container, &decoded.bytes, whole) != Some(false) =>
+                {
+                    Chain::Container { container }
+                }
+                _ => Chain::Raw,
+            },
             _ => Chain::Raw,
         }
     };
@@ -924,6 +966,14 @@ struct DecodedPrefix {
     bytes: Vec<u8>,
     /// The read stopped on an error rather than at the window or at EOF.
     failed: bool,
+}
+
+impl DecodedPrefix {
+    /// The decoded bytes are the layer's entire stream: it ended cleanly
+    /// before filling the window.
+    fn is_whole(&self) -> bool {
+        !self.failed && self.bytes.len() < PROBE_LEN
+    }
 }
 
 /// How many `Interrupted` reads in a row [`decode_prefix`] retries before
@@ -2020,11 +2070,11 @@ mod truthful_identification_tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    fn yes(_: &[u8]) -> bool {
+    fn yes(_: &[u8], _: bool) -> bool {
         true
     }
 
-    fn no(_: &[u8]) -> bool {
+    fn no(_: &[u8], _: bool) -> bool {
         false
     }
 
@@ -2286,7 +2336,7 @@ mod truthful_identification_tests {
 
     /// The mock container's record header is `ME` + a little-endian u16 name
     /// length; a name that runs past the prefix is not a mock archive.
-    fn mock_archive_confirms(p: &[u8]) -> bool {
+    fn mock_archive_confirms(p: &[u8], _whole: bool) -> bool {
         p.len() >= 4 && {
             let n = u16::from_le_bytes([p[2], p[3]]) as usize;
             n > 0 && 4 + n <= p.len()
@@ -2308,7 +2358,7 @@ mod truthful_identification_tests {
         r.register_codec(
             Arc::new(LayerCodec),
             FormatMeta::codec(MOCK_CODEC, &["mock"], CODEC_MAGIC)
-                .with_confirm(|p| p.starts_with(LAYER_MAGIC)),
+                .with_confirm(|p, _| p.starts_with(LAYER_MAGIC)),
         );
         r.register_container(
             Arc::new(MockContainer),
@@ -2635,5 +2685,118 @@ mod truthful_identification_tests {
         let (chain, ev) = resolve_chain_checked(&r, Some(Path::new("x.apk")), b"PK..").unwrap();
         assert_eq!(chain, Chain::Container { container: ZIP });
         assert_eq!(ev, Evidence::Confirmed);
+    }
+    // --- whole streams ----------------------------------------------------
+
+    /// Refuses exactly what is whole and shorter than eight bytes.
+    fn eight_when_whole(p: &[u8], whole: bool) -> bool {
+        !whole || p.len() >= 8
+    }
+
+    #[test]
+    fn a_probe_prefix_short_of_the_window_is_confirmed_as_the_whole_stream() {
+        let mut r = Registry::new();
+        r.register_codec(
+            Arc::new(MockCodec),
+            FormatMeta::codec(ALPHA, &[], &SHARED_MAGIC[..1]).with_confirm(eight_when_whole),
+        );
+        let ev = |prefix: &[u8]| resolve_chain_checked(&r, None, prefix).unwrap().1;
+        assert_eq!(ev(b"SH"), Evidence::Unconfirmed, "a two-byte file is whole");
+        assert_eq!(ev(b"SH345678"), Evidence::Confirmed);
+        // A full window is never whole, however little of it the check reads.
+        let mut window = vec![0u8; PROBE_LEN];
+        window[..2].copy_from_slice(b"SH");
+        assert_eq!(ev(&window), Evidence::Confirmed);
+    }
+
+    const PLAIN: FormatId = FormatId::new("plain");
+    const WHOLE: FormatId = FormatId::new("wholecheck");
+
+    /// `scripted_registry` plus a magicless container (`.pln`, confirmed by
+    /// a leading `PL`) and one whose magic `WH` is refused only when whole.
+    fn layered_registry(yields: &'static [u8], then_error: bool) -> Registry {
+        let mut r = scripted_registry(yields, then_error);
+        r.register_container(
+            Arc::new(MockContainer),
+            FormatMeta::container(PLAIN, &["pln"], &[]).with_confirm(|p, _| p.starts_with(b"PL")),
+        );
+        r.register_container(
+            Arc::new(MockContainer),
+            FormatMeta::container(
+                WHOLE,
+                &["wh"],
+                &[MagicRule {
+                    offset: 0,
+                    bytes: b"WH",
+                    format: WHOLE,
+                }],
+            )
+            .with_confirm(eight_when_whole),
+        );
+        r
+    }
+
+    fn over(inner: Chain) -> Option<Chain> {
+        Some(Chain::Codec {
+            codec: MOCK_CODEC,
+            inner: Box::new(inner),
+        })
+    }
+
+    #[test]
+    fn a_decoded_layer_is_whole_only_when_it_ended_cleanly_inside_the_window() {
+        // Ended cleanly at two bytes: the whole inner stream, refused.
+        let r = layered_registry(b"WH", false);
+        assert_eq!(strict(&r, None, b"MOCKjunk", None), over(Chain::Raw));
+        let chain = over(Chain::Container { container: WHOLE }).unwrap();
+        assert_eq!(
+            first_unconfirmed_layer(&r, &chain, b"MOCKjunk", &DecodeOpts::default()),
+            Some(WHOLE)
+        );
+        // Stopped on an error: a cut stream, judged as one.
+        let r = layered_registry(b"WH", true);
+        assert_eq!(
+            strict(&r, None, b"MOCKjunk", None),
+            over(Chain::Container { container: WHOLE })
+        );
+        assert_eq!(
+            first_unconfirmed_layer(&r, &chain, b"MOCKjunk", &DecodeOpts::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn decoded_bytes_with_no_magic_take_the_paths_container_when_it_confirms() {
+        let plain = Chain::Container { container: PLAIN };
+        let r = layered_registry(b"PLAIN DATA", false);
+        assert_eq!(
+            strict(&r, Some("x.pln.mock"), b"MOCKjunk", None),
+            over(plain.clone()),
+            "a magicless inner layer the name gives and the bytes confirm"
+        );
+        assert_eq!(
+            strict(&r, None, b"MOCKjunk", None),
+            over(Chain::Raw),
+            "no name"
+        );
+        assert_eq!(
+            strict(&r, Some("x.mock"), b"MOCKjunk", None),
+            over(Chain::Raw),
+            "a name with nothing inside"
+        );
+        let r = layered_registry(b"just text", false);
+        assert_eq!(
+            strict(&r, Some("x.pln.mock"), b"MOCKjunk", None),
+            over(Chain::Raw),
+            "the name alone is not enough when the check refuses the bytes"
+        );
+        // `info`'s chain for the same file names the same layer as refused.
+        let (chain, _) =
+            resolve_chain_checked(&r, Some(Path::new("x.pln.mock")), b"MOCKjunk").unwrap();
+        assert_eq!(chain, over(plain).unwrap());
+        assert_eq!(
+            first_unconfirmed_layer(&r, &chain, b"MOCKjunk", &DecodeOpts::default()),
+            Some(PLAIN)
+        );
     }
 }

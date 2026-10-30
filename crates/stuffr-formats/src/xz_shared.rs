@@ -39,7 +39,12 @@ pub fn xz_meta() -> FormatMeta {
 /// (zero), byte 1's high nibble is reserved (zero; the low nibble is the
 /// check type, any of which a decoder must accept), and bytes 8..12 are the
 /// little-endian CRC-32 of those two flag bytes.
-fn confirm(prefix: &[u8]) -> bool {
+///
+/// A whole stream must hold the twelve-byte stream header.
+fn confirm(prefix: &[u8], whole: bool) -> bool {
+    if whole && prefix.len() < 12 {
+        return false;
+    }
     if prefix.get(6).is_some_and(|&b| b != 0) || prefix.get(7).is_some_and(|&b| b & 0xf0 != 0) {
         return false;
     }
@@ -91,8 +96,23 @@ mod confirm_tests {
     use crate::confirm_test::{assert_every_cut_confirms, assert_never_panics};
     use stuffr_core::ConfirmFn;
 
-    fn confirm() -> ConfirmFn {
+    fn confirm_fn() -> ConfirmFn {
         xz_meta().confirm.expect("xz registers a confirm function")
+    }
+
+    /// The registered function judging a window (`whole` false): what
+    /// every test below that cuts a stream short means.
+    fn confirm() -> impl Fn(&[u8]) -> bool {
+        |p| confirm_fn()(p, false)
+    }
+
+    /// A whole stream that stops inside the header the check reads is
+    /// refused; the same bytes as a window onto a longer stream are not.
+    #[test]
+    fn confirm_refuses_a_whole_stream_cut_inside_its_header() {
+        use crate::confirm_test::assert_whole_cuts_refused as refused;
+        refused("xz", confirm_fn(), &HEADERS[0], 0);
+        assert!(confirm_fn()(&HEADERS[0][..11], false));
     }
 
     /// Stream headers as xz writes them, one per check type, with their
@@ -115,7 +135,7 @@ mod confirm_tests {
     #[test]
     fn confirm_accepts_every_check_type_header() {
         for header in HEADERS {
-            assert_every_cut_confirms("xz header", confirm(), &header, 6);
+            assert_every_cut_confirms("xz header", confirm_fn(), &header, 6);
         }
     }
 
@@ -142,6 +162,6 @@ mod confirm_tests {
         stream.extend_from_slice(&[
             0x02, 0x00, 0x21, 0x01, 0x16, 0, 0, 0, 0x74, 0x2f, 0xe5, 0xa3,
         ]);
-        assert_never_panics(confirm(), &stream);
+        assert_never_panics(confirm_fn(), &stream);
     }
 }

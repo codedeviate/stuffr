@@ -300,7 +300,13 @@ pub fn meta() -> FormatMeta {
 /// The other fields are not checked: GNU's symbol table, BSD's `#1/` names
 /// and MSVC's blank uid, gid and mode all differ there. A cut-short header
 /// is checked as far as it goes.
-fn confirm(prefix: &[u8]) -> bool {
+///
+/// A whole stream is either the global header alone (an archive of no
+/// members) or holds the first member's 60-byte header entire.
+fn confirm(prefix: &[u8], whole: bool) -> bool {
+    if whole && prefix.len() != GLOBAL_HEADER.len() && prefix.len() < GLOBAL_HEADER.len() + 60 {
+        return false;
+    }
     let header = prefix.get(GLOBAL_HEADER.len()..).unwrap_or_default();
     let header = &header[..header.len().min(60)];
     let size = header.get(48..58.min(header.len())).unwrap_or_default();
@@ -3228,8 +3234,30 @@ mod confirm_tests {
     };
     use stuffr_core::{ConfirmFn, CreateOpts};
 
-    fn confirm() -> ConfirmFn {
+    fn confirm_fn() -> ConfirmFn {
         meta().confirm.expect("ar registers a confirm function")
+    }
+
+    /// The registered function judging a window (`whole` false): what
+    /// every test below that cuts a stream short means.
+    fn confirm() -> impl Fn(&[u8]) -> bool {
+        |p| confirm_fn()(p, false)
+    }
+
+    /// A whole stream that stops inside the header the check reads is
+    /// refused; the same bytes as a window onto a longer stream are not.
+    #[test]
+    fn confirm_refuses_a_whole_stream_cut_inside_its_header() {
+        use crate::confirm_test::assert_whole_cuts_refused as refused;
+        let mut s = archive(&[header("a.txt", "0", "644", "5")]);
+        s.extend_from_slice(b"alpha\n");
+        refused("ar", confirm_fn(), &s[..68], 9);
+        assert!(!confirm_fn()(b"!<arch>\n!", true));
+        assert!(confirm_fn()(b"!<arch>\n!", false));
+        assert!(
+            confirm_fn()(GLOBAL_HEADER, true),
+            "an archive of no members"
+        );
     }
 
     /// One 60-byte member header: `name` (16), date (12), uid (6), gid
@@ -3306,6 +3334,6 @@ mod confirm_tests {
     #[test]
     fn confirm_never_panics_on_short_input() {
         let bytes = archive(&[header("a.txt", "0", "644", "5")]);
-        assert_never_panics_upto(confirm(), &bytes, 68);
+        assert_never_panics_upto(confirm_fn(), &bytes, 68);
     }
 }

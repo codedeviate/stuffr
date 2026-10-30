@@ -195,7 +195,17 @@ const CHKSUM: std::ops::Range<usize> = 148..156;
 /// chars, and POSIX tells a reader to accept either sum. Base-256 is never
 /// used for this field. A prefix cut before the header ends keeps only the
 /// field's own spelling to check.
-fn confirm(prefix: &[u8]) -> bool {
+///
+/// A whole stream must hold the 512-byte header entire. An all-zero first
+/// block is tar's end-of-archive marker, which is what an archive of no
+/// entries (`tar -cf x.tar -T /dev/null`) begins with: confirmed.
+fn confirm(prefix: &[u8], whole: bool) -> bool {
+    if whole && prefix.len() < BLOCK {
+        return false;
+    }
+    if prefix[..prefix.len().min(BLOCK)].iter().all(|&b| b == 0) {
+        return true;
+    }
     let Some(field) = prefix.get(CHKSUM) else {
         return true;
     };
@@ -3304,8 +3314,47 @@ mod confirm_tests {
     };
     use stuffr_core::{ConfirmFn, CreateOpts};
 
-    fn confirm() -> ConfirmFn {
+    fn confirm_fn() -> ConfirmFn {
         meta().confirm.expect("tar registers a confirm function")
+    }
+
+    /// The registered function judging a window (`whole` false): what
+    /// every test below that cuts a stream short means.
+    fn confirm() -> impl Fn(&[u8]) -> bool {
+        |p| confirm_fn()(p, false)
+    }
+
+    /// An archive of no entries is the end-of-archive marker alone: zero
+    /// blocks, no magic, reached by a `.tar` name. `tar -cf x.tar -T
+    /// /dev/null` writes 10240 of them; stuffr's own writer writes two.
+    #[test]
+    fn confirm_accepts_the_empty_archive() {
+        let gnu = vec![0u8; 10240];
+        assert!(confirm_fn()(&gnu[..stuffr_core::probe::PROBE_LEN], false));
+        assert!(confirm_fn()(&gnu, true));
+        let own = crate::confirm_test::write_archive(&Tar, &CreateOpts::default(), &[])
+            .expect("tar writes an empty archive");
+        assert!(own.iter().all(|&b| b == 0), "{} bytes", own.len());
+        assert!(confirm_fn()(&own, true));
+        // A zero block with one stray byte is no marker.
+        let mut stray = gnu.clone();
+        stray[100] = 1;
+        assert!(!confirm_fn()(&stray, true));
+    }
+
+    /// A whole stream that stops inside the header the check reads is
+    /// refused; the same bytes as a window onto a longer stream are not.
+    #[test]
+    fn confirm_refuses_a_whole_stream_cut_inside_its_header() {
+        use crate::confirm_test::assert_whole_cuts_refused as refused;
+        let entries = [(stuffr_core::EntryMeta::file("a.txt"), b"alpha".to_vec())];
+        let s = crate::confirm_test::write_archive(&Tar, &CreateOpts::default(), &entries)
+            .expect("tar writes one file");
+        refused("tar", confirm_fn(), &s[..BLOCK], 0);
+        // recon's `headers.js` shape under 512 bytes: `ustar` at 257, the
+        // file over before the header is.
+        assert!(!confirm_fn()(&s[..300], true));
+        assert!(confirm_fn()(&s[..300], false), "a window may end there");
     }
 
     #[test]
@@ -3326,7 +3375,7 @@ mod confirm_tests {
             header.set_mode(0o644);
             header.set_mtime(0);
             header.set_cksum();
-            assert_every_cut_confirms("tar crate header", confirm(), header.as_bytes(), 262);
+            assert_every_cut_confirms("tar crate header", confirm_fn(), header.as_bytes(), 262);
         }
     }
 
@@ -3401,6 +3450,6 @@ mod confirm_tests {
             &[(EntryMeta::file("a.txt"), b"alpha".to_vec())],
         )
         .unwrap();
-        assert_never_panics_upto(confirm(), &bytes, BLOCK);
+        assert_never_panics_upto(confirm_fn(), &bytes, BLOCK);
     }
 }

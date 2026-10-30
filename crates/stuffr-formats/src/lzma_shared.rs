@@ -44,7 +44,12 @@ pub fn lzma_meta() -> FormatMeta {
 /// size of at least 4 KiB (liblzma's minimum), and a little-endian
 /// uncompressed size that is either unknown (all `FF`) or at most 2^48 —
 /// no writer records more, and liblzma refuses it.
-fn confirm(prefix: &[u8]) -> bool {
+///
+/// A whole stream must hold the thirteen-byte header.
+fn confirm(prefix: &[u8], whole: bool) -> bool {
+    if whole && prefix.len() < 13 {
+        return false;
+    }
     if prefix.first().is_some_and(|&props| props >= 225) {
         return false;
     }
@@ -68,10 +73,26 @@ mod confirm_tests {
     use crate::confirm_test::{assert_every_cut_confirms, assert_never_panics};
     use stuffr_core::ConfirmFn;
 
-    fn confirm() -> ConfirmFn {
+    fn confirm_fn() -> ConfirmFn {
         lzma_meta()
             .confirm
             .expect("lzma registers a confirm function")
+    }
+
+    /// The registered function judging a window (`whole` false): what
+    /// every test below that cuts a stream short means.
+    fn confirm() -> impl Fn(&[u8]) -> bool {
+        |p| confirm_fn()(p, false)
+    }
+
+    /// A whole stream that stops inside the header the check reads is
+    /// refused; the same bytes as a window onto a longer stream are not.
+    #[test]
+    fn confirm_refuses_a_whole_stream_cut_inside_its_header() {
+        use crate::confirm_test::assert_whole_cuts_refused as refused;
+        let h = header(0x5d, 1 << 23, u64::MAX);
+        refused("lzma", confirm_fn(), &h[..13], 0);
+        assert!(confirm_fn()(&h[..12], false));
     }
 
     /// `props`, a dictionary size and an uncompressed size, as a header.
@@ -92,7 +113,7 @@ mod confirm_tests {
             (224, u32::MAX, 1 << 48),
         ] {
             let what = format!("props {props:#04x} dict {dict} size {size}");
-            assert_every_cut_confirms(&what, confirm(), &header(props, dict, size), 0);
+            assert_every_cut_confirms(&what, confirm_fn(), &header(props, dict, size), 0);
         }
     }
 
@@ -109,6 +130,6 @@ mod confirm_tests {
 
     #[test]
     fn confirm_never_panics_on_short_input() {
-        assert_never_panics(confirm(), &header(0x5d, 1 << 23, u64::MAX));
+        assert_never_panics(confirm_fn(), &header(0x5d, 1 << 23, u64::MAX));
     }
 }

@@ -48,8 +48,10 @@ pub(crate) fn encode(codec: &dyn Codec, plain: &[u8], level: Option<i32>) -> Vec
 }
 
 /// Every cut of `stream` from `from` bytes up to the probe window (or the
-/// whole stream) confirms: a stream cut short inside the prefix is still the
-/// format's, so a confirm function may only refuse what it can see is wrong.
+/// whole stream) confirms as a window (`whole` false): a stream cut short
+/// inside the prefix is still the format's, so a confirm function may only
+/// refuse what it can see is wrong. And `stream` itself, all of it,
+/// confirms as the whole stream it is.
 pub(crate) fn assert_every_cut_confirms(
     what: &str,
     confirm: ConfirmFn,
@@ -59,39 +61,58 @@ pub(crate) fn assert_every_cut_confirms(
     let end = stream.len().min(PROBE_LEN);
     for cut in from.min(end)..=end {
         assert!(
-            confirm(&stream[..cut]),
+            confirm(&stream[..cut], false),
             "{what}: the first {cut} of {} bytes were refused: {:02x?}",
             stream.len(),
+            &stream[..cut.min(24)]
+        );
+    }
+    assert!(
+        confirm(stream, true),
+        "{what}: the whole {}-byte stream was refused: {:02x?}",
+        stream.len(),
+        &stream[..stream.len().min(24)]
+    );
+}
+
+/// `stream` cut at every length from `from` short of its end is refused
+/// when presented as the whole stream: a file that stops inside the header
+/// the check reads is not the format's. Pass the length of that header (or
+/// the shortest valid stream), not a whole archive.
+pub(crate) fn assert_whole_cuts_refused(
+    what: &str,
+    confirm: ConfirmFn,
+    stream: &[u8],
+    from: usize,
+) {
+    for cut in from.min(stream.len())..stream.len() {
+        assert!(
+            !confirm(&stream[..cut], true),
+            "{what}: a whole stream of the first {cut} bytes was confirmed: {:02x?}",
             &stream[..cut.min(24)]
         );
     }
 }
 
 /// Every prefix length 0..=64 of `stream` returns a verdict without
-/// panicking, and so does each with its last byte replaced by every value.
+/// panicking, and so does each with its last byte replaced by every value,
+/// both as a window and as the whole stream.
 pub(crate) fn assert_never_panics(confirm: ConfirmFn, stream: &[u8]) {
-    for cut in 0..=stream.len().min(64) {
-        let _ = confirm(&stream[..cut]);
-        if cut > 0 {
-            let mut bent = stream[..cut].to_vec();
-            for b in 0..=255u8 {
-                bent[cut - 1] = b;
-                let _ = confirm(&bent);
-            }
-        }
-    }
+    assert_never_panics_upto(confirm, stream, 64);
 }
 
 /// [`assert_never_panics`] for a header longer than 64 bytes: every prefix
 /// length 0..=`upto`, each also with its last byte bent through every value.
 pub(crate) fn assert_never_panics_upto(confirm: ConfirmFn, stream: &[u8], upto: usize) {
     for cut in 0..=stream.len().min(upto) {
-        let _ = confirm(&stream[..cut]);
-        if cut > 0 {
-            let mut bent = stream[..cut].to_vec();
-            for b in 0..=255u8 {
-                bent[cut - 1] = b;
-                let _ = confirm(&bent);
+        for whole in [false, true] {
+            let _ = confirm(&stream[..cut], whole);
+            if cut > 0 {
+                let mut bent = stream[..cut].to_vec();
+                for b in 0..=255u8 {
+                    bent[cut - 1] = b;
+                    let _ = confirm(&bent, whole);
+                }
             }
         }
     }

@@ -106,7 +106,12 @@ pub fn meta() -> FormatMeta {
 /// RFC 1952's header behind the magic: compression method 8 (deflate, the
 /// only one defined) and none of the three reserved flag bits (`0xE0`),
 /// which every decoder must refuse.
-fn confirm(prefix: &[u8]) -> bool {
+///
+/// A whole stream must hold the ten-byte fixed header at least.
+fn confirm(prefix: &[u8], whole: bool) -> bool {
+    if whole && prefix.len() < 10 {
+        return false;
+    }
     prefix.get(2).is_none_or(|&cm| cm == 8) && prefix.get(3).is_none_or(|&flg| flg & 0xe0 == 0)
 }
 
@@ -437,8 +442,25 @@ mod confirm_tests {
     use crate::confirm_test::{assert_every_cut_confirms, assert_never_panics, encode, inputs};
     use stuffr_core::ConfirmFn;
 
-    fn confirm() -> ConfirmFn {
+    fn confirm_fn() -> ConfirmFn {
         meta().confirm.expect("gzip registers a confirm function")
+    }
+
+    /// The registered function judging a window (`whole` false): what
+    /// every test below that cuts a stream short means.
+    fn confirm() -> impl Fn(&[u8]) -> bool {
+        |p| confirm_fn()(p, false)
+    }
+
+    /// A whole stream that stops inside the header the check reads is
+    /// refused; the same bytes as a window onto a longer stream are not.
+    #[test]
+    fn confirm_refuses_a_whole_stream_cut_inside_its_header() {
+        use crate::confirm_test::assert_whole_cuts_refused as refused;
+        let s = encode(&Gzip, b"hello", None);
+        refused("gzip", confirm_fn(), &s[..10], 0);
+        assert!(!confirm_fn()(&[0x1f, 0x8b], true), "the magic alone");
+        assert!(confirm_fn()(&[0x1f, 0x8b], false), "a window may end there");
     }
 
     #[test]
@@ -447,7 +469,7 @@ mod confirm_tests {
             for level in [Some(0), None, Some(9)] {
                 let stream = encode(&Gzip, &plain, level);
                 let what = format!("gzip level {level:?}, {} bytes in", plain.len());
-                assert_every_cut_confirms(&what, confirm(), &stream, 2);
+                assert_every_cut_confirms(&what, confirm_fn(), &stream, 2);
             }
         }
         // A header carrying every optional field (FTEXT, FHCRC, FEXTRA,
@@ -475,6 +497,6 @@ mod confirm_tests {
 
     #[test]
     fn confirm_never_panics_on_short_input() {
-        assert_never_panics(confirm(), &encode(&Gzip, b"hello", None));
+        assert_never_panics(confirm_fn(), &encode(&Gzip, b"hello", None));
     }
 }

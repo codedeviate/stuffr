@@ -258,9 +258,21 @@ pub fn meta() -> FormatMeta {
 /// case), and the name size (the twelfth) is at least one, since every
 /// entry, the trailer included, has a NUL-terminated name. A cut-short
 /// header is checked as far as it goes.
-fn confirm(prefix: &[u8]) -> bool {
+///
+/// A whole stream must hold the 110-byte header and the name it sizes (an
+/// archive always has at least the `TRAILER!!!` entry).
+fn confirm(prefix: &[u8], whole: bool) -> bool {
     let fields = prefix.get(6..).unwrap_or_default();
     let fields = &fields[..fields.len().min(13 * 8)];
+    if whole {
+        let namesize = fields
+            .get(88..96)
+            .and_then(|f| std::str::from_utf8(f).ok())
+            .and_then(|f| usize::from_str_radix(f, 16).ok());
+        if namesize.is_none_or(|n| prefix.len() < 110 + n) {
+            return false;
+        }
+    }
     fields.iter().all(u8::is_ascii_hexdigit)
         && fields
             .get(88..96)
@@ -2854,8 +2866,27 @@ mod confirm_tests {
     };
     use stuffr_core::{ConfirmFn, CreateOpts};
 
-    fn confirm() -> ConfirmFn {
+    fn confirm_fn() -> ConfirmFn {
         meta().confirm.expect("cpio registers a confirm function")
+    }
+
+    /// The registered function judging a window (`whole` false): what
+    /// every test below that cuts a stream short means.
+    fn confirm() -> impl Fn(&[u8]) -> bool {
+        |p| confirm_fn()(p, false)
+    }
+
+    /// A whole stream that stops inside the header the check reads is
+    /// refused; the same bytes as a window onto a longer stream are not.
+    #[test]
+    fn confirm_refuses_a_whole_stream_cut_inside_its_header() {
+        use crate::confirm_test::assert_whole_cuts_refused as refused;
+        let s = one_entry();
+        let namesize =
+            usize::from_str_radix(std::str::from_utf8(&s[94..102]).unwrap(), 16).unwrap();
+        refused("cpio", confirm_fn(), &s[..110 + namesize], 0);
+        assert!(!confirm_fn()(b"070701", true));
+        assert!(confirm_fn()(b"070701", false));
     }
 
     fn one_entry() -> Vec<u8> {
@@ -2906,6 +2937,6 @@ mod confirm_tests {
 
     #[test]
     fn confirm_never_panics_on_short_input() {
-        assert_never_panics_upto(confirm(), &one_entry(), 110);
+        assert_never_panics_upto(confirm_fn(), &one_entry(), 110);
     }
 }

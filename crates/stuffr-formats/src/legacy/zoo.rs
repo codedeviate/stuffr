@@ -362,7 +362,17 @@ pub fn meta() -> FormatMeta {
 /// those (`"ZOO 2.10 Archive.\x1a\0\0"`, whatever version wrote it), and
 /// `zoo_start` at 24, where the first directory entry sits, is at least
 /// `FIXED_OFFSET` (34, the smallest archive header) and below 2^24.
-fn confirm(prefix: &[u8]) -> bool {
+///
+/// A whole stream must hold the start field and reach the offset it names.
+fn confirm(prefix: &[u8], whole: bool) -> bool {
+    if whole
+        && prefix
+            .get(24..28)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .is_none_or(|start| usize::try_from(start).is_ok_and(|s| s >= prefix.len()))
+    {
+        return false;
+    }
     let text = &prefix[..prefix.len().min(20)];
     let end = text
         .iter()
@@ -2688,18 +2698,34 @@ mod confirm_tests {
         ),
     ];
 
-    fn confirm() -> ConfirmFn {
+    fn confirm_fn() -> ConfirmFn {
         meta().confirm.expect("zoo registers a confirm function")
+    }
+
+    /// The registered function judging a window (`whole` false): what
+    /// every test below that cuts a stream short means.
+    fn confirm() -> impl Fn(&[u8]) -> bool {
+        |p| confirm_fn()(p, false)
+    }
+
+    /// A whole stream that stops inside the header the check reads is
+    /// refused; the same bytes as a window onto a longer stream are not.
+    #[test]
+    fn confirm_refuses_a_whole_stream_cut_inside_its_header() {
+        use crate::confirm_test::assert_whole_cuts_refused as refused;
+        let s = FIXTURES[0].1;
+        refused("zoo", confirm_fn(), &s[..28], 0);
+        assert!(confirm_fn()(&s[..28], false));
     }
 
     /// Read-only: the borrowed corpus, and the module's own test builder.
     #[test]
     fn confirm_accepts_own_output() {
         for (label, bytes) in FIXTURES {
-            assert_every_cut_confirms(label, confirm(), bytes, 24);
+            assert_every_cut_confirms(label, confirm_fn(), bytes, 24);
         }
         let built = build_zoo(&[Spec::stored("a.txt", b"alpha")]);
-        assert_every_cut_confirms("build_zoo", confirm(), &built, 24);
+        assert_every_cut_confirms("build_zoo", confirm_fn(), &built, 24);
         // Text written by another version, and filling all twenty bytes.
         let mut other = built.clone();
         other[..20].copy_from_slice(b"ZOO 1.50 Archive.\x1a\0\0");
@@ -2733,6 +2759,6 @@ mod confirm_tests {
 
     #[test]
     fn confirm_never_panics_on_short_input() {
-        assert_never_panics_upto(confirm(), FIXTURES[0].1, SIZ_ZOOH);
+        assert_never_panics_upto(confirm_fn(), FIXTURES[0].1, SIZ_ZOOH);
     }
 }

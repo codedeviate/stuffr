@@ -292,13 +292,26 @@ pub fn meta() -> FormatMeta {
 /// prefix), and a stored entry (method 2) is not larger than its original.
 /// Method 1 has no original-size field. `1A 00` (an empty archive) has no
 /// header to check. A cut-short header is checked as far as it goes.
-fn confirm(prefix: &[u8]) -> bool {
+///
+/// A whole stream must hold the entry's header entire (25 bytes for method
+/// 1, 29 for the rest) and the compressed bytes it claims.
+fn confirm(prefix: &[u8], whole: bool) -> bool {
     const LIMIT: u32 = 1 << 31;
     let Some(&method) = prefix.get(1) else {
-        return true;
+        return !whole;
     };
     if method == 0 {
         return true;
+    }
+    if whole {
+        let header = if method == 1 { 25 } else { 29 };
+        let fits = prefix.get(15..19).is_some_and(|c| {
+            let c = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            usize::try_from(c).is_ok_and(|c| c.saturating_add(header) <= prefix.len())
+        });
+        if prefix.len() < header || !fits {
+            return false;
+        }
     }
     let field = &prefix[2.min(prefix.len())..(2 + NAME_LEN).min(prefix.len())];
     let name = match field.iter().position(|&b| b == 0) {
@@ -2099,8 +2112,28 @@ mod confirm_tests {
         ),
     ];
 
-    fn confirm() -> ConfirmFn {
+    fn confirm_fn() -> ConfirmFn {
         meta().confirm.expect("arc registers a confirm function")
+    }
+
+    /// The registered function judging a window (`whole` false): what
+    /// every test below that cuts a stream short means.
+    fn confirm() -> impl Fn(&[u8]) -> bool {
+        |p| confirm_fn()(p, false)
+    }
+
+    /// A whole stream that stops inside the header the check reads is
+    /// refused; the same bytes as a window onto a longer stream are not.
+    #[test]
+    fn confirm_refuses_a_whole_stream_cut_inside_its_header() {
+        use crate::confirm_test::assert_whole_cuts_refused as refused;
+        let s = FIXTURES[1].1;
+        let csize = u32::from_le_bytes([s[15], s[16], s[17], s[18]]) as usize;
+        let header = if s[1] == 1 { 25 } else { 29 };
+        refused("arc", confirm_fn(), &s[..header + csize], 0);
+        assert!(!confirm_fn()(&[0x1a, 0x08, 0x58, 0x60], true));
+        assert!(confirm_fn()(&[0x1a, 0x08, 0x58, 0x60], false));
+        assert!(confirm_fn()(&[MARKER, 0], true), "the end marker alone");
     }
 
     /// A 29-byte entry header: marker, `method`, `name` NUL-padded to 13,
@@ -2122,7 +2155,7 @@ mod confirm_tests {
     #[test]
     fn confirm_accepts_own_output() {
         for (label, bytes) in FIXTURES {
-            assert_every_cut_confirms(label, confirm(), bytes, 2);
+            assert_every_cut_confirms(label, confirm_fn(), bytes, 2);
         }
         for method in 1..=11u8 {
             let h = header(
@@ -2181,7 +2214,7 @@ mod confirm_tests {
 
     #[test]
     fn confirm_never_panics_on_short_input() {
-        assert_never_panics(confirm(), FIXTURES[0].1);
-        assert_never_panics(confirm(), &header(1, b"A", 1, 1));
+        assert_never_panics(confirm_fn(), FIXTURES[0].1);
+        assert_never_panics(confirm_fn(), &header(1, b"A", 1, 1));
     }
 }

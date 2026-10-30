@@ -95,7 +95,12 @@ const END_MAGIC: [u8; 6] = [0x17, 0x72, 0x45, 0x38, 0x50, 0x90];
 
 /// `BZh`, a block-size digit `1`..=`9`, then the block magic or the
 /// end-of-stream magic — as much of either as `prefix` holds.
-fn confirm(prefix: &[u8]) -> bool {
+///
+/// A whole stream must reach the end of that first block or end magic.
+fn confirm(prefix: &[u8], whole: bool) -> bool {
+    if whole && prefix.len() < 10 {
+        return false;
+    }
     if !prefix.get(3).is_none_or(|d| (b'1'..=b'9').contains(d)) {
         return false;
     }
@@ -781,8 +786,24 @@ mod confirm_tests {
     use crate::confirm_test::{assert_every_cut_confirms, assert_never_panics, encode, inputs};
     use stuffr_core::ConfirmFn;
 
-    fn confirm() -> ConfirmFn {
+    fn confirm_fn() -> ConfirmFn {
         meta().confirm.expect("bzip2 registers a confirm function")
+    }
+
+    /// The registered function judging a window (`whole` false): what
+    /// every test below that cuts a stream short means.
+    fn confirm() -> impl Fn(&[u8]) -> bool {
+        |p| confirm_fn()(p, false)
+    }
+
+    /// A whole stream that stops inside the header the check reads is
+    /// refused; the same bytes as a window onto a longer stream are not.
+    #[test]
+    fn confirm_refuses_a_whole_stream_cut_inside_its_header() {
+        use crate::confirm_test::assert_whole_cuts_refused as refused;
+        let s = encode(&Bzip2, b"hello", None);
+        refused("bzip2", confirm_fn(), &s[..10], 0);
+        assert!(confirm_fn()(&s[..4], false));
     }
 
     #[test]
@@ -791,7 +812,7 @@ mod confirm_tests {
             for level in [Some(1), None, Some(9)] {
                 let stream = encode(&Bzip2, &plain, level);
                 let what = format!("bzip2 level {level:?}, {} bytes in", plain.len());
-                assert_every_cut_confirms(&what, confirm(), &stream, 3);
+                assert_every_cut_confirms(&what, confirm_fn(), &stream, 3);
             }
         }
     }
@@ -815,6 +836,6 @@ mod confirm_tests {
 
     #[test]
     fn confirm_never_panics_on_short_input() {
-        assert_never_panics(confirm(), &encode(&Bzip2, b"hello", None));
+        assert_never_panics(confirm_fn(), &encode(&Bzip2, b"hello", None));
     }
 }

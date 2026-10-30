@@ -466,7 +466,12 @@ pub fn meta() -> FormatMeta {
 /// Version 1 (the only one), and a coded dictionary size inside lzip's
 /// 4 KiB..=512 MiB: bits 4-0 are the base-2 logarithm of a base size, bits
 /// 7-5 how many sixteenths of it to subtract.
-fn confirm(prefix: &[u8]) -> bool {
+///
+/// A whole stream must hold the six-byte header.
+fn confirm(prefix: &[u8], whole: bool) -> bool {
+    if whole && prefix.len() < 6 {
+        return false;
+    }
     if prefix.get(4).is_some_and(|&v| v != 1) {
         return false;
     }
@@ -2715,8 +2720,24 @@ mod confirm_tests {
     use crate::confirm_test::{assert_every_cut_confirms, assert_never_panics, encode, inputs};
     use stuffr_core::ConfirmFn;
 
-    fn confirm() -> ConfirmFn {
+    fn confirm_fn() -> ConfirmFn {
         meta().confirm.expect("lzip registers a confirm function")
+    }
+
+    /// The registered function judging a window (`whole` false): what
+    /// every test below that cuts a stream short means.
+    fn confirm() -> impl Fn(&[u8]) -> bool {
+        |p| confirm_fn()(p, false)
+    }
+
+    /// A whole stream that stops inside the header the check reads is
+    /// refused; the same bytes as a window onto a longer stream are not.
+    #[test]
+    fn confirm_refuses_a_whole_stream_cut_inside_its_header() {
+        use crate::confirm_test::assert_whole_cuts_refused as refused;
+        let s = encode(&Lzip, b"hello", None);
+        refused("lzip", confirm_fn(), &s[..6], 0);
+        assert!(confirm_fn()(&s[..5], false));
     }
 
     #[test]
@@ -2725,7 +2746,7 @@ mod confirm_tests {
             for level in [Some(0), None, Some(9)] {
                 let stream = encode(&Lzip, &plain, level);
                 let what = format!("lzip level {level:?}, {} bytes in", plain.len());
-                assert_every_cut_confirms(&what, confirm(), &stream, 4);
+                assert_every_cut_confirms(&what, confirm_fn(), &stream, 4);
             }
         }
         // Every coded dictionary size in 4 KiB..=512 MiB.
@@ -2753,6 +2774,6 @@ mod confirm_tests {
 
     #[test]
     fn confirm_never_panics_on_short_input() {
-        assert_never_panics(confirm(), &encode(&Lzip, b"hello", None));
+        assert_never_panics(confirm_fn(), &encode(&Lzip, b"hello", None));
     }
 }

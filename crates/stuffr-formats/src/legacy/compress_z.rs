@@ -215,7 +215,12 @@ pub fn meta() -> FormatMeta {
 /// The flags byte behind the magic: a maximum code width of 9..=16 bits in
 /// its low five bits, and bits `0x60` clear (unused by every `compress`;
 /// ncompress refuses them).
-fn confirm(prefix: &[u8]) -> bool {
+///
+/// A whole stream must hold the flags byte.
+fn confirm(prefix: &[u8], whole: bool) -> bool {
+    if whole && prefix.len() < 3 {
+        return false;
+    }
     prefix.get(2).is_none_or(|&flags| {
         let bits = u32::from(flags & MAXBITS_MASK);
         (INIT_BITS..=MAX_MAXBITS).contains(&bits) && flags & 0x60 == 0
@@ -1781,10 +1786,26 @@ mod confirm_tests {
     use crate::confirm_test::{assert_every_cut_confirms, assert_never_panics, encode, inputs};
     use stuffr_core::ConfirmFn;
 
-    fn confirm() -> ConfirmFn {
+    fn confirm_fn() -> ConfirmFn {
         meta()
             .confirm
             .expect("compress registers a confirm function")
+    }
+
+    /// The registered function judging a window (`whole` false): what
+    /// every test below that cuts a stream short means.
+    fn confirm() -> impl Fn(&[u8]) -> bool {
+        |p| confirm_fn()(p, false)
+    }
+
+    /// A whole stream that stops inside the header the check reads is
+    /// refused; the same bytes as a window onto a longer stream are not.
+    #[test]
+    fn confirm_refuses_a_whole_stream_cut_inside_its_header() {
+        use crate::confirm_test::assert_whole_cuts_refused as refused;
+        let s = encode(&CompressZ, b"hello", None);
+        refused("compress", confirm_fn(), &s[..3], 0);
+        assert!(confirm_fn()(&s[..2], false));
     }
 
     #[test]
@@ -1793,11 +1814,11 @@ mod confirm_tests {
             for level in [Some(9), Some(12), None, Some(16)] {
                 let stream = encode(&CompressZ, &plain, level);
                 let what = format!("compress level {level:?}, {} bytes in", plain.len());
-                assert_every_cut_confirms(&what, confirm(), &stream, 2);
+                assert_every_cut_confirms(&what, confirm_fn(), &stream, 2);
             }
         }
         let fixture = include_bytes!("../../fixtures/legacy/hello.Z");
-        assert_every_cut_confirms("hello.Z", confirm(), fixture, 2);
+        assert_every_cut_confirms("hello.Z", confirm_fn(), fixture, 2);
         // Block mode off is a real (old) variant.
         assert!(confirm()(&[0x1f, 0x9d, 0x10]));
     }
@@ -1817,6 +1838,6 @@ mod confirm_tests {
 
     #[test]
     fn confirm_never_panics_on_short_input() {
-        assert_never_panics(confirm(), &encode(&CompressZ, b"hello", None));
+        assert_never_panics(confirm_fn(), &encode(&CompressZ, b"hello", None));
     }
 }

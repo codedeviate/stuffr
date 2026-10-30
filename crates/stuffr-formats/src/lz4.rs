@@ -363,7 +363,9 @@ pub fn meta() -> FormatMeta {
 /// far as `prefix` reaches. A prefix holding only skippable frames confirms
 /// nothing. The full header goes through `lz4_opts::parse_frame_header`,
 /// the same validation `LZ4F_decodeHeader` applies.
-fn confirm(prefix: &[u8]) -> bool {
+///
+/// A whole stream must hold the frame's complete header.
+fn confirm(prefix: &[u8], whole: bool) -> bool {
     let Some(at) = crate::skippable::next_frame(prefix) else {
         return false;
     };
@@ -383,7 +385,11 @@ fn confirm(prefix: &[u8]) -> bool {
     {
         return false;
     }
-    crate::lz4_opts::parse_frame_header(frame).is_ok()
+    match crate::lz4_opts::parse_frame_header(frame) {
+        Ok(Some(_)) => true,
+        Ok(None) => !whole,
+        Err(_) => false,
+    }
 }
 
 #[derive(Debug)]
@@ -1386,8 +1392,27 @@ mod confirm_tests {
     use crate::confirm_test::{assert_every_cut_confirms, assert_never_panics, encode, inputs};
     use stuffr_core::ConfirmFn;
 
-    fn confirm() -> ConfirmFn {
+    fn confirm_fn() -> ConfirmFn {
         meta().confirm.expect("lz4 registers a confirm function")
+    }
+
+    /// The registered function judging a window (`whole` false): what
+    /// every test below that cuts a stream short means.
+    fn confirm() -> impl Fn(&[u8]) -> bool {
+        |p| confirm_fn()(p, false)
+    }
+
+    /// A whole stream that stops inside the header the check reads is
+    /// refused; the same bytes as a window onto a longer stream are not.
+    #[test]
+    fn confirm_refuses_a_whole_stream_cut_inside_its_header() {
+        use crate::confirm_test::assert_whole_cuts_refused as refused;
+        let header = crate::lz4_opts::parse_frame_header(HELLO)
+            .unwrap()
+            .unwrap()
+            .header_len;
+        refused("lz4", confirm_fn(), &HELLO[..header], 0);
+        assert!(confirm_fn()(&HELLO[..header - 1], false));
     }
 
     /// lz4 1.10.0 writing `hello`: FLG 0x64, BD 0x40 (4 MiB), HC 0xa7.
@@ -1408,14 +1433,14 @@ mod confirm_tests {
         for plain in inputs() {
             let stream = encode(&Lz4, &plain, None);
             let what = format!("lz4, {} bytes in", plain.len());
-            assert_every_cut_confirms(&what, confirm(), &stream, 4);
+            assert_every_cut_confirms(&what, confirm_fn(), &stream, 4);
         }
-        assert_every_cut_confirms("lz4 hello", confirm(), HELLO, 4);
+        assert_every_cut_confirms("lz4 hello", confirm_fn(), HELLO, 4);
         let mut stream = skippable(0, 16);
         stream.extend(skippable(9, 0));
         let real = stream.len();
         stream.extend_from_slice(HELLO);
-        assert_every_cut_confirms("skippable + lz4", confirm(), &stream, real + 1);
+        assert_every_cut_confirms("skippable + lz4", confirm_fn(), &stream, real + 1);
     }
 
     #[test]
@@ -1454,9 +1479,9 @@ mod confirm_tests {
 
     #[test]
     fn confirm_never_panics_on_short_input() {
-        assert_never_panics(confirm(), HELLO);
+        assert_never_panics(confirm_fn(), HELLO);
         let mut stream = skippable(1, 4);
         stream.extend_from_slice(HELLO);
-        assert_never_panics(confirm(), &stream);
+        assert_never_panics(confirm_fn(), &stream);
     }
 }

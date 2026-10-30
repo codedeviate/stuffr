@@ -219,7 +219,7 @@ pub fn meta() -> FormatMeta {
 /// a zip64 one `0xFFFFFFFF`. An end-of-central-directory record
 /// (`PK\x05\x06`) at offset 0 is an empty zip, so it must be whole and
 /// list no entries and no directory bytes.
-fn confirm(prefix: &[u8]) -> bool {
+fn confirm(prefix: &[u8], whole: bool) -> bool {
     let u16_at = |i: usize| {
         prefix
             .get(i..i + 2)
@@ -231,6 +231,10 @@ fn confirm(prefix: &[u8]) -> bool {
             && u16_at(8) == Some(0)
             && u16_at(10) == Some(0)
             && prefix[12..16] == [0; 4];
+    }
+    if whole && u16_at(26).is_none_or(|n| prefix.len() < 30 + usize::from(n)) {
+        // A whole stream must hold the local header and the name it gives.
+        return false;
     }
     prefix.get(4).is_none_or(|&version| version <= 63)
         && u16_at(8).is_none_or(defined_method)
@@ -5544,8 +5548,26 @@ mod confirm_tests {
     };
     use stuffr_core::ConfirmFn;
 
-    fn confirm() -> ConfirmFn {
+    fn confirm_fn() -> ConfirmFn {
         meta().confirm.expect("zip registers a confirm function")
+    }
+
+    /// The registered function judging a window (`whole` false): what
+    /// every test below that cuts a stream short means.
+    fn confirm() -> impl Fn(&[u8]) -> bool {
+        |p| confirm_fn()(p, false)
+    }
+
+    /// A whole stream that stops inside the header the check reads is
+    /// refused; the same bytes as a window onto a longer stream are not.
+    #[test]
+    fn confirm_refuses_a_whole_stream_cut_inside_its_header() {
+        use crate::confirm_test::assert_whole_cuts_refused as refused;
+        let s = one_entry();
+        let name = usize::from(u16::from_le_bytes([s[26], s[27]]));
+        refused("zip", confirm_fn(), &s[..30 + name], 0);
+        assert!(!confirm_fn()(b"PK\x03\x04\x14", true));
+        assert!(confirm_fn()(b"PK\x03\x04\x14", false));
     }
 
     fn one_entry() -> Vec<u8> {
@@ -5565,7 +5587,7 @@ mod confirm_tests {
     /// checked on their own.
     #[test]
     fn confirm_accepts_own_output() {
-        assert_every_cut_confirms("one entry", confirm(), &one_entry(), 4);
+        assert_every_cut_confirms("one entry", confirm_fn(), &one_entry(), 4);
         let mut checked = 0;
         for codec in ["store", "deflate", "bzip2", "xz", "zstd"] {
             let opts = CreateOpts {
@@ -5639,8 +5661,8 @@ mod confirm_tests {
 
     #[test]
     fn confirm_never_panics_on_short_input() {
-        assert_never_panics(confirm(), &one_entry());
+        assert_never_panics(confirm_fn(), &one_entry());
         let empty = write_archive(&Zip, &CreateOpts::default(), &[]).unwrap();
-        assert_never_panics(confirm(), &empty);
+        assert_never_panics(confirm_fn(), &empty);
     }
 }

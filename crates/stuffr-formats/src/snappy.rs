@@ -64,10 +64,13 @@ pub fn meta() -> FormatMeta {
 /// (`0x00`), uncompressed (`0x01`), a reserved skippable type
 /// (`0x80`..=`0xfd`), padding (`0xfe`) or another stream identifier
 /// (`0xff`). `0x02`..=`0x7f` are reserved unskippable: a decoder must stop.
-fn confirm(prefix: &[u8]) -> bool {
+///
+/// A whole stream must hold the identifier entire (alone, it is a valid
+/// empty stream).
+fn confirm(prefix: &[u8], whole: bool) -> bool {
     let id = SNAPPY_MAGIC[0].bytes;
     let seen = prefix.len().min(id.len());
-    if prefix[..seen] != id[..seen] {
+    if prefix[..seen] != id[..seen] || (whole && seen < id.len()) {
         return false;
     }
     prefix
@@ -567,16 +570,40 @@ mod confirm_tests {
     use crate::confirm_test::{assert_every_cut_confirms, assert_never_panics, encode, inputs};
     use stuffr_core::ConfirmFn;
 
-    fn confirm() -> ConfirmFn {
+    fn confirm_fn() -> ConfirmFn {
         meta().confirm.expect("snappy registers a confirm function")
+    }
+
+    /// The registered function judging a window (`whole` false): what
+    /// every test below that cuts a stream short means.
+    fn confirm() -> impl Fn(&[u8]) -> bool {
+        |p| confirm_fn()(p, false)
+    }
+
+    /// A whole stream that stops inside the header the check reads is
+    /// refused; the same bytes as a window onto a longer stream are not.
+    #[test]
+    fn confirm_refuses_a_whole_stream_cut_inside_its_header() {
+        use crate::confirm_test::assert_whole_cuts_refused as refused;
+        let s = encode(&Snappy, b"hello", None);
+        refused("snappy", confirm_fn(), &s[..10], 0);
+        assert!(
+            confirm_fn()(&s[..10], true),
+            "the identifier alone is an empty stream"
+        );
     }
 
     #[test]
     fn confirm_accepts_own_output() {
         for plain in inputs() {
             let stream = encode(&Snappy, &plain, None);
+            if stream.is_empty() {
+                // `snap` writes nothing at all for nothing: no magic, so
+                // nothing for a confirm function to see.
+                continue;
+            }
             let what = format!("snappy, {} bytes in", plain.len());
-            assert_every_cut_confirms(&what, confirm(), &stream, 10);
+            assert_every_cut_confirms(&what, confirm_fn(), &stream, 10);
         }
         // Padding, a skippable chunk and a repeated stream identifier may
         // follow the first one.
@@ -601,6 +628,6 @@ mod confirm_tests {
 
     #[test]
     fn confirm_never_panics_on_short_input() {
-        assert_never_panics(confirm(), &encode(&Snappy, b"hello", None));
+        assert_never_panics(confirm_fn(), &encode(&Snappy, b"hello", None));
     }
 }

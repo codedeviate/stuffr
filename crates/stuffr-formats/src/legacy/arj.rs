@@ -269,9 +269,11 @@ pub fn meta() -> FormatMeta {
 /// after the basic header matches it. A header cut short by the prefix is
 /// not checked; at most 2608 bytes, it always fits the probe window of a
 /// file long enough to hold it.
-fn confirm(prefix: &[u8]) -> bool {
+///
+/// A whole stream must hold the header and its CRC entire.
+fn confirm(prefix: &[u8], whole: bool) -> bool {
     let Some(size) = prefix.get(2..4) else {
-        return true;
+        return !whole;
     };
     let size = usize::from(u16::from_le_bytes([size[0], size[1]]));
     if size == 0 || size > MAX_ARJ_HEADER_SIZE {
@@ -281,7 +283,7 @@ fn confirm(prefix: &[u8]) -> bool {
         (Some(header), Some(crc)) => {
             crc32_ieee(header) == u32::from_le_bytes([crc[0], crc[1], crc[2], crc[3]])
         }
-        _ => true,
+        _ => !whole,
     }
 }
 
@@ -3745,8 +3747,26 @@ mod confirm_tests {
 
     const SAMPLE_ARJ: &[u8] = include_bytes!("../../fixtures/legacy/sample.arj");
 
-    fn confirm() -> ConfirmFn {
+    fn confirm_fn() -> ConfirmFn {
         meta().confirm.expect("arj registers a confirm function")
+    }
+
+    /// The registered function judging a window (`whole` false): what
+    /// every test below that cuts a stream short means.
+    fn confirm() -> impl Fn(&[u8]) -> bool {
+        |p| confirm_fn()(p, false)
+    }
+
+    /// A whole stream that stops inside the header the check reads is
+    /// refused; the same bytes as a window onto a longer stream are not.
+    #[test]
+    fn confirm_refuses_a_whole_stream_cut_inside_its_header() {
+        use crate::confirm_test::assert_whole_cuts_refused as refused;
+        let s = one_entry();
+        let size = usize::from(u16::from_le_bytes([s[2], s[3]]));
+        refused("arj", confirm_fn(), &s[..8 + size], 0);
+        assert!(!confirm_fn()(&[0x60, 0xea, 0x00], true));
+        assert!(confirm_fn()(&[0x60, 0xea, 0x00], false));
     }
 
     fn one_entry() -> Vec<u8> {
@@ -3762,7 +3782,7 @@ mod confirm_tests {
     fn confirm_accepts_own_output() {
         let checked = assert_own_archives_confirm("arj", &Arj, &CreateOpts::default(), &meta(), 2);
         assert!(checked >= 6, "only {checked} arj archives were checked");
-        assert_every_cut_confirms("sample.arj", confirm(), SAMPLE_ARJ, 2);
+        assert_every_cut_confirms("sample.arj", confirm_fn(), SAMPLE_ARJ, 2);
     }
 
     #[test]
@@ -3792,6 +3812,6 @@ mod confirm_tests {
 
     #[test]
     fn confirm_never_panics_on_short_input() {
-        assert_never_panics(confirm(), &one_entry());
+        assert_never_panics(confirm_fn(), &one_entry());
     }
 }

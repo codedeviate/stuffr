@@ -51,13 +51,39 @@ pub fn zstd_meta() -> FormatMeta {
 /// Behind any skippable frames inside `prefix`, a zstd frame: its magic,
 /// then a frame header descriptor whose reserved bit (bit 3) is clear. A
 /// prefix holding only skippable frames confirms nothing.
-fn confirm(prefix: &[u8]) -> bool {
+///
+/// A whole stream must hold the frame header its descriptor announces and
+/// the first block's three-byte header after it: every frame has a block.
+fn confirm(prefix: &[u8], whole: bool) -> bool {
     let Some(at) = crate::skippable::next_frame(prefix) else {
         return false;
     };
     let frame = &prefix[at..];
-    crate::skippable::magic_agrees(frame, ZSTD_MAGIC[0].bytes)
-        && frame.get(4).is_none_or(|&fhd| fhd & 0x08 == 0)
+    if !crate::skippable::magic_agrees(frame, ZSTD_MAGIC[0].bytes) {
+        return false;
+    }
+    let Some(&fhd) = frame.get(4) else {
+        return !whole;
+    };
+    if fhd & 0x08 != 0 {
+        return false;
+    }
+    !whole || frame.len() >= frame_header_len(fhd) + 3
+}
+
+/// A zstd frame header's length from its descriptor byte: magic, the
+/// descriptor, the window byte (absent for a single segment), the
+/// dictionary id and the content size (RFC 8878 §3.1.1.1).
+fn frame_header_len(fhd: u8) -> usize {
+    let single = fhd & 0x20 != 0;
+    let dict = [0, 1, 2, 4][usize::from(fhd & 3)];
+    let size = match fhd >> 6 {
+        0 => usize::from(single),
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    };
+    4 + 1 + usize::from(!single) + dict + size
 }
 
 #[cfg(test)]
@@ -66,10 +92,29 @@ mod confirm_tests {
     use crate::confirm_test::{assert_every_cut_confirms, assert_never_panics};
     use stuffr_core::ConfirmFn;
 
-    fn confirm() -> ConfirmFn {
+    fn confirm_fn() -> ConfirmFn {
         zstd_meta()
             .confirm
             .expect("zstd registers a confirm function")
+    }
+
+    /// The registered function judging a window (`whole` false): what
+    /// every test below that cuts a stream short means.
+    fn confirm() -> impl Fn(&[u8]) -> bool {
+        |p| confirm_fn()(p, false)
+    }
+
+    /// A whole stream that stops inside the header the check reads is
+    /// refused; the same bytes as a window onto a longer stream are not.
+    #[test]
+    fn confirm_refuses_a_whole_stream_cut_inside_its_header() {
+        use crate::confirm_test::assert_whole_cuts_refused as refused;
+        let end = frame_header_len(HELLO[4]) + 3;
+        refused("zstd", confirm_fn(), &HELLO[..end], 0);
+        assert!(confirm_fn()(&HELLO[..end], true));
+        assert!(confirm_fn()(&HELLO[..5], false));
+        // Skippable frames that end the whole stream hold no real frame.
+        assert!(!confirm_fn()(&skippable(0, 8), true));
     }
 
     /// A small real frame: zstd 1.5.7 writing `hello` (a window
@@ -92,8 +137,8 @@ mod confirm_tests {
         stream.extend(skippable(0xf, 0));
         let real = stream.len();
         stream.extend_from_slice(HELLO);
-        assert_every_cut_confirms("skippable + zstd", confirm(), &stream, real + 1);
-        assert_every_cut_confirms("zstd", confirm(), HELLO, 4);
+        assert_every_cut_confirms("skippable + zstd", confirm_fn(), &stream, real + 1);
+        assert_every_cut_confirms("zstd", confirm_fn(), HELLO, 4);
         // Every FHD a writer can set: bits 0-1 dictionary ID size, 2
         // checksum, 4 unused, 5 single segment, 6-7 content size size.
         for fhd in (0u8..=255).filter(|b| b & 0x08 == 0) {
@@ -120,9 +165,9 @@ mod confirm_tests {
 
     #[test]
     fn confirm_never_panics_on_short_input() {
-        assert_never_panics(confirm(), HELLO);
+        assert_never_panics(confirm_fn(), HELLO);
         let mut stream = skippable(1, 4);
         stream.extend_from_slice(HELLO);
-        assert_never_panics(confirm(), &stream);
+        assert_never_panics(confirm_fn(), &stream);
     }
 }

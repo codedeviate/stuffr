@@ -195,7 +195,10 @@ pub fn meta() -> FormatMeta {
 /// is the whole header's length, at least its 26 fixed bytes; level 3's is
 /// the word size 4 (`delharc` refuses anything else). A cut-short header is
 /// checked as far as it goes.
-fn confirm(prefix: &[u8]) -> bool {
+///
+/// A whole stream must reach the level byte and, for levels 0 to 2, hold
+/// the header whose length the first bytes give.
+fn confirm(prefix: &[u8], whole: bool) -> bool {
     let method_ok = prefix.get(2..7).is_none_or(|m| {
         matches!(
             m,
@@ -215,18 +218,24 @@ fn confirm(prefix: &[u8]) -> bool {
         )
     });
     let Some(&level) = prefix.get(20) else {
-        return method_ok;
+        return method_ok && !whole;
     };
     method_ok
         && match level {
             0 | 1 => {
                 let len = usize::from(prefix[0]);
                 len >= 22
-                    && prefix.get(2..2 + len).is_none_or(|header| {
-                        header.iter().fold(0u8, |sum, &b| sum.wrapping_add(b)) == prefix[1]
-                    })
+                    && match prefix.get(2..2 + len) {
+                        Some(header) => {
+                            header.iter().fold(0u8, |sum, &b| sum.wrapping_add(b)) == prefix[1]
+                        }
+                        None => !whole,
+                    }
             }
-            2 => u16::from_le_bytes([prefix[0], prefix[1]]) >= 26,
+            2 => {
+                let len = usize::from(u16::from_le_bytes([prefix[0], prefix[1]]));
+                len >= 26 && (!whole || prefix.len() >= len)
+            }
             3 => prefix[..2] == [4, 0],
             _ => false,
         }
@@ -2442,8 +2451,25 @@ mod confirm_tests {
 
     const SAMPLE_LZH: &[u8] = include_bytes!("../../fixtures/legacy/sample.lzh");
 
-    fn confirm() -> ConfirmFn {
+    fn confirm_fn() -> ConfirmFn {
         meta().confirm.expect("lha registers a confirm function")
+    }
+
+    /// The registered function judging a window (`whole` false): what
+    /// every test below that cuts a stream short means.
+    fn confirm() -> impl Fn(&[u8]) -> bool {
+        |p| confirm_fn()(p, false)
+    }
+
+    /// A whole stream that stops inside the header the check reads is
+    /// refused; the same bytes as a window onto a longer stream are not.
+    #[test]
+    fn confirm_refuses_a_whole_stream_cut_inside_its_header() {
+        use crate::confirm_test::assert_whole_cuts_refused as refused;
+        let s = one_entry();
+        assert!(s[20] < 2, "a level 0 or 1 header");
+        refused("lha", confirm_fn(), &s[..2 + usize::from(s[0])], 0);
+        assert!(confirm_fn()(&s[..21], false));
     }
 
     fn one_entry() -> Vec<u8> {
@@ -2474,7 +2500,7 @@ mod confirm_tests {
     fn confirm_accepts_own_output() {
         let checked = assert_own_archives_confirm("lha", &Lha, &CreateOpts::default(), &meta(), 5);
         assert!(checked >= 5, "only {checked} lha archives were checked");
-        assert_every_cut_confirms("sample.lzh", confirm(), SAMPLE_LZH, 5);
+        assert_every_cut_confirms("sample.lzh", confirm_fn(), SAMPLE_LZH, 5);
     }
 
     /// Levels 2 and 3 carry no base-header checksum (a CRC-16 sits in an
@@ -2530,7 +2556,7 @@ mod confirm_tests {
 
     #[test]
     fn confirm_never_panics_on_short_input() {
-        assert_never_panics(confirm(), &one_entry());
-        assert_never_panics(confirm(), &long_header(3, b"-lh5-"));
+        assert_never_panics(confirm_fn(), &one_entry());
+        assert_never_panics(confirm_fn(), &long_header(3, b"-lh5-"));
     }
 }

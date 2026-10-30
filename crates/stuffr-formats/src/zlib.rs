@@ -66,28 +66,30 @@ pub fn meta() -> FormatMeta {
 /// be clear (a preset dictionary no decoder here can supply). The first
 /// block's BTYPE must not be 3 (reserved), and a stored block's LEN must be
 /// the complement of its NLEN. Only the bytes inside `prefix` are judged.
-fn confirm(prefix: &[u8]) -> bool {
+///
+/// A whole stream that stops before the field being read is refused.
+fn confirm(prefix: &[u8], whole: bool) -> bool {
     let Some(&cmf) = prefix.first() else {
-        return true;
+        return !whole;
     };
     if cmf & 0x0f != 8 || cmf >> 4 > 7 {
         return false;
     }
     let Some(&flg) = prefix.get(1) else {
-        return true;
+        return !whole;
     };
     if (u16::from(cmf) << 8 | u16::from(flg)) % 31 != 0 || flg & 0x20 != 0 {
         return false;
     }
     let Some(&block) = prefix.get(2) else {
-        return true;
+        return !whole;
     };
     match (block >> 1) & 3 {
         3 => false,
         // Stored: the rest of this byte is padding, then LEN and NLEN.
         0 => match prefix.get(3..7) {
             Some(n) => u16::from_le_bytes([n[0], n[1]]) == !u16::from_le_bytes([n[2], n[3]]),
-            None => true,
+            None => !whole,
         },
         _ => true,
     }
@@ -228,8 +230,27 @@ mod confirm_tests {
     use crate::confirm_test::{assert_every_cut_confirms, assert_never_panics, encode, inputs};
     use stuffr_core::ConfirmFn;
 
-    fn confirm() -> ConfirmFn {
+    fn confirm_fn() -> ConfirmFn {
         meta().confirm.expect("zlib registers a confirm function")
+    }
+
+    /// The registered function judging a window (`whole` false): what
+    /// every test below that cuts a stream short means.
+    fn confirm() -> impl Fn(&[u8]) -> bool {
+        |p| confirm_fn()(p, false)
+    }
+
+    /// A whole stream that stops inside the header the check reads is
+    /// refused; the same bytes as a window onto a longer stream are not.
+    #[test]
+    fn confirm_refuses_a_whole_stream_cut_inside_its_header() {
+        use crate::confirm_test::assert_whole_cuts_refused as refused;
+        for level in [Some(0), None] {
+            let s = encode(&Zlib, b"hello", level);
+            let header = if level == Some(0) { 7 } else { 3 };
+            refused("zlib", confirm_fn(), &s[..header], 0);
+            assert!(confirm_fn()(&s[..header - 1], false));
+        }
     }
 
     #[test]
@@ -238,7 +259,7 @@ mod confirm_tests {
             for level in [Some(0), Some(1), Some(2), None, Some(9)] {
                 let stream = encode(&Zlib, &plain, level);
                 let what = format!("zlib level {level:?}, {} bytes in", plain.len());
-                assert_every_cut_confirms(&what, confirm(), &stream, 2);
+                assert_every_cut_confirms(&what, confirm_fn(), &stream, 2);
             }
         }
     }
@@ -266,7 +287,7 @@ mod confirm_tests {
 
     #[test]
     fn confirm_never_panics_on_short_input() {
-        assert_never_panics(confirm(), &encode(&Zlib, b"hello", Some(0)));
-        assert_never_panics(confirm(), &encode(&Zlib, b"hello", None));
+        assert_never_panics(confirm_fn(), &encode(&Zlib, b"hello", Some(0)));
+        assert_never_panics(confirm_fn(), &encode(&Zlib, b"hello", None));
     }
 }
