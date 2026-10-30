@@ -32,6 +32,83 @@ pub const LZMA: FormatId = FormatId::new("lzma");
 /// detection is by extension only, and a `.lzma` stream arriving on a pipe
 /// with no filename needs `--format lzma` — the same limitation this
 /// project already documents for brotli and raw deflate.
+///
+/// Its confirm function grades only an extension's claim, since there is no
+/// magic to hit.
 pub fn lzma_meta() -> FormatMeta {
-    FormatMeta::codec(LZMA, &["lzma"], &[])
+    FormatMeta::codec(LZMA, &["lzma"], &[]).with_confirm(confirm)
+}
+
+/// The 13-byte `.lzma` header: a properties byte encoding lc/lp/pb
+/// (`(pb * 5 + lp) * 9 + lc`, so below 225), a little-endian dictionary
+/// size of at least 4 KiB (liblzma's minimum), and a little-endian
+/// uncompressed size that is either unknown (all `FF`) or at most 2^48 —
+/// no writer records more, and liblzma refuses it.
+fn confirm(prefix: &[u8]) -> bool {
+    if prefix.first().is_some_and(|&props| props >= 225) {
+        return false;
+    }
+    if let Some(d) = prefix.get(1..5)
+        && u32::from_le_bytes([d[0], d[1], d[2], d[3]]) < 4096
+    {
+        return false;
+    }
+    match prefix.get(5..13) {
+        Some(s) => {
+            let size = u64::from_le_bytes(s.try_into().unwrap_or([0; 8]));
+            size == u64::MAX || size <= 1 << 48
+        }
+        None => true,
+    }
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+    use crate::confirm_test::{assert_every_cut_confirms, assert_never_panics};
+    use stuffr_core::ConfirmFn;
+
+    fn confirm() -> ConfirmFn {
+        lzma_meta()
+            .confirm
+            .expect("lzma registers a confirm function")
+    }
+
+    /// `props`, a dictionary size and an uncompressed size, as a header.
+    fn header(props: u8, dict: u32, size: u64) -> Vec<u8> {
+        let mut out = vec![props];
+        out.extend_from_slice(&dict.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&[0x00, 0x34, 0x19, 0x49]);
+        out
+    }
+
+    #[test]
+    fn confirm_accepts_every_header_a_writer_emits() {
+        for (props, dict, size) in [
+            (0x5d, 1 << 23, u64::MAX),
+            (0x5d, 4096, 0),
+            (0x00, 1 << 16, 12),
+            (224, u32::MAX, 1 << 48),
+        ] {
+            let what = format!("props {props:#04x} dict {dict} size {size}");
+            assert_every_cut_confirms(&what, confirm(), &header(props, dict, size), 0);
+        }
+    }
+
+    #[test]
+    fn confirm_rejects_magic_plus_noise() {
+        assert!(!confirm()(&header(225, 1 << 23, u64::MAX)));
+        assert!(!confirm()(&header(0xff, 1 << 23, u64::MAX)));
+        assert!(!confirm()(&header(0x5d, 4095, u64::MAX)));
+        assert!(!confirm()(&header(0x5d, 0, u64::MAX)));
+        assert!(!confirm()(&header(0x5d, 1 << 23, (1 << 48) + 1)));
+        assert!(!confirm()(&header(0x5d, 1 << 23, u64::MAX - 1)));
+        assert!(!confirm()(b"ordinary text, not an LZMA header"));
+    }
+
+    #[test]
+    fn confirm_never_panics_on_short_input() {
+        assert_never_panics(confirm(), &header(0x5d, 1 << 23, u64::MAX));
+    }
 }

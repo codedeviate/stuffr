@@ -209,7 +209,17 @@ fn invalid_data(msg: impl Into<String>) -> io::Error {
 
 /// Registration metadata for Unix `compress`.
 pub fn meta() -> FormatMeta {
-    FormatMeta::codec(COMPRESS, &["z"], COMPRESS_MAGIC)
+    FormatMeta::codec(COMPRESS, &["z"], COMPRESS_MAGIC).with_confirm(confirm)
+}
+
+/// The flags byte behind the magic: a maximum code width of 9..=16 bits in
+/// its low five bits, and bits `0x60` clear (unused by every `compress`;
+/// ncompress refuses them).
+fn confirm(prefix: &[u8]) -> bool {
+    prefix.get(2).is_none_or(|&flags| {
+        let bits = u32::from(flags & MAXBITS_MASK);
+        (INIT_BITS..=MAX_MAXBITS).contains(&bits) && flags & 0x60 == 0
+    })
 }
 
 #[derive(Debug)]
@@ -1762,5 +1772,51 @@ mod tests {
                 "maxbits={maxbits}: decoded bytes must match the ORIGINAL plaintext exactly"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+    use crate::confirm_test::{assert_every_cut_confirms, assert_never_panics, encode, inputs};
+    use stuffr_core::ConfirmFn;
+
+    fn confirm() -> ConfirmFn {
+        meta()
+            .confirm
+            .expect("compress registers a confirm function")
+    }
+
+    #[test]
+    fn confirm_accepts_own_output() {
+        for plain in inputs() {
+            for level in [Some(9), Some(12), None, Some(16)] {
+                let stream = encode(&CompressZ, &plain, level);
+                let what = format!("compress level {level:?}, {} bytes in", plain.len());
+                assert_every_cut_confirms(&what, confirm(), &stream, 2);
+            }
+        }
+        let fixture = include_bytes!("../../fixtures/legacy/hello.Z");
+        assert_every_cut_confirms("hello.Z", confirm(), fixture, 2);
+        // Block mode off is a real (old) variant.
+        assert!(confirm()(&[0x1f, 0x9d, 0x10]));
+    }
+
+    #[test]
+    fn confirm_rejects_magic_plus_noise() {
+        for bits in [0u8, 8, 17, 31, 0x80 | 8, 0x80 | 17] {
+            assert!(!confirm()(&[0x1f, 0x9d, bits]), "bits byte {bits:#04x}");
+        }
+        for reserved in [0x20u8, 0x40] {
+            assert!(
+                !confirm()(&[0x1f, 0x9d, 0x90 | reserved]),
+                "{reserved:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn confirm_never_panics_on_short_input() {
+        assert_never_panics(confirm(), &encode(&CompressZ, b"hello", None));
     }
 }

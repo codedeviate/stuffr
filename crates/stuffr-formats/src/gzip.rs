@@ -100,7 +100,14 @@ impl std::io::Read for MultiMemberGzip {
 
 /// Registration metadata for gzip.
 pub fn meta() -> FormatMeta {
-    FormatMeta::codec(GZIP, &["gz"], GZIP_MAGIC)
+    FormatMeta::codec(GZIP, &["gz"], GZIP_MAGIC).with_confirm(confirm)
+}
+
+/// RFC 1952's header behind the magic: compression method 8 (deflate, the
+/// only one defined) and none of the three reserved flag bits (`0xE0`),
+/// which every decoder must refuse.
+fn confirm(prefix: &[u8]) -> bool {
+    prefix.get(2).is_none_or(|&cm| cm == 8) && prefix.get(3).is_none_or(|&flg| flg & 0xe0 == 0)
 }
 
 #[derive(Debug)]
@@ -421,5 +428,53 @@ mod tests {
         // ~80-line, 16 MiB test here; the harness now covers it for every
         // codec that adopts it, gzip included.
         stuffr_core::testing::assert_codec_conforms(&Gzip, &meta());
+    }
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+    use crate::confirm_test::{assert_every_cut_confirms, assert_never_panics, encode, inputs};
+    use stuffr_core::ConfirmFn;
+
+    fn confirm() -> ConfirmFn {
+        meta().confirm.expect("gzip registers a confirm function")
+    }
+
+    #[test]
+    fn confirm_accepts_own_output() {
+        for plain in inputs() {
+            for level in [Some(0), None, Some(9)] {
+                let stream = encode(&Gzip, &plain, level);
+                let what = format!("gzip level {level:?}, {} bytes in", plain.len());
+                assert_every_cut_confirms(&what, confirm(), &stream, 2);
+            }
+        }
+        // A header carrying every optional field (FTEXT, FHCRC, FEXTRA,
+        // FNAME, FCOMMENT): bits 0-4 are the format's, only 5-7 reserved.
+        let mut all_flags = vec![0x1f, 0x8b, 8, 0x1f, 0, 0, 0, 0, 0, 3];
+        all_flags.extend_from_slice(b"\x02\x00ab");
+        assert!(confirm()(&all_flags));
+    }
+
+    #[test]
+    fn confirm_rejects_magic_plus_noise() {
+        let good = encode(&Gzip, b"hello", None);
+        assert!(confirm()(&good));
+        for method in [0u8, 7, 9, 0xff] {
+            let mut bad = good.clone();
+            bad[2] = method;
+            assert!(!confirm()(&bad), "compression method {method}");
+        }
+        for reserved in [0x20u8, 0x40, 0x80] {
+            let mut bad = good.clone();
+            bad[3] |= reserved;
+            assert!(!confirm()(&bad), "reserved flag {reserved:#04x}");
+        }
+    }
+
+    #[test]
+    fn confirm_never_panics_on_short_input() {
+        assert_never_panics(confirm(), &encode(&Gzip, b"hello", None));
     }
 }

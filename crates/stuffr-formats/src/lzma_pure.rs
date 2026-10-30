@@ -1236,3 +1236,21 @@ mod tests {
         assert_eq!(out, plain);
     }
 }
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+    use crate::confirm_test::{assert_every_cut_confirms, encode, inputs};
+
+    #[test]
+    fn confirm_accepts_own_output() {
+        let confirm = meta().confirm.expect("lzma registers a confirm function");
+        for plain in inputs() {
+            for level in [Some(0), None, Some(9)] {
+                let stream = encode(&Lzma, &plain, level);
+                let what = format!("lzma_pure level {level:?}, {} bytes in", plain.len());
+                assert_every_cut_confirms(&what, confirm, &stream, 0);
+            }
+        }
+    }
+}

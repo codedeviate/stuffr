@@ -32,7 +32,39 @@ pub(crate) const XZ_MAGIC: &[MagicRule] = &[MagicRule {
 
 /// Registration metadata for xz, shared by both backends.
 pub fn xz_meta() -> FormatMeta {
-    FormatMeta::codec(XZ, &["xz"], XZ_MAGIC)
+    FormatMeta::codec(XZ, &["xz"], XZ_MAGIC).with_confirm(confirm)
+}
+
+/// The stream header behind the magic: stream flags byte 0 is reserved
+/// (zero), byte 1's high nibble is reserved (zero; the low nibble is the
+/// check type, any of which a decoder must accept), and bytes 8..12 are the
+/// little-endian CRC-32 of those two flag bytes.
+fn confirm(prefix: &[u8]) -> bool {
+    if prefix.get(6).is_some_and(|&b| b != 0) || prefix.get(7).is_some_and(|&b| b & 0xf0 != 0) {
+        return false;
+    }
+    match prefix.get(6..12) {
+        Some(h) => crc32(&h[..2]) == u32::from_le_bytes([h[2], h[3], h[4], h[5]]),
+        None => true,
+    }
+}
+
+/// CRC-32/ISO-HDLC, bitwise: two bytes per call is all it ever hashes, and
+/// the crate's other copies sit behind container features an xz-only build
+/// does not enable.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
 }
 
 /// Finds the `xz` binary on `PATH` without shelling out to `which` (not
@@ -51,4 +83,65 @@ pub(crate) fn which_xz() -> Option<std::path::PathBuf> {
         let candidate = dir.join("xz");
         candidate.is_file().then_some(candidate)
     })
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+    use crate::confirm_test::{assert_every_cut_confirms, assert_never_panics};
+    use stuffr_core::ConfirmFn;
+
+    fn confirm() -> ConfirmFn {
+        xz_meta().confirm.expect("xz registers a confirm function")
+    }
+
+    /// Stream headers as xz writes them, one per check type, with their
+    /// CRC-32s as the reference tool computed them.
+    const HEADERS: [[u8; 12]; 4] = [
+        [
+            0xfd, 0x37, 0x7a, 0x58, 0x5a, 0, 0, 0x00, 0xff, 0x12, 0xd9, 0x41,
+        ],
+        [
+            0xfd, 0x37, 0x7a, 0x58, 0x5a, 0, 0, 0x01, 0x69, 0x22, 0xde, 0x36,
+        ],
+        [
+            0xfd, 0x37, 0x7a, 0x58, 0x5a, 0, 0, 0x04, 0xe6, 0xd6, 0xb4, 0x46,
+        ],
+        [
+            0xfd, 0x37, 0x7a, 0x58, 0x5a, 0, 0, 0x0a, 0xe1, 0xfb, 0x0c, 0xa1,
+        ],
+    ];
+
+    #[test]
+    fn confirm_accepts_every_check_type_header() {
+        for header in HEADERS {
+            assert_every_cut_confirms("xz header", confirm(), &header, 6);
+        }
+    }
+
+    #[test]
+    fn confirm_rejects_magic_plus_noise() {
+        let good = HEADERS[2];
+        let mut bad = good;
+        bad[6] = 1; // stream flags byte 0 is reserved
+        assert!(!confirm()(&bad));
+        let mut bad = good;
+        bad[7] |= 0x10; // byte 1's high nibble is reserved
+        assert!(!confirm()(&bad));
+        let mut bad = good;
+        bad[11] ^= 0x80; // the CRC-32 disagrees
+        assert!(!confirm()(&bad));
+        let mut noise = good.to_vec();
+        noise[6..].copy_from_slice(b"ordina");
+        assert!(!confirm()(&noise));
+    }
+
+    #[test]
+    fn confirm_never_panics_on_short_input() {
+        let mut stream = HEADERS[2].to_vec();
+        stream.extend_from_slice(&[
+            0x02, 0x00, 0x21, 0x01, 0x16, 0, 0, 0, 0x74, 0x2f, 0xe5, 0xa3,
+        ]);
+        assert_never_panics(confirm(), &stream);
+    }
 }

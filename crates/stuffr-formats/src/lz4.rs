@@ -333,15 +333,57 @@ impl<R: std::io::Read> std::io::Read for EnforceEndMark<R> {
 
 pub const LZ4: FormatId = FormatId::new("lz4");
 
-const LZ4_MAGIC: &[MagicRule] = &[MagicRule {
-    offset: 0,
-    bytes: &[0x04, 0x22, 0x4d, 0x18],
-    format: LZ4,
-}];
+/// The frame magic, then the sixteen skippable-frame magics lz4 shares with
+/// zstd (see [`crate::skippable`]).
+const LZ4_MAGIC: &[MagicRule] = &{
+    let frame = [MagicRule {
+        offset: 0,
+        bytes: &[0x04, 0x22, 0x4d, 0x18],
+        format: LZ4,
+    }];
+    let skippable = crate::skippable::skippable_rules!(LZ4);
+    let mut all = [frame[0]; 17];
+    let mut i = 0;
+    while i < 16 {
+        all[i + 1] = skippable[i];
+        i += 1;
+    }
+    all
+};
 
 /// Registration metadata for lz4 (frame format only — see the module docs).
 pub fn meta() -> FormatMeta {
-    FormatMeta::codec(LZ4, &["lz4"], LZ4_MAGIC)
+    FormatMeta::codec(LZ4, &["lz4"], LZ4_MAGIC).with_confirm(confirm)
+}
+
+/// Behind any skippable frames inside `prefix`, an lz4 frame: its magic;
+/// FLG's version bits `01` and reserved bit 1 clear; BD's reserved bits
+/// clear and a block maximum size ID of 4..=7; and the header checksum
+/// byte (the second byte of the xxh32 of the descriptor), each judged as
+/// far as `prefix` reaches. A prefix holding only skippable frames confirms
+/// nothing. The full header goes through `lz4_opts::parse_frame_header`,
+/// the same validation `LZ4F_decodeHeader` applies.
+fn confirm(prefix: &[u8]) -> bool {
+    let Some(at) = crate::skippable::next_frame(prefix) else {
+        return false;
+    };
+    let frame = &prefix[at..];
+    if !crate::skippable::magic_agrees(frame, LZ4_MAGIC[0].bytes) {
+        return false;
+    }
+    if !frame
+        .get(4)
+        .is_none_or(|&flg| flg >> 6 == 1 && flg & 0x02 == 0)
+    {
+        return false;
+    }
+    if !frame
+        .get(5)
+        .is_none_or(|&bd| bd & 0x8f == 0 && (4..=7).contains(&(bd >> 4)))
+    {
+        return false;
+    }
+    crate::lz4_opts::parse_frame_header(frame).is_ok()
 }
 
 #[derive(Debug)]
@@ -1320,5 +1362,86 @@ mod tests {
     #[test]
     fn lz4_conforms() {
         stuffr_core::testing::assert_codec_conforms(&Lz4, &meta());
+    }
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+    use crate::confirm_test::{assert_every_cut_confirms, assert_never_panics, encode, inputs};
+    use stuffr_core::ConfirmFn;
+
+    fn confirm() -> ConfirmFn {
+        meta().confirm.expect("lz4 registers a confirm function")
+    }
+
+    /// lz4 1.10.0 writing `hello`: FLG 0x64, BD 0x40 (4 MiB), HC 0xa7.
+    const HELLO: &[u8] = &[
+        0x04, 0x22, 0x4d, 0x18, 0x64, 0x40, 0xa7, 0x05, 0x00, 0x00, 0x80, 0x68, 0x65, 0x6c, 0x6c,
+        0x6f, 0x00, 0x00, 0x00, 0x00, 0xf9, 0x77, 0x00, 0xfb,
+    ];
+
+    fn skippable(nibble: u8, payload: usize) -> Vec<u8> {
+        let mut out = vec![0x50 | nibble, 0x2a, 0x4d, 0x18];
+        out.extend_from_slice(&(payload as u32).to_le_bytes());
+        out.resize(8 + payload, 0x5a);
+        out
+    }
+
+    #[test]
+    fn confirm_accepts_own_output() {
+        for plain in inputs() {
+            let stream = encode(&Lz4, &plain, None);
+            let what = format!("lz4, {} bytes in", plain.len());
+            assert_every_cut_confirms(&what, confirm(), &stream, 4);
+        }
+        assert_every_cut_confirms("lz4 hello", confirm(), HELLO, 4);
+        let mut stream = skippable(0, 16);
+        stream.extend(skippable(9, 0));
+        let real = stream.len();
+        stream.extend_from_slice(HELLO);
+        assert_every_cut_confirms("skippable + lz4", confirm(), &stream, real + 1);
+    }
+
+    #[test]
+    fn confirm_rejects_magic_plus_noise() {
+        let flg = |f: u8| {
+            let mut b = HELLO.to_vec();
+            b[4] = f;
+            b
+        };
+        assert!(!confirm()(&flg(0x24)), "version bits 00");
+        assert!(!confirm()(&flg(0xa4)), "version bits 10");
+        assert!(!confirm()(&flg(0x66)), "FLG reserved bit 1");
+        let bd = |d: u8| {
+            let mut b = HELLO.to_vec();
+            b[5] = d;
+            b
+        };
+        assert!(!confirm()(&bd(0xc0)), "BD bit 7");
+        assert!(!confirm()(&bd(0x41)), "BD low bits");
+        for id in 0..4u8 {
+            assert!(!confirm()(&bd(id << 4)), "block size ID {id}");
+        }
+        let mut bad = HELLO.to_vec();
+        bad[6] ^= 1;
+        assert!(!confirm()(&bad), "header checksum");
+        // Skippable frames, then a zstd frame or noise; or nothing else.
+        let mut zstd_next = skippable(0, 16);
+        zstd_next.extend_from_slice(&[0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x58]);
+        assert!(!confirm()(&zstd_next));
+        let mut noise = skippable(2, 1);
+        noise.extend_from_slice(b"ordinary text");
+        assert!(!confirm()(&noise));
+        assert!(!confirm()(&skippable(0, 16)));
+        assert!(!confirm()(&skippable(0, 5000)[..4096]));
+    }
+
+    #[test]
+    fn confirm_never_panics_on_short_input() {
+        assert_never_panics(confirm(), HELLO);
+        let mut stream = skippable(1, 4);
+        stream.extend_from_slice(HELLO);
+        assert_never_panics(confirm(), &stream);
     }
 }

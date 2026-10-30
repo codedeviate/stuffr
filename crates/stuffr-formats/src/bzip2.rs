@@ -85,7 +85,23 @@ impl std::io::Read for MultiMemberBzip2 {
 
 /// Registration metadata for bzip2.
 pub fn meta() -> FormatMeta {
-    FormatMeta::codec(BZIP2, &["bz2"], BZIP2_MAGIC)
+    FormatMeta::codec(BZIP2, &["bz2"], BZIP2_MAGIC).with_confirm(confirm)
+}
+
+/// The first block's magic (π) or, for an empty stream, the end-of-stream
+/// magic (√π), both 48 bits.
+const BLOCK_MAGIC: [u8; 6] = [0x31, 0x41, 0x59, 0x26, 0x53, 0x59];
+const END_MAGIC: [u8; 6] = [0x17, 0x72, 0x45, 0x38, 0x50, 0x90];
+
+/// `BZh`, a block-size digit `1`..=`9`, then the block magic or the
+/// end-of-stream magic — as much of either as `prefix` holds.
+fn confirm(prefix: &[u8]) -> bool {
+    if !prefix.get(3).is_none_or(|d| (b'1'..=b'9').contains(d)) {
+        return false;
+    }
+    let next = prefix.get(4..).unwrap_or(&[]);
+    let next = &next[..next.len().min(6)];
+    BLOCK_MAGIC.starts_with(next) || END_MAGIC.starts_with(next)
 }
 
 #[derive(Debug)]
@@ -756,5 +772,49 @@ mod tests {
             assert_eq!(sr.read(&mut src, &mut buf).unwrap().0, 5000);
         }
         assert_eq!(sr.read(&mut src, &mut buf).unwrap(), (0, true));
+    }
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+    use crate::confirm_test::{assert_every_cut_confirms, assert_never_panics, encode, inputs};
+    use stuffr_core::ConfirmFn;
+
+    fn confirm() -> ConfirmFn {
+        meta().confirm.expect("bzip2 registers a confirm function")
+    }
+
+    #[test]
+    fn confirm_accepts_own_output() {
+        for plain in inputs() {
+            for level in [Some(1), None, Some(9)] {
+                let stream = encode(&Bzip2, &plain, level);
+                let what = format!("bzip2 level {level:?}, {} bytes in", plain.len());
+                assert_every_cut_confirms(&what, confirm(), &stream, 3);
+            }
+        }
+    }
+
+    #[test]
+    fn confirm_rejects_magic_plus_noise() {
+        let good = encode(&Bzip2, b"hello", None);
+        assert!(confirm()(&good));
+        for size in [b'0', b'A', 0] {
+            let mut bad = good.clone();
+            bad[3] = size;
+            assert!(!confirm()(&bad), "block size byte {size:#04x}");
+        }
+        // Neither a block magic nor the end-of-stream magic.
+        let mut bad = good.clone();
+        bad[9] ^= 1;
+        assert!(!confirm()(&bad));
+        assert!(!confirm()(b"BZh9\x17\x72\x45\x38\x50\x91"));
+        assert!(!confirm()(b"BZh9ordinary text"));
+    }
+
+    #[test]
+    fn confirm_never_panics_on_short_input() {
+        assert_never_panics(confirm(), &encode(&Bzip2, b"hello", None));
     }
 }

@@ -1544,3 +1544,39 @@ fn a_stored_block_of_length_zero_is_not_the_end_mark() {
         assert!(out.is_empty(), "checksum {content_checksum}");
     }
 }
+
+/// Every frame option the lz4 CLI exposes, on either tier, writes a frame
+/// the registered lz4 codec's confirm function accepts — cut anywhere.
+#[test]
+fn confirm_accepts_every_frame_option() {
+    let confirm = crate::lz4::meta()
+        .confirm
+        .expect("lz4 registers a confirm function");
+    let inputs = [Vec::new(), b"lz4 frame options ".repeat(1500)];
+    for level in [-5, 1, 3, 9, 12] {
+        for id in 4..=7u8 {
+            for flags in 0..16u8 {
+                let o = EncodeOptions {
+                    level,
+                    block_size: BlockSizeId::from_id(id).unwrap(),
+                    block_linked: flags & 1 != 0,
+                    block_checksum: flags & 2 != 0,
+                    content_checksum: flags & 4 != 0,
+                    favor_dec_speed: flags & 8 != 0,
+                    ..EncodeOptions::default()
+                };
+                for plain in &inputs {
+                    for content_size in [None, Some(plain.len() as u64)] {
+                        let o = EncodeOptions {
+                            content_size,
+                            ..o.clone()
+                        };
+                        let what = format!("{o:?}, {} bytes in", plain.len());
+                        let frame = encode(&o, plain);
+                        crate::confirm_test::assert_every_cut_confirms(&what, confirm, &frame, 4);
+                    }
+                }
+            }
+        }
+    }
+}

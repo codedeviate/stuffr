@@ -1614,3 +1614,43 @@ fn the_last_block_is_out_before_its_checksum_is_read() {
     }
     assert_eq!(out, data);
 }
+
+/// Every frame option the zstd CLI exposes, on either tier, writes a frame
+/// the registered zstd codec's confirm function accepts — cut anywhere.
+#[test]
+fn confirm_accepts_every_frame_option() {
+    let confirm = crate::zstd_shared::zstd_meta()
+        .confirm
+        .expect("zstd registers a confirm function");
+    let inputs = [Vec::new(), text(20_000, 0xc0f1)];
+    for level in [-5, 1, 3, 19] {
+        for flags in 0..8u8 {
+            for plain in &inputs {
+                let o = EncodeOptions {
+                    level,
+                    checksum: flags & 1 != 0,
+                    content_size: flags & 2 != 0,
+                    pledged_size: (flags & 4 != 0).then_some(plain.len() as u64),
+                    ..EncodeOptions::default()
+                };
+                let what = format!("level {level} flags {flags:03b}, {} bytes in", plain.len());
+                let frame = encode(&o, plain);
+                crate::confirm_test::assert_every_cut_confirms(&what, confirm, &frame, 4);
+            }
+        }
+    }
+    // A dictionary ID in the header (the C tier alone encodes with one).
+    #[cfg(feature = "zstd-c")]
+    for dict_id in [false, true] {
+        let o = EncodeOptions {
+            dict_id,
+            dictionary: Some(fixture("dict4k.dict")),
+            ..EncodeOptions::default()
+        };
+        let frame = encode(&o, &dict_plain());
+        crate::confirm_test::assert_every_cut_confirms("dictionary", confirm, &frame, 4);
+    }
+    for name in ["dict4k.zst", "patch.zst"] {
+        crate::confirm_test::assert_every_cut_confirms(name, confirm, &fixture(name), 4);
+    }
+}

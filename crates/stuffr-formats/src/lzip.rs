@@ -460,7 +460,25 @@ const LZIP_MAGIC: &[MagicRule] = &[MagicRule {
 
 /// Registration metadata for LZIP.
 pub fn meta() -> FormatMeta {
-    FormatMeta::codec(LZIP, &["lz"], LZIP_MAGIC)
+    FormatMeta::codec(LZIP, &["lz"], LZIP_MAGIC).with_confirm(confirm)
+}
+
+/// Version 1 (the only one), and a coded dictionary size inside lzip's
+/// 4 KiB..=512 MiB: bits 4-0 are the base-2 logarithm of a base size, bits
+/// 7-5 how many sixteenths of it to subtract.
+fn confirm(prefix: &[u8]) -> bool {
+    if prefix.get(4).is_some_and(|&v| v != 1) {
+        return false;
+    }
+    prefix.get(5).is_none_or(|&coded| {
+        let log = u32::from(coded & 0x1f);
+        if !(12..=29).contains(&log) {
+            return false;
+        }
+        let base = 1u32 << log;
+        let size = base - (base / 16) * u32::from(coded >> 5);
+        (4096..=512 << 20).contains(&size)
+    })
 }
 
 #[derive(Debug)]
@@ -2688,5 +2706,53 @@ mod tests {
             "u32::MAX is the crate's \"no limit\" sentinel: clamping onto it would turn the \
              largest possible bound into no bound at all"
         );
+    }
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+    use crate::confirm_test::{assert_every_cut_confirms, assert_never_panics, encode, inputs};
+    use stuffr_core::ConfirmFn;
+
+    fn confirm() -> ConfirmFn {
+        meta().confirm.expect("lzip registers a confirm function")
+    }
+
+    #[test]
+    fn confirm_accepts_own_output() {
+        for plain in inputs() {
+            for level in [Some(0), None, Some(9)] {
+                let stream = encode(&Lzip, &plain, level);
+                let what = format!("lzip level {level:?}, {} bytes in", plain.len());
+                assert_every_cut_confirms(&what, confirm(), &stream, 4);
+            }
+        }
+        // Every coded dictionary size in 4 KiB..=512 MiB.
+        for (byte, size) in [(0x0c, 4096u32), (0x1d, 512 << 20), (0x1d | 0xe0, 288 << 20)] {
+            assert!(confirm()(&[b'L', b'Z', b'I', b'P', 1, byte]), "{size}");
+        }
+    }
+
+    #[test]
+    fn confirm_rejects_magic_plus_noise() {
+        for version in [0u8, 2, 0xff] {
+            assert!(
+                !confirm()(&[b'L', b'Z', b'I', b'P', version, 0x14]),
+                "version {version}"
+            );
+        }
+        // 2 KiB; 1 GiB; 4 KiB minus a sixteenth; a base past 2^31.
+        for byte in [0x0b, 0x1e, 0x2c, 0x1f, 0xff] {
+            assert!(
+                !confirm()(&[b'L', b'Z', b'I', b'P', 1, byte]),
+                "dict byte {byte:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn confirm_never_panics_on_short_input() {
+        assert_never_panics(confirm(), &encode(&Lzip, b"hello", None));
     }
 }

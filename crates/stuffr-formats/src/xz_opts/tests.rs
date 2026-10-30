@@ -2296,3 +2296,57 @@ finished_test!(
     pure_decoder_says_when_the_stream_ended,
     crate::xz_opts::pure
 );
+
+/// Every check type and a spread of presets, on either tier, write a stream
+/// the registered xz codec's confirm function accepts — and `.lzma` output
+/// one the lzma codec's accepts — cut anywhere.
+#[test]
+fn confirm_accepts_every_check_and_format() {
+    let xz = crate::xz_shared::xz_meta()
+        .confirm
+        .expect("xz registers a confirm function");
+    let inputs = [Vec::new(), text(20_000, 0xc0f1)];
+    for check in [Check::None, Check::Crc32, Check::Crc64, Check::Sha256] {
+        for (level, extreme) in [(0, false), (3, false), (6, false), (0, true)] {
+            for plain in &inputs {
+                let o = EncodeOptions {
+                    filters: vec![Filter::Lzma2(Lzma::preset(level, extreme).unwrap())],
+                    check,
+                    ..EncodeOptions::default()
+                };
+                let what = format!("{check:?} preset {level} extreme {extreme}");
+                let stream = confirm_encode(&o, plain);
+                crate::confirm_test::assert_every_cut_confirms(&what, xz, &stream, 6);
+            }
+        }
+    }
+    #[cfg(any(feature = "lzma-c", feature = "lzma-pure"))]
+    {
+        let lzma = crate::lzma_shared::lzma_meta()
+            .confirm
+            .expect("lzma registers a confirm function");
+        for dict in [4096, 65_536, 1 << 20, 3 << 20] {
+            for plain in &inputs {
+                let mut l = Lzma::preset(6, false).unwrap();
+                l.dict_size = dict;
+                let o = EncodeOptions {
+                    format: Format::Lzma,
+                    filters: vec![Filter::Lzma1(l)],
+                    ..EncodeOptions::default()
+                };
+                let what = format!(".lzma dict {dict}, {} bytes in", plain.len());
+                let stream = confirm_encode(&o, plain);
+                crate::confirm_test::assert_every_cut_confirms(&what, lzma, &stream, 0);
+            }
+        }
+    }
+}
+
+/// `input` through this build's [`Encoder`] in one piece.
+fn confirm_encode(o: &EncodeOptions, input: &[u8]) -> Vec<u8> {
+    let mut e = Encoder::new(o).unwrap();
+    let mut out = Vec::new();
+    e.feed(input, &mut out).unwrap();
+    e.finish(&mut out).unwrap();
+    out
+}

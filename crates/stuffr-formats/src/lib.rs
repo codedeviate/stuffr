@@ -214,9 +214,13 @@ pub(crate) mod alloc_probe {
 #[global_allocator]
 static PROBE_ALLOCATOR: alloc_probe::Probe = alloc_probe::Probe;
 
+#[cfg(test)]
+pub(crate) mod confirm_test;
 #[cfg(any(feature = "lzma-c", feature = "lzma-pure"))]
 mod lzma_shared;
 mod normalize;
+#[cfg(any(feature = "lz4", feature = "zstd-c", feature = "zstd-pure"))]
+mod skippable;
 #[cfg(any(feature = "xz-c", feature = "xz-pure"))]
 mod xz_shared;
 #[cfg(any(feature = "zstd-c", feature = "zstd-pure"))]

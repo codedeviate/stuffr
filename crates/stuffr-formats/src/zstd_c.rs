@@ -620,3 +620,28 @@ mod tests {
         assert_eq!(out, plain);
     }
 }
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+    use crate::confirm_test::{assert_every_cut_confirms, encode, inputs};
+
+    #[test]
+    fn confirm_accepts_own_output() {
+        let confirm = meta().confirm.expect("zstd registers a confirm function");
+        for plain in inputs() {
+            for level in [
+                Some(*zstd::compression_level_range().start()),
+                Some(-5),
+                Some(1),
+                None,
+                Some(19),
+                Some(22),
+            ] {
+                let stream = encode(&Zstd, &plain, level);
+                let what = format!("zstd_c level {level:?}, {} bytes in", plain.len());
+                assert_every_cut_confirms(&what, confirm, &stream, 4);
+            }
+        }
+    }
+}

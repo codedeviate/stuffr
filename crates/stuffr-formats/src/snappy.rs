@@ -56,7 +56,23 @@ const SNAPPY_MAGIC: &[MagicRule] = &[MagicRule {
 /// Registration metadata for snappy (frame format only — see the module
 /// docs).
 pub fn meta() -> FormatMeta {
-    FormatMeta::codec(SNAPPY, &["sz"], SNAPPY_MAGIC)
+    FormatMeta::codec(SNAPPY, &["sz"], SNAPPY_MAGIC).with_confirm(confirm)
+}
+
+/// The whole ten-byte stream identifier chunk, then — when the prefix holds
+/// it — a next chunk of a type the framing format defines: compressed
+/// (`0x00`), uncompressed (`0x01`), a reserved skippable type
+/// (`0x80`..=`0xfd`), padding (`0xfe`) or another stream identifier
+/// (`0xff`). `0x02`..=`0x7f` are reserved unskippable: a decoder must stop.
+fn confirm(prefix: &[u8]) -> bool {
+    let id = SNAPPY_MAGIC[0].bytes;
+    let seen = prefix.len().min(id.len());
+    if prefix[..seen] != id[..seen] {
+        return false;
+    }
+    prefix
+        .get(id.len())
+        .is_none_or(|&kind| !(0x02..=0x7f).contains(&kind))
 }
 
 #[derive(Debug)]
@@ -542,5 +558,49 @@ mod tests {
     #[test]
     fn snappy_conforms() {
         stuffr_core::testing::assert_codec_conforms(&Snappy, &meta());
+    }
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+    use crate::confirm_test::{assert_every_cut_confirms, assert_never_panics, encode, inputs};
+    use stuffr_core::ConfirmFn;
+
+    fn confirm() -> ConfirmFn {
+        meta().confirm.expect("snappy registers a confirm function")
+    }
+
+    #[test]
+    fn confirm_accepts_own_output() {
+        for plain in inputs() {
+            let stream = encode(&Snappy, &plain, None);
+            let what = format!("snappy, {} bytes in", plain.len());
+            assert_every_cut_confirms(&what, confirm(), &stream, 10);
+        }
+        // Padding, a skippable chunk and a repeated stream identifier may
+        // follow the first one.
+        for kind in [0xfe, 0x80, 0xfd, 0xff, 0x00, 0x01] {
+            let mut ok = SNAPPY_MAGIC[0].bytes.to_vec();
+            ok.extend_from_slice(&[kind, 4, 0, 0]);
+            assert!(confirm()(&ok), "chunk type {kind:#04x}");
+        }
+    }
+
+    #[test]
+    fn confirm_rejects_magic_plus_noise() {
+        // A reserved unskippable chunk type (0x02..=0x7f) next.
+        for kind in [0x02, 0x41, 0x7f] {
+            let mut bad = SNAPPY_MAGIC[0].bytes.to_vec();
+            bad.extend_from_slice(&[kind, 4, 0, 0]);
+            assert!(!confirm()(&bad), "chunk type {kind:#04x}");
+        }
+        // The identifier chunk itself incomplete or wrong.
+        assert!(!confirm()(b"\xff\x06\x00\x00sNaPpX\x00"));
+    }
+
+    #[test]
+    fn confirm_never_panics_on_short_input() {
+        assert_never_panics(confirm(), &encode(&Snappy, b"hello", None));
     }
 }

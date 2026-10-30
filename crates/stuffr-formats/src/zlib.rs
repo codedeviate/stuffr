@@ -56,7 +56,41 @@ pub(crate) const ZLIB_MAGIC: &[MagicRule] = &[
 /// which is LZW `compress(1)` — a Phase 3 legacy format. Colliding them would
 /// be painful to undo once 0.1.0 pins the extension map.
 pub fn meta() -> FormatMeta {
-    FormatMeta::codec(ZLIB, &["zz"], ZLIB_MAGIC)
+    FormatMeta::codec(ZLIB, &["zz"], ZLIB_MAGIC).with_confirm(confirm)
+}
+
+/// RFC 1950's header and the first deflate block header behind it.
+///
+/// CMF must say deflate (CM 8) with a window of at most 32 KiB (CINFO
+/// ≤ 7); the two header bytes must be a multiple of 31 (FCHECK); FDICT must
+/// be clear (a preset dictionary no decoder here can supply). The first
+/// block's BTYPE must not be 3 (reserved), and a stored block's LEN must be
+/// the complement of its NLEN. Only the bytes inside `prefix` are judged.
+fn confirm(prefix: &[u8]) -> bool {
+    let Some(&cmf) = prefix.first() else {
+        return true;
+    };
+    if cmf & 0x0f != 8 || cmf >> 4 > 7 {
+        return false;
+    }
+    let Some(&flg) = prefix.get(1) else {
+        return true;
+    };
+    if (u16::from(cmf) << 8 | u16::from(flg)) % 31 != 0 || flg & 0x20 != 0 {
+        return false;
+    }
+    let Some(&block) = prefix.get(2) else {
+        return true;
+    };
+    match (block >> 1) & 3 {
+        3 => false,
+        // Stored: the rest of this byte is padding, then LEN and NLEN.
+        0 => match prefix.get(3..7) {
+            Some(n) => u16::from_le_bytes([n[0], n[1]]) == !u16::from_le_bytes([n[2], n[3]]),
+            None => true,
+        },
+        _ => true,
+    }
 }
 
 #[derive(Debug)]
@@ -185,5 +219,54 @@ mod tests {
                 &packed[..2]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+    use crate::confirm_test::{assert_every_cut_confirms, assert_never_panics, encode, inputs};
+    use stuffr_core::ConfirmFn;
+
+    fn confirm() -> ConfirmFn {
+        meta().confirm.expect("zlib registers a confirm function")
+    }
+
+    #[test]
+    fn confirm_accepts_own_output() {
+        for plain in inputs() {
+            for level in [Some(0), Some(1), Some(2), None, Some(9)] {
+                let stream = encode(&Zlib, &plain, level);
+                let what = format!("zlib level {level:?}, {} bytes in", plain.len());
+                assert_every_cut_confirms(&what, confirm(), &stream, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn confirm_rejects_magic_plus_noise() {
+        let good = encode(&Zlib, b"hello", None);
+        assert!(confirm()(&good));
+        // FCHECK: the header is not a multiple of 31.
+        assert!(!confirm()(&[0x78, 0x9d, 0x01, 0x00]));
+        // FDICT set (with a valid FCHECK): a preset dictionary no writer of
+        // a standalone stream uses, and no decoder here can supply.
+        assert!(!confirm()(&[0x78, 0x20, 0x01, 0x00]));
+        // The first deflate block's BTYPE 3 (reserved), final or not.
+        assert!(!confirm()(&[0x78, 0x9c, 0x07]));
+        assert!(!confirm()(&[0x78, 0x9c, 0x06]));
+        // A stored block whose NLEN is not LEN's complement.
+        assert!(!confirm()(&[0x78, 0x01, 0x01, 0x05, 0x00, 0x00, 0x00]));
+        assert!(confirm()(&[0x78, 0x01, 0x01, 0x05, 0x00, 0xfa, 0xff]));
+        // Not deflate at all (CM 7).
+        assert!(!confirm()(&[0x77, 0x01, 0x01]));
+        // CINFO 8: a window past 32 KiB, with a valid FCHECK.
+        assert!(!confirm()(&[0x88, 0x1c, 0x01]));
+    }
+
+    #[test]
+    fn confirm_never_panics_on_short_input() {
+        assert_never_panics(confirm(), &encode(&Zlib, b"hello", Some(0)));
+        assert_never_panics(confirm(), &encode(&Zlib, b"hello", None));
     }
 }
