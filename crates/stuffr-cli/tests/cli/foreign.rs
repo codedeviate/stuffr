@@ -51,54 +51,80 @@ pub(crate) fn synthetic_dmg() -> Vec<u8> {
 }
 
 /// Real disk images made by `hdiutil` from a one-file folder, one per
-/// format, written into `dir`. Empty (with a printed note) where `hdiutil`
+/// format, copied into `dir`. Empty (with a printed note) where `hdiutil`
 /// is missing or refuses — CI's macOS runner may not be allowed to make
 /// disk images, and hdiutil's own failure is not stuffr's.
+///
+/// `hdiutil create` costs about five seconds an image, so the five are made
+/// once per test binary ([`hdiutil_images`]) and every caller gets copies.
 #[cfg(target_os = "macos")]
 pub(crate) fn real_disk_images(dir: &Path) -> Vec<PathBuf> {
-    let Some(hdiutil) = which("hdiutil") else {
-        eprintln!("note: hdiutil is missing; real disk images skipped");
-        return Vec::new();
-    };
-    let src = tmp_dir();
-    std::fs::write(src.join("hello.txt"), b"hello from a disk image\n").unwrap();
-    let mut made = Vec::new();
-    for format in ["UDZO", "UDBZ", "ULMO", "UDRO", "ULFO"] {
-        let out = dir.join(format!("image-{format}.dmg"));
-        let run = std::process::Command::new(&hdiutil)
-            .args([
-                "create", "-quiet", "-ov", "-volname", "stuffr", "-format", format,
-            ])
-            .arg("-srcfolder")
-            .arg(&*src)
-            .arg("-o")
-            .arg(&out)
-            .output();
-        match run {
-            Ok(o) if o.status.success() && out.is_file() => {
-                let bytes = std::fs::read(&out).unwrap();
-                assert_eq!(
-                    bytes[bytes.len() - 512..][..4],
-                    *b"koly",
-                    "hdiutil's {format} image has no koly trailer"
-                );
-                made.push(out);
-            }
-            Ok(o) => {
-                eprintln!(
-                    "note: hdiutil create -format {format} failed ({}): {}; skipped",
-                    o.status,
-                    String::from_utf8_lossy(&o.stderr).trim()
-                );
-                let _ = std::fs::remove_file(&out);
-            }
-            Err(e) => {
-                eprintln!("note: hdiutil could not run ({e}); real disk images skipped");
-                return made;
+    hdiutil_images()
+        .iter()
+        .map(|(name, bytes)| {
+            let out = dir.join(name);
+            std::fs::write(&out, bytes).unwrap();
+            out
+        })
+        .collect()
+}
+
+/// The images `hdiutil` made, as (file name, bytes), built on first use.
+///
+/// Held in memory rather than in a scratch folder kept for the process: a
+/// static never drops, so such a folder would outlive the run with a dead
+/// pid in its name and `scripts/tmp-leaks.sh check` would flag it. The
+/// folders `hdiutil` works in are ordinary per-call scratch guards, removed
+/// before this returns.
+#[cfg(target_os = "macos")]
+fn hdiutil_images() -> &'static [(String, Vec<u8>)] {
+    static IMAGES: std::sync::OnceLock<Vec<(String, Vec<u8>)>> = std::sync::OnceLock::new();
+    IMAGES.get_or_init(|| {
+        let Some(hdiutil) = which("hdiutil") else {
+            eprintln!("note: hdiutil is missing; real disk images skipped");
+            return Vec::new();
+        };
+        let src = tmp_dir();
+        std::fs::write(src.join("hello.txt"), b"hello from a disk image\n").unwrap();
+        let dir = tmp_dir();
+        let mut made = Vec::new();
+        for format in ["UDZO", "UDBZ", "ULMO", "UDRO", "ULFO"] {
+            let name = format!("image-{format}.dmg");
+            let out = dir.join(&name);
+            let run = std::process::Command::new(&hdiutil)
+                .args([
+                    "create", "-quiet", "-ov", "-volname", "stuffr", "-format", format,
+                ])
+                .arg("-srcfolder")
+                .arg(&*src)
+                .arg("-o")
+                .arg(&out)
+                .output();
+            match run {
+                Ok(o) if o.status.success() && out.is_file() => {
+                    let bytes = std::fs::read(&out).unwrap();
+                    assert_eq!(
+                        bytes[bytes.len() - 512..][..4],
+                        *b"koly",
+                        "hdiutil's {format} image has no koly trailer"
+                    );
+                    made.push((name, bytes));
+                }
+                Ok(o) => {
+                    eprintln!(
+                        "note: hdiutil create -format {format} failed ({}): {}; skipped",
+                        o.status,
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("note: hdiutil could not run ({e}); real disk images skipped");
+                    return made;
+                }
             }
         }
-    }
-    made
+        made
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
