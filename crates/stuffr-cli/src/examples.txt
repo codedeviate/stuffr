@@ -494,7 +494,7 @@ STDIN AND STDOUT VIA `-`
       Both ends can be `-` at once: stdin in, stdout out.
 
 
-INSPECTING A STREAM WITHOUT DECODING IT
+INSPECTING A STREAM (DECODING AT MOST ITS FIRST 4 KiB)
 
   stuffr info notes.txt.gz
       Reports the format, the resolved chain, the fidelity "rung", and the
@@ -508,14 +508,14 @@ INSPECTING A STREAM WITHOUT DECODING IT
   stream can only be read once, so this is the tool telling you the format
   was inferred from bytes it saw going by, not confirmed by looking back.
 
-  The heading is nearly literal: info decodes nothing past the first 4096
-  bytes (see `detected:` below), and it does not OPEN an archive either. So it reports `fidelity: not evaluated` instead of
-  "nothing approximated" wherever a forward read of that container could
-  genuinely have lost something and info has not looked. Today that means
-  zip, the only container here that keeps its index at the END of the
-  stream, whenever that zip will not be read authoritatively (run `stuffr
-  test` for the real answer; see "LISTING AND TESTING" below). Two shapes
-  qualify:
+  info decodes nothing past the first 4096 bytes (see `detected:` below),
+  and it does not OPEN an archive either. So it reports `fidelity: not
+  evaluated` instead of "nothing approximated" wherever a forward read of
+  that container could genuinely have lost something and info has not
+  looked. Today that means zip, the only container here that keeps its index
+  at the END of the stream, whenever that zip will not be read
+  authoritatively (run `stuffr test` for the real answer; see "LISTING AND
+  TESTING" below). Two shapes qualify:
 
     * a zip on a pipe, and
     * a zip under a codec — `bundle.zip.gz` — however seekable the FILE
@@ -531,15 +531,16 @@ INSPECTING A STREAM WITHOUT DECODING IT
   `fidelity_evaluated` field, because `"warnings": []` cannot carry it.
 
   The `detected:` line says how the outer format was decided: `magic`,
-  `extension` (no magic matched; the name decided), or `magic-unconfirmed`
-  / `extension-unconfirmed` when that format's header check refused the
-  bytes. Such a file is still read by every verb, so a damaged archive you
-  name is reported corrupt (exit 5) and stays reachable by salvage. When a
-  layer did not check out, a `checks:` line names it — `checks:   tar did
-  not check out` for a `.tar.gz` whose tar header fails its checksum —
-  and --json adds `unconfirmed_layer`. To judge an inner layer info
-  decodes the first 4096 bytes and nothing more; a file whose every layer
-  checks out shows neither.
+  `extension` (no magic matched; the name decided), or `magic-unconfirmed` /
+  `extension-unconfirmed` when that format's header check refused the bytes.
+  Such a file is still read by every verb, so a damaged archive you name is
+  reported corrupt (exit 5) and stays reachable by salvage. When a layer did
+  not check out, a `checks:` line names it — `checks:   tar did not check out`
+  for a `.tar.gz` whose tar header fails its checksum — and --json adds
+  `unconfirmed_layer`. To judge an inner layer info decodes the first 4096
+  bytes and nothing more, under --memory-limit (a layer whose decoder the
+  limit refuses is not judged); a file whose every layer checks out shows
+  neither.
 
   One limit worth knowing: on a PIPE with no filename, info resolves only
   the outer layer. `cat bundle.zip.gz | stuffr info -` reports `chain:

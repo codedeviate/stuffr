@@ -254,7 +254,7 @@ pub enum Command {
         #[arg(long, value_name = "SIZE")]
         memory_limit: Option<String>,
     },
-    /// Identify a stream without decoding it.
+    /// Identify a stream, decoding at most its first 4 KiB.
     Info {
         /// Input path, or `-` for stdin.
         input: String,

@@ -2289,20 +2289,22 @@ format's own header check accepts what follows (a format with no magic,
 brotli, is listed by its extension). So an extensionless gzip is found, while
 a `.zip` that is really an HTML page, or text that happens to begin with a
 format's magic bytes, is not. A compressed file's inner layer is decoded from
-those 4096 bytes alone to name it (`tar+gzip`); `ls` reads nothing more than
-that and the last 512 bytes. Apple disk images (`.dmg`, recognised by their
-`koly` trailer) are not listed, and every verb but `salvage` refuses one with
-exit 3 (`--format` overrides that); a disk image piped in on stdin cannot be
-recognised, and stuffr may decode its first chunk. On macOS, a file kept only in iCloud
-or another cloud provider (not downloaded) is never opened, since reading it
-would download it, so it is not identified and counts as not openable. Sizes are `ls -lh`'s, dates `ls -l`'s
-in local time, and the footer (left out when it would say 0) counts the
-files that are not openable. `-r` adds one block per subfolder holding
-something openable, `-a` includes hidden names, `-n` sorts by name, and
-`--json` prints `{entries, shown, skipped, warnings}`. `stuffr files` is the
-same folder listing. Given a file or `-`, `stuffr ls` is `stuffr list`,
-unchanged. A file or subfolder that cannot be read is named on stderr and
-the exit is 4; the listing itself never exits 1.
+those 4096 bytes alone to name it (`tar+gzip`; a magicless inner layer such as
+a v7 tar is named by the file's name, and only when its own check accepts the
+decoded bytes); `ls` reads nothing more than that and the last 512 bytes.
+Apple disk images (`.dmg`, recognised by their `koly` trailer) are not listed,
+and every verb but `salvage` refuses one with exit 3 (`--format` overrides
+that); a disk image piped in on stdin cannot be recognised, and stuffr may
+decode its first chunk. On macOS, a file kept only in iCloud or another cloud
+provider (not downloaded) is never opened, since reading it would download it,
+so it is not identified and counts as not openable. Sizes are `ls -lh`'s,
+dates `ls -l`'s in local time, and the footer (left out when it would say 0)
+counts the files that are not openable. `-r` adds one block per subfolder
+holding something openable, `-a` includes hidden names, `-n` sorts by name,
+and `--json` prints `{entries, shown, skipped, warnings}`. `stuffr files` is
+the same folder listing. Given a file or `-`, `stuffr ls` is `stuffr list`,
+unchanged. A file or subfolder that cannot be read is named on stderr and the
+exit is 4; the listing itself never exits 1.
 
 ### `stuffr bench`
 
