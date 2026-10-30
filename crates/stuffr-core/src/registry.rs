@@ -176,6 +176,22 @@ impl Registry {
         self.magics.iter().any(|m| m.format == id)
     }
 
+    /// The format's own verdict on a prefix its magic matched: `Some(true)`
+    /// or `Some(false)` from the function it registered
+    /// ([`FormatMeta::with_confirm`]), `None` when it registered none or is
+    /// not registered at all.
+    ///
+    /// `None` is deliberately not `Some(true)`: the resolver treats both as
+    /// confirming (no behaviour change for a format that has not opted in),
+    /// but a caller auditing coverage needs to tell "checked and passed" from
+    /// "never checked".
+    pub fn confirm(&self, id: FormatId, prefix: &[u8]) -> Option<bool> {
+        self.metas
+            .get(&id)
+            .and_then(|m| m.confirm)
+            .map(|f| f(prefix))
+    }
+
     /// The priority of a registered format, or 0 if unknown.
     pub fn priority_of(&self, id: FormatId) -> i16 {
         self.metas.get(&id).map_or(0, |m| m.priority)
@@ -579,5 +595,27 @@ mod tests {
         let mut ok = Registry::new();
         ok.register_container(Arc::new(MockContainer), container_meta());
         assert!(ok.require_container_writer(MOCK_CONTAINER).is_ok());
+    }
+
+    #[test]
+    fn confirm_answers_only_for_a_format_that_registered_a_function() {
+        fn starts_mock(p: &[u8]) -> bool {
+            p.starts_with(b"MOCK")
+        }
+        let mut r = Registry::new();
+        r.register_codec(Arc::new(MockCodec), codec_meta().with_confirm(starts_mock));
+        r.register_container(Arc::new(MockContainer), container_meta());
+        assert_eq!(r.confirm(MOCK_CODEC, b"MOCK...."), Some(true));
+        assert_eq!(r.confirm(MOCK_CODEC, b"MOCX...."), Some(false));
+        assert_eq!(
+            r.confirm(MOCK_CONTAINER, b"ME"),
+            None,
+            "no function registered: no verdict, not a refusal"
+        );
+        assert_eq!(r.confirm(FormatId::new("absent"), b""), None);
+
+        // Re-registration replaces the function with the metadata.
+        r.register_codec(Arc::new(MockCodec), codec_meta());
+        assert_eq!(r.confirm(MOCK_CODEC, b"MOCK"), None);
     }
 }

@@ -369,6 +369,24 @@ pub struct MagicRule {
     pub format: FormatId,
 }
 
+/// A format's second look at a prefix its magic already matched: `true` when
+/// the bytes after the magic are what the format's own header says they must
+/// be, `false` when they are not.
+///
+/// A magic number is two to six bytes, and two bytes is a coin toss over a
+/// folder of ordinary files: an Apple disk image begins with zlib's `78 9c`,
+/// so `stuffr ls` listed one as `zlib`, and other application files that
+/// merely share a magic's few bytes were listed the same way. The function sees only the probe prefix (at most
+/// [`crate::probe::PROBE_LEN`] bytes, possibly fewer) and must be pure and
+/// cheap — it runs on every magic hit of every file a folder listing reads.
+/// It must answer `true` for every stream the format's writers produce,
+/// including one cut short inside the prefix, because a damaged archive the
+/// user names must stay reachable; it may only refuse what no writer emits.
+///
+/// Core supplies only the hook. Every real check lives beside its format in
+/// `stuffr-formats`, which is what keeps this crate free of format knowledge.
+pub type ConfirmFn = fn(prefix: &[u8]) -> bool;
+
 /// Registration metadata for one format.
 #[derive(Clone, Copy, Debug)]
 pub struct FormatMeta {
@@ -384,6 +402,13 @@ pub struct FormatMeta {
     /// base format above its derivatives, and a bare stream resolves to the
     /// base while a derivative is reached by extension.
     pub priority: i16,
+    /// The format's confirmation of its own magic hits — see [`ConfirmFn`].
+    ///
+    /// `None` from [`Self::codec`] and [`Self::container`]: a format that
+    /// registers no function is treated as confirming every hit, so adding
+    /// the hook changes nothing for a format until it opts in with
+    /// [`Self::with_confirm`].
+    pub confirm: Option<ConfirmFn>,
 }
 
 impl CodecCaps {
@@ -466,6 +491,7 @@ impl FormatMeta {
             extensions,
             magics,
             priority: 0,
+            confirm: None,
         }
     }
 
@@ -480,11 +506,18 @@ impl FormatMeta {
             extensions,
             magics,
             priority: 0,
+            confirm: None,
         }
     }
 
     pub const fn with_priority(mut self, priority: i16) -> Self {
         self.priority = priority;
+        self
+    }
+
+    /// Registers `f` as this format's confirmation — see [`ConfirmFn`].
+    pub const fn with_confirm(mut self, f: ConfirmFn) -> Self {
+        self.confirm = Some(f);
         self
     }
 }

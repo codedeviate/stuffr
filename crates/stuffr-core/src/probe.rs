@@ -34,12 +34,112 @@ pub const PROBE_LEN: usize = 4096;
 /// the resolution site rather than in the type.
 pub const MAX_CHAIN_DEPTH: usize = 4;
 
+/// How many bytes [`read_tail`] reads from the END of a seekable input: the
+/// size of the one trailer [`foreign_from_tail`] knows, UDIF's `koly` block.
+pub const TAIL_LEN: usize = 512;
+
+/// A format stuffr recognises in order to refuse it, rather than to open it.
+///
+/// Exists because some files' first bytes carry a magic stuffr DOES open: an
+/// Apple disk image (UDZO) begins with a zlib stream, so without this check
+/// `stuffr ls` listed it as `zlib` and every other verb took it for a zlib
+/// stream. Recognising the container from its own trailer is cheaper and
+/// truer than teaching zlib's check to guess.
+#[non_exhaustive]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Foreign {
+    /// An Apple disk image (UDIF: `.dmg`), identified by its `koly` trailer.
+    AppleDiskImage,
+}
+
+impl std::fmt::Display for Foreign {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Foreign::AppleDiskImage => f.write_str("an Apple disk image (UDIF)"),
+        }
+    }
+}
+
+/// Recognises a foreign format from the last [`TAIL_LEN`] bytes of a file.
+///
+/// UDIF's trailer is the last 512 bytes: `koly`, then a big-endian u32
+/// version (4), then a big-endian u32 header size (512). All three are
+/// required — the four-letter signature alone is 32 bits of evidence, and
+/// the version and size fields turn it into 96 that no ordinary file's tail
+/// matches by accident. Anything but exactly [`TAIL_LEN`] bytes is `None`:
+/// a shorter tail is not where the trailer lives.
+pub fn foreign_from_tail(tail: &[u8]) -> Option<Foreign> {
+    (tail.len() == TAIL_LEN
+        && tail[0..4] == *b"koly"
+        && tail[4..8] == [0, 0, 0, 4]
+        && tail[8..12] == [0, 0, 2, 0])
+    .then_some(Foreign::AppleDiskImage)
+}
+
+/// Reads the last [`TAIL_LEN`] bytes of a seekable source and rewinds it to
+/// byte zero.
+///
+/// `None` — having read nothing — for a source that cannot seek (a pipe has
+/// no end to look at without consuming it, and buffering a whole pipe to
+/// learn its last 512 bytes is not a probe), and for one shorter than
+/// [`TAIL_LEN`], which cannot hold the trailer. Also `None` if the source
+/// delivers fewer bytes than its own length promised (a file shrinking under
+/// the read): no tail is better evidence than a torn one.
+///
+/// The position afterwards is byte zero in every case that seeked at all,
+/// which is where [`probe`] expects its source to start.
+pub fn read_tail(src: &mut dyn Source) -> Result<Option<Vec<u8>>> {
+    if !src.caps().seekable {
+        return Ok(None);
+    }
+    // A source that claims to seek and has no seek view is `probe`'s to
+    // refuse (`NotSeekable`); this function only declines to look.
+    let Some(seek) = src.as_seek() else {
+        return Ok(None);
+    };
+    use std::io::SeekFrom;
+    let len = seek.seek(SeekFrom::End(0))?;
+    if len < TAIL_LEN as u64 {
+        seek.seek(SeekFrom::Start(0))?;
+        return Ok(None);
+    }
+    seek.seek(SeekFrom::Start(len - TAIL_LEN as u64))?;
+    let mut tail = vec![0u8; TAIL_LEN];
+    let mut filled = 0;
+    while filled < TAIL_LEN {
+        match seek.read(&mut tail[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    seek.seek(SeekFrom::Start(0))?;
+    Ok((filled == TAIL_LEN).then_some(tail))
+}
+
 /// Reads a bounded prefix without consuming it.
 ///
 /// A seekable source is rewound; a pipe is wrapped in a [`PeekSource`] that
 /// replays the prefix. Either way the caller still sees byte zero.
+///
+/// A seekable source has its last [`TAIL_LEN`] bytes read first
+/// ([`read_tail`]), and a foreign trailer ([`foreign_from_tail`]) is
+/// [`Error::ForeignFormat`] — exit 3 — before any magic is consulted. Every
+/// verb that identifies its input goes through here, so an Apple disk image
+/// is refused by name everywhere rather than decoded as the zlib stream it
+/// begins with. A pipe's tail is never read: that would consume it. A caller
+/// that must not refuse (`--format`, `salvage`) must not call `probe`.
+///
+/// Reading the tail first also means a seekable source that cannot really
+/// seek (a FIFO opened by path) fails before a byte of it is consumed, where
+/// it used to fail on the rewind after the prefix — the same `Error::Io`.
 pub fn probe(mut src: Box<dyn Source>) -> Result<(Vec<u8>, Box<dyn Source>)> {
     if src.caps().seekable {
+        if let Some(foreign) = read_tail(src.as_mut())?
+            .as_deref()
+            .and_then(foreign_from_tail)
+        {
+            return Err(Error::ForeignFormat(foreign));
+        }
         let mut prefix = vec![0u8; PROBE_LEN];
         // `caps().seekable` is the `Source`'s own claim; `as_seek()` is a
         // second, independent method on the same trait, and `Source` is
@@ -296,8 +396,65 @@ pub fn chain_for_new_path(reg: &Registry, path: &Path) -> Chain {
 /// decides only when the path is silent or names a format whose magic did not
 /// match. Failure names the bytes actually seen so a misdetection is
 /// debuggable without library prints.
+///
+/// The lenient resolution every verb given a file uses: a magic hit its
+/// format does not confirm still resolves (see [`resolve_chain_checked`]),
+/// so a damaged archive the user names reaches its reader and is reported
+/// corrupt (exit 5) rather than unknown.
 pub fn resolve_chain(reg: &Registry, path: Option<&Path>, prefix: &[u8]) -> Result<Chain> {
-    let mut candidates = reg.match_magic(prefix);
+    resolve_chain_checked(reg, path, prefix).map(|(chain, _)| chain)
+}
+
+/// How the outer layer of a resolved [`Chain`] was reached.
+#[non_exhaustive]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Evidence {
+    /// A magic hit (or, for a magicless format, the extension) that the
+    /// format's own [`crate::format::ConfirmFn`] accepted — or that has no
+    /// such function, which counts as accepting.
+    Confirmed,
+    /// Only magic hits (or an extension) that the format's function refused.
+    /// Still resolved, because the lenient verbs must reach a damaged file's
+    /// reader; [`identify_strict`] refuses it.
+    Unconfirmed,
+    /// No magic matched, and the extension named a format that has no
+    /// confirmation function: a name, and nothing else (brotli, raw deflate).
+    ByName,
+}
+
+/// [`resolve_chain`], also saying how the outer layer was reached.
+///
+/// Candidates are ranked by confirmation before anything else: the magic
+/// hits whose format confirms the prefix (or registered no function) are
+/// selected among exactly as `resolve_chain` always selected — the extension
+/// first, then priority, [`Error::AmbiguousFormat`] on a tie — and the
+/// answer is [`Evidence::Confirmed`]. Only when no hit confirms are all the
+/// hits selected among the same way, [`Evidence::Unconfirmed`]. So a
+/// refused hit can no longer tie with, or outrank, a confirmed one: two
+/// formats sharing a magic are separated by their bytes, not by an error.
+///
+/// With no magic hit at all the extension decides, and its format's function
+/// (if any) grades it: `Confirmed`, `Unconfirmed`, or [`Evidence::ByName`]
+/// when there is none. Every error is the one `resolve_chain` raised before
+/// confirmation existed.
+pub fn resolve_chain_checked(
+    reg: &Registry,
+    path: Option<&Path>,
+    prefix: &[u8],
+) -> Result<(Chain, Evidence)> {
+    let hits = reg.match_magic(prefix);
+    // `match_magic`'s order (priority descending) survives the filter, which
+    // the tie-break below relies on.
+    let confirmed: Vec<FormatId> = hits
+        .iter()
+        .copied()
+        .filter(|id| reg.confirm(*id, prefix) != Some(false))
+        .collect();
+    let (mut candidates, mut evidence) = if confirmed.is_empty() {
+        (hits, Evidence::Unconfirmed)
+    } else {
+        (confirmed, Evidence::Confirmed)
+    };
 
     if candidates.len() > 1 {
         // The extension is consulted FIRST, and against every magic hit — a
@@ -328,9 +485,21 @@ pub fn resolve_chain(reg: &Registry, path: Option<&Path>, prefix: &[u8]) -> Resu
         }
     }
 
-    let outer = candidates.first().copied().or_else(|| {
-        path.and_then(|p| extensions(p).iter().rev().find_map(|e| reg.by_extension(e)))
-    });
+    let outer = match candidates.first() {
+        Some(id) => Some(*id),
+        None => {
+            let by_name =
+                path.and_then(|p| extensions(p).iter().rev().find_map(|e| reg.by_extension(e)));
+            if let Some(id) = by_name {
+                evidence = match reg.confirm(id, prefix) {
+                    Some(true) => Evidence::Confirmed,
+                    Some(false) => Evidence::Unconfirmed,
+                    None => Evidence::ByName,
+                };
+            }
+            by_name
+        }
+    };
 
     let Some(outer) = outer else {
         return Err(Error::UnknownFormat {
@@ -346,13 +515,14 @@ pub fn resolve_chain(reg: &Registry, path: Option<&Path>, prefix: &[u8]) -> Resu
         return Err(Error::FormatNotEnabled(outer));
     };
 
-    Ok(match kind {
+    let chain = match kind {
         FormatKind::Container => Chain::Container { container: outer },
         FormatKind::Codec => Chain::Codec {
             codec: outer,
             inner: Box::new(inner_from_path(reg, path, outer)),
         },
-    })
+    };
+    Ok((chain, evidence))
 }
 
 /// Builds `innermost` back up under each codec in `layers`, outermost last so
@@ -566,6 +736,120 @@ pub fn resolve_chain_deep_with(
         current_codec = nested;
         src = next_src;
     }
+}
+
+/// Identifies an input for a listing that must not claim what it cannot
+/// show: `Some(chain)` only when every layer is confirmed, `None` for "not
+/// something stuffr opens".
+///
+/// The strict twin of [`resolve_chain`], for `stuffr ls`, which reads a
+/// folder of arbitrary files and has no user naming any of them: a lenient
+/// answer there is a false positive in a list, where for a verb given a file
+/// it is the route to an honest exit 5. Reads nothing — the caller supplies
+/// the probe prefix and, for a seekable file, [`read_tail`]'s tail.
+///
+/// * A foreign tail ([`foreign_from_tail`]) is `None` before anything else.
+/// * The outer layer comes from [`resolve_chain_checked`]; an error or
+///   [`Evidence::Unconfirmed`] is `None`. [`Evidence::ByName`] is accepted:
+///   a magicless format has nothing more to show.
+/// * A container is the answer.
+/// * A codec is decoded from the prefix itself — never from the file — up to
+///   [`PROBE_LEN`] output bytes, keeping what arrives before any error (a
+///   prefix is a truncated stream, so an error at its end is expected). A
+///   decoder that fails before yielding a byte is `None`: the magic and the
+///   check agreed, and the bytes still decode to nothing. Otherwise the
+///   decoded bytes are resolved with no path; a confirmed codec or container
+///   becomes the inner layer (a codec recursively), anything else is
+///   [`Chain::Raw`]. The path's inner extensions are not consulted:
+///   `x.tar.gz` holding no tar is a gzip, whatever its name says.
+///
+/// The nesting is bounded below [`MAX_CHAIN_DEPTH`] codec layers — the most
+/// [`resolve_chain_deep_with`] will open — and a deeper stack stops at
+/// `Raw` rather than failing, because the outer layers did decode.
+pub fn identify_strict(
+    reg: &Registry,
+    path: Option<&Path>,
+    prefix: &[u8],
+    tail: Option<&[u8]>,
+    opts: &DecodeOpts,
+) -> Option<Chain> {
+    if tail.and_then(foreign_from_tail).is_some() {
+        return None;
+    }
+    let (chain, evidence) = resolve_chain_checked(reg, path, prefix).ok()?;
+    if evidence == Evidence::Unconfirmed {
+        return None;
+    }
+    match chain {
+        Chain::Container { .. } => Some(chain),
+        Chain::Codec { codec, .. } => strict_codec_layer(reg, codec, prefix, opts, 1),
+        // `resolve_chain_checked` answers a container or a codec; anything
+        // added to `Chain` later is not something this function can vouch for.
+        _ => None,
+    }
+}
+
+/// One codec layer of [`identify_strict`]: decodes `bytes` through `codec`
+/// and resolves what comes out. `depth` counts the codec layers down to and
+/// including this one.
+fn strict_codec_layer(
+    reg: &Registry,
+    codec: FormatId,
+    bytes: &[u8],
+    opts: &DecodeOpts,
+    depth: usize,
+) -> Option<Chain> {
+    let decoded = decode_prefix(reg, codec, bytes, opts)?;
+    let inner = match resolve_chain_checked(reg, None, &decoded) {
+        Ok((inner @ Chain::Container { .. }, Evidence::Confirmed)) => inner,
+        Ok((Chain::Codec { codec: nested, .. }, Evidence::Confirmed))
+            if depth + 1 < MAX_CHAIN_DEPTH =>
+        {
+            // A nested codec whose own bytes decode to nothing is not a
+            // reason to disown the layer above, which did decode: that layer
+            // is then a codec over opaque bytes.
+            strict_codec_layer(reg, nested, &decoded, opts, depth + 1).unwrap_or(Chain::Raw)
+        }
+        _ => Chain::Raw,
+    };
+    Some(Chain::Codec {
+        codec,
+        inner: Box::new(inner),
+    })
+}
+
+/// Up to [`PROBE_LEN`] bytes of `codec`'s decoding of `bytes`, or `None` when
+/// the decoder fails before producing one (at construction or on its first
+/// read). A failure after some output keeps that output.
+fn decode_prefix(
+    reg: &Registry,
+    codec: FormatId,
+    bytes: &[u8],
+    opts: &DecodeOpts,
+) -> Option<Vec<u8>> {
+    let src = Box::new(crate::source::ReaderSource::new(std::io::Cursor::new(
+        bytes.to_vec(),
+    )));
+    let mut decoder = build_decoder(reg, codec, src, opts).ok()?;
+    let mut out = vec![0u8; PROBE_LEN];
+    let mut filled = 0;
+    let mut failed = false;
+    while filled < PROBE_LEN {
+        match std::io::Read::read(&mut decoder, &mut out[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+    }
+    if failed && filled == 0 {
+        return None;
+    }
+    out.truncate(filled);
+    Some(out)
 }
 
 #[cfg(test)]
@@ -1594,6 +1878,507 @@ mod tests {
         assert_eq!(
             bytes_with_path, bytes_no_path,
             "both routes must leave the source in the identical, already-decoded state"
+        );
+    }
+}
+
+#[cfg(test)]
+mod truthful_identification_tests {
+    //! The confirmation hook, [`Evidence`], [`identify_strict`] and the
+    //! foreign tail. Mock formats only: core has no real format to confirm.
+    use super::*;
+    use crate::archive::{Codec, DecodeOpts, EncodeOpts, Sink};
+    use crate::format::{CodecCaps, ConfirmFn, FormatId, FormatMeta, MagicRule};
+    use crate::registry::Registry;
+    use crate::source::{ReaderSource, SeekRead, Source, SourceCaps, StreamOnly};
+    use crate::testing::{
+        MOCK_CODEC, MOCK_CONTAINER, MockCodec, MockContainer, mock_archive_bytes,
+    };
+    use std::io::{self, Read, Write};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    fn yes(_: &[u8]) -> bool {
+        true
+    }
+
+    fn no(_: &[u8]) -> bool {
+        false
+    }
+
+    /// The UDIF trailer, as the spec states it: `koly`, big-endian version 4,
+    /// big-endian header size 512, zeros for the rest.
+    fn koly(version: u32, size: u32) -> Vec<u8> {
+        let mut t = vec![0u8; TAIL_LEN];
+        t[0..4].copy_from_slice(b"koly");
+        t[4..8].copy_from_slice(&version.to_be_bytes());
+        t[8..12].copy_from_slice(&size.to_be_bytes());
+        t
+    }
+
+    /// An in-memory seekable source: `FileSource` without the file.
+    struct SeekCursor(io::Cursor<Vec<u8>>);
+
+    impl Read for SeekCursor {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl Source for SeekCursor {
+        fn caps(&self) -> SourceCaps {
+            SourceCaps {
+                seekable: true,
+                len: Some(self.0.get_ref().len() as u64),
+            }
+        }
+
+        fn as_seek(&mut self) -> Option<&mut dyn SeekRead> {
+            Some(&mut self.0)
+        }
+    }
+
+    fn zlib_ish_image() -> Vec<u8> {
+        let mut bytes = vec![0x78, 0x9c];
+        bytes.extend(std::iter::repeat_n(0xa5, 1000));
+        bytes.extend(koly(4, 512));
+        bytes
+    }
+
+    #[test]
+    fn foreign_tail_needs_signature_version_and_size() {
+        assert_eq!(
+            foreign_from_tail(&koly(4, 512)),
+            Some(Foreign::AppleDiskImage)
+        );
+        assert_eq!(foreign_from_tail(&koly(3, 512)), None, "version 3");
+        assert_eq!(foreign_from_tail(&koly(4, 256)), None, "header size 256");
+        assert_eq!(foreign_from_tail(&koly(4, 512)[..511]), None, "511 bytes");
+        let mut kolx = koly(4, 512);
+        kolx[3] = b'x';
+        assert_eq!(foreign_from_tail(&kolx), None, "kolx");
+        assert_eq!(
+            Foreign::AppleDiskImage.to_string(),
+            "an Apple disk image (UDIF)"
+        );
+    }
+
+    #[test]
+    fn probe_refuses_a_seekable_source_with_a_koly_tail() {
+        let src: Box<dyn Source> = Box::new(SeekCursor(io::Cursor::new(zlib_ish_image())));
+        match probe(src) {
+            Err(e) => {
+                assert!(
+                    matches!(e, Error::ForeignFormat(Foreign::AppleDiskImage)),
+                    "{e:?}"
+                );
+                assert_eq!(e.exit_code(), 3);
+                assert_eq!(
+                    e.to_string(),
+                    "this is an Apple disk image (UDIF), which stuffr cannot open"
+                );
+            }
+            Ok(_) => panic!("a koly tail must be refused"),
+        }
+    }
+
+    #[test]
+    fn probe_does_not_read_the_tail_of_a_pipe() {
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(io::Cursor::new(zlib_ish_image())));
+        let Ok((prefix, _)) = probe(src) else {
+            panic!("a pipe has no tail to read, so it must probe as before");
+        };
+        assert_eq!(&prefix[..2], &[0x78, 0x9c]);
+    }
+
+    #[test]
+    fn read_tail_leaves_a_seekable_source_at_zero() {
+        let mut bytes = b"HEAD".to_vec();
+        bytes.extend(vec![7u8; 600]);
+        let mut src = SeekCursor(io::Cursor::new(bytes.clone()));
+        let tail = read_tail(&mut src)
+            .unwrap()
+            .expect("600+ bytes have a tail");
+        assert_eq!(tail.len(), TAIL_LEN);
+        assert_eq!(tail, bytes[bytes.len() - TAIL_LEN..]);
+        let mut all = Vec::new();
+        src.read_to_end(&mut all).unwrap();
+        assert_eq!(all, bytes, "the position must be back at byte zero");
+
+        // Shorter than a tail: nothing read, still at zero.
+        let mut short = SeekCursor(io::Cursor::new(b"tiny".to_vec()));
+        assert_eq!(read_tail(&mut short).unwrap(), None);
+        let mut all = Vec::new();
+        short.read_to_end(&mut all).unwrap();
+        assert_eq!(all, b"tiny");
+
+        // A pipe: nothing read.
+        let mut pipe = ReaderSource::new(io::Cursor::new(bytes));
+        assert_eq!(read_tail(&mut pipe).unwrap(), None);
+    }
+
+    const ALPHA: FormatId = FormatId::new("alpha");
+    const BETA: FormatId = FormatId::new("beta");
+    const SHARED_MAGIC: &[MagicRule] = &[
+        MagicRule {
+            offset: 0,
+            bytes: b"SH",
+            format: ALPHA,
+        },
+        MagicRule {
+            offset: 0,
+            bytes: b"SH",
+            format: BETA,
+        },
+    ];
+
+    #[test]
+    fn confirmed_candidate_beats_an_unconfirmed_one() {
+        // Equal priority and no path: without confirmation this is an
+        // `AmbiguousFormat`. Each way round, so the answer is not an accident
+        // of id order.
+        for (alpha_ok, winner) in [(true, ALPHA), (false, BETA)] {
+            let mut r = Registry::new();
+            let (a, b): (ConfirmFn, ConfirmFn) = if alpha_ok { (yes, no) } else { (no, yes) };
+            r.register_codec(
+                Arc::new(MockCodec),
+                FormatMeta::codec(ALPHA, &[], SHARED_MAGIC).with_confirm(a),
+            );
+            r.register_codec(
+                Arc::new(MockCodec),
+                FormatMeta::codec(BETA, &[], SHARED_MAGIC).with_confirm(b),
+            );
+            let (chain, ev) = resolve_chain_checked(&r, None, b"SH..").expect("no ambiguity");
+            assert_eq!(chain.outermost_codec(), Some(winner));
+            assert_eq!(ev, Evidence::Confirmed);
+        }
+    }
+
+    #[test]
+    fn a_format_with_no_confirm_function_counts_as_confirmed() {
+        let mut r = Registry::new();
+        r.register_codec(
+            Arc::new(MockCodec),
+            FormatMeta::codec(ALPHA, &[], SHARED_MAGIC).with_confirm(no),
+        );
+        r.register_codec(
+            Arc::new(MockCodec),
+            FormatMeta::codec(BETA, &[], SHARED_MAGIC),
+        );
+        let (chain, ev) = resolve_chain_checked(&r, None, b"SH..").unwrap();
+        assert_eq!(chain.outermost_codec(), Some(BETA));
+        assert_eq!(ev, Evidence::Confirmed);
+    }
+
+    #[test]
+    fn unconfirmed_magic_still_resolves_leniently() {
+        let mut r = Registry::new();
+        r.register_codec(
+            Arc::new(MockCodec),
+            FormatMeta::codec(ALPHA, &["al"], &SHARED_MAGIC[..1]).with_confirm(no),
+        );
+        let chain = resolve_chain(&r, None, b"SH..").expect("lenient resolution keeps it");
+        assert_eq!(chain.outermost_codec(), Some(ALPHA));
+        let (_, ev) = resolve_chain_checked(&r, None, b"SH..").unwrap();
+        assert_eq!(ev, Evidence::Unconfirmed);
+    }
+
+    #[test]
+    fn extension_without_confirm_is_by_name() {
+        let mut r = Registry::new();
+        r.register_codec(Arc::new(MockCodec), FormatMeta::codec(ALPHA, &["al"], &[]));
+        let (chain, ev) = resolve_chain_checked(&r, Some(Path::new("x.al")), b"whatever").unwrap();
+        assert_eq!(chain.outermost_codec(), Some(ALPHA));
+        assert_eq!(ev, Evidence::ByName);
+    }
+
+    #[test]
+    fn extension_with_failing_confirm_is_unconfirmed() {
+        let mut r = Registry::new();
+        r.register_codec(
+            Arc::new(MockCodec),
+            FormatMeta::codec(ALPHA, &["al"], &[]).with_confirm(no),
+        );
+        let (_, ev) = resolve_chain_checked(&r, Some(Path::new("x.al")), b"whatever").unwrap();
+        assert_eq!(ev, Evidence::Unconfirmed);
+
+        let mut r = Registry::new();
+        r.register_codec(
+            Arc::new(MockCodec),
+            FormatMeta::codec(ALPHA, &["al"], &[]).with_confirm(yes),
+        );
+        let (_, ev) = resolve_chain_checked(&r, Some(Path::new("x.al")), b"whatever").unwrap();
+        assert_eq!(ev, Evidence::Confirmed);
+    }
+
+    #[test]
+    fn errors_are_unchanged() {
+        let r = Registry::new();
+        assert!(matches!(
+            resolve_chain_checked(&r, None, b"??"),
+            Err(Error::UnknownFormat { .. })
+        ));
+        let mut r = Registry::new();
+        r.register_codec(
+            Arc::new(MockCodec),
+            FormatMeta::codec(ALPHA, &[], SHARED_MAGIC).with_confirm(no),
+        );
+        r.register_codec(
+            Arc::new(MockCodec),
+            FormatMeta::codec(BETA, &[], SHARED_MAGIC).with_confirm(no),
+        );
+        assert!(matches!(
+            resolve_chain_checked(&r, None, b"SH"),
+            Err(Error::AmbiguousFormat { .. })
+        ));
+    }
+
+    // --- identify_strict -------------------------------------------------
+
+    const LAYER_MAGIC: &[u8] = b"MOCK";
+
+    /// Strips `LAYER_MAGIC` and passes the rest through — one layer peeled
+    /// per decode, however many are stacked (`MockCodec`'s XOR would undo
+    /// itself every second layer).
+    struct LayerCodec;
+
+    impl Codec for LayerCodec {
+        fn id(&self) -> FormatId {
+            MOCK_CODEC
+        }
+
+        fn caps(&self) -> CodecCaps {
+            CodecCaps::round_trip()
+        }
+
+        fn decoder(&self, mut src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+            let mut discard = [0u8; 4];
+            src.read_exact(&mut discard)?;
+            Ok(Box::new(StreamOnly::new(src)))
+        }
+
+        fn encoder(&self, _dst: Box<dyn Write + Send>, _o: &EncodeOpts) -> Result<Box<dyn Sink>> {
+            unreachable!("identification never encodes")
+        }
+    }
+
+    /// The mock container's record header is `ME` + a little-endian u16 name
+    /// length; a name that runs past the prefix is not a mock archive.
+    fn mock_archive_confirms(p: &[u8]) -> bool {
+        p.len() >= 4 && {
+            let n = u16::from_le_bytes([p[2], p[3]]) as usize;
+            n > 0 && 4 + n <= p.len()
+        }
+    }
+
+    fn strict_registry() -> Registry {
+        const CODEC_MAGIC: &[MagicRule] = &[MagicRule {
+            offset: 0,
+            bytes: LAYER_MAGIC,
+            format: MOCK_CODEC,
+        }];
+        const CONTAINER_MAGIC: &[MagicRule] = &[MagicRule {
+            offset: 0,
+            bytes: b"ME",
+            format: MOCK_CONTAINER,
+        }];
+        let mut r = Registry::new();
+        r.register_codec(
+            Arc::new(LayerCodec),
+            FormatMeta::codec(MOCK_CODEC, &["mock"], CODEC_MAGIC)
+                .with_confirm(|p| p.starts_with(LAYER_MAGIC)),
+        );
+        r.register_container(
+            Arc::new(MockContainer),
+            FormatMeta::container(MOCK_CONTAINER, &["mar"], CONTAINER_MAGIC)
+                .with_confirm(mock_archive_confirms),
+        );
+        r
+    }
+
+    fn layered(layers: usize, inner: &[u8]) -> Vec<u8> {
+        let mut out = LAYER_MAGIC.repeat(layers);
+        out.extend_from_slice(inner);
+        out
+    }
+
+    fn strict(
+        r: &Registry,
+        path: Option<&str>,
+        prefix: &[u8],
+        tail: Option<&[u8]>,
+    ) -> Option<Chain> {
+        identify_strict(r, path.map(Path::new), prefix, tail, &DecodeOpts::default())
+    }
+
+    #[test]
+    fn identify_strict_rejects_unconfirmed_and_foreign() {
+        let r = strict_registry();
+        assert_eq!(
+            strict(&r, None, b"ME\xff\xffabc", None),
+            None,
+            "a magic hit whose confirmation fails is not openable"
+        );
+        let archive = mock_archive_bytes(&[("a.txt", b"alpha")]);
+        assert_eq!(
+            strict(&r, None, &archive, None),
+            Some(Chain::Container {
+                container: MOCK_CONTAINER
+            })
+        );
+        assert_eq!(
+            strict(&r, None, &archive, Some(&koly(4, 512))),
+            None,
+            "a koly tail outranks a confirmed prefix"
+        );
+        assert_eq!(strict(&r, None, b"nothing", None), None, "unknown");
+    }
+
+    #[test]
+    fn identify_strict_decodes_the_inner_layer_from_the_prefix() {
+        let r = strict_registry();
+        let archive = mock_archive_bytes(&[("a.txt", b"alpha")]);
+        assert_eq!(
+            strict(&r, None, &layered(1, &archive), None),
+            Some(Chain::Codec {
+                codec: MOCK_CODEC,
+                inner: Box::new(Chain::Container {
+                    container: MOCK_CONTAINER
+                }),
+            })
+        );
+        assert_eq!(
+            strict(&r, Some("x.mar.mock"), &layered(1, b"ME\xff\xffabc"), None),
+            Some(Chain::Codec {
+                codec: MOCK_CODEC,
+                inner: Box::new(Chain::Raw),
+            }),
+            "an inner layer failing confirmation is Raw, whatever the path says"
+        );
+    }
+
+    #[test]
+    fn identify_strict_bounds_the_nesting() {
+        let r = strict_registry();
+        let archive = mock_archive_bytes(&[("a.txt", b"alpha")]);
+        let depth = |c: &Chain| {
+            let mut n = 0;
+            let mut c = c;
+            while let Chain::Codec { inner, .. } = c {
+                n += 1;
+                c = inner;
+            }
+            n
+        };
+        let three = strict(&r, None, &layered(3, &archive), None).unwrap();
+        assert_eq!(depth(&three), 3);
+        assert_eq!(three.container(), Some(MOCK_CONTAINER));
+        let many = strict(&r, None, &layered(10, &archive), None).unwrap();
+        assert!(depth(&many) < MAX_CHAIN_DEPTH, "{many:?}");
+        assert_eq!(many.container(), None, "stopped with Raw at the bound");
+    }
+
+    /// A codec whose decoder yields `yields` and then either errors or ends.
+    struct Scripted {
+        yields: &'static [u8],
+        then_error: bool,
+    }
+
+    struct ScriptedSource {
+        rest: &'static [u8],
+        then_error: bool,
+    }
+
+    impl Read for ScriptedSource {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.rest.is_empty() {
+                return if self.then_error {
+                    Err(io::Error::new(io::ErrorKind::InvalidData, "bad stream"))
+                } else {
+                    Ok(0)
+                };
+            }
+            let n = buf.len().min(self.rest.len());
+            buf[..n].copy_from_slice(&self.rest[..n]);
+            self.rest = &self.rest[n..];
+            Ok(n)
+        }
+    }
+
+    impl Source for ScriptedSource {
+        fn caps(&self) -> SourceCaps {
+            SourceCaps::default()
+        }
+
+        fn as_seek(&mut self) -> Option<&mut dyn SeekRead> {
+            None
+        }
+    }
+
+    impl Codec for Scripted {
+        fn id(&self) -> FormatId {
+            MOCK_CODEC
+        }
+
+        fn caps(&self) -> CodecCaps {
+            CodecCaps::decode_only()
+        }
+
+        fn decoder(&self, _src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+            Ok(Box::new(ScriptedSource {
+                rest: self.yields,
+                then_error: self.then_error,
+            }))
+        }
+
+        fn encoder(&self, _dst: Box<dyn Write + Send>, _o: &EncodeOpts) -> Result<Box<dyn Sink>> {
+            unreachable!("identification never encodes")
+        }
+    }
+
+    fn scripted_registry(yields: &'static [u8], then_error: bool) -> Registry {
+        let mut r = strict_registry();
+        r.register_codec(
+            Arc::new(Scripted { yields, then_error }),
+            FormatMeta::codec(
+                MOCK_CODEC,
+                &["mock"],
+                &[MagicRule {
+                    offset: 0,
+                    bytes: LAYER_MAGIC,
+                    format: MOCK_CODEC,
+                }],
+            )
+            .with_confirm(yes),
+        );
+        r
+    }
+
+    #[test]
+    fn identify_strict_drops_a_codec_that_decodes_nothing() {
+        let raw = Some(Chain::Codec {
+            codec: MOCK_CODEC,
+            inner: Box::new(Chain::Raw),
+        });
+        assert_eq!(
+            strict(&scripted_registry(b"", true), None, b"MOCKjunk", None),
+            None,
+            "an error before the first byte: nothing here decodes"
+        );
+        assert_eq!(
+            strict(&scripted_registry(b"", false), None, b"MOCKjunk", None),
+            raw,
+            "a clean, empty stream is still a stream"
+        );
+        assert_eq!(
+            strict(
+                &scripted_registry(b"plain text", true),
+                None,
+                b"MOCKjunk",
+                None
+            ),
+            raw,
+            "what arrived before the error is kept"
         );
     }
 }

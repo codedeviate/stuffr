@@ -606,6 +606,7 @@ fn a_registry_with_two_non_gzip_codecs_reports_ambiguity_rather_than_guessing() 
                 extensions: &[],
                 magics: &[],
                 priority: 0,
+                confirm: None,
             },
         );
     }

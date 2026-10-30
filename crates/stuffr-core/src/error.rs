@@ -80,6 +80,20 @@ pub enum Error {
     /// rather than a bare refusal.
     #[error("{chain} is not an archive — it has no entries to list")]
     NotAnArchive { chain: String },
+
+    /// The input is a format stuffr recognises and cannot open — an Apple
+    /// disk image, found by its `koly` trailer
+    /// ([`crate::probe::foreign_from_tail`]). Raised by
+    /// [`crate::probe::probe`] before any magic is consulted, because such a
+    /// file's first bytes can carry a codec's magic (a UDZO image begins with
+    /// a zlib stream) and would otherwise be decoded as that codec, ending in
+    /// a corrupt-stream error that blames the file for being what it is.
+    ///
+    /// Exit 3, "this build cannot do that", alongside `Unsupported`: naming a
+    /// file stuffr does not open is a capability limit, not corruption and
+    /// not a usage mistake. No `#[from]`: nothing converts into it.
+    #[error("this is {0}, which stuffr cannot open")]
+    ForeignFormat(crate::probe::Foreign),
 }
 
 impl Error {
@@ -232,6 +246,11 @@ impl Error {
             // `UnknownFormat`/`AmbiguousFormat` pair. Found by Phase 3a's
             // honesty oracle (`honesty.rs`), before the fuzzer had run once.
             Error::NotSeekable { .. } => 3,
+            // A recognised format this build does not open (an Apple disk
+            // image): the same capability answer as `Unsupported`, and
+            // explicit so the wildcard below can never report it as stuffr
+            // failing.
+            Error::ForeignFormat(_) => 3,
             Error::FidelityDegraded(_) => 4,
             Error::Corrupt(_) => 5,
             // A nesting bound is a bound on WORK, the same family as the

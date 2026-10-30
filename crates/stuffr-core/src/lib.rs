@@ -38,12 +38,14 @@ pub use display::fmt_name;
 pub use error::{Error, Result};
 pub use fidelity::{Fidelity, FidelityReport, MetaFields, Rung};
 pub use format::{
-    CodecCaps, ContainerCaps, CorruptionDetection, FormatId, FormatKind, FormatMeta, MagicRule,
+    CodecCaps, ConfirmFn, ContainerCaps, CorruptionDetection, FormatId, FormatKind, FormatMeta,
+    MagicRule,
 };
 pub use governor::{BudgetInputs, Governor, LeaseSet, default_memory_limit, resolve_workers};
 pub use ladder::{Resolved, StreamPolicy, resolve};
 pub use probe::{
-    Chain, PROBE_LEN, chain_for_new_path, probe, resolve_chain, resolve_chain_deep,
+    Chain, Evidence, Foreign, PROBE_LEN, TAIL_LEN, chain_for_new_path, foreign_from_tail,
+    identify_strict, probe, read_tail, resolve_chain, resolve_chain_checked, resolve_chain_deep,
     resolve_chain_deep_with,
 };
 pub use registry::{FormatRow, Registry};
