@@ -36,7 +36,9 @@
 //! window too (`FullReset`), so a reset member costs nearly what a new one
 //! does. The bound is on work instead: [`FREE_MEMBERS`] members are free, and
 //! each further one must be paid for by [`BYTES_PER_MEMBER`] bytes read or
-//! decoded, or the stream is refused as a resource limit (exit 6). A gzip
+//! decoded, or the stream is refused as a resource limit (exit 6). A member
+//! pays for at most itself — its bytes count up to [`BYTES_PER_MEMBER`] and
+//! no further — so one large member cannot buy a run of empty ones. A gzip
 //! member is at least 20 bytes and a bzip2 stream 14, so a run of empty ones
 //! still exhausts the budget within a few thousand (~6,000 for gzip), while
 //! any member carrying real data pays its way: one 40-byte log line appended
@@ -151,14 +153,27 @@ pub(crate) const FREE_MEMBERS: u64 = 4096;
 /// where it was unbounded per input byte before (a 20 MB file: tens of GB).
 pub(crate) const BYTES_PER_MEMBER: u64 = 64;
 
-/// Counts the members a multi-member decoder starts against the bytes it
-/// reads and produces; see the module doc for why.
+/// Counts the members a multi-member decoder starts against the bytes each
+/// member moved; see the module doc for why.
+///
+/// **Each member is credited at most [`BYTES_PER_MEMBER`]**, however much it
+/// moved. Pooling the bytes over the whole stream (the first version) let one
+/// bomb member pay for the rest: 64 MB of zeros deflate to ~62 KB, and that
+/// one member bought a million empty ones (~40 GB of zeroing) at a ratio
+/// `--max-ratio` reads as ~3:1 (the T10 re-review's I1). Capped, a member can
+/// pay for at most itself, so members that move less than the price — empty
+/// ones above all — run the free allowance down whatever came before them.
 pub(crate) struct MemberBudget {
     format: FormatId,
     /// Members started, the first included.
     started: u64,
-    /// Decoded bytes handed to the caller.
+    /// Decoded bytes handed to the caller, in all.
     produced: u64,
+    /// Sum over finished members of `min(bytes moved, BYTES_PER_MEMBER)`.
+    credit: u64,
+    /// Bytes read and decoded when the current member started.
+    mark_read: u64,
+    mark_produced: u64,
 }
 
 impl MemberBudget {
@@ -168,6 +183,9 @@ impl MemberBudget {
             format,
             started: 1,
             produced: 0,
+            credit: 0,
+            mark_read: 0,
+            mark_produced: 0,
         }
     }
 
@@ -181,15 +199,21 @@ impl MemberBudget {
     /// `Error::ResourceLimit`, exit 6).
     pub(crate) fn start_member<R>(&mut self, r: &PeekBuf<R>) -> io::Result<()> {
         let read = r.taken;
-        let allowance = FREE_MEMBERS + (read + self.produced) / BYTES_PER_MEMBER;
+        // What the member that just ended moved, capped at its price.
+        let moved = (read - self.mark_read) + (self.produced - self.mark_produced);
+        self.credit += moved.min(BYTES_PER_MEMBER);
+        self.mark_read = read;
+        self.mark_produced = self.produced;
+        let allowance = FREE_MEMBERS + self.credit / BYTES_PER_MEMBER;
         if self.started >= allowance {
             return Err(io::Error::new(
                 ErrorKind::OutOfMemory,
                 format!(
                     "the {} stream starts more members than its size accounts for: {} members \
                      in {read} bytes read, {} bytes decoded (at most {FREE_MEMBERS}, plus one \
-                     per {BYTES_PER_MEMBER} bytes read or decoded); refused, since every member \
-                     costs a fresh decoder",
+                     per {BYTES_PER_MEMBER} bytes read or decoded, each member counting at \
+                     most {BYTES_PER_MEMBER}); refused, since every member costs a fresh \
+                     decoder",
                     self.format,
                     self.started + 1,
                     self.produced

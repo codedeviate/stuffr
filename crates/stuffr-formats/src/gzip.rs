@@ -77,9 +77,11 @@ const GZIP_MAGIC: &[MagicRule] = &[MagicRule {
 struct MultiMemberGzip<'a> {
     /// `None` once the stream has ended (or failed); see `failed`.
     cur: Option<GzMemberDecoder<PeekBuf<Box<dyn Source + 'a>>>>,
-    /// Set when the tail check refused: later reads repeat the refusal
-    /// instead of reporting a clean end.
-    failed: bool,
+    /// Set when the tail check or the member budget refused: later reads
+    /// repeat that refusal — its kind and its message — instead of reporting
+    /// a clean end. The kind matters: a budget refusal is `OutOfMemory`
+    /// (exit 6), and repeating it as `InvalidData` turned it into exit 5.
+    failed: Option<(std::io::ErrorKind, String)>,
     sink: FidelitySink,
     /// Bounds the members started against the bytes moved (N1).
     budget: MemberBudget,
@@ -89,7 +91,7 @@ impl<'a> MultiMemberGzip<'a> {
     fn new(src: Box<dyn Source + 'a>, sink: FidelitySink) -> Self {
         Self {
             cur: Some(GzMemberDecoder::new(PeekBuf::new(src))),
-            failed: false,
+            failed: None,
             sink,
             budget: MemberBudget::new(GZIP),
         }
@@ -127,11 +129,8 @@ impl std::io::Read for MultiMemberGzip<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
             let Some(dec) = self.cur.as_mut() else {
-                if self.failed {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "gzip stream previously failed to decode",
-                    ));
+                if let Some((kind, msg)) = &self.failed {
+                    return Err(std::io::Error::new(*kind, msg.clone()));
                 }
                 return Ok(0);
             };
@@ -141,7 +140,7 @@ impl std::io::Read for MultiMemberGzip<'_> {
                     match member_tail::after_member(&mut rest, &TAIL_RULE, &self.sink) {
                         Ok(true) => {
                             if let Err(e) = self.budget.start_member(&rest) {
-                                self.failed = true;
+                                self.failed = Some((e.kind(), e.to_string()));
                                 return Err(e);
                             }
                             self.cur = Some(GzMemberDecoder::new(rest));
@@ -149,7 +148,7 @@ impl std::io::Read for MultiMemberGzip<'_> {
                         }
                         Ok(false) => return Ok(0),
                         Err(e) => {
-                            self.failed = true;
+                            self.failed = Some((e.kind(), e.to_string()));
                             return Err(e);
                         }
                     }
@@ -522,6 +521,38 @@ mod tests {
             6,
             "a work limit, not corruption"
         );
+    }
+
+    /// The T10 re-review's I1: one member that decodes to a lot (64 MiB of
+    /// zeros) must not pay for a run of empty members after it — a member is
+    /// credited at most `BYTES_PER_MEMBER` of its own bytes. The refusal is
+    /// repeated with its own kind on a later read (M2: it was `InvalidData`,
+    /// exit 5).
+    #[test]
+    fn a_bomb_member_does_not_pay_for_a_run_of_empty_members() {
+        use crate::member_tail::FREE_MEMBERS;
+        // Pooled over the stream (the first version), the bomb's 64 MiB bought
+        // ~1M members, so all 100,000 empty ones decoded and nothing refused.
+        let bomb = compress(&vec![0u8; 64 << 20]);
+        let empties = compress(b"").repeat(100_000);
+        let mut m = MultiMemberGzip::new(
+            Box::new(ReaderSource::new(std::io::Cursor::new(
+                [bomb, empties].concat(),
+            ))),
+            FidelitySink::new(),
+        );
+        let mut sink = std::io::sink();
+        let err = std::io::copy(&mut m, &mut sink).expect_err("refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::OutOfMemory, "{err}");
+        let started = m.budget.started();
+        assert!(
+            started < 2 * FREE_MEMBERS,
+            "{started} decoders: the bomb bought empty members"
+        );
+        let again = m.read(&mut [0u8; 16]).expect_err("still refused");
+        assert_eq!(again.kind(), std::io::ErrorKind::OutOfMemory, "{again}");
+        assert_eq!(again.to_string(), err.to_string());
+        assert_eq!(stuffr_core::Error::from_decode_io(again).exit_code(), 6);
     }
 
     /// The other side: members that each move their share of bytes are never
