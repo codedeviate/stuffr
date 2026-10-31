@@ -197,12 +197,6 @@ mod differential {
     fn sym_lz_to_fz(d: &Path) {
         std::os::unix::fs::symlink("f.Z", d.join("l.Z")).unwrap();
     }
-    fn dangling_fz(d: &Path) {
-        std::os::unix::fs::symlink("t", d.join("f.Z")).unwrap();
-    }
-    fn dangling_f(d: &Path) {
-        std::os::unix::fs::symlink("t", d.join("f")).unwrap();
-    }
     fn mkdir_dir(d: &Path) {
         std::fs::create_dir(d.join("dir")).unwrap();
     }
@@ -349,7 +343,7 @@ mod differential {
 
     /// Review Focus 1 without a terminal: an existing output is refused
     /// (`already exists`, exit 1, both files kept) unless `-f`; `-c` never
-    /// looks; a directory or a dangling link in the output's place.
+    /// looks; a directory in the output's place.
     #[test]
     fn existing_outputs_match_apple() {
         let Some(x) = fixtures() else { return };
@@ -367,14 +361,8 @@ mod differential {
                 mkdir_fz,
             ),
             set(case("compress", &["f"], vec![("f", x.f.clone())]), mkdir_fz),
-            set(
-                case("compress", &["f"], vec![("f", x.f.clone())]),
-                dangling_fz,
-            ),
-            set(
-                case("uncompress", &["f.Z"], vec![("f.Z", x.fz.clone())]),
-                dangling_f,
-            ),
+            // A dangling link in the output's place: deviation A5
+            // (`deviations::a5_*`).
             // Standard input is a terminal but standard error is not: no
             // question, the refusal.
             {
@@ -983,6 +971,111 @@ mod deviations {
             if let Some((bytes, _, mtime)) = s.tree.get("hdr") {
                 assert!(bytes.is_empty());
                 assert_eq!(*mtime, INPUT_MTIME as i64);
+            }
+        }
+    }
+    fn live_out(d: &Path, name: &str) {
+        std::fs::write(d.join("t"), b"old target").unwrap();
+        std::os::unix::fs::symlink("t", d.join(name)).unwrap();
+    }
+    fn live_fz(d: &Path) {
+        live_out(d, "f.Z");
+    }
+    fn live_f(d: &Path) {
+        live_out(d, "f");
+    }
+    fn dangling_fz(d: &Path) {
+        std::os::unix::fs::symlink("t", d.join("f.Z")).unwrap();
+    }
+    fn dangling_f(d: &Path) {
+        std::os::unix::fs::symlink("t", d.join("f")).unwrap();
+    }
+
+    /// A5: a symlink at the output name, live or dangling. Apple follows
+    /// it: without `-f` a dangling one looks absent and the output is
+    /// written to the file it names (`t` created), with `-f` a live one is
+    /// truncated through. stuffr treats it as an existing file: refused
+    /// without `-f` (`already exists`, exit 1, link kept, `t` as it was or
+    /// absent); with `-f` the link is replaced by a regular file holding
+    /// the output and `t` is untouched.
+    #[test]
+    fn a5_a_symlink_at_the_output_name_is_never_written_through() {
+        let Some(x) = fixtures() else { return };
+        type Row<'a> = (
+            &'a str,
+            &'a str,
+            (&'a str, Vec<u8>),
+            &'a str,
+            fn(&Path),
+            bool,
+        );
+        let rows: [Row; 4] = [
+            (
+                "compress",
+                "f",
+                ("f", x.f.clone()),
+                "f.Z",
+                dangling_fz,
+                false,
+            ),
+            ("compress", "f", ("f", x.f.clone()), "f.Z", live_fz, true),
+            (
+                "uncompress",
+                "f.Z",
+                ("f.Z", x.fz.clone()),
+                "f",
+                dangling_f,
+                false,
+            ),
+            (
+                "uncompress",
+                "f.Z",
+                ("f.Z", x.fz.clone()),
+                "f",
+                live_f,
+                true,
+            ),
+        ];
+        for (tool, operand, input, out, setup, live) in rows {
+            let what = format!("{tool} {operand}, {out} live {live}");
+            let want = if tool == "compress" { &x.fz } else { &x.f };
+            let mut c = case(tool, &[operand], vec![input.clone()]);
+            c.setup = Some(setup);
+            let Some((r, s)) = both(&c) else { return };
+            if !live {
+                // The reference wrote through the dangling link.
+                assert_eq!(r.code, 0, "reference, {what}: {}", r.stderr);
+                assert!(
+                    r.tree.get("t").is_some_and(|t| t.0 == *want),
+                    "reference, {what}"
+                );
+            }
+            assert_eq!(
+                (s.code, s.stderr.as_str()),
+                (1, format!("{tool}: {out} already exists\n").as_str()),
+                "stuffr, {what}"
+            );
+            assert_eq!(s.tree[out].0, b"t", "stuffr, {what}: link replaced");
+            assert!(s.tree.contains_key(input.0), "stuffr, {what}: input gone");
+            if live {
+                assert_eq!(s.tree["t"].0, b"old target", "stuffr, {what}");
+            } else {
+                assert!(!s.tree.contains_key("t"), "stuffr, {what}: t created");
+            }
+
+            let mut c = case(tool, &["-f", operand], vec![input.clone()]);
+            c.setup = Some(setup);
+            let Some((r, s)) = both(&c) else { return };
+            if live {
+                assert_eq!(r.tree["t"].0, *want, "reference -f, {what}");
+            }
+            assert_eq!((s.code, s.stderr.as_str()), (0, ""), "stuffr -f, {what}");
+            assert_eq!(s.tree[out].0, *want, "stuffr -f, {what}");
+            assert!(!s.tree.contains_key(input.0), "stuffr -f, {what}");
+            if live {
+                assert_eq!(s.tree["t"].0, b"old target", "stuffr -f, {what}");
+            } else {
+                assert!(!s.tree.contains_key("t"), "stuffr -f, {what}: t created");
             }
         }
     }

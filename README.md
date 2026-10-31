@@ -1780,6 +1780,15 @@ the output.
   end of the stream, publishes the cut-short output and removes the input,
   exit 0, and the data is lost. stuffr warns (`uncompress: NAME: <strerror>`),
   exit 1, removes the output and keeps the input.
+- **A5 (hardening).** A symlink at an output name is never written through.
+  Apple checks for an existing output with `stat`, so a dangling symlink
+  looks absent and the write creates the file it names, and a live one is
+  truncated through. stuffr treats any symlink there as an existing file
+  (`already exists`, or the question); `-f` (or `y`) replaces the link with
+  a fresh file and leaves its target alone. A new output is created 0600
+  and given the input's mode, owner, times and flags through its
+  descriptor at the end (Apple sets them by name), so a private input is
+  never readable through its output while it is written.
 - **Smaller points.** The overwrite question's answer is judged by the C
   locale (`y` or `Y`); undefined behaviour (a table chain longer than 65536
   entries, an encoder writing past its buffer after a failed write) is not

@@ -279,11 +279,14 @@ impl Run<'_, '_> {
         };
         let sb = fs::metadata(self.path(o)).ok();
         let is_reg = sb.as_ref().is_some_and(Metadata::is_file);
-        if !self.force && is_reg && !self.cat && !self.permission(o) {
+        // Deviation A5: a symlink at the name, live or dangling, exists,
+        // and is replaced by the output, never followed.
+        let is_link = fs::symlink_metadata(self.path(o)).is_ok_and(|m| m.file_type().is_symlink());
+        if !self.force && (is_reg || is_link) && !self.cat && !self.permission(o) {
             self.cwarnx(m::ALREADY_EXISTS, &[o]);
             return Err(());
         }
-        let oreg = sb.is_none() || is_reg;
+        let oreg = sb.is_none() || is_reg || is_link;
         Ok((sb, oreg))
     }
 
@@ -346,10 +349,17 @@ impl Run<'_, '_> {
 
     /// Open where the output is written: the output itself, or for
     /// deviation A2 (the output is the input, through a link) a temporary
-    /// beside it.
-    fn open_output(&mut self, out: Name, same: bool) -> io::Result<(Target, Option<File>)> {
+    /// beside it. Deviation A5: the output is never opened through a
+    /// symlink (`host::create_output`), and a file this run creates is
+    /// created 0600; the returned descriptor gives it [`Run::setfile`]'s
+    /// mode, or on drop the mode Apple creates it with.
+    fn open_output(
+        &mut self,
+        out: Name,
+        same: bool,
+    ) -> io::Result<(Target, Option<File>, Option<host::OutFd>)> {
         let Name::File(o) = out else {
-            return Ok((Target::Stdout, None));
+            return Ok((Target::Stdout, None, None));
         };
         let path = self.path(o);
         if same {
@@ -359,6 +369,7 @@ impl Run<'_, '_> {
             };
             let (tmp, f, guard) =
                 host::create_temp_armed(self.host, &dir, "compress", TEMP_SIGNALS)?;
+            let fd = host::OutFd::new(&f, true);
             return Ok((
                 Target::Temp {
                     tmp,
@@ -366,14 +377,13 @@ impl Run<'_, '_> {
                     _guard: guard,
                 },
                 Some(f),
+                fd,
             ));
         }
-        let f = File::options()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)?;
-        Ok((Target::Direct(path), Some(f)))
+        let fresh = host::output_is_fresh(&path);
+        let f = host::create_output(&path, 0o600)?;
+        let fd = host::OutFd::new(&f, fresh);
+        Ok((Target::Direct(path), Some(f), fd))
     }
 
     /// The failure path's `unlink(out)` (only a regular output not
@@ -455,7 +465,7 @@ impl Run<'_, '_> {
             return;
         }
         let same = self.is_same(&sb, &isb);
-        let (target, file) = match self.open_output(out, same) {
+        let (target, file, mut fd) = match self.open_output(out, same) {
             Ok(t) => t,
             Err(e) => {
                 self.cwarn_io(out_shown, &e);
@@ -528,8 +538,9 @@ impl Run<'_, '_> {
             return;
         }
         let Name::File(i) = inp else { return };
-        let out_path = self.path(out_shown);
-        self.setfile(out_shown, &out_path, isb);
+        if let Some(fd) = fd.as_mut() {
+            self.setfile(out_shown, fd, isb);
+        }
         if let Err(e) = fs::remove_file(self.path(i)) {
             self.cwarn_io(i, &e);
         }
@@ -568,7 +579,7 @@ impl Run<'_, '_> {
         // (deviation A3).
         debug_assert!(nr > 0 || dec.was_empty());
         let same = self.is_same(&sb, &isb);
-        let (target, file) = match self.open_output(out, same) {
+        let (target, file, mut fd) = match self.open_output(out, same) {
             Ok(t) => t,
             Err(e) => {
                 self.cwarn_io(out_shown, &e);
@@ -636,7 +647,9 @@ impl Run<'_, '_> {
         }
         let Name::File(i) = inp else { return };
         let out_path = self.path(out_shown);
-        self.setfile(out_shown, &out_path, isb);
+        if let Some(fd) = fd.as_mut() {
+            self.setfile(out_shown, fd, isb);
+        }
         if let Err(e) = fs::remove_file(self.path(i)) {
             self.cwarn_io(i, &e);
         }
@@ -661,15 +674,16 @@ impl Run<'_, '_> {
     }
 
     /// `setfile(name, fs)`: times, owner (a refusal drops set-id bits),
-    /// mode, file flags, each by path, each failure a warning.
-    fn setfile(&mut self, shown: &[u8], path: &Path, fs: &Metadata) {
+    /// mode, file flags, each failure a warning. Apple sets them by path;
+    /// deviation A5 (HOST-8): through the output's own descriptor, so a
+    /// name swapped for a symlink meanwhile is never followed.
+    fn setfile(&mut self, shown: &[u8], out: &mut host::OutFd, fs: &Metadata) {
+        out.settle();
         #[cfg(unix)]
         {
-            use std::os::unix::ffi::OsStrExt;
+            use std::os::fd::AsRawFd;
             use std::os::unix::fs::MetadataExt;
-            let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-                return;
-            };
+            let fd = out.file().as_raw_fd();
             let errno = || io::Error::last_os_error().raw_os_error().unwrap_or(0);
             let mut mode = fs.mode() & 0o6777;
             let times = [
@@ -682,13 +696,14 @@ impl Run<'_, '_> {
                     tv_nsec: fs.mtime_nsec() as libc::c_long,
                 },
             ];
-            // SAFETY: `c` is a NUL-terminated path and `times` two timespecs.
-            if unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) } != 0 {
+            // SAFETY: `fd` is the output's open descriptor, `times` two
+            // timespecs.
+            if unsafe { libc::futimens(fd, times.as_ptr()) } != 0 {
                 let e = host::errno_text(errno());
                 self.cwarn(m::UTIMENSAT, &[shown], &e);
             }
             // SAFETY: as above.
-            if unsafe { libc::chown(c.as_ptr(), fs.uid(), fs.gid()) } != 0 {
+            if unsafe { libc::fchown(fd, fs.uid(), fs.gid()) } != 0 {
                 let n = errno();
                 if n != libc::EPERM {
                     self.cwarn(m::CHOWN, &[shown], &host::errno_text(n));
@@ -696,7 +711,7 @@ impl Run<'_, '_> {
                 mode &= !0o6000;
             }
             // SAFETY: as above.
-            if unsafe { libc::chmod(c.as_ptr(), mode as libc::mode_t) } != 0 {
+            if unsafe { libc::fchmod(fd, mode as libc::mode_t) } != 0 {
                 let n = errno();
                 if n != libc::EOPNOTSUPP {
                     self.cwarn(m::CHMOD, &[shown], &host::errno_text(n));
@@ -706,7 +721,7 @@ impl Run<'_, '_> {
             {
                 use std::os::macos::fs::MetadataExt as _;
                 // SAFETY: as above.
-                if unsafe { libc::chflags(c.as_ptr(), fs.st_flags() as _) } != 0 {
+                if unsafe { libc::fchflags(fd, fs.st_flags() as _) } != 0 {
                     let n = errno();
                     if n != libc::EOPNOTSUPP {
                         self.cwarn(m::CHFLAGS, &[shown], &host::errno_text(n));
@@ -716,7 +731,7 @@ impl Run<'_, '_> {
         }
         #[cfg(not(unix))]
         {
-            let _ = (shown, path, fs);
+            let _ = (shown, fs);
         }
     }
 }

@@ -97,6 +97,21 @@
 //!   output keeps what was written) and keeps the input (ruling E7). A read
 //!   error inside the 3-byte header stays Apple's `Inappropriate file type
 //!   or format`.
+//! - **A5.** Hardening (ruling T5 of the 2026-10-31 security audit): a
+//!   symlink at an output name is never written through. Apple checks for
+//!   an existing output with `stat` and opens it `fopen(.., "w")`, so a
+//!   dangling symlink looks absent and the write creates the file it
+//!   names, a live one is truncated through, and `setfile` sets the
+//!   times, owner, mode and flags by name. stuffr checks with `lstat`: a
+//!   symlink, dangling or not, is an existing file (`already exists`, or
+//!   the question); overwriting it (`-f`, or `y`) unlinks the link and
+//!   creates a fresh file (`O_NOFOLLOW`), its target untouched. A file it
+//!   creates is created 0600 and given the input's mode, owner, times and
+//!   flags through its own descriptor at the end (a run that ends first
+//!   gives it Apple's 0666 less the umask), so a private input is never
+//!   readable through its output while it is written, and a "no saving"
+//!   or failed output removed is always the file this run created. Why: a
+//!   planted link must not redirect a write.
 //! - The overwrite question's answer is judged by the C locale's
 //!   `rpmatch` (`y` or `Y`), whatever `LC_MESSAGES` says; Apple loads the
 //!   user's locale first.

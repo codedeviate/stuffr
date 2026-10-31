@@ -380,6 +380,8 @@ impl Run<'_, '_> {
         self.ifname = tempname.clone();
 
         let out_path = self.path(&ofname);
+        // A second descriptor of the output, for `copy_stat` (HOST-8).
+        let mut out_fd = None;
         let mut out = if !self.s.zcat {
             // `access(ofname, F_OK)`: follows a link.
             if fs::metadata(&out_path).is_ok() {
@@ -405,6 +407,7 @@ impl Run<'_, '_> {
             let file = match host::create_excl_armed(self.host, &out_path) {
                 Ok((f, guard)) => {
                     self.armed = Some(guard);
+                    out_fd = f.try_clone().ok();
                     f
                 }
                 Err(e) => {
@@ -473,7 +476,7 @@ impl Run<'_, '_> {
                     }
                     let _ = self.err.write_all(m::NEWLINE.as_bytes());
                 }
-                self.copy_stat(&ofname, &infstat);
+                self.copy_stat(&ofname, out_fd.as_ref(), &infstat);
                 self.armed = None;
                 if !self.s.keep
                     && let Err(e) = fs::remove_file(&in_path)
@@ -530,36 +533,46 @@ impl Run<'_, '_> {
         self.perror_text(b"stdin", &text);
     }
 
-    /// `utime`, `chmod` (`st_mode & 07777`), `chown`, each by name, each
-    /// failure reported and ignored.
-    fn copy_stat(&mut self, ofname: &[u8], st: &Metadata) {
+    /// `utime`, `chmod` (`st_mode & 07777`), `chown`, each failure
+    /// reported and ignored. ncompress sets them by name; stuffr through
+    /// the output's own descriptor `out` (HOST-8: a name swapped for a
+    /// symlink meanwhile is never followed), the times in whole seconds as
+    /// `utime` gives them.
+    fn copy_stat(&mut self, ofname: &[u8], out: Option<&File>, st: &Metadata) {
         #[cfg(unix)]
         {
-            use std::os::unix::ffi::OsStrExt;
+            use std::os::fd::AsRawFd;
             use std::os::unix::fs::MetadataExt;
-            let path = self.path(ofname);
-            let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            let Some(out) = out else {
                 return;
             };
+            let fd = out.as_raw_fd();
             let last = || io::Error::last_os_error();
-            let times = libc::utimbuf {
-                actime: st.atime() as libc::time_t,
-                modtime: st.mtime() as libc::time_t,
-            };
-            // SAFETY: `c` is a NUL-terminated path and `times` a utimbuf.
-            if unsafe { libc::utime(c.as_ptr(), &times) } != 0 {
+            let times = [
+                libc::timespec {
+                    tv_sec: st.atime() as libc::time_t,
+                    tv_nsec: 0,
+                },
+                libc::timespec {
+                    tv_sec: st.mtime() as libc::time_t,
+                    tv_nsec: 0,
+                },
+            ];
+            // SAFETY: `fd` is the output's open descriptor, `times` two
+            // timespecs.
+            if unsafe { libc::futimens(fd, times.as_ptr()) } != 0 {
                 let e = last();
                 let _ = self.err.write_all(m::UTIME_ERROR.as_bytes());
                 self.perror(ofname, &e);
             }
             // SAFETY: as above.
-            if unsafe { libc::chmod(c.as_ptr(), (st.mode() & 0o7777) as libc::mode_t) } != 0 {
+            if unsafe { libc::fchmod(fd, (st.mode() & 0o7777) as libc::mode_t) } != 0 {
                 let e = last();
                 let _ = self.err.write_all(m::CHMOD_ERROR.as_bytes());
                 self.perror(ofname, &e);
             }
             // SAFETY: as above.
-            if unsafe { libc::chown(c.as_ptr(), st.uid(), st.gid()) } != 0 {
+            if unsafe { libc::fchown(fd, st.uid(), st.gid()) } != 0 {
                 let e = last();
                 let _ = self.err.write_all(m::CHOWN_ERROR.as_bytes());
                 self.perror(ofname, &e);
@@ -567,7 +580,7 @@ impl Run<'_, '_> {
         }
         #[cfg(not(unix))]
         {
-            let _ = (ofname, st);
+            let _ = (ofname, out, st);
         }
     }
 
