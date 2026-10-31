@@ -17,11 +17,11 @@ jobs:
     # 24.04, not -latest: the Ubuntu unzip suites need unzip 6.0-28ubuntu4.1.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           # `make check`'s lint and fmt steps now reach `fuzz/` as well as the
           # workspace, and `fuzz/` is `exclude`d from the workspace so it has
@@ -128,9 +128,9 @@ jobs:
     # 24.04, not -latest: the Ubuntu unzip suites need unzip 6.0-28ubuntu4.1.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@360a4e93673de6630fac2478bc9e35244b01a759 # 1.88
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # rust-toolchain.toml pins 1.95 for local development and must not
       # constrain the MSRV check. Remove it so the toolchain action's choice
       # takes effect.
@@ -171,9 +171,9 @@ jobs:
     # 24.04, not -latest: the Ubuntu unzip suites need unzip 6.0-28ubuntu4.1.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # rust-toolchain.toml pins 1.95 for local development, which would
       # otherwise make the toolchain selection above inert (see "gate"'s
       # identical step).
@@ -228,11 +228,11 @@ jobs:
     name: miri (the two unsafe regions)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
         with:
           components: miri
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # rust-toolchain.toml pins 1.95 for local development, which would
       # otherwise make the nightly selection above inert (see "gate"'s
       # identical step). Miri only exists on nightly.
@@ -259,9 +259,9 @@ jobs:
     name: fuzz smoke (codec, container, chain, roundtrip, salvage, compat, infozip — pure tier)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           # `fuzz/` is excluded from the workspace (its own Cargo.toml,
           # `publish = false`) and cargo-fuzz builds it into `fuzz/target`,
@@ -285,7 +285,7 @@ jobs:
       # pins tool versions it depends on.
       - name: cache cargo-fuzz binary
         id: cache-cargo-fuzz
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cargo/bin/cargo-fuzz
           key: cargo-fuzz-0.13.2-${{ runner.os }}
@@ -423,9 +423,9 @@ jobs:
     name: purity (pure pulls in no C-compiling crate)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: rm rust-toolchain.toml
       # Structural, not environmental: this cannot prove `cc` is absent from
       # a runner (runners have compilers), only that a default `pure` build
@@ -445,6 +445,31 @@ jobs:
             | grep ' cc v' && exit 1
           echo "pure graph is free of C-compiling crates"
 
+  supply-chain:
+    name: supply chain (cargo-deny)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - run: rm rust-toolchain.toml
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-0.20.2-${{ runner.os }}
+      - name: install cargo-deny 0.20.2
+        run: command -v cargo-deny || cargo install --locked cargo-deny --version 0.20.2
+      # deny.toml: every RustSec advisory, licences by name, crates.io only.
+      # The workspace graph, then fuzz/'s separate lock for advisories (the
+      # fuzz targets run hostile input through the same decoders).
+      - name: workspace (advisories, bans, licenses, sources)
+        run: cargo deny --manifest-path Cargo.toml check
+      - name: fuzz lock (advisories)
+        run: cargo deny --manifest-path fuzz/Cargo.toml --config deny.toml check advisories
+      # The vendored libbrotli must be upstream's v1.2.1, file for file
+      # (pins in crates/stuffr-formats/c/VENDORED.md).
+      - name: vendored C matches upstream
+        run: scripts/check-vendored.sh
+
   compat-macos:
     name: compat (macos)
     # The compatibility-link differential suites against the macOS tools:
@@ -452,9 +477,9 @@ jobs:
     # gzip. This is the only job that runs on macOS.
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # Same as "gate": rust-toolchain.toml would otherwise make the
       # toolchain action's choice inert.
       - run: rm rust-toolchain.toml

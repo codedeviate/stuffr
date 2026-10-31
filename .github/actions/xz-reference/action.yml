@@ -11,7 +11,7 @@ runs:
     # Keyed on the version, the OS and the CPU: the install is a native build.
     - name: cache the xz 5.8.4 install
       id: cache
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: ${{ runner.temp }}/xz-5.8.4
         key: xz-5.8.4-${{ runner.os }}-${{ runner.arch }}

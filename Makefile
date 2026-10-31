@@ -25,7 +25,7 @@ TEST_THREAD_ARGS =
 FUZZ_RSS_ARGS =
 endif
 
-.PHONY: help check check-legs lint-latest deps-guard fmt fmt-check lint doc test test-pure release miri hooks clean fuzz-corpus fuzz compat-ubuntu sweep-tmp leak-snapshot leak-check tmp-leaks-selftest
+.PHONY: help check check-legs lint-latest deps-guard fmt fmt-check lint doc test test-pure release miri hooks clean fuzz-corpus fuzz compat-ubuntu deny sweep-tmp leak-snapshot leak-check tmp-leaks-selftest
 
 help:
 	@echo 'stuffr development targets:'
@@ -50,6 +50,7 @@ help:
 	@echo '  make clean    remove build artefacts'
 	@echo '  make fuzz-corpus  (re)generate fuzz/corpus/{codec,container,chain,roundtrip,salvage,compat,infozip}'
 	@echo '  make fuzz     short, seeded smoke pass over the seven targets (mirrors CI)'
+	@echo '  make deny     cargo-deny (advisories, licences, bans, sources) and the vendored-C check'
 	@echo '  make compat-ubuntu  the unzip, compress and zip suites against Ubuntu 24.04, in Docker'
 	@echo '                (not in check; COMPAT_UBUNTU_ARGS=... is passed to the tests)'
 
@@ -527,3 +528,12 @@ compat-ubuntu:
 
 clean:
 	$(CARGO) clean
+
+# Supply chain, as CI's `supply-chain` job: every RustSec advisory, licences by
+# name, crates.io only (deny.toml). fuzz/ is its own workspace with its own lock.
+# Then the vendored libbrotli against upstream's archive (needs the network).
+# Needs `cargo install --locked cargo-deny`.
+deny:
+	cargo deny --manifest-path Cargo.toml check
+	cargo deny --manifest-path fuzz/Cargo.toml --config deny.toml check advisories
+	scripts/check-vendored.sh

@@ -23,7 +23,7 @@ runs:
     # Keyed on the version, the OS and the CPU: the install is a native build.
     - name: cache the zstd 1.5.7 install
       id: cache
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: ${{ runner.temp }}/zstd-1.5.7
         key: zstd-1.5.7-lz4-1.10.0-${{ runner.os }}-${{ runner.arch }}
