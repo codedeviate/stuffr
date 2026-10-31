@@ -92,24 +92,159 @@ pub(crate) const BZIP2_SIGNALS: Signals = &[];
 #[cfg(unix)]
 const SLOT_LEN: usize = libc::PATH_MAX as usize;
 
-/// The armed path, NUL-terminated, for the handler to `unlink`. A fixed
-/// static, so the handler never allocates or locks.
+/// A value a signal handler reads (the path to remove, the terminal mode
+/// to put back, zipsplit's names) while ordinary code arms, re-arms and
+/// disarms it: lock-free, never allocating, and never read half-written,
+/// even by a handler on another thread (ruling T7b of the 2026-10-31
+/// security audit, UNSAFE-2/HOST-11: libzstd's and liblzma's workers keep
+/// the signals unblocked, so blocking them on the arming thread is not
+/// enough).
+///
+/// Two buffers. `state` says which one is published (bit 0) and whether
+/// it is armed ([`HandlerSlot::ARMED`]); `readers[i]` counts the handlers
+/// reading buffer `i`. The invariant: **a buffer is written only while it
+/// is not published and no handler reads it.**
+///
+/// - The writer ([`HandlerSlot::publish`]; ordinary code, one writer at a
+///   time) fills the buffer that is not published, after waiting for its
+///   reader count to reach 0, then publishes it with one store of `state`.
+///   So any number of back-to-back re-arms never writes the buffer a
+///   handler may be reading: the re-arm after next, which comes back to a
+///   buffer, waits for that buffer's readers first.
+/// - A handler ([`HandlerSlot::read`]) loads `state`, increments the
+///   published buffer's reader count, and loads `state` again: only if it
+///   is unchanged does it read the buffer, then it decrements the count.
+///   If it changed, the handler backs off and tries again (a few times;
+///   past that it reads nothing, as if nothing were armed).
+///
+/// Why that is enough (every access `SeqCst`, so all of them fall in one
+/// total order): a writer about to fill buffer `i` has already published
+/// the other one, then seen `readers[i] == 0`. A handler whose increment
+/// of `readers[i]` comes before that check makes the writer wait until it
+/// is done. One whose increment comes after loads `state` after the other
+/// buffer was published, so it sees that (and backs off) or a later
+/// publish of `i`, which comes after `i` was filled (and reads it whole).
+/// The reads and writes of a buffer are therefore never concurrent, and
+/// each read happens-after the write it reads (the publish store and the
+/// handler's load pair).
+///
+/// The writer's wait lasts while a handler is between its increment and
+/// its decrement: a few loads plus an `unlink(2)` or `tcsetattr(3)`. A
+/// handler on the writer's own thread never makes it wait: it has
+/// returned (its count back to 0) before the writer runs again. A child
+/// forked while a handler of the parent was inside that window inherits a
+/// count that never drops; it would wait for ever only if it re-armed
+/// before `exec`, which no family does (`disarm_inherited` clears the
+/// counts for the tests' forked children).
 #[cfg(unix)]
-struct PathSlot(std::cell::UnsafeCell<[u8; SLOT_LEN]>);
+struct HandlerSlot<T: Copy> {
+    bufs: [std::cell::UnsafeCell<T>; 2],
+    state: std::sync::atomic::AtomicUsize,
+    readers: [std::sync::atomic::AtomicUsize; 2],
+}
 
-// SAFETY: the slot is written only by `arm_cleanup`, with `ARMED` false and
-// the cleanup signals blocked on the writing thread, and read only by the
-// handler after it has seen `ARMED` true (Acquire, pairing with the Release
-// that follows the write). One compat run per process arms at a time.
+// SAFETY: the buffers are only written by `publish` and read by `read`
+// under the protocol above, which never lets a read and a write of one
+// buffer overlap; `T: Copy` holds no references or destructors.
 #[cfg(unix)]
-unsafe impl Sync for PathSlot {}
+unsafe impl<T: Copy> Sync for HandlerSlot<T> {}
 
 #[cfg(unix)]
-static SLOT: PathSlot = PathSlot(std::cell::UnsafeCell::new([0; SLOT_LEN]));
+impl<T: Copy> HandlerSlot<T> {
+    /// `state`'s armed bit (bit 0 is the published buffer).
+    const ARMED: usize = 2;
+    /// How many times [`HandlerSlot::read`] tries before giving up.
+    const READ_TRIES: usize = 8;
 
-/// Whether `SLOT` holds a path the handler should remove.
+    const fn new(init: T) -> Self {
+        HandlerSlot {
+            bufs: [
+                std::cell::UnsafeCell::new(init),
+                std::cell::UnsafeCell::new(init),
+            ],
+            state: std::sync::atomic::AtomicUsize::new(0),
+            readers: [
+                std::sync::atomic::AtomicUsize::new(0),
+                std::sync::atomic::AtomicUsize::new(0),
+            ],
+        }
+    }
+
+    /// Fill the buffer that is not published with `fill` (it is given what
+    /// that buffer last held), then publish it armed. Ordinary code only,
+    /// one writer at a time; never from a handler.
+    fn publish(&self, fill: impl FnOnce(&mut T)) {
+        let i = (self.state.load(Ordering::SeqCst) & 1) ^ 1;
+        while self.readers[i].load(Ordering::SeqCst) != 0 {
+            std::hint::spin_loop();
+        }
+        // SAFETY: buffer `i` is not published and has no reader, and a
+        // handler that starts now sees the other buffer published and
+        // backs off (the type's invariant), so this is the only access.
+        fill(unsafe { &mut *self.bufs[i].get() });
+        self.state.store(i | Self::ARMED, Ordering::SeqCst);
+    }
+
+    /// Disarm: a handler that starts now reads nothing. One already
+    /// reading finishes with what it read.
+    fn disarm(&self) {
+        self.state.fetch_and(!Self::ARMED, Ordering::SeqCst);
+    }
+
+    fn is_armed(&self) -> bool {
+        self.state.load(Ordering::SeqCst) & Self::ARMED != 0
+    }
+
+    /// `read` applied to the armed value, or `None` when nothing is armed
+    /// (or the value kept changing under it). Async-signal-safe: atomics
+    /// only, a bounded loop, and whatever `read` does.
+    fn read<R>(&self, read: impl FnOnce(&T) -> R) -> Option<R> {
+        for _ in 0..Self::READ_TRIES {
+            let s = self.state.load(Ordering::SeqCst);
+            if s & Self::ARMED == 0 {
+                return None;
+            }
+            let i = s & 1;
+            self.readers[i].fetch_add(1, Ordering::SeqCst);
+            if self.state.load(Ordering::SeqCst) == s {
+                // SAFETY: buffer `i` is published and this handler is
+                // counted among its readers, so no writer touches it until
+                // the count drops (the type's invariant).
+                let r = read(unsafe { &*self.bufs[i].get() });
+                self.readers[i].fetch_sub(1, Ordering::SeqCst);
+                return Some(r);
+            }
+            self.readers[i].fetch_sub(1, Ordering::SeqCst);
+        }
+        None
+    }
+
+    /// In a forked child (tests): forget the arm and any reader count
+    /// inherited from the parent.
+    #[cfg(test)]
+    fn reset_after_fork(&self) {
+        self.disarm();
+        for r in &self.readers {
+            r.store(0, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The armed path, NUL-terminated, for the handler to `unlink`: fixed
+/// statics, so the handler never allocates or locks.
 #[cfg(unix)]
-static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SLOT: HandlerSlot<[u8; SLOT_LEN]> = HandlerSlot::new([0; SLOT_LEN]);
+
+/// Remove the armed path, if one is armed: the handlers' half of the slot.
+/// Async-signal-safe (`unlink` and atomics).
+#[cfg(unix)]
+fn unlink_armed() {
+    SLOT.read(|path| {
+        // SAFETY: an armed buffer holds a NUL-terminated path (`fill_slot`);
+        // unlink is async-signal-safe.
+        unsafe { libc::unlink(path.as_ptr().cast::<libc::c_char>()) };
+    });
+}
 
 /// What a run holds while its output is partial; dropping it disarms the
 /// handler, so a published output is never removed.
@@ -146,7 +281,7 @@ impl Drop for CleanupGuard {
                 // touches no Rust state (fileio.c: clearHandler).
                 unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
             }
-            ARMED.store(false, Ordering::Release);
+            SLOT.disarm();
         }
     }
 }
@@ -154,30 +289,21 @@ impl Drop for CleanupGuard {
 /// Write `bytes` (shorter than `SLOT_LEN`, no NUL) into the slot,
 /// NUL-terminated, and mark it armed, with `signals` blocked on this thread
 /// meanwhile.
+///
+/// The previous arm is dropped first, so while the new path is written
+/// nothing is armed, as before the double buffer. A handler on another
+/// thread that is still reading the previous path reads it whole: the new
+/// one goes to the other buffer ([`HandlerSlot`]).
 #[cfg(unix)]
 fn fill_slot(bytes: &[u8], signals: Signals) {
     debug_assert!(bytes.len() < SLOT_LEN && !bytes.contains(&0));
-    // SAFETY: sigset_t is plain data, initialised by sigemptyset before
-    // use. Blocking the cleanup signals on this thread while the slot is
-    // written means this thread's handler never sees it half-written;
-    // `ARMED` is false meanwhile, so a handler on another thread reads
-    // nothing. The write stays inside the slot (len < SLOT_LEN), and the
-    // previous mask is restored after.
-    unsafe {
-        let mut block: libc::sigset_t = std::mem::zeroed();
-        let mut old: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut block);
-        for &sig in signals {
-            libc::sigaddset(&mut block, sig);
-        }
-        libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
-        ARMED.store(false, Ordering::SeqCst);
-        let slot = SLOT.0.get().cast::<u8>();
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), slot, bytes.len());
-        slot.add(bytes.len()).write(0);
-        ARMED.store(true, Ordering::Release);
-        libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
-    }
+    held_back(signals, || {
+        SLOT.disarm();
+        SLOT.publish(|slot| {
+            slot[..bytes.len()].copy_from_slice(bytes);
+            slot[bytes.len()] = 0;
+        });
+    });
 }
 
 /// Arm the removal of `path`, the run's partial output, should one of
@@ -206,7 +332,7 @@ pub(crate) fn arm_cleanup(host: &Host, path: &Path, signals: Signals) -> Cleanup
             return CleanupGuard { armed: false, kind };
         }
         debug_assert!(
-            !ARMED.load(Ordering::Acquire),
+            !SLOT.is_armed(),
             "arm_cleanup: another output is still armed"
         );
         install_handlers(signals);
@@ -266,12 +392,7 @@ extern "C" fn on_cleanup_signal(sig: libc::c_int) {
         let hook: extern "C" fn() = unsafe { std::mem::transmute(hook) };
         hook();
     }
-    if ARMED.load(Ordering::Acquire) {
-        // SAFETY: `ARMED` true means the slot holds a NUL-terminated path,
-        // written before the Release store this load pairs with; unlink is
-        // async-signal-safe.
-        unsafe { libc::unlink(SLOT.0.get().cast::<libc::c_char>()) };
-    }
+    unlink_armed();
     // SAFETY: sigaction and raise are async-signal-safe. The re-raised
     // signal is blocked until this handler returns, then delivered at
     // SIG_DFL, which ends the process with that signal.
@@ -376,7 +497,7 @@ pub(crate) fn arm_cleanup_exit(host: &Host, path: &Path) -> CleanupGuard {
             return unarmed;
         }
         debug_assert!(
-            !ARMED.load(Ordering::Acquire),
+            !SLOT.is_armed(),
             "arm_cleanup_exit: another output is still armed"
         );
         const INT: Signals = &[libc::SIGINT];
@@ -414,12 +535,7 @@ extern "C" fn on_interrupt_exit(_sig: libc::c_int) {
     // SAFETY: signal is async-signal-safe; ignoring SIGINT installs no
     // handler.
     unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
-    if ARMED.load(Ordering::Acquire) {
-        // SAFETY: `ARMED` true means the slot holds a NUL-terminated path,
-        // written before the Release store this load pairs with; unlink is
-        // async-signal-safe.
-        unsafe { libc::unlink(SLOT.0.get().cast::<libc::c_char>()) };
-    }
+    unlink_armed();
     // SAFETY: write and _exit are async-signal-safe; the buffer is a
     // one-byte static literal.
     unsafe {
@@ -484,12 +600,7 @@ pub(crate) fn install_abort_exit(host: &Host) -> bool {
 /// locks.
 #[cfg(unix)]
 extern "C" fn on_abort_exit(_sig: libc::c_int) {
-    if ARMED.load(Ordering::Acquire) {
-        // SAFETY: `ARMED` true means the slot holds a NUL-terminated path,
-        // written before the Release store this load pairs with; unlink is
-        // async-signal-safe.
-        unsafe { libc::unlink(SLOT.0.get().cast::<libc::c_char>()) };
-    }
+    unlink_armed();
     // SAFETY: _exit is async-signal-safe.
     unsafe { libc::_exit(1) };
 }
@@ -511,7 +622,7 @@ pub(crate) fn create_excl_armed(host: &Host, path: &Path) -> io::Result<(File, C
                 return Ok((f, CleanupGuard { armed: false, kind }));
             }
             debug_assert!(
-                !ARMED.load(Ordering::Acquire),
+                !SLOT.is_armed(),
                 "create_excl_armed: another output is still armed"
             );
             fill_slot(bytes, NCOMPRESS_SIGNALS);
@@ -563,35 +674,40 @@ static ZIP_ABORT_EXTRA: std::sync::atomic::AtomicPtr<u8> =
 #[cfg(unix)]
 static ZIP_ABORT_EXTRA_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// The longest `-b` directory and name prefix zipsplit's cleanup holds.
+#[cfg(unix)]
+const SPLIT_DIR_MAX: usize = SLOT_LEN / 2;
+#[cfg(unix)]
+const SPLIT_PREFIX_MAX: usize = 16;
+
 /// zipsplit's cleanup for [`on_zip_abort`]: the names `ziperr` removes, as
-/// the template makes them (the directory, the name's prefix, the digits),
-/// and how many parts and whether the index have been made. Fixed statics,
-/// so the handler never allocates or locks.
+/// the template makes them (the directory, the name's prefix, the digits).
 #[cfg(unix)]
-struct SplitNames(std::cell::UnsafeCell<[u8; SLOT_LEN]>);
+#[derive(Clone, Copy)]
+struct SplitNames {
+    dir: [u8; SPLIT_DIR_MAX],
+    dir_len: usize,
+    prefix: [u8; SPLIT_PREFIX_MAX],
+    prefix_len: usize,
+    digits: usize,
+}
 
-// SAFETY: written only by `arm_split_cleanup` with `SPLIT_ARMED` false and
-// read only by the handler after it saw `SPLIT_ARMED` true (Acquire,
-// pairing with the Release after the write).
+/// The armed [`SplitNames`]: fixed statics, so the handler never allocates
+/// or locks, and double-buffered ([`HandlerSlot`], ruling T7b).
 #[cfg(unix)]
-unsafe impl Sync for SplitNames {}
-
-#[cfg(unix)]
-static SPLIT_DIR: SplitNames = SplitNames(std::cell::UnsafeCell::new([0; SLOT_LEN]));
-#[cfg(unix)]
-static SPLIT_DIR_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-#[cfg(unix)]
-static SPLIT_PREFIX: SplitNames = SplitNames(std::cell::UnsafeCell::new([0; SLOT_LEN]));
-#[cfg(unix)]
-static SPLIT_PREFIX_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-#[cfg(unix)]
-static SPLIT_DIGITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SPLIT: HandlerSlot<SplitNames> = HandlerSlot::new(SplitNames {
+    dir: [0; SPLIT_DIR_MAX],
+    dir_len: 0,
+    prefix: [0; SPLIT_PREFIX_MAX],
+    prefix_len: 0,
+    digits: 0,
+});
+/// How many parts, and whether the index, have been made: single words,
+/// read by the handler as they are.
 #[cfg(unix)]
 static SPLIT_PARTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(unix)]
 static SPLIT_INDEX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-#[cfg(unix)]
-static SPLIT_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// What a zipsplit run holds while it may have made files; dropping it
 /// disarms the handler's removal.
@@ -604,7 +720,7 @@ impl Drop for SplitGuard {
     fn drop(&mut self) {
         #[cfg(unix)]
         if self.armed {
-            SPLIT_ARMED.store(false, Ordering::SeqCst);
+            SPLIT.disarm();
         }
     }
 }
@@ -620,24 +736,17 @@ pub(crate) fn arm_split_cleanup(
     digits: usize,
 ) -> SplitGuard {
     #[cfg(unix)]
-    if matches!(host, Host::Real) && dir.len() < SLOT_LEN / 2 && prefix.len() < 16 {
-        SPLIT_ARMED.store(false, Ordering::SeqCst);
-        // SAFETY: SPLIT_ARMED is false, so no handler reads the buffers;
-        // both writes stay inside them (lengths checked above).
-        unsafe {
-            std::ptr::copy_nonoverlapping(dir.as_ptr(), SPLIT_DIR.0.get().cast::<u8>(), dir.len());
-            std::ptr::copy_nonoverlapping(
-                prefix.as_ptr(),
-                SPLIT_PREFIX.0.get().cast::<u8>(),
-                prefix.len(),
-            );
-        }
-        SPLIT_DIR_LEN.store(dir.len(), Ordering::SeqCst);
-        SPLIT_PREFIX_LEN.store(prefix.len(), Ordering::SeqCst);
-        SPLIT_DIGITS.store(digits, Ordering::SeqCst);
+    if matches!(host, Host::Real) && dir.len() < SPLIT_DIR_MAX && prefix.len() < SPLIT_PREFIX_MAX {
+        SPLIT.disarm();
         SPLIT_PARTS.store(0, Ordering::SeqCst);
         SPLIT_INDEX.store(false, Ordering::SeqCst);
-        SPLIT_ARMED.store(true, Ordering::Release);
+        SPLIT.publish(|n| {
+            n.dir[..dir.len()].copy_from_slice(dir);
+            n.dir_len = dir.len();
+            n.prefix[..prefix.len()].copy_from_slice(prefix);
+            n.prefix_len = prefix.len();
+            n.digits = digits;
+        });
         return SplitGuard { armed: true };
     }
     let _ = (host, dir, prefix, digits);
@@ -659,18 +768,15 @@ pub(crate) fn split_progress(parts: u64, index: bool) {
 /// each part from the last. Only stack memory and `unlink`.
 #[cfg(unix)]
 fn remove_split_files() {
-    if !SPLIT_ARMED.load(Ordering::Acquire) {
+    // a copy on this handler's stack, taken whole (ruling T7b)
+    let Some(names) = SPLIT.read(|n| *n) else {
         return;
-    }
-    let mut buf = [0u8; SLOT_LEN + 48];
-    let dl = SPLIT_DIR_LEN.load(Ordering::SeqCst).min(SLOT_LEN / 2);
-    let pl = SPLIT_PREFIX_LEN.load(Ordering::SeqCst).min(16);
-    // SAFETY: the buffers were filled before SPLIT_ARMED was set; the
-    // lengths are clamped to what they hold and `buf` is larger than
-    // dir + prefix + 20 digits + ".zip" + NUL.
-    unsafe {
-        std::ptr::copy_nonoverlapping(SPLIT_DIR.0.get().cast::<u8>(), buf.as_mut_ptr(), dl);
-    }
+    };
+    // `buf` is larger than dir + prefix + 40 digits + ".zip" + NUL
+    let mut buf = [0u8; SPLIT_DIR_MAX + SPLIT_PREFIX_MAX + 48];
+    let dl = names.dir_len.min(SPLIT_DIR_MAX);
+    let pl = names.prefix_len.min(SPLIT_PREFIX_MAX);
+    buf[..dl].copy_from_slice(&names.dir[..dl]);
     if SPLIT_INDEX.load(Ordering::SeqCst) {
         let name = b"zipsplit.idx";
         buf[dl..dl + name.len()].copy_from_slice(name);
@@ -678,15 +784,8 @@ fn remove_split_files() {
         // SAFETY: `buf` holds a NUL-terminated path.
         unsafe { libc::unlink(buf.as_ptr().cast::<libc::c_char>()) };
     }
-    // SAFETY: as above.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            SPLIT_PREFIX.0.get().cast::<u8>(),
-            buf.as_mut_ptr().add(dl),
-            pl,
-        );
-    }
-    let digits = SPLIT_DIGITS.load(Ordering::SeqCst).min(20);
+    buf[dl..dl + pl].copy_from_slice(&names.prefix[..pl]);
+    let digits = names.digits.min(20);
     let mut k = SPLIT_PARTS.load(Ordering::SeqCst);
     while k > 0 {
         let at = dl + pl;
@@ -856,25 +955,23 @@ extern "C" fn on_zip_abort(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *
     restore_saved_tty();
     if own_or_fault(sig, info) {
         // ruling T7a: no message, the temporary and the parts removed, and
-        // the signal re-raised. SAFETY: unlink, sigaction and raise are
-        // async-signal-safe; the slot is read only when `ARMED` says it
-        // holds a NUL-terminated path. The re-raised signal is blocked
-        // until this handler returns, then delivered at SIG_DFL (a fault
-        // re-executes and faults again at SIG_DFL), ending the process.
+        // the signal re-raised.
+        unlink_armed();
+        remove_split_files();
+        // SAFETY: sigaction and raise are async-signal-safe. The re-raised
+        // signal is blocked until this handler returns, then delivered at
+        // SIG_DFL (a fault re-executes and faults again at SIG_DFL),
+        // ending the process.
         unsafe {
-            if ARMED.load(Ordering::Acquire) {
-                libc::unlink(SLOT.0.get().cast::<libc::c_char>());
-            }
-            remove_split_files();
             reset_to_default(sig);
             libc::raise(sig);
         }
         return;
     }
     let fd = ZIP_MESG_FD.load(Ordering::Acquire);
-    // SAFETY: write, unlink and _exit are async-signal-safe; the text is a
-    // `'static` slice stored before the handler was installed, and the
-    // slot is read only when `ARMED` says it holds a NUL-terminated path.
+    // SAFETY: write and _exit are async-signal-safe (so are the slots'
+    // reads); the text is a `'static` slice stored before the handler was
+    // installed.
     unsafe {
         libc::write(fd, b"\n".as_ptr().cast(), 1);
         if ZIP_LINE_STARTED.load(Ordering::Acquire) {
@@ -888,9 +985,7 @@ extern "C" fn on_zip_abort(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *
         if !x.is_null() {
             libc::write(fd, x.cast(), ZIP_ABORT_EXTRA_LEN.load(Ordering::Acquire));
         }
-        if ARMED.load(Ordering::Acquire) {
-            libc::unlink(SLOT.0.get().cast::<libc::c_char>());
-        }
+        unlink_armed();
         remove_split_files();
         libc::_exit(9);
     }
@@ -1222,37 +1317,33 @@ extern "C" fn on_interrupt_exit_code(
     }
 }
 
-/// The terminal whose mode a [`TtyMode`] has changed, for the interrupt
-/// handler to put back: its descriptor (`-1`: none) and saved mode.
+/// The terminal whose mode a [`TtyMode`] has changed and that mode, for
+/// the interrupt handler to put back.
 #[cfg(unix)]
-static TTY_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+#[derive(Clone, Copy)]
+struct TtySaved {
+    fd: libc::c_int,
+    mode: libc::termios,
+}
 
+/// The armed [`TtySaved`] (armed while a [`TtyMode`] lives),
+/// double-buffered ([`HandlerSlot`], ruling T7b).
 #[cfg(unix)]
-struct TtySlot(std::cell::UnsafeCell<std::mem::MaybeUninit<libc::termios>>);
-
-// SAFETY: the slot is written only by `TtyMode::set`, with `TTY_FD` at -1
-// and the exit signals blocked on the writing thread, and read only after
-// `TTY_FD` is seen >= 0 (Acquire, pairing with the Release after the
-// write). One `TtyMode` exists at a time.
-#[cfg(unix)]
-unsafe impl Sync for TtySlot {}
-
-#[cfg(unix)]
-static TTY_SAVED: TtySlot = TtySlot(std::cell::UnsafeCell::new(std::mem::MaybeUninit::uninit()));
+static TTY: HandlerSlot<TtySaved> = HandlerSlot::new(TtySaved {
+    fd: -1,
+    // SAFETY: termios is plain data, for which all zeros is a value.
+    mode: unsafe { std::mem::zeroed() },
+});
 
 /// Put back the mode a live [`TtyMode`] saved, if there is one
 /// (`tcsetattr(TCSAFLUSH)`, which is async-signal-safe): the signal path of
 /// the guard's restore.
 #[cfg(unix)]
 pub(crate) fn restore_saved_tty() {
-    let fd = TTY_FD.load(Ordering::Acquire);
-    if fd >= 0 {
-        // SAFETY: `TTY_FD` >= 0 means the slot holds the termios written
-        // before the Release store this load pairs with.
-        unsafe {
-            libc::tcsetattr(fd, libc::TCSAFLUSH, (*TTY_SAVED.0.get()).as_ptr());
-        }
-    }
+    TTY.read(|t| {
+        // SAFETY: tcsetattr reads the termios of the armed buffer.
+        unsafe { libc::tcsetattr(t.fd, libc::TCSAFLUSH, &t.mode) };
+    });
 }
 
 /// ruling: T11-1. The mode is put back as saved, where the C's `echon()`
@@ -1282,23 +1373,13 @@ impl TtyMode {
         if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
             return None;
         }
-        assert!(TTY_FD.load(Ordering::Acquire) < 0, "one TtyMode at a time");
-        // SAFETY: sigset_t is plain data, initialised by sigemptyset. The
-        // exit signals are blocked on this thread while the slot is
-        // written, and `TTY_FD` is -1 meanwhile, so no handler reads it
-        // half-written; the previous mask is restored after.
-        unsafe {
-            let mut block: libc::sigset_t = std::mem::zeroed();
-            let mut old: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut block);
-            for &sig in UNZIP_SIGNALS {
-                libc::sigaddset(&mut block, sig);
-            }
-            libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
-            (*TTY_SAVED.0.get()).write(saved);
-            TTY_FD.store(fd, Ordering::Release);
-            libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
-        }
+        assert!(!TTY.is_armed(), "one TtyMode at a time");
+        // The exit signals held back on this thread while the mode is
+        // published; a handler on another thread reads only a whole
+        // buffer (ruling T7b).
+        held_back(UNZIP_SIGNALS, || {
+            TTY.publish(|t| *t = TtySaved { fd, mode: saved });
+        });
         let mut t = saved;
         change(&mut t);
         // SAFETY: tcsetattr reads the termios we own.
@@ -1314,7 +1395,7 @@ impl Drop for TtyMode {
         // the two restores the same mode again.
         // SAFETY: tcsetattr reads the termios we own.
         unsafe { libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.saved) };
-        TTY_FD.store(-1, Ordering::Release);
+        TTY.disarm();
     }
 }
 
@@ -1508,12 +1589,7 @@ pub(crate) fn create_armed(path: &Path) -> io::Result<(File, CleanupGuard)> {
 #[cfg(all(test, unix))]
 pub(crate) fn armed_path() -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
-    if !ARMED.load(Ordering::Acquire) {
-        return None;
-    }
-    // SAFETY: `ARMED` true means the slot holds a NUL-terminated path; the
-    // tests that arm hold `ARM_TEST_LOCK`, so nothing rewrites it meanwhile.
-    let slot = unsafe { &*SLOT.0.get() };
+    let slot = SLOT.read(|slot| *slot)?;
     let len = slot.iter().position(|&b| b == 0)?;
     Some(PathBuf::from(std::ffi::OsStr::from_bytes(&slot[..len])))
 }
@@ -1524,9 +1600,9 @@ pub(crate) fn armed_path() -> Option<PathBuf> {
 /// child. Only after `fork`: stores, async-signal-safe.
 #[cfg(all(test, unix))]
 pub(crate) fn disarm_inherited() {
-    ARMED.store(false, Ordering::SeqCst);
+    SLOT.reset_after_fork();
     PRE_EXIT_HOOK.store(0, Ordering::SeqCst);
-    SPLIT_ARMED.store(false, Ordering::SeqCst);
+    SPLIT.reset_after_fork();
     ZIP_ABORT_EXTRA.store(std::ptr::null_mut(), Ordering::SeqCst);
 }
 
@@ -1607,7 +1683,7 @@ pub(crate) fn with_zip_signals_held<T>(f: impl FnOnce() -> T) -> T {
 /// disarms again, harmlessly.
 pub(crate) fn disarm_cleanup() {
     #[cfg(unix)]
-    ARMED.store(false, Ordering::SeqCst);
+    SLOT.disarm();
 }
 
 /// Run `f` with `signals` blocked on this thread, then restore the mask; a
@@ -2944,18 +3020,16 @@ mod tests {
         let bytes = file.as_os_str().as_bytes();
         {
             let _guard = arm_cleanup(&Host::Real, &file, XZ_SIGNALS);
-            assert!(ARMED.load(Ordering::Acquire), "not armed");
-            // SAFETY: no handler runs (no signal is sent), and this test is
-            // the only in-process arm, so nothing writes the slot meanwhile.
-            let slot = unsafe { &*SLOT.0.get() };
+            assert!(SLOT.is_armed(), "not armed");
+            let slot = SLOT.read(|s| *s).expect("armed");
             assert_eq!(&slot[..bytes.len()], bytes);
             assert_eq!(slot[bytes.len()], 0);
         }
-        assert!(!ARMED.load(Ordering::Acquire), "still armed after drop");
+        assert!(!SLOT.is_armed(), "still armed after drop");
 
         let long = dir.join("x".repeat(SLOT_LEN));
         let guard = arm_cleanup(&Host::Real, &long, XZ_SIGNALS);
-        assert!(!ARMED.load(Ordering::Acquire), "an over-long path armed");
+        assert!(!SLOT.is_armed(), "an over-long path armed");
         drop(guard);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -3018,9 +3092,9 @@ mod tests {
             fs::write(&file, b"partial").unwrap();
             let status = in_child(|| {
                 default_dispositions();
-                // ARMED is inherited at fork, where `arm_then_drop_disarms`
+                // the arm is inherited at fork, where `arm_then_drop_disarms`
                 // may hold it; this child's arm is its only one.
-                ARMED.store(false, Ordering::SeqCst);
+                SLOT.reset_after_fork();
                 let _guard = arm_cleanup(&Host::Real, &file, XZ_SIGNALS);
                 // SAFETY: raise is async-signal-safe; the handler unlinks
                 // the armed path and re-raises at SIG_DFL, ending the child.
@@ -3046,7 +3120,7 @@ mod tests {
             let file = dir.join(format!("bench-{sig}"));
             let status = in_child(|| {
                 default_dispositions();
-                ARMED.store(false, Ordering::SeqCst);
+                SLOT.reset_after_fork();
                 if let Ok((_file, _guard)) = create_armed(&file) {
                     // SAFETY: raise is async-signal-safe; the handler unlinks
                     // the armed path and re-raises at SIG_DFL.
@@ -3102,7 +3176,7 @@ mod tests {
                 HOOK_PATH.store(cpath.as_ptr().cast_mut(), Ordering::SeqCst);
                 let status = in_child(|| {
                     default_dispositions();
-                    ARMED.store(false, Ordering::SeqCst);
+                    SLOT.reset_after_fork();
                     PRE_EXIT_HOOK.store(0, Ordering::SeqCst);
                     let _hook = hook_run_signals(recording_hook);
                     let armed = arm.then(|| create_armed(&file));
@@ -3194,18 +3268,16 @@ mod tests {
         let dir = scratch("temp-armed");
         let status = in_child(|| {
             default_dispositions();
-            ARMED.store(false, Ordering::SeqCst);
+            SLOT.reset_after_fork();
             let code = match create_temp_armed(&Host::Real, &dir, "xz", XZ_SIGNALS) {
                 Err(_) => 1,
                 Ok((path, _file, guard)) => {
                     let bytes = path.as_os_str().as_bytes();
-                    // SAFETY: no handler runs in this child; nothing else
-                    // writes the slot.
-                    let slot = unsafe { &*SLOT.0.get() };
-                    let armed = ARMED.load(Ordering::Acquire);
+                    let slot = SLOT.read(|s| *s).unwrap_or([0; SLOT_LEN]);
+                    let armed = SLOT.is_armed();
                     let held = &slot[..bytes.len()] == bytes && slot[bytes.len()] == 0;
                     drop(guard);
-                    let released = !ARMED.load(Ordering::Acquire);
+                    let released = !SLOT.is_armed();
                     if !armed {
                         2
                     } else if !held {
@@ -3234,13 +3306,13 @@ mod tests {
         let dir = scratch("temp-armed-fail").join("missing");
         let status = in_child(|| {
             default_dispositions();
-            ARMED.store(false, Ordering::SeqCst);
+            SLOT.reset_after_fork();
             let before = current_mask();
             let failed = create_temp_armed(&Host::Real, &dir, "xz", XZ_SIGNALS).is_err();
             let after = current_mask();
             let code = if !failed {
                 1
-            } else if ARMED.load(Ordering::Acquire) {
+            } else if SLOT.is_armed() {
                 2
             } else if !same_mask(&before, &after) {
                 3
@@ -3271,13 +3343,13 @@ mod tests {
         });
         let status = in_child(|| {
             default_dispositions();
-            ARMED.store(false, Ordering::SeqCst);
+            SLOT.reset_after_fork();
             let code = match create_temp_armed(&host, &dir, "xz", XZ_SIGNALS) {
                 Err(_) => 1,
                 Ok((path, _file, _guard)) => {
                     if !path.exists() {
                         2
-                    } else if ARMED.load(Ordering::Acquire) {
+                    } else if SLOT.is_armed() {
                         3
                     } else {
                         0
@@ -3310,12 +3382,12 @@ mod tests {
         });
         let status = in_child(|| {
             default_dispositions();
-            // ARMED is inherited from the parent at fork, where another
+            // the arm is inherited from the parent at fork, where another
             // test may hold it; clear it so the check below sees only this
             // arm.
-            ARMED.store(false, Ordering::SeqCst);
+            SLOT.reset_after_fork();
             let _guard = arm_cleanup(&host, &file, XZ_SIGNALS);
-            let mut all_default = !ARMED.load(Ordering::Acquire);
+            let mut all_default = !SLOT.is_armed();
             for &sig in XZ_SIGNALS {
                 // SAFETY: a zeroed sigaction is a valid out-parameter, and a
                 // query (null new action) changes nothing.
@@ -3363,10 +3435,10 @@ mod tests {
             default_dispositions();
             // SAFETY: SIG_IGN installs no handler; the parent's `nohup`.
             unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
-            ARMED.store(false, Ordering::SeqCst);
+            SLOT.reset_after_fork();
             let handler = on_interrupt_exit as extern "C" fn(libc::c_int) as libc::sighandler_t;
             let guard = arm_cleanup_exit(&Host::Real, &file);
-            let armed = ARMED.load(Ordering::Acquire) && sigint_action() == handler;
+            let armed = SLOT.is_armed() && sigint_action() == handler;
             let term_default = {
                 // SAFETY: a query into a zeroed out-parameter.
                 let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -3374,12 +3446,12 @@ mod tests {
                 old.sa_sigaction == libc::SIG_DFL
             };
             drop(guard);
-            let restored = !ARMED.load(Ordering::Acquire) && sigint_action() == libc::SIG_DFL;
+            let restored = !SLOT.is_armed() && sigint_action() == libc::SIG_DFL;
             // A directory is not a regular file: nothing armed, SIGINT kept.
             // SAFETY: as above.
             unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
             let g = arm_cleanup_exit(&Host::Real, &dir);
-            let skipped = !ARMED.load(Ordering::Acquire) && sigint_action() == libc::SIG_IGN;
+            let skipped = !SLOT.is_armed() && sigint_action() == libc::SIG_IGN;
             drop(g);
             let untouched = sigint_action() == libc::SIG_IGN;
             let code = match (armed, term_default, restored, skipped, untouched) {
@@ -3418,15 +3490,13 @@ mod tests {
         });
         let status = in_child(|| {
             default_dispositions();
-            ARMED.store(false, Ordering::SeqCst);
+            SLOT.reset_after_fork();
             let g = arm_cleanup_exit(&host, &file);
-            let direct = !ARMED.load(Ordering::Acquire) && sigint_action() == libc::SIG_DFL;
+            let direct = !SLOT.is_armed() && sigint_action() == libc::SIG_DFL;
             drop(g);
             let made = match create_temp_armed_exit(&dir, "zstd", &host) {
                 Ok((path, _file, _g)) => {
-                    path.exists()
-                        && !ARMED.load(Ordering::Acquire)
-                        && sigint_action() == libc::SIG_DFL
+                    path.exists() && !SLOT.is_armed() && sigint_action() == libc::SIG_DFL
                 }
                 Err(_) => false,
             };
@@ -3456,7 +3526,7 @@ mod tests {
         let dir = scratch("exit-temp");
         let status = in_child(|| {
             default_dispositions();
-            ARMED.store(false, Ordering::SeqCst);
+            SLOT.reset_after_fork();
             // The handler's "\n" would land in the test's output.
             // SAFETY: open and dup2 are async-signal-safe; the path is a
             // NUL-terminated literal.
@@ -3755,5 +3825,74 @@ mod tests {
         );
         assert!(!temp.exists(), "the armed temporary is left");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Ruling T7b: the slot API. Publishing A then B leaves B readable
+    /// whole; a handler still reading A sees A intact while B is written,
+    /// and a third publish, which comes back to A's buffer, waits until
+    /// that reader is done.
+    #[cfg(unix)]
+    #[test]
+    fn a_slot_is_never_read_half_written() {
+        let slot: HandlerSlot<[u8; 64]> = HandlerSlot::new([0; 64]);
+        assert_eq!(slot.read(|v| *v), None, "armed before any publish");
+        slot.publish(|v| *v = [b'A'; 64]);
+        slot.publish(|v| *v = [b'B'; 64]);
+        assert_eq!(slot.read(|v| *v), Some([b'B'; 64]));
+        slot.disarm();
+        assert_eq!(slot.read(|v| *v), None, "read after disarm");
+
+        slot.publish(|v| *v = [b'A'; 64]);
+        let third_done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|sc| {
+            slot.read(|a| {
+                // a handler in the middle of reading A
+                slot.publish(|v| *v = [b'B'; 64]);
+                assert_eq!(*a, [b'A'; 64], "A changed under its reader");
+                sc.spawn(|| {
+                    slot.publish(|v| *v = [b'C'; 64]);
+                    third_done.store(true, Ordering::SeqCst);
+                });
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                assert!(
+                    !third_done.load(Ordering::SeqCst),
+                    "the third publish wrote A's buffer under its reader"
+                );
+                assert_eq!(*a, [b'A'; 64], "A changed under its reader");
+            })
+            .expect("armed");
+        });
+        assert!(third_done.load(Ordering::SeqCst));
+        assert_eq!(slot.read(|v| *v), Some([b'C'; 64]));
+    }
+
+    /// Ruling T7b: one writer re-arming as fast as it can while readers
+    /// on other threads read: every read is one whole value.
+    #[cfg(unix)]
+    #[test]
+    fn a_slot_re_armed_under_readers_is_read_whole() {
+        let slot: HandlerSlot<[u8; 256]> = HandlerSlot::new([0; 256]);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|sc| {
+            for _ in 0..3 {
+                sc.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Some(v) = slot.read(|v| *v) {
+                            assert!(v.iter().all(|&b| b == v[0]), "torn read: {v:?}");
+                            reads.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(200);
+            let mut k = 0u8;
+            while std::time::Instant::now() < until {
+                k = k.wrapping_add(1);
+                slot.publish(|v| *v = [k; 256]);
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        assert!(reads.load(Ordering::Relaxed) > 0, "nothing was read");
     }
 }
