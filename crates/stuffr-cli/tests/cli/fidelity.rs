@@ -1672,3 +1672,108 @@ fn encoder_flags_are_refused_only_where_there_is_no_codec_to_honour_them() {
             .success()
     );
 }
+
+// ---------------------------------------------------------------------
+// Cloaking: a zip whose local header and central directory disagree
+// (GHSA-m665-v7pm-7grj). A warning, exit 4 under --strict-fidelity.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_cloaked_zip_file_warns_and_exits_4_under_strict() {
+    let dir = tmp_dir();
+    let clean = write_zip_via_pack(&dir, &[("a.txt", b"alpha")]);
+    let mut bytes = std::fs::read(&clean).unwrap();
+    assert_eq!(&bytes[..4], b"PK\x03\x04");
+    let name_len = usize::from(u16::from_le_bytes([bytes[26], bytes[27]]));
+    let central_name = String::from_utf8(bytes[30..30 + name_len].to_vec()).unwrap();
+    // The last byte of the LOCAL name only; the central record keeps it.
+    bytes[30 + name_len - 1] ^= 0x20;
+    let cloaked = dir.join("cloaked.zip");
+    std::fs::write(&cloaked, &bytes).unwrap();
+
+    let out = run_output(&["test", cloaked.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stderr.contains("local header and central directory disagree on name")
+            && stderr.contains(&central_name),
+        "the warning must name the field and the entry: {stderr}"
+    );
+
+    let strict = run_output(&["test", cloaked.to_str().unwrap(), "--strict-fidelity"]);
+    assert_eq!(
+        strict.status.code(),
+        Some(4),
+        "stderr: {}",
+        String::from_utf8_lossy(&strict.stderr)
+    );
+
+    // The untouched archive passes strict mode, so it is the cloak that fails.
+    let clean_strict = run_output(&["test", clean.to_str().unwrap(), "--strict-fidelity"]);
+    assert_eq!(
+        clean_strict.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&clean_strict.stderr)
+    );
+}
+
+/// Real writers on this platform raise no header warning: Apple's Info-ZIP
+/// `zip -r` (a UTF-8 name stored with bit 11 clear) and `ditto -c -k`
+/// (bit 3, data descriptors, local CRC and sizes zero). Skips where the
+/// tools are absent.
+#[cfg(target_os = "macos")]
+#[test]
+fn real_tool_zips_raise_no_header_warning() {
+    let dir = tmp_dir();
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::write(tree.join("plain.txt"), b"plain\n").unwrap();
+    std::fs::write(tree.join("café 日本.txt"), b"unicode name\n").unwrap();
+    std::fs::write(tree.join("sub/b.bin"), vec![7u8; 70_000]).unwrap();
+
+    let mut made = Vec::new();
+    if Path::new("/usr/bin/zip").exists() {
+        let z = dir.join("infozip.zip");
+        let ok = Command::new("/usr/bin/zip")
+            .current_dir(&dir)
+            .args(["-q", "-r", z.to_str().unwrap(), "tree"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "/usr/bin/zip failed");
+        made.push(z);
+    } else {
+        eprintln!("note: /usr/bin/zip absent; skipping its leg");
+    }
+    if Path::new("/usr/bin/ditto").exists() {
+        let z = dir.join("ditto.zip");
+        let ok = Command::new("/usr/bin/ditto")
+            .args(["-c", "-k", tree.to_str().unwrap(), z.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "ditto failed");
+        made.push(z);
+    } else {
+        eprintln!("note: /usr/bin/ditto absent; skipping its leg");
+    }
+
+    for z in made {
+        for verb in ["test", "list"] {
+            let out = run_output(&[verb, z.to_str().unwrap(), "--strict-fidelity"]);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "{verb} {}: stderr: {stderr}",
+                z.display()
+            );
+            assert!(
+                !stderr.contains("disagree"),
+                "{verb} {}: {stderr}",
+                z.display()
+            );
+        }
+    }
+}

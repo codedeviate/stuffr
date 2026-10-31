@@ -253,6 +253,33 @@ pub enum Fidelity {
         computed: u16,
         recorded: u16,
     },
+
+    /// A zip entry's local file header and its central-directory record
+    /// disagree on a field both carry — the "cloaking" shape (GHSA-m665-v7pm-
+    /// 7grj), where one archive shows different names or contents depending
+    /// on which of its two descriptions a reader trusts.
+    ///
+    /// A warning, not [`crate::Error::Corrupt`]: the bytes handed back are
+    /// still a coherent reading (the central directory's on a seekable
+    /// source, the local headers' on a pipe), and the archive is not
+    /// self-contradictory within either description. What cannot be claimed
+    /// is that the reading is the only one, so `--strict-fidelity` turns this
+    /// into exit 4.
+    ///
+    /// `field` is one of `"name"`, `"compression method"`, `"CRC-32"`,
+    /// `"compressed size"`, `"uncompressed size"`, `"encryption flag"`,
+    /// `"UTF-8 flag"`, `"entry count"` or `"order"`. `entry` is the name as
+    /// the authoritative description (the central directory, when it was
+    /// read) spells it, decoded as the reader decodes names.
+    #[error(
+        "`{format}` local header and central directory disagree on {field} for entry `{}`",
+        fmt_name(.entry)
+    )]
+    HeadersDisagree {
+        format: FormatId,
+        entry: String,
+        field: &'static str,
+    },
 }
 
 /// What a read cost in fidelity. Returned alongside data, never logged and
@@ -384,6 +411,11 @@ mod tests {
                 entry: n(),
                 declared: 1,
                 fixup: "f".into(),
+            },
+            Fidelity::HeadersDisagree {
+                format: FormatId::new("zip"),
+                entry: n(),
+                field: "name",
             },
         ];
         for f in all {
