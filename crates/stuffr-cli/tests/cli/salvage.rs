@@ -948,3 +948,129 @@ fn salvage_output_refuses_to_name_the_archive_it_is_reading() {
     );
     assert_eq!(std::fs::read(&archive).unwrap(), bytes);
 }
+
+/// Fix round 1 of EXTRACT-1: a symlink at a salvage target — live or
+/// dangling — is the destination's, so it stays exactly as it was, what it
+/// points at is untouched (nothing is written through it), and the record
+/// lands as `NAME.salvaged-N`.
+#[cfg(unix)]
+#[test]
+fn salvage_leaves_a_symlink_at_its_target_alone() {
+    let dir = tmp_dir();
+    let archive = dir.join("links.zip");
+    std::fs::write(
+        &archive,
+        stored_zip_of(&[
+            ("live", b"recovered live"),
+            ("dangling", b"recovered dangling"),
+        ]),
+    )
+    .unwrap();
+    let dest = dir.join("out");
+    std::fs::create_dir_all(&dest).unwrap();
+    let pointee = dir.join("pointee.txt");
+    std::fs::write(&pointee, b"untouched").unwrap();
+    let missing = dir.join("missing.txt");
+    std::os::unix::fs::symlink(&pointee, dest.join("live")).unwrap();
+    std::os::unix::fs::symlink(&missing, dest.join("dangling")).unwrap();
+
+    let out = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_link(dest.join("live")).unwrap(), pointee);
+    assert_eq!(std::fs::read_link(dest.join("dangling")).unwrap(), missing);
+    assert_eq!(std::fs::read(&pointee).unwrap(), b"untouched");
+    assert!(
+        !missing.exists(),
+        "nothing may be created through a dangling link"
+    );
+    assert_eq!(
+        std::fs::read(dest.join("live.salvaged-0")).unwrap(),
+        b"recovered live"
+    );
+    assert_eq!(
+        std::fs::read(dest.join("dangling.salvaged-1")).unwrap(),
+        b"recovered dangling"
+    );
+}
+
+/// Fix round 1 of EXTRACT-1: the archive reached through another name at
+/// the target — a symlink to it, or a hard link to it — is never removed or
+/// overwritten by salvage.
+#[cfg(unix)]
+#[test]
+fn salvage_never_replaces_the_archive_through_a_link_at_the_target() {
+    let dir = tmp_dir();
+    let archive = dir.join("damaged.zip");
+    let bytes = stored_zip_of(&[("soft.zip", b"one"), ("hard.zip", b"two")]);
+    std::fs::write(&archive, &bytes).unwrap();
+    let dest = dir.join("out");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::os::unix::fs::symlink(&archive, dest.join("soft.zip")).unwrap();
+    std::fs::hard_link(&archive, dest.join("hard.zip")).unwrap();
+
+    let out = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(&archive).unwrap(), bytes);
+    assert_eq!(std::fs::read_link(dest.join("soft.zip")).unwrap(), archive);
+    assert_eq!(std::fs::read(dest.join("hard.zip")).unwrap(), bytes);
+    assert_eq!(
+        std::fs::read(dest.join("soft.zip.salvaged-0")).unwrap(),
+        b"one"
+    );
+    assert_eq!(
+        std::fs::read(dest.join("hard.zip.salvaged-1")).unwrap(),
+        b"two"
+    );
+}
+
+/// Fix round 1 of EXTRACT-1: a re-run into the same directory leaves the
+/// first run's output alone and writes its copies beside it.
+#[test]
+fn a_salvage_rerun_writes_beside_the_previous_output() {
+    let dir = tmp_dir();
+    let archive = dir.join("a.zip");
+    std::fs::write(&archive, stored_zip_of(&[("x.txt", b"recovered")])).unwrap();
+    let dest = dir.join("out");
+    let run = || {
+        run_output(&[
+            "salvage",
+            archive.to_str().unwrap(),
+            "-C",
+            dest.to_str().unwrap(),
+        ])
+    };
+    assert_eq!(run().status.code(), Some(0));
+    std::fs::write(dest.join("x.txt"), b"edited since").unwrap();
+    let second = run();
+    assert_eq!(
+        second.status.code(),
+        Some(4),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(std::fs::read(dest.join("x.txt")).unwrap(), b"edited since");
+    assert_eq!(
+        std::fs::read(dest.join("x.txt.salvaged-0")).unwrap(),
+        b"recovered"
+    );
+}

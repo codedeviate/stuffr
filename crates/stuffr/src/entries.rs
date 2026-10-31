@@ -876,7 +876,11 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
     refuse_directory_for(&src, "unpack")?;
     // Before `src` is consumed by `open_archive`, which takes it by value.
     // The archive's identity, for `place`'s never-replace-the-archive rule.
-    let archive_id = src.path().and_then(ArchiveId::of);
+    // Standard input redirected from a file is that file (fix round 1).
+    let archive_id = match src.path() {
+        Some(p) => ArchiveId::of(p),
+        None => ArchiveId::of_stdin(),
+    };
     let compressed_total = o.compressed_total.or_else(|| {
         src.path()
             .and_then(|p| std::fs::metadata(p).ok())
@@ -5163,6 +5167,11 @@ const SALVAGE_REASON_DIRECTORY_IN_THE_WAY: &str =
 const SALVAGE_REASON_NOT_A_DIRECTORY_HERE: &str =
     "something that is not a directory is already at this path";
 
+/// Salvage's reason for a record whose path is the archive being read
+/// (EXTRACT-1). It is never replaced.
+const SALVAGE_REASON_ARCHIVE_HERE: &str =
+    "the archive being read is at this path, and salvage never replaces it";
+
 /// Why `unpack` skips a hard link: its target was not written by this run —
 /// filtered out by the selection, skipped, or never seen. The target is
 /// interpolated raw; `Fidelity`'s `Display` escapes the whole reason.
@@ -5599,6 +5608,27 @@ impl ArchiveId {
         (id.is_some() || canonical.is_some()).then_some(ArchiveId { id, canonical })
     }
 
+    /// Standard input, when it is redirected from a regular file: `fstat`
+    /// of fd 0, as the CLI's `refuse_stdin_redirected_from` does. `None`
+    /// for a pipe or terminal, and off unix.
+    fn of_stdin() -> Option<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd;
+            use std::os::unix::fs::MetadataExt;
+            let fd = std::io::stdin().as_fd().try_clone_to_owned().ok()?;
+            let md = std::fs::File::from(fd).metadata().ok()?;
+            md.is_file().then(|| ArchiveId {
+                id: Some((md.dev(), md.ino())),
+                canonical: None,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
     /// Whether the directory entry at `target` is the archive. Compared by
     /// identity without following a symlink at `target` (removing a link to
     /// the archive harms nothing); by canonical path only when no identity
@@ -5871,6 +5901,8 @@ enum Held {
     DirectoryInTheWay(PathBuf),
     /// A non-directory at the entry's own path, and no licence to remove it.
     Exists(PathBuf),
+    /// The archive being read is at the entry's own path (EXTRACT-8).
+    IsArchive(PathBuf),
 }
 
 impl Held {
@@ -5892,6 +5924,11 @@ impl Held {
                     path.display()
                 )
             }
+            Held::IsArchive(path) => format!(
+                "{} is the archive being read, so `{name}` cannot be extracted over it; \
+                 extract into another directory",
+                path.display()
+            ),
         }
     }
 
@@ -5905,6 +5942,7 @@ impl Held {
             Held::NotADirectoryAbove(_) => SALVAGE_REASON_NOT_A_DIRECTORY_ABOVE,
             Held::DirectoryInTheWay(_) => SALVAGE_REASON_DIRECTORY_IN_THE_WAY,
             Held::Exists(_) => SALVAGE_REASON_NOT_A_DIRECTORY_HERE,
+            Held::IsArchive(_) => SALVAGE_REASON_ARCHIVE_HERE,
         }
     }
 }
@@ -5984,10 +6022,14 @@ fn place(
             }
             Ok(_) => {
                 // Security audit EXTRACT-8: the archive being read is never
-                // removed to make room for one of its own entries, with or
-                // without `--force` — a skip naming why, not a usage error,
-                // since `--force` would not help.
+                // removed to make room for one of its own entries. Under
+                // `--force` that entry is skipped with a warning; without
+                // it, it is held like any existing file (exit 2 for
+                // `unpack`), worded without suggesting `--force`.
                 if made.is_archive(target) {
+                    if !force {
+                        return Ok(Placed::Held(Held::IsArchive(target.to_path_buf())));
+                    }
                     return Ok(Placed::Skip(Fidelity::EntrySkipped {
                         entry: name.to_string(),
                         reason: ARCHIVE_IN_THE_WAY_REASON.to_string(),

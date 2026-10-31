@@ -1174,3 +1174,95 @@ fn unpack_force_never_replaces_the_archive_it_is_reading() {
     );
     assert_eq!(std::fs::read(&archive).unwrap(), bytes);
 }
+
+/// Fix round 1 of EXTRACT-8: without `--force` the archive at an entry's
+/// target is a usage error (exit 2) like any existing file, worded so it
+/// does not suggest `--force`, and the archive is untouched.
+#[test]
+fn unpack_without_force_refuses_an_entry_whose_target_is_the_archive() {
+    let dir = tmp_dir();
+    let work = dir.join("w");
+    std::fs::create_dir_all(&work).unwrap();
+    let archive = work.join("self.zip");
+    let bytes = stored_zip_of(&[("self.zip", b"gone"), ("later.txt", b"later")]);
+    std::fs::write(&archive, &bytes).unwrap();
+
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        work.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains("archive being read") && !stderr.contains("--force"),
+        "the refusal must say why and must not suggest --force: {stderr}"
+    );
+    assert_eq!(std::fs::read(&archive).unwrap(), bytes);
+}
+
+/// Fix round 1 of EXTRACT-8: the archive redirected onto standard input
+/// (`stuffr unpack - < self.zip`) is identified by fstat of fd 0 and is
+/// never replaced either.
+#[cfg(unix)]
+#[test]
+fn unpack_force_from_stdin_never_replaces_the_redirected_archive() {
+    let dir = tmp_dir();
+    let work = dir.join("w");
+    std::fs::create_dir_all(&work).unwrap();
+    let archive = work.join("self.zip");
+    let bytes = stored_zip_of(&[("self.zip", b"gone"), ("later.txt", b"later")]);
+    std::fs::write(&archive, &bytes).unwrap();
+
+    let out = Command::new(STUFFR)
+        .args(["unpack", "-", "-C", work.to_str().unwrap(), "--force"])
+        .stdin(Stdio::from(std::fs::File::open(&archive).unwrap()))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stderr.contains("archive being read"), "stderr: {stderr}");
+    assert_eq!(std::fs::read(&archive).unwrap(), bytes);
+    assert_eq!(std::fs::read(work.join("later.txt")).unwrap(), b"later");
+}
+
+/// Fix round 1 of EXTRACT-8: the archive reached through another name at
+/// the target. A hard link IS the archive's inode, so the entry is
+/// skipped; a symlink to it is only a link, so `--force` replaces the link
+/// and the archive itself is untouched either way.
+#[cfg(unix)]
+#[test]
+fn unpack_force_never_replaces_the_archive_through_a_link_at_the_target() {
+    let dir = tmp_dir();
+    let archive = dir.join("a.zip");
+    let bytes = stored_zip_of(&[("soft.zip", b"one"), ("hard.zip", b"two")]);
+    std::fs::write(&archive, &bytes).unwrap();
+    let dest = dir.join("out");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::os::unix::fs::symlink(&archive, dest.join("soft.zip")).unwrap();
+    std::fs::hard_link(&archive, dest.join("hard.zip")).unwrap();
+
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+        "--force",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(std::fs::read(&archive).unwrap(), bytes);
+    assert_eq!(std::fs::read(dest.join("hard.zip")).unwrap(), bytes);
+    assert!(
+        stderr.contains("hard.zip") && stderr.contains("archive being read"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !std::fs::symlink_metadata(dest.join("soft.zip"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read(dest.join("soft.zip")).unwrap(), b"one");
+}

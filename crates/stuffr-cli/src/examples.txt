@@ -1189,6 +1189,8 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
       previous run's output, a symlink, or broken.zip itself when out/ is
       its own directory — is left alone, and the recovered copy lands
       beside it as `NAME.salvaged-N`, listed on stderr; the run exits 4.
+      So re-running salvage into the same out/ writes `NAME.salvaged-N`
+      copies beside the earlier run's output rather than over it.
 
       The default (non---list) report — counts only — goes to stderr, the
       same destination `unpack`'s and `test`'s own summary lines use.
