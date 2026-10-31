@@ -2652,9 +2652,15 @@ fn zip_looks_like_archive(b: &[u8]) -> bool {
 /// `@file`), the payload's lines, plus one per `.` token (`-r .` visits
 /// every file of the directory). A path nobody names must not be opened.
 ///
-/// Per path, `opens ≤ 4 × m` and `bytes ≤ m × 3 × len + 8 KiB × opens`
-/// (`len` the largest length at an open; the figures are what the seeds
-/// measured, see `ZIP_READ_*`). `-FF` is held to `m × (2 × len + 1 MiB)`
+/// Per path, `opens ≤ 4 × m + 2 × records` and `bytes ≤ m × 3 × len + 8 KiB
+/// × opens` (`len` the largest length at an open; the figures are what the
+/// seeds measured, see `ZIP_READ_*`). `records` counts the central and local
+/// header signatures in the file as it was before the run: zipfile.c's
+/// `zipcopy` and `readlocal` reopen the archive whenever an entry starts on
+/// another disk than the one open ("don't assume reading the right disk"),
+/// so records whose disk numbers alternate cost an open each, in each of
+/// the two (0.23.0 deep fuzz: `-F a.zip -O b.zip` opened it five times, two
+/// of them `zipcopy`'s reopens; the same five since 0.19.0). `-FF` is held to `m × (2 × len + 1 MiB)`
 /// and no more: its descriptor search is bounded (Task 8) and charged to
 /// the sandbox budget.
 fn check_zip_reads(
@@ -2664,6 +2670,7 @@ fn check_zip_reads(
     args: &[&str],
     payload: &[u8],
     reads: &BTreeMap<PathBuf, compat::InputReads>,
+    before: &BTreeMap<PathBuf, Vec<u8>>,
 ) {
     let from_payload = zip_names_from_payload(args);
     // The names the payload supplies, as the sandbox resolves them (a root
@@ -2712,9 +2719,15 @@ fn check_zip_reads(
             m > 0,
             "{name} ({flavour}) {args:?}: opened {file:?}, which no operand names"
         );
+        let records = before.get(path).map_or(0, |b| {
+            b.windows(4)
+                .filter(|w| *w == b"PK\x01\x02" || *w == b"PK\x03\x04")
+                .count() as u64
+        });
         assert!(
-            r.opens <= ZIP_READ_OPENS * m,
-            "{name} ({flavour}) {args:?}: {} opens of {file:?}, which {m} operand(s) name",
+            r.opens <= ZIP_READ_OPENS * m + 2 * records,
+            "{name} ({flavour}) {args:?}: {} opens of {file:?}, which {m} operand(s) name \
+             and which held {records} record(s)",
             r.opens
         );
         // `-FF` reads the archive as a stream and scans on past damage:
@@ -2801,7 +2814,7 @@ fn run_zip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8], pay
         "{name} ({flavour_name}) {args:?}: exit {code} is not a ziperr code\n{}",
         why()
     );
-    check_zip_reads(dir, name, flavour_name, args, payload, &reads);
+    check_zip_reads(dir, name, flavour_name, args, payload, &reads, &before);
 
     let after = tree_contents(dir);
     let mut created = Vec::new();
