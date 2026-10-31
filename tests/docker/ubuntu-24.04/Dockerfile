@@ -16,7 +16,9 @@
 # The harness checks the unzip version itself (`unzip_dir()` requires
 # `dpkg-query -W -f '${Version}' unzip` = 6.0-28ubuntu4.1), so a newer apt
 # package fails the run loudly instead of being used as the oracle.
-FROM ubuntu:24.04
+# Pinned by digest (the multi-arch index of ubuntu:24.04 on 2026-10-31) so a
+# re-pushed tag cannot change the base under us; refresh it deliberately.
+FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
 
 # The channel `rust-toolchain.toml` names; the Makefile passes it.
 ARG RUST_TOOLCHAIN=1.95
