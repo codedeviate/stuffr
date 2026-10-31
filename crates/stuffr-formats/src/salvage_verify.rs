@@ -168,7 +168,7 @@ pub fn stream_verify(
 /// `arj`/`arc`/`zoo`/`lha`, none of which this module's own gate implies.
 /// Moved here verbatim from Stage 1's `zip_salvage.rs` (Task 1 of Salvage
 /// Stage 2) as part of generalising `stream_verify` to both CRC widths.
-fn crc32_ieee_update(crc: u32, data: &[u8]) -> u32 {
+pub(crate) fn crc32_ieee_update(crc: u32, data: &[u8]) -> u32 {
     let mut crc = crc;
     for &b in data {
         crc ^= u32::from(b);

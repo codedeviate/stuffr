@@ -1540,6 +1540,11 @@ impl ZipIndexed {
 #[derive(Debug, PartialEq, Eq)]
 struct HeaderClaim {
     name: Vec<u8>,
+    /// The name a reader of this record alone delivers: the raw name with
+    /// this record's own Info-ZIP Unicode Path field applied as zip 9 applies
+    /// it ([`shown_name`]), ruling T5-d. `None` when it could not be read;
+    /// then only the raw names are compared.
+    shown: Option<String>,
     flags: u16,
     method: u16,
     crc: Option<u32>,
@@ -1557,23 +1562,25 @@ const FLAG_UTF8: u16 = 0x0800;
 /// AES extra field, whose metadata ruling B3 leaves uncompared.
 const METHOD_AES: u16 = 99;
 
-/// Reads the local header at `header_start` as far as ruling B3 needs: the
-/// 30-byte fixed block and the name, plus the extra field only when a size
-/// is `0xFFFFFFFF` and must be resolved from zip64. zip 9 reads the same
-/// fixed block when it opens the entry (`find_content`) and does not expose
-/// it, so this is an extra read (ruling T4-a): at most 30 + name + extra
-/// bytes at an offset about to be read anyway. The only other one is
-/// [`read_central_name_and_flags`], for an entry with a Unicode Path field. `None` on any failure: a header this
-/// cannot read is left to zip's own path, which classifies it.
+/// Reads the local header at `header_start` as far as rulings B3 and T5-d
+/// need: the 30-byte fixed block, the name and the extra field (zip64 sizes,
+/// and the Unicode Path field for [`HeaderClaim::shown`]). zip 9 reads the
+/// same fixed block when it opens the entry (`find_content`) and does not
+/// expose it, so this is an extra read (ruling T4-a): at most 30 + 65,535 +
+/// 65,535 bytes at an offset about to be read anyway. The only other one is
+/// [`read_central_name_and_flags`], for an entry with a Unicode Path field.
+/// `None` on any failure: a header this cannot read is left to zip's own
+/// path, which classifies it.
 fn read_local_claim<R: Read + Seek>(r: &mut R, header_start: u64) -> Option<HeaderClaim> {
     r.seek(SeekFrom::Start(header_start)).ok()?;
     parse_local_claim(r)
 }
 
 /// [`read_local_claim`]'s parse, from wherever `r` stands: the signature, the
-/// fixed block, the name, and the extra field only when a 32-bit size is
-/// `0xFFFFFFFF`. The forward reader calls it on the stream itself, through
-/// [`Recording`], and replays what it read. `None` on any failure.
+/// fixed block, the name and the extra field. The forward reader calls it on
+/// the stream itself, through [`Recording`], and replays what it read. `None`
+/// if the fixed block or the name cannot be read; an unreadable extra field
+/// leaves `shown` and any zip64 size `None`.
 fn parse_local_claim<R: Read>(r: &mut R) -> Option<HeaderClaim> {
     let mut fixed = [0u8; 30];
     r.read_exact(&mut fixed).ok()?;
@@ -1589,10 +1596,14 @@ fn parse_local_claim<R: Read>(r: &mut R) -> Option<HeaderClaim> {
     let extra_len = usize::from(le16(&fixed[28..30]));
     let mut name = vec![0u8; name_len];
     r.read_exact(&mut name).ok()?;
+    let mut extra = vec![0u8; extra_len];
+    let extra = r.read_exact(&mut extra).ok().map(|()| extra);
+    let shown = extra.as_deref().map(|x| shown_name(&name, flags, x));
 
     if flags & FLAG_DATA_DESCRIPTOR != 0 {
         return Some(HeaderClaim {
             name,
+            shown,
             flags,
             method,
             crc: None,
@@ -1602,23 +1613,54 @@ fn parse_local_claim<R: Read>(r: &mut R) -> Option<HeaderClaim> {
     }
     let (mut csize, mut usize_) = (Some(u64::from(csize32)), Some(u64::from(usize32)));
     if csize32 == u32::MAX || usize32 == u32::MAX {
-        let mut extra = vec![0u8; extra_len];
-        let zip64 = r
-            .read_exact(&mut extra)
-            .ok()
-            .and_then(|()| zip64_block(&extra).map(<[u8]>::to_vec));
-        let (u, c) = local_zip64_sizes(zip64.as_deref(), usize32, csize32);
+        let zip64 = extra.as_deref().and_then(zip64_block);
+        let (u, c) = local_zip64_sizes(zip64, usize32, csize32);
         usize_ = u;
         csize = c;
     }
     Some(HeaderClaim {
         name,
+        shown,
         flags,
         method,
         crc: Some(crc),
         csize,
         usize_,
     })
+}
+
+/// The name a reader delivers for one record: `raw` with the record's own
+/// Info-ZIP Unicode Path field (0x7075) applied exactly as zip 9 applies it
+/// (`ZipFileData::apply_extra_fields`, `extra_fields/extra_field.rs`): every
+/// such field in order, each replacing the name when its CRC-32 matches the
+/// RAW name and its content is UTF-8, so the last valid one wins. Otherwise
+/// the raw name decoded by the language-encoding flag ([`entry_name`]).
+/// Fields are walked as id, length, data; a field running past the end stops
+/// the walk (zip 9 refuses such a header outright, so nothing it delivers is
+/// at stake).
+fn shown_name(raw: &[u8], flags: u16, extra: &[u8]) -> String {
+    const UNICODE_PATH: u16 = 0x7075;
+    let mut crc = None;
+    let mut shown = None;
+    let mut at = 0usize;
+    while at + 4 <= extra.len() {
+        let id = le16(&extra[at..at + 2]);
+        let len = usize::from(le16(&extra[at + 2..at + 4]));
+        let Some(data) = extra.get(at + 4..at + 4 + len) else {
+            break;
+        };
+        if id == UNICODE_PATH && data.len() >= 5 {
+            let raw_crc =
+                *crc.get_or_insert_with(|| !crate::salvage_verify::crc32_ieee_update(!0, raw));
+            if le32(&data[1..5]) == raw_crc
+                && let Ok(name) = std::str::from_utf8(&data[5..])
+            {
+                shown = Some(name.to_owned());
+            }
+        }
+        at += 4 + len;
+    }
+    shown.unwrap_or_else(|| entry_name(raw, flags))
 }
 
 /// The data of the first zip64 extended-information block (id 0x0001) in an
@@ -1677,7 +1719,10 @@ fn local_zip64_sizes(
 /// off unseen.
 fn disagreeing_fields(central: &HeaderClaim, local: &HeaderClaim) -> Vec<&'static str> {
     let mut out = Vec::new();
-    if local.name != central.name {
+    // Ruling T5-d: the raw names, and the names each record alone would be
+    // delivered under. One "name" either way.
+    let shown_differ = matches!((&central.shown, &local.shown), (Some(c), Some(l)) if c != l);
+    if local.name != central.name || shown_differ {
         out.push("name");
     }
     if central.method != local.method && central.method != METHOD_AES && local.method != METHOD_AES
@@ -1752,6 +1797,9 @@ impl ZipIndexed {
             let method = raw.compression().to_u16();
             let central = HeaderClaim {
                 name: raw.name_raw().to_vec(),
+                // zip's view, its own Unicode Path applied: what this path
+                // delivers (ruling T5-d).
+                shown: Some(entry_name(raw.name_raw(), raw.flags().as_u16())),
                 flags: raw.flags().as_u16(),
                 method,
                 crc: Some(raw.crc32()),
@@ -2298,18 +2346,15 @@ fn verify_trailing_index(
                 check.note_central_framing(&fixed, variable);
                 let what = "central directory header fields";
                 if check.can_hold(usize::from(name)) {
-                    // The record's own name, and its extra field only when a
-                    // size is saturated and must be resolved from zip64. Both
-                    // at most 65,535 bytes; the rest is skipped as before.
+                    // The record's own name and extra field (zip64 sizes, and
+                    // the Unicode Path field for the name it would be
+                    // delivered under, ruling T5-d): each at most 65,535
+                    // bytes, the extra field dropped once read. The comment
+                    // is skipped as before.
                     let name = read_vec(source, usize::from(name), what)?;
-                    let extra = if central_sizes_saturated(&fixed) {
-                        Some(read_vec(source, usize::from(extra), what)?)
-                    } else {
-                        skip(source, u64::from(extra), what)?;
-                        None
-                    };
+                    let extra = read_vec(source, usize::from(extra), what)?;
                     skip(source, u64::from(comment), what)?;
-                    check.record_central(central_claim(&fixed, name, extra.as_deref()));
+                    check.record_central(central_claim(&fixed, name, &extra));
                 } else {
                     skip(source, variable, what)?;
                 }
@@ -2434,8 +2479,9 @@ fn skip(source: &mut Pushback, mut count: u64, what: &str) -> Result<()> {
 const ZIP64_END_FIXED: usize = 44;
 
 /// The most bytes [`IndexCheck`] holds for the comparison: every walked local
-/// header's name (raw and as delivered) and every central record's name, each
-/// charged with its fixed part ([`CLAIM_OVERHEAD`]). Past it the comparison
+/// header's raw name and its delivered name (held twice: the claim's `shown`
+/// and the warning's entry) and every central record's raw and shown names,
+/// each charged with its fixed part ([`CLAIM_OVERHEAD`]). Past it the comparison
 /// is given up, memory is freed, and the archive keeps the forward reader's
 /// two warnings exactly as before (ruling B2, "over the bound"). 32 MiB holds
 /// about 200,000 entries with 40-byte names.
@@ -2512,16 +2558,25 @@ impl IndexCheck {
             self.give_up();
             return;
         };
-        if self.can_hold(claim.name.len() + delivered.len()) {
-            self.held += claim.name.len() + delivered.len() + CLAIM_OVERHEAD;
+        // What zip delivered for this header is the shown name (ruling
+        // T5-d), rather than a re-derivation of it.
+        let claim = HeaderClaim {
+            shown: Some(delivered.to_owned()),
+            ..claim
+        };
+        let cost = claim.name.len() + 2 * delivered.len();
+        if self.can_hold(cost) {
+            self.held += cost + CLAIM_OVERHEAD;
             self.locals.push((claim, delivered.to_owned()));
         }
     }
 
     fn record_central(&mut self, claim: HeaderClaim) {
-        // `can_hold` was asked before the name was read.
-        self.held += claim.name.len() + CLAIM_OVERHEAD;
-        self.centrals.push(claim);
+        let cost = claim.name.len() + claim.shown.as_ref().map_or(0, String::len);
+        if self.can_hold(cost) {
+            self.held += cost + CLAIM_OVERHEAD;
+            self.centrals.push(claim);
+        }
     }
 
     /// Counts one central record from its fixed block, recorded or not.
@@ -2563,29 +2618,18 @@ impl IndexCheck {
     }
 }
 
-/// Whether a central record's 32-bit compressed or uncompressed size is
-/// `0xFFFFFFFF`, so the real one is in its zip64 extra block.
-fn central_sizes_saturated(fixed: &[u8; CENTRAL_HEADER_FIXED]) -> bool {
-    le32(&fixed[16..20]) == u32::MAX || le32(&fixed[20..24]) == u32::MAX
-}
-
 /// A central record's claim on ruling B3's fields, from its own bytes: the
-/// 42-byte fixed block after the signature, the raw name, and the extra field
-/// when [`central_sizes_saturated`]. The central zip64 block holds only the
-/// saturated fields, uncompressed size first (APPNOTE 4.5.3); one that cannot
-/// be resolved is `None`, never compared.
-fn central_claim(
-    fixed: &[u8; CENTRAL_HEADER_FIXED],
-    name: Vec<u8>,
-    extra: Option<&[u8]>,
-) -> HeaderClaim {
+/// 42-byte fixed block after the signature, the raw name, and the extra
+/// field. The central zip64 block holds only the saturated fields,
+/// uncompressed size first (APPNOTE 4.5.3); one that cannot be resolved is
+/// `None`, never compared. `shown` applies the record's own Unicode Path
+/// field ([`shown_name`]).
+fn central_claim(fixed: &[u8; CENTRAL_HEADER_FIXED], name: Vec<u8>, extra: &[u8]) -> HeaderClaim {
     let usize32 = le32(&fixed[20..24]);
     let csize32 = le32(&fixed[16..20]);
-    let mut fields = extra
-        .and_then(zip64_block)
-        .unwrap_or(&[])
-        .chunks_exact(8)
-        .map(le64);
+    let flags = le16(&fixed[4..6]);
+    let shown = Some(shown_name(&name, flags, extra));
+    let mut fields = zip64_block(extra).unwrap_or(&[]).chunks_exact(8).map(le64);
     let usize_ = if usize32 == u32::MAX {
         fields.next()
     } else {
@@ -2598,7 +2642,8 @@ fn central_claim(
     };
     HeaderClaim {
         name,
-        flags: le16(&fixed[4..6]),
+        shown,
+        flags,
         method: le16(&fixed[6..8]),
         crc: Some(le32(&fixed[12..16])),
         csize,
@@ -4151,6 +4196,7 @@ mod tests {
     fn claim(name: &[u8]) -> HeaderClaim {
         HeaderClaim {
             name: name.to_vec(),
+            shown: None,
             flags: 0,
             method: 0,
             crc: Some(0),
@@ -4175,7 +4221,7 @@ mod tests {
         }
         assert_eq!(
             recorded - 1,
-            MAX_INDEX_CHECK_BYTES / (120_000 + CLAIM_OVERHEAD),
+            MAX_INDEX_CHECK_BYTES / (180_000 + CLAIM_OVERHEAD),
             "every record that fits is kept"
         );
         assert!(check.locals.capacity() == 0 && check.held == 0);
@@ -4324,11 +4370,22 @@ mod tests {
     /// flags and extra field, the same bytes in the local header and the
     /// central record, so both rungs read the identical claim.
     fn raw_zip(name: &[u8], flags: u16, extra: &[u8], payload: &[u8]) -> Vec<u8> {
+        raw_zip_with_extras(name, flags, extra, extra, payload)
+    }
+
+    /// [`raw_zip`] with a different extra field in each header.
+    fn raw_zip_with_extras(
+        name: &[u8],
+        flags: u16,
+        local_extra: &[u8],
+        central_extra: &[u8],
+        payload: &[u8],
+    ) -> Vec<u8> {
         let crc = crc32(payload);
         let size = u32::try_from(payload.len()).expect("short payload");
         let n_len = u16::try_from(name.len()).expect("short name");
-        let x_len = u16::try_from(extra.len()).expect("short extra");
-        let fixed = |out: &mut Vec<u8>| {
+        let fixed = |out: &mut Vec<u8>, extra: &[u8]| {
+            let x_len = u16::try_from(extra.len()).expect("short extra");
             out.extend_from_slice(&20u16.to_le_bytes()); // version needed
             out.extend_from_slice(&flags.to_le_bytes());
             out.extend_from_slice(&0u16.to_le_bytes()); // method: STORE
@@ -4342,21 +4399,21 @@ mod tests {
         };
         let mut out = Vec::new();
         out.extend_from_slice(&SIG_LOCAL_HEADER);
-        fixed(&mut out);
+        fixed(&mut out, local_extra);
         out.extend_from_slice(name);
-        out.extend_from_slice(extra);
+        out.extend_from_slice(local_extra);
         out.extend_from_slice(payload);
         let cd_start = u32::try_from(out.len()).expect("small archive");
         out.extend_from_slice(&SIG_CENTRAL_HEADER);
         out.extend_from_slice(&20u16.to_le_bytes()); // version made by
-        fixed(&mut out);
+        fixed(&mut out, central_extra);
         out.extend_from_slice(&0u16.to_le_bytes()); // comment length
         out.extend_from_slice(&0u16.to_le_bytes()); // disk number start
         out.extend_from_slice(&0u16.to_le_bytes()); // internal attributes
         out.extend_from_slice(&0u32.to_le_bytes()); // external attributes
         out.extend_from_slice(&0u32.to_le_bytes()); // local header offset
         out.extend_from_slice(name);
-        out.extend_from_slice(extra);
+        out.extend_from_slice(central_extra);
         let cd_size = u32::try_from(out.len()).expect("small archive") - cd_start;
         out.extend_from_slice(&SIG_END_OF_CENTRAL_DIR);
         out.extend_from_slice(&0u16.to_le_bytes()); // this disk
@@ -4600,6 +4657,173 @@ mod tests {
         extra.extend_from_slice(&crc32(raw_name).to_le_bytes());
         extra.extend_from_slice(unicode);
         raw_zip(raw_name, 0, &extra, b"payload")
+    }
+
+    /// An Info-ZIP Unicode Path field (0x7075) naming `unicode`, vouched for
+    /// by `crc`.
+    fn unicode_path_field(crc: u32, unicode: &str) -> Vec<u8> {
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&0x7075u16.to_le_bytes());
+        extra.extend_from_slice(&((1 + 4 + unicode.len()) as u16).to_le_bytes());
+        extra.push(1); // version
+        extra.extend_from_slice(&crc.to_le_bytes());
+        extra.extend_from_slice(unicode.as_bytes());
+        extra
+    }
+
+    /// The disagreements a forward (piped) walk of `bytes` reports, with
+    /// whether the two index warnings were withdrawn.
+    fn piped_disagreements(bytes: &[u8]) -> (Vec<(String, &'static str)>, bool) {
+        let mut ar = open_forward_only(&Zip, bytes);
+        while let Some(mut e) = ar.next_entry().expect("entry") {
+            io::copy(&mut e.reader(), &mut io::sink()).expect("payload");
+        }
+        let report = ar.fidelity();
+        let withdrawn = !report.warnings.contains(&Fidelity::EntryCountUnknown);
+        (disagreements(report), withdrawn)
+    }
+
+    /// Ruling T5-d: raw names alike, but one record carries a Unicode Path
+    /// field the other does not, so a reader of that record alone delivers
+    /// another name (zip 9 applies a local field on the pipe,
+    /// `read/stream.rs:774`, and a central one on the seekable path). Both
+    /// shapes are reported as "name" on both paths, once.
+    #[test]
+    fn a_unicode_path_field_in_one_header_only_is_a_name_disagreement() {
+        let field = unicode_path_field(crc32(b"a.txt"), "evil.sh");
+        let local_only = raw_zip_with_extras(b"a.txt", 0, &field, &[], b"payload");
+        let central_only = raw_zip_with_extras(b"a.txt", 0, &[], &field, b"payload");
+
+        // Seekable: delivered under the central record's name.
+        let (_, found) = read_with_disagreements(&local_only);
+        assert_eq!(found, vec![("a.txt".to_string(), "name")]);
+        let (_, found) = read_with_disagreements(&central_only);
+        assert_eq!(found, vec![("evil.sh".to_string(), "name")]);
+
+        // Piped: delivered under the local header's name. The index was read
+        // and compared, so the two index warnings go; the cloak warning is
+        // what is left.
+        let (found, withdrawn) = piped_disagreements(&local_only);
+        assert_eq!(found, vec![("evil.sh".to_string(), "name")]);
+        assert!(withdrawn);
+        let (found, _) = piped_disagreements(&central_only);
+        assert_eq!(found, vec![("a.txt".to_string(), "name")]);
+    }
+
+    /// Info-ZIP writes the same Unicode Path field in both headers: agreement
+    /// on both paths. A field whose CRC-32 does not vouch for the raw name is
+    /// ignored by zip 9, so in one header only it changes nothing delivered
+    /// and is not reported either.
+    #[test]
+    fn a_matching_or_ignored_unicode_path_field_is_not_a_disagreement() {
+        let good = unicode_path_field(crc32(b"a.txt"), "évil.sh");
+        let forged = unicode_path_field(crc32(b"a.txt") ^ 1, "evil.sh");
+        for (what, bytes) in [
+            (
+                "matching in both",
+                raw_zip_with_extras(b"a.txt", 0, &good, &good, b"payload"),
+            ),
+            (
+                "forged, local only",
+                raw_zip_with_extras(b"a.txt", 0, &forged, &[], b"payload"),
+            ),
+            (
+                "forged, central only",
+                raw_zip_with_extras(b"a.txt", 0, &[], &forged, b"payload"),
+            ),
+        ] {
+            let (_, found) = read_with_disagreements(&bytes);
+            assert_eq!(found, vec![], "seekable, {what}");
+            let (found, withdrawn) = piped_disagreements(&bytes);
+            assert_eq!(found, vec![], "piped, {what}");
+            assert!(withdrawn, "piped, {what}");
+        }
+    }
+
+    /// The anti-goal "no change on well-formed archives", for zip64 on the
+    /// pipe: a central record whose 32-bit sizes are `0xFFFFFFFF` with the
+    /// real ones in its zip64 block, and an end record whose count is
+    /// `0xFFFF`, deferring to a zip64 end record and locator. The walk
+    /// resolves both, reports nothing and withdraws both index warnings.
+    #[test]
+    fn a_piped_zip64_archive_raises_nothing_and_withdraws_both_warnings() {
+        let name = b"big.bin";
+        let payload = b"zip64 payload";
+        let crc = crc32(payload);
+        let size = payload.len() as u64;
+        let fixed = |out: &mut Vec<u8>, sizes32: u32, x_len: u16| {
+            out.extend_from_slice(&45u16.to_le_bytes()); // version needed
+            out.extend_from_slice(&0u16.to_le_bytes()); // flags
+            out.extend_from_slice(&0u16.to_le_bytes()); // STORE
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0x21u16.to_le_bytes());
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&sizes32.to_le_bytes());
+            out.extend_from_slice(&sizes32.to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&x_len.to_le_bytes());
+        };
+        let mut out = Vec::new();
+        out.extend_from_slice(&SIG_LOCAL_HEADER);
+        fixed(&mut out, size as u32, 0);
+        out.extend_from_slice(name);
+        out.extend_from_slice(payload);
+
+        let cd_start = out.len() as u64;
+        out.extend_from_slice(&SIG_CENTRAL_HEADER);
+        out.extend_from_slice(&45u16.to_le_bytes()); // version made by
+        fixed(&mut out, u32::MAX, 20);
+        out.extend_from_slice(&[0u8; 6]); // comment, disk, internal attrs
+        out.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+        out.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+        out.extend_from_slice(name);
+        out.extend_from_slice(&0x0001u16.to_le_bytes());
+        out.extend_from_slice(&16u16.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes()); // uncompressed
+        out.extend_from_slice(&size.to_le_bytes()); // compressed
+        let cd_size = out.len() as u64 - cd_start;
+
+        let zip64_end = out.len() as u64;
+        out.extend_from_slice(&SIG_ZIP64_END);
+        out.extend_from_slice(&44u64.to_le_bytes());
+        out.extend_from_slice(&45u16.to_le_bytes());
+        out.extend_from_slice(&45u16.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&1u64.to_le_bytes());
+        out.extend_from_slice(&1u64.to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_start.to_le_bytes());
+        out.extend_from_slice(&SIG_ZIP64_LOCATOR);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&zip64_end.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&SIG_END_OF_CENTRAL_DIR);
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&u16::MAX.to_le_bytes());
+        out.extend_from_slice(&u16::MAX.to_le_bytes());
+        out.extend_from_slice(&u32::MAX.to_le_bytes());
+        out.extend_from_slice(&u32::MAX.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+
+        let mut ar = open_forward_only(&Zip, &out);
+        let mut data = Vec::new();
+        let mut e = ar.next_entry().expect("entry").expect("one entry");
+        e.reader().read_to_end(&mut data).expect("payload");
+        drop(e);
+        assert_eq!(data, payload);
+        assert!(ar.next_entry().expect("the index walk").is_none());
+        assert!(
+            ar.fidelity().warnings.is_empty(),
+            "{:?}",
+            ar.fidelity().warnings
+        );
+        // And the seekable reader accepts the same bytes, so the fixture is
+        // a real zip64 archive, not one only this walk believes in.
+        let (payloads, found) = read_with_disagreements(&out);
+        assert_eq!(payloads, vec![payload.to_vec()]);
+        assert_eq!(found, vec![]);
     }
 
     /// zip 9 replaces a central name with a valid Info-ZIP Unicode Path
