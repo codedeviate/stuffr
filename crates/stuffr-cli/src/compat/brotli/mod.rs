@@ -65,6 +65,17 @@
 //!     signal, because the Rust runtime ignores SIGPIPE before `main` and
 //!     the inherited setting cannot be told apart. A permanent deviation,
 //!     as in every family.
+//! 11. Hardening (ruling T5 of the 2026-10-31 security audit): `-f` never
+//!     writes through a symlink at the output name. The reference opens a
+//!     forced output `O_CREAT | O_TRUNC` without `O_EXCL`, so a symlink
+//!     there, dangling or not, is followed and the file it names is
+//!     created or truncated. stuffr unlinks the link and creates a fresh
+//!     file (`O_NOFOLLOW`), its target untouched; without `-f` both refuse
+//!     it (`O_EXCL`), as before. The attributes `CopyStat` copies are still
+//!     set by name after the close, as the reference sets them, but only
+//!     onto the file this run opened (same device and inode, not a
+//!     symlink): if the name was swapped meanwhile they are not copied.
+//!     Why: a planted link must not redirect a write.
 //!
 //! `files.rs` is the file handling (`NextFile`, `OpenFiles`, `CloseFiles`,
 //! `CopyStat`, `ReadDictionary`), `codec.rs` compression and the

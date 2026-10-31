@@ -157,6 +157,9 @@ pub(super) struct Ctx<'a> {
     pub(super) input_file_length: i64,
     pub(super) fin: Option<InputFile>,
     pub(super) fout: Option<OutputFile>,
+    /// The output file as opened (`fstat`), so [`copy_stat`] touches only
+    /// that file (deviation 11).
+    pub(super) fout_meta: Option<Metadata>,
     /// Closes an output file ([`close_file`]; a test injects a failure).
     pub(super) close_output: CloseFile,
     /// The raw dictionary (`-D`), read once.
@@ -182,6 +185,7 @@ impl<'a> Ctx<'a> {
             input_file_length: -1,
             fin: None,
             fout: None,
+            fout_meta: None,
             close_output: close_file,
             dictionary: None,
             prepared: None,
@@ -346,7 +350,9 @@ fn later_input_at(ctx: &Ctx, output: &Metadata) -> Option<OsString> {
 
 /// `OpenOutputFile`: standard output, or `open(O_CREAT | O_WRONLY |
 /// O_TRUNC, 0600)` with `O_EXCL` unless `-f`. Before a forced open the
-/// output is checked against the input (module doc).
+/// output is checked against the input (module doc). Deviation 11: a
+/// forced open never follows a symlink at the name: the link is replaced
+/// by a fresh file (`host::create_output`, `O_NOFOLLOW`).
 fn open_output(ctx: &mut Ctx, input: Option<&Metadata>) -> bool {
     let Some(name) = ctx.output_path.clone() else {
         ctx.fout = Some(OutputFile::Other(ctx.host.out_writer(None)));
@@ -371,20 +377,21 @@ fn open_output(ctx: &mut Ctx, input: Option<&Metadata>) -> bool {
         ctx.say(m::LATER_INPUT, &[cli::bytes(&later), &input_name]);
         return false;
     }
-    let mut opts = File::options();
-    opts.write(true).truncate(true);
-    if force {
-        opts.create(true);
+    let opened = if force {
+        host::create_output(&path, 0o600)
     } else {
-        opts.create_new(true);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    match opts.open(&path) {
+        let mut opts = File::options();
+        opts.write(true).truncate(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(&path)
+    };
+    match opened {
         Ok(f) => {
+            ctx.fout_meta = f.metadata().ok();
             ctx.fout = Some(match ctx.host {
                 Host::Real => OutputFile::File(BufWriter::with_capacity(64 * 1024, f)),
                 Host::Sandbox(_) => OutputFile::Other(ctx.host.out_writer(Some(f))),
@@ -448,6 +455,7 @@ pub(super) fn close_files(ctx: &mut Ctx, rm_input: bool, rm_output: bool) -> boo
         }
     }
     ctx.fout = None;
+    ctx.fout_meta = None;
     ctx.fin = None;
     // Ruling T4-g: the input goes only once its output is safely closed
     // (the reference unlinks it even after a failed `fclose`).
@@ -480,6 +488,17 @@ pub(super) fn copy_stat(ctx: &mut Ctx) {
     };
     let out = ctx.host.path(cli::bytes(&output));
     let name = cli::bytes(&output);
+    // Deviation 11: the attributes go by name, after the close, as the
+    // reference sets them (its `close(2)` result is checked first, T4-g,
+    // so no second descriptor is held open past it). Only onto the file
+    // this run opened: a symlink or another file now at the name is left
+    // alone, attributes not copied.
+    if let Some(opened) = &ctx.fout_meta
+        && fs::symlink_metadata(&out)
+            .map_or(true, |now| host::same_file(opened, &now) != Some(true))
+    {
+        return;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;

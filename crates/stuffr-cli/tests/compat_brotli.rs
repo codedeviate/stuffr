@@ -2880,4 +2880,64 @@ mod unix {
         let got = stuffr_as(&case("brotli", rows[2].1, false, false));
         assert!(!got.tree.contains_key("a") && got.tree.contains_key("b"));
     }
+
+    fn out_links_to_target(w: &Path) {
+        mkdir_d(w);
+        fs::write(w.join("t"), b"old target").unwrap();
+        std::os::unix::fs::symlink("t", w.join("o")).unwrap();
+    }
+    fn out_dangles(w: &Path) {
+        mkdir_d(w);
+        std::os::unix::fs::symlink("t", w.join("o")).unwrap();
+    }
+
+    /// Deviation 11 (ruling T5): a symlink at the output name, live or
+    /// dangling. Without `-f` both refuse it (`O_EXCL`, `File exists`),
+    /// the link and its target untouched; with `-f` the reference writes
+    /// through it, stuffr replaces the link with a fresh file and leaves
+    /// the target alone. stuffr alone (the reference differs).
+    #[test]
+    fn force_never_writes_through_a_symlink_at_the_output_name() {
+        for (setup, live) in [
+            (out_links_to_target as fn(&Path), true),
+            (out_dangles, false),
+        ] {
+            for (args, input, want) in [
+                (&["-o", "o", "a"][..], A, A),
+                (&["-d", "-o", "o", "a"], BR, A),
+            ] {
+                let what = format!("{args:?}, live {live}");
+                let msg = "failed to open output file [o]: File exists\n";
+                let rw = row(args, vec![("a", input.to_vec())], 1, msg);
+                let mut c = case("brotli", rw, false, false);
+                c.setup = Some(setup);
+                let got = stuffr_as(&c);
+                assert_eq!((got.code, got.stderr.as_str()), (1, msg), "{what}");
+                assert_eq!(got.tree["o"].0, b"t", "{what}: link replaced");
+                if live {
+                    assert_eq!(got.tree["t"].0, b"old target", "{what}");
+                } else {
+                    assert!(!got.tree.contains_key("t"), "{what}: t created");
+                }
+
+                let mut forced = vec!["-f"];
+                forced.extend_from_slice(args);
+                let rw = row(&forced, vec![("a", input.to_vec())], 0, "");
+                let mut c = case("brotli", rw, false, false);
+                c.setup = Some(setup);
+                let got = stuffr_as(&c);
+                assert_eq!((got.code, got.stderr.as_str()), (0, ""), "-f {what}");
+                let o = &got.tree["o"].0;
+                assert_ne!(o.as_slice(), b"t", "-f {what}: still the link");
+                if args[0] == "-d" {
+                    assert_eq!(o.as_slice(), want, "-f {what}");
+                }
+                if live {
+                    assert_eq!(got.tree["t"].0, b"old target", "-f {what}");
+                } else {
+                    assert!(!got.tree.contains_key("t"), "-f {what}: t created");
+                }
+            }
+        }
+    }
 }

@@ -2126,6 +2126,13 @@ The exit codes are 0 and 1 only, and the first failing file ends the run.
     dies of the signal, because the Rust runtime ignores SIGPIPE before
     `main` and the inherited setting cannot be told apart. A permanent
     deviation, as in every family.
+11. **`-f` never writes through a symlink at the output name** (hardening).
+    The reference opens a forced output without `O_EXCL`, so a symlink
+    there, dangling or not, is followed and the file it names created or
+    truncated. stuffr replaces the link with a fresh file and leaves its
+    target alone; without `-f` both refuse it. The input's attributes are
+    copied by name after the close, as the reference copies them, but only
+    onto the file this run opened.
 
 ### Roadmap
 
