@@ -891,6 +891,7 @@ dependencies = [
  "delharc",
  "flate2",
  "liblzma",
+ "liblzma-sys",
  "libz-sys",
  "lz4-sys",
  "lz4_flex",

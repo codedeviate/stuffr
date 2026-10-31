@@ -101,6 +101,13 @@ ruzstd = "0.9.1"
 # `pure` graph is unaffected (verified with `cargo tree -p stuffr
 # --no-default-features --features pure -e normal`).
 liblzma = { version = "0.4", default-features = false, features = ["static", "parallel"] }
+# The crate `liblzma` builds `liblzma.a` with and does not re-export. Named
+# only so `xz_opts/c.rs`'s layout test can compare its hand-written structs
+# with this crate's (UNSAFE-4, 2026-10-31 audit): the same single copy, no
+# features added (`static`/`parallel` come from `liblzma` above). liblzma
+# keeps its struct ABI stable across 5.x with reserved fields, so no exact
+# pin; the test fails if a bump moves a layout.
+liblzma-sys = { version = "0.4.9", default-features = false }
 # C zlib for `zlib-c` only: the Apple gzip personality's raw-deflate encoder,
 # byte-identical to macOS /usr/bin/gzip (stock zlib). `static` builds the
 # vendored zlib from source (no pkg-config, no system libz), as `liblzma`

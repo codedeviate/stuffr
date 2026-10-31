@@ -850,3 +850,59 @@ impl Decoder {
         Ok((info, n))
     }
 }
+
+/// UNSAFE-4 (2026-10-31 audit): the declarations above are written by hand
+/// against liblz4 1.10.0's `lib/lz4frame.h`, and pass `lz4-sys`'s own
+/// structs through. The workspace pins `lz4-sys` exactly; these pin the
+/// layouts the declarations assume, so a bump that moves them fails here.
+#[cfg(test)]
+mod layout_tests {
+    use std::mem::{align_of, offset_of, size_of};
+
+    use super::{FrameInfo, sys};
+
+    #[test]
+    fn the_linked_liblz4_is_the_one_the_declarations_were_written_for() {
+        // SAFETY: LZ4_versionNumber takes no arguments and returns a constant.
+        assert_eq!(unsafe { sys::LZ4_versionNumber() }, 11000);
+    }
+
+    #[test]
+    fn the_hand_declared_frame_info_matches_lz4_sys() {
+        assert_eq!(size_of::<FrameInfo>(), size_of::<sys::LZ4FFrameInfo>());
+        assert_eq!(align_of::<FrameInfo>(), align_of::<sys::LZ4FFrameInfo>());
+        assert_eq!(
+            offset_of!(FrameInfo, content_size),
+            offset_of!(sys::LZ4FFrameInfo, content_size)
+        );
+        assert_eq!(
+            offset_of!(FrameInfo, dict_id),
+            offset_of!(sys::LZ4FFrameInfo, dict_id)
+        );
+        assert_eq!(
+            offset_of!(FrameInfo, block_checksum_flag),
+            offset_of!(sys::LZ4FFrameInfo, block_checksum_flag)
+        );
+    }
+
+    #[test]
+    fn lz4_sys_preferences_match_lz4frame_h_1_10_0() {
+        // `LZ4F_preferences_t` (lz4frame.h:192): `LZ4F_frameInfo_t` (four
+        // enums, `unsigned long long contentSize`, `unsigned dictID`, an
+        // enum: 32 bytes, 8-aligned), then `int compressionLevel`,
+        // `unsigned autoFlush`, `unsigned favorDecSpeed`, `unsigned
+        // reserved[3]`: 56 bytes. The hand-declared one-shot and dictionary
+        // functions take a pointer to it.
+        assert_eq!(size_of::<sys::LZ4FFrameInfo>(), 32);
+        assert_eq!(offset_of!(sys::LZ4FFrameInfo, content_size), 16);
+        assert_eq!(size_of::<sys::LZ4FPreferences>(), 56);
+        assert_eq!(align_of::<sys::LZ4FPreferences>(), 8);
+        assert_eq!(offset_of!(sys::LZ4FPreferences, compression_level), 32);
+        assert_eq!(offset_of!(sys::LZ4FPreferences, auto_flush), 36);
+        assert_eq!(offset_of!(sys::LZ4FPreferences, favor_dec_speed), 40);
+        assert_eq!(offset_of!(sys::LZ4FPreferences, reserved), 44);
+        // `LZ4F_decompressOptions_t` (lz4frame.h:371): four `unsigned`s
+        // (`lz4-sys` names the last three `reserved`).
+        assert_eq!(size_of::<sys::LZ4FDecompressOptions>(), 16);
+    }
+}

@@ -37,6 +37,51 @@ fn check(r: usize) -> Result<usize, ZstdError> {
     }
 }
 
+// libzstd's static-linking-only parameter names are `#define` aliases of
+// `ZSTD_c_experimentalParamN` / `ZSTD_d_experimentalParamN` in `zstd.h`,
+// which bindgen does not carry, so `zstd_sys` exposes only the numbered
+// names. Which number means which parameter is fixed per libzstd release;
+// these are zstd 1.5.7's (`zstd.h` line of each alias, and of the enum
+// value in `ZSTD_cParameter`/`ZSTD_dParameter`), the release `zstd-sys`
+// `=2.1.2` bundles and the workspace manifest pins (UNSAFE-4, 2026-10-31
+// audit). A bump must re-check each line below against the new `zstd.h`;
+// `the_linked_libzstd_is_the_one_the_numbering_was_checked_against` fails
+// first if the bundled library moves.
+
+/// `#define ZSTD_c_rsyncable ZSTD_c_experimentalParam1` (zstd.h:2046;
+/// `=500`, :522).
+const C_RSYNCABLE: sys::ZSTD_cParameter = sys::ZSTD_cParameter::ZSTD_c_experimentalParam1;
+/// `#define ZSTD_c_literalCompressionMode ZSTD_c_experimentalParam5`
+/// (zstd.h:2073; `=1002`, :526).
+const C_LITERAL_COMPRESSION_MODE: sys::ZSTD_cParameter =
+    sys::ZSTD_cParameter::ZSTD_c_experimentalParam5;
+/// `#define ZSTD_c_srcSizeHint ZSTD_c_experimentalParam7` (zstd.h:2079;
+/// `=1004`, :528).
+const C_SRC_SIZE_HINT: sys::ZSTD_cParameter = sys::ZSTD_cParameter::ZSTD_c_experimentalParam7;
+/// `#define ZSTD_c_enableDedicatedDictSearch ZSTD_c_experimentalParam8`
+/// (zstd.h:2135; `=1005`, :529).
+const C_ENABLE_DEDICATED_DICT_SEARCH: sys::ZSTD_cParameter =
+    sys::ZSTD_cParameter::ZSTD_c_experimentalParam8;
+/// `#define ZSTD_c_useRowMatchFinder ZSTD_c_experimentalParam14`
+/// (zstd.h:2263; `=1011`, :535).
+const C_USE_ROW_MATCH_FINDER: sys::ZSTD_cParameter =
+    sys::ZSTD_cParameter::ZSTD_c_experimentalParam14;
+/// `#define ZSTD_d_forceIgnoreChecksum ZSTD_d_experimentalParam3`
+/// (zstd.h:2543; `=1002`, :663).
+const D_FORCE_IGNORE_CHECKSUM: sys::ZSTD_dParameter =
+    sys::ZSTD_dParameter::ZSTD_d_experimentalParam3;
+
+// The numbers libzstd 1.5.7 compares against: `zstd_sys`'s pregenerated
+// bindings must agree, or the names above pass another parameter.
+const _: () = {
+    assert!(C_RSYNCABLE as i32 == 500);
+    assert!(C_LITERAL_COMPRESSION_MODE as i32 == 1002);
+    assert!(C_SRC_SIZE_HINT as i32 == 1004);
+    assert!(C_ENABLE_DEDICATED_DICT_SEARCH as i32 == 1005);
+    assert!(C_USE_ROW_MATCH_FINDER as i32 == 1011);
+    assert!(D_FORCE_IGNORE_CHECKSUM as i32 == 1002);
+};
+
 /// `ZDICT_isError` and the same code computation, for the trainers.
 fn check_zdict(r: usize) -> Result<usize, ZstdError> {
     // SAFETY: ZDICT_isError only compares its argument with a constant.
@@ -116,9 +161,9 @@ impl Encoder {
         e.set(ZSTD_c_checksumFlag, i32::from(o.checksum))?;
         e.set(ZSTD_c_compressionLevel, o.level)?;
         e.set(ZSTD_c_targetCBlockSize, o.target_cblock_size as i32)?;
-        // ZSTD_c_srcSizeHint; FIO_setSrcSizeHint clamps to INT_MAX.
+        // FIO_setSrcSizeHint clamps to INT_MAX.
         e.set(
-            ZSTD_c_experimentalParam7,
+            C_SRC_SIZE_HINT,
             o.src_size_hint.map_or(0, |h| h.min(i32::MAX as u64) as i32),
         )?;
         e.set(ZSTD_c_enableLongDistanceMatching, o.ldm.value())?;
@@ -130,8 +175,7 @@ impl Encoder {
         if o.ldm_params.hash_rate_log != 0 {
             e.set(ZSTD_c_ldmHashRateLog, o.ldm_params.hash_rate_log as i32)?;
         }
-        // ZSTD_c_useRowMatchFinder.
-        e.set(ZSTD_c_experimentalParam14, o.row_match_finder.value())?;
+        e.set(C_USE_ROW_MATCH_FINDER, o.row_match_finder.value())?;
         e.set(ZSTD_c_windowLog, o.cparam(CParamKey::WindowLog) as i32)?;
         e.set(ZSTD_c_chainLog, o.cparam(CParamKey::ChainLog) as i32)?;
         e.set(ZSTD_c_hashLog, o.cparam(CParamKey::HashLog) as i32)?;
@@ -142,17 +186,15 @@ impl Encoder {
             o.cparam(CParamKey::TargetLength) as i32,
         )?;
         e.set(ZSTD_c_strategy, o.cparam(CParamKey::Strategy) as i32)?;
-        // ZSTD_c_literalCompressionMode.
-        e.set(ZSTD_c_experimentalParam5, o.literal_compression.value())?;
-        // ZSTD_c_enableDedicatedDictSearch, always 1 in fileio.c.
-        e.set(ZSTD_c_experimentalParam8, 1)?;
+        e.set(C_LITERAL_COMPRESSION_MODE, o.literal_compression.value())?;
+        // Always 1 in fileio.c.
+        e.set(C_ENABLE_DEDICATED_DICT_SEARCH, 1)?;
         e.set(ZSTD_c_nbWorkers, o.workers as i32)?;
         e.set(ZSTD_c_jobSize, o.job_size as i32)?;
         if let Some(log) = o.overlap_log {
             e.set(ZSTD_c_overlapLog, log)?;
         }
-        // ZSTD_c_rsyncable.
-        e.set(ZSTD_c_experimentalParam1, i32::from(o.rsyncable))?;
+        e.set(C_RSYNCABLE, i32::from(o.rsyncable))?;
         if let Some(p) = &e._prefix {
             // SAFETY: the prefix is a boxed slice owned by `e`, so the
             // pointer and length stay valid for as long as the context can
@@ -358,7 +400,7 @@ impl Decoder {
         check(unsafe {
             sys::ZSTD_DCtx_setParameter(
                 d.dctx.as_ptr(),
-                sys::ZSTD_dParameter::ZSTD_d_experimentalParam3,
+                D_FORCE_IGNORE_CHECKSUM,
                 c_int::from(o.ignore_checksum),
             )
         })?;
@@ -618,6 +660,16 @@ pub fn train(samples: &[u8], sizes: &[usize], p: &TrainParams) -> Result<Trained
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_linked_libzstd_is_the_one_the_numbering_was_checked_against() {
+        // The `const` asserts above pin `zstd_sys`'s enum numbers; what the
+        // numbers MEAN is libzstd's, so the library actually linked must be
+        // the release whose `zstd.h` was read (its pregenerated bindings'
+        // `ZSTD_VERSION_NUMBER` constant is stale, 10505, so ask libzstd).
+        // SAFETY: ZSTD_versionNumber takes no arguments and reads nothing.
+        assert_eq!(unsafe { sys::ZSTD_versionNumber() }, 10507);
+    }
 
     fn text(n: usize) -> Vec<u8> {
         (0..n).map(|i| b"abcdefgh stuff "[i * 7 % 15]).collect()

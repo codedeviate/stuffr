@@ -1206,3 +1206,99 @@ pub(super) fn lzma_preset_of_liblzma(level: u32, extreme: bool) -> Option<Lzma> 
         preset_dict: (!o.preset_dict.is_null()).then(Vec::new),
     })
 }
+
+/// UNSAFE-4 (2026-10-31 audit): `ffi`'s structs are written by hand from
+/// liblzma 5.8.4's `api/lzma/*.h`. `liblzma-sys` (the crate that builds the
+/// linked `liblzma.a`) declares its own — a second, independent
+/// transcription — so their sizes, alignments and the offsets of the fields
+/// both name publicly must agree. `liblzma-sys` declares no
+/// `lzma_options_delta`, so that one is checked against `delta.h` directly.
+#[cfg(test)]
+mod layout_tests {
+    use std::ffi::c_void;
+    use std::mem::{align_of, offset_of, size_of};
+
+    use super::ffi;
+    use liblzma_sys as sys;
+
+    macro_rules! same_layout {
+        ($ours:ty, $theirs:ty, [$($field:ident),* $(,)?]) => {{
+            assert_eq!(size_of::<$ours>(), size_of::<$theirs>(), "size of {}", stringify!($ours));
+            assert_eq!(align_of::<$ours>(), align_of::<$theirs>(), "align of {}", stringify!($ours));
+            $(
+                assert_eq!(
+                    offset_of!($ours, $field),
+                    offset_of!($theirs, $field),
+                    "{}.{}",
+                    stringify!($ours),
+                    stringify!($field)
+                );
+            )*
+        }};
+    }
+
+    #[test]
+    fn the_linked_liblzma_is_the_one_the_declarations_were_written_for() {
+        // SAFETY: lzma_version_number takes no arguments and returns a constant.
+        // 5.8.4 is 50080042 (major·10^7 + minor·10^4 + patch·10 + stable 2).
+        assert_eq!(unsafe { sys::lzma_version_number() }, 50_080_042);
+    }
+
+    #[test]
+    fn the_hand_declared_structs_match_liblzma_sys() {
+        same_layout!(
+            ffi::lzma_stream,
+            sys::lzma_stream,
+            [
+                next_in, avail_in, total_in, next_out, avail_out, total_out, allocator
+            ]
+        );
+        same_layout!(ffi::lzma_filter, sys::lzma_filter, [id, options]);
+        same_layout!(
+            ffi::lzma_options_lzma,
+            sys::lzma_options_lzma,
+            [
+                dict_size,
+                preset_dict,
+                preset_dict_size,
+                lc,
+                lp,
+                pb,
+                mode,
+                nice_len,
+                mf,
+                depth
+            ]
+        );
+        same_layout!(
+            ffi::lzma_mt,
+            sys::lzma_mt,
+            [
+                flags,
+                threads,
+                block_size,
+                timeout,
+                preset,
+                filters,
+                check,
+                memlimit_threading,
+                memlimit_stop,
+            ]
+        );
+        same_layout!(ffi::lzma_options_bcj, sys::lzma_options_bcj, [start_offset]);
+    }
+
+    #[test]
+    fn lzma_options_delta_matches_delta_h() {
+        // `lzma_options_delta` (5.8.4 `api/lzma/delta.h`): an enum `type`,
+        // `uint32_t dist`, four reserved `uint32_t`s, two reserved pointers.
+        let ptr = size_of::<*mut c_void>();
+        assert_eq!(offset_of!(ffi::lzma_options_delta, dist), 4);
+        assert_eq!(offset_of!(ffi::lzma_options_delta, reserved_ptr1), 24);
+        assert_eq!(size_of::<ffi::lzma_options_delta>(), 24 + 2 * ptr);
+        assert_eq!(
+            align_of::<ffi::lzma_options_delta>(),
+            align_of::<*mut c_void>()
+        );
+    }
+}
