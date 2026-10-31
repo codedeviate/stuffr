@@ -51,7 +51,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output as ProcOutput, Stdio};
 use std::sync::LazyLock;
 
-use stuffr_core::{Fidelity, FormatId, Rung};
+use stuffr_core::{
+    Container, Fidelity, FidelityReport, FormatId, OpenOpts, ReaderSource, Rung, Source,
+    StreamPolicy, resolve,
+};
+use stuffr_formats::zip::Zip;
 
 const ZIP: FormatId = FormatId::new("zip");
 
@@ -548,21 +552,40 @@ fn the_same_zip_read_seekably_and_over_a_pipe_agrees_on_data_and_differs_on_rung
         "the forward read must not spool to disk"
     );
 
-    // 6: metadata forward reading cannot recover is REPORTED, not absent.
-    // Asserted against the real `Fidelity` values' own `Display`, not a
-    // guessed pair of strings, and as an exact set (not just "non-empty") —
-    // this is what "assert against what it actually emits" means here.
-    let expected_trailing_index_unread = Fidelity::TrailingIndexUnread { format: ZIP }.to_string();
-    let expected_entry_count_unknown = Fidelity::EntryCountUnknown.to_string();
-    assert_eq!(
-        piped.warnings,
-        vec![expected_trailing_index_unread, expected_entry_count_unknown],
-        "a forward zip read loses central-directory metadata and must warn, not go quiet"
+    // 6: since ruling B2 the forward read reads the central directory at the
+    //    end of the pipe and compares it with the local headers it walked.
+    //    When they agree, `TrailingIndexUnread` and `EntryCountUnknown` are
+    //    no longer true and are withdrawn: a well-formed piped zip reports
+    //    nothing (it reported exactly those two in 0.22.0). The cut-off case
+    //    keeps both: `a_piped_zip_with_a_cut_central_directory_keeps_both_warnings`
+    //    below, and over the binary the cut test right after this one.
+    assert!(
+        piped.warnings.is_empty(),
+        "a piped zip whose index was read and agrees has nothing to warn about: {:?}",
+        piped.warnings
     );
     assert!(
         exact.warnings.is_empty(),
         "a seekable zip read has nothing to warn about: {:?}",
         exact.warnings
+    );
+}
+
+/// The cut-off case over the binary, unchanged from 0.22.0: a pipe whose
+/// central directory is cut off is corruption (exit 5), and the CLI prints
+/// the error alone, as it did. The report behind it still carries both index
+/// warnings (`a_piped_zip_with_a_cut_central_directory_keeps_both_warnings`).
+#[test]
+fn a_piped_zip_cut_inside_its_central_directory_is_still_exit_5() {
+    let bytes = fixture_zip(&[("a.txt", b"alpha"), ("b.txt", b"bravo")]);
+    let (locals, _) = split_zip(&bytes);
+    let out = run_piped(&["test", "-"], &bytes[..locals.len() + 20]);
+    assert_eq!(out.status.code(), Some(5), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("16 bytes into a 42-byte central directory header")
+            && !stderr.contains("disagree"),
+        "{stderr}"
     );
 }
 
@@ -739,4 +762,278 @@ fn require_bin(bin: &str) -> PathBuf {
              knowing rather than passing silently"
         )
     })
+}
+
+// ---------------------------------------------------------------------------
+// The central directory, read and compared at the end of the pipe (spec goal
+// 2, rulings B2 and B3), in process over a `ReaderSource`
+// ---------------------------------------------------------------------------
+
+/// Walks `bytes` as a pipe through `Zip`, reading every payload, and returns
+/// how the walk ended with the report as it stood then.
+fn walk_piped(bytes: &[u8]) -> (stuffr_core::Result<usize>, FidelityReport) {
+    let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(bytes.to_vec())));
+    let resolved = resolve(src, ZIP, Zip.caps(), &StreamPolicy::default()).expect("resolve");
+    let mut ar = Zip.open(resolved, &OpenOpts::default()).expect("open");
+    let mut n = 0;
+    let end = loop {
+        match ar.next_entry() {
+            Ok(Some(mut e)) => {
+                let mut sink = Vec::new();
+                if let Err(err) = std::io::Read::read_to_end(&mut e.reader(), &mut sink) {
+                    break Err(stuffr_core::Error::from_decode_io(err));
+                }
+                n += 1;
+            }
+            Ok(None) => break Ok(n),
+            Err(e) => break Err(e),
+        }
+    };
+    (end, ar.fidelity().clone())
+}
+
+fn index_warnings(report: &FidelityReport) -> (bool, bool) {
+    (
+        report
+            .warnings
+            .contains(&Fidelity::TrailingIndexUnread { format: ZIP }),
+        report.warnings.contains(&Fidelity::EntryCountUnknown),
+    )
+}
+
+fn disagreements(report: &FidelityReport) -> Vec<(String, &'static str)> {
+    report
+        .warnings
+        .iter()
+        .filter_map(|w| match w {
+            Fidelity::HeadersDisagree { entry, field, .. } => Some((entry.clone(), *field)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn le16(b: &[u8], at: usize) -> usize {
+    usize::from(u16::from_le_bytes([b[at], b[at + 1]]))
+}
+
+fn le32(b: &[u8], at: usize) -> usize {
+    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]) as usize
+}
+
+/// A comment-free zip split into its local section (everything before the
+/// central directory) and its central records, each whole.
+fn split_zip(bytes: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let eocd = bytes.len() - 22;
+    assert_eq!(&bytes[eocd..eocd + 4], b"PK\x05\x06", "a comment-free zip");
+    let count = le16(bytes, eocd + 10);
+    let mut at = le32(bytes, eocd + 16);
+    let locals = bytes[..at].to_vec();
+    let mut records = Vec::new();
+    for _ in 0..count {
+        assert_eq!(&bytes[at..at + 4], b"PK\x01\x02");
+        let len = 46 + le16(bytes, at + 28) + le16(bytes, at + 30) + le16(bytes, at + 32);
+        records.push(bytes[at..at + len].to_vec());
+        at += len;
+    }
+    (locals, records)
+}
+
+/// `locals`, then `records`, then an end record declaring exactly them.
+fn assemble(locals: &[u8], records: &[Vec<u8>]) -> Vec<u8> {
+    let cd: Vec<u8> = records.concat();
+    let mut out = locals.to_vec();
+    out.extend_from_slice(&cd);
+    out.extend_from_slice(b"PK\x05\x06\0\0\0\0");
+    let n = u16::try_from(records.len()).unwrap().to_le_bytes();
+    out.extend_from_slice(&n);
+    out.extend_from_slice(&n);
+    out.extend_from_slice(&u32::try_from(cd.len()).unwrap().to_le_bytes());
+    out.extend_from_slice(&u32::try_from(locals.len()).unwrap().to_le_bytes());
+    out.extend_from_slice(&[0, 0]);
+    out
+}
+
+const THREE: &[(&str, &[u8])] = &[
+    ("a.txt", b"alpha"),
+    ("b.txt", b"bravo"),
+    ("c.txt", b"charlie"),
+];
+
+#[test]
+fn a_piped_zip_whose_index_agrees_has_no_index_warnings() {
+    for bytes in [
+        fixture_zip(THREE),
+        fixture_zip(&[]),
+        // Names that repeat are a real, well-formed shape (ruling B3).
+        fixture_zip_allowing_duplicates(&[("d.txt", b"one"), ("d.txt", b"two")]),
+    ] {
+        let (end, report) = walk_piped(&bytes);
+        end.expect("a well-formed zip reads whole");
+        assert_eq!(
+            report.rung,
+            Rung::ForwardOnly,
+            "the access path is unchanged"
+        );
+        assert!(
+            report.warnings.is_empty(),
+            "the index was read and agrees, so nothing is lost: {:?}",
+            report.warnings
+        );
+    }
+}
+
+/// zip 9 refuses a second entry of the same name, so the duplicate is spliced
+/// in by hand: the first entry's local header and central record, twice,
+/// with the second payload's bytes.
+fn fixture_zip_allowing_duplicates(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut locals = Vec::new();
+    let mut records = Vec::new();
+    for (name, data) in entries {
+        let (l, r) = split_zip(&fixture_zip(&[(*name, *data)]));
+        let mut record = r[0].clone();
+        record[42..46].copy_from_slice(&u32::try_from(locals.len()).unwrap().to_le_bytes());
+        locals.extend_from_slice(&l);
+        records.push(record);
+    }
+    assemble(&locals, &records)
+}
+
+#[test]
+fn a_piped_zip_with_a_cut_central_directory_keeps_both_warnings() {
+    let bytes = fixture_zip(THREE);
+    let (locals, _) = split_zip(&bytes);
+    let cut_inside = bytes[..locals.len() + 30].to_vec();
+    let cut_in_the_end_record = bytes[..bytes.len() - 5].to_vec();
+    for (what, cut) in [
+        ("inside the central directory", cut_inside),
+        ("inside the end record", cut_in_the_end_record),
+        ("with no central directory at all", locals),
+    ] {
+        let (end, report) = walk_piped(&cut);
+        let err = end.expect_err(what);
+        assert_eq!(err.exit_code(), 5, "{what}: a cut is corruption: {err}");
+        assert_eq!(
+            index_warnings(&report),
+            (true, true),
+            "{what}: the index was not read, so both warnings stay as in 0.22.0: {:?}",
+            report.warnings
+        );
+        assert!(disagreements(&report).is_empty(), "{what}");
+    }
+}
+
+#[test]
+fn a_piped_cloaked_name_is_reported() {
+    let bytes = fixture_zip(THREE);
+    let (mut locals, records) = split_zip(&bytes);
+    // The first LOCAL name only: `a.txt` becomes `e.txt` on the pipe.
+    assert_eq!(&locals[30..35], b"a.txt");
+    locals[30] = b'e';
+    let (end, report) = walk_piped(&assemble(&locals, &records));
+    end.expect("a cloak is not damage");
+    assert_eq!(disagreements(&report), vec![("e.txt".to_owned(), "name")]);
+    assert_eq!(
+        index_warnings(&report),
+        (false, false),
+        "the index was read; what it showed is the cloak warning"
+    );
+}
+
+#[test]
+fn a_piped_extra_local_entry_is_reported() {
+    let bytes = fixture_zip(THREE);
+    let (locals, mut records) = split_zip(&bytes);
+    records.remove(1);
+    let (end, report) = walk_piped(&assemble(&locals, &records));
+    assert_eq!(end.expect("every local entry still reads"), 3);
+    assert_eq!(
+        disagreements(&report),
+        vec![("b.txt".to_owned(), "entry count")]
+    );
+
+    // And the other way round: a central record no local header matches.
+    let (locals, records) = split_zip(&bytes);
+    let c_starts = le32(&records[2], 42);
+    let (end, report) = walk_piped(&assemble(&locals[..c_starts], &records));
+    end.expect("the walk itself is whole");
+    assert_eq!(
+        disagreements(&report),
+        vec![("c.txt".to_owned(), "entry count")]
+    );
+}
+
+#[test]
+fn a_piped_reordered_index_is_reported() {
+    let bytes = fixture_zip(THREE);
+    let (locals, mut records) = split_zip(&bytes);
+    records.swap(0, 2);
+    let (end, report) = walk_piped(&assemble(&locals, &records));
+    end.expect("order is not damage");
+    assert_eq!(
+        disagreements(&report),
+        vec![("b.txt".to_owned(), "order")],
+        "one warning for the archive, at the first pairing that runs backwards (c, then b)"
+    );
+}
+
+#[test]
+fn a_piped_field_disagreement_is_reported_as_on_the_seekable_path() {
+    let bytes = fixture_zip(THREE);
+    let (locals, mut records) = split_zip(&bytes);
+    // The second central record's CRC-32.
+    records[1][16] ^= 0xff;
+    let (end, report) = walk_piped(&assemble(&locals, &records));
+    end.expect("the local CRC-32 matches the payload");
+    assert_eq!(disagreements(&report), vec![("b.txt".to_owned(), "CRC-32")]);
+}
+
+/// The end record declares a 2 GiB central directory. The forward walk never
+/// sizes anything by that field: it walks the records by their own framing
+/// (each variable field at most 65,535 bytes, read or skipped through a
+/// fixed buffer) and only compares the declared size with what it walked. So
+/// nothing proportional to the declaration is allocated, by construction.
+/// The declaration contradicts the directory, so the index is not confirmed
+/// and both warnings stay: the "fidelity warning" choice of ruling B2's
+/// "over the bound", never a refusal and never exit 1.
+#[test]
+fn a_huge_declared_central_directory_on_a_pipe_is_bounded() {
+    let mut bytes = fixture_zip(THREE);
+    let eocd = bytes.len() - 22;
+    bytes[eocd + 12..eocd + 16].copy_from_slice(&0x8000_0000u32.to_le_bytes());
+    let (end, report) = walk_piped(&bytes);
+    assert_eq!(end.expect("the entries themselves are whole"), 3);
+    assert_eq!(
+        index_warnings(&report),
+        (true, true),
+        "{:?}",
+        report.warnings
+    );
+    assert!(disagreements(&report).is_empty());
+
+    // The same through the binary: no refusal, no exit 1, and strict mode
+    // still fails it.
+    let out = run_piped(&["test", "-", "--strict-fidelity"], &bytes);
+    assert_eq!(out.status.code(), Some(4), "{out:?}");
+}
+
+/// The forward read delivers a symlink as a regular file holding its target;
+/// only the central directory says it was a link. That stays a reported loss.
+#[test]
+fn a_piped_zip_holding_a_symlink_keeps_its_index_warnings() {
+    let mut buf = Vec::new();
+    {
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        w.add_symlink("link", "target", opts).expect("add_symlink");
+        w.finish().expect("finish");
+    }
+    let (end, report) = walk_piped(&buf);
+    end.expect("reads");
+    assert_eq!(
+        index_warnings(&report),
+        (true, true),
+        "{:?}",
+        report.warnings
+    );
 }

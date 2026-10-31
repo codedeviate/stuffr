@@ -708,7 +708,30 @@ fn info_does_not_claim_nothing_was_approximated_for_a_container_under_a_codec() 
         let wrapped = dir.join(format!("bundle.{ext}.gz"));
         let bytes = std::fs::read(&wrapped).unwrap();
 
-        // Ground truth first, from the verb that opens the archive.
+        // Ground truth first, from the verb that opens the archive. Since
+        // ruling B2 a zip read forward checks its central directory at the
+        // end, so a zip whose index agrees loses nothing even under a codec;
+        // what a forward read CAN lose is shown by a cloaked one, whose
+        // disagreement only that end-of-stream read finds. So the zip leg
+        // gzips a cloaked copy. info sees neither far and withholds for both.
+        if has_trailing_index {
+            let clean = std::fs::read(&bare).unwrap();
+            std::fs::write(&bare, cloak_first_local_name(&clean)).unwrap();
+            assert!(
+                Command::new(STUFFR)
+                    .args([
+                        "pack",
+                        bare.to_str().unwrap(),
+                        "--format",
+                        "gzip",
+                        "--force"
+                    ])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            std::fs::write(&bare, clean).unwrap();
+        }
         let strict = Command::new(STUFFR)
             .args(["test", wrapped.to_str().unwrap(), "--strict-fidelity"])
             .output()
@@ -1715,6 +1738,46 @@ fn a_cloaked_zip_file_warns_and_exits_4_under_strict() {
         Some(0),
         "stderr: {}",
         String::from_utf8_lossy(&clean_strict.stderr)
+    );
+}
+
+/// Ruling B2, over a pipe: the forward reader reads the central directory at
+/// the end and compares it with the local headers it walked. A well-formed
+/// piped zip now passes `--strict-fidelity` (exit 0; it was 4 in 0.22.0, a
+/// deliberate change); the same bytes with one local name cloaked warn and
+/// exit 4 under strict, naming the field.
+#[test]
+fn a_piped_zip_is_checked_against_its_central_directory() {
+    let dir = tmp_dir();
+    let clean = write_zip_via_pack(&dir, &[("a.txt", b"alpha"), ("b.txt", b"bravo")]);
+    let bytes = std::fs::read(&clean).unwrap();
+
+    let strict = run_with_stdin_output(&["test", "-", "--strict-fidelity"], &bytes);
+    let stderr = String::from_utf8_lossy(&strict.stderr);
+    assert_eq!(strict.status.code(), Some(0), "stderr: {stderr}");
+    assert!(!stderr.contains("fidelity warning"), "stderr: {stderr}");
+
+    let mut cloaked = bytes.clone();
+    assert_eq!(&cloaked[..4], b"PK\x03\x04");
+    let name_len = usize::from(u16::from_le_bytes([cloaked[26], cloaked[27]]));
+    // The last byte of the first LOCAL name only; the central record keeps it.
+    cloaked[30 + name_len - 1] ^= 0x20;
+    let delivered = String::from_utf8(cloaked[30..30 + name_len].to_vec()).unwrap();
+
+    let lenient = run_with_stdin_output(&["test", "-"], &cloaked);
+    let stderr = String::from_utf8_lossy(&lenient.stderr);
+    assert_eq!(lenient.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stderr.contains("local header and central directory disagree on name")
+            && stderr.contains(&delivered),
+        "the warning must name the field and the entry as delivered: {stderr}"
+    );
+    let strict = run_with_stdin_output(&["test", "-", "--strict-fidelity"], &cloaked);
+    assert_eq!(
+        strict.status.code(),
+        Some(4),
+        "stderr: {}",
+        String::from_utf8_lossy(&strict.stderr)
     );
 }
 

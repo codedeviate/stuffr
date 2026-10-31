@@ -1024,6 +1024,22 @@ pub(crate) fn write_zip_via_pack(dir: &Path, entries: &[(&str, &[u8])]) -> PathB
     zip
 }
 
+/// `bytes`, a zip, with the last byte of its FIRST local header's name
+/// changed and its central record left alone: a "cloaked" zip. Since ruling
+/// B2 this is the shape a piped zip read really does warn about (a
+/// `HeadersDisagree` on `name`): a well-formed piped zip no longer warns.
+pub(crate) fn cloak_first_local_name(bytes: &[u8]) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    assert_eq!(
+        &out[..4],
+        b"PK\x03\x04",
+        "a zip that opens with a local header"
+    );
+    let name_len = usize::from(u16::from_le_bytes([out[26], out[27]]));
+    out[30 + name_len - 1] ^= 0x20;
+    out
+}
+
 /// **The documents this crate's count guards scan, in one place.**
 ///
 /// It was three — this crate's README, the workspace README and

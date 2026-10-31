@@ -215,24 +215,38 @@ fn info_withholds_the_fidelity_claim_only_where_a_forward_read_could_lose_someth
             assert!(!text.contains("not evaluated"), ".{ext}: {text}");
         }
 
-        // And the ground truth for the `else` branch above, from the command
+        // And the ground truth for both branches above, from the command
         // that DOES open the archive: a piped tar/cpio/ar really does report
         // no warnings, so "nothing approximated" is not merely convenient.
-        let mut child = Command::new(STUFFR)
-            .args(["test", "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child.stdin.take().unwrap().write_all(&bytes).unwrap();
-        let out = child.wait_with_output().unwrap();
+        // For zip, what a forward read finds is known only once it has read
+        // the central directory at the END (ruling B2): these bytes agree
+        // with their index and report nothing, the same bytes with one local
+        // name cloaked report a disagreement. info reads neither far, so it
+        // cannot tell them apart and must withhold.
+        let tested = |bytes: &[u8]| {
+            let mut child = Command::new(STUFFR)
+                .args(["test", "-"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(bytes).unwrap();
+            child.wait_with_output().unwrap()
+        };
+        let out = tested(&bytes);
         let stderr = String::from_utf8_lossy(&out.stderr);
         if *has_trailing_index {
+            let cloaked = tested(&cloak_first_local_name(&bytes));
+            let cloaked_err = String::from_utf8_lossy(&cloaked.stderr);
             assert!(
-                stderr.contains("fidelity warning"),
-                ".{ext} on a pipe must really have warnings, or info would be right to \
-                 claim none: {stderr}"
+                cloaked_err.contains("fidelity warning"),
+                ".{ext} on a pipe must be able to really have warnings, or info would be \
+                 right to claim none: {cloaked_err}"
+            );
+            assert!(
+                out.status.success() && !stderr.contains("fidelity warning"),
+                ".{ext} on a pipe whose index agrees reports nothing since B2: {stderr}"
             );
         } else {
             assert!(
@@ -256,7 +270,10 @@ fn info_withholds_the_fidelity_claim_only_where_a_forward_read_could_lose_someth
 ///
 /// The fix is to withhold the claim, not to make `info` open the archive.
 /// This test asserts both halves of that: `info` no longer claims, and
-/// `test` still does.
+/// `test` still finds what a forward read can lose. Since ruling B2 that is
+/// known only at the end of the stream: these bytes agree with their central
+/// directory and `test -` reports nothing, while the same bytes with a
+/// cloaked local name report the disagreement. Both look alike to `info`.
 #[test]
 fn info_on_a_piped_zip_does_not_claim_nothing_was_approximated() {
     let dir = tmp("info-zip-fidelity");
@@ -288,23 +305,37 @@ fn info_on_a_piped_zip_does_not_claim_nothing_was_approximated() {
         "the line must say the conclusion was withheld, not vanish: {text}"
     );
 
-    // The other half: `test`, which DOES open the archive, still reports the
-    // two warnings. Without this the assertion above could be satisfied by
-    // having lost the warnings altogether.
-    let mut child = Command::new(STUFFR)
-        .args(["test", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(&bytes).unwrap();
-    let out = child.wait_with_output().unwrap();
+    // The other half: `test`, which DOES open the archive and reads it to
+    // the end, finds a loss where there is one. Without this the assertion
+    // above could be satisfied by having lost the warnings altogether.
+    let tested = |bytes: &[u8]| {
+        let mut child = Command::new(STUFFR)
+            .args(["test", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(bytes).unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let cloaked = tested(&cloak_first_local_name(&bytes));
+    let stderr = String::from_utf8_lossy(&cloaked.stderr);
+    assert!(
+        stderr.contains("local header and central directory disagree on name"),
+        "`test` reads the archive to its index and must report the cloak: {stderr}"
+    );
+    assert_eq!(
+        info_over_stdin(&cloak_first_local_name(&bytes)),
+        text,
+        "info cannot tell the cloaked bytes from the clean ones"
+    );
+    let out = tested(&bytes);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("central/trailing index was never read")
-            && stderr.contains("entry count is unknown"),
-        "`test` opens the archive and must still report both losses: {stderr}"
+        out.status.success() && !stderr.contains("fidelity warning"),
+        "the clean bytes' index was read and agrees (ruling B2; two warnings in 0.22.0): \
+         {stderr}"
     );
 
     // A real FILE is the other side of the rule and was WRONG in round 2:

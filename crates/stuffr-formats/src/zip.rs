@@ -21,8 +21,8 @@
 //!   zip). From a pipe, then, a symlink entry becomes a regular file holding
 //!   its target text, streamed and never buffered, so the 64 KiB
 //!   symlink-target cap (exit 6) applies to seekable reads only; the
-//!   `zip_on_a_pipe` suite pins that asymmetry. That is a real loss and it
-//!   is reported as one:
+//!   `zip_on_a_pipe` suite pins that asymmetry. Until the walk reaches the
+//!   central directory, that is reported as
 //!   [`Fidelity::TrailingIndexUnread`] plus [`Fidelity::EntryCountUnknown`],
 //!   the vocabulary Phase 0 defined for exactly this, seeded by
 //!   `ladder::seed_report` and re-asserted here so the report is complete
@@ -30,8 +30,14 @@
 //!
 //! The rung describes the ACCESS PATH and the warnings describe the LOSS —
 //! `--strict-fidelity` gates on the warnings (see
-//! `FidelityReport::has_warnings`). A piped zip therefore fails strict mode,
-//! where a piped tar does not, and that difference is the honest one.
+//! `FidelityReport::has_warnings`). Since ruling B2 the forward reader reads
+//! the central directory at the end of the pipe and compares it with the
+//! local headers it walked (see "The forward reader reads and compares the
+//! index" below). When the index is read whole and agrees, both warnings are
+//! withdrawn and a well-formed piped zip passes strict mode (it failed in
+//! 0.22.0); when it is cut off, absent, past the bound, contradicted by its
+//! end record, or holds a symlink the forward read delivered as a file, both
+//! stay.
 //! `by_index` on the forward reader is `Err(NotSeekable)`, never a re-scan
 //! billed as random access.
 //!
@@ -78,14 +84,29 @@
 //! Forward parsing rather than the backward EOCD SEARCH a seekable reader
 //! does, for two reasons: a pipe cannot seek, and a forward walk is
 //! unambiguous where the search is not (a `PK\x05\x06` inside a file comment
-//! is exactly the case that makes the backward search heuristic). Constant
-//! memory — nothing is buffered, the fields are skipped by their declared
-//! lengths.
+//! is exactly the case that makes the backward search heuristic). Nothing is
+//! sized by a declared length: comments and unneeded extra fields are skipped
+//! through a fixed buffer, and a name or extra field read is a 16-bit length.
 //!
 //! Whatever follows the EOCD record is ignored, as every zip tool ignores it.
-//! This walks the index's FRAMING and deliberately reads none of its
-//! CONTENTS, so `TrailingIndexUnread` stays true: entry metadata still came
-//! from the inline local headers.
+//!
+//! # The forward reader reads and compares the index (ruling B2)
+//!
+//! A pipe can show one archive under names or contents its central directory
+//! does not (the "cloaking" of GHSA-m665-v7pm-7grj). So the walk records each
+//! local header's raw claim on ruling B3's fields (`peek_local_claim`, which
+//! parses the header and replays it for zip), reads each central record's
+//! raw name and fields as `verify_trailing_index` passes it, and compares the
+//! two at the end record (`compare_walk`): the same fields as the seekable
+//! path (`disagreeing_fields`), plus records present on one side only
+//! (`"entry count"`) and order (`"order"`), each a
+//! [`Fidelity::HeadersDisagree`]. The bytes delivered stay the local
+//! headers'; only the warnings are new.
+//!
+//! What is held is bounded: `MAX_INDEX_CHECK_BYTES` of claims (names plus a
+//! fixed charge per record). Past it the comparison is given up, its memory
+//! freed, and the two index warnings stay, as for any index that was not
+//! read.
 //!
 //! # Writing: `new_stream` cannot be used, and the reason is structural
 //!
@@ -172,7 +193,7 @@
 //! this module's two readers) is to be reported, not refused.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -435,6 +456,7 @@ impl Container for Zip {
                 held: Vec::new(),
             },
             report,
+            index: IndexCheck::default(),
             ended: false,
         }))
     }
@@ -1544,8 +1566,16 @@ const METHOD_AES: u16 = 99;
 /// [`read_central_name_and_flags`], for an entry with a Unicode Path field. `None` on any failure: a header this
 /// cannot read is left to zip's own path, which classifies it.
 fn read_local_claim<R: Read + Seek>(r: &mut R, header_start: u64) -> Option<HeaderClaim> {
-    let mut fixed = [0u8; 30];
     r.seek(SeekFrom::Start(header_start)).ok()?;
+    parse_local_claim(r)
+}
+
+/// [`read_local_claim`]'s parse, from wherever `r` stands: the signature, the
+/// fixed block, the name, and the extra field only when a 32-bit size is
+/// `0xFFFFFFFF`. The forward reader calls it on the stream itself, through
+/// [`Recording`], and replays what it read. `None` on any failure.
+fn parse_local_claim<R: Read>(r: &mut R) -> Option<HeaderClaim> {
+    let mut fixed = [0u8; 30];
     r.read_exact(&mut fixed).ok()?;
     if fixed[..4] != SIG_LOCAL_HEADER {
         return None;
@@ -2120,14 +2150,17 @@ impl ArchiveRead for ZipIndexed {
 ///    happened to consume.
 struct Pushback {
     inner: Box<dyn Source>,
-    /// Bytes read ahead and not yet handed on. At most one four-byte
-    /// signature at a time.
+    /// Bytes read ahead and not yet handed on: a four-byte signature, or a
+    /// whole local header [`peek_local_claim`] read to record it (at most
+    /// 30 + 65,535 + 65,535 bytes, handed on before the next entry).
     held: Vec<u8>,
 }
 
 impl Pushback {
+    /// Puts `bytes` back in front of anything already held, so they are
+    /// read again first.
     fn push_back(&mut self, bytes: &[u8]) {
-        self.held.extend_from_slice(bytes);
+        self.held.splice(0..0, bytes.iter().copied());
     }
 }
 
@@ -2154,6 +2187,9 @@ const SIG_LOCAL_HEADER: [u8; 4] = *b"PK\x03\x04";
 struct ZipStreamed {
     source: Pushback,
     report: FidelityReport,
+    /// What the walk keeps to compare with the central directory when it
+    /// reaches it.
+    index: IndexCheck,
     /// Set once the entries have run out (or a read has failed), so the
     /// trailing-structure check runs exactly once and a caller polling past
     /// the end gets `Ok(None)` rather than the same error repeatedly. The
@@ -2175,10 +2211,13 @@ impl ArchiveRead for ZipStreamed {
             // Everything from here on is the trailing index, which
             // `read_zipfile_from_stream` would never have looked at. See the
             // module doc for why that leaves a truncated archive undetected.
-            verify_trailing_index(&mut self.source, signature)?;
+            verify_trailing_index(&mut self.source, signature, &mut self.index)?;
+            self.conclude_index_check();
             return Ok(None);
         }
         self.source.push_back(&signature);
+        // Read and replayed, so zip reads the same bytes after.
+        let claim = peek_local_claim(&mut self.source);
 
         let file = match zip::read::read_zipfile_from_stream(&mut self.source) {
             Ok(Some(file)) => file,
@@ -2204,6 +2243,7 @@ impl ArchiveRead for ZipStreamed {
         // explicitly rather than read off the entry so the seekable path is
         // the only one that CAN supply a mode, and this one visibly cannot.
         let meta = entry_meta(&file, None);
+        self.index.record_local(claim, &meta.name);
         let payload = EntryPayload::new(file, meta.size, &meta.name);
         Ok(Some(Entry::new(
             meta,
@@ -2238,7 +2278,11 @@ impl ArchiveRead for ZipStreamed {
 /// The contents of the index are deliberately not read. A cut here is damage
 /// and is reported as [`Error::Corrupt`]; a byte that follows a complete EOCD
 /// record is ignored, exactly as every zip tool ignores it.
-fn verify_trailing_index(source: &mut Pushback, first: [u8; 4]) -> Result<()> {
+fn verify_trailing_index(
+    source: &mut Pushback,
+    first: [u8; 4],
+    check: &mut IndexCheck,
+) -> Result<()> {
     let mut signature = first;
     loop {
         match signature {
@@ -2250,22 +2294,42 @@ fn verify_trailing_index(source: &mut Pushback, first: [u8; 4]) -> Result<()> {
                 let name = u16::from_le_bytes([fixed[24], fixed[25]]);
                 let extra = u16::from_le_bytes([fixed[26], fixed[27]]);
                 let comment = u16::from_le_bytes([fixed[28], fixed[29]]);
-                skip(
-                    source,
-                    u64::from(name) + u64::from(extra) + u64::from(comment),
-                    "central directory header fields",
-                )?;
+                let variable = u64::from(name) + u64::from(extra) + u64::from(comment);
+                check.note_central_framing(&fixed, variable);
+                let what = "central directory header fields";
+                if check.can_hold(usize::from(name)) {
+                    // The record's own name, and its extra field only when a
+                    // size is saturated and must be resolved from zip64. Both
+                    // at most 65,535 bytes; the rest is skipped as before.
+                    let name = read_vec(source, usize::from(name), what)?;
+                    let extra = if central_sizes_saturated(&fixed) {
+                        Some(read_vec(source, usize::from(extra), what)?)
+                    } else {
+                        skip(source, u64::from(extra), what)?;
+                        None
+                    };
+                    skip(source, u64::from(comment), what)?;
+                    check.record_central(central_claim(&fixed, name, extra.as_deref()));
+                } else {
+                    skip(source, variable, what)?;
+                }
             }
             SIG_ZIP64_END => {
                 // Self-describing: an 8-byte size counting everything after
                 // itself. Skipping by it rather than by a fixed width is what
                 // makes this tolerant of the zip64 extensible data sector.
-                let size = read_fixed::<8>(source, "zip64 end of central directory")?;
-                skip(
-                    source,
-                    u64::from_le_bytes(size),
-                    "zip64 end of central directory",
-                )?;
+                let size =
+                    u64::from_le_bytes(read_fixed::<8>(source, "zip64 end of central directory")?);
+                // The fixed part (44 bytes) carries the declared record count
+                // and directory size; read when whole, the rest skipped.
+                let mut rest = size;
+                if size >= ZIP64_END_FIXED as u64 {
+                    let fixed =
+                        read_fixed::<ZIP64_END_FIXED>(source, "zip64 end of central directory")?;
+                    check.zip64_declared = Some((le64(&fixed[20..28]), le64(&fixed[28..36])));
+                    rest -= ZIP64_END_FIXED as u64;
+                }
+                skip(source, rest, "zip64 end of central directory")?;
             }
             SIG_ZIP64_LOCATOR => {
                 read_fixed::<ZIP64_LOCATOR_FIXED>(
@@ -2276,6 +2340,7 @@ fn verify_trailing_index(source: &mut Pushback, first: [u8; 4]) -> Result<()> {
             SIG_END_OF_CENTRAL_DIR => {
                 let fixed =
                     read_fixed::<END_OF_CENTRAL_DIR_FIXED>(source, "end of central directory")?;
+                check.eocd_declared = Some((le16(&fixed[6..8]), le32(&fixed[8..12])));
                 let comment = u16::from_le_bytes([fixed[16], fixed[17]]);
                 skip(
                     source,
@@ -2319,6 +2384,27 @@ fn read_fixed<const N: usize>(source: &mut Pushback, what: &str) -> Result<[u8; 
     Ok(buf)
 }
 
+/// Reads exactly `len` bytes into a new buffer, reporting a short stream as
+/// truncation in [`skip`]'s words. Callers pass a 16-bit field's length, so
+/// the allocation is at most 65,535 bytes.
+fn read_vec(source: &mut Pushback, len: usize, what: &str) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    let mut filled = 0;
+    while filled < len {
+        match source.read(&mut buf[filled..]).map_err(Error::from)? {
+            0 => {
+                return Err(Error::Corrupt(format!(
+                    "zip stream ends {} bytes short of the end of its {what}; the archive \
+                     is truncated",
+                    len - filled
+                )));
+            }
+            n => filled += n,
+        }
+    }
+    Ok(buf)
+}
+
 /// Discards `count` bytes, reporting a short stream as truncation. A fixed
 /// scratch buffer, so an absurd declared length costs time rather than memory.
 fn skip(source: &mut Pushback, mut count: u64, what: &str) -> Result<()> {
@@ -2336,6 +2422,330 @@ fn skip(source: &mut Pushback, mut count: u64, what: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The forward reader's index check: local headers against the central
+// directory (spec goal 2, rulings B2 and B3)
+// ---------------------------------------------------------------------------
+
+/// The fixed part of the zip64 end-of-central-directory record after its
+/// 8-byte size: versions, disks, both counts, the directory size and offset.
+const ZIP64_END_FIXED: usize = 44;
+
+/// The most bytes [`IndexCheck`] holds for the comparison: every walked local
+/// header's name (raw and as delivered) and every central record's name, each
+/// charged with its fixed part ([`CLAIM_OVERHEAD`]). Past it the comparison
+/// is given up, memory is freed, and the archive keeps the forward reader's
+/// two warnings exactly as before (ruling B2, "over the bound"). 32 MiB holds
+/// about 200,000 entries with 40-byte names.
+const MAX_INDEX_CHECK_BYTES: usize = 32 * 1024 * 1024;
+
+/// What one recorded claim costs besides its name bytes.
+const CLAIM_OVERHEAD: usize = std::mem::size_of::<HeaderClaim>() + std::mem::size_of::<String>();
+
+/// Unix file-type bits for a symlink, in a central record's external
+/// attributes (high 16 bits) when the record was made on unix (host 3).
+const S_IFMT: u32 = 0o170_000;
+const S_IFLNK: u32 = 0o120_000;
+const HOST_UNIX: u8 = 3;
+
+/// What the forward walk keeps to compare with the central directory when
+/// the walk reaches it.
+///
+/// When the directory was read whole, matched its end record, and was
+/// compared, the forward reader's [`Fidelity::TrailingIndexUnread`] and
+/// [`Fidelity::EntryCountUnknown`] are no longer true and are withdrawn
+/// ([`ZipStreamed::conclude_index_check`]). Anything short of that — a cut
+/// directory (an error before this is consulted), no directory, the bound
+/// passed, an end record that contradicts the directory — leaves both.
+#[derive(Default)]
+struct IndexCheck {
+    /// Each walked local header, in order, with the name it was delivered
+    /// under.
+    locals: Vec<(HeaderClaim, String)>,
+    /// Each central record, in order.
+    centrals: Vec<HeaderClaim>,
+    /// Bytes charged against [`MAX_INDEX_CHECK_BYTES`].
+    held: usize,
+    /// Set once something could not be recorded (the bound, or a local header
+    /// this could not parse): the comparison is then not made.
+    incomplete: bool,
+    /// Central records walked, and the bytes they span (signatures
+    /// included), counted whether or not they were recorded.
+    central_records: u64,
+    central_bytes: u64,
+    /// A central record marks a unix symlink, which a forward read delivers
+    /// as a regular file holding the target.
+    symlink: bool,
+    /// The end record's total record count and directory size.
+    eocd_declared: Option<(u16, u32)>,
+    /// The zip64 end record's, when present and whole.
+    zip64_declared: Option<(u64, u64)>,
+}
+
+impl IndexCheck {
+    /// Whether `name_len` more bytes of claim fit under the bound. The first
+    /// refusal gives the comparison up and frees what it held.
+    fn can_hold(&mut self, name_len: usize) -> bool {
+        if self.incomplete {
+            return false;
+        }
+        if self.held.saturating_add(name_len + CLAIM_OVERHEAD) > MAX_INDEX_CHECK_BYTES {
+            self.give_up();
+            return false;
+        }
+        true
+    }
+
+    fn give_up(&mut self) {
+        self.incomplete = true;
+        self.locals = Vec::new();
+        self.centrals = Vec::new();
+        self.held = 0;
+    }
+
+    fn record_local(&mut self, claim: Option<HeaderClaim>, delivered: &str) {
+        let Some(claim) = claim else {
+            // zip accepted a header this could not parse; nothing to compare
+            // it with.
+            self.give_up();
+            return;
+        };
+        if self.can_hold(claim.name.len() + delivered.len()) {
+            self.held += claim.name.len() + delivered.len() + CLAIM_OVERHEAD;
+            self.locals.push((claim, delivered.to_owned()));
+        }
+    }
+
+    fn record_central(&mut self, claim: HeaderClaim) {
+        // `can_hold` was asked before the name was read.
+        self.held += claim.name.len() + CLAIM_OVERHEAD;
+        self.centrals.push(claim);
+    }
+
+    /// Counts one central record from its fixed block, recorded or not.
+    fn note_central_framing(&mut self, fixed: &[u8; CENTRAL_HEADER_FIXED], variable: u64) {
+        self.central_records += 1;
+        self.central_bytes += 4 + CENTRAL_HEADER_FIXED as u64 + variable;
+        let host = fixed[1];
+        let mode = le32(&fixed[34..38]) >> 16;
+        if host == HOST_UNIX && mode & S_IFMT == S_IFLNK {
+            self.symlink = true;
+        }
+    }
+
+    /// Whether the end record declares the directory that was walked: the
+    /// same number of records and the same size. A 16- or 32-bit field at its
+    /// maximum defers to the zip64 end record (APPNOTE 4.4.1.4); with none,
+    /// nothing is confirmed.
+    fn declared_matches_walk(&self) -> bool {
+        let Some((count16, size32)) = self.eocd_declared else {
+            return false;
+        };
+        let count = if count16 == u16::MAX {
+            match self.zip64_declared {
+                Some((count, _)) => count,
+                None => return false,
+            }
+        } else {
+            u64::from(count16)
+        };
+        let size = if size32 == u32::MAX {
+            match self.zip64_declared {
+                Some((_, size)) => size,
+                None => return false,
+            }
+        } else {
+            u64::from(size32)
+        };
+        count == self.central_records && size == self.central_bytes
+    }
+}
+
+/// Whether a central record's 32-bit compressed or uncompressed size is
+/// `0xFFFFFFFF`, so the real one is in its zip64 extra block.
+fn central_sizes_saturated(fixed: &[u8; CENTRAL_HEADER_FIXED]) -> bool {
+    le32(&fixed[16..20]) == u32::MAX || le32(&fixed[20..24]) == u32::MAX
+}
+
+/// A central record's claim on ruling B3's fields, from its own bytes: the
+/// 42-byte fixed block after the signature, the raw name, and the extra field
+/// when [`central_sizes_saturated`]. The central zip64 block holds only the
+/// saturated fields, uncompressed size first (APPNOTE 4.5.3); one that cannot
+/// be resolved is `None`, never compared.
+fn central_claim(
+    fixed: &[u8; CENTRAL_HEADER_FIXED],
+    name: Vec<u8>,
+    extra: Option<&[u8]>,
+) -> HeaderClaim {
+    let usize32 = le32(&fixed[20..24]);
+    let csize32 = le32(&fixed[16..20]);
+    let mut fields = extra
+        .and_then(zip64_block)
+        .unwrap_or(&[])
+        .chunks_exact(8)
+        .map(le64);
+    let usize_ = if usize32 == u32::MAX {
+        fields.next()
+    } else {
+        Some(u64::from(usize32))
+    };
+    let csize = if csize32 == u32::MAX {
+        fields.next()
+    } else {
+        Some(u64::from(csize32))
+    };
+    HeaderClaim {
+        name,
+        flags: le16(&fixed[4..6]),
+        method: le16(&fixed[6..8]),
+        crc: Some(le32(&fixed[12..16])),
+        csize,
+        usize_,
+    }
+}
+
+/// A reader that keeps a copy of everything it hands on.
+struct Recording<'a> {
+    inner: &'a mut Pushback,
+    seen: Vec<u8>,
+}
+
+impl Read for Recording<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.seen.extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+}
+
+/// Parses the local header at the front of `source` with
+/// [`parse_local_claim`] and puts every byte it read back, so zip's own
+/// `read_zipfile_from_stream` reads the same bytes after. The raw header is
+/// what ruling B3 compares; zip's view has already applied an Info-ZIP
+/// Unicode Path field to the name. `None` if the header cannot be parsed:
+/// zip then reports it, and the comparison is not made.
+fn peek_local_claim(source: &mut Pushback) -> Option<HeaderClaim> {
+    let mut recording = Recording {
+        inner: source,
+        seen: Vec::new(),
+    };
+    let claim = parse_local_claim(&mut recording);
+    let seen = recording.seen;
+    source.push_back(&seen);
+    claim
+}
+
+/// Compares the walked local headers with the central records (ruling B3's
+/// fields, plus entries present on one side only and order) and returns the
+/// warnings, in central order.
+///
+/// Records pair by name: at the same position first, else the first unpaired
+/// local header of that name. A pairing that runs backwards against the walk
+/// is one `"order"` warning for the archive, naming the first entry found out
+/// of place. Records left unpaired on both sides pair up in order, which is
+/// how a cloaked name is reported (`"name"`, plus any other field that
+/// differs); what remains on either side is `"entry count"`, one warning per
+/// record. A local header's entry is named as it was delivered; a central-only
+/// record by its own raw name and flag.
+fn compare_walk(locals: &[(HeaderClaim, String)], centrals: &[HeaderClaim]) -> Vec<Fidelity> {
+    let warn = |entry: &str, field: &'static str| Fidelity::HeadersDisagree {
+        format: ZIP,
+        entry: entry.to_owned(),
+        field,
+    };
+    // Each name's local headers in walk order. A paired index is dropped from
+    // the front when next met, so the lookups are linear in all, however many
+    // records share a name.
+    let mut by_name: HashMap<&[u8], VecDeque<usize>> = HashMap::new();
+    for (j, (claim, _)) in locals.iter().enumerate() {
+        by_name
+            .entry(claim.name.as_slice())
+            .or_default()
+            .push_back(j);
+    }
+    let mut paired = vec![false; locals.len()];
+    let mut out = Vec::new();
+    let mut unpaired_centrals = Vec::new();
+    let mut last = None;
+    let mut order_reported = false;
+    for (k, central) in centrals.iter().enumerate() {
+        let positional = locals
+            .get(k)
+            .is_some_and(|(l, _)| !paired[k] && l.name == central.name);
+        let j = if positional {
+            Some(k)
+        } else {
+            by_name.get_mut(central.name.as_slice()).and_then(|js| {
+                while js.front().is_some_and(|&j| paired[j]) {
+                    js.pop_front();
+                }
+                js.front().copied()
+            })
+        };
+        let Some(j) = j else {
+            unpaired_centrals.push(k);
+            continue;
+        };
+        paired[j] = true;
+        let (local, delivered) = &locals[j];
+        if last.is_some_and(|last| j < last) && !order_reported {
+            out.push(warn(delivered, "order"));
+            order_reported = true;
+        }
+        last = Some(j);
+        for field in disagreeing_fields(central, local) {
+            out.push(warn(delivered, field));
+        }
+    }
+    let unpaired_locals: Vec<usize> = (0..locals.len()).filter(|&j| !paired[j]).collect();
+    for (&k, &j) in unpaired_centrals.iter().zip(&unpaired_locals) {
+        let (local, delivered) = &locals[j];
+        for field in disagreeing_fields(&centrals[k], local) {
+            out.push(warn(delivered, field));
+        }
+    }
+    for &j in unpaired_locals.iter().skip(unpaired_centrals.len()) {
+        out.push(warn(&locals[j].1, "entry count"));
+    }
+    for &k in unpaired_centrals.iter().skip(unpaired_locals.len()) {
+        let central = &centrals[k];
+        out.push(warn(
+            &entry_name(&central.name, central.flags),
+            "entry count",
+        ));
+    }
+    out
+}
+
+impl ZipStreamed {
+    /// Called once the walk has read the whole central directory and its end
+    /// record. Reports every disagreement the comparison finds, then withdraws
+    /// the two index warnings when they are no longer true: the comparison
+    /// was made, and the end record declares the directory that was walked.
+    ///
+    /// Kept, as in 0.22.0, when the directory holds a unix symlink: the
+    /// forward read delivered it as a regular file, which only the index
+    /// could have said otherwise.
+    fn conclude_index_check(&mut self) {
+        let check = std::mem::take(&mut self.index);
+        if check.incomplete {
+            return;
+        }
+        for w in compare_walk(&check.locals, &check.centrals) {
+            self.report.warn(w);
+        }
+        if check.symlink || !check.declared_matches_walk() {
+            return;
+        }
+        self.report.warnings.retain(|w| {
+            !matches!(
+                w,
+                Fidelity::TrailingIndexUnread { format: ZIP } | Fidelity::EntryCountUnknown
+            )
+        });
+    }
 }
 
 /// One entry's payload, held to the length its own header declares — the
@@ -3704,15 +4114,17 @@ mod tests {
     /// The rung/warning split, stated as a test because getting it wrong for
     /// tar cost a fix round. The rung describes the ACCESS PATH; the warnings
     /// describe the LOSS, and `--strict-fidelity` gates on the warnings. A
-    /// piped tar has none; a piped zip must have exactly these.
+    /// piped tar has none; a piped zip has exactly these until its walk has
+    /// read the central directory, and none once that index agrees (ruling
+    /// B2; in 0.22.0 they stayed to the end).
     #[test]
     fn a_piped_zip_warns_about_the_index_it_did_not_read() {
         let bytes = build_zip(&[("a.txt", b"alpha")]);
-        let ar = open_forward_only(&Zip, &bytes);
+        let mut ar = open_forward_only(&Zip, &bytes);
         let report = ar.fidelity();
         assert!(
             report.has_warnings(),
-            "--strict-fidelity must fail a piped zip: its metadata really is approximate"
+            "before the walk reaches the index, a piped zip's metadata really is approximate"
         );
         assert!(
             report
@@ -3725,6 +4137,75 @@ mod tests {
             2,
             "each loss is reported once, not twice: {:?}",
             report.warnings
+        );
+
+        while ar.next_entry().unwrap().is_some() {}
+        assert_eq!(ar.fidelity().rung, Rung::ForwardOnly);
+        assert!(
+            ar.fidelity().warnings.is_empty(),
+            "the index was read and agrees: {:?}",
+            ar.fidelity().warnings
+        );
+    }
+
+    fn claim(name: &[u8]) -> HeaderClaim {
+        HeaderClaim {
+            name: name.to_vec(),
+            flags: 0,
+            method: 0,
+            crc: Some(0),
+            csize: Some(0),
+            usize_: Some(0),
+        }
+    }
+
+    /// The pipe's comparison holds at most `MAX_INDEX_CHECK_BYTES` of claims.
+    /// The first record past it gives the comparison up and frees what it
+    /// held, and nothing is recorded after.
+    #[test]
+    fn the_pipes_index_check_gives_up_at_its_bound_and_frees_what_it_held() {
+        let mut check = IndexCheck::default();
+        let name = vec![b'n'; 60_000];
+        let delivered = "d".repeat(60_000);
+        let mut recorded = 0usize;
+        while !check.incomplete {
+            check.record_local(Some(claim(&name)), &delivered);
+            recorded += 1;
+            assert!(check.held <= MAX_INDEX_CHECK_BYTES);
+        }
+        assert_eq!(
+            recorded - 1,
+            MAX_INDEX_CHECK_BYTES / (120_000 + CLAIM_OVERHEAD),
+            "every record that fits is kept"
+        );
+        assert!(check.locals.capacity() == 0 && check.held == 0);
+        assert!(!check.can_hold(0), "nothing more is recorded");
+    }
+
+    /// Many records under one name pair in linear time: a paired index is
+    /// dropped when next met, never scanned again. Quadratic, this would be
+    /// 10^10 steps.
+    #[test]
+    fn many_records_sharing_a_name_compare_in_linear_time() {
+        let n = 100_000;
+        // Locals `other, same, same, ...`; centrals `same, same, ..., other`.
+        // No `same` record is at its local's position, so every one is found
+        // by the lookup, each the next after the last one paired.
+        let mut locals = vec![(claim(b"other"), "other".to_owned())];
+        locals.extend((1..n).map(|_| (claim(b"same"), "same".to_owned())));
+        let mut centrals: Vec<HeaderClaim> = (1..n).map(|_| claim(b"same")).collect();
+        centrals.push(claim(b"other"));
+        let started = std::time::Instant::now();
+        let warnings = compare_walk(&locals, &centrals);
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        assert_eq!(
+            warnings,
+            vec![Fidelity::HeadersDisagree {
+                format: ZIP,
+                entry: "other".to_owned(),
+                field: "order",
+            }],
+            "only `other` moved"
         );
     }
 

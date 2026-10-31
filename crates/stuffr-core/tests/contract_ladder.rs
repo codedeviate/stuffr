@@ -81,6 +81,11 @@ fn the_file_read_is_lossless_and_authoritative() {
     );
 }
 
+/// The mock container's index is never read on a pipe, so these two losses
+/// are true to the end of its walk. That is the case of a pipe whose index is
+/// cut off, absent or unread; zip keeps both there too, and withdraws them
+/// only once it has read and compared its central directory (ruling B2,
+/// pinned in `stuffr-formats/tests/zip_on_a_pipe.rs`).
 #[test]
 fn the_pipe_read_is_lossy_in_exactly_the_documented_ways() {
     let (_, report) = read_all(as_pipe(&archive()));

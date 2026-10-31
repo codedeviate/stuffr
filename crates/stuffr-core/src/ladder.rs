@@ -74,6 +74,11 @@ static NO_SPILL: SpillPolicy = SpillPolicy::Off;
 /// by the container as it parses, by calling [`FidelityReport::warn`] directly
 /// on the report it inherited from [`Resolved`] — not by building a second
 /// report and folding it in with `merge`.
+///
+/// The two trailing-index warnings say what is true when the walk starts. A
+/// container that reads and checks its index at the end of the stream may
+/// remove them from its report then (zip's forward reader does, ruling B2);
+/// the report's `warnings` are its own to edit.
 fn seed_report(rung: Rung, format: FormatId, caps: ContainerCaps) -> FidelityReport {
     let mut report = FidelityReport::new(rung);
     if rung.is_authoritative() {

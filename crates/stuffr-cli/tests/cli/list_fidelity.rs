@@ -6,7 +6,9 @@ use crate::common::*;
 
 /// `list` used to drop the container's fidelity report entirely. On a piped
 /// zip — the one shape whose forward read provably loses metadata — `test`
-/// warned and `list` printed its rows in silence.
+/// warned and `list` printed its rows in silence. Since ruling B2 a
+/// well-formed piped zip loses nothing (its central directory is read at the
+/// end and agrees), so the fixture is a cloaked one, which still warns.
 ///
 /// Fixed by handing `report_fidelity` the report, the same call `test` and
 /// `unpack -C` make. Asserted against `test`'s own stderr on the identical
@@ -16,7 +18,7 @@ use crate::common::*;
 fn list_reports_the_same_fidelity_warnings_test_does() {
     let dir = tmp_dir();
     let zip = write_zip_via_pack(&dir, &[("one.txt", b"first"), ("two.txt", b"second")]);
-    let bytes = std::fs::read(&zip).unwrap();
+    let bytes = cloak_first_local_name(&std::fs::read(&zip).unwrap());
 
     let listed = run_with_stdin_output(&["list", "-"], &bytes);
     assert!(
@@ -52,17 +54,17 @@ fn list_reports_the_same_fidelity_warnings_test_does() {
 
 /// And the gate: `list --strict-fidelity` exits 4 on the same archive it
 /// exits 0 on without the flag, the same contract `test` and `unpack -C`
-/// have.
+/// have. The archive is a cloaked piped zip (see the test above).
 #[test]
 fn list_strict_fidelity_turns_a_warning_into_exit_four() {
     let dir = tmp_dir();
     let zip = write_zip_via_pack(&dir, &[("one.txt", b"first")]);
-    let bytes = std::fs::read(&zip).unwrap();
+    let bytes = cloak_first_local_name(&std::fs::read(&zip).unwrap());
 
     let lenient = run_with_stdin_output(&["list", "-"], &bytes);
     assert_eq!(lenient.status.code(), Some(0));
     assert!(
-        String::from_utf8_lossy(&lenient.stdout).contains("one.txt"),
+        String::from_utf8_lossy(&lenient.stdout).contains("one.tx"),
         "the listing itself is still printed"
     );
 
@@ -74,8 +76,22 @@ fn list_strict_fidelity_turns_a_warning_into_exit_four() {
         String::from_utf8_lossy(&strict.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&strict.stdout).contains("one.txt"),
+        String::from_utf8_lossy(&strict.stdout).contains("one.tx"),
         "the gate is a verdict on a listing that was still produced"
+    );
+
+    // Since ruling B2 the same zip uncloaked passes the gate over a pipe too:
+    // its central directory was read at the end and agrees (exit 4 in
+    // 0.22.0).
+    let piped_clean = run_with_stdin_output(
+        &["list", "-", "--strict-fidelity"],
+        &std::fs::read(&zip).unwrap(),
+    );
+    assert_eq!(
+        piped_clean.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&piped_clean.stderr)
     );
 
     // A read that loses nothing is still exit 0 under the flag — the gate is

@@ -1689,6 +1689,11 @@ mod tests {
         );
     }
 
+    /// The ladder's seed, as a container inherits it at `open`. The mock never
+    /// reads its trailing index, so both warnings stay to the end of its walk
+    /// (`contract_ladder.rs`). A container that does read and check its index
+    /// at the end of a pipe may withdraw them then: zip does since ruling B2,
+    /// and keeps them when that index is cut off (`zip_on_a_pipe.rs`).
     #[test]
     fn open_reports_index_and_count_loss_on_a_non_seekable_source() {
         let bytes = mock_archive_bytes(&[("a.txt", b"alpha")]);
