@@ -3816,6 +3816,33 @@ impl Read for CountingReader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One central record whose "version made by" host is `host` and whose
+    /// external attributes hold the unix word for a 0644 regular file.
+    fn cd_record_from_host(host: u8) -> CdRecord {
+        let mut bytes = SIG_CENTRAL_HEADER.to_vec();
+        let mut fixed = [0u8; CENTRAL_HEADER_FIXED];
+        fixed[0] = 30;
+        fixed[1] = host;
+        fixed[24..26].copy_from_slice(&1u16.to_le_bytes());
+        fixed[34..38].copy_from_slice(&(0o100644u32 << 16).to_le_bytes());
+        bytes.extend_from_slice(&fixed);
+        bytes.push(b'f');
+        read_one_cd_record(&mut std::io::Cursor::new(bytes), 0)
+            .unwrap()
+            .unwrap()
+    }
+
+    /// A unix mode is taken only from a record a unix host (3) or OS X (19)
+    /// made; the same attribute word from MS-DOS (0) or NTFS (10) is not a
+    /// mode.
+    #[test]
+    fn a_central_record_carries_a_unix_mode_only_from_a_unix_host() {
+        assert_eq!(cd_record_from_host(3).unix_mode, Some(0o100644));
+        assert_eq!(cd_record_from_host(19).unix_mode, Some(0o100644));
+        assert_eq!(cd_record_from_host(0).unix_mode, None);
+        assert_eq!(cd_record_from_host(10).unix_mode, None);
+    }
     use stuffr_core::testing::{SharedBuf, assert_container_conforms, open_forward_only};
     use stuffr_core::{ArchiveRead, OpenOpts, ReaderSource, StreamPolicy};
 

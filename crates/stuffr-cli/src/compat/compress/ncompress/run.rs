@@ -664,6 +664,16 @@ mod tests {
 
     /// `prratio` in the C's fixed point: two decimals, the sign first, the
     /// large-number branch, and 100% for an empty input.
+    #[test]
+    fn prratio_is_fixed_point() {
+        assert_eq!(prratio(50_000 - 21_313, 50_000), b"57.37%");
+        assert_eq!(prratio(1 - 5, 1), b"-400.00%");
+        assert_eq!(prratio(4096 - 5632, 4096), b"-37.50%");
+        assert_eq!(prratio(0, 0), b"100.00%");
+        assert_eq!(prratio(-3, 0), b"100.00%");
+        assert_eq!(prratio(1_000_000, 2_000_000), b"50.00%");
+    }
+
     /// Final security review, Minor 6: a duplicate descriptor that could
     /// not be taken reports all three steps, each as its own failure would
     /// be, instead of skipping them in silence.
@@ -702,15 +712,5 @@ mod tests {
             String::from_utf8_lossy(&err),
             String::from_utf8_lossy(&want)
         );
-    }
-
-    #[test]
-    fn prratio_is_fixed_point() {
-        assert_eq!(prratio(50_000 - 21_313, 50_000), b"57.37%");
-        assert_eq!(prratio(1 - 5, 1), b"-400.00%");
-        assert_eq!(prratio(4096 - 5632, 4096), b"-37.50%");
-        assert_eq!(prratio(0, 0), b"100.00%");
-        assert_eq!(prratio(-3, 0), b"100.00%");
-        assert_eq!(prratio(1_000_000, 2_000_000), b"50.00%");
     }
 }
