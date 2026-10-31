@@ -103,6 +103,10 @@
 //! [`Fidelity::HeadersDisagree`]. The bytes delivered stay the local
 //! headers'; only the warnings are new.
 //!
+//! B3's "the descriptor, if read, is compared instead" is not implemented
+//! because it is vacuous today: zip 9 refuses a bit-3 entry on a pipe, and
+//! the seekable path never reads a data descriptor.
+//!
 //! What is held is bounded: `MAX_INDEX_CHECK_BYTES` of claims (names plus a
 //! fixed charge per record). Past it the comparison is given up, its memory
 //! freed, and the two index warnings stay, as for any index that was not
@@ -502,7 +506,9 @@ impl Container for Zip {
 /// [`Error::Corrupt`] (exit 5), which is what conformance property 9
 /// requires and what `Error::from_decode_io` would otherwise leave at exit 1.
 /// `Other`, `InvalidInput` and `Unsupported` are folded the same way since
-/// zip 9, for the header sites the payload constant's doc lists.
+/// zip 9, for the header sites the payload constant's doc lists — but only
+/// when the error carries no OS error code: an `EINVAL` from the source is
+/// a real I/O failure and stays [`Error::Io`].
 fn classify_zip_error(e: ZipError) -> Error {
     match e {
         ZipError::Io(io_err) => {
@@ -516,7 +522,11 @@ fn classify_zip_error(e: ZipError) -> Error {
             // `from_decode_io` (the first in 8.6 as well). The list and why
             // folding them is safe: `normalize::
             // ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_UNSUPPORTED_EOF`.
-            if ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_UNSUPPORTED_EOF.contains(&io_err.kind()) {
+            // Only an error zip made itself: one carrying an OS error code
+            // is the source failing, and stays `Error::Io`.
+            if io_err.raw_os_error().is_none()
+                && ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_UNSUPPORTED_EOF.contains(&io_err.kind())
+            {
                 return Error::Corrupt(io_err.to_string());
             }
             Error::from_decode_io(io_err)
@@ -2371,7 +2381,14 @@ fn verify_trailing_index(
                 if size >= ZIP64_END_FIXED as u64 {
                     let fixed =
                         read_fixed::<ZIP64_END_FIXED>(source, "zip64 end of central directory")?;
-                    check.zip64_declared = Some((le64(&fixed[20..28]), le64(&fixed[28..36])));
+                    // After the size field: versions (4), disk numbers
+                    // (8), records on this disk, total records, directory
+                    // size (APPNOTE 4.3.14).
+                    check.zip64_declared = Some((
+                        le64(&fixed[12..20]),
+                        le64(&fixed[20..28]),
+                        le64(&fixed[28..36]),
+                    ));
                     rest -= ZIP64_END_FIXED as u64;
                 }
                 skip(source, rest, "zip64 end of central directory")?;
@@ -2385,7 +2402,10 @@ fn verify_trailing_index(
             SIG_END_OF_CENTRAL_DIR => {
                 let fixed =
                     read_fixed::<END_OF_CENTRAL_DIR_FIXED>(source, "end of central directory")?;
-                check.eocd_declared = Some((le16(&fixed[6..8]), le32(&fixed[8..12])));
+                // After the signature: disk numbers (4), records on this
+                // disk, total records, directory size (APPNOTE 4.3.16).
+                check.eocd_declared =
+                    Some((le16(&fixed[4..6]), le16(&fixed[6..8]), le32(&fixed[8..12])));
                 let comment = u16::from_le_bytes([fixed[16], fixed[17]]);
                 skip(
                     source,
@@ -2524,10 +2544,11 @@ struct IndexCheck {
     /// A central record marks a unix symlink, which a forward read delivers
     /// as a regular file holding the target.
     symlink: bool,
-    /// The end record's total record count and directory size.
-    eocd_declared: Option<(u16, u32)>,
+    /// The end record's records-on-this-disk count, total record count and
+    /// directory size.
+    eocd_declared: Option<(u16, u16, u32)>,
     /// The zip64 end record's, when present and whole.
-    zip64_declared: Option<(u64, u64)>,
+    zip64_declared: Option<(u64, u64, u64)>,
 }
 
 impl IndexCheck {
@@ -2591,24 +2612,30 @@ impl IndexCheck {
     }
 
     /// Whether the end record declares the directory that was walked: the
-    /// same number of records and the same size. A 16- or 32-bit field at its
-    /// maximum defers to the zip64 end record (APPNOTE 4.4.1.4); with none,
+    /// same number of records and the same size, and its records-on-this-disk
+    /// count equal to its total (a seekable read refuses an end record whose
+    /// two counts disagree, exit 5; here it leaves the two warnings). A 16-
+    /// or 32-bit field at its maximum defers to the zip64 end record
+    /// (APPNOTE 4.4.1.4), whose own two counts must agree too; with none,
     /// nothing is confirmed.
     fn declared_matches_walk(&self) -> bool {
-        let Some((count16, size32)) = self.eocd_declared else {
+        let Some((on_disk16, count16, size32)) = self.eocd_declared else {
             return false;
         };
+        if on_disk16 != count16 {
+            return false;
+        }
         let count = if count16 == u16::MAX {
             match self.zip64_declared {
-                Some((count, _)) => count,
-                None => return false,
+                Some((on_disk, count, _)) if on_disk == count => count,
+                _ => return false,
             }
         } else {
             u64::from(count16)
         };
         let size = if size32 == u32::MAX {
             match self.zip64_declared {
-                Some((_, size)) => size,
+                Some((_, _, size)) => size,
                 None => return false,
             }
         } else {
@@ -3569,6 +3596,29 @@ mod tests {
     use super::*;
     use stuffr_core::testing::{SharedBuf, assert_container_conforms, open_forward_only};
     use stuffr_core::{ArchiveRead, OpenOpts, ReaderSource, StreamPolicy};
+
+    /// The header-parsing fold reaches only errors `zip` made itself. An OS
+    /// `EINVAL` is `InvalidInput` too, but it is the source failing: it must
+    /// stay `Error::Io`, never be reported as a corrupt archive. A crate-made
+    /// `InvalidInput` beside it is still folded.
+    #[cfg(unix)]
+    #[test]
+    fn an_os_error_of_a_folded_kind_stays_io() {
+        // EINVAL is 22 on every unix this builds for (no `libc` dependency).
+        let os = io::Error::from_raw_os_error(22);
+        assert_eq!(os.kind(), ErrorKind::InvalidInput);
+        let classified = classify_zip_error(ZipError::Io(os));
+        assert!(
+            matches!(classified, Error::Io(_)),
+            "an OS error is not a malformed archive: {classified:?}"
+        );
+
+        let made = io::Error::new(ErrorKind::InvalidInput, "range overflows u64");
+        assert!(matches!(
+            classify_zip_error(ZipError::Io(made)),
+            Error::Corrupt(_)
+        ));
+    }
 
     // -----------------------------------------------------------------------
     // Helpers

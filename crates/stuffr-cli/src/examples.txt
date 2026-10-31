@@ -648,9 +648,12 @@ LISTING AND TESTING AN ARCHIVE
       read" and "total entry count is unknown"; those two warnings are now
       raised only when the directory could not be read: cut off, absent,
       more than 32 MiB of recorded headers, or contradicted by its own end
-      record. They are raised too when the directory marks a unix symlink,
-      because the pipe delivers a link as a regular file holding its target
-      (and no modes are restored from a pipe). A pipe that is cut off
+      record (a different count or size, or an end record whose entries-
+      on-this-disk and total counts differ: on a pipe the warnings stay,
+      where the same record read from a file is exit 5). They are raised
+      too when the directory marks a unix symlink, because the pipe
+      delivers a link as a regular file holding its target (and no modes
+      are restored from a pipe). A pipe that is cut off
       inside its directory is exit 5 as it always was. --strict-fidelity
       gates on what was lost, never on the rung. (`list`/`ls`, `test` and
       `unpack` all take the flag; `cat` does not, because its output IS the
@@ -666,10 +669,13 @@ LISTING AND TESTING AN ARCHIVE
       the sizes, or flag bits 0, 3 and 11. Without the flag it is a warning
       and the exit is 0: the data is still read, but one of the two headers
       is lying about the entry, which is how a zip is made to show one name
-      to one tool and another to a different tool. An end record whose two
-      entry counts disagree is exit 5, and so is a multi-disk end record
-      (was 3); a Unicode Path field with a bad CRC is ignored, not an
-      error; AES (method 99) without its extra field is exit 3.
+      to one tool and another to a different tool. Read from a file, an end
+      record whose entries-on-this-disk and total counts disagree is exit
+      5, and so is a multi-disk end record (was 3); read from a pipe, such
+      an end record leaves the two index warnings above in place (exit 4
+      under --strict-fidelity). A Unicode Path field with a bad CRC is
+      ignored, not an error; AES (method 99) without its extra field is
+      exit 3.
 
   stuffr test archive.zip
       Verifies every entry's CRC32 — zip carries one per entry, so

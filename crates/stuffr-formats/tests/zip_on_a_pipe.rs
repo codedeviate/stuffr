@@ -1016,6 +1016,37 @@ fn a_huge_declared_central_directory_on_a_pipe_is_bounded() {
     assert_eq!(out.status.code(), Some(4), "{out:?}");
 }
 
+/// An end record whose records-on-this-disk count (bytes 8..10) disagrees
+/// with its total (10..12) contradicts itself. A seekable read refuses it
+/// (zip's own check, exit 5); the forward walk has already read every entry
+/// by then, so it keeps going and does not confirm the index: both warnings
+/// stay, strict mode fails it with 4, and nothing is exit 1.
+#[test]
+fn a_piped_end_record_whose_two_counts_disagree_keeps_both_warnings() {
+    let mut bytes = fixture_zip(THREE);
+    let eocd = bytes.len() - 22;
+    assert_eq!(le16(&bytes, eocd + 10), 3, "the total");
+    bytes[eocd + 8..eocd + 10].copy_from_slice(&2u16.to_le_bytes());
+    let (end, report) = walk_piped(&bytes);
+    assert_eq!(end.expect("the entries themselves are whole"), 3);
+    assert_eq!(
+        index_warnings(&report),
+        (true, true),
+        "{:?}",
+        report.warnings
+    );
+    assert!(disagreements(&report).is_empty());
+
+    let out = run_piped(&["test", "-", "--strict-fidelity"], &bytes);
+    assert_eq!(out.status.code(), Some(4), "{out:?}");
+
+    // The seekable path, for the contrast examples.txt states.
+    let dir = scratch("eocd-counts");
+    let path = write_temp_zip(&dir, &bytes);
+    let out = run_on_path(&["test", path.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(5), "{out:?}");
+}
+
 /// The forward read delivers a symlink as a regular file holding its target;
 /// only the central directory says it was a link. That stays a reported loss.
 #[test]

@@ -708,7 +708,10 @@ pub(crate) const CPIO_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
 /// `ppmd-rust 1.5.2`, `deflate64 0.1.12`, `flate2` and `bzip2 0.6` over
 /// `libbz2-rs-sys`. Two consumers: `zip.rs`'s payload readers (through
 /// [`NormalizeDecodeErrors`] and `normalize_payload_error`) and, since zip
-/// 9, `classify_zip_error`'s `ZipError::Io` arm for header parsing.
+/// 9, `classify_zip_error`'s `ZipError::Io` arm for header parsing, which
+/// folds only an error carrying no OS error code (`raw_os_error()` is
+/// `None`): an `EINVAL` the source itself raised is `InvalidInput` too, and
+/// stays [`Error::Io`](stuffr_core::Error::Io).
 ///
 /// Payload readers:
 ///
@@ -782,7 +785,9 @@ pub(crate) const CPIO_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
 /// manufactures `Other`, `InvalidInput`, `Unsupported` or `UnexpectedEof` out
 /// of one. `std` never raises `Other` (an OS error with no named kind is
 /// `Uncategorized`), and raises `Unsupported` only for an operation the
-/// platform lacks, never for a read of a file or a pipe. The one `Other`
+/// platform lacks, never for a read of a file or a pipe. `std` does raise
+/// `InvalidInput` for an OS `EINVAL`; such an error carries its OS code, and
+/// the header-parsing fold leaves anything with one alone. The one `Other`
 /// `zip.rs` constructs — `SeekAdapter::seek`'s "source reported seekable but
 /// cannot seek" — is unreachable by its own doc. Conformance property 10 (a
 /// `PermissionDenied` source stays `Error::Io`) still holds, but cannot
