@@ -679,8 +679,9 @@ LISTING AND TESTING AN ARCHIVE
   stuffr test disagree.zip --strict-fidelity
       Exit 4 when a zip's local headers and its central directory disagree
       about an entry, on a file or on a pipe. The warning reads: `zip` local
-      header and central directory disagree on <field> for entry `<name>`,
-      where the field is the raw name, the name each header would deliver
+      header and central directory disagree on <fields> for entry `<name>`,
+      one line per entry listing every field (the first 64 entries; the
+      rest are one count), where a field is the raw name, the name each header would deliver
       (including its own Unicode Path extra field), the method, the CRC-32,
       the sizes, or flag bits 0, 3 and 11. Without the flag it is a warning
       and the exit is 0: the data is still read, but one of the two headers

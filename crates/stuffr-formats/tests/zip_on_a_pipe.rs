@@ -806,9 +806,12 @@ fn disagreements(report: &FidelityReport) -> Vec<(String, &'static str)> {
         .warnings
         .iter()
         .filter_map(|w| match w {
-            Fidelity::HeadersDisagree { entry, field, .. } => Some((entry.clone(), *field)),
+            Fidelity::HeadersDisagree { entry, fields, .. } => {
+                Some(fields.iter().map(|f| (entry.clone(), *f)))
+            }
             _ => None,
         })
+        .flatten()
         .collect()
 }
 

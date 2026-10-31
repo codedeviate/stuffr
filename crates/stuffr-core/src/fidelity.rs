@@ -266,21 +266,39 @@ pub enum Fidelity {
     /// is that the reading is the only one, so `--strict-fidelity` turns this
     /// into exit 4.
     ///
-    /// `field` is one of `"name"`, `"compression method"`, `"CRC-32"`,
+    /// `fields` lists, in a fixed order and never empty, every field the
+    /// two records disagree on for this one entry — one warning per entry,
+    /// not per field (it was per field up to 0.22.0, as `field`). Each is
+    /// one of `"order"`, `"name"`, `"compression method"`, `"CRC-32"`,
     /// `"compressed size"`, `"uncompressed size"`, `"encryption flag"`,
-    /// `"data-descriptor flag"`, `"UTF-8 flag"`, `"entry count"` or
-    /// `"order"`. `entry` is the name as
-    /// the authoritative description (the central directory, when it was
-    /// read) spells it, decoded as the reader decodes names.
+    /// `"data-descriptor flag"`, `"UTF-8 flag"` or `"entry count"`. `entry`
+    /// is the name as the authoritative description (the central directory,
+    /// when it was read) spells it, decoded as the reader decodes names.
+    ///
+    /// An archive lists at most 64 entries this way; the rest are counted
+    /// in one [`Fidelity::HeadersDisagreeUnlisted`].
     #[error(
-        "`{format}` local header and central directory disagree on {field} for entry `{}`",
+        "`{format}` local header and central directory disagree on {} for entry `{}`",
+        .fields.join(", "),
         fmt_name(.entry)
     )]
     HeadersDisagree {
         format: FormatId,
         entry: String,
-        field: &'static str,
+        fields: Vec<&'static str>,
     },
+
+    /// More entries whose local header and central record disagree, past
+    /// the 64 an archive lists as [`Fidelity::HeadersDisagree`]: `entries`
+    /// counts them. Each listed warning copies its entry's name, so an
+    /// archive of a hundred thousand cloaked records would otherwise make a
+    /// report as large as its index; the count keeps the verdict
+    /// (`--strict-fidelity` exits 4 on either) without the copies.
+    #[error(
+        "`{format}` local header and central directory disagree for {entries} more \
+         entr(y/ies), not listed"
+    )]
+    HeadersDisagreeUnlisted { format: FormatId, entries: u64 },
 
     /// A codec stream whose last complete, verified member (or stream) is
     /// followed by bytes that are neither another member nor padding, and
@@ -517,7 +535,7 @@ mod tests {
             Fidelity::HeadersDisagree {
                 format: FormatId::new("zip"),
                 entry: n(),
-                field: "name",
+                fields: vec!["name", "CRC-32"],
             },
         ];
         for f in all {
@@ -525,6 +543,27 @@ mod tests {
             assert!(m.contains("a\\x1bb"), "{m}");
             assert!(!m.contains('\x1b'), "{m:?}");
         }
+    }
+
+    #[test]
+    fn headers_disagree_names_every_field_on_one_line() {
+        let w = Fidelity::HeadersDisagree {
+            format: FormatId::new("zip"),
+            entry: "a.txt".into(),
+            fields: vec!["name", "CRC-32"],
+        };
+        assert_eq!(
+            w.to_string(),
+            "`zip` local header and central directory disagree on name, CRC-32 for entry `a.txt`"
+        );
+        let more = Fidelity::HeadersDisagreeUnlisted {
+            format: FormatId::new("zip"),
+            entries: 3,
+        };
+        assert_eq!(
+            more.to_string(),
+            "`zip` local header and central directory disagree for 3 more entr(y/ies), not listed"
+        );
     }
 
     #[test]

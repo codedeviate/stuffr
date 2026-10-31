@@ -99,8 +99,10 @@
 //! raw name and fields as `verify_trailing_index` passes it, and compares the
 //! two at the end record (`compare_walk`): the same fields as the seekable
 //! path (`disagreeing_fields`), plus records present on one side only
-//! (`"entry count"`) and order (`"order"`), each a
-//! [`Fidelity::HeadersDisagree`]. The bytes delivered stay the local
+//! (`"entry count"`) and order (`"order"`): one
+//! [`Fidelity::HeadersDisagree`] per entry, naming every field, for the
+//! first 64 entries, then one [`Fidelity::HeadersDisagreeUnlisted`]
+//! counting the rest (`DisagreementLog`). The bytes delivered stay the local
 //! headers'; only the warnings are new.
 //!
 //! B3's "the descriptor, if read, is compared instead" is not implemented
@@ -431,6 +433,7 @@ impl Container for Zip {
                 next: 0,
                 compared: HashSet::new(),
                 claims: LocalClaims::new(archive_len),
+                disagreements: DisagreementLog::default(),
             }));
         }
 
@@ -1505,11 +1508,63 @@ struct ZipIndexed {
     /// independent views of the same index, which is the point of having one.
     next: usize,
     /// Entries whose local header has been compared with their central
-    /// record, so an entry opened twice warns once per field.
+    /// record, so an entry opened twice warns once.
     compared: HashSet<usize>,
     /// The local-header reads behind those comparisons, memoised and bounded
     /// ([`LocalClaims`]).
     claims: LocalClaims,
+    /// The disagreements reported so far, capped ([`DisagreementLog`]).
+    disagreements: DisagreementLog,
+}
+
+/// Entries an archive names in [`Fidelity::HeadersDisagree`] before the rest
+/// are only counted ([`Fidelity::HeadersDisagreeUnlisted`]); `SightingLog`'s
+/// figure in salvage.
+const MAX_LISTED_DISAGREEMENTS: u64 = 64;
+
+/// One archive's header disagreements (finding PARSE-5): one warning per
+/// entry listing every field, the first [`MAX_LISTED_DISAGREEMENTS`] entries
+/// by name, the rest counted in one warning kept up to date in place. Each
+/// listed warning copies its entry's name, so without the cap an index of
+/// 100,000 cloaked records made a report as large as itself.
+#[derive(Default)]
+struct DisagreementLog {
+    listed: u64,
+    unlisted: u64,
+    /// Where `report` holds the [`Fidelity::HeadersDisagreeUnlisted`]
+    /// warning once there is one.
+    unlisted_at: Option<usize>,
+}
+
+impl DisagreementLog {
+    fn warn(&mut self, report: &mut FidelityReport, entry: String, fields: Vec<&'static str>) {
+        if fields.is_empty() {
+            return;
+        }
+        if self.listed < MAX_LISTED_DISAGREEMENTS {
+            self.listed += 1;
+            report.warn(Fidelity::HeadersDisagree {
+                format: ZIP,
+                entry,
+                fields,
+            });
+            return;
+        }
+        self.unlisted += 1;
+        let entries = self.unlisted;
+        if let Some(at) = self.unlisted_at
+            && let Some(Fidelity::HeadersDisagreeUnlisted { entries: n, .. }) =
+                report.warnings.get_mut(at)
+        {
+            *n = entries;
+            return;
+        }
+        self.unlisted_at = Some(report.warnings.len());
+        report.warn(Fidelity::HeadersDisagreeUnlisted {
+            format: ZIP,
+            entries,
+        });
+    }
 }
 
 /// Bytes of parsed local headers [`LocalClaims`] remembers at once.
@@ -1938,7 +1993,7 @@ fn read_central_name_and_flags<R: Read + Seek>(r: &mut R, at: u64) -> Option<(u1
 
 impl ZipIndexed {
     /// Compares entry `index`'s local header with its central record and
-    /// warns, once per entry and field, on each field of ruling B3 they
+    /// warns once per entry, naming every field of ruling B3 they
     /// disagree on (`Fidelity::HeadersDisagree`). The bytes handed back stay
     /// the central directory's; this only reports. Anything that cannot be
     /// read here is left silently to the entry's own open, which classifies
@@ -1993,13 +2048,8 @@ impl ZipIndexed {
         else {
             return;
         };
-        for field in disagreeing_fields(&central, local) {
-            self.report.warn(Fidelity::HeadersDisagree {
-                format: ZIP,
-                entry: entry.clone(),
-                field,
-            });
-        }
+        let fields = disagreeing_fields(&central, local);
+        self.disagreements.warn(&mut self.report, entry, fields);
     }
 }
 
@@ -2879,11 +2929,15 @@ fn peek_local_claim(source: &mut Pushback) -> Option<HeaderClaim> {
 /// differs); what remains on either side is `"entry count"`, one warning per
 /// record. A local header's entry is named as it was delivered; a central-only
 /// record by its own raw name and flag.
-fn compare_walk(locals: &[(HeaderClaim, String)], centrals: &[HeaderClaim]) -> Vec<Fidelity> {
-    let warn = |entry: &str, field: &'static str| Fidelity::HeadersDisagree {
-        format: ZIP,
-        entry: entry.to_owned(),
-        field,
+fn compare_walk(
+    locals: &[(HeaderClaim, String)],
+    centrals: &[HeaderClaim],
+) -> Vec<(String, Vec<&'static str>)> {
+    let mut out: Vec<(String, Vec<&'static str>)> = Vec::new();
+    let mut warn = |entry: &str, fields: Vec<&'static str>| {
+        if !fields.is_empty() {
+            out.push((entry.to_owned(), fields));
+        }
     };
     // Each name's local headers in walk order. A paired index is dropped from
     // the front when next met, so the lookups are linear in all, however many
@@ -2896,7 +2950,6 @@ fn compare_walk(locals: &[(HeaderClaim, String)], centrals: &[HeaderClaim]) -> V
             .push_back(j);
     }
     let mut paired = vec![false; locals.len()];
-    let mut out = Vec::new();
     let mut unpaired_centrals = Vec::new();
     let mut last = None;
     let mut order_reported = false;
@@ -2920,31 +2973,29 @@ fn compare_walk(locals: &[(HeaderClaim, String)], centrals: &[HeaderClaim]) -> V
         };
         paired[j] = true;
         let (local, delivered) = &locals[j];
+        let mut fields = Vec::new();
         if last.is_some_and(|last| j < last) && !order_reported {
-            out.push(warn(delivered, "order"));
+            fields.push("order");
             order_reported = true;
         }
         last = Some(j);
-        for field in disagreeing_fields(central, local) {
-            out.push(warn(delivered, field));
-        }
+        fields.extend(disagreeing_fields(central, local));
+        warn(delivered, fields);
     }
     let unpaired_locals: Vec<usize> = (0..locals.len()).filter(|&j| !paired[j]).collect();
     for (&k, &j) in unpaired_centrals.iter().zip(&unpaired_locals) {
         let (local, delivered) = &locals[j];
-        for field in disagreeing_fields(&centrals[k], local) {
-            out.push(warn(delivered, field));
-        }
+        warn(delivered, disagreeing_fields(&centrals[k], local));
     }
     for &j in unpaired_locals.iter().skip(unpaired_centrals.len()) {
-        out.push(warn(&locals[j].1, "entry count"));
+        warn(&locals[j].1, vec!["entry count"]);
     }
     for &k in unpaired_centrals.iter().skip(unpaired_locals.len()) {
         let central = &centrals[k];
-        out.push(warn(
+        warn(
             &entry_name(&central.name, central.flags),
-            "entry count",
-        ));
+            vec!["entry count"],
+        );
     }
     out
 }
@@ -2963,8 +3014,9 @@ impl ZipStreamed {
         if check.incomplete {
             return;
         }
-        for w in compare_walk(&check.locals, &check.centrals) {
-            self.report.warn(w);
+        let mut log = DisagreementLog::default();
+        for (entry, fields) in compare_walk(&check.locals, &check.centrals) {
+            log.warn(&mut self.report, entry, fields);
         }
         if check.symlink || !check.declared_matches_walk() {
             return;
@@ -4454,11 +4506,7 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(20));
         assert_eq!(
             warnings,
-            vec![Fidelity::HeadersDisagree {
-                format: ZIP,
-                entry: "other".to_owned(),
-                field: "order",
-            }],
+            vec![("other".to_owned(), vec!["order"])],
             "only `other` moved"
         );
     }
@@ -4705,13 +4753,15 @@ mod tests {
                 Fidelity::HeadersDisagree {
                     format,
                     entry,
-                    field,
+                    fields,
                 } => {
                     assert_eq!(*format, ZIP);
-                    Some((entry.clone(), *field))
+                    assert!(!fields.is_empty(), "a warning names its fields");
+                    Some(fields.iter().map(|f| (entry.clone(), *f)))
                 }
                 _ => None,
             })
+            .flatten()
             .collect()
     }
 
@@ -4856,6 +4906,79 @@ mod tests {
             unchecked[0] > 0 && unchecked[0] <= records as u64 - misses,
             "{} unchecked after {misses} reads",
             unchecked[0]
+        );
+    }
+
+    /// PARSE-5: one warning per entry, naming every field it disagrees on.
+    #[test]
+    fn an_entry_disagreeing_on_several_fields_is_one_warning() {
+        let mut bytes = raw_zip(b"a.txt", 0, &[], b"payload");
+        bytes[LH_NAME] = b'b';
+        bytes[LH_CRC] ^= 1;
+        let ar = {
+            let mut ar = open_seekable(&bytes);
+            while ar.next_entry().expect("entry").is_some() {}
+            ar
+        };
+        let found: Vec<&Fidelity> = ar
+            .fidelity()
+            .warnings
+            .iter()
+            .filter(|w| matches!(w, Fidelity::HeadersDisagree { .. }))
+            .collect();
+        assert_eq!(
+            found,
+            vec![&Fidelity::HeadersDisagree {
+                format: ZIP,
+                entry: "a.txt".to_owned(),
+                fields: vec!["name", "CRC-32"],
+            }]
+        );
+    }
+
+    /// PARSE-5: past 64 entries, disagreements are counted in one warning,
+    /// on the seekable rung and on a pipe alike.
+    #[test]
+    fn disagreements_past_the_listed_cap_are_counted_in_one_warning() {
+        let records = 100;
+        let (bytes, _) = fan_out_zip(1, records);
+        let count = |report: &FidelityReport| {
+            let listed = report
+                .warnings
+                .iter()
+                .filter(|w| matches!(w, Fidelity::HeadersDisagree { .. }))
+                .count() as u64;
+            let unlisted: Vec<u64> = report
+                .warnings
+                .iter()
+                .filter_map(|w| match w {
+                    Fidelity::HeadersDisagreeUnlisted { entries, .. } => Some(*entries),
+                    _ => None,
+                })
+                .collect();
+            (listed, unlisted)
+        };
+        let (report, _, _) = list_counting_claim_reads(&bytes);
+        assert_eq!(
+            count(&report),
+            (
+                MAX_LISTED_DISAGREEMENTS,
+                vec![records as u64 - MAX_LISTED_DISAGREEMENTS]
+            )
+        );
+        let mut log = DisagreementLog::default();
+        let mut report = FidelityReport::exact();
+        for i in 0..records {
+            log.warn(&mut report, format!("e{i}"), vec!["entry count"]);
+            log.warn(&mut report, format!("quiet{i}"), Vec::new());
+        }
+        assert_eq!(
+            count(&report),
+            (
+                MAX_LISTED_DISAGREEMENTS,
+                vec![records as u64 - MAX_LISTED_DISAGREEMENTS]
+            ),
+            "the pipe's log, and an entry with no field is no warning"
         );
     }
 

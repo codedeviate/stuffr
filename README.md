@@ -2308,8 +2308,10 @@ unknown`) are not raised, so a well-formed piped zip passes `--strict-fidelity`
 absent, past 32 MiB of recorded headers, or holds a unix symlink (a pipe delivers
 the link as a regular file). The same comparison runs on a seekable zip: a local
 header and central directory that disagree raise `Fidelity::HeadersDisagree` (``zip``
-local header and central directory disagree on FIELD for entry `NAME`), exit 4 under
-`--strict-fidelity`. Each local header is read once however many records point at
+local header and central directory disagree on FIELDS for entry `NAME`), one per entry
+listing every field it disagrees on (one per field up to 0.22.0; JSON `fields`, a
+list, replaces `field`), the first 64 entries by name and the rest counted in one
+`Fidelity::HeadersDisagreeUnlisted`, exit 4 under `--strict-fidelity`. Each local header is read once however many records point at
 it, and the reads stop at twice the archive's length plus 64 MiB (a well-formed
 zip reads each header once): past that, the remaining entries are not compared and
 `Fidelity::LocalHeadersUnchecked` says how many, exit 4 under `--strict-fidelity`.
