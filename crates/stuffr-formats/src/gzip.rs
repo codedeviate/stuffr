@@ -10,7 +10,7 @@ use stuffr_core::{
     FormatMeta, MagicRule, Result, Sink, Source, StreamOnly,
 };
 
-use crate::member_tail::{self, Header, PeekBuf, Rule};
+use crate::member_tail::{self, Header, MemberBudget, PeekBuf, Rule};
 use crate::normalize::{MALFORMED_AS_INVALID_INPUT_EOF, NormalizeDecodeErrors};
 
 pub const GZIP: FormatId = FormatId::new("gzip");
@@ -81,6 +81,8 @@ struct MultiMemberGzip<'a> {
     /// instead of reporting a clean end.
     failed: bool,
     sink: FidelitySink,
+    /// Bounds the members started against the bytes moved (N1).
+    budget: MemberBudget,
 }
 
 impl<'a> MultiMemberGzip<'a> {
@@ -89,6 +91,7 @@ impl<'a> MultiMemberGzip<'a> {
             cur: Some(GzMemberDecoder::new(PeekBuf::new(src))),
             failed: false,
             sink,
+            budget: MemberBudget::new(GZIP),
         }
     }
 }
@@ -137,6 +140,10 @@ impl std::io::Read for MultiMemberGzip<'_> {
                     let mut rest = self.cur.take().unwrap().into_inner();
                     match member_tail::after_member(&mut rest, &TAIL_RULE, &self.sink) {
                         Ok(true) => {
+                            if let Err(e) = self.budget.start_member(&rest) {
+                                self.failed = true;
+                                return Err(e);
+                            }
                             self.cur = Some(GzMemberDecoder::new(rest));
                             continue;
                         }
@@ -147,7 +154,10 @@ impl std::io::Read for MultiMemberGzip<'_> {
                         }
                     }
                 }
-                n => return Ok(n),
+                n => {
+                    self.budget.produced(n);
+                    return Ok(n);
+                }
             }
         }
     }
@@ -473,6 +483,66 @@ mod tests {
         let (out, warnings) = decode_tail(x);
         assert_eq!(out.unwrap(), b"first member\n".repeat(100));
         assert_eq!(warnings, ignored(b.len() as u64));
+    }
+
+    /// N1: every member builds a fresh decoder (tens of KiB zeroed) while an
+    /// empty member is a handful of bytes, so a file of empty members cost
+    /// thousands of times its size in work with no output for `--max-ratio`
+    /// to see. Members past `FREE_MEMBERS` must be paid for in bytes moved;
+    /// this file is refused (exit 6) after a bounded number of decoders.
+    #[test]
+    fn a_file_of_empty_members_starts_a_bounded_number_of_decoders() {
+        use crate::member_tail::{BYTES_PER_MEMBER, FREE_MEMBERS};
+        let empty = compress(b"");
+        let bytes = empty.repeat(100000);
+        let len = bytes.len() as u64;
+        let mut m = MultiMemberGzip::new(
+            Box::new(ReaderSource::new(std::io::Cursor::new(bytes))),
+            FidelitySink::new(),
+        );
+        let mut out = Vec::new();
+        let err = m.read_to_end(&mut out).expect_err("refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::OutOfMemory, "{err}");
+        assert!(
+            err.to_string().contains("gzip stream starts more members"),
+            "{err}"
+        );
+        assert!(out.is_empty());
+        let started = m.budget.started();
+        assert!(
+            started <= FREE_MEMBERS + len / BYTES_PER_MEMBER,
+            "{started} decoders for {len} bytes"
+        );
+        assert!(
+            started >= FREE_MEMBERS,
+            "the free members decode: {started}"
+        );
+        assert_eq!(
+            stuffr_core::Error::from_decode_io(err).exit_code(),
+            6,
+            "a work limit, not corruption"
+        );
+    }
+
+    /// The other side: members that each move their share of bytes are never
+    /// refused, however many there are.
+    #[test]
+    fn many_members_that_carry_data_are_not_refused() {
+        use crate::member_tail::FREE_MEMBERS;
+        // 300 incompressible bytes: each member moves well over
+        // `BYTES_PER_MEMBER` (its compressed form in, its 300 bytes out).
+        let mut state = 0x9e37_79b9u32;
+        let member: Vec<u8> = (0..300)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        let count = (FREE_MEMBERS + 2000) as usize;
+        let packed = compress(&member).repeat(count);
+        assert_eq!(decompress(packed), member.repeat(count));
     }
 
     #[test]

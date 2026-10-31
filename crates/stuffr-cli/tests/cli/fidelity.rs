@@ -2275,3 +2275,28 @@ fn info_withholds_the_claim_for_a_codec_that_judges_its_trailing_bytes() {
         );
     }
 }
+
+/// N1: a file of empty gzip members / bzip2 streams starts a fresh decoder
+/// per member and yields nothing, so `--max-ratio` cannot see the work; past
+/// a free allowance each member must be paid for in bytes moved, or the file
+/// is refused as a resource limit (exit 6).
+#[test]
+fn a_file_of_empty_members_is_a_resource_limit() {
+    let dir = tmp_dir();
+    for (ext, count) in [("gz", 100_000), ("bz2", 20_000)] {
+        let empty = packed(&dir, &format!("empty.{ext}"), b"");
+        let input = dir.join(format!("many-empty.{ext}"));
+        std::fs::write(&input, empty.repeat(count)).unwrap();
+        let output = dir.join(format!("many-empty-{ext}.out"));
+        let out = run_output(&[
+            "unpack",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+        ]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(6), ".{ext}: {stderr}");
+        assert!(stderr.contains("starts more members"), ".{ext}: {stderr}");
+        assert!(!output.exists(), ".{ext}: nothing published");
+    }
+}

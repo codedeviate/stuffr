@@ -24,6 +24,21 @@
 //!    [`Fidelity::TrailingDataIgnored`] with its length, which
 //!    `--strict-fidelity` turns into exit 4. The tail is counted while it is
 //!    read, never buffered, so an unbounded tail costs O(1) memory.
+//!
+//! **How many members a stream may start** is bounded too ([`MemberBudget`],
+//! the T10 review's N1). Every member gets a fresh decoder — flate2's inflate
+//! state is ~40 KiB zeroed, libbz2-rs-sys's `DState` tens of KiB zeroed plus
+//! the block buffer it allocates at each stream header — while an empty gzip
+//! member is 20 bytes and an empty bzip2 stream 14. A file of a million empty
+//! members (20 MB) cost tens of GB of memset with no output at all, so
+//! `--max-ratio` (which counts output) never saw it. Reusing the decoder does
+//! not close it: `flate2::Decompress::reset` zeroes miniz_oxide's 32 KiB
+//! window too (`FullReset`), so a reset member costs nearly what a new one
+//! does. The bound is on work instead: [`FREE_MEMBERS`] members are free, and
+//! each further one must be paid for by [`BYTES_PER_MEMBER`] bytes read or
+//! decoded, or the stream is refused as a resource limit (exit 6). Real
+//! multi-member files (pigz, bgzip's 64 KiB blocks, pbzip2's 900 KB blocks,
+//! `gzip >>` appends) never come near it.
 
 use std::io::{self, BufRead, ErrorKind, Read};
 
@@ -44,6 +59,8 @@ pub(crate) struct PeekBuf<R> {
     buf: Box<[u8]>,
     pos: usize,
     end: usize,
+    /// Bytes consumed so far — what [`MemberBudget`] counts as read.
+    taken: u64,
 }
 
 impl<R: Read> PeekBuf<R> {
@@ -53,6 +70,7 @@ impl<R: Read> PeekBuf<R> {
             buf: vec![0; CAP].into_boxed_slice(),
             pos: 0,
             end: 0,
+            taken: 0,
         }
     }
 
@@ -108,7 +126,76 @@ impl<R: Read> BufRead for PeekBuf<R> {
     }
 
     fn consume(&mut self, n: usize) {
-        self.pos = (self.pos + n).min(self.end);
+        let next = (self.pos + n).min(self.end);
+        self.taken += (next - self.pos) as u64;
+        self.pos = next;
+    }
+}
+
+/// Members a stream may start before any has to be paid for — enough for
+/// every real multi-member file of tiny members we know of, and at most
+/// ~4096 decoder set-ups (a few hundred MB of memset in all) for a hostile
+/// one.
+pub(crate) const FREE_MEMBERS: u64 = 4096;
+
+/// Bytes read or decoded that pay for one member past [`FREE_MEMBERS`]. A
+/// member's set-up is tens of KiB of zeroing, so this keeps the set-up work
+/// within roughly a hundred times the bytes the stream actually moves.
+pub(crate) const BYTES_PER_MEMBER: u64 = 512;
+
+/// Counts the members a multi-member decoder starts against the bytes it
+/// reads and produces; see the module doc for why.
+pub(crate) struct MemberBudget {
+    format: FormatId,
+    /// Members started, the first included.
+    started: u64,
+    /// Decoded bytes handed to the caller.
+    produced: u64,
+}
+
+impl MemberBudget {
+    /// A budget for a stream whose first member has already been started.
+    pub(crate) fn new(format: FormatId) -> Self {
+        Self {
+            format,
+            started: 1,
+            produced: 0,
+        }
+    }
+
+    /// Records `n` decoded bytes handed to the caller.
+    pub(crate) fn produced(&mut self, n: usize) {
+        self.produced += n as u64;
+    }
+
+    /// Charges the member about to start at `r`'s position, or refuses it
+    /// (`OutOfMemory`, which `Error::from_decode_io` makes
+    /// `Error::ResourceLimit`, exit 6).
+    pub(crate) fn start_member<R>(&mut self, r: &PeekBuf<R>) -> io::Result<()> {
+        let read = r.taken;
+        let allowance = FREE_MEMBERS + (read + self.produced) / BYTES_PER_MEMBER;
+        if self.started >= allowance {
+            return Err(io::Error::new(
+                ErrorKind::OutOfMemory,
+                format!(
+                    "the {} stream starts more members than its size accounts for: {} members \
+                     in {read} bytes read, {} bytes decoded (at most {FREE_MEMBERS}, plus one \
+                     per {BYTES_PER_MEMBER} bytes read or decoded); refused, since every member \
+                     costs a fresh decoder",
+                    self.format,
+                    self.started + 1,
+                    self.produced
+                ),
+            ));
+        }
+        self.started += 1;
+        Ok(())
+    }
+
+    /// Members started so far, the first included.
+    #[cfg(test)]
+    pub(crate) fn started(&self) -> u64 {
+        self.started
     }
 }
 
