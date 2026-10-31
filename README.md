@@ -519,6 +519,25 @@ read list.
 > **3679** tests under `--all-features`, **3556** on the default tier —
 > measured from this bump's own `make check FULL=1`, `GATE_EXIT=0`.
 >
+> `0.24.0` is a security release, from an audit of the whole tool. The
+> default pure-tier zstd decoder took ruzstd 0.9.1 (RUSTSEC-2026-0344: a
+> 9 KB file made 0.23.0 allocate 538 MB) and now bounds every frame's window
+> by `--memory-limit`, as the C tier does too. `salvage` never replaces a file
+> it did not write, nor the archive it reads; `unpack` masks restored modes
+> by the umask (`-p` keeps them) and never re-modes a folder that was already
+> there; single-stream outputs keep the input's mode; macOS quarantine is
+> carried onto what `unpack`, `salvage` and `convert` create. A damaged
+> boundary in a multi-member gzip or bzip2 file is no longer silent, and a
+> file of empty members is refused (exit 6). The compatibility links never
+> write through a symlink planted at an output name (bzip2recover, lz4,
+> zstd, compress, brotli, zip, zipsplit), `zip -lf` no longer logs `-P`'s
+> password, and a crash in the zip family is no longer reported as an
+> interrupt. CI checks advisories, licences and sources with cargo-deny, the
+> vendored libbrotli against upstream, and every action is pinned by SHA.
+> A MINOR: several public structs gained fields (see CONTRIBUTING).
+> **3814** tests under `--all-features`, **3675** on the default tier —
+> measured from this bump's own `make check FULL=1`, `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
