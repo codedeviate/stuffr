@@ -260,8 +260,10 @@ fn test_catches_a_payload_truncation() {
 /// `i64::MAX` reaches `lseek(2)` NEGATIVE and the kernel answers `EINVAL` —
 /// a genuine errno that `Error::from_decode_io` does not fold.
 ///
-/// The refusal now comes from `stuffr_core::source::GuardedSeek`, one layer
-/// below every container, so this is a class fix and not a zip patch. Exit 5
+/// The refusal came from `stuffr_core::source::GuardedSeek`, one layer
+/// below every container, so this is a class fix and not a zip patch. Under
+/// zip 9 the crate refuses this file's EOCD first (still exit 5); the guard
+/// is pinned on a hand-built fixture in `stuffr-formats`' `zip.rs`. Exit 5
 /// rather than 6 by `error.rs`'s `exit_code` rule: nothing was allocated
 /// from the offset, and what is wrong is the file's agreement with itself.
 ///
@@ -304,9 +306,16 @@ fn a_zip_declaring_an_unreachable_local_header_offset_exits_5_not_1() {
             Some(5),
             "`{verb}` must report the ARCHIVE as corrupt, never exit 1: {err}"
         );
+        // zip 9 refuses this reproducer's end-of-central-directory record
+        // ("Multi-disk ZIP files are not supported") before the declared
+        // offset is ever sought, so the seek guard's own wording is reached
+        // only under zip 8.6. `stuffr-formats`' `zip.rs` keeps a fixture
+        // that still reaches the guard
+        // (`a_zip64_header_offset_past_the_addressable_range_is_corrupt_not_an_i_o_failure`).
         assert!(
             err.contains("archive is corrupt")
-                && err.contains("largest position any file can hold"),
+                && (err.contains("largest position any file can hold")
+                    || err.contains("Multi-disk ZIP files are not supported")),
             "the refusal must name what the archive declared, not an errno: {err}"
         );
         assert!(

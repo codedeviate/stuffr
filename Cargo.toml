@@ -222,7 +222,7 @@ ar = "=0.9.0"
 # `newc` only — the crate ships no odc or CRC variant, so this container
 # declares exactly that rather than implying the others work.
 cpio = "0.4"
-# NOT `zip = "8.6"`. zip's default features include `zstd`, which pulls
+# NOT `zip = "9"`. zip's default features include `zstd`, which pulls
 # `zstd-sys` — a C-compiling crate — into every graph that touches this
 # dependency, and the `purity` CI job fails the moment `zstd-sys` or
 # `liblzma-sys` appears in a default-feature build. The curated list below is
@@ -232,9 +232,10 @@ cpio = "0.4"
 # features both resolve to `lzma-rust2` — the same crate this tree's pure xz
 # and LZMA1 backends use, so no new licence (Apache-2.0, already reachable
 # from a default build). Worth stating precisely rather than as "no new
-# dependency", because it is not quite that: zip pins `lzma-rust2 ^0.16.1`
-# while this workspace is on 0.20, and 0.x versions are semver-incompatible,
-# so `cargo tree` shows BOTH 0.16.5 and 0.20.1 and both get compiled. That
+# dependency", because it is not quite that: zip 9.1.3 pins
+# `lzma-rust2 ^0.23.0` while this workspace is on 0.20, and 0.x versions are
+# semver-incompatible, so `cargo tree` shows BOTH 0.23.0 and 0.20.1 and both
+# get compiled (zip 8.6 pinned 0.16, the same shape). That
 # is compile time and binary size, not a new licence or a new C toolchain
 # requirement; it resolves itself when zip catches up.
 #
@@ -260,9 +261,16 @@ cpio = "0.4"
 #
 # zip's `zstd` feature is reached only through `stuffr-formats/zip-zstd`,
 # which the `c-backed` bundle turns on — see that feature's own comment.
-# Bumping `zip` (or its `lzma-rust2`/`zstd` decoders): re-trace the `Other`
-# list on `normalize::ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_EOF` first.
-zip = { version = "8.6", default-features = false, features = [
+#
+# zip 9 (2026-10-31, RUSTSEC-2026-0367/-0368/-0369): adds `nix` (pure Rust,
+# libc bindings, for its `extract`, which nothing here calls) and moves
+# `ppmd-rust` to 1.5; its `zstd` is 0.14, the same zstd-safe 8.2.0 /
+# zstd-sys 2.1.2 chain stuffr's own `zstd` uses, so `c-backed` builds ONE
+# libzstd. `bzip2 0.6` still resolves to `libbz2-rs-sys`.
+#
+# Bumping `zip` (or its `lzma-rust2`/`zstd` decoders): re-trace the kind
+# list on `normalize::ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_UNSUPPORTED_EOF` first.
+zip = { version = "9", default-features = false, features = [
     "deflate-flate2",
     "bzip2",
     "deflate64",

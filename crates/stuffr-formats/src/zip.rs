@@ -154,6 +154,22 @@
 //! has no downgrade vocabulary for one entry). `unpack` therefore writes a
 //! file, never a link; `a_legacy_symlink_entry_reads_as_a_regular_file`
 //! pins it.
+//!
+//! # zip 9: extraction audit and header consistency
+//!
+//! RUSTSEC-2026-0367/0368/0369 live in zip's own `extract*`, which nothing in
+//! this workspace calls (audited at the zip 9 bump). The crate supplies entry
+//! metadata, payload readers and `ZipWriter` only. `stuffr unpack` and
+//! `salvage` write through `stuffr::entries` (`safe_join`, symlinked-ancestor
+//! refusal, `place_entry`), restoring at most `0o777` through the open
+//! handle; `convert`/`pack` write one archive file; the `unzip` and `zip`
+//! compatibility links are Info-ZIP ports that never touch this crate
+//! (`unzip` writes beneath `compat/unzip/unix/beneath.rs`).
+//!
+//! zip 9's `enforce_header_consistency` is deliberately left OFF: it fails
+//! the read outright where a local header disagrees with its central record,
+//! and that disagreement (the GHSA-m665-v7pm-7grj "cloaking" split between
+//! this module's two readers) is to be reported, not refused.
 
 use std::cell::RefCell;
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
@@ -169,7 +185,9 @@ use zip::CompressionMethod;
 use zip::result::ZipError;
 use zip::write::SimpleFileOptions;
 
-use crate::normalize::{NormalizeDecodeErrors, ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_EOF};
+use crate::normalize::{
+    NormalizeDecodeErrors, ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_UNSUPPORTED_EOF,
+};
 
 pub const ZIP: FormatId = FormatId::new("zip");
 
@@ -372,7 +390,8 @@ impl Container for Zip {
             // `read_declared_index` is: nothing gets the bytes back out from
             // under a `ZipArchive`.
             let opens_with_an_entry = begins_with_a_local_header(&mut adapter);
-            let archive = zip::ZipArchive::new(adapter).map_err(classify_zip_error)?;
+            let archive = zip::ZipArchive::new(adapter)
+                .map_err(|e| name_a_self_contradicting_index(classify_zip_error(e), &declared))?;
             refuse_an_index_that_reaches_nothing(&archive, opens_with_an_entry)?;
             let mut report = report;
             note_unreachable_records(&mut report, &archive, declared);
@@ -455,14 +474,26 @@ impl Container for Zip {
 ///
 /// `UnexpectedEof` is the exception within `Io`: `zip`'s header parsing uses
 /// `read_exact`, so a stream that runs out mid-structure surfaces as an I/O
-/// error even though it is really a cut archive. That single kind is folded
-/// onto [`Error::Corrupt`] (exit 5), which is what conformance property 9
+/// error even though it is really a cut archive. That kind is folded onto
+/// [`Error::Corrupt`] (exit 5), which is what conformance property 9
 /// requires and what `Error::from_decode_io` would otherwise leave at exit 1.
+/// `Other`, `InvalidInput` and `Unsupported` are folded the same way since
+/// zip 9, for the header sites the payload constant's doc lists.
 fn classify_zip_error(e: ZipError) -> Error {
     match e {
         ZipError::Io(io_err) => {
             if io_err.kind() == ErrorKind::UnexpectedEof {
                 return Error::Corrupt(format!("zip stream ended mid-structure: {io_err}"));
+            }
+            // zip 9.1.3's header parsing raises `Other` and `InvalidInput`
+            // for malformed fields too — an extended-timestamp extra field
+            // whose length disagrees with its flags, a local header whose
+            // data range overflows `u64` — and both reached exit 1 through
+            // `from_decode_io` (the first in 8.6 as well). The list and why
+            // folding them is safe: `normalize::
+            // ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_UNSUPPORTED_EOF`.
+            if ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_UNSUPPORTED_EOF.contains(&io_err.kind()) {
+                return Error::Corrupt(io_err.to_string());
             }
             Error::from_decode_io(io_err)
         }
@@ -637,7 +668,9 @@ struct DeclaredIndex {
     /// `number_of_files_on_this_disk`; only a zip64 record has it read the
     /// total). When it disagrees with [`Self::entries`] the index contradicts
     /// itself, and the enumeration can then land on EITHER side of the
-    /// declared total — see [`note_unreachable_records`].
+    /// declared total — see [`note_unreachable_records`]. zip 9 refuses
+    /// such an EOCD outright, so the disagreement now reaches
+    /// [`name_a_self_contradicting_index`] instead.
     entries_on_disk: u64,
     /// Offset of the central directory, relative to the start of the archive.
     ///
@@ -750,6 +783,42 @@ fn read_zip64_declared_index<R: Read + Seek>(
     })
 }
 
+/// Rewords zip 9's refusal of an end-of-central-directory record whose two
+/// record counts disagree, so the message says what the archive contradicts.
+///
+/// zip 9 raises `InvalidArchive("Multi-disk ZIP files are not supported")`
+/// in `find_central_directory` (`format/find_central_directory.rs:236-240`
+/// for a plain EOCD, `:343-344` for zip64) both for a genuine multi-disk
+/// EOCD and for one whose on-this-disk and total counts disagree. zip 8.6
+/// opened the second (it looped over the on-this-disk count) and
+/// [`note_unreachable_records`] warned: exit 0, 4 under `--strict-fidelity`.
+/// zip 9's refusal is kept — exit 5 is `error.rs`'s rule for bytes that
+/// contradict themselves — and only reworded to name both counts, since such
+/// an archive is no multi-disk set. That is a behaviour change zip 9 forces:
+/// undoing it would mean rewriting the EOCD under the crate.
+///
+/// Every other "Multi-disk" refusal keeps the crate's wording and exit 5.
+/// zip 8.6 answered exit 3 (`UnsupportedArchive`) for an EOCD naming a
+/// non-zero disk with agreeing counts, but exit 5 for the last segment of a
+/// real split set (`stuffr-cli/tests/data/zip/split.zip`, "Invalid local
+/// file header"), and fuzzer junk reaches the same check; mapping it to
+/// exit 3 would call hostile bytes "a split archive", so it is not mapped.
+fn name_a_self_contradicting_index(err: Error, declared: &Option<DeclaredIndex>) -> Error {
+    match (&err, declared) {
+        (Error::Corrupt(msg), Some(d))
+            if msg.contains("Multi-disk") && d.entries != d.entries_on_disk =>
+        {
+            Error::Corrupt(format!(
+                "zip: the end-of-central-directory record contradicts itself, declaring {} \
+                 record(s) in the archive but {} on its only disk; `stuffr salvage` reads the \
+                 records themselves",
+                d.entries, d.entries_on_disk
+            ))
+        }
+        _ => err,
+    }
+}
+
 /// Records the shortfall between what the index declares and what the reader
 /// could enumerate, when there is one.
 ///
@@ -787,6 +856,12 @@ fn read_zip64_declared_index<R: Read + Seek>(
 /// believed reachable (only a zip64 record whose total disagrees with an
 /// unsaturated plain EOCD could produce one) and is still reported rather
 /// than trusted.
+///
+/// **Since zip 9 the self-contradiction arm is not reached through
+/// `ZipArchive::new`**: the crate refuses an EOCD whose two counts disagree
+/// before this runs (see [`name_a_self_contradicting_index`]). The arm is
+/// kept, not deleted, so a later zip that relaxes that check is warned about
+/// rather than trusted.
 fn note_unreachable_records(
     report: &mut FidelityReport,
     archive: &zip::ZipArchive<SeekAdapter>,
@@ -1421,7 +1496,7 @@ impl ZipIndexed {
             meta,
             Box::new(NormalizeDecodeErrors::new(
                 payload,
-                ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_EOF,
+                ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_UNSUPPORTED_EOF,
             )),
         ))
     }
@@ -1874,7 +1949,7 @@ impl ArchiveRead for ZipStreamed {
             meta,
             Box::new(NormalizeDecodeErrors::new(
                 payload,
-                ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_EOF,
+                ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_UNSUPPORTED_EOF,
             )),
         )))
     }
@@ -2123,6 +2198,8 @@ impl<R: Read> Read for EntryPayload<R> {
 ///
 /// Names are NOT sanitised: harness property 12 requires them verbatim, and
 /// the ops-layer refusal can only refuse what it can still see.
+///
+/// Nor are they taken from `ZipFile::name()`: see [`entry_name`].
 fn entry_meta<R: Read>(file: &zip::read::ZipFile<'_, R>, mode: Option<u32>) -> EntryMeta {
     // Name-based, and therefore the one kind that survives a forward read
     // intact: a zip directory entry is a zero-length entry whose name ends in
@@ -2138,7 +2215,7 @@ fn entry_meta<R: Read>(file: &zip::read::ZipFile<'_, R>, mode: Option<u32>) -> E
     };
 
     EntryMeta {
-        name: file.name().to_owned(),
+        name: entry_name(file.name_raw(), file.flags().as_u16()),
         size: Some(file.size()),
         compressed_size: Some(file.compressed_size()),
         mtime: file.last_modified().and_then(system_time_from_dos),
@@ -2192,10 +2269,49 @@ fn read_symlink_target<R: Read>(
 /// The same rule [`NormalizeDecodeErrors`] applies to a caller-driven payload
 /// read, applied to the one payload this module reads for itself.
 fn normalize_payload_error(e: io::Error) -> io::Error {
-    if ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_EOF.contains(&e.kind()) {
+    if ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_UNSUPPORTED_EOF.contains(&e.kind()) {
         return io::Error::new(ErrorKind::InvalidData, e.to_string());
     }
     e
+}
+
+/// An entry's name, decoded by the language-encoding flag (bit 11) as zip
+/// 8.6 decoded it: flag set → UTF-8, lossily; flag clear → IBM code page 437.
+///
+/// zip 9's `ZipFile::name()` decides by CONTENT instead — any name that
+/// happens to be valid UTF-8 is UTF-8, every other one CP437, flag
+/// ignored — and returns a `Result`. Taking it would have changed the name
+/// `list` prints for an unflagged non-ASCII name that is also valid UTF-8,
+/// and for a flagged one that is not, in a release meant to change no
+/// behaviour. `name_raw()` already carries an Info-ZIP Unicode Path (0x7075)
+/// when the crate accepted one, with the flag set, so that case decodes as
+/// UTF-8 here exactly as it did in 8.6. Infallible: CP437 maps all 256 bytes.
+fn entry_name(raw: &[u8], flags: u16) -> String {
+    const LANGUAGE_ENCODING: u16 = 0x0800;
+    if flags & LANGUAGE_ENCODING != 0 {
+        return String::from_utf8_lossy(raw).into_owned();
+    }
+    raw.iter().map(|&b| cp437(b)).collect()
+}
+
+/// One IBM code page 437 byte as a `char` — the table zip 8.6's `cp437.rs`
+/// used, which is the standard one (0x00-0x7F identical to ASCII).
+fn cp437(b: u8) -> char {
+    const HIGH: [char; 128] = [
+        'Ç', 'ü', 'é', 'â', 'ä', 'à', 'å', 'ç', 'ê', 'ë', 'è', 'ï', 'î', 'ì', 'Ä', 'Å', //
+        'É', 'æ', 'Æ', 'ô', 'ö', 'ò', 'û', 'ù', 'ÿ', 'Ö', 'Ü', '¢', '£', '¥', '₧', 'ƒ', //
+        'á', 'í', 'ó', 'ú', 'ñ', 'Ñ', 'ª', 'º', '¿', '⌐', '¬', '½', '¼', '¡', '«', '»', //
+        '░', '▒', '▓', '│', '┤', '╡', '╢', '╖', '╕', '╣', '║', '╗', '╝', '╜', '╛', '┐', //
+        '└', '┴', '┬', '├', '─', '┼', '╞', '╟', '╚', '╔', '╩', '╦', '╠', '═', '╬', '╧', //
+        '╨', '╤', '╥', '╙', '╘', '╒', '╓', '╫', '╪', '┘', '┌', '█', '▄', '▌', '▐', '▀', //
+        'α', 'ß', 'Γ', 'π', 'Σ', 'σ', 'µ', 'τ', 'Φ', 'Θ', 'Ω', 'δ', '∞', 'φ', 'ε', '∩', //
+        '≡', '±', '≥', '≤', '⌠', '⌡', '÷', '≈', '°', '∙', '·', '√', 'ⁿ', '²', '■', '\u{a0}',
+    ];
+    if b < 0x80 {
+        char::from(b)
+    } else {
+        HIGH[usize::from(b - 0x80)]
+    }
 }
 
 /// Which `FormatId` an entry's compression method names.
@@ -3051,12 +3167,17 @@ mod tests {
     /// Hand-spliced onto a genuine `ZipWriter` archive rather than minimised
     /// out of the fuzzer's own 6,779-byte artefact, because the mechanism is
     /// three fields wide and naming them is worth more than a blob:
-    /// `zip-8.6.0`'s `Zip64ExtendedInformation::parse`
+    /// `Zip64ExtendedInformation::parse`
     /// (`extra_fields/zip64_extended_information.rs`) overwrites
-    /// `ZipFileData::header_start` with this block's THIRD `u64` whenever the
-    /// block is 24 bytes or longer, and `ZipFileData::find_data_start`
-    /// (`types.rs:240`) then hands that value straight to
-    /// `Seek::seek(SeekFrom::Start(..))`. On unix `std` casts that `u64` to
+    /// `ZipFileData::header_start` with this block's offset `u64`, and the
+    /// local-header lookup then hands that value straight to
+    /// `Seek::seek(SeekFrom::Start(..))`. The block carries the offset ALONE,
+    /// as APPNOTE 4.5.3 says it must when only the offset field holds the
+    /// sentinel: zip 8.6 read the offset as the block's THIRD `u64` whatever
+    /// the sentinels said (the fuzzer's artefact had all three), zip 9 reads
+    /// only the values a sentinel asked for, so the three-value block this
+    /// fixture carried under 8.6 handed 9 the uncompressed size, 2, as the
+    /// offset. On unix `std` casts that `u64` to
     /// `off_t`, an `i64`, so anything above `i64::MAX` reaches `lseek(2)`
     /// NEGATIVE and the kernel answers `EINVAL` — a real
     /// `Os { code: 22, kind: InvalidInput }`, which
@@ -3067,6 +3188,7 @@ mod tests {
     /// ONE thing separating it from an archive that reads cleanly is a
     /// single declared offset.
     fn build_zip_declaring_a_zip64_header_offset(header_start: u64) -> Vec<u8> {
+        const EXTRA_LEN: usize = 12;
         let mut cursor = io::Cursor::new(Vec::new());
         {
             let mut w = zip::ZipWriter::new(&mut cursor);
@@ -3091,20 +3213,18 @@ mod tests {
             "the splice below assumes ZipWriter emitted no central extra field"
         );
 
-        // Tag, block size, then the three `u64`s the parser reads in order.
-        let mut extra = Vec::with_capacity(28);
+        // Tag, block size, then the one `u64` the sentinel below asks for.
+        let mut extra = Vec::with_capacity(EXTRA_LEN);
         extra.extend_from_slice(&1u16.to_le_bytes());
-        extra.extend_from_slice(&24u16.to_le_bytes());
-        extra.extend_from_slice(&2u64.to_le_bytes()); // uncompressed size
-        extra.extend_from_slice(&2u64.to_le_bytes()); // compressed size
+        extra.extend_from_slice(&8u16.to_le_bytes());
         extra.extend_from_slice(&header_start.to_le_bytes());
-        assert_eq!(extra.len(), 28);
+        assert_eq!(extra.len(), EXTRA_LEN);
 
         let mut out = base.clone();
         // The extra field follows the record's name.
         let insert_at = cd_start + 46 + name_len;
         out.splice(insert_at..insert_at, extra.iter().copied());
-        out[cd_start + 30..cd_start + 32].copy_from_slice(&28u16.to_le_bytes());
+        out[cd_start + 30..cd_start + 32].copy_from_slice(&(EXTRA_LEN as u16).to_le_bytes());
         // The 32-bit offset field carries the zip64 sentinel, the spelling a
         // real archive uses when the extra field supplies the real one.
         out[cd_start + 42..cd_start + 46].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -3114,7 +3234,7 @@ mod tests {
         // both of `read_declared_index`'s guards still hold.
         let eocd = out.len() - END_OF_CENTRAL_DIR_TOTAL;
         assert_eq!(out[eocd..eocd + 4], SIG_END_OF_CENTRAL_DIR);
-        let cd_size = le32(&out[eocd + 12..]) + 28;
+        let cd_size = le32(&out[eocd + 12..]) + EXTRA_LEN as u32;
         out[eocd + 12..eocd + 16].copy_from_slice(&cd_size.to_le_bytes());
         out
     }
@@ -3455,6 +3575,183 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // zip 9 port: names decode as zip 8.6 decoded them; malformed header
+    // fields are corruption, never exit 1
+    // -----------------------------------------------------------------------
+
+    /// A one-entry stored zip with the given raw name bytes, general-purpose
+    /// flags and extra field, the same bytes in the local header and the
+    /// central record, so both rungs read the identical claim.
+    fn raw_zip(name: &[u8], flags: u16, extra: &[u8], payload: &[u8]) -> Vec<u8> {
+        let crc = crc32(payload);
+        let size = u32::try_from(payload.len()).expect("short payload");
+        let n_len = u16::try_from(name.len()).expect("short name");
+        let x_len = u16::try_from(extra.len()).expect("short extra");
+        let fixed = |out: &mut Vec<u8>| {
+            out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            out.extend_from_slice(&flags.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // method: STORE
+            out.extend_from_slice(&0u16.to_le_bytes()); // mod time
+            out.extend_from_slice(&0x21u16.to_le_bytes()); // mod date 1980-01-01
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&size.to_le_bytes());
+            out.extend_from_slice(&size.to_le_bytes());
+            out.extend_from_slice(&n_len.to_le_bytes());
+            out.extend_from_slice(&x_len.to_le_bytes());
+        };
+        let mut out = Vec::new();
+        out.extend_from_slice(&SIG_LOCAL_HEADER);
+        fixed(&mut out);
+        out.extend_from_slice(name);
+        out.extend_from_slice(extra);
+        out.extend_from_slice(payload);
+        let cd_start = u32::try_from(out.len()).expect("small archive");
+        out.extend_from_slice(&SIG_CENTRAL_HEADER);
+        out.extend_from_slice(&20u16.to_le_bytes()); // version made by
+        fixed(&mut out);
+        out.extend_from_slice(&0u16.to_le_bytes()); // comment length
+        out.extend_from_slice(&0u16.to_le_bytes()); // disk number start
+        out.extend_from_slice(&0u16.to_le_bytes()); // internal attributes
+        out.extend_from_slice(&0u32.to_le_bytes()); // external attributes
+        out.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+        out.extend_from_slice(name);
+        out.extend_from_slice(extra);
+        let cd_size = u32::try_from(out.len()).expect("small archive") - cd_start;
+        out.extend_from_slice(&SIG_END_OF_CENTRAL_DIR);
+        out.extend_from_slice(&0u16.to_le_bytes()); // this disk
+        out.extend_from_slice(&0u16.to_le_bytes()); // disk with the CD
+        out.extend_from_slice(&1u16.to_le_bytes()); // records on this disk
+        out.extend_from_slice(&1u16.to_le_bytes()); // records in total
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_start.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // comment length
+        out
+    }
+
+    fn names_on_both_rungs(bytes: &[u8]) -> (String, String) {
+        let seekable = read_all_seekable(bytes).expect("seekable read");
+        let forward = read_all_forward(bytes).expect("forward read");
+        (seekable[0].0.name.clone(), forward[0].0.clone())
+    }
+
+    /// zip 9's `ZipFile::name()` decides by content (valid UTF-8 → UTF-8,
+    /// else CP437) and ignores the language-encoding flag; zip 8.6 decided by
+    /// the flag. `entry_name` keeps 8.6's rule. Pinned on the two shapes
+    /// where the rules disagree, on both rungs.
+    #[test]
+    fn names_decode_by_the_language_encoding_flag_as_zip_8_6_did() {
+        // "é.txt" in UTF-8 with the flag CLEAR: CP437 (0xC3 '├', 0xA9 '⌐'),
+        // where zip 9's `name()` would answer "é.txt".
+        let unflagged = raw_zip("é.txt".as_bytes(), 0, &[], b"x");
+        let (s, f) = names_on_both_rungs(&unflagged);
+        assert_eq!((s.as_str(), f.as_str()), ("├⌐.txt", "├⌐.txt"));
+
+        // 0xFF is not UTF-8; with the flag SET it decodes lossily, where zip
+        // 9's `name()` would answer CP437's U+00A0.
+        let flagged = raw_zip(b"\xff.txt", 0x0800, &[], b"x");
+        let (s, f) = names_on_both_rungs(&flagged);
+        assert_eq!((s.as_str(), f.as_str()), ("\u{fffd}.txt", "\u{fffd}.txt"));
+
+        // And the ordinary cases are untouched.
+        let ascii = raw_zip(b"a.txt", 0, &[], b"x");
+        assert_eq!(
+            names_on_both_rungs(&ascii),
+            ("a.txt".into(), "a.txt".into())
+        );
+        let utf8 = raw_zip("é.txt".as_bytes(), 0x0800, &[], b"x");
+        assert_eq!(names_on_both_rungs(&utf8), ("é.txt".into(), "é.txt".into()));
+    }
+
+    /// Every byte of the CP437 table, against the standard mapping's
+    /// landmarks: identity below 0x80, then the first and last of each row
+    /// of the high half.
+    #[test]
+    fn the_cp437_table_matches_the_standard_mapping() {
+        for b in 0u8..0x80 {
+            assert_eq!(cp437(b), char::from(b));
+        }
+        for (b, c) in [
+            (0x80, 'Ç'),
+            (0x8f, 'Å'),
+            (0x90, 'É'),
+            (0x9f, 'ƒ'),
+            (0xa0, 'á'),
+            (0xaf, '»'),
+            (0xb0, '░'),
+            (0xbf, '┐'),
+            (0xc0, '└'),
+            (0xcf, '╧'),
+            (0xd0, '╨'),
+            (0xdf, '▀'),
+            (0xe0, 'α'),
+            (0xef, '∩'),
+            (0xf0, '≡'),
+            (0xff, '\u{a0}'),
+        ] {
+            assert_eq!(cp437(b), c, "{b:#04x}");
+        }
+    }
+
+    /// An extended-timestamp extra field (0x5455) whose length disagrees with
+    /// its flags: zip raises `ZipError::Io(Other)` for it while parsing the
+    /// header. On zip 8.6 the seekable rung reached exit 1 with it; on zip 9
+    /// the forward rung does (the crate now parses it there). Both rungs must
+    /// answer exit 5 or read the archive — never exit 1.
+    #[test]
+    fn a_malformed_extended_timestamp_is_never_exit_1() {
+        // len 9 with only the "modified" flag: 1 + 4 * 1 = 5, and 9 != 5.
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&0x5455u16.to_le_bytes());
+        extra.extend_from_slice(&9u16.to_le_bytes());
+        extra.push(0x01);
+        extra.extend_from_slice(&[0u8; 8]);
+        let bytes = raw_zip(b"a.txt", 0, &extra, b"hello");
+
+        for (rung, result) in [
+            ("seekable", read_all_seekable(&bytes).map(|_| ())),
+            ("forward", read_all_forward(&bytes).map(|_| ())),
+        ] {
+            if let Err(err) = result {
+                assert!(matches!(err, Error::Corrupt(_)), "{rung}: {err:?}");
+                assert_eq!(err.exit_code(), 5, "{rung}: {err}");
+            }
+        }
+        let err = read_all_forward(&bytes).expect_err("zip 9 refuses it on the forward rung");
+        assert!(err.to_string().contains("extended timestamp"), "{err}");
+    }
+
+    /// lzma-rust2 0.23 (zip 9's) raises `ErrorKind::Unsupported` for an xz
+    /// stream header with a reserved flag bit set, where 0.16.5 (zip 8.6's)
+    /// said `InvalidData`; unfolded, a zip whose xz entry carries one
+    /// answered `i/o error: invalid XZ stream flags`, exit 1, on both rungs.
+    #[test]
+    fn an_xz_entry_with_reserved_stream_flags_is_corrupt_not_exit_1() {
+        // A 12-byte xz stream header: magic, flags 01 00 (a reserved bit in
+        // the first byte), and the CRC32 of those two flag bytes, so the
+        // header checksum passes and the flags are what is refused.
+        let mut xz = vec![0xFD, b'7', b'z', b'X', b'Z', 0x00, 0x01, 0x00];
+        xz.extend_from_slice(&crc32(&[0x01, 0x00]).to_le_bytes());
+        xz.extend_from_slice(&[0u8; 32]);
+        let mut bytes = raw_zip(b"a.txt", 0, &[], &xz);
+        // Method 95 (xz) in the local header and the central record.
+        bytes[8..10].copy_from_slice(&95u16.to_le_bytes());
+        let cd = bytes
+            .windows(4)
+            .position(|w| w == SIG_CENTRAL_HEADER)
+            .expect("central record");
+        bytes[cd + 10..cd + 12].copy_from_slice(&95u16.to_le_bytes());
+
+        for (rung, result) in [
+            ("seekable", read_all_seekable(&bytes).map(|_| ())),
+            ("forward", read_all_forward(&bytes).map(|_| ())),
+        ] {
+            let err = result.expect_err("reserved xz stream flags must be refused");
+            assert!(matches!(err, Error::Corrupt(_)), "{rung}: {err:?}");
+            assert_eq!(err.exit_code(), 5, "{rung}: {err}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // An EOCD whose two counts disagree with each other
     // -----------------------------------------------------------------------
 
@@ -3469,97 +3766,77 @@ mod tests {
         out
     }
 
-    fn count_mismatch_reason(report: &FidelityReport) -> Option<&str> {
-        report.warnings.iter().find_map(|w| match w {
-            Fidelity::EntryCountMismatch { reason, .. } => Some(reason.as_str()),
-            _ => None,
-        })
+    /// Opens `bytes` seekably and requires the refusal zip 9 gives an EOCD
+    /// whose two record counts disagree, worded by
+    /// `name_a_self_contradicting_index` to name both counts.
+    fn assert_self_contradicting_index_refused(bytes: &[u8], total: u64, on_disk: u64) {
+        let err = match try_open_seekable(bytes) {
+            Err(e) => e,
+            Ok(_) => panic!("an EOCD whose counts disagree must be refused"),
+        };
+        assert!(matches!(err, Error::Corrupt(_)), "{err:?}");
+        assert_eq!(err.exit_code(), 5, "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!("{total} record(s) in the archive"))
+                && text.contains(&format!("{on_disk} on its only disk")),
+            "the refusal must name the self-contradiction, not a multi-disk set: {text}"
+        );
     }
 
     /// The v0.7.0 deep-fuzz finding (`container` target, 505-byte input):
     /// an EOCD declaring 4 records on this disk but 1 in the whole archive.
-    /// `zip` reads the plain EOCD's on-this-disk count and so enumerates
-    /// every record, while the declared TOTAL — the figure Info-ZIP's
-    /// `zipinfo` reports ("number of entries: 1") — says one. Before this,
-    /// `note_unreachable_records` reported only a shortfall, so the
-    /// excess was silent: `list` printed four rows and `test
-    /// --strict-fidelity` said "exact fidelity" at exit 0 for an index that
-    /// contradicts itself.
+    /// Under zip 8.6 the crate enumerated the on-disk count and
+    /// `note_unreachable_records` warned (exit 0, 4 under strict). zip 9
+    /// refuses the record (`find_central_directory.rs:236-240`), so the
+    /// verdict is now exit 5 — bytes that contradict themselves — with a
+    /// message naming both counts rather than the crate's "Multi-disk".
     #[test]
-    fn an_eocd_declaring_fewer_records_in_total_than_on_its_only_disk_is_reported() {
+    fn an_eocd_declaring_fewer_records_in_total_than_on_its_only_disk_is_refused() {
         let clean = build_zip(&[("a.txt", b"alpha"), ("b.txt", b"beta"), ("c.txt", b"c")]);
         let bytes = with_eocd_count(&clean, 10, 1);
-        let ar = open_seekable(&bytes);
-        let report = ar.fidelity();
-
-        assert_eq!(
-            count_mismatch(report),
-            Some((1, 3)),
-            "both numbers must be named: {:?}",
-            report.warnings
-        );
-        let reason = count_mismatch_reason(report).unwrap();
-        assert!(
-            reason.contains("1 record(s) in the archive") && reason.contains("3 on its only disk"),
-            "the reason must name the self-contradiction, not a shadowed name: {reason}"
-        );
-        assert!(!report.is_lossless());
-        assert_eq!(report.rung, Rung::Exact);
+        assert_self_contradicting_index_refused(&bytes, 1, 3);
     }
 
-    /// The converse: 3 in total, 1 on this disk. `zip` reads one record, so
-    /// this was already warned about — but as "records repeat a name", which
-    /// is false here: nothing is shadowed, the index itself disagrees.
+    /// The converse: 3 in total, 1 on this disk. Refused the same way.
     #[test]
-    fn an_eocd_declaring_more_records_in_total_than_on_its_only_disk_names_the_real_cause() {
+    fn an_eocd_declaring_more_records_in_total_than_on_its_only_disk_is_refused() {
         let clean = build_zip(&[("a.txt", b"alpha"), ("b.txt", b"beta"), ("c.txt", b"c")]);
         let bytes = with_eocd_count(&clean, 8, 1);
-        let ar = open_seekable(&bytes);
-        let report = ar.fidelity();
-
-        assert_eq!(
-            count_mismatch(report),
-            Some((3, 1)),
-            "{:?}",
-            report.warnings
-        );
-        let reason = count_mismatch_reason(report).unwrap();
-        assert!(
-            reason.contains("3 record(s) in the archive") && reason.contains("1 on its only disk"),
-            "the reason must name the self-contradiction, not a shadowed name: {reason}"
-        );
+        assert_self_contradicting_index_refused(&bytes, 3, 1);
     }
 
     /// Salvage Stage 3 final review, zip M1: the two counts disagree AND
-    /// the enumeration happens to land on the total. Eight records under six
-    /// names, EOCD saying 8 on this disk and 6 in total: `zip` walks all
-    /// eight (the on-disk count), collapses them to six names, and six
-    /// equals the declared total — so the early `enumerated == total`
-    /// return used to skip the self-contradiction check, and `list` showed
-    /// six of eight records with "exact fidelity". The contradiction is a
-    /// fact about the index whatever the enumeration landed on.
+    /// the enumeration would land on the total (eight records under six
+    /// names, EOCD saying 8 on this disk and 6 in total). Under zip 8.6 that
+    /// needed the contradiction checked before the equality return; under
+    /// zip 9 the record is refused before anything is enumerated, so the
+    /// coincidence cannot hide it either way.
     #[test]
-    fn an_eocd_contradicting_itself_is_reported_even_when_the_enumeration_matches_its_total() {
+    fn an_eocd_contradicting_itself_is_refused_even_when_the_enumeration_would_match_its_total() {
         let shadowing = build_shadowing_zip();
         let eocd = shadowing.len() - END_OF_CENTRAL_DIR_TOTAL;
         assert_eq!(le16(&shadowing[eocd + 8..]), 8, "fixture: 8 on this disk");
         let bytes = with_eocd_count(&shadowing, 10, 6);
-        let ar = open_seekable(&bytes);
-        let report = ar.fidelity();
+        assert_self_contradicting_index_refused(&bytes, 6, 8);
+    }
 
-        assert_eq!(
-            count_mismatch(report),
-            Some((6, 6)),
-            "a self-contradicting EOCD must be warned about even when the collapsed \
-             enumeration equals its total: {:?}",
-            report.warnings
-        );
-        let reason = count_mismatch_reason(report).unwrap();
-        assert!(
-            reason.contains("6 record(s) in the archive") && reason.contains("8 on its only disk"),
-            "{reason}"
-        );
-        assert!(!report.is_lossless());
+    /// A multi-disk EOCD with agreeing counts keeps zip 9's verdict, exit 5
+    /// with the crate's wording (zip 8.6 said exit 3 for this synthetic
+    /// shape; see `name_a_self_contradicting_index` for why it is not mapped).
+    #[test]
+    fn a_multi_disk_eocd_with_agreeing_counts_keeps_the_crates_verdict() {
+        let clean = build_zip(&[("a.txt", b"alpha")]);
+        let eocd = clean.len() - END_OF_CENTRAL_DIR_TOTAL;
+        let mut bytes = clean.clone();
+        bytes[eocd + 4..eocd + 6].copy_from_slice(&1u16.to_le_bytes());
+        let err = match try_open_seekable(&bytes) {
+            Err(e) => e,
+            Ok(_) => panic!("a multi-disk EOCD must be refused"),
+        };
+        assert!(matches!(err, Error::Corrupt(_)), "{err:?}");
+        assert_eq!(err.exit_code(), 5, "{err}");
+        assert!(err.to_string().contains("Multi-disk"), "{err}");
     }
 
     // -----------------------------------------------------------------------
@@ -4793,7 +5070,7 @@ z.close()\n";
     /// directory. The `container` target aborted on it with `a decoder
     /// raised Io(Custom { kind: Other, error: "dist overflow" }), which maps
     /// to exit code 1` — hostile input reaching exit 1, which the exit-code
-    /// contract forbids. `ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_EOF`'s doc
+    /// contract forbids. `ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_UNSUPPORTED_EOF`'s doc
     /// carries the trace.
     ///
     /// The seekable rung needs a central directory, so it is asserted over

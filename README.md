@@ -721,7 +721,8 @@ read list.
 > existing archive stays byte-identical.
 >
 > **Containers bring sharp edges worth knowing before they read as bugs.**
-> zip 8.6.0 cannot forward-read entries written with data descriptors —
+> The zip crate (9.1.3, as 8.6.0 before it) cannot forward-read entries
+> written with data descriptors —
 > exactly what many tools emit when streaming a zip *to* a pipe — so stuffr
 > reports that as `Unsupported` (exit 3, with a hint), never as corruption:
 > stuffr forward-reads an ordinary zip but not one another tool streamed to

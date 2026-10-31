@@ -58,7 +58,7 @@ tempfile = "3"
 # with the workspace's `zip` (which `stuffr-formats/zip` brings, with
 # `deflate-flate2`, `deflate64`, `bzip2`, ...), so deflated entries decode
 # too (`cargo tree -e features -i zip` in this directory shows it).
-zip = { version = "8.6", default-features = false }
+zip = { version = "9", default-features = false }
 
 [[bin]]
 name = "codec"
