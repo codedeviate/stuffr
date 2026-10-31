@@ -1498,12 +1498,16 @@ fn fresh_temp_dir_in(root: &Path, label: &str) -> stuffr::Result<TempDirGuard> {
 /// redirect — and THAT is renamed into place (security audit HOST-7: the
 /// old fallback removed `to` and then `fs::copy`ed onto the same name, which
 /// follows a symlink planted in between).
-fn move_into_place(from: &Path, to: &Path) -> std::io::Result<()> {
+///
+/// `Ok` carries [`copy_into_place`]'s answer about the mode: `None` when the
+/// staged file's mode is on `to` (always, for a rename), else the error that
+/// kept it off.
+fn move_into_place(from: &Path, to: &Path) -> std::io::Result<Option<std::io::Error>> {
     // Windows' rename does not replace an existing file.
     #[cfg(not(unix))]
     let _ = std::fs::remove_file(to);
     match std::fs::rename(from, to) {
-        Ok(()) => return Ok(()),
+        Ok(()) => return Ok(None),
         Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {}
         Err(e) => return Err(e),
     }
@@ -1519,7 +1523,19 @@ const TEMP_NAME_KEEP: usize = 64;
 /// (macOS) quarantine go into a `create_new` 0600 temp beside `to` — a name
 /// no planted symlink can redirect — which is then renamed onto `to`, and
 /// `from` is removed. Never writes through `to` by name.
-fn copy_into_place(from: &Path, to: &Path) -> std::io::Result<()> {
+///
+/// **The mode is best effort** (final review re-review, 1b): the staged
+/// file carries the archived mode, and a destination filesystem that
+/// refuses `fchmod` must not cost the recovered bytes. The copy then keeps
+/// its creation mode (0600) and the refusal comes back as `Ok(Some(e))`
+/// for the caller to report (exit 4); `Ok(None)` means the mode is on.
+///
+/// **A staged file the archive made unreadable** (1a): an archived mode
+/// such as 0o000 or 0o200 lands on the staged file too, and opening it to
+/// copy would fail `EACCES` — exit 1 from hostile input. The staged file
+/// sits in a 0700 directory this run made, so it is first given owner
+/// read and write by name; its recorded mode is what the copy receives.
+fn copy_into_place(from: &Path, to: &Path) -> std::io::Result<Option<std::io::Error>> {
     let parent = match to.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
@@ -1535,8 +1551,15 @@ fn copy_into_place(from: &Path, to: &Path) -> std::io::Result<()> {
         keep -= 1;
     }
     let name = &name[..keep];
+    let mode = std::fs::symlink_metadata(from)?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if mode.mode() & 0o600 != 0o600 {
+            std::fs::set_permissions(from, std::fs::Permissions::from_mode(mode.mode() | 0o600))?;
+        }
+    }
     let mut input = std::fs::File::open(from)?;
-    let mode = input.metadata()?.permissions();
     let mut attempt = 0;
     let (tmp, mut out) = loop {
         let tmp = parent.join(format!(
@@ -1562,8 +1585,9 @@ fn copy_into_place(from: &Path, to: &Path) -> std::io::Result<()> {
     if let Some(q) = stuffr::quarantine::read_raw(&input) {
         let _ = stuffr::quarantine::apply(&out, &q);
     }
+    let mut mode_refused = None;
     let copied = std::io::copy(&mut input, &mut out)
-        .and_then(|_| out.set_permissions(mode))
+        .map(|_| mode_refused = set_staged_mode(&out, mode).err())
         .and_then(|()| out.sync_all())
         .and_then(|()| {
             #[cfg(not(unix))]
@@ -1574,7 +1598,24 @@ fn copy_into_place(from: &Path, to: &Path) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    std::fs::remove_file(from)
+    std::fs::remove_file(from)?;
+    Ok(mode_refused)
+}
+
+/// `out.set_permissions(mode)`, with a test seam standing in for a
+/// destination filesystem that refuses it.
+fn set_staged_mode(out: &std::fs::File, mode: std::fs::Permissions) -> std::io::Result<()> {
+    #[cfg(test)]
+    if REFUSE_STAGED_MODE.with(std::cell::Cell::get) {
+        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    }
+    out.set_permissions(mode)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes [`set_staged_mode`] fail, as vfat/exfat, SMB or NFS can.
+    static REFUSE_STAGED_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// `-o FILE`'s second half: given the outcome of a `select = {scan_position}`
@@ -1587,12 +1628,15 @@ fn copy_into_place(from: &Path, to: &Path) -> std::io::Result<()> {
 /// caller-named path instead of an entry-named one for the identical reason:
 /// a truncated file under the name asked for is indistinguishable from a
 /// whole one to every tool downstream.
+///
+/// `Ok(true)` when the file was written but its mode could not be set
+/// ([`copy_into_place`]): the run then exits at least 4.
 fn finish_single_file_recovery(
     outcome: &entries::SalvageOutcome,
     scan_position: usize,
     output_path: &Path,
     archive: &Path,
-) -> stuffr::Result<()> {
+) -> stuffr::Result<bool> {
     let record = outcome
         .entries
         .iter()
@@ -1638,7 +1682,7 @@ fn finish_single_file_recovery(
                 "salvage -> nothing written for scan position {scan_position}: {}",
                 describe_salvage_row(record)
             );
-            return Ok(());
+            return Ok(false);
         }
     };
 
@@ -1670,8 +1714,15 @@ fn finish_single_file_recovery(
     // `from` lives in a temp directory that may sit on a different
     // filesystem than `final_path`'s; `move_into_place` handles `EXDEV`
     // without ever writing through `final_path` by name.
-    move_into_place(&from, &final_path)?;
+    let mode_refused = move_into_place(&from, &final_path)?;
     eprintln!("salvage -> wrote {}", final_path.display());
+    if let Some(e) = &mode_refused {
+        eprintln!(
+            "salvage -> could not give {} the archived mode ({e}); it was left as created \
+             (0600)",
+            final_path.display()
+        );
+    }
     // Salvage Stage 3 Task 3, R1 (routed from Task 1): an `Unattested`
     // entry written through `-o` exits 4, and until this line nothing said
     // why — `wrote FILE` alone, then a non-zero status. `-C` and `--list`
@@ -1679,7 +1730,7 @@ fn finish_single_file_recovery(
     if record.status == stuffr::salvage::SalvageStatus::Unattested {
         eprintln!("{}", unattested_note(1, 1));
     }
-    Ok(())
+    Ok(mode_refused.is_some())
 }
 
 /// [`Command::Salvage`]'s fields, bundled so [`dispatch_salvage`] takes one
@@ -1696,44 +1747,6 @@ struct SalvageArgs {
     format: Option<String>,
 }
 
-/// Implements `salvage` end to end: builds the policy, runs the scan-and-
-/// recover engine (`entries::salvage`), prints the report, and returns the
-/// aggregate exit-code bucket (0/3/4/5) for the calling match arm to act on.
-///
-/// A plain function rather than inlined in the `dispatch` arm purely so the
-/// arm above reads as a dispatch table, matching the shape every other verb
-/// here already has.
-///
-/// # The three surface forms (fix round 1, REQUIRED 2)
-///
-/// - `--list` alone: report-only, `dest: None` — nothing touches the
-///   filesystem, not even to create a directory.
-/// - `-C DIR`: recover a whole tree (optionally narrowed by `--index`,
-///   repeatable) into `DIR`.
-/// - `-o FILE --index N`: recover exactly the one entry at scan position `N`
-///   to `FILE`. There is no separate single-file write path in
-///   `entries.rs`: this still goes through `entries::salvage`'s ordinary
-///   directory mode, into a [`TempDirGuard`]'s temporary directory with
-///   `select` narrowed to `{N}`, and [`finish_single_file_recovery`] moves
-///   the single result out to `FILE` afterward.
-///
-/// # `--list` reports the full scan; the summary and exit code report the selection
-///
-/// `entries::salvage` always returns a record for every scan position, `-o`
-/// included — an unselected one comes back `NotSelected` rather than
-/// omitted. `--list` prints exactly that full outcome, unfiltered, because a
-/// diagnostic listing must not narrow just because `--index` narrowed what
-/// gets WRITTEN. The default summary and the exit code below are the other
-/// way around: both are filtered down to `select` when one was given
-/// (`None` when it was not, so the whole scan either way), because those two
-/// answer "how did the entries I asked to recover fare", not "what does this
-/// archive hold" — `--index 6` on an otherwise-clean archive reports
-/// `1 scanned, 1 skipped` and exits 4 even though the archive's OTHER seven
-/// entries are all fine, because entry 6 is the only one the caller asked
-/// about.
-///
-/// At least one of `-C`, `-o` or `--list` is required; `-C` and `-o` are
-/// mutually exclusive; `-o` requires exactly one `--index`.
 /// Refuses a salvage input that is neither a regular file, a block device
 /// nor a directory (final security review, Minor 3): a FIFO, a character
 /// device or a socket. Salvage reads its input more than once and seeks in
@@ -1775,6 +1788,44 @@ fn refuse_unseekable_salvage_input(path: &Path) -> stuffr::Result<()> {
     }
 }
 
+/// Implements `salvage` end to end: builds the policy, runs the scan-and-
+/// recover engine (`entries::salvage`), prints the report, and returns the
+/// aggregate exit-code bucket (0/3/4/5) for the calling match arm to act on.
+///
+/// A plain function rather than inlined in the `dispatch` arm purely so the
+/// arm above reads as a dispatch table, matching the shape every other verb
+/// here already has.
+///
+/// # The three surface forms (fix round 1, REQUIRED 2)
+///
+/// - `--list` alone: report-only, `dest: None` — nothing touches the
+///   filesystem, not even to create a directory.
+/// - `-C DIR`: recover a whole tree (optionally narrowed by `--index`,
+///   repeatable) into `DIR`.
+/// - `-o FILE --index N`: recover exactly the one entry at scan position `N`
+///   to `FILE`. There is no separate single-file write path in
+///   `entries.rs`: this still goes through `entries::salvage`'s ordinary
+///   directory mode, into a [`TempDirGuard`]'s temporary directory with
+///   `select` narrowed to `{N}`, and [`finish_single_file_recovery`] moves
+///   the single result out to `FILE` afterward.
+///
+/// # `--list` reports the full scan; the summary and exit code report the selection
+///
+/// `entries::salvage` always returns a record for every scan position, `-o`
+/// included — an unselected one comes back `NotSelected` rather than
+/// omitted. `--list` prints exactly that full outcome, unfiltered, because a
+/// diagnostic listing must not narrow just because `--index` narrowed what
+/// gets WRITTEN. The default summary and the exit code below are the other
+/// way around: both are filtered down to `select` when one was given
+/// (`None` when it was not, so the whole scan either way), because those two
+/// answer "how did the entries I asked to recover fare", not "what does this
+/// archive hold" — `--index 6` on an otherwise-clean archive reports
+/// `1 scanned, 1 skipped` and exits 4 even though the archive's OTHER seven
+/// entries are all fine, because entry 6 is the only one the caller asked
+/// about.
+///
+/// At least one of `-C`, `-o` or `--list` is required; `-C` and `-o` are
+/// mutually exclusive; `-o` requires exactly one `--index`.
 fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
     let SalvageArgs {
         input,
@@ -1911,8 +1962,10 @@ fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
         print_salvage_list(&outcome.entries)?;
     }
 
+    let mut mode_refused = false;
     if let Some(output_path) = &output {
-        finish_single_file_recovery(&outcome, index[0], Path::new(output_path), &path)?;
+        mode_refused =
+            finish_single_file_recovery(&outcome, index[0], Path::new(output_path), &path)?;
     } else if !list {
         // The default summary — like the exit code below — reports on what
         // the CALLER asked about: the whole scan when no `--index` was
@@ -1951,11 +2004,14 @@ fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
             Vec::new(),
         ),
     };
-    Ok(entries::salvage_exit_code(&entries::SalvageOutcome {
+    let code = entries::salvage_exit_code(&entries::SalvageOutcome {
         entries: subset,
         sightings,
         walk_stop: outcome.walk_stop,
-    }))
+    });
+    // A file written without its mode is degraded, like the other bucket-4
+    // outcomes; a higher bucket (5, 7) still wins.
+    Ok(if mode_refused { code.max(4) } else { code })
 }
 
 /// The parenthesised fidelity phrase of a read-side summary line: `exact
@@ -2717,6 +2773,65 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// Re-review 1a: an archived mode with no owner read (0o000, 0o200)
+    /// sits on the staged file; the copy still reads it and the final file
+    /// gets that mode, rather than the run failing `EACCES` at exit 1.
+    #[cfg(unix)]
+    #[test]
+    fn copying_into_place_reads_a_staged_file_its_mode_made_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `geteuid` cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root reads a 0o000 file anyway");
+            return;
+        }
+        let root =
+            std::env::temp_dir().join(format!("stuffr-copy-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        for mode in [0o000, 0o200, 0o300] {
+            let from = root.join("from");
+            std::fs::write(&from, b"recovered").unwrap();
+            std::fs::set_permissions(&from, std::fs::Permissions::from_mode(mode)).unwrap();
+            let to = root.join(format!("to-{mode:o}"));
+            assert!(copy_into_place(&from, &to).unwrap().is_none());
+            assert!(!from.exists());
+            assert_eq!(
+                std::fs::symlink_metadata(&to).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+            std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(std::fs::read(&to).unwrap(), b"recovered");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Re-review 1b: a destination that refuses the mode keeps the bytes
+    /// (left 0600) and reports the refusal instead of failing.
+    #[cfg(unix)]
+    #[test]
+    fn copying_into_place_keeps_the_file_when_its_mode_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("stuffr-copy-refused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let from = root.join("from");
+        std::fs::write(&from, b"recovered").unwrap();
+        std::fs::set_permissions(&from, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let to = root.join("to");
+        REFUSE_STAGED_MODE.with(|c| c.set(true));
+        let got = copy_into_place(&from, &to);
+        REFUSE_STAGED_MODE.with(|c| c.set(false));
+        assert!(got.unwrap().is_some(), "the refusal is reported");
+        assert_eq!(std::fs::read(&to).unwrap(), b"recovered");
+        assert_eq!(
+            std::fs::metadata(&to).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(!from.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// HOST-7, the `EXDEV` branch: the copy lands in a temp beside `to`
     /// and is renamed over a symlink planted there, never written through
     /// it; mode (and quarantine on macOS) come along, nothing is left over.
@@ -2740,7 +2855,7 @@ mod tests {
             stuffr::quarantine::apply(&std::fs::File::open(&from).unwrap(), qtn).unwrap();
             let to = root.join(name);
             std::os::unix::fs::symlink(&victim, &to).unwrap();
-            copy_into_place(&from, &to).unwrap();
+            assert!(copy_into_place(&from, &to).unwrap().is_none());
             assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
             let md = std::fs::symlink_metadata(&to).unwrap();
             assert!(md.file_type().is_file());
@@ -2779,7 +2894,7 @@ mod tests {
         std::fs::write(&from, b"recovered").unwrap();
         let to = root.join("out");
         std::os::unix::fs::symlink(&victim, &to).unwrap();
-        move_into_place(&from, &to).unwrap();
+        assert!(move_into_place(&from, &to).unwrap().is_none());
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
         assert!(
             !std::fs::symlink_metadata(&to)
