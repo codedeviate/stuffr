@@ -449,38 +449,68 @@ impl Output {
     /// descriptor turns out to be a regular file: a link to `/dev/null` or a
     /// FIFO is written through and nothing is set on it. A device or FIFO
     /// named directly takes nothing either.
+    ///
+    /// **"Created by this open" comes from the open itself** (re-review,
+    /// Minor 2), never from a `stat` before it: a target that appeared in
+    /// between would otherwise be taken for ours and given the input's
+    /// (possibly wider) mode. `O_EXCL` refuses any symlink at the name, so
+    /// a dangling link is resolved here ([`dangling_link_end`]) and the
+    /// missing file it leads to is created `create_new` (0600 when a mode
+    /// follows). Anything else — an existing target, a creation that lost
+    /// a race (`AlreadyExists`), a chain this cannot resolve — takes the
+    /// ordinary truncating open through the link and counts as existing:
+    /// its own mode, read from the descriptor, is intersected with the
+    /// input's.
     fn create_direct(p: &Path, through_link: bool, from: &FromInput) -> Result<Opened> {
-        // Followed: what the link leads to, before the open may create it.
-        #[cfg(unix)]
-        let before = std::fs::metadata(p).ok().filter(|m| m.is_file());
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        if through_link && from.mode.is_some() {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+        let mut made: Option<std::fs::File> = None;
+        if through_link && let Some(end) = dangling_link_end(p) {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            if from.mode.is_some() {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            match opts.open(&end) {
+                Ok(f) => made = Some(f),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e.into()),
+            }
         }
-        let f = opts.open(p)?;
+        let created = made.is_some();
+        let f = match made {
+            Some(f) => f,
+            None => std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(p)?,
+        };
         let mut warnings = Vec::new();
-        if through_link && f.metadata().is_ok_and(|m| m.is_file()) {
+        if through_link
+            && let Ok(md) = f.metadata()
+            && md.is_file()
+        {
             from.stamp(&f);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let want = match &before {
-                    Some(md) => {
-                        let mut masked = md.permissions().mode() & 0o7777 & !0o7000;
-                        if let Some(input) = from.mode {
-                            masked &= input | !0o777;
-                        }
-                        (masked != md.permissions().mode() & 0o7777).then_some(masked)
+                let want = if created {
+                    from.mode
+                } else {
+                    let had = md.permissions().mode() & 0o7777;
+                    let mut masked = had & !0o7000;
+                    if let Some(input) = from.mode {
+                        masked &= input | !0o777;
                     }
-                    None => from.mode,
+                    (masked != had).then_some(masked)
                 };
                 if let Some(mode) = want {
                     warnings.extend(set_mode_best_effort(&f, mode, p));
                 }
             }
+            #[cfg(not(unix))]
+            let _ = (md, created);
         }
         Ok(Opened {
             writer: Box::new(f),
@@ -488,6 +518,29 @@ impl Output {
             warnings,
         })
     }
+}
+
+/// Where the symlink chain at `p` ends when that end does not exist: the
+/// path a dangling link would create through. `None` when `p` is not a
+/// symlink, when the chain reaches something that exists, or when it
+/// cannot be followed (unreadable link, more than 40 hops, a loop).
+fn dangling_link_end(p: &Path) -> Option<PathBuf> {
+    let mut cur = p.to_path_buf();
+    for hop in 0..=40 {
+        match std::fs::symlink_metadata(&cur) {
+            Ok(md) if md.file_type().is_symlink() => {
+                let target = std::fs::read_link(&cur).ok()?;
+                cur = match cur.parent() {
+                    Some(dir) if target.is_relative() => dir.join(target),
+                    _ => target,
+                };
+            }
+            Ok(_) => return None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && hop > 0 => return Some(cur),
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 /// Counts calls to `sync_all()` on the temp file inside `publish`.
@@ -2207,6 +2260,26 @@ mod tests {
         for p in [&src, &real, &link, &made, &dangling] {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    #[test]
+    fn a_dangling_link_end_is_resolved_through_a_relative_chain() {
+        let dir = tmp("dangling-dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink("b", dir.join("a")).unwrap();
+        std::os::unix::fs::symlink("c.gz", dir.join("b")).unwrap();
+        assert_eq!(dangling_link_end(&dir.join("a")), Some(dir.join("c.gz")));
+        // Not a link, missing, or a chain that reaches something: nothing.
+        assert_eq!(dangling_link_end(&dir.join("missing")), None);
+        std::fs::write(dir.join("c.gz"), b"").unwrap();
+        assert_eq!(dangling_link_end(&dir.join("a")), None);
+        assert_eq!(dangling_link_end(&dir.join("c.gz")), None);
+        // A loop is given up on.
+        std::os::unix::fs::symlink("y", dir.join("x")).unwrap();
+        std::os::unix::fs::symlink("x", dir.join("y")).unwrap();
+        assert_eq!(dangling_link_end(&dir.join("x")), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
