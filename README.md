@@ -2286,7 +2286,7 @@ about the archive.*
 
 ```
 stuffr pack     [-o out.tar.zst] [--format F] [--level N] PATHS...
-stuffr unpack   [-C dir] ARCHIVE [PATTERNS... | --index N...]
+stuffr unpack   [-C dir [-p]] ARCHIVE [PATTERNS... | --index N...]
 stuffr list     ARCHIVE                    # first column is the index
 stuffr ls       [-r] [-a] [-n] [FOLDER]    # alias: files; what a folder holds that stuffr opens
 stuffr cat      ARCHIVE [PATTERNS... | --index N...]  # entry data; works on a pipe
@@ -2488,6 +2488,14 @@ domain, so:
 - **Bomb limits.** Default caps on total output and expansion ratio, so a 42 KB
   zip that expands to 4.5 PB fails fast instead of filling the disk. The error
   names the entry that tripped it.
+
+Permissions follow `tar`'s non-root defaults: a restored mode is masked by the
+umask (`unpack -C -p` / `--same-permissions` restores the archived bits),
+setuid, setgid and the sticky bit are never restored, and a directory that
+existed before the run keeps its own mode and mtime. A directory's metadata is
+applied at the end of the run, through a descriptor opened `O_NOFOLLOW` and
+checked against the inode the run created, so a directory swapped for a
+symlink in the meantime is skipped with a warning rather than followed.
 
 **One window is deliberately still open, and it is worth stating plainly.** The
 symlinked-component check is the only containment check that consults the

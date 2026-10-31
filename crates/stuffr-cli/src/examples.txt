@@ -738,6 +738,15 @@ EXTRACTING AN ARCHIVE'S ENTRIES
       something inferred from the input because the decision has to be made
       before a byte is read — a pipe cannot be probed and then reconsidered.
 
+  stuffr unpack backup.tar -C out/ -p
+      Permissions. By default an entry's mode is masked by your umask, as
+      tar does for a non-root user: a 0777 entry lands 0755 under umask 022.
+      -p/--same-permissions restores the archived bits exactly. Either way
+      setuid, setgid and the sticky bit are never restored (a fidelity
+      warning says so), and a directory that already existed before the run
+      keeps its own mode and mtime — the archive's metadata is only applied
+      to what the run created.
+
   stuffr unpack backup.tar.gz -C out/ docs notes.txt
       PATTERNS after the input select what to extract: an exact entry name,
       or a directory selecting everything beneath it (`docs` takes

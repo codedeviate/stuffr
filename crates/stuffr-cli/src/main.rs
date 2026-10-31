@@ -352,6 +352,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             patterns,
             index,
             directory,
+            same_permissions,
             output,
             force,
             format,
@@ -380,6 +381,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                         parse_memory_limit(memory_limit)?
                             .unwrap_or_else(stuffr::default_memory_limit),
                     ),
+                    same_permissions,
                     ..Default::default()
                 };
                 let out = entries::extract(input_of(&input), Path::new(&dir), &selection, &opts)?;
@@ -388,6 +390,15 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                     out.format, out.bytes_out, out.fidelity.rung
                 );
                 return report_fidelity(&out.fidelity, strict_fidelity);
+            }
+            if same_permissions {
+                // A single stream carries no archived mode to restore:
+                // refused rather than accepted and ignored.
+                return Err(stuffr::Error::Usage(
+                    "--same-permissions restores archived entry modes; pass -C DIR to extract \
+                     entries"
+                        .into(),
+                ));
             }
             if named_entries {
                 // `--index 6` needs the same refusal a pattern gets, and for

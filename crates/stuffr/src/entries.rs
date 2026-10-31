@@ -821,6 +821,11 @@ pub struct ExtractOpts {
     /// `None` is unbounded, the library default; the CLI always resolves a
     /// value.
     pub memory_limit: Option<u64>,
+    /// Restore an entry's permission bits exactly as archived (`tar -p`),
+    /// rather than masked by the process umask — the default, which is what
+    /// `tar` and `bsdtar` do for a non-root extraction (security audit
+    /// EXTRACT-2). setuid, setgid and the sticky bit are dropped either way.
+    pub same_permissions: bool,
 }
 
 impl Default for ExtractOpts {
@@ -830,7 +835,48 @@ impl Default for ExtractOpts {
             compressed_total: None,
             force: false,
             memory_limit: None,
+            same_permissions: false,
         }
+    }
+}
+
+/// The process's file-mode creation mask, read once per call.
+///
+/// On Linux it comes from `/proc/self/status` (`Umask:`, since 4.7), which
+/// changes nothing. Elsewhere on unix the only portable read is `umask(2)`
+/// itself, which SETS the mask: it is swapped for `0o077` and put straight
+/// back. Another thread creating a file inside that window gets a mode
+/// MORE restrictive than it asked for, never a wider one — that is why the
+/// placeholder is `0o077` and not `0`. The `stuffr` binary calls this from
+/// one thread. `0` off unix, where there are no mode bits to mask.
+pub fn process_umask() -> u32 {
+    #[cfg(unix)]
+    {
+        #[cfg(target_os = "linux")]
+        if let Some(mask) = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix("Umask:"))
+                    .and_then(|v| u32::from_str_radix(v.trim(), 8).ok())
+            })
+        {
+            return mask & 0o777;
+        }
+        // SAFETY: `umask` cannot fail and only swaps the process's mask;
+        // the second call restores the value the first returned.
+        let old = unsafe {
+            let old = libc::umask(0o077);
+            libc::umask(old);
+            old
+        };
+        #[allow(clippy::useless_conversion)] // `mode_t` is u16 on macOS
+        let old = u32::from(old);
+        old & 0o777
+    }
+    #[cfg(not(unix))]
+    {
+        0
     }
 }
 
@@ -889,6 +935,13 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
     let (mut ar, format, consumed) =
         open_archive(crate::registry(), src, o.max_ratio, o.memory_limit)?;
     let mut budget = ArchiveBudget::new(compressed_total, o.max_ratio).tracking(consumed);
+    // The permission bits a restored mode may keep: the umask's complement
+    // unless `same_permissions` (EXTRACT-2). Read once, here.
+    let mode_bits = if o.same_permissions {
+        RESTORED_MODE_BITS
+    } else {
+        RESTORED_MODE_BITS & !process_umask()
+    };
 
     // The destination itself, once, up front: an archive of plain files
     // names no directory entry to create it, and a destination that cannot
@@ -906,8 +959,11 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
     // Directory metadata is applied AFTER every entry has been written.
     // Applying it inline would be wrong twice over: creating a child updates
     // its parent's mtime, and a directory whose archived mode is read-only
-    // (0o555, say) could not be written into afterwards.
-    let mut deferred_dirs: Vec<(PathBuf, EntryMeta)> = Vec::new();
+    // (0o555, say) could not be written into afterwards. Only directories
+    // THIS RUN created are here, each with the identity it had when it was
+    // created: one that was there before is never re-moded or re-timed
+    // (EXTRACT-2), and one swapped since is not followed (EXTRACT-5).
+    let mut deferred_dirs: Vec<(PathBuf, EntryMeta, Option<DevIno>)> = Vec::new();
     // What this run made, by path: what `place_entry` tells a self-
     // contradicting archive (a skip) from a destination that already held
     // something (exit 2) with, and what a later hard link resolves against.
@@ -1006,14 +1062,26 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
                     {
                         return Ok(());
                     }
-                    if let Err(w) =
-                        skip_if_name_refused(std::fs::create_dir_all(&target), &meta.name)?
+                    // `place_entry` created the parents; `create_dir` says
+                    // whether THIS call made the directory or it was there.
+                    let created = match skip_if_name_refused(create_dir_once(&target), &meta.name)?
                     {
-                        warnings.push(w);
-                        return Ok(());
+                        Ok(created) => created,
+                        Err(w) => {
+                            warnings.push(w);
+                            return Ok(());
+                        }
+                    };
+                    if created {
+                        made.record_created_dir(&target);
                     }
                     made.record(&meta.name, &target, MadeKind::Dir);
-                    deferred_dirs.push((target.clone(), meta.clone()));
+                    // Created by this run, by this entry or earlier (a parent
+                    // `place_entry` made, a repeated entry): its metadata is
+                    // the archive's to set. Otherwise the destination's own.
+                    if let Some(id) = made.created_dir(&target) {
+                        deferred_dirs.push((target.clone(), meta.clone(), id));
+                    }
                 } else {
                     made.record(&meta.name, &target, MadeKind::Dir);
                     // The destination is the caller's own directory, named by
@@ -1062,7 +1130,7 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
                 out.flush()?;
                 // Through the open handle rather than the path: an fd cannot
                 // be redirected by a symlink appearing underneath it.
-                let missing = apply_metadata(&out, &meta);
+                let missing = apply_metadata(&out, &meta, mode_bits);
                 warn_metadata(&mut warnings, &meta.name, missing);
                 made.record(&meta.name, &target, MadeKind::File);
             }
@@ -1077,6 +1145,7 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
                         meta: &meta,
                         link_to,
                         force: o.force,
+                        mode_bits,
                     },
                     &mut made,
                     &mut budget,
@@ -1122,13 +1191,15 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
     // cost. Safe for mtime too, either way: chmod or utimes on a child does
     // not touch its parent's mtime, so applying children first cannot cause
     // the parent to observe a stale timestamp.
-    deferred_dirs.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
-    for (path, meta) in &deferred_dirs {
-        let missing = match std::fs::File::open(path) {
-            Ok(handle) => apply_metadata(&handle, meta),
+    deferred_dirs.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.components().count()));
+    for (path, meta, id) in &deferred_dirs {
+        let missing = match open_created_dir(path, *id) {
+            Ok(handle) => apply_metadata(&handle, meta, mode_bits),
             // The directory is there — it was just created — so a failure to
             // reopen it is a metadata loss, not a reason to fail the
-            // extraction after the data is already on disk.
+            // extraction after the data is already on disk. That includes
+            // one replaced since (a symlink, another directory): its
+            // metadata is skipped, and the warning says so.
             Err(_) => MetaFields {
                 mtime: meta.mtime.is_some(),
                 mode: meta.mode.is_some(),
@@ -1226,6 +1297,8 @@ struct HardLinkSite<'a> {
     meta: &'a EntryMeta,
     link_to: &'a str,
     force: bool,
+    /// The permission bits a restored mode may keep ([`extract`]'s).
+    mode_bits: u32,
 }
 
 /// Recreates one hard-link entry, returning what it left at the link's path
@@ -1264,6 +1337,7 @@ fn extract_hard_link(
         meta,
         link_to,
         force,
+        mode_bits,
     } = site;
     // The target is an archive-supplied path too: lexically checked before
     // anything else, exactly as an entry's own name is, so a target that
@@ -1403,7 +1477,15 @@ fn extract_hard_link(
             if hard_link(target_path, link_path).is_ok() {
                 return Ok(Some((MadeKind::Hardlink, 0)));
             }
-            copy_link_target(target_path, link_path, meta, link_to, budget, warnings)
+            copy_link_target(
+                target_path,
+                link_path,
+                meta,
+                link_to,
+                mode_bits,
+                budget,
+                warnings,
+            )
         }
     }
 }
@@ -1517,6 +1599,7 @@ fn copy_link_target(
     link_path: &Path,
     meta: &EntryMeta,
     link_to: &str,
+    mode_bits: u32,
     budget: &mut ArchiveBudget,
     warnings: &mut Vec<Fidelity>,
 ) -> Result<Option<(MadeKind, u64)>> {
@@ -1559,7 +1642,7 @@ fn copy_link_target(
     out.flush()?;
     // The copy is a file of its own: it gets the link entry's metadata, as
     // the `File` arm gives a payload's, through the same open handle.
-    let missing = apply_metadata(&out, meta);
+    let missing = apply_metadata(&out, meta, mode_bits);
     warn_metadata(warnings, &meta.name, missing);
     Ok(Some((MadeKind::Hardlink, copied)))
 }
@@ -1579,7 +1662,11 @@ const RESTORED_MODE_BITS: u32 = 0o777;
 ///
 /// Takes the open handle rather than the path: an fd cannot be redirected by
 /// a symlink appearing underneath it between the write and this call.
-fn apply_metadata(handle: &std::fs::File, meta: &EntryMeta) -> MetaFields {
+///
+/// `mode_bits` is what a restored mode may keep: [`RESTORED_MODE_BITS`]
+/// less the umask by default, all of them under `same_permissions`. What
+/// the umask clears is policy, not a loss, and is not reported.
+fn apply_metadata(handle: &std::fs::File, meta: &EntryMeta, mode_bits: u32) -> MetaFields {
     let mut missing = MetaFields::default();
 
     if let Some(mode) = meta.mode {
@@ -1602,7 +1689,7 @@ fn apply_metadata(handle: &std::fs::File, meta: &EntryMeta) -> MetaFields {
                 missing.mode = true;
             }
             if handle
-                .set_permissions(std::fs::Permissions::from_mode(mode & RESTORED_MODE_BITS))
+                .set_permissions(std::fs::Permissions::from_mode(mode & mode_bits))
                 .is_err()
             {
                 missing.mode = true;
@@ -1610,7 +1697,7 @@ fn apply_metadata(handle: &std::fs::File, meta: &EntryMeta) -> MetaFields {
         }
         #[cfg(not(unix))]
         {
-            let _ = handle;
+            let _ = (handle, mode_bits);
             missing.mode = true;
         }
     }
@@ -5582,6 +5669,11 @@ struct MadeByRun {
     /// something the run made; it rides here because `made` is the one
     /// record every placement already consults.
     archive: Option<ArchiveId>,
+    /// Directories this run CREATED (`mkdir` succeeded), with the identity
+    /// each had then — never one that was there before, even when an entry
+    /// names it and `at` records it. Only these get an entry's mode and
+    /// mtime, and only while the identity still matches (EXTRACT-2/5).
+    created_dirs: HashMap<PathBuf, Option<(u64, u64)>>,
 }
 
 /// The archive being read, as [`place`] and salvage compare it against a
@@ -5703,6 +5795,58 @@ fn identity(path: &Path) -> Option<(u64, u64)> {
     }
 }
 
+/// A `(st_dev, st_ino)` pair: what [`identity`] reads.
+type DevIno = (u64, u64);
+
+/// `mkdir path`: `Ok(true)` when this call created it, `Ok(false)` when a
+/// directory (not a symlink to one) was already there.
+fn create_dir_once(path: &Path) -> std::io::Result<bool> {
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(true),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::AlreadyExists
+                && std::fs::symlink_metadata(path).is_ok_and(|md| md.is_dir()) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Re-opens a directory this run created, for its deferred metadata,
+/// without following a symlink swapped in at its last component
+/// (`O_NOFOLLOW|O_DIRECTORY`), and refuses what is there now unless it is
+/// the inode the run created (`expected`, from [`MadeByRun::created_dir`]) —
+/// which also catches an ANCESTOR swapped for a symlink, since that leads to
+/// some other inode (security audit EXTRACT-5). The deferral window is the
+/// whole extraction, so a local writer has all of it to make the swap.
+/// Off unix: a plain open, and no identity to compare.
+fn open_created_dir(path: &Path, expected: Option<(u64, u64)>) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(path)?;
+        if let Some(id) = expected {
+            let md = handle.metadata()?;
+            if (md.dev(), md.ino()) != id {
+                return Err(std::io::Error::other(format!(
+                    "{} was replaced after this run created it",
+                    path.display()
+                )));
+            }
+        }
+        Ok(handle)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = expected;
+        std::fs::File::open(path)
+    }
+}
+
 impl MadeByRun {
     /// A record for a run reading the archive at `archive` (`None` for a
     /// stream with no path): [`place`] never removes it.
@@ -5711,6 +5855,18 @@ impl MadeByRun {
             archive: archive.and_then(ArchiveId::of),
             ..MadeByRun::default()
         }
+    }
+
+    /// `path` is a directory this run's own `mkdir` just made.
+    fn record_created_dir(&mut self, path: &Path) {
+        self.created_dirs.insert(path.to_path_buf(), identity(path));
+    }
+
+    /// The identity `path` had when this run created it, or `None` when this
+    /// run did not create it (the outer `Option`); the inner one is `None`
+    /// off unix or when it could not be read.
+    fn created_dir(&self, path: &Path) -> Option<Option<(u64, u64)>> {
+        self.created_dirs.get(path).copied()
     }
 
     /// Whether `path` is the archive this run is reading.
@@ -6057,7 +6213,10 @@ fn place(
         for component in &components[first..parents] {
             path.push(component);
             match std::fs::create_dir(&path) {
-                Ok(()) => made.record_path(&path, MadeKind::Dir),
+                Ok(()) => {
+                    made.record_created_dir(&path);
+                    made.record_path(&path, MadeKind::Dir);
+                }
                 // Only this run writes here, and the walk above found it
                 // absent; a racing local writer is the TOCTOU window
                 // `refuse_symlinked_ancestors` documents.
@@ -6395,6 +6554,107 @@ mod tests {
     use super::scratch_dir::ScratchDir;
     use super::*;
     use stuffr_core::{DEFAULT_MAX_RATIO, ReaderSource};
+
+    /// EXTRACT-5: deferred directory metadata re-opens only the directory
+    /// this run created. A symlink swapped in at its name is not followed,
+    /// and another directory moved into its place is refused by identity.
+    #[cfg(unix)]
+    #[test]
+    fn a_created_directory_is_reopened_only_while_it_is_the_one_created() {
+        let root = ScratchDir::create(&format!("stuffr-entries-reopen-{}", std::process::id()));
+        let d = root.join("d");
+        assert!(create_dir_once(&d).unwrap(), "created by this call");
+        assert!(!create_dir_once(&d).unwrap(), "already there");
+        let id = identity(&d);
+        assert!(id.is_some());
+        assert!(open_created_dir(&d, id).is_ok());
+
+        // Swapped for a symlink to a directory elsewhere: not followed.
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::rename(&d, root.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &d).unwrap();
+        assert!(open_created_dir(&d, id).is_err(), "followed a symlink");
+        assert!(open_created_dir(&d, None).is_err(), "O_NOFOLLOW alone");
+
+        // Swapped for another real directory: refused by identity.
+        std::fs::remove_file(&d).unwrap();
+        std::fs::rename(&elsewhere, &d).unwrap();
+        let err = open_created_dir(&d, id).unwrap_err();
+        assert!(err.to_string().contains("replaced"), "{err}");
+
+        // An ancestor swapped for a symlink leads to another inode too.
+        let parent = root.join("p");
+        std::fs::create_dir(&parent).unwrap();
+        let child = parent.join("c");
+        std::fs::create_dir(&child).unwrap();
+        let child_id = identity(&child);
+        let decoy = root.join("decoy");
+        std::fs::create_dir_all(decoy.join("c")).unwrap();
+        std::fs::rename(&parent, root.join("p-moved")).unwrap();
+        std::os::unix::fs::symlink(&decoy, &parent).unwrap();
+        assert!(open_created_dir(&child, child_id).is_err());
+    }
+
+    /// EXTRACT-2: a restored mode is masked by the process umask unless
+    /// `same_permissions`, and a pre-existing directory keeps its own.
+    #[cfg(unix)]
+    #[test]
+    fn restored_modes_follow_the_umask_and_spare_existing_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = ScratchDir::create(&format!("stuffr-entries-umask-{}", std::process::id()));
+        let archive = root.join("w.tar");
+        {
+            let tar = FormatId::new("tar");
+            let container = crate::registry().require_container(tar).unwrap();
+            let file = std::fs::File::create(&archive).unwrap();
+            let mut w = container
+                .create(PlainSink::new(Box::new(file)), &CreateOpts::default())
+                .unwrap();
+            for (name, kind) in [("d", EntryKind::Dir), ("d/x", EntryKind::File)] {
+                w.add(
+                    &EntryMeta {
+                        name: name.to_string(),
+                        size: Some(0),
+                        kind,
+                        mode: Some(0o777),
+                        ..Default::default()
+                    },
+                    &mut std::io::empty(),
+                )
+                .unwrap();
+            }
+            w.finish().unwrap().finish().unwrap();
+        }
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let umask = process_umask();
+
+        let out = root.join("masked");
+        extract(
+            Input::Path(archive.clone()),
+            &out,
+            &Selection::All,
+            &ExtractOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(mode(&out.join("d/x")), 0o777 & !umask);
+        assert_eq!(mode(&out.join("d")), 0o777 & !umask);
+
+        let out = root.join("same");
+        let same = ExtractOpts {
+            same_permissions: true,
+            ..Default::default()
+        };
+        extract(Input::Path(archive.clone()), &out, &Selection::All, &same).unwrap();
+        assert_eq!(mode(&out.join("d/x")), 0o777);
+        assert_eq!(mode(&out.join("d")), 0o777);
+
+        let out = root.join("existing");
+        std::fs::create_dir_all(out.join("d")).unwrap();
+        std::fs::set_permissions(out.join("d"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        extract(Input::Path(archive), &out, &Selection::All, &same).unwrap();
+        assert_eq!(mode(&out.join("d")), 0o700);
+    }
 
     /// A container of `a`/`b`/`c`/`d` that records which of the two routes
     /// [`visit_by_index`] actually took.
@@ -7464,6 +7724,7 @@ mod tests {
                 meta,
                 link_to: target,
                 force: true,
+                mode_bits: RESTORED_MODE_BITS,
             },
             extracted,
             &mut budget,
@@ -7629,6 +7890,7 @@ mod tests {
                 meta: &meta,
                 link_to: "b",
                 force: false,
+                mode_bits: RESTORED_MODE_BITS,
             },
             &mut extracted,
             &mut budget,

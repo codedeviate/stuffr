@@ -16,6 +16,7 @@ mod max_ratio;
 mod pack_edges;
 mod pack_findings;
 mod pack_walk;
+mod permissions;
 mod reference_tools;
 mod salvage;
 mod salvage_checksumless;

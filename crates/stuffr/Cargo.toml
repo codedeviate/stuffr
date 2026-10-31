@@ -93,6 +93,13 @@ stuffr-core = { workspace = true }
 stuffr-formats = { workspace = true }
 serde = { workspace = true, optional = true }
 
+# The process umask, `O_NOFOLLOW`/`O_DIRECTORY` for re-opening a directory
+# this run created, and (macOS) the quarantine attribute by descriptor.
+# Already in every build's graph (via `tempfile` in `stuffr-core`), so this
+# adds no crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Self dev-dependency with `serde` and `testing` turned on: the same trick
 # `stuffr-core` uses on itself, so both features are active for this crate's

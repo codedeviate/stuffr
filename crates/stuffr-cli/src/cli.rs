@@ -114,6 +114,14 @@ pub enum Command {
         /// directory are refused (exit 7), never silently sanitised.
         #[arg(short = 'C', long, value_name = "DIR")]
         directory: Option<String>,
+        /// Restore archived permission bits exactly, not masked by the umask.
+        ///
+        /// By default an entry's mode is masked by the umask, as `tar` does
+        /// for a non-root user. setuid, setgid and the sticky bit are never
+        /// restored, and a directory that existed before the run keeps its
+        /// own mode either way. Needs -C.
+        #[arg(short = 'p', long)]
+        same_permissions: bool,
         /// Fail (exit 4) if anything was approximated or lost.
         ///
         /// On extraction that means an entry whose mode or mtime could not be
