@@ -295,6 +295,45 @@ mod tests {
         out
     }
 
+    /// RUSTSEC-2026-0403: a 5 or 6 byte frame starting with a legacy magic
+    /// (v0.4 to v0.7) then garbage must be an error and expose no output
+    /// through the codec decoder (`zstd::stream::read::Decoder`).
+    #[test]
+    fn a_corrupt_legacy_frame_exposes_no_output() {
+        for magic in 0xFD2F_B524u32..=0xFD2F_B527 {
+            for tail in [&[0xFFu8][..], &[0xFF, 0x00], &[0x00, 0x00]] {
+                let mut bytes = magic.to_le_bytes().to_vec();
+                bytes.extend_from_slice(tail);
+                let src: Box<dyn Source> =
+                    Box::new(ReaderSource::new(std::io::Cursor::new(bytes.clone())));
+                let mut dec = Zstd.decoder(src, &DecodeOpts::default()).unwrap();
+                let mut out = Vec::new();
+                let r = dec.read_to_end(&mut out);
+                assert!(r.is_err(), "{magic:#x} {tail:?}: decoded without error");
+                assert!(out.is_empty(), "{magic:#x} {tail:?}: leaked {out:?}");
+            }
+        }
+    }
+
+    /// RUSTSEC-2026-0391: the codec makes one decoder per stream
+    /// (`Decoder::new` above, never `with_context`), so an abandoned
+    /// stream cannot reach the next; pinned by decoding a cut stream and
+    /// then a whole one.
+    #[test]
+    fn an_abandoned_stream_leaves_nothing_in_the_next() {
+        let first = b"first stream, line after line. ".repeat(5000);
+        let second = b"second stream is different. ".repeat(3000);
+        let a = compress(&first);
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(
+            a[..a.len() / 2].to_vec(),
+        )));
+        let mut dec = Zstd.decoder(src, &DecodeOpts::default()).unwrap();
+        let mut part = vec![0u8; 1000];
+        let _ = dec.read(&mut part);
+        drop(dec);
+        assert_eq!(decompress(compress(&second)), second);
+    }
+
     #[test]
     fn zstd_c_skips_a_trailing_skippable_frame() {
         let plain = b"blender-like text, line after line of it. ".repeat(2500);

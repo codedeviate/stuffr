@@ -1919,6 +1919,86 @@ mod unix {
         }
     }
 
+    /// RUSTSEC-2026-0403: a 5 or 6 byte frame that starts with a legacy
+    /// magic (v0.4 to v0.7) and is then garbage must fail with no output
+    /// bytes. stuffr drives libzstd through `zstd_opts` (its own
+    /// `ZSTD_decompressStream` call, which commits only `outb.pos`), not the
+    /// `zstd` crate's `DCtx::decompress_stream` the advisory names; this
+    /// pins that, and compares with the reference's exit and stderr.
+    #[test]
+    fn a_corrupt_legacy_frame_exposes_no_output() {
+        let mut cases = Vec::new();
+        let mut names = Vec::new();
+        for magic in 0xFD2F_B524u32..=0xFD2F_B527 {
+            for tail in [&[0xFFu8][..], &[0xFF, 0x00], &[0x00, 0x00]] {
+                let mut data = magic.to_le_bytes().to_vec();
+                data.extend_from_slice(tail);
+                names.push(data);
+            }
+        }
+        let names: Vec<(String, Vec<u8>)> = names
+            .into_iter()
+            .enumerate()
+            .map(|(i, d)| (format!("bad{i}.zst"), d))
+            .collect();
+        for (name, data) in &names {
+            for args in [&["-dc"][..], &["-d", "-k"], &["-t"]] {
+                let mut a = args.to_vec();
+                a.push(name.as_str());
+                cases.push(with_files("zstd", &a, vec![(name.as_str(), data.clone())]));
+            }
+        }
+        if EXACT {
+            check("a_corrupt_legacy_frame_exposes_no_output", &cases);
+        }
+        if zstd_dir().is_none() {
+            return;
+        }
+        for c in &cases {
+            let s = stuffr_as(c);
+            assert_ne!(s.code, 0, "{:?}", c.args);
+            assert!(s.stdout.is_empty(), "{:?}: output {:?}", c.args, s.stdout);
+        }
+    }
+
+    /// RUSTSEC-2026-0391: `with_context` decoders carry an abandoned
+    /// stream into the next. stuffr never calls `with_context`. The one
+    /// place a libzstd context is reused across inputs is `decompress_files`
+    /// (`create_dresources` makes one `Decoder` per call, `reset()` between
+    /// frames, as `FIO_decompressMultipleFilenames` shares one `dRess`);
+    /// every other decoder (`zstd_c.rs`'s codec, the pure tier) is created
+    /// per stream. A first input cut short must leave nothing in the second:
+    /// its output equals a fresh decode of it alone, and the reference's.
+    #[test]
+    fn an_abandoned_stream_leaves_nothing_in_the_next() {
+        let first = mixed(300_000, 7);
+        let second = mixed(70_000, 8);
+        let a = packed(&["-1"], &first);
+        let b = packed(&["-1"], &second);
+        if zstd_dir().is_none() {
+            return;
+        }
+        for cut in [a.len() / 3, a.len() / 2, a.len() - 5] {
+            let files = vec![("a.zst", a[..cut].to_vec()), ("b.zst", b.clone())];
+            let both = with_files("zstd", &["-dc", "a.zst", "b.zst"], files.clone());
+            let alone = with_files("zstd", &["-dc", "b.zst"], vec![("b.zst", b.clone())]);
+            if EXACT {
+                check(
+                    "an_abandoned_stream_leaves_nothing_in_the_next",
+                    std::slice::from_ref(&both),
+                );
+            }
+            let s_both = stuffr_as(&both);
+            let s_alone = stuffr_as(&alone);
+            assert_eq!(s_alone.stdout, second);
+            assert!(
+                s_both.stdout.ends_with(&second),
+                "cut {cut}: the second output differs from a fresh decode"
+            );
+            assert_ne!(s_both.code, 0, "cut {cut}: the cut input must fail");
+        }
+    }
+
     // ---- Review Focus 1-5 ----
 
     /// Review Focus 1: a 64 MiB stream decodes in bounded memory.
