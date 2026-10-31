@@ -1506,6 +1506,19 @@ fn move_into_place(from: &Path, to: &Path) -> std::io::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {}
         Err(e) => return Err(e),
     }
+    copy_into_place(from, to)
+}
+
+/// The most bytes of the output's own name a staging temp beside it keeps:
+/// with the dot, pid, attempt and suffix it stays far below `NAME_MAX`
+/// (255 on every unix stuffr runs on).
+const TEMP_NAME_KEEP: usize = 64;
+
+/// [`move_into_place`]'s cross-filesystem branch: `from`'s bytes, mode and
+/// (macOS) quarantine go into a `create_new` 0600 temp beside `to` — a name
+/// no planted symlink can redirect — which is then renamed onto `to`, and
+/// `from` is removed. Never writes through `to` by name.
+fn copy_into_place(from: &Path, to: &Path) -> std::io::Result<()> {
     let parent = match to.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
@@ -1514,6 +1527,13 @@ fn move_into_place(from: &Path, to: &Path) -> std::io::Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    // Cut on a character boundary: the temp's name must fit `NAME_MAX`
+    // even when the output's own name nearly fills it.
+    let mut keep = name.len().min(TEMP_NAME_KEEP);
+    while !name.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    let name = &name[..keep];
     let mut input = std::fs::File::open(from)?;
     let mode = input.metadata()?.permissions();
     let mut attempt = 0;
@@ -2651,6 +2671,54 @@ mod tests {
         assert_eq!(md.permissions().mode() & 0o777, 0o700);
         assert_eq!(std::fs::read_dir(&a.0).unwrap().count(), 0);
         drop((a, b));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// HOST-7, the `EXDEV` branch: the copy lands in a temp beside `to`
+    /// and is renamed over a symlink planted there, never written through
+    /// it; mode (and quarantine on macOS) come along, nothing is left over.
+    #[cfg(unix)]
+    #[test]
+    fn copying_into_place_replaces_a_planted_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("stuffr-copy-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let victim = root.join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let from = root.join("from");
+        #[cfg(target_os = "macos")]
+        let qtn = b"0081;5f000000;Safari;";
+        let long = "n".repeat(250);
+        for name in ["out", long.as_str()] {
+            std::fs::write(&from, b"recovered").unwrap();
+            std::fs::set_permissions(&from, std::fs::Permissions::from_mode(0o640)).unwrap();
+            #[cfg(target_os = "macos")]
+            stuffr::quarantine::apply(&std::fs::File::open(&from).unwrap(), qtn).unwrap();
+            let to = root.join(name);
+            std::os::unix::fs::symlink(&victim, &to).unwrap();
+            copy_into_place(&from, &to).unwrap();
+            assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+            let md = std::fs::symlink_metadata(&to).unwrap();
+            assert!(md.file_type().is_file());
+            assert_eq!(md.permissions().mode() & 0o777, 0o640);
+            assert_eq!(std::fs::read(&to).unwrap(), b"recovered");
+            #[cfg(target_os = "macos")]
+            assert_eq!(
+                stuffr::quarantine::read_raw(&std::fs::File::open(&to).unwrap()).as_deref(),
+                Some(&qtn[..])
+            );
+            assert!(!from.exists());
+            let mut left: Vec<_> = std::fs::read_dir(&root)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            left.sort();
+            let mut want = vec![std::ffi::OsString::from(name), "victim".into()];
+            want.sort();
+            assert_eq!(left, want, "a temp was left behind");
+            std::fs::remove_file(&to).unwrap();
+        }
         std::fs::remove_dir_all(&root).unwrap();
     }
 

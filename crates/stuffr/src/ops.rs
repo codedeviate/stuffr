@@ -130,6 +130,14 @@ impl FromInput {
     /// regular file (followed through a symlink, as the read is), or (the
     /// quarantine alone) standard input redirected from one. Both are read
     /// from one descriptor.
+    ///
+    /// **Only a regular file is opened.** Opening a FIFO here would block
+    /// until a writer came, then close the only reader before `src.open()`
+    /// reopened it — the writer meeting `EPIPE`/`SIGPIPE` in between. So
+    /// the path is `stat`ed first; the open is `O_NONBLOCK` (a FIFO swapped
+    /// in after the `stat` cannot block it) and its descriptor is `fstat`ed
+    /// again before anything is read from it. The swap window itself (a
+    /// FIFO renamed in between the two) still opens that FIFO briefly.
     pub(crate) fn of(src: &Input) -> Self {
         let Some(path) = src.path() else {
             return Self {
@@ -137,7 +145,14 @@ impl FromInput {
                 quarantine: stdin_file().as_ref().and_then(crate::quarantine::read),
             };
         };
-        let Ok(file) = std::fs::File::open(path) else {
+        if !std::fs::metadata(path).is_ok_and(|md| md.is_file()) {
+            return Self::default();
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NONBLOCK);
+        let Ok(file) = opts.open(path) else {
             return Self::default();
         };
         let Ok(md) = file.metadata() else {
@@ -329,7 +344,7 @@ impl Output {
                     create_temp_file(&parent, &file_name, exists || from.mode.is_some())?;
                 from.stamp(&f);
                 if let Some(perms) = carry_over_perms {
-                    // Mask off setuid/setgid (0o6000) before applying: a
+                    // Mask off setuid/setgid and sticky (0o7000) before applying: a
                     // destination that happened to carry either bit must
                     // never propagate it onto a freshly compressed or
                     // decompressed artefact — that is never what a user
@@ -338,7 +353,7 @@ impl Output {
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        let mut masked = perms.mode() & !0o6000;
+                        let mut masked = perms.mode() & !0o7000;
                         if let Some(input) = from.mode {
                             masked &= input | !0o777;
                         }
@@ -1233,6 +1248,12 @@ impl ConvertSource {
     /// its own report once the walk is over (`entries::open_resolved`).
     pub(crate) fn fidelity_sink(&self) -> stuffr_core::FidelitySink {
         self.fidelity.clone()
+    }
+
+    /// What an output of this source takes from it (its quarantine, for an
+    /// archive `convert` writes).
+    pub(crate) fn input_traits(&self) -> &FromInput {
+        &self.from_input
     }
 
     pub(crate) fn into_parts(self) -> ConvertParts {

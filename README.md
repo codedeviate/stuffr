@@ -2519,8 +2519,10 @@ A single-stream output (`pack a.txt -o a.txt.gz`, `unpack a.gz -o a`,
 file stays 0600. On macOS the input's quarantine attribute
 (`com.apple.quarantine`) is carried onto every file and directory `unpack` and
 `salvage` create and onto a single-stream output, as Apple's tar and unzip do,
-so Gatekeeper still checks what came out of a downloaded archive (symlinks are
-not stamped).
+so Gatekeeper still checks what came out of a downloaded archive, and onto an
+archive `convert` writes from a quarantined one. Symlinks are not stamped by
+these verbs (the unzip compatibility link does stamp them, as Apple's unzip
+does).
 
 **One window is deliberately still open, and it is worth stating plainly.** The
 symlinked-component check is the only containment check that consults the

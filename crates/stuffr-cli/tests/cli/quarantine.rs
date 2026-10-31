@@ -161,3 +161,40 @@ fn a_single_stream_decode_carries_the_quarantine() {
     ]);
     assert_eq!(quarantine_of(&out), None);
 }
+
+/// Review M2: converting a quarantined archive to another container must
+/// not launder it — the new archive carries the quarantine too.
+#[test]
+fn convert_between_containers_carries_the_quarantine() {
+    let dir = tmp_dir();
+    let tree = dir.join("tree");
+    std::fs::create_dir(&tree).unwrap();
+    std::fs::write(tree.join("a.txt"), b"alpha").unwrap();
+    let zip = dir.join("t.zip");
+    ok(&["pack", tree.to_str().unwrap(), "-o", zip.to_str().unwrap()]);
+    quarantine(&zip);
+    let tgz = dir.join("t.tar.gz");
+    ok(&[
+        "convert",
+        zip.to_str().unwrap(),
+        "-o",
+        tgz.to_str().unwrap(),
+    ]);
+    assert_eq!(quarantine_of(&tgz).as_deref(), Some(VALUE));
+
+    let clean = dir.join("clean.zip");
+    ok(&[
+        "pack",
+        tree.to_str().unwrap(),
+        "-o",
+        clean.to_str().unwrap(),
+    ]);
+    let out = dir.join("clean.tar.gz");
+    ok(&[
+        "convert",
+        clean.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(quarantine_of(&out), None);
+}

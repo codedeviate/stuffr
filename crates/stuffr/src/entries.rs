@@ -877,8 +877,9 @@ impl Default for ExtractOpts {
 /// itself, which SETS the mask: it is swapped for `0o077` and put straight
 /// back. Another thread creating a file inside that window gets a mode
 /// MORE restrictive than it asked for, never a wider one — that is why the
-/// placeholder is `0o077` and not `0`. The `stuffr` binary calls this from
-/// one thread. `0` off unix, where there are no mode bits to mask.
+/// placeholder is `0o077` and not `0`. Calls through stuffr are serialised
+/// by a lock; code outside stuffr calling `umask(2)` concurrently is not,
+/// and can interleave with the pair. `0` off unix, where there are no mode bits to mask.
 pub fn process_umask() -> u32 {
     #[cfg(unix)]
     {
@@ -893,6 +894,15 @@ pub fn process_umask() -> u32 {
         {
             return mask & 0o777;
         }
+        // Two callers in this process interleaving their swap-and-restore
+        // could leave the placeholder installed for good (T1 sets 0o077 and
+        // reads 022, T2 sets 0o077 and reads 0o077, T1 restores 022, T2
+        // "restores" 0o077), so stuffr's own reads are serialised. A
+        // caller outside stuffr setting the umask meanwhile can still race.
+        static UMASK_READ: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = UMASK_READ
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // SAFETY: `umask` cannot fail and only swaps the process's mask;
         // the second call restores the value the first returned.
         let old = unsafe {
@@ -1162,7 +1172,7 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
                     return Ok(());
                 }
                 let mut out =
-                    match skip_if_name_refused(std::fs::File::create(&target), &meta.name)? {
+                    match skip_if_name_refused(create_entry_file(&target, &meta), &meta.name)? {
                         Ok(out) => out,
                         Err(w) => {
                             warnings.push(w);
@@ -1701,7 +1711,7 @@ fn copy_link_target(
     budget.charge(&meta.name, len)?;
     // `hard_link` failing on a name too long falls through to here, and
     // the create meets the same refusal: one skip, never exit 1.
-    let mut out = match skip_if_name_refused(std::fs::File::create(link_path), &meta.name)? {
+    let mut out = match skip_if_name_refused(create_entry_file(link_path, meta), &meta.name)? {
         Ok(out) => out,
         Err(w) => {
             warnings.push(w);
@@ -1732,6 +1742,23 @@ fn copy_link_target(
     let missing = apply_metadata(&out, meta, stamp.mode_bits);
     warn_metadata(warnings, &meta.name, missing);
     Ok(Some((MadeKind::Hardlink, copied)))
+}
+
+/// `File::create(path)` for an entry's payload — created 0600 when the
+/// entry carries a mode, which [`apply_metadata`] sets by descriptor once
+/// the data is written, so an archived 0600 file never sits wider while
+/// being filled (the umask default would be 0644). An entry without a mode
+/// keeps `File::create`'s umask default.
+fn create_entry_file(path: &Path, meta: &EntryMeta) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    if meta.mode.is_some() {
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = meta;
+    opts.open(path)
 }
 
 /// The permission bits extraction restores.
@@ -4141,7 +4168,15 @@ pub fn create_archive(
         archive,
         finish,
         bytes_out,
-    } = create_target(kind.as_ref(), encoder, &dst, o.level, o.force, o.sync)?;
+    } = create_target(
+        kind.as_ref(),
+        encoder,
+        &dst,
+        o.level,
+        o.force,
+        o.sync,
+        &crate::ops::FromInput::default(),
+    )?;
 
     // Read once, outside the closure: what this container can and cannot
     // represent decides whether a directory or symlink is written or warned
@@ -4516,6 +4551,13 @@ pub fn convert_archive_source_with(
     // The rung is the RAW source's; the container's own report, from the
     // ladder that actually opened it, is the one that describes this read.
     let sink = src.fidelity_sink();
+    // Its quarantine only (macOS): an archive converted from a quarantined
+    // one stays quarantined (EXTRACT-3); the mode is not carried, as for
+    // any archive written from many entries.
+    let from = crate::ops::FromInput {
+        mode: None,
+        quarantine: src.input_traits().quarantine.clone(),
+    };
     let (chain, decoded, consumed, _raw_rung, compressed_total) = src.into_parts();
     let (mut ar, source_container) = open_resolved(
         registry,
@@ -4532,7 +4574,15 @@ pub fn convert_archive_source_with(
         archive,
         finish,
         bytes_out,
-    } = create_target(kind.as_ref(), encoder, &dst, o.level, o.force, o.sync)?;
+    } = create_target(
+        kind.as_ref(),
+        encoder,
+        &dst,
+        o.level,
+        o.force,
+        o.sync,
+        &from,
+    )?;
     let caps = kind.caps();
     // A link into a target that cannot store one is written as a copy of
     // its target's bytes, kept here as they stream past (see `link_cache`).
@@ -4841,9 +4891,10 @@ fn create_target(
     level: Option<i32>,
     force: bool,
     sync: bool,
+    from: &crate::ops::FromInput,
 ) -> Result<ArchiveTarget> {
-    // An archive written from many inputs takes no single input's mode.
-    let opened = dst.create(force, sync, &crate::ops::FromInput::default())?;
+    // `pack` passes nothing; `convert` passes the source's quarantine.
+    let opened = dst.create(force, sync, from)?;
     let finish = opened.finish;
     // `CountingWriter` is innermost, closest to the file, so `bytes_out`
     // counts the bytes that actually land on disk — compressed, when there is
@@ -5925,10 +5976,12 @@ fn create_dir_once(path: &Path) -> std::io::Result<bool> {
 /// Re-opens a directory this run created, for its deferred metadata,
 /// without following a symlink swapped in at its last component
 /// (`O_NOFOLLOW|O_DIRECTORY`), and refuses what is there now unless it is
-/// the inode the run created (`expected`, from [`MadeByRun::created_dir`]) —
-/// which also catches an ANCESTOR swapped for a symlink, since that leads to
-/// some other inode (security audit EXTRACT-5). The deferral window is the
-/// whole extraction, so a local writer has all of it to make the swap.
+/// the inode the run recorded (`expected`, from [`MadeByRun::created_dir`])
+/// (security audit EXTRACT-5). The deferral window is the whole extraction,
+/// so a local writer has all of it to make the swap. An ancestor swapped
+/// for a symlink AFTER the recording leads to some other inode and is
+/// refused too; the recording itself is an `lstat` by path right after
+/// `mkdir`, so a swap inside that instant would be recorded as the run's.
 /// Off unix: a plain open, and no identity to compare.
 fn open_created_dir(path: &Path, expected: Option<(u64, u64)>) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
@@ -6704,6 +6757,24 @@ mod tests {
         std::fs::rename(&parent, root.join("p-moved")).unwrap();
         std::os::unix::fs::symlink(&decoy, &parent).unwrap();
         assert!(open_created_dir(&child, child_id).is_err());
+    }
+
+    /// Review M5: an entry carrying a mode is created 0600 and only widened
+    /// once its data is written; one without keeps `File::create`'s default.
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_file_is_created_private_until_its_mode_is_applied() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = ScratchDir::create(&format!("stuffr-entries-create-{}", std::process::id()));
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let moded = EntryMeta {
+            mode: Some(0o644),
+            ..Default::default()
+        };
+        create_entry_file(&root.join("m"), &moded).unwrap();
+        assert_eq!(mode(&root.join("m")), 0o600);
+        create_entry_file(&root.join("n"), &EntryMeta::default()).unwrap();
+        assert_eq!(mode(&root.join("n")), 0o666 & !process_umask());
     }
 
     /// EXTRACT-2: a restored mode is masked by the process umask unless
