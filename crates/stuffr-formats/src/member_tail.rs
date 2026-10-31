@@ -36,9 +36,12 @@
 //! window too (`FullReset`), so a reset member costs nearly what a new one
 //! does. The bound is on work instead: [`FREE_MEMBERS`] members are free, and
 //! each further one must be paid for by [`BYTES_PER_MEMBER`] bytes read or
-//! decoded, or the stream is refused as a resource limit (exit 6). Real
-//! multi-member files (pigz, bgzip's 64 KiB blocks, pbzip2's 900 KB blocks,
-//! `gzip >>` appends) never come near it.
+//! decoded, or the stream is refused as a resource limit (exit 6). A gzip
+//! member is at least 20 bytes and a bzip2 stream 14, so a run of empty ones
+//! still exhausts the budget within a few thousand (~6,000 for gzip), while
+//! any member carrying real data pays its way: one 40-byte log line appended
+//! as its own gzip member moves ~100 bytes. pigz, bgzip's 64 KiB blocks,
+//! pbzip2's 900 KB blocks and `gzip >>` appends never come near it.
 
 use std::io::{self, BufRead, ErrorKind, Read};
 
@@ -138,10 +141,15 @@ impl<R: Read> BufRead for PeekBuf<R> {
 /// one.
 pub(crate) const FREE_MEMBERS: u64 = 4096;
 
-/// Bytes read or decoded that pay for one member past [`FREE_MEMBERS`]. A
-/// member's set-up is tens of KiB of zeroing, so this keeps the set-up work
-/// within roughly a hundred times the bytes the stream actually moves.
-pub(crate) const BYTES_PER_MEMBER: u64 = 512;
+/// Bytes read or decoded that pay for one member past [`FREE_MEMBERS`].
+///
+/// Low on purpose (controller ruling on the first value, 512): files of
+/// per-line appended gzip members move ~100-200 bytes a member and must
+/// decode, while an empty member (gzip 20 bytes, bzip2 14) can never pay 64.
+/// A member's set-up is tens of KiB of zeroing, so the set-up work stays
+/// within roughly a thousand times the bytes the stream moves — bounded,
+/// where it was unbounded per input byte before (a 20 MB file: tens of GB).
+pub(crate) const BYTES_PER_MEMBER: u64 = 64;
 
 /// Counts the members a multi-member decoder starts against the bytes it
 /// reads and produces; see the module doc for why.

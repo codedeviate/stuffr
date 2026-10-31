@@ -2259,7 +2259,7 @@ the end of the archive: `list`, `test`, `unpack -C`, `cat FILE ENTRY` and
 entry-mode `convert` print it, and the verbs that take `--strict-fidelity` exit 4.
 Each member costs a fresh decoder, so the number a file may start is bounded
 by the bytes it moves: 4096 are free, and each further member must be paid for
-by 512 bytes read or decoded, or the file is refused as a resource limit (exit 6).
+by 64 bytes read or decoded, or the file is refused as a resource limit (exit 6).
 A file of a million empty 20-byte gzip members used to cost tens of GB of
 zeroing with no output for `--max-ratio` to see.
 

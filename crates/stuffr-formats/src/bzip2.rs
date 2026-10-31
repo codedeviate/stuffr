@@ -686,6 +686,16 @@ mod tests {
         assert_eq!(decompress(packed), member.repeat(count));
     }
 
+    /// The controller's ruling on the price: a log appended one line per
+    /// member (members of ~100 bytes in and out) decodes in full.
+    #[test]
+    fn fifty_thousand_one_line_members_decode_in_full() {
+        let line = b"2026-10-31T10:39:06Z host app[42]: ok\n";
+        assert_eq!(line.len(), 38);
+        let packed = compress(line).repeat(50_000);
+        assert_eq!(decompress(packed), line.repeat(50_000));
+    }
+
     /// The T10 review's M2: bzip2's tail rule judges ten header bytes (`BZh`,
     /// the level, and a block or end-of-stream magic), more than gzip's four,
     /// so a source handing out one byte per read must still show all ten —
