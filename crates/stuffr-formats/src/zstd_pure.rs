@@ -683,7 +683,13 @@ fn declared_window(header: &[u8]) -> Option<u64> {
 /// 96 MiB window), the same "declaration, not RSS" bound `xz_pure.rs`'s
 /// pre-flight sets.
 fn check_window(window: u64, memory_limit: Option<u64>) -> std::io::Result<()> {
-    if window > PURE_WINDOW_CAP {
+    // The tighter constraint is tested first, so the message names the one
+    // that actually binds: a limit below the cap refuses before the cap
+    // would (raising --memory-limit is then the remedy, not a rebuild); at
+    // or above the cap only the cap can refuse, and its message names the
+    // build that lifts it.
+    let limit_binds = memory_limit.is_some_and(|limit| limit < PURE_WINDOW_CAP);
+    if !limit_binds && window > PURE_WINDOW_CAP {
         return Err(window_over_pure_cap(window));
     }
     if let Some(limit) = memory_limit
@@ -1256,16 +1262,13 @@ mod tests {
             "every malformed-input error here must classify as InvalidData once \
              NormalizeDecodeErrors has run — {other_kind} positions did not"
         );
-        // Measured, not merely bounded: 9 of 4105 detected (8 InvalidData,
-        // plus byte 5 as a resource refusal) (structural
-        // framing bytes only — no checksum exists to catch a corrupted
-        // literal), 4096 silently wrong, and no silently-unchanged
-        // window-descriptor position the other two sweeps hit. A
-        // dramatically weaker showing than either checksummed sweep above,
-        // which is the whole point of this test — see the `decoder` doc's
-        // disclosure this backs.
-        // Byte 5 (the window descriptor) is the ninth detected position,
-        // refused as a resource limit — `sweep` pins it.
+        // Measured, not merely bounded: 9 of 4105 positions detected, all
+        // structural framing bytes (no checksum exists to catch a corrupted
+        // literal) — 8 as InvalidData, and byte 5 (the window descriptor) as
+        // a resource refusal, which `sweep` pins — 4096 silently wrong, and
+        // no silently-unchanged position. A dramatically weaker showing than
+        // either checksummed sweep above, which is the whole point of this
+        // test — see the `decoder` doc's disclosure this backs.
         assert_eq!(
             invalid_data,
             8,
@@ -1544,12 +1547,18 @@ mod window_tests {
     const WD_128_MIB: u8 = 17 << 3;
     const WD_144_MIB: u8 = (17 << 3) | 1;
 
-    /// One real frame of `payload` from this codec's own encoder, its header
-    /// rewritten to carry `window_descriptor` (and only that). The encoder
-    /// writes a single-segment header, whose window is its content size; the
-    /// patch clears Single_Segment_Flag and inserts the descriptor byte, which
-    /// leaves a valid frame: the FCS field keeps its width (flag 0 then means
-    /// "no field", so a one-byte field is not kept — see the assertion).
+    /// One real frame of `payload` from this codec's own encoder, its
+    /// Window_Descriptor (byte 5) rewritten to `window_descriptor`, which
+    /// leaves a valid frame declaring a larger window than the encoder used.
+    ///
+    /// `ruzstd` 0.9.1's `FrameCompressor` writes `single_segment: false`, so
+    /// the header always carries a Window_Descriptor right after the frame
+    /// header descriptor. The assertion pins that: should a later `ruzstd`
+    /// write a single-segment header (window = content size, no descriptor
+    /// byte), this helper must instead clear Single_Segment_Flag and insert
+    /// the descriptor at byte 5 — which keeps a valid frame only when the FCS
+    /// field is two bytes or wider (FCS flag 0 means "no field" once the
+    /// flag is clear), i.e. a payload of 256 bytes or more.
     fn frame_declaring(window_descriptor: u8, payload: &[u8]) -> Vec<u8> {
         let buf = SharedBuf::new();
         let mut sink = Zstd
@@ -1558,21 +1567,12 @@ mod window_tests {
         sink.write_all(payload).unwrap();
         sink.finish().unwrap();
         let mut frame = buf.contents();
-        let descriptor = frame[4];
-        let fcs_flag = descriptor >> 6;
-        if descriptor & 0x20 == 0 {
-            frame[5] = window_descriptor;
-            return frame;
-        }
-        assert_ne!(
-            fcs_flag, 0,
-            "a one-byte single-segment FCS cannot survive clearing the flag; \
-             use a payload of 256 bytes or more"
+        assert_eq!(
+            frame[4] & 0x20,
+            0,
+            "ruzstd now writes a single-segment header; see this helper's doc"
         );
-        frame[4] = descriptor & !0x20;
-        // Window_Descriptor sits right after the descriptor, before any
-        // Dictionary_ID and Frame_Content_Size.
-        frame.insert(5, window_descriptor);
+        frame[5] = window_descriptor;
         frame
     }
 
@@ -1673,6 +1673,63 @@ mod window_tests {
         );
         // A generous limit does not lift the cap, and the cap's message wins.
         let err = decode(frame_declaring(WD_144_MIB, &payload()), Some(1 << 40)).unwrap_err();
+        assert!(err.to_string().contains("c-backed"), "{err}");
+    }
+
+    #[test]
+    fn a_later_frame_is_checked_when_the_source_yields_one_byte_per_read() {
+        // Pins `Replay::read_up_to`'s fill loop: the header must be gathered
+        // across many short reads, at the second frame's start too.
+        struct OneByte(std::io::Cursor<Vec<u8>>);
+        impl Read for OneByte {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = buf.len().min(1);
+                self.0.read(&mut buf[..n])
+            }
+        }
+        let mut two = frame_declaring(WD_1_MIB, &payload());
+        two.extend_from_slice(&frame_declaring(WD_96_MIB, &payload()));
+        let open = |bytes: Vec<u8>, memory_limit| {
+            let src: Box<dyn Source> =
+                Box::new(ReaderSource::new(OneByte(std::io::Cursor::new(bytes))));
+            let mut dec = Zstd
+                .decoder(
+                    src,
+                    &DecodeOpts {
+                        memory_limit,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let mut out = Vec::new();
+            dec.read_to_end(&mut out).map(|_| out)
+        };
+        let mut both = payload();
+        both.extend_from_slice(&payload());
+        assert_eq!(open(two.clone(), Some(128 * MIB)).unwrap(), both);
+
+        let err = Error::from_decode_io(open(two, Some(8 * MIB)).unwrap_err());
+        assert!(matches!(err, Error::ResourceLimit(_)), "{err:?}");
+        assert!(err.to_string().contains("96 MiB"), "{err}");
+    }
+
+    #[test]
+    fn a_limit_below_the_cap_is_named_before_the_cap() {
+        // 144 MiB is over both the 1 MiB limit and the 128 MiB cap; the
+        // limit is the tighter constraint, so it is the one named.
+        let err = decode(frame_declaring(WD_144_MIB, &payload()), Some(MIB)).unwrap_err();
+        assert!(matches!(err, Error::ResourceLimit(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(
+            text.contains("--memory-limit") && text.contains("1 MiB") && !text.contains("c-backed"),
+            "{text}"
+        );
+        // A limit at the cap: only the cap can refuse, and it is named.
+        let err = decode(
+            frame_declaring(WD_144_MIB, &payload()),
+            Some(PURE_WINDOW_CAP),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("c-backed"), "{err}");
     }
 
