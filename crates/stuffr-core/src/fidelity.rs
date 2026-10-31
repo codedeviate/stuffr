@@ -268,7 +268,8 @@ pub enum Fidelity {
     ///
     /// `field` is one of `"name"`, `"compression method"`, `"CRC-32"`,
     /// `"compressed size"`, `"uncompressed size"`, `"encryption flag"`,
-    /// `"UTF-8 flag"`, `"entry count"` or `"order"`. `entry` is the name as
+    /// `"data-descriptor flag"`, `"UTF-8 flag"`, `"entry count"` or
+    /// `"order"`. `entry` is the name as
     /// the authoritative description (the central directory, when it was
     /// read) spells it, decoded as the reader decodes names.
     #[error(

@@ -1539,8 +1539,9 @@ const METHOD_AES: u16 = 99;
 /// 30-byte fixed block and the name, plus the extra field only when a size
 /// is `0xFFFFFFFF` and must be resolved from zip64. zip 9 reads the same
 /// fixed block when it opens the entry (`find_content`) and does not expose
-/// it, so this is the one extra read: at most 30 + name + extra bytes at an
-/// offset about to be read anyway. `None` on any failure: a header this
+/// it, so this is an extra read (ruling T4-a): at most 30 + name + extra
+/// bytes at an offset about to be read anyway. The only other one is
+/// [`read_central_name_and_flags`], for an entry with a Unicode Path field. `None` on any failure: a header this
 /// cannot read is left to zip's own path, which classifies it.
 fn read_local_claim<R: Read + Seek>(r: &mut R, header_start: u64) -> Option<HeaderClaim> {
     let mut fixed = [0u8; 30];
@@ -1637,30 +1638,16 @@ fn local_zip64_sizes(
 }
 
 /// The fields of ruling B3 on which `local` disagrees with `central`, in a
-/// fixed order.
+/// fixed order. Both claims hold their record's own raw bytes: the name and
+/// flags are compared exactly.
 ///
-/// `unicode_name` is the Info-ZIP Unicode Path field (0x7075) of a central
-/// record that has bit 11 set. zip replaces a central name with that field's
-/// content when its CRC-32 matches the original name, and sets bit 11 on its
-/// copy, so `central` may no longer hold the record's own name or bit. The
-/// local name then agrees when the field vouches for it (its CRC-32 is the
-/// local name's and its content is the name zip kept), and bit 11 is not
-/// compared: a writer that puts the field beside a clear bit 11 would
-/// otherwise warn on every such entry, for a bit zip itself set.
-fn disagreeing_fields(
-    central: &HeaderClaim,
-    local: &HeaderClaim,
-    unicode_name: Option<&zip::extra_fields::UnicodeExtraField>,
-) -> Vec<&'static str> {
+/// CRC-32 and the sizes are compared only when neither record sets bit 3. A
+/// bit 3 set on one side only is itself a disagreement ("data-descriptor
+/// flag", ruling T4-b): otherwise one flipped bit would switch those checks
+/// off unseen.
+fn disagreeing_fields(central: &HeaderClaim, local: &HeaderClaim) -> Vec<&'static str> {
     let mut out = Vec::new();
-    let renamed = unicode_name.is_some();
-    let name_agrees = local.name == central.name
-        || unicode_name.is_some_and(|u| {
-            u.clone()
-                .unwrap_valid(&local.name)
-                .is_ok_and(|content| *content == *central.name)
-        });
-    if !name_agrees {
+    if local.name != central.name {
         out.push("name");
     }
     if central.method != local.method && central.method != METHOD_AES && local.method != METHOD_AES
@@ -1681,13 +1668,37 @@ fn disagreeing_fields(
             out.push("uncompressed size");
         }
     }
-    if (central.flags ^ local.flags) & FLAG_ENCRYPTED != 0 {
+    let flags_differ = central.flags ^ local.flags;
+    if flags_differ & FLAG_ENCRYPTED != 0 {
         out.push("encryption flag");
     }
-    if !renamed && (central.flags ^ local.flags) & FLAG_UTF8 != 0 {
+    if flags_differ & FLAG_DATA_DESCRIPTOR != 0 {
+        out.push("data-descriptor flag");
+    }
+    if flags_differ & FLAG_UTF8 != 0 {
         out.push("UTF-8 flag");
     }
     out
+}
+
+/// The flags and raw name of the central-directory record at `at`, read
+/// from the record itself: 46 fixed bytes and the name. Needed only for an
+/// entry carrying an Info-ZIP Unicode Path field (0x7075), because zip 9
+/// replaces the name it keeps with that field's content (when the field's
+/// CRC-32 matches the original name) and sets bit 11 on its copy, so its
+/// view no longer holds the record's own name or flags. `None` on any
+/// failure.
+fn read_central_name_and_flags<R: Read + Seek>(r: &mut R, at: u64) -> Option<(u16, Vec<u8>)> {
+    let mut fixed = [0u8; 4 + CENTRAL_HEADER_FIXED];
+    r.seek(SeekFrom::Start(at)).ok()?;
+    r.read_exact(&mut fixed).ok()?;
+    if fixed[..4] != SIG_CENTRAL_HEADER {
+        return None;
+    }
+    let flags = le16(&fixed[8..10]);
+    let mut name = vec![0u8; usize::from(le16(&fixed[28..30]))];
+    r.read_exact(&mut name).ok()?;
+    Some((flags, name))
 }
 
 impl ZipIndexed {
@@ -1701,34 +1712,47 @@ impl ZipIndexed {
         if !self.compared.insert(index) {
             return;
         }
-        let (central, header_start, unicode_name) = {
+        let (mut central, header_start, central_start, renamed) = {
             // `by_index_raw` decodes nothing and reads only the local fixed
             // block zip reads to open the entry anyway (cached after).
             let Ok(raw) = self.archive.by_index_raw(index) else {
                 return;
             };
-            let flags = raw.flags().as_u16();
             #[allow(deprecated)] // the raw method id; zip offers no other spelling
             let method = raw.compression().to_u16();
             let central = HeaderClaim {
                 name: raw.name_raw().to_vec(),
-                flags,
+                flags: raw.flags().as_u16(),
                 method,
                 crc: Some(raw.crc32()),
                 csize: Some(raw.compressed_size()),
                 usize_: Some(raw.size()),
             };
-            let unicode_name = raw.extra_data_fields().find_map(|f| match f {
-                zip::ExtraField::UnicodePath(u) if flags & FLAG_UTF8 != 0 => Some(u.clone()),
-                _ => None,
-            });
-            (central, raw.header_start(), unicode_name)
+            let renamed = raw
+                .extra_data_fields()
+                .any(|f| matches!(f, zip::ExtraField::UnicodePath(_)));
+            (
+                central,
+                raw.header_start(),
+                raw.central_header_start(),
+                renamed,
+            )
         };
+        // The warning names the entry as stuffr names it (zip's view, a valid
+        // Unicode Path applied); the comparison uses the record's own bytes.
+        let entry = entry_name(&central.name, central.flags);
+        if renamed {
+            let Some((flags, name)) = read_central_name_and_flags(&mut self.handle, central_start)
+            else {
+                return;
+            };
+            central.flags = flags;
+            central.name = name;
+        }
         let Some(local) = read_local_claim(&mut self.handle, header_start) else {
             return;
         };
-        let entry = entry_name(&central.name, central.flags);
-        for field in disagreeing_fields(&central, &local, unicode_name.as_ref()) {
+        for field in disagreeing_fields(&central, &local) {
             self.report.warn(Fidelity::HeadersDisagree {
                 format: ZIP,
                 entry: entry.clone(),
@@ -3967,13 +3991,14 @@ mod tests {
     #[test]
     fn each_compared_field_differing_in_the_local_header_alone_is_reported() {
         type Patch = fn(&mut Vec<u8>);
-        let rows: [(&str, Patch); 6] = [
+        let rows: [(&str, Patch); 7] = [
             ("compression method", |b| put16(b, LH_METHOD, 8)),
             ("CRC-32", |b| b[LH_CRC] ^= 1),
             ("compressed size", |b| put32(b, LH_CSIZE, 8)),
             ("uncompressed size", |b| put32(b, LH_USIZE, 8)),
             ("encryption flag", |b| put16(b, LH_FLAGS, 0x0001)),
             ("UTF-8 flag", |b| put16(b, LH_FLAGS, 0x0800)),
+            ("data-descriptor flag", |b| put16(b, LH_FLAGS, 0x0008)),
         ];
         for (field, patch) in rows {
             let mut bytes = raw_zip(b"a.txt", 0, &[], b"payload");
@@ -4083,29 +4108,127 @@ mod tests {
         assert_eq!(found, vec![("a.txt".to_string(), "name")]);
     }
 
-    /// zip 9 replaces a central name with a valid Info-ZIP Unicode Path
-    /// (0x7075) and sets bit 11 on its copy. The local header still carries
-    /// the original bytes and flags, which is agreement, not a cloak.
-    #[test]
-    fn a_unicode_path_extra_field_is_not_a_disagreement() {
-        let raw_name = b"caf\x82.txt"; // CP437 for "café.txt"
-        let unicode = "café.txt".as_bytes();
+    /// One `raw_zip` whose two records carry an Info-ZIP Unicode Path field
+    /// (0x7075) vouching for `raw_name` (its CRC-32) and naming `unicode`.
+    fn unicode_path_zip(raw_name: &[u8], unicode: &str) -> Vec<u8> {
+        let unicode = unicode.as_bytes();
         let mut extra = Vec::new();
         extra.extend_from_slice(&0x7075u16.to_le_bytes());
         extra.extend_from_slice(&((1 + 4 + unicode.len()) as u16).to_le_bytes());
         extra.push(1); // version
         extra.extend_from_slice(&crc32(raw_name).to_le_bytes());
         extra.extend_from_slice(unicode);
-        let bytes = raw_zip(raw_name, 0, &extra, b"payload");
+        raw_zip(raw_name, 0, &extra, b"payload")
+    }
 
+    /// zip 9 replaces a central name with a valid Info-ZIP Unicode Path
+    /// (0x7075) and sets bit 11 on its copy. The local header still carries
+    /// the record's original bytes and flags, which is agreement, not a cloak.
+    #[test]
+    fn a_unicode_path_extra_field_is_not_a_disagreement() {
+        let bytes = unicode_path_zip(b"caf\x82.txt", "café.txt"); // CP437 "café.txt"
         let (payloads, found) = read_with_disagreements(&bytes);
         assert_eq!(found, vec![]);
         assert_eq!(payloads, vec![b"payload".to_vec()]);
-        // And a cloaked local name under the same extra field still warns.
+        // And a cloaked local name under the same extra field still warns,
+        // named as stuffr names the entry.
         let mut cloaked = bytes.clone();
         cloaked[LH_NAME] = b'C';
         let (_, found) = read_with_disagreements(&cloaked);
         assert_eq!(found, vec![("café.txt".to_string(), "name")]);
+    }
+
+    /// The review's attack: a local name that differs from the central
+    /// record's raw name but has the same CRC-32, the one value a Unicode
+    /// Path field vouches with. CRC-32 is linear, so such a name is cheap to
+    /// make. The raw names are compared, so it is reported.
+    #[test]
+    fn a_local_name_sharing_the_central_names_crc_is_still_reported() {
+        let central = b"0008ddf9.txt";
+        let local = b"02008894.txt";
+        assert_eq!(crc32(central), crc32(local), "the pair must collide");
+        let mut bytes = unicode_path_zip(central, "unicode-é.txt");
+        bytes[LH_NAME..LH_NAME + local.len()].copy_from_slice(local);
+        let (payloads, found) = read_with_disagreements(&bytes);
+        assert_eq!(found, vec![("unicode-é.txt".to_string(), "name")]);
+        assert_eq!(payloads, vec![b"payload".to_vec()]);
+    }
+
+    /// Bit 11 is compared with the central record's own bit, even where zip
+    /// set it on its copy for a Unicode Path field.
+    #[test]
+    fn the_utf8_flag_is_compared_with_the_central_records_own_bit() {
+        let mut bytes = unicode_path_zip(b"caf\x82.txt", "café.txt");
+        put16(&mut bytes, LH_FLAGS, 0x0800);
+        let (_, found) = read_with_disagreements(&bytes);
+        assert_eq!(found, vec![("café.txt".to_string(), "UTF-8 flag")]);
+    }
+
+    /// Ruling T4-b: bit 3 on one side only switches the CRC and size checks
+    /// off, so it is itself reported, whichever record sets it.
+    #[test]
+    fn a_data_descriptor_flag_on_one_side_only_is_reported() {
+        let mut local_only = raw_zip(b"a.txt", 0, &[], b"payload");
+        put16(&mut local_only, LH_FLAGS, 0x0008);
+        let (payloads, found) = read_with_disagreements(&local_only);
+        assert_eq!(found, vec![("a.txt".to_string(), "data-descriptor flag")]);
+        assert_eq!(payloads, vec![b"payload".to_vec()]);
+
+        let mut central_only = raw_zip(b"a.txt", 0, &[], b"payload");
+        let eocd = central_only.len() - 22;
+        let cd_start = le32(&central_only[eocd + 16..eocd + 20]) as usize;
+        put16(&mut central_only, cd_start + 8, 0x0008);
+        // And the local CRC lies, which bit 3 on one side alone must not hide
+        // behind: the flag is what is reported.
+        central_only[LH_CRC] ^= 1;
+        let (_, found) = read_with_disagreements(&central_only);
+        assert_eq!(found, vec![("a.txt".to_string(), "data-descriptor flag")]);
+    }
+
+    /// A hostile local header is left to zip's own open: no comparison, no
+    /// `HeadersDisagree`, and the error it always raised (never exit 1).
+    #[test]
+    fn a_hostile_local_header_raises_no_disagreement_and_keeps_its_error() {
+        fn walk(bytes: &[u8]) -> (Option<i32>, Vec<(String, &'static str)>) {
+            let mut ar = match try_open_seekable(bytes) {
+                Ok(ar) => ar,
+                Err(e) => return (Some(e.exit_code()), vec![]),
+            };
+            let mut code = None;
+            loop {
+                match ar.next_entry() {
+                    Ok(Some(mut e)) => {
+                        let mut d = Vec::new();
+                        if let Err(err) = e.reader().read_to_end(&mut d) {
+                            code = Some(Error::from_decode_io(err).exit_code());
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        code = Some(e.exit_code());
+                        break;
+                    }
+                }
+            }
+            (code, disagreements(ar.fidelity()))
+        }
+
+        // The local name length runs past the end of the file.
+        let mut long_name = raw_zip(b"a.txt", 0, &[], b"payload");
+        put16(&mut long_name, 26, u16::MAX);
+        let (code, found) = walk(&long_name);
+        assert_eq!(found, vec![]);
+        assert_eq!(code, Some(5), "a name past EOF");
+
+        // The central record's local-header offset points past the end.
+        let mut far = raw_zip(b"a.txt", 0, &[], b"payload");
+        let eocd = far.len() - 22;
+        let cd_start = le32(&far[eocd + 16..eocd + 20]) as usize;
+        put32(&mut far, cd_start + 42, 0x7FFF_0000);
+        let (code, found) = walk(&far);
+        assert_eq!(found, vec![]);
+        assert_eq!(code, Some(5), "a local header past EOF");
     }
 
     /// Zip64: the local header's 32-bit sizes are 0xFFFFFFFF and the real
