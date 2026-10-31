@@ -2327,6 +2327,38 @@ fn a_file_of_empty_members_is_a_resource_limit() {
         assert!(stderr.contains("starts more members"), ".{ext}: {stderr}");
         assert!(!output.exists(), ".{ext}: nothing published");
     }
+
+    // The T10 re-review's M3: the same run of empty members behind a valid
+    // `.tar.gz`'s gzip member is read by the container's end-of-walk drain;
+    // `test` must answer exit 6 there too, never 1.
+    let tarball = packed_tree(&dir, "e.tar.gz");
+    let empty = packed(&dir, "empty2.gz", b"");
+    let input = dir.join("tail-of-empties.tar.gz");
+    std::fs::write(&input, [tarball, empty.repeat(100_000)].concat()).unwrap();
+    let out = run_output(&["test", input.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(6), ".tar.gz: {stderr}");
+    assert!(stderr.contains("starts more members"), ".tar.gz: {stderr}");
+}
+
+/// The T10 re-review's M4: entry-mode `cat` prints the read's fidelity
+/// warnings on stderr (since T10b), and stdout still carries exactly the
+/// entry's bytes. A piped zip whose first local header disagrees with its
+/// central record ("cloaked") is the shape a forward zip read warns about.
+#[test]
+fn cat_of_an_entry_says_what_the_read_approximated_on_stderr_only() {
+    let dir = tmp_dir();
+    let zip = write_zip_via_pack(&dir, &[("a.txt", b"aaa\n"), ("b.txt", b"bbb\n")]);
+    let cloaked = cloak_first_local_name(&std::fs::read(&zip).unwrap());
+    let out = run_with_stdin_output(&["cat", "-", "b.txt"], &cloaked);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert_eq!(out.stdout, b"bbb\n", "stdout is the entry and nothing else");
+    assert!(stderr.contains("fidelity warning"), "{stderr}");
+    assert!(
+        stderr.contains("local header and central directory disagree on name"),
+        "{stderr}"
+    );
 }
 
 /// The T10 re-review's M1: a stream of NESTED codecs (`.gz.gz`, `.xz.gz`)

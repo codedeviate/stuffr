@@ -352,6 +352,11 @@ STREAMING TO STDOUT
       above it, from the archive itself. `--index N` asks for the same
       entry-aware streaming by POSITION rather than by name — see --index
       under "EXTRACTING AN ARCHIVE'S ENTRIES" below.
+      What the read approximated is said on stderr, never mixed into the
+      entry's bytes on stdout: a piped zip whose local header disagrees with
+      its central directory, or junk after a `.tar.gz`'s gzip member (the
+      latter only once the walk reaches the end of the archive). cat has no
+      --strict-fidelity, so it still exits 0; `stuffr test` gates on them.
 
 
 CONVERTING BETWEEN FORMATS
@@ -511,12 +516,13 @@ INSPECTING A STREAM (DECODING AT MOST ITS FIRST 4 KiB)
 
   info decodes nothing past the first 4096 bytes (see `detected:` below),
   and it does not OPEN an archive either. So it reports `fidelity: not
-  evaluated` instead of "nothing approximated" wherever a forward read of
-  that container could genuinely have lost something and info has not
-  looked. Today that means zip, the only container here that keeps its index
-  at the END of the stream, whenever that zip will not be read
+  evaluated` instead of "nothing approximated" wherever a read could
+  genuinely have lost something that sits beyond what info looked at. Two
+  causes qualify today: a codec that judges its own end (gzip and bzip2,
+  next paragraph but one), and zip, the only container here that keeps its
+  index at the END of the stream, whenever that zip will not be read
   authoritatively (run `stuffr test` for the real answer; see "LISTING AND
-  TESTING" below). Two shapes qualify:
+  TESTING" below). For zip, two shapes qualify:
 
     * a zip on a pipe, and
     * a zip under a codec — `bundle.zip.gz` — however seekable the FILE
@@ -532,9 +538,10 @@ INSPECTING A STREAM (DECODING AT MOST ITS FIRST 4 KiB)
   (`notes.txt.gz`, `bundle.tar.gz`, `bundle.tar.bz2`): those files are
   concatenations of members, and what follows the last member is judged
   only at the end of the stream — junk there is a warning (and exit 4
-  under --strict-fidelity). For a bare stream info points at
-  `stuffr cat FILE >/dev/null`, which reads it whole (`test` takes
-  archives only); for an archive, at `stuffr test`.
+  under --strict-fidelity). For a bare stream, nested codecs included
+  (`notes.txt.gz.gz`), info points at `stuffr cat FILE >/dev/null`, which
+  reads it whole (`test` takes archives only); for an archive, a piped
+  `.tar.gz` included, at `stuffr test`.
 
   Everywhere else the claim is true and info still makes it: a seekable
   bare zip read its central directory, a tar, ar or cpio has no trailing

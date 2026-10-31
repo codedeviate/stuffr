@@ -2257,6 +2257,9 @@ a member boundary silently dropped every later member at exit 0. A codec under a
 container (`.tar.gz`, `.tar.bz2`) reports it the same way once the walk reaches
 the end of the archive: `list`, `test`, `unpack -C`, `cat FILE ENTRY` and
 entry-mode `convert` print it, and the verbs that take `--strict-fidelity` exit 4.
+`cat FILE ENTRY` now prints every fidelity warning of its read on stderr (it
+used to drop its report): stdout still carries the entry's bytes alone, and the
+exit stays 0, since `cat` has no `--strict-fidelity`.
 Each member costs a fresh decoder, so the number a file may start is bounded
 member by member: 4096 are free, and each further one must be paid for by 64
 bytes read or decoded, each member counting for at most 64 of its own bytes (so
