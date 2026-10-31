@@ -576,15 +576,6 @@ dependencies = [
 
 [[package]]
 name = "lzma-rust2"
-version = "0.20.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e2a88783b84d2d67ef2791778a9e76bfb68b8017aaf6c9d7d5f2626a478b16c"
-dependencies = [
- "sha2",
-]
-
-[[package]]
-name = "lzma-rust2"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1c46f3fcd2e888afdb01a07efc071cb21300e07c68d32c3e8b01b5c8cb1fcaa"
@@ -895,7 +886,7 @@ dependencies = [
  "libz-sys",
  "lz4-sys",
  "lz4_flex",
- "lzma-rust2 0.20.1",
+ "lzma-rust2",
  "newtua-lzw-z",
  "oxiarc-lzhuf",
  "ruzstd",
@@ -1168,7 +1159,7 @@ dependencies = [
  "flate2",
  "getrandom",
  "indexmap",
- "lzma-rust2 0.23.0",
+ "lzma-rust2",
  "memchr",
  "nix",
  "ppmd-rust",
