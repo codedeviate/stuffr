@@ -2582,7 +2582,12 @@ domain, so:
   wherever it points. Such a link (and one with an empty target) is **skipped,
   not created** — named in a warning, the rest extracted, exit 0 (4 under
   `--strict-fidelity`) — since GNU tar's `--transform` rewrites targets into
-  exactly that shape; a target that actually climbs out is still exit 7.
+  exactly that shape; a target that actually climbs out is still exit 7. On
+  Windows an entry name is also refused (exit 7) when a component would not
+  name the file it spells: one holding `:` (an NTFS alternate data stream), a
+  reserved device name (`CON`, `NUL.txt`, `com1`, `LPT9.dat`, any case, any
+  extension), a trailing dot or space (stripped, so `x.` lands on `x`), or a
+  character Windows refuses (`<>"|?*`, control characters).
 - **Bomb limits.** Default caps on total output and expansion ratio, so a 42 KB
   zip that expands to 4.5 PB fails fast instead of filling the disk. The error
   names the entry that tripped it.

@@ -32,7 +32,7 @@ pub use archive::{
 };
 pub use containment::{
     NameRefusal, SymlinkVerdict, check_symlink_target, classify_symlink_target,
-    name_refused_by_filesystem, safe_join,
+    name_refused_by_filesystem, safe_join, windows_name_hazard,
 };
 pub use display::fmt_name;
 pub use error::{Error, Result};

@@ -95,6 +95,24 @@ pub fn safe_join(dest: &Path, entry_name: &str) -> Result<PathBuf> {
             reason: reason.to_string(),
         }
     })?;
+    // EXTRACT-6: on Windows a component can be accepted above and still not
+    // name the file it spells — `a:b` writes an NTFS stream of `a`,
+    // `CON.txt` opens the console, `x.` and `x ` are stored as `x`. Refused
+    // there as the escapes they are; the predicate is tested everywhere.
+    #[cfg(windows)]
+    for comp in Path::new(entry_name).components() {
+        if let Component::Normal(part) = comp
+            && let Some(why) = part.to_str().and_then(windows_name_hazard)
+        {
+            return Err(Error::UnsafePath {
+                path: entry_name.to_string(),
+                reason: format!(
+                    "component `{}` {why}",
+                    crate::display::fmt_name(part.to_str().unwrap_or_default())
+                ),
+            });
+        }
+    }
 
     if out.as_os_str().is_empty() {
         return if pushed_a_component {
@@ -164,6 +182,59 @@ fn walk_within(
         }
     }
     Ok(())
+}
+
+/// Why one path component cannot be a Windows file name that means what it
+/// says, or `None` when it can (finding EXTRACT-6).
+///
+/// A pure predicate on the component's text, tested on every platform;
+/// [`safe_join`] applies it on Windows only, as an [`Error::UnsafePath`]
+/// refusal (exit 7). Elsewhere these names are ordinary files and are
+/// extracted as such. Flagged:
+///
+/// - **`:`** — `name:stream` writes an NTFS alternate data stream of `name`
+///   (and `C:x` is drive-relative); the file the archive names never exists.
+/// - **A reserved device name** — `CON`, `PRN`, `AUX`, `NUL`, `CONIN$`,
+///   `CONOUT$`, `COM0`-`COM9`, `LPT0`-`LPT9` and `COM`/`LPT` with a
+///   superscript `¹` `²` `³`, in any case, alone or before any extension
+///   (`nul.tar.gz`), trailing spaces before the extension included
+///   (`CON .txt`): opening one opens the device, not a file.
+/// - **A trailing `.` or space** — Win32 strips them, so `x.` and `x `
+///   land on `x`, another entry's file.
+/// - **`<` `>` `"` `|` `?` `*`, or a control character** — names Windows
+///   refuses outright; refused here with a reason rather than left to
+///   surface as an I/O error.
+#[must_use]
+pub fn windows_name_hazard(component: &str) -> Option<&'static str> {
+    if component.contains(':') {
+        return Some("holds `:`, which Windows reads as an alternate data stream or a drive");
+    }
+    if component
+        .chars()
+        .any(|c| matches!(c, '<' | '>' | '"' | '|' | '?' | '*') || u32::from(c) < 0x20)
+    {
+        return Some("holds a character Windows does not allow in a file name");
+    }
+    if component.ends_with('.') || component.ends_with(' ') {
+        return Some("ends in a dot or a space, which Windows strips from a file name");
+    }
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or(component)
+        .trim_end_matches(' ');
+    let reserved = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+        .iter()
+        .any(|r| stem.eq_ignore_ascii_case(r));
+    let numbered = ["COM", "LPT"].iter().any(|p| {
+        stem.get(..3)
+            .is_some_and(|head| head.eq_ignore_ascii_case(p))
+            && matches!(
+                stem.get(3..),
+                Some("0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")
+            )
+    });
+    (reserved || numbered).then_some("is a reserved Windows device name")
 }
 
 /// [`classify_symlink_target`]'s skip reason for an empty target.
@@ -451,6 +522,89 @@ mod tests {
     use std::path::Path;
 
     use crate::error::Error;
+
+    #[test]
+    fn windows_name_hazards_are_flagged_on_every_platform() {
+        use super::windows_name_hazard as flagged;
+        for bad in [
+            "a:b",
+            "file.txt:hidden",
+            "C:",
+            "CON",
+            "con",
+            "Con.txt",
+            "nul.tar.gz",
+            "NUL ",
+            "CON .txt",
+            "aux.c",
+            "PRN",
+            "conin$",
+            "CONOUT$.log",
+            "COM0",
+            "com1",
+            "COM9.txt",
+            "lpt1",
+            "LPT9.dat",
+            "COM\u{b9}",
+            "lpt\u{b2}.txt",
+            "COM\u{b3}",
+            "x.",
+            "x ",
+            "dir...",
+            "a<b",
+            "a>b",
+            "a\"b",
+            "a|b",
+            "a?b",
+            "a*b",
+            "a\u{1}b",
+            "tab\there",
+        ] {
+            assert!(flagged(bad).is_some(), "{bad:?} should be flagged");
+        }
+        for good in [
+            "a",
+            "file.txt",
+            ".hidden",
+            "CONFIG",
+            "console.log",
+            "nullable.rs",
+            "auxiliary",
+            "COM10",
+            "COM",
+            "LPT",
+            "LPTX",
+            "com1x",
+            "x.CON",
+            "my CON.txt",
+            "COM\u{b4}",
+            "naïve 日本",
+            "a b",
+        ] {
+            assert_eq!(flagged(good), None, "{good:?} should pass");
+        }
+    }
+
+    /// On Windows those components are refused by `safe_join` (exit 7);
+    /// elsewhere they are ordinary names and are joined.
+    #[test]
+    fn safe_join_applies_the_windows_predicate_only_on_windows() {
+        let dest = Path::new("out");
+        for name in ["d/a:b", "CON.txt", "d/nul", "x.", "dir/x /f"] {
+            let r = super::safe_join(dest, name);
+            if cfg!(windows) {
+                match r {
+                    Err(Error::UnsafePath { path, reason }) => {
+                        assert_eq!(path, name);
+                        assert!(reason.starts_with("component `"), "{reason}");
+                    }
+                    other => panic!("expected UnsafePath for {name:?}, got {other:?}"),
+                }
+            } else {
+                assert_eq!(r.unwrap(), dest.join(name));
+            }
+        }
+    }
 
     #[test]
     fn absolute_traversal_and_escaping_symlinks_are_all_refused() {
