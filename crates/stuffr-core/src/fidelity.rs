@@ -306,6 +306,27 @@ pub enum Fidelity {
          nor padding; they were ignored"
     )]
     TrailingDataIgnored { format: FormatId, bytes: u64 },
+
+    /// The local headers of `entries` entries were not compared with their
+    /// central-directory records ([`Fidelity::HeadersDisagree`] could not be
+    /// ruled out for them), because the comparison ran out of its work
+    /// budget.
+    ///
+    /// Each comparison reads a local header — up to 128 KiB of name and extra
+    /// field — and an index whose records keep pointing at the same few fat
+    /// headers (or at headers overlapping one another) makes every record pay
+    /// that again. The reads are bounded by a budget proportional to the
+    /// archive's own length, generous enough that a well-formed archive,
+    /// which reads each local header once, never reaches it. Past it, the
+    /// remaining entries are delivered as the central directory describes
+    /// them, unchecked, and this says so; `--strict-fidelity` turns it into
+    /// exit 4.
+    #[error(
+        "`{format}` local headers of {entries} entr(y/ies) were not compared with the central \
+         directory: the archive's records point at the same header bytes again and again, \
+         and the comparison's work budget ran out"
+    )]
+    LocalHeadersUnchecked { format: FormatId, entries: u64 },
 }
 
 /// Where a codec's decoder records what it approximated.

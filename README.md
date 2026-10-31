@@ -2309,7 +2309,11 @@ absent, past 32 MiB of recorded headers, or holds a unix symlink (a pipe deliver
 the link as a regular file). The same comparison runs on a seekable zip: a local
 header and central directory that disagree raise `Fidelity::HeadersDisagree` (``zip``
 local header and central directory disagree on FIELD for entry `NAME`), exit 4 under
-`--strict-fidelity`. On hostile zips four exits moved with the `zip` crate's 9.1.3
+`--strict-fidelity`. Each local header is read once however many records point at
+it, and the reads stop at twice the archive's length plus 64 MiB (a well-formed
+zip reads each header once): past that, the remaining entries are not compared and
+`Fidelity::LocalHeadersUnchecked` says how many, exit 4 under `--strict-fidelity`.
+On hostile zips four exits moved with the `zip` crate's 9.1.3
 upgrade: an end record whose two counts disagree is exit 5 (was a warning), a
 multi-disk end record is exit 5 (was 3), AES method 99 without its extra field is
 exit 3 (was 5), and a Unicode Path extra field with a bad CRC is ignored (was exit 5).

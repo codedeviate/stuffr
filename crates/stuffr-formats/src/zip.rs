@@ -416,6 +416,9 @@ impl Container for Zip {
             // `read_declared_index` is: nothing gets the bytes back out from
             // under a `ZipArchive`.
             let opens_with_an_entry = begins_with_a_local_header(&mut adapter);
+            // For the local-header comparison's work budget; an unknown
+            // length leaves it at its floor.
+            let archive_len = adapter.seek(SeekFrom::End(0)).unwrap_or(0);
             let archive = zip::ZipArchive::new(adapter)
                 .map_err(|e| name_a_self_contradicting_index(classify_zip_error(e), &declared))?;
             refuse_an_index_that_reaches_nothing(&archive, opens_with_an_entry)?;
@@ -427,6 +430,7 @@ impl Container for Zip {
                 report,
                 next: 0,
                 compared: HashSet::new(),
+                claims: LocalClaims::new(archive_len),
             }));
         }
 
@@ -1503,6 +1507,126 @@ struct ZipIndexed {
     /// Entries whose local header has been compared with their central
     /// record, so an entry opened twice warns once per field.
     compared: HashSet<usize>,
+    /// The local-header reads behind those comparisons, memoised and bounded
+    /// ([`LocalClaims`]).
+    claims: LocalClaims,
+}
+
+/// Bytes of parsed local headers [`LocalClaims`] remembers at once.
+const LOCAL_CLAIM_MEMO_BYTES: usize = 1024 * 1024;
+
+/// Local-header bytes [`LocalClaims`] reads beyond twice the archive's length
+/// before it stops comparing ([`Fidelity::LocalHeadersUnchecked`]).
+const LOCAL_CLAIM_BUDGET_FLOOR: u64 = 64 * 1024 * 1024;
+
+/// Accounting for each [`HeaderClaim`] held in the memo, on top of its two
+/// names.
+const LOCAL_CLAIM_OVERHEAD: usize = 96;
+
+/// The seekable rung's local-header reads (finding PARSE-4).
+///
+/// Every central record's local header is read and parsed to compare it
+/// (ruling B3): up to 30 + 65,535 + 65,535 bytes. An index of many records
+/// pointing at ONE fat local header made each record pay that again — 100,000
+/// records at one header took 7.3 s to `list`. Two bounds, each covering what
+/// the other cannot:
+///
+/// - **A memo keyed by `header_start`**, so a header is read once however
+///   many records point at it. Bounded in bytes ([`LOCAL_CLAIM_MEMO_BYTES`]);
+///   an insert that does not fit clears it first, so the memo is always
+///   about the most recent headers, the ones a fan-out keeps returning to.
+///   A well-formed archive points each record at its own header, so its
+///   memo never hits; that costs one map insert per entry.
+/// - **A read budget**: twice the archive's length plus
+///   [`LOCAL_CLAIM_BUDGET_FLOOR`]. The memo alone is defeated by cycling over
+///   more fat headers than it holds — and those headers can overlap, a new
+///   `PK\x03\x04` every few bytes inside one another's names, so a small file
+///   holds thousands of them. A well-formed archive reads each local header
+///   once, never more than its own length; past the budget, the remaining
+///   entries are not compared and [`Fidelity::LocalHeadersUnchecked`] counts
+///   them.
+///
+/// Reading the extra field lazily was considered and not done: it is needed
+/// in the ordinary case (equal names — the Unicode Path field decides the
+/// name each record delivers, ruling T5-d), so it would not bound the cost.
+struct LocalClaims {
+    memo: HashMap<u64, Option<HeaderClaim>>,
+    held: usize,
+    /// Local-header bytes still allowed to be read.
+    budget: u64,
+    /// Entries left uncompared since the budget ran out.
+    unchecked: u64,
+    /// Where `report` holds the [`Fidelity::LocalHeadersUnchecked`] warning
+    /// once there is one, to count it up in place.
+    unchecked_at: Option<usize>,
+}
+
+impl LocalClaims {
+    fn new(archive_len: u64) -> Self {
+        Self {
+            memo: HashMap::new(),
+            held: 0,
+            budget: archive_len
+                .saturating_mul(2)
+                .saturating_add(LOCAL_CLAIM_BUDGET_FLOOR),
+            unchecked: 0,
+            unchecked_at: None,
+        }
+    }
+
+    /// The claim of the local header at `header_start`, from the memo or
+    /// read through `handle`. `Err(())` once the budget is spent: the entry
+    /// is counted as unchecked in `report`. `Ok(None)` when the header
+    /// cannot be read (left to the entry's own open, as before).
+    fn get<R: Read + Seek>(
+        &mut self,
+        handle: &mut R,
+        header_start: u64,
+        report: &mut FidelityReport,
+    ) -> std::result::Result<Option<&HeaderClaim>, ()> {
+        if !self.memo.contains_key(&header_start) {
+            if self.budget == 0 {
+                self.count_unchecked(report);
+                return Err(());
+            }
+            let (claim, read) = read_local_claim(handle, header_start);
+            self.budget = self.budget.saturating_sub(read);
+            let cost = claim.as_ref().map_or(0, |c| {
+                c.name.len() + c.shown.as_ref().map_or(0, String::len)
+            }) + LOCAL_CLAIM_OVERHEAD;
+            if self.held + cost > LOCAL_CLAIM_MEMO_BYTES {
+                self.memo.clear();
+                self.held = 0;
+            }
+            self.held += cost;
+            self.memo.insert(header_start, claim);
+        }
+        Ok(self.memo.get(&header_start).and_then(Option::as_ref))
+    }
+
+    fn count_unchecked(&mut self, report: &mut FidelityReport) {
+        self.unchecked += 1;
+        let entries = self.unchecked;
+        if let Some(at) = self.unchecked_at
+            && let Some(Fidelity::LocalHeadersUnchecked { entries: n, .. }) =
+                report.warnings.get_mut(at)
+        {
+            *n = entries;
+            return;
+        }
+        self.unchecked_at = Some(report.warnings.len());
+        report.warn(Fidelity::LocalHeadersUnchecked {
+            format: ZIP,
+            entries,
+        });
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Local-header bytes [`read_local_claim`] read on this thread: the
+    /// PARSE-4 tests count work, not time.
+    static LOCAL_CLAIM_BYTES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 impl ZipIndexed {
@@ -1580,10 +1704,32 @@ const METHOD_AES: u16 = 99;
 /// 65,535 bytes at an offset about to be read anyway. The only other one is
 /// [`read_central_name_and_flags`], for an entry with a Unicode Path field.
 /// `None` on any failure: a header this cannot read is left to zip's own
-/// path, which classifies it.
-fn read_local_claim<R: Read + Seek>(r: &mut R, header_start: u64) -> Option<HeaderClaim> {
-    r.seek(SeekFrom::Start(header_start)).ok()?;
-    parse_local_claim(r)
+/// path, which classifies it. Also returns how many bytes were read, for
+/// [`LocalClaims`]' budget.
+fn read_local_claim<R: Read + Seek>(r: &mut R, header_start: u64) -> (Option<HeaderClaim>, u64) {
+    if r.seek(SeekFrom::Start(header_start)).is_err() {
+        return (None, 0);
+    }
+    let mut counted = ClaimCounter { inner: r, read: 0 };
+    let claim = parse_local_claim(&mut counted);
+    let read = counted.read;
+    #[cfg(test)]
+    LOCAL_CLAIM_BYTES_READ.with(|n| n.set(n.get() + read));
+    (claim, read)
+}
+
+/// Counts the bytes [`read_local_claim`] reads.
+struct ClaimCounter<'a, R> {
+    inner: &'a mut R,
+    read: u64,
+}
+
+impl<R: Read> Read for ClaimCounter<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read += n as u64;
+        Ok(n)
+    }
 }
 
 /// [`read_local_claim`]'s parse, from wherever `r` stands: the signature, the
@@ -1841,10 +1987,13 @@ impl ZipIndexed {
             central.flags = flags;
             central.name = name;
         }
-        let Some(local) = read_local_claim(&mut self.handle, header_start) else {
+        let Ok(Some(local)) = self
+            .claims
+            .get(&mut self.handle, header_start, &mut self.report)
+        else {
             return;
         };
-        for field in disagreeing_fields(&central, &local) {
+        for field in disagreeing_fields(&central, local) {
             self.report.warn(Fidelity::HeadersDisagree {
                 format: ZIP,
                 entry: entry.clone(),
@@ -4572,6 +4721,142 @@ mod tests {
 
     fn put32(bytes: &mut [u8], at: usize, v: u32) {
         bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// A zip of `headers` fat local headers (65,535-byte name, 65,532-byte
+    /// extra of empty fields, no payload) and `records` central records,
+    /// record `i` pointing at header `i % headers` under its own short name
+    /// (zip collapses records sharing a name). The PARSE-4 fan-out shape.
+    fn fan_out_zip(headers: usize, records: usize) -> (Vec<u8>, u64) {
+        const NAME: usize = 65_535;
+        const EXTRA: usize = 65_532;
+        let mut out = Vec::new();
+        let mut starts = Vec::new();
+        for h in 0..headers {
+            starts.push(u32::try_from(out.len()).expect("small"));
+            out.extend_from_slice(&SIG_LOCAL_HEADER);
+            out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            out.extend_from_slice(&0u16.to_le_bytes()); // flags
+            out.extend_from_slice(&0u16.to_le_bytes()); // STORE
+            out.extend_from_slice(&0u16.to_le_bytes()); // time
+            out.extend_from_slice(&0x21u16.to_le_bytes()); // date
+            out.extend_from_slice(&0u32.to_le_bytes()); // crc of nothing
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&u16::try_from(NAME).expect("fits").to_le_bytes());
+            out.extend_from_slice(&u16::try_from(EXTRA).expect("fits").to_le_bytes());
+            let tag = u8::try_from(h % 26).expect("small") + b'a';
+            out.extend(std::iter::repeat_n(tag, NAME));
+            out.extend(std::iter::repeat_n(0u8, EXTRA));
+        }
+        let cd_start = u32::try_from(out.len()).expect("small");
+        for i in 0..records {
+            let name = format!("e{i}");
+            out.extend_from_slice(&SIG_CENTRAL_HEADER);
+            out.extend_from_slice(&20u16.to_le_bytes()); // made by
+            out.extend_from_slice(&20u16.to_le_bytes()); // needed
+            out.extend_from_slice(&0u16.to_le_bytes()); // flags
+            out.extend_from_slice(&0u16.to_le_bytes()); // STORE
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0x21u16.to_le_bytes());
+            out.extend_from_slice(&[0u8; 12]); // crc, csize, usize
+            out.extend_from_slice(&u16::try_from(name.len()).expect("short").to_le_bytes());
+            out.extend_from_slice(&[0u8; 12]); // extra, comment, disk, attrs
+            out.extend_from_slice(&starts[i % headers].to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+        }
+        let cd_len = u32::try_from(out.len()).expect("small") - cd_start;
+        let n = u16::try_from(records).expect("fits");
+        out.extend_from_slice(b"PK\x05\x06");
+        out.extend_from_slice(&[0u8; 4]);
+        out.extend_from_slice(&n.to_le_bytes());
+        out.extend_from_slice(&n.to_le_bytes());
+        out.extend_from_slice(&cd_len.to_le_bytes());
+        out.extend_from_slice(&cd_start.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        let header_len = u64::try_from(30 + NAME + EXTRA).expect("fits");
+        (out, header_len)
+    }
+
+    /// Lists every entry (the comparison runs for each, as `list` does) and
+    /// returns the report and the local-header bytes this thread read.
+    fn list_counting_claim_reads(bytes: &[u8]) -> (FidelityReport, usize, u64) {
+        LOCAL_CLAIM_BYTES_READ.with(|n| n.set(0));
+        let mut ar = open_seekable(bytes);
+        let mut entries = 0;
+        while ar.next_entry().expect("entry").is_some() {
+            entries += 1;
+        }
+        let read = LOCAL_CLAIM_BYTES_READ.with(std::cell::Cell::get);
+        (ar.fidelity().clone(), entries, read)
+    }
+
+    /// PARSE-4: many central records at ONE fat local header read it once,
+    /// not once per record (2,000 x 131 KB = 262 MB unmemoised).
+    #[test]
+    fn records_fanning_out_to_one_local_header_read_it_once() {
+        let (bytes, header_len) = fan_out_zip(1, 2_000);
+        let (report, entries, read) = list_counting_claim_reads(&bytes);
+        assert_eq!(entries, 2_000);
+        assert!(
+            read <= header_len,
+            "read {read} local-header bytes for a {header_len}-byte header"
+        );
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| matches!(w, Fidelity::LocalHeadersUnchecked { .. })),
+            "every record was compared"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| matches!(w, Fidelity::HeadersDisagree { .. })),
+            "the names still disagree"
+        );
+    }
+
+    /// PARSE-4: cycling over more fat headers than the memo holds misses
+    /// every time; the read budget stops it at about twice the archive's
+    /// length plus the floor, and says how many entries went unchecked.
+    #[test]
+    fn cycling_past_the_claim_memo_stops_at_the_read_budget() {
+        let headers = 12;
+        let records = 800;
+        let (bytes, header_len) = fan_out_zip(headers, records);
+        let per_claim = 2 * 65_535 + LOCAL_CLAIM_OVERHEAD;
+        assert!(headers * per_claim > LOCAL_CLAIM_MEMO_BYTES, "memo too big");
+        let budget = 2 * bytes.len() as u64 + LOCAL_CLAIM_BUDGET_FLOOR;
+        assert!(records as u64 * header_len > budget, "fixture too small");
+        let (report, entries, read) = list_counting_claim_reads(&bytes);
+        assert_eq!(entries, records);
+        assert!(
+            read <= budget + header_len,
+            "read {read} bytes against a budget of {budget}"
+        );
+        assert!(read >= budget, "the budget was spent: {read} of {budget}");
+        let unchecked: Vec<u64> = report
+            .warnings
+            .iter()
+            .filter_map(|w| match w {
+                Fidelity::LocalHeadersUnchecked { format, entries } => {
+                    assert_eq!(*format, ZIP);
+                    Some(*entries)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(unchecked.len(), 1, "one warning, counted up in place");
+        // Every read before the budget ran out compared one entry (a memo
+        // hit compares one for free), so at most this many were not.
+        let misses = read.div_ceil(header_len);
+        assert!(
+            unchecked[0] > 0 && unchecked[0] <= records as u64 - misses,
+            "{} unchecked after {misses} reads",
+            unchecked[0]
+        );
     }
 
     #[test]
