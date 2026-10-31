@@ -181,6 +181,19 @@ mod crypt {
         assert_eq!(Keys::new(b"test\0junk").raw(), KEYS_TEST);
     }
 
+    /// Ruling T6: dropping the keys zeroes them, every copy (`Clone` stays).
+    #[test]
+    fn dropping_keys_zeroes_them() {
+        let original = Keys::new(b"test");
+        let mut copy = std::mem::ManuallyDrop::new(original.clone());
+        assert_eq!(copy.raw(), KEYS_TEST);
+        // SAFETY: dropped exactly once, in place, and never again (it is in
+        // a `ManuallyDrop`); the fields are plain integers, still readable.
+        unsafe { std::ptr::drop_in_place(&mut *copy) };
+        assert_eq!(copy.raw(), [0, 0, 0]);
+        assert_eq!(original.raw(), KEYS_TEST, "the clone was its own copy");
+    }
+
     #[test]
     fn decrypt_round_trips_with_the_reference() {
         for (password, plain, after) in [

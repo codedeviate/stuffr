@@ -2076,7 +2076,11 @@ before the command line, as the reference does.
     `********` in place of the password (every form: `-P pw`, `-Ppw`,
     `--password=pw`, ...), creates a new log 0600 and opens it, `-la`'s too,
     without following a symlink (`could not open logfile`, exit 16). zip
-    and zipcloak keep the password only in a buffer zeroed when dropped.
+    and zipcloak keep the password, given or typed, only in a buffer zeroed
+    when dropped, and zero the encryption keys derived from it when they
+    are dropped. Only those are zeroed: the process's own arguments
+    (`argv`) and the option parser's copies of them (`z.o.args`, which
+    `-sc` and `-R`'s hint print) still hold the `-P` value.
 34. **stuffr's own crash is not an interrupt** (hardening). zip answers
     SIGABRT, SIGSEGV, SIGBUS and SIGILL as it answers Ctrl-C (`Interrupted
     (aborting)`, exit 9). stuffr does so only for a signal another process

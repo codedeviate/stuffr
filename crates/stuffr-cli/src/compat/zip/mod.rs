@@ -380,9 +380,12 @@
 //!     open logfile`, exit 16, where zip writes through it. `-sc`'s listing
 //!     still shows the password, as zip's does (it goes to the terminal,
 //!     not to a file). zip and zipcloak keep the password, given or typed,
-//!     only in a holder that zeroes it when dropped (ruling T6b); the
-//!     process's own arguments, and the parser's copies of them (which
-//!     `-sc` and `-R`'s hint print), are not zeroed.
+//!     only in a holder that zeroes it when dropped (ruling T6b), and the
+//!     traditional-encryption keys derived from it (`infozip::crypt::Keys`)
+//!     are zeroed when dropped too. Only those are: the process's own
+//!     arguments (`argv`), and the parser's copies of them (`z.o.args`,
+//!     which `-sc` and `-R`'s hint print), still hold the `-P` value and
+//!     are not zeroed.
 //! 34. Hardening (ruling T7a of the 2026-10-31 security audit): zip's
 //!     handler answers every INT, TERM, ABRT, BUS, ILL and SEGV with
 //!     `Interrupted (aborting)`, exit 9. stuffr's answers a signal it sent

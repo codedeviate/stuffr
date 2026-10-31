@@ -49,6 +49,22 @@ pub struct Keys {
     k2: u32,
 }
 
+/// The keys are the password's whole state (anyone holding them decrypts
+/// what it encrypted, and the first ones follow from the password alone), so
+/// every copy is zeroed when dropped: volatile stores the optimiser cannot
+/// drop as dead, then a fence (hardening, ruling T6 of the 2026-10-31
+/// security audit). A copy a move left behind in an old stack slot is not
+/// reached; nothing here can reach it.
+impl Drop for Keys {
+    fn drop(&mut self) {
+        for k in [&mut self.k0, &mut self.k1, &mut self.k2] {
+            // SAFETY: `k` is a valid, aligned, exclusive `&mut u32`.
+            unsafe { std::ptr::write_volatile(k, 0) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 impl Keys {
     /// Keys initialised from `password`, as `init_keys()` does.
     ///
