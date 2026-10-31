@@ -741,10 +741,9 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 // The hint must name a verb that works on this input: `test`
                 // refuses a bare stream, so a bare `.gz` (withheld because
                 // gzip judges its trailing bytes only at the end) points at
-                // a full decode instead. "Bare" = the chain is the outer
-                // format alone and that format is not a container.
-                let bare_stream = i.chain == i.format.as_str()
-                    && stuffr::registry().container(i.format).is_none();
+                // a full decode instead. "Bare" = the chain reaches no
+                // container, however many codecs it has (`.gz.gz`).
+                let bare_stream = i.container.is_none();
                 if !i.fidelity_evaluated && bare_stream {
                     writeln!(
                         out,

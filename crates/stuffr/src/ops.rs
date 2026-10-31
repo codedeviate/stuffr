@@ -1555,6 +1555,17 @@ pub struct Inspection {
     /// yields is not judged.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub unconfirmed_layer: Option<FormatId>,
+    /// The container the stream reaches, when it reaches one (`tar` for
+    /// `bundle.tar.gz`, from its name, or for a piped `.tar.gz`, from the
+    /// decoded probe prefix); `None` for a stream of codecs alone, nested
+    /// ones included (`.gz.xz`). Decides which verb can
+    /// answer what `fidelity_evaluated` withholds: `stuffr test` opens an
+    /// archive and refuses a bare stream, so a stream is pointed at a full
+    /// decode instead (the T10 re-review's M1: the CLI compared the chain's
+    /// text with the format's name, which missed every nested codec).
+    /// Left out of the JSON when absent, as `unconfirmed_layer` is.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub container: Option<FormatId>,
 }
 
 /// Identifies a stream without decoding it (beyond the probe prefix, which
@@ -1626,13 +1637,26 @@ pub fn inspect_with_limit(
         }
     };
 
-    let fidelity_evaluated = fidelity_is_knowable_without_opening(registry, &chain, rung);
     // Decodes nothing beyond the prefix already in memory, under the bound
     // every verb given this file would use.
     let opts = DecodeOpts {
         memory_limit: Some(memory_limit),
         ..Default::default()
     };
+    let fidelity_evaluated = fidelity_is_knowable_without_opening(registry, &chain, rung);
+    // Which verb can answer what `fidelity_evaluated` withholds depends on
+    // whether the stream holds an archive. The chain above stops at the
+    // outer codec on a pipe (no name to read further), so the layers the
+    // probe prefix decodes to are consulted too: a piped `.tar.gz` is an
+    // archive `stuffr test` opens (the T10 re-review's M1). The fidelity
+    // rule itself stays on `chain`: a single-stream decode (`cat`, `unpack
+    // -o`) decodes the outer codec only, so a gzip nested inside an xz is
+    // never judged by it.
+    let container = chain.container().or_else(|| {
+        stuffr_core::identify_strict(registry, path.as_deref(), &prefix, None, &opts)
+            .as_ref()
+            .and_then(Chain::container)
+    });
     let unconfirmed_layer = stuffr_core::first_unconfirmed_layer(registry, &chain, &prefix, &opts);
 
     Ok(Inspection {
@@ -1643,6 +1667,7 @@ pub fn inspect_with_limit(
         bytes_in: caps.len,
         detected_by,
         unconfirmed_layer,
+        container,
     })
 }
 

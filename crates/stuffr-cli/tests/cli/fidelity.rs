@@ -2328,3 +2328,63 @@ fn a_file_of_empty_members_is_a_resource_limit() {
         assert!(!output.exists(), ".{ext}: nothing published");
     }
 }
+
+/// The T10 re-review's M1: a stream of NESTED codecs (`.gz.gz`, `.xz.gz`)
+/// is still a bare stream — `stuffr test` refuses it — so `info`'s hint must
+/// name the full decode, not `test`. (The CLI used to decide by comparing the
+/// chain's text with the format's name.) A piped `.tar.gz`, whose chain
+/// `info` resolves only as far as `gzip`, is an archive `test` opens.
+#[test]
+fn info_on_nested_codecs_points_at_a_full_decode_not_test() {
+    let dir = tmp_dir();
+    for (inner_name, outer_name) in [("i.gz", "n.gz.gz"), ("i.xz", "n.xz.gz")] {
+        let inner = dir.join(inner_name);
+        std::fs::write(&inner, packed(&dir, inner_name, b"nested payload\n")).unwrap();
+        let outer = packed(
+            &dir,
+            &format!("{inner_name}.gz"),
+            &std::fs::read(&inner).unwrap(),
+        );
+        // Junk after the OUTER gzip member: what a full decode reports.
+        let nested = dir.join(outer_name);
+        std::fs::write(&nested, [outer, b"junk".to_vec()].concat()).unwrap();
+        let nested = nested.to_str().unwrap();
+
+        let test = run_output(&["test", nested]);
+        assert!(
+            !test.status.success(),
+            "{outer_name}: `test` refuses a bare stream"
+        );
+        let cat = run_output(&["cat", nested]);
+        assert!(
+            String::from_utf8_lossy(&cat.stderr).contains("stream is followed by"),
+            "{outer_name}: ground truth, the full decode warns"
+        );
+
+        for (what, text) in [
+            (
+                "a file",
+                String::from_utf8(run_output(&["info", nested]).stdout).unwrap(),
+            ),
+            ("a pipe", info_over_stdin(&std::fs::read(nested).unwrap())),
+        ] {
+            assert!(
+                !text.contains("nothing approximated"),
+                "{outer_name} {what}: {text}"
+            );
+            assert!(
+                text.contains("not evaluated") && text.contains("stuffr cat FILE >/dev/null"),
+                "{outer_name} {what}: {text}"
+            );
+            assert!(!text.contains("stuffr test"), "{outer_name} {what}: {text}");
+        }
+    }
+
+    let tarball = packed_tree(&dir, "p.tar.gz");
+    let text = info_over_stdin(&tarball);
+    assert!(text.contains("chain:    gzip"), "{text}");
+    assert!(
+        text.contains("not evaluated") && text.contains("stuffr test"),
+        "a piped .tar.gz is an archive: {text}"
+    );
+}
