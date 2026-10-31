@@ -343,6 +343,25 @@
 //!     remove it. Pinned by
 //!     `tests::an_interrupt_during_replace_leaves_a_whole_archive` and
 //!     `tests::an_interrupt_after_a_failed_replace_keeps_the_temporary`.
+//! 31. Hardening (ruling T5 of the 2026-10-31 security audit): a symbolic
+//!     link at the archive's name that leads to no regular file (dangling,
+//!     or naming a directory or a device) is refused before any work: `zip
+//!     I/O error: Too many levels of symbolic links`, `zip error: Could not
+//!     create output file (NAME)`, exit 15, the link kept, no temporary
+//!     left. Info-ZIP follows it (`fopen`, then `fileio.c:replace`'s copy
+//!     for a symlinked archive), creating the file a dangling link names.
+//!     A link to an existing regular file is still updated through it, as
+//!     Info-ZIP updates it (`replace`'s copy), and `replace` itself refuses
+//!     a link that has gone dangling by then. `zipcloak`, `zipnote -w` and
+//!     `-F`/`-FF` share `replace`'s check. Why: a planted link must not
+//!     redirect where the archive is written.
+//! 32. Hardening (ruling T5): `zipsplit` opens its index and each part
+//!     `O_NOFOLLOW`. zipsplit truncates whatever is at the name
+//!     (`fopen(.., "w")`), writing through a symlink there, live or
+//!     dangling; stuffr fails the open (`zipsplit error: Too many levels of
+//!     symbolic links`, `Could not create output file (NAME)`, exit 15) and
+//!     its cleanup leaves the link, which it did not make. A regular file
+//!     at a part's name is still truncated, as zipsplit truncates it.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};

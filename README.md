@@ -2054,6 +2054,17 @@ before the command line, as the reference does.
     answers Ctrl-C when it ends. When the replace fails after the archive
     was unlinked or cut (ruling Z34), the temporary is the only whole copy:
     it is kept under its own name, where zip's handler would remove it.
+31. **A dangling symlink as the archive's name is refused** (hardening).
+    Info-ZIP follows a symlink at the archive's name and creates the file a
+    dangling one names. stuffr refuses a link that leads to no regular file
+    before any work (`Could not create output file (NAME)`, exit 15), the
+    link kept. A link to an existing archive is still updated through it,
+    as Info-ZIP does.
+32. **`zipsplit` never writes a part through a symlink** (hardening). It
+    opens its index and parts `O_NOFOLLOW`: a symlink at a part's name,
+    live or dangling, is `Could not create output file`, exit 15, and is
+    left in place, where zipsplit writes through it. A regular file there
+    is still overwritten, as zipsplit overwrites it.
 
 The full set is in the code's module docs
 (`crates/stuffr-cli/src/compat/zip/mod.rs`), which is the source of truth.

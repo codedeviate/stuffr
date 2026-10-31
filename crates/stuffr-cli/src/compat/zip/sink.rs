@@ -411,9 +411,10 @@ pub(crate) fn mkstemp_with(
 }
 
 /// fileio.c:replace: `rename` the temporary onto the archive, or copy it
-/// over it when the archive has other links or is a symbolic link
-/// (respected: written through), or when the rename crosses devices. `Err`
-/// is the ziperr code and the system's answer.
+/// over it when the archive has other links or is a symbolic link to a
+/// regular file (respected: written through), or when the rename crosses
+/// devices. A symbolic link to anything else is refused (deviation 31).
+/// `Err` is the ziperr code and the system's answer.
 ///
 /// SIGINT and SIGTERM are held back meanwhile (ruling Z32, deviation 30):
 /// between the archive's unlink and the rename, or while the copy rewrites
@@ -449,7 +450,33 @@ fn mid_replace() {
     }
 }
 
+/// Deviation 31 (hardening, ruling T5): a symbolic link at the archive's
+/// name that does not lead to a regular file (dangling, or naming a
+/// directory or a device). Info-ZIP writes the archive through it,
+/// creating the file a dangling link names; stuffr refuses it. A link to a
+/// regular file is still updated in place, as Info-ZIP updates it.
+pub(crate) fn dangling_archive_link(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink())
+        && !std::fs::metadata(p).is_ok_and(|m| m.is_file())
+}
+
+/// The error a refused [`dangling_archive_link`] is reported with: what
+/// an `O_NOFOLLOW` open of it answers (`ELOOP`).
+pub(crate) fn link_refusal() -> io::Error {
+    #[cfg(unix)]
+    {
+        io::Error::from_raw_os_error(libc::ELOOP)
+    }
+    #[cfg(not(unix))]
+    {
+        io::Error::other("the archive's name is a symbolic link to no file")
+    }
+}
+
 fn replace_now(d: &Path, s: &Path) -> Result<(), (i32, io::Error)> {
+    if dangling_archive_link(d) {
+        return Err((ZE_CREAT, link_refusal()));
+    }
     if let Ok(t) = std::fs::symlink_metadata(d) {
         #[cfg(unix)]
         let copy = {

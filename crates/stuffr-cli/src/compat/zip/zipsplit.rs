@@ -419,9 +419,16 @@ fn make_part(
         z.mesg_write(&l);
         made.index = true;
         host::split_progress(made.parts, made.index);
-        let f = match std::fs::File::create(z.host.path(&path)) {
+        let f = match create_part(&z.host.path(&path)) {
             Ok(f) => f,
-            Err(e) => return Err(part_error(z, job, ZE_CREAT, &path, &e)),
+            Err(e) => {
+                if is_symlink(&z.host.path(&path)) {
+                    // deviation 32: not ours, so not removed
+                    made.index = false;
+                    host::split_progress(made.parts, made.index);
+                }
+                return Err(part_error(z, job, ZE_CREAT, &path, &e));
+            }
         };
         let mut w = FileSink::stdio(
             STDIO_BUF,
@@ -448,9 +455,16 @@ fn make_part(
     z.mesg_write(&l);
     made.parts = j as u64 + 1;
     host::split_progress(made.parts, made.index);
-    let f = match std::fs::File::create(z.host.path(&path)) {
+    let f = match create_part(&z.host.path(&path)) {
         Ok(f) => f,
-        Err(e) => return Err(part_error(z, job, ZE_CREAT, &path, &e)),
+        Err(e) => {
+            if is_symlink(&z.host.path(&path)) {
+                // deviation 32: not ours, so not removed
+                made.parts = j as u64;
+                host::split_progress(made.parts, made.index);
+            }
+            return Err(part_error(z, job, ZE_CREAT, &path, &e));
+        }
     };
     out.restart(Box::new(FileSink::stdio(
         STDIO_BUF,
@@ -486,6 +500,28 @@ fn make_part(
         return Err(part_error(z, job, ZE_WRITE, &path, &e));
     }
     Ok(())
+}
+
+/// `fopen(name, "w")` for the index and each part, but never through a
+/// symbolic link at the name (deviation 32, ruling T5): `O_NOFOLLOW`, so a
+/// link there, dangling or not, fails the open (`ELOOP`, "Could not create
+/// output file") where zipsplit writes through it; the link is then not
+/// counted as made, so the cleanup leaves it. A regular file is truncated,
+/// as zipsplit truncates it.
+fn create_part(p: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut o = std::fs::File::options();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW);
+    }
+    o.open(p)
+}
+
+/// Whether `p` is a symbolic link (`lstat`).
+fn is_symlink(p: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink())
 }
 
 /// [`simple`], for the tests.

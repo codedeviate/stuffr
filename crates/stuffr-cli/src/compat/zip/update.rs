@@ -132,6 +132,11 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
     // Make sure the zip file is writeable (the C leaves the check to the
     // end when -b names the temp's directory and there is no archive).
     let tempdir_check_later = z.o.tempdir && !has_files && ar.zipbeg == 0;
+    // deviation 31: a symlink at the archive's name that leads to no
+    // regular file is refused before any work, never written through
+    if !to_stdout && super::sink::dangling_archive_link(&z.host.path(&out_path)) {
+        return z.ziperr_os(ZE_CREAT, &out_path, &super::sink::link_refusal());
+    }
     if !to_stdout && !tempdir_check_later {
         let p = z.host.path(&out_path);
         let fresh = z.o.have_out || (!has_files && ar.zipbeg == 0);

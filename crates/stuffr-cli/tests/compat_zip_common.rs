@@ -943,4 +943,75 @@ mod unix {
             );
         }
     }
+
+    fn node<'a>(run: &'a ZipRun, name: &str) -> Option<&'a UnzipNode> {
+        run.tree.get(name.as_bytes())
+    }
+
+    fn is_link_to(run: &ZipRun, name: &str, to: &str) -> bool {
+        matches!(node(run, name), Some(UnzipNode::Symlink { target, .. }) if target == to.as_bytes())
+    }
+
+    /// Deviation 31 (ruling T5): a symlink at the archive's name that
+    /// leads to no regular file (here dangling) is refused before any work,
+    /// `Could not create output file`, exit 15, the link kept and nothing
+    /// created through it (Info-ZIP creates the file the link names); with
+    /// `-b` too, and no temporary left. A link to an existing archive is
+    /// still updated through it, as Info-ZIP updates it. stuffr alone.
+    #[test]
+    fn a_dangling_symlink_archive_name_is_refused() {
+        for args in [&["d.zip", "a.txt"][..], &["-b", ".", "d.zip", "a.txt"]] {
+            let tree = ZipTree::standard().symlink("d.zip", "nowhere");
+            let s = stuffr_zip(&zip_case("zip", args, tree));
+            // zip's errors go to standard output
+            let err = String::from_utf8_lossy(&s.stdout);
+            assert_eq!(s.code, 15, "{args:?}: {err}");
+            assert!(
+                err.contains("zip error: Could not create output file (d.zip)"),
+                "{args:?}: {err}"
+            );
+            assert!(is_link_to(&s, "d.zip", "nowhere"), "{args:?}");
+            assert!(node(&s, "nowhere").is_none(), "{args:?}: created");
+            assert!(
+                !s.tree.keys().any(|k| k.starts_with(b"zi")),
+                "{args:?}: a temporary is left"
+            );
+        }
+        let tree = with_archive(&[(b"x.txt", b"x\n")]).symlink("l.zip", "t.zip");
+        let s = stuffr_zip(&zip_case("zip", &["l.zip", "a.txt"], tree));
+        assert_eq!(s.code, 0, "{}", String::from_utf8_lossy(&s.stderr));
+        assert!(is_link_to(&s, "l.zip", "t.zip"));
+        let t = archive_of(&s, b"t.zip");
+        assert!(t.windows(5).any(|w| w == b"a.txt") && t.windows(5).any(|w| w == b"x.txt"));
+    }
+
+    /// Deviation 32 (ruling T5): zipsplit never writes a part through a
+    /// symlink at its name (live or dangling): `O_NOFOLLOW` fails the open
+    /// (`ELOOP`'s text, `Could not create output file`), the link and its
+    /// target untouched, the link not removed by the cleanup.
+    /// zipsplit writes through it. stuffr alone.
+    #[test]
+    fn zipsplit_never_writes_a_part_through_a_symlink() {
+        for live in [true, false] {
+            let mut tree = with_archive(&[(b"x.txt", b"x\n")]).symlink("t1.zip", "victim");
+            if live {
+                tree = tree.file("victim", b"old victim");
+            }
+            let s = stuffr_zip(&zip_case("zipsplit", &["t.zip"], tree));
+            let err =
+                String::from_utf8_lossy(&[s.stdout.as_slice(), &s.stderr].concat()).into_owned();
+            assert_ne!(s.code, 0, "live {live}: {err}");
+            assert!(
+                err.contains("Too many levels of symbolic links")
+                    && err.contains("Could not create output file (t1.zip)"),
+                "live {live}: {err}"
+            );
+            assert!(is_link_to(&s, "t1.zip", "victim"), "live {live}");
+            if live {
+                assert_eq!(archive_of(&s, b"victim"), b"old victim");
+            } else {
+                assert!(node(&s, "victim").is_none(), "created through");
+            }
+        }
+    }
 }
