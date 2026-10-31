@@ -109,7 +109,7 @@ impl Codec for Zstd {
     /// reading, whether an incoming stream carries the checksum at all.
     ///
     /// **`DecodeOpts::memory_limit` bounds the window** (the 2026-10-31
-    /// audit, T13): see [`window_log_max`] and [`WindowLimit`]. Under a
+    /// audit, T13): see `window_log_max` and `WindowLimit`. Under a
     /// limit, a frame declaring a larger window is refused before libzstd
     /// allocates it, as `Error::ResourceLimit` (exit 6). Without a limit the
     /// cap stays libzstd's own default (`ZSTD_WINDOWLOG_LIMIT_DEFAULT`, 27:
