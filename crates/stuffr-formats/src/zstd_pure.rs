@@ -33,6 +33,30 @@
 //! improvement — see "The content checksum is on here BY DEFAULT" below
 //! for the window-size-cap detail.
 //!
+//! ## Decode memory bound: every frame's window, before `ruzstd` allocates
+//!
+//! `ruzstd` sizes its buffers by the window a frame header declares, before
+//! the first output byte, so `--max-ratio` (which counts output) cannot see
+//! it. Until the 2026-10-31 audit (PARSE-2) this decoder ignored
+//! [`DecodeOpts::memory_limit`]: a 9 KB `.zst` whose header declared a
+//! 96 MiB window cost 242-276 MB peak RSS in `cat`/`list`/`ls` under
+//! `--memory-limit 1M`. `open_frame` now reads each real frame's header
+//! (RFC 8878: Window_Descriptor, or Frame_Content_Size under
+//! Single_Segment_Flag — `declared_window`) at EVERY frame start, the first
+//! and every concatenated one, and `check_window` refuses a declaration over
+//! the limit with `io::ErrorKind::OutOfMemory`, which classifies as
+//! `Error::ResourceLimit` (exit 6), the `xz_pure.rs` pre-flight's shape.
+//!
+//! A window above `ruzstd`'s own cap (`DEFAULT_MAX_WINDOW_SIZE`, 128 MiB in
+//! 0.9.1) is refused the same way on any limit, naming the cap and
+//! `--features c-backed` (PARSE-3: `ruzstd`'s `WindowSizeTooBig` used to fold
+//! onto "archive is corrupt", exit 5, for valid zstd). The bound is on the
+//! declaration, not on resident memory, which runs 2.5-2.9x the window. A header
+//! with the reserved descriptor bit set is refused as corrupt here, because
+//! `ruzstd` does not check that bit. The zstd compatibility link's pure tier
+//! (`zstd_opts/pure.rs`) keeps its own window rules (zstd's
+//! `--memory`/`--long`) and is not affected.
+//!
 //! ## Three of five compression levels panic — read this before touching `level`
 //!
 //! Measured directly against `ruzstd` 0.8.1's `encoding::frame_compressor`,
@@ -100,7 +124,7 @@ use ruzstd::encoding::{CompressionLevel, FrameCompressor};
 
 use stuffr_core::{
     Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, Result, Sink,
-    Source, StreamOnly,
+    Source, StreamOnly, format_size,
 };
 
 pub use crate::zstd_shared::{ZSTD, zstd_meta as meta};
@@ -134,6 +158,11 @@ impl Codec for Zstd {
     /// attempted here, and the corruption-sweep tests for the measured
     /// error kinds `RUZSTD_MALFORMED_AS_OTHER_EOF` folds onto `InvalidData`.
     ///
+    /// `o.memory_limit` bounds every frame's declared window — see the
+    /// module doc's "Decode memory bound". The refusal comes from the first
+    /// `read` that reaches the frame, never from here, for the same deferred
+    /// construction reason.
+    ///
     /// **This decoder only weakly detects corruption in a stream that was
     /// not written with the content checksum on.** `caps().detects_corruption`
     /// is `CorruptionDetection::WhenPresent` because THIS codec's own encoder
@@ -162,10 +191,10 @@ impl Codec for Zstd {
     fn decoder<'a>(
         &self,
         src: Box<dyn Source + 'a>,
-        _o: &DecodeOpts,
+        o: &DecodeOpts,
     ) -> Result<Box<dyn Source + 'a>> {
         let normalized = crate::normalize::NormalizeDecodeErrors::new(
-            LazyRuzstdDecoder::new(src),
+            LazyRuzstdDecoder::new(src, o.memory_limit),
             crate::normalize::RUZSTD_MALFORMED_AS_OTHER_EOF,
         );
         Ok(Box::new(StreamOnly::new(normalized)))
@@ -327,7 +356,14 @@ impl Sink for RuzstdSink {
 ///   first frame followed by a TRUNCATED second one is still rejected, not
 ///   waved through as "just the first frame, nothing more". See
 ///   `a_truncated_second_frame_in_a_concatenated_stream_is_rejected`.
-enum LazyRuzstdDecoder<'a> {
+struct LazyRuzstdDecoder<'a> {
+    state: LazyState<'a>,
+    /// [`DecodeOpts::memory_limit`], checked against every frame's declared
+    /// window before `ruzstd` is built for it — see [`check_window`].
+    memory_limit: Option<u64>,
+}
+
+enum LazyState<'a> {
     Pending(Box<dyn Source + 'a>),
     Ready(Box<RuzstdFrame<'a>>),
     /// Every frame has ended, and the underlying source confirmed
@@ -341,8 +377,11 @@ enum LazyRuzstdDecoder<'a> {
 }
 
 impl<'a> LazyRuzstdDecoder<'a> {
-    fn new(src: Box<dyn Source + 'a>) -> Self {
-        Self::Pending(src)
+    fn new(src: Box<dyn Source + 'a>, memory_limit: Option<u64>) -> Self {
+        Self {
+            state: LazyState::Pending(src),
+            memory_limit,
+        }
     }
 }
 
@@ -358,9 +397,9 @@ impl Read for LazyRuzstdDecoder<'_> {
             return Ok(0);
         }
         loop {
-            match self {
-                LazyRuzstdDecoder::Done => return Ok(0),
-                LazyRuzstdDecoder::Ready(dec) => {
+            match &mut self.state {
+                LazyState::Done => return Ok(0),
+                LazyState::Ready(dec) => {
                     let n = dec.read(buf)?;
                     if n > 0 {
                         return Ok(n);
@@ -404,18 +443,18 @@ impl Read for LazyRuzstdDecoder<'_> {
                     // non-destructively, exactly one byte — whether a
                     // concatenated next frame follows. See the module doc's
                     // note on concatenation for why this is the mechanism.
-                    let LazyRuzstdDecoder::Ready(dec) =
-                        std::mem::replace(self, LazyRuzstdDecoder::Failed)
+                    let LazyState::Ready(dec) =
+                        std::mem::replace(&mut self.state, LazyState::Failed)
                     else {
                         unreachable!("just matched Ready above")
                     };
                     let remaining = dec.into_inner();
-                    match open_frame(remaining, false)? {
-                        Some(next) => *self = LazyRuzstdDecoder::Ready(Box::new(next)),
+                    match open_frame(remaining, false, self.memory_limit)? {
+                        Some(next) => self.state = LazyState::Ready(Box::new(next)),
                         None => {
                             // Genuinely nothing left (skippable frames
                             // included): the whole stream is done.
-                            *self = LazyRuzstdDecoder::Done;
+                            self.state = LazyState::Done;
                             return Ok(0);
                         }
                     }
@@ -423,23 +462,23 @@ impl Read for LazyRuzstdDecoder<'_> {
                     // the top of the loop serves its bytes like any other
                     // frame's.
                 }
-                LazyRuzstdDecoder::Failed => {
+                LazyState::Failed => {
                     return Err(std::io::Error::new(
                         ErrorKind::InvalidData,
                         "ruzstd: stream failed to decode",
                     ));
                 }
-                LazyRuzstdDecoder::Pending(_) => {
-                    let LazyRuzstdDecoder::Pending(src) =
-                        std::mem::replace(self, LazyRuzstdDecoder::Failed)
+                LazyState::Pending(_) => {
+                    let LazyState::Pending(src) =
+                        std::mem::replace(&mut self.state, LazyState::Failed)
                     else {
                         unreachable!("just matched Pending above")
                     };
-                    match open_frame(Replay::new(src), true)? {
-                        Some(dec) => *self = LazyRuzstdDecoder::Ready(Box::new(dec)),
+                    match open_frame(Replay::new(src), true, self.memory_limit)? {
+                        Some(dec) => self.state = LazyState::Ready(Box::new(dec)),
                         // Nothing but skippable frames: an empty stream,
                         // as `zstd -d` reads it.
-                        None => *self = LazyRuzstdDecoder::Done,
+                        None => self.state = LazyState::Done,
                     }
                 }
             }
@@ -512,7 +551,11 @@ impl Read for Replay<'_> {
 /// payload — is `InvalidData` (exit 5), never an I/O failure. Skipping reads
 /// through the one source, so a stream of millions of empty skippable frames
 /// costs time, never stack.
-fn open_frame(mut src: Replay<'_>, first: bool) -> std::io::Result<Option<RuzstdFrame<'_>>> {
+fn open_frame(
+    mut src: Replay<'_>,
+    first: bool,
+    memory_limit: Option<u64>,
+) -> std::io::Result<Option<RuzstdFrame<'_>>> {
     let mut skipped = false;
     loop {
         let mut buf = [0u8; 8];
@@ -526,7 +569,31 @@ fn open_frame(mut src: Replay<'_>, first: bool) -> std::io::Result<Option<Ruzstd
             && head[0] & 0xf0 == 0x50
             && crate::skippable::magic_agrees(&head[1..], &[0x2a, 0x4d, 0x18]);
         if !(crate::skippable::starts_skippable(head) || cut_magic) {
-            src.push_front(head);
+            // A real frame's header: read the rest of it (at most
+            // `FRAME_HEADER_MAX` bytes in all) and judge its window BEFORE
+            // `ruzstd` allocates one — see `check_window`.
+            let mut header = [0u8; FRAME_HEADER_MAX];
+            header[..n].copy_from_slice(head);
+            let mut len = n;
+            if n == buf.len() {
+                len += src.read_up_to(&mut header[n..])?;
+            }
+            let header = &header[..len];
+            if header.len() > 4 && header[..4] == ZSTD_FRAME_MAGIC && header[4] & 0x08 != 0 {
+                // RFC 8878 §3.1.1.1.1: the reserved bit must be zero. Refused
+                // here because `ruzstd` does not check it, and reads the rest
+                // of such a header as if it were well formed — a flipped
+                // descriptor then reached its window refusal (exit 6) for
+                // what is plainly a damaged header (exit 5).
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "zstd: frame header descriptor sets the reserved bit",
+                ));
+            }
+            if let Some(window) = declared_window(header) {
+                check_window(window, memory_limit)?;
+            }
+            src.push_front(header);
             return match StreamingDecoder::new(src) {
                 Ok(dec) => Ok(Some(dec)),
                 Err(e) => Err(frame_decoder_error_to_io(e)),
@@ -552,6 +619,103 @@ fn open_frame(mut src: Replay<'_>, first: bool) -> std::io::Result<Option<Ruzstd
         }
         skipped = true;
     }
+}
+
+/// The longest zstd frame header (RFC 8878 §3.1.1.1): magic (4),
+/// Frame_Header_Descriptor (1), Window_Descriptor (1), Dictionary_ID (up to
+/// 4) and Frame_Content_Size (up to 8).
+const FRAME_HEADER_MAX: usize = 18;
+
+/// A real (not skippable) zstd frame's magic, little-endian `0xFD2FB528`.
+const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+/// The largest window this build's pure decoder accepts: `ruzstd`'s own
+/// default cap (`FrameDecoder::check_window_size`; 128 MiB in 0.9.1, whose
+/// doc comment says "100mb" while the constant says 128). `StreamingDecoder`
+/// never raises it, so a frame above it can only be decoded by the C tier.
+const PURE_WINDOW_CAP: u64 = ruzstd::decoding::DEFAULT_MAX_WINDOW_SIZE;
+
+/// The window a real zstd frame header declares (RFC 8878 §3.1.1.1.2:
+/// Window_Descriptor, or Frame_Content_Size when Single_Segment_Flag is set —
+/// the same rule `ruzstd`'s `FrameHeader::window_size` applies), or `None`
+/// when `header` is not a complete, well-formed frame header. `None` means
+/// "not this function's call": the frame is handed to `ruzstd` unjudged and a
+/// malformed header is reported there as corrupt (exit 5), never as a
+/// resource refusal (exit 6).
+fn declared_window(header: &[u8]) -> Option<u64> {
+    if header.get(..4)? != ZSTD_FRAME_MAGIC {
+        return None;
+    }
+    let descriptor = *header.get(4)?;
+    if descriptor & 0x08 != 0 {
+        // The reserved bit: a malformed header, `ruzstd`'s to refuse.
+        return None;
+    }
+    if descriptor & 0x20 == 0 {
+        let wd = *header.get(5)?;
+        let base = 1u64 << (10 + u32::from(wd >> 3));
+        return Some(base + (base / 8) * u64::from(wd & 7));
+    }
+    let did_len = [0, 1, 2, 4][usize::from(descriptor & 0x03)];
+    let fcs_len = [1, 2, 4, 8][usize::from(descriptor >> 6)];
+    let at = 5 + did_len;
+    let field = header.get(at..at + fcs_len)?;
+    let mut le = [0u8; 8];
+    le[..fcs_len].copy_from_slice(field);
+    let size = u64::from_le_bytes(le);
+    // The two-byte field is offset by 256 (RFC 8878 §3.1.1.1.4).
+    Some(if fcs_len == 2 { size + 256 } else { size })
+}
+
+/// Refuses a frame whose declared window this decoder will not allocate:
+/// above [`PURE_WINDOW_CAP`] on any limit, or above
+/// [`DecodeOpts::memory_limit`]. Runs at EVERY frame start, the first and
+/// each concatenated one after it, before `StreamingDecoder::new` sizes its
+/// buffers by the declaration — `--max-ratio` cannot see this, because the
+/// allocation precedes any output.
+///
+/// The kind is `OutOfMemory`, which `RUZSTD_MALFORMED_AS_OTHER_EOF` does
+/// not fold, so `Error::from_decode_io` classifies it as
+/// `Error::ResourceLimit` (exit 6): the file is not damaged, this decoder
+/// declined to ask the allocator (the rule in `Error::exit_code`'s doc).
+/// The pre-flight compares the declaration with the limit; `ruzstd`'s actual
+/// resident cost runs higher (PARSE-2 measured 242-276 MB peak RSS for a
+/// 96 MiB window), the same "declaration, not RSS" bound `xz_pure.rs`'s
+/// pre-flight sets.
+fn check_window(window: u64, memory_limit: Option<u64>) -> std::io::Result<()> {
+    if window > PURE_WINDOW_CAP {
+        return Err(window_over_pure_cap(window));
+    }
+    if let Some(limit) = memory_limit
+        && window > limit
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::OutOfMemory,
+            format!(
+                "zstd: frame header declares a window needing {}, but --memory-limit \
+                 allows only {} — raise --memory-limit to decode this file",
+                format_size(window),
+                format_size(limit)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// A window above [`PURE_WINDOW_CAP`]: valid zstd this build cannot decode,
+/// so a resource limit naming the cap and the build that lifts it — never
+/// "archive is corrupt" (PARSE-3).
+fn window_over_pure_cap(window: u64) -> std::io::Error {
+    std::io::Error::new(
+        ErrorKind::OutOfMemory,
+        format!(
+            "zstd: frame header declares a window of {}, above the {} this build's \
+             pure zstd decoder (ruzstd) accepts — rebuild with --features c-backed \
+             to decode this file",
+            format_size(window),
+            format_size(PURE_WINDOW_CAP)
+        ),
+    )
 }
 
 /// The content checksum a finished frame carried and the one `ruzstd`
@@ -595,6 +759,13 @@ pub(crate) fn checksum_mismatch(dec: &ruzstd::decoding::FrameDecoder) -> Option<
 /// consistently regardless of which stage of decoding caught the problem.
 fn frame_decoder_error_to_io(e: ruzstd::decoding::errors::FrameDecoderError) -> std::io::Error {
     use std::error::Error as StdError;
+    // `check_window` refuses every such frame before `ruzstd` sees it; this
+    // arm keeps the verdict exit 6 should a header ever reach `ruzstd` that
+    // `declared_window` could not read, rather than letting the
+    // `Other` fold below report valid zstd as corrupt (PARSE-3).
+    if let ruzstd::decoding::errors::FrameDecoderError::WindowSizeTooBig { requested, .. } = e {
+        return window_over_pure_cap(requested);
+    }
     let msg = e.to_string();
     let mut cause: Option<&(dyn StdError + 'static)> = Some(&e);
     while let Some(c) = cause {
@@ -907,6 +1078,7 @@ mod tests {
     fn sweep(plain: &[u8], packed: &[u8]) -> (usize, usize, usize, usize) {
         let mut invalid_data = 0usize;
         let mut other_kind = 0usize;
+        let mut refused = Vec::new();
         let mut silently_wrong = 0usize;
         let mut silently_unchanged = 0usize;
         for i in 0..packed.len() {
@@ -919,9 +1091,19 @@ mod tests {
                 Ok(_) if out == plain => silently_unchanged += 1,
                 Ok(_) => silently_wrong += 1,
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidData => invalid_data += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::OutOfMemory => refused.push(i),
                 Err(_) => other_kind += 1,
             }
         }
+        assert_eq!(
+            refused,
+            [5],
+            "only byte 5, the window descriptor, may turn a frame into a resource refusal: \
+             flipped, it declares a window of gigabytes, above ruzstd's 128 MiB cap, which \
+             `check_window` refuses before allocating (exit 6, the rule in \
+             `Error::exit_code`'s doc) where ruzstd's own refusal used to fold onto \
+             InvalidData"
+        );
         (invalid_data, other_kind, silently_wrong, silently_unchanged)
     }
 
@@ -946,6 +1128,10 @@ mod tests {
     /// `snappy.rs`'s own single documented exception (its chunk type byte,
     /// index 10): both are one real, protocol-level gap in an otherwise
     /// fully covered format, not a probe bug.
+    ///
+    /// (The figures above are 0.8.1's. Since the window pre-flight, byte 5
+    /// flipped declares gigabytes, over `ruzstd`'s 128 MiB cap, and is
+    /// refused as a resource limit; `sweep` pins that position.)
     #[test]
     fn corruption_sweep_on_a_stream_this_codec_wrote() {
         use stuffr_core::testing::incompressible;
@@ -985,10 +1171,10 @@ mod tests {
         );
         assert_eq!(
             invalid_data,
-            packed.len(),
-            "ruzstd 0.9.0 detects EVERY position, with no structural exception. The \
-             previously pinned 0.8.1 left byte 5 (the window descriptor) undetected, \
-             so this read `packed.len() - 1`; the upgrade closed that gap."
+            packed.len() - 1,
+            "every position but byte 5 is detected as InvalidData; byte 5 (the window \
+             descriptor) is detected too, as a resource refusal — `sweep` pins that. \
+             (0.8.1 left byte 5 undetected; 0.9.0 folded its refusal onto InvalidData.)"
         );
     }
 
@@ -1070,16 +1256,19 @@ mod tests {
             "every malformed-input error here must classify as InvalidData once \
              NormalizeDecodeErrors has run — {other_kind} positions did not"
         );
-        // Measured, not merely bounded: 9 of 4105 detected (structural
+        // Measured, not merely bounded: 9 of 4105 detected (8 InvalidData,
+        // plus byte 5 as a resource refusal) (structural
         // framing bytes only — no checksum exists to catch a corrupted
         // literal), 4096 silently wrong, and no silently-unchanged
         // window-descriptor position the other two sweeps hit. A
         // dramatically weaker showing than either checksummed sweep above,
         // which is the whole point of this test — see the `decoder` doc's
         // disclosure this backs.
+        // Byte 5 (the window descriptor) is the ninth detected position,
+        // refused as a resource limit — `sweep` pins it.
         assert_eq!(
             invalid_data,
-            9,
+            8,
             "measured {invalid_data} of {} positions detected without a checksum to check \
              against — only structural framing bytes remain protected",
             packed.len()
@@ -1334,6 +1523,204 @@ mod tests {
         let plain = b"cross-backend: the C backend writes, ruzstd reads".repeat(50);
         let packed = crate::zstd_c::encode_for_test(plain.as_slice());
         assert_eq!(decompress(packed), plain);
+    }
+}
+
+/// PARSE-2 and PARSE-3 of the 2026-10-31 audit: the decoder honours
+/// `DecodeOpts::memory_limit` at every frame start, and a window above
+/// `ruzstd`'s own cap is a resource limit, not corruption.
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use stuffr_core::ReaderSource;
+    use stuffr_core::testing::SharedBuf;
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// Window_Descriptor bytes (RFC 8878 §3.1.1.1.2: exponent in the top
+    /// five bits, mantissa in the low three, window = 2^(10+e) · (1 + m/8)).
+    const WD_1_MIB: u8 = 10 << 3;
+    const WD_96_MIB: u8 = (16 << 3) | 4;
+    const WD_128_MIB: u8 = 17 << 3;
+    const WD_144_MIB: u8 = (17 << 3) | 1;
+
+    /// One real frame of `payload` from this codec's own encoder, its header
+    /// rewritten to carry `window_descriptor` (and only that). The encoder
+    /// writes a single-segment header, whose window is its content size; the
+    /// patch clears Single_Segment_Flag and inserts the descriptor byte, which
+    /// leaves a valid frame: the FCS field keeps its width (flag 0 then means
+    /// "no field", so a one-byte field is not kept — see the assertion).
+    fn frame_declaring(window_descriptor: u8, payload: &[u8]) -> Vec<u8> {
+        let buf = SharedBuf::new();
+        let mut sink = Zstd
+            .encoder(Box::new(buf.clone()), &EncodeOpts::default())
+            .unwrap();
+        sink.write_all(payload).unwrap();
+        sink.finish().unwrap();
+        let mut frame = buf.contents();
+        let descriptor = frame[4];
+        let fcs_flag = descriptor >> 6;
+        if descriptor & 0x20 == 0 {
+            frame[5] = window_descriptor;
+            return frame;
+        }
+        assert_ne!(
+            fcs_flag, 0,
+            "a one-byte single-segment FCS cannot survive clearing the flag; \
+             use a payload of 256 bytes or more"
+        );
+        frame[4] = descriptor & !0x20;
+        // Window_Descriptor sits right after the descriptor, before any
+        // Dictionary_ID and Frame_Content_Size.
+        frame.insert(5, window_descriptor);
+        frame
+    }
+
+    fn decode(bytes: Vec<u8>, memory_limit: Option<u64>) -> std::result::Result<Vec<u8>, Error> {
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(bytes)));
+        let mut dec = Zstd
+            .decoder(
+                src,
+                &DecodeOpts {
+                    memory_limit,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).map_err(Error::from_decode_io)?;
+        Ok(out)
+    }
+
+    fn payload() -> Vec<u8> {
+        b"window bound payload ".repeat(40)
+    }
+
+    #[test]
+    fn the_patched_frames_still_decode_without_a_limit() {
+        // The fixtures are valid zstd: unbounded, under the cap, they decode.
+        for wd in [WD_1_MIB, WD_96_MIB, WD_128_MIB] {
+            assert_eq!(
+                decode(frame_declaring(wd, &payload()), None).unwrap(),
+                payload()
+            );
+        }
+    }
+
+    #[test]
+    fn a_window_over_the_memory_limit_is_a_resource_limit() {
+        let err = decode(frame_declaring(WD_96_MIB, &payload()), Some(MIB)).unwrap_err();
+        assert!(
+            matches!(err, Error::ResourceLimit(_)),
+            "a window over --memory-limit is exit 6, not {err:?}"
+        );
+        assert_eq!(err.exit_code(), 6);
+        let text = err.to_string();
+        // The pre-flight's own words: `ruzstd` was never built for the frame,
+        // so nothing was allocated by the declaration.
+        assert!(
+            text.contains("--memory-limit") && text.contains("96 MiB") && text.contains("1 MiB"),
+            "the refusal names the declared window and the limit: {text}"
+        );
+    }
+
+    #[test]
+    fn a_window_under_the_memory_limit_still_decodes() {
+        let got = decode(frame_declaring(WD_1_MIB, &payload()), Some(8 * MIB)).unwrap();
+        assert_eq!(got, payload());
+        // Exactly at the limit is allowed: the check is "exceeds".
+        let got = decode(frame_declaring(WD_1_MIB, &payload()), Some(MIB)).unwrap();
+        assert_eq!(got, payload());
+    }
+
+    #[test]
+    fn a_later_frame_declaring_a_larger_window_is_refused() {
+        let mut two = frame_declaring(WD_1_MIB, &payload());
+        two.extend_from_slice(&frame_declaring(WD_96_MIB, &payload()));
+        // Both frames decode unbounded, so the refusal below is the limit's.
+        let mut both = payload();
+        both.extend_from_slice(&payload());
+        assert_eq!(decode(two.clone(), None).unwrap(), both);
+
+        let err = decode(two, Some(8 * MIB)).unwrap_err();
+        assert!(
+            matches!(err, Error::ResourceLimit(_)),
+            "the second frame's window must be checked too, got {err:?}"
+        );
+        assert!(err.to_string().contains("96 MiB"), "{err}");
+    }
+
+    #[test]
+    fn a_later_frame_behind_a_skippable_frame_is_checked_too() {
+        let mut stream = frame_declaring(WD_1_MIB, &payload());
+        stream.extend_from_slice(&[0x50, 0x2a, 0x4d, 0x18, 3, 0, 0, 0, 1, 2, 3]);
+        stream.extend_from_slice(&frame_declaring(WD_96_MIB, &payload()));
+        let err = decode(stream, Some(8 * MIB)).unwrap_err();
+        assert!(matches!(err, Error::ResourceLimit(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_window_above_the_pure_tier_cap_is_a_resource_limit_not_corrupt() {
+        let err = decode(frame_declaring(WD_144_MIB, &payload()), None).unwrap_err();
+        assert!(
+            matches!(err, Error::ResourceLimit(_)),
+            "valid zstd above ruzstd's cap is exit 6, not {err:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("c-backed") && text.contains("144 MiB") && text.contains("128 MiB"),
+            "the refusal names the window, the pure-tier cap and the build: {text}"
+        );
+        // A generous limit does not lift the cap, and the cap's message wins.
+        let err = decode(frame_declaring(WD_144_MIB, &payload()), Some(1 << 40)).unwrap_err();
+        assert!(err.to_string().contains("c-backed"), "{err}");
+    }
+
+    #[test]
+    fn a_reserved_descriptor_bit_is_corrupt_not_a_resource_limit() {
+        // Found by the corruption sweep: flipping the descriptor byte sets
+        // the reserved bit AND Single_Segment_Flag with an 8-byte FCS read
+        // from payload bytes, and `ruzstd` (which ignores the reserved bit)
+        // refused the resulting window — exit 6 for a damaged header.
+        let mut frame = frame_declaring(WD_1_MIB, &payload());
+        frame[4] ^= 0xff;
+        let err = decode(frame, Some(MIB)).unwrap_err();
+        assert!(matches!(err, Error::Corrupt(_)), "{err:?}");
+    }
+
+    #[test]
+    fn ruzstds_own_window_refusal_is_a_resource_limit() {
+        // The fallback in `frame_decoder_error_to_io`, reached directly.
+        let e = frame_decoder_error_to_io(
+            ruzstd::decoding::errors::FrameDecoderError::WindowSizeTooBig {
+                requested: 144 * MIB,
+                max: PURE_WINDOW_CAP,
+            },
+        );
+        assert_eq!(e.kind(), ErrorKind::OutOfMemory);
+        assert!(matches!(Error::from_decode_io(e), Error::ResourceLimit(_)));
+    }
+
+    #[test]
+    fn the_declared_window_follows_rfc_8878() {
+        let h = |rest: &[u8]| [&[0x28, 0xb5, 0x2f, 0xfd][..], rest].concat();
+        assert_eq!(declared_window(&h(&[0x00, 0x00])), Some(1024));
+        assert_eq!(declared_window(&h(&[0x00, WD_96_MIB])), Some(96 * MIB));
+        assert_eq!(
+            declared_window(&h(&[0x00, 0xff])),
+            Some((1 << 41) + 7 * (1 << 38))
+        );
+        // Single segment: the window is Frame_Content_Size, at each width.
+        assert_eq!(declared_window(&h(&[0x20, 200])), Some(200));
+        assert_eq!(declared_window(&h(&[0x60, 0x00, 0x01])), Some(256 + 256));
+        assert_eq!(declared_window(&h(&[0xa0, 0, 0, 0, 0x10])), Some(256 * MIB));
+        // With a one-byte Dictionary_ID before it.
+        assert_eq!(declared_window(&h(&[0x21, 7, 200])), Some(200));
+        // Not this function's call: wrong magic, reserved bit, cut short.
+        assert_eq!(declared_window(&[0, 0, 0, 0, 0, 0]), None);
+        assert_eq!(declared_window(&h(&[0x08, 0x00])), None);
+        assert_eq!(declared_window(&h(&[0x00])), None);
+        assert_eq!(declared_window(&h(&[0xa0, 0, 0])), None);
     }
 }
 

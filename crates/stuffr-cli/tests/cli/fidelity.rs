@@ -440,6 +440,78 @@ fn a_legitimate_archive_of_the_same_size_still_works_on_every_verb() {
     assert!(dest.join("a.txt").exists());
 }
 
+/// A zstd frame of one raw (stored) block holding `payload`, declaring
+/// `window_descriptor` (RFC 8878: window = 2^(10+e) * (1 + m/8), e the top
+/// five bits, m the low three). Valid zstd: no checksum, no content size.
+#[cfg(not(feature = "zstd-c"))]
+fn raw_zstd_frame(window_descriptor: u8, payload: &[u8]) -> Vec<u8> {
+    let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, window_descriptor];
+    let block = ((payload.len() as u32) << 3) | 1; // last block, raw
+    frame.extend_from_slice(&block.to_le_bytes()[..3]);
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// PARSE-2/PARSE-3 (2026-10-31 audit): the pure-tier zstd decoder honours
+/// `--memory-limit` at every frame start, and a window above ruzstd's own
+/// 128 MiB cap is exit 6 naming `c-backed`, not "archive is corrupt". Pure
+/// tier only: under `zstd-c` the registry's zstd is libzstd.
+#[cfg(not(feature = "zstd-c"))]
+#[test]
+fn pure_zstd_refuses_a_window_over_the_memory_limit_on_every_frame() {
+    let dir = tmp("zstd-window");
+    std::fs::create_dir_all(&dir).unwrap();
+    let small = raw_zstd_frame(10 << 3, b"first-"); // 1 MiB window
+    let big = raw_zstd_frame((16 << 3) | 4, b"second"); // 96 MiB window
+    let over_cap = raw_zstd_frame((17 << 3) | 1, b"third"); // 144 MiB window
+
+    let run = |name: &str, bytes: &[u8], limit: &str| {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        Command::new(STUFFR)
+            .args(["cat", path.to_str().unwrap(), "--memory-limit", limit])
+            .output()
+            .unwrap()
+    };
+
+    let out = run("small.zst", &small, "1M");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"first-");
+
+    let out = run("big.zst", &big, "1M");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(6), "stderr: {stderr}");
+    assert!(
+        stderr.contains("memory-limit") && stderr.contains("96 MiB"),
+        "{stderr}"
+    );
+
+    // The second frame declares more than the first: checked too.
+    let out = run("two.zst", &[small.clone(), big.clone()].concat(), "8M");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(6), "stderr: {stderr}");
+    assert!(stderr.contains("96 MiB"), "{stderr}");
+    let out = run("two-ok.zst", &[small.clone(), big].concat(), "100M");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"first-second");
+
+    let out = run("over-cap.zst", &over_cap, "64G");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(6), "stderr: {stderr}");
+    assert!(
+        stderr.contains("c-backed") && !stderr.contains("corrupt"),
+        "{stderr}"
+    );
+}
+
 /// `--memory-limit` is now ACCEPTED and honoured on the entry-aware paths,
 /// where it used to be refused at exit 2 with "not yet honoured for a
 /// container". Raising it past the declaration lets the crafted archive
