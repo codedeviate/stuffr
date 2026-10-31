@@ -277,7 +277,8 @@ COLLECTING FILES INTO AN ARCHIVE
       streams out everything before it — the archive is never buffered
       whole, but a single huge entry does cost its own compressed size in
       RAM. Reading: see "LISTING AND TESTING" below, because a zip on a
-      pipe is genuinely worth less than a zip in a file.
+      pipe gives up random access and its unix modes, and its symlinks
+      arrive as files.
       Entries are deflate-compressed by default. Directory entries carry
       the trailing "/" the format identifies them by, and symlinks are
       stored the way Info-ZIP stores them, so `unzip` restores them as
@@ -521,8 +522,11 @@ INSPECTING A STREAM (DECODING AT MOST ITS FIRST 4 KiB)
     * a zip under a codec — `bundle.zip.gz` — however seekable the FILE
       is. The rung reported is the raw input's, and a seekable file says
       nothing about a container read out of a gzip decoder: that decoder
-      is forward-only by construction, and `stuffr test bundle.zip.gz
-      --strict-fidelity` on the same bytes exits 4 with two warnings.
+      is forward-only by construction. What `stuffr test bundle.zip.gz
+      --strict-fidelity` finds is another matter: a well-formed zip is
+      read to its central directory and compared, and exits 0 (see
+      "LISTING AND TESTING" below); one whose directory cannot be read
+      exits 4 with two warnings.
 
   Everywhere else the claim is true and info still makes it: a seekable
   bare zip read its central directory, a tar, ar or cpio has no trailing
@@ -631,20 +635,41 @@ LISTING AND TESTING AN ARCHIVE
 
   stuffr test photos.zip --strict-fidelity
   cat photos.zip | stuffr test - --strict-fidelity
-      The first succeeds and the second fails with exit 4, and that is the
-      whole point of the flag. A zip keeps its authoritative metadata in a
-      central directory at the END of the file: given a real file stuffr
-      reads it (`stuffr info` says rung "exact" — random access to any
-      entry, unix modes present, symlinks reported as symlinks), and given
-      a pipe it cannot, so it reads the inline local headers instead. That
-      yields the same DATA and a strict subset of the metadata — no modes,
-      no entry count, and a symlink indistinguishable from a small file
-      holding its target. Both losses are reported by name, which is why
-      --strict-fidelity fails here and passes on a piped tar: it gates on
-      what was lost, never on the rung. (`list`/`ls`, `test` and `unpack`
-      all take the flag; `cat` does not, because its output IS the data and
-      a caller piping it somewhere wants the bytes or an error, not a
-      verdict on metadata.)
+      Both succeed on a well-formed zip. A zip keeps its authoritative
+      metadata in a central directory at the END of the file: given a real
+      file stuffr reads it up front (`stuffr info` says rung "exact" —
+      random access to any entry, unix modes present, symlinks reported as
+      symlinks). A pipe cannot seek, so stuffr walks the inline local
+      headers, then reads the central directory that follows the last entry
+      and compares the two: the entry count and order, and for each entry
+      the name, method, CRC-32, sizes and flag bits. When that comparison
+      completes and agrees, nothing is reported and the exit is 0. Before
+      0.23.0 the pipe always exited 4 with "central/trailing index was never
+      read" and "total entry count is unknown"; those two warnings are now
+      raised only when the directory could not be read: cut off, absent,
+      more than 32 MiB of recorded headers, or contradicted by its own end
+      record. They are raised too when the directory marks a unix symlink,
+      because the pipe delivers a link as a regular file holding its target
+      (and no modes are restored from a pipe). A pipe that is cut off
+      inside its directory is exit 5 as it always was. --strict-fidelity
+      gates on what was lost, never on the rung. (`list`/`ls`, `test` and
+      `unpack` all take the flag; `cat` does not, because its output IS the
+      data and a caller piping it somewhere wants the bytes or an error,
+      not a verdict on metadata.)
+
+  stuffr test disagree.zip --strict-fidelity
+      Exit 4 when a zip's local headers and its central directory disagree
+      about an entry, on a file or on a pipe. The warning reads: `zip` local
+      header and central directory disagree on <field> for entry `<name>`,
+      where the field is the raw name, the name each header would deliver
+      (including its own Unicode Path extra field), the method, the CRC-32,
+      the sizes, or flag bits 0, 3 and 11. Without the flag it is a warning
+      and the exit is 0: the data is still read, but one of the two headers
+      is lying about the entry, which is how a zip is made to show one name
+      to one tool and another to a different tool. An end record whose two
+      entry counts disagree is exit 5, and so is a multi-disk end record
+      (was 3); a Unicode Path field with a bad CRC is ignored, not an
+      error; AES (method 99) without its extra field is exit 3.
 
   stuffr test archive.zip
       Verifies every entry's CRC32 — zip carries one per entry, so

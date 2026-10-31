@@ -7,6 +7,55 @@
 //! **This crate has no binary.** `cargo install stuffr` fails with "no
 //! binaries"; the `stuffr` command lives in the `stuffr-cli` package, so the
 //! working spelling is `cargo install stuffr-cli`.
+//!
+//! # Decoding a borrowed reader
+//!
+//! [`Source`] and [`SeekRead`] no longer require `Send`, and
+//! [`Codec::decoder`] takes a `Box<dyn Source + 'a>`, so a codec can be put
+//! over a reader that borrows something: an archive member's reader (a `.Z`
+//! inside a tar or a zip), a `&mut &[u8]`, a `&mut File`. [`decode_reader`]
+//! is the one-call route and [`BorrowedSource`] the source under it; neither
+//! needs a registry, and a codec that cannot decode is refused with exit 3.
+//!
+//! ```
+//! # #[cfg(feature = "compress")]
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use std::io::{Read, Write};
+//! use std::sync::{Arc, Mutex};
+//! use stuffr::{DecodeOpts, EncodeOpts, FormatId, decode_reader};
+//!
+//! // A writer the encoder can own (it must be `Send`) and we can still read.
+//! #[derive(Clone, Default)]
+//! struct Shared(Arc<Mutex<Vec<u8>>>);
+//! impl Write for Shared {
+//!     fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+//!         self.0.lock().unwrap().extend_from_slice(b);
+//!         Ok(b.len())
+//!     }
+//!     fn flush(&mut self) -> std::io::Result<()> {
+//!         Ok(())
+//!     }
+//! }
+//!
+//! let codec = stuffr::registry().codec(FormatId::new("compress")).expect("the `compress` feature");
+//! let shared = Shared::default();
+//! let mut sink = codec.encoder(Box::new(shared.clone()), &EncodeOpts::default())?;
+//! sink.write_all(b"hello, borrowed world")?;
+//! sink.finish()?;
+//! let stream: Vec<u8> = shared.0.lock().unwrap().clone();
+//!
+//! // `&mut &[u8]` borrows the local `stream`: not `'static`, and the decoder
+//! // lives no longer than that borrow.
+//! let mut input: &[u8] = &stream;
+//! let mut out = Vec::new();
+//! decode_reader(codec.as_ref(), &mut input, &DecodeOpts::default())?
+//!     .read_to_end(&mut out)?;
+//! assert_eq!(out, b"hello, borrowed world");
+//! # Ok(())
+//! # }
+//! # #[cfg(not(feature = "compress"))]
+//! # fn main() {}
+//! ```
 
 pub use stuffr_core as core;
 pub use stuffr_core::*;

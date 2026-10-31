@@ -1097,6 +1097,17 @@ cargo add stuffr                # the facade; re-exports stuffr-core + stuffr-fo
 | [`stuffr-formats`](https://crates.io/crates/stuffr-formats) | codec and container implementations |
 | [`stuffr-core`](https://crates.io/crates/stuffr-core) | traits, stream ladder, fidelity, governor, registry — zero format dependencies |
 
+### Decoding a borrowed reader
+
+`Source` and `SeekRead` no longer require `Send`, and `Codec::decoder` takes a
+`Box<dyn Source + 'a>`, so a codec decodes a reader that borrows something: an
+archive member's reader (a `.Z` inside a tar or a zip), a `&mut &[u8]`, a
+`&mut File`. `stuffr::decode_reader(codec, reader, &DecodeOpts::default())` is the
+one-call route (`stuffr::BorrowedSource` is the source under it); it needs no
+registry and refuses a codec that cannot decode with exit 3. A caller that does
+need `Send` asks for `Box<dyn Source + Send>` itself. The `stuffr` crate docs
+carry a compiled example.
+
 ## Compatibility links
 
 Invoked as `bzip2`, `bunzip2`, `bzcat` or `bzip2recover`, the `stuffr` binary
@@ -2198,6 +2209,22 @@ data, or that a solid block cost 40 MB of wasted decode to reach one file.
 
 So `curl … | stuffr cat - | grep pattern` works on a ZIP, on real data, and tells
 you honestly what it approximated.
+
+What it approximated shrinks when the stream allows. A zip on a pipe is walked by
+its local headers, then its central directory, which follows the last entry, is
+read and compared with them: entry count and order, and per entry the name, method,
+CRC-32, sizes and flag bits 0, 3 and 11. When that comparison completes the old
+pipe warnings (`central/trailing index was never read`, `total entry count is
+unknown`) are not raised, so a well-formed piped zip passes `--strict-fidelity`
+(exit 0; it was exit 4 up to 0.22.0). They stay when the directory is cut off,
+absent, past 32 MiB of recorded headers, or holds a unix symlink (a pipe delivers
+the link as a regular file). The same comparison runs on a seekable zip: a local
+header and central directory that disagree raise `Fidelity::HeadersDisagree` (``zip``
+local header and central directory disagree on FIELD for entry `NAME`), exit 4 under
+`--strict-fidelity`. On hostile zips four exits moved with the `zip` crate's 9.1.3
+upgrade: an end record whose two counts disagree is exit 5 (was a warning), a
+multi-disk end record is exit 5 (was 3), AES method 99 without its extra field is
+exit 3 (was 5), and a Unicode Path extra field with a bad CRC is ignored (was exit 5).
 
 ### 3. One governed thread budget, conservative by default
 
