@@ -322,7 +322,7 @@ fn compress_child(
         .collect::<io::Result<Vec<_>>>()?;
     let mut buf = vec![0u8; CHUNK];
     let dst: Box<dyn Write + Send> = match out {
-        Some(path) => Box::new(File::options().write(true).truncate(true).open(path)?),
+        Some(path) => Box::new(open_copy(path, true)?),
         None => Box::new(io::sink()),
     };
     let dst = BufWriter::with_capacity(CHUNK, dst);
@@ -335,6 +335,57 @@ fn compress_child(
     Ok(peak_rss()?.saturating_sub(baseline))
 }
 
+/// Opens the parent's temp copy, by the name it was handed (HOST-9): the
+/// parent works through the descriptor it created, but a child is another
+/// process. Opened `O_NOFOLLOW` (a symlink put at the name fails, ELOOP),
+/// `O_NONBLOCK` (a FIFO put there cannot hang the open), never created and
+/// never `O_TRUNC`; then `fstat` must show a regular file with one link,
+/// owned by this user, before anything is written — the writer truncates
+/// it only then, through the checked descriptor.
+///
+/// Why not compare its (dev, ino) with the parent's: the copy lives in a
+/// temp directory, where another user can remove a file of ours only if the
+/// directory is not sticky, and can put there only a file of THEIR own
+/// (refused by the owner check) or a link (refused by `O_NOFOLLOW`, or by
+/// the link count for a hard link to a file of ours). What the identity
+/// would add is defence against this same user, who owns every file
+/// involved anyway; it would cost two fields on the child's command line.
+fn open_copy(path: &Path, write: bool) -> io::Result<File> {
+    let mut opts = File::options();
+    if write {
+        opts.write(true);
+    } else {
+        opts.read(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = file.metadata()?;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        if !m.file_type().is_file() || m.nlink() != 1 || m.uid() != me {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is not bench's own temp file (a regular file with one link, \
+                     owned by this user)",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    if write {
+        file.set_len(0)?;
+    }
+    Ok(file)
+}
+
 /// Reads `copy` through the decoder to its end, discarding the output.
 fn decompress_child(
     codec: &dyn Codec,
@@ -342,7 +393,7 @@ fn decompress_child(
     copy: &Snapshot,
 ) -> stuffr::Result<u64> {
     let src: Box<dyn Source> = Box::new(temp_source(
-        GuardedSeek::new(File::open(&copy.path)?),
+        GuardedSeek::new(open_copy(&copy.path, false)?),
         copy.len,
     ));
     let mut buf = vec![0u8; CHUNK];
@@ -596,7 +647,7 @@ pub fn measure_memory_with(
         // The copy lives until this stream's decompress child is done; the
         // compress child opens it by name, so the parent's handle closes.
         let copy = match TempOut::create() {
-            Ok((copy, _file)) => copy,
+            Ok(copy) => copy,
             Err(e) => {
                 fail(
                     Side::Compress,
@@ -981,6 +1032,37 @@ mod tests {
             path: out.path,
             len,
         }
+    }
+
+    /// HOST-9: the child opens the parent's copy by name, so it refuses
+    /// what someone else could have put there: a symlink (the victim is
+    /// untouched), a second hard link, a FIFO (without hanging). The real
+    /// copy — a regular file of ours with one link — is emptied for writing.
+    #[cfg(unix)]
+    #[test]
+    fn the_child_opens_only_bench_s_own_temp_copy() {
+        let dir = Scratch::new();
+        let victim = dir.file("victim", b"precious");
+        let link = dir.0.join("link");
+        std::os::unix::fs::symlink(&victim.path, &link).unwrap();
+        for write in [true, false] {
+            assert!(open_copy(&link, write).is_err(), "symlink, write {write}");
+        }
+        assert_eq!(fs::read(&victim.path).unwrap(), b"precious");
+        let hard = dir.0.join("hard");
+        fs::hard_link(&victim.path, &hard).unwrap();
+        let e = open_copy(&hard, true).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        assert_eq!(fs::read(&victim.path).unwrap(), b"precious");
+        fs::remove_file(&hard).unwrap();
+        let fifo = dir.0.join("fifo");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(open_copy(&fifo, false).is_err(), "a FIFO is no temp copy");
+        let copy = dir.file("copy", b"stale");
+        drop(open_copy(&copy.path, true).unwrap());
+        assert_eq!(fs::metadata(&copy.path).unwrap().len(), 0, "emptied");
     }
 
     /// The compress child writes the compressed stream to its output file

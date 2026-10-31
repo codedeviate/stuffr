@@ -333,7 +333,7 @@ fn run(
     let streamed = matches!(input, Input::Files(_));
     let dest = |g: &[Part<'_>]| destination(name, group_len(g), plan.memory_limit, streamed);
     let temp = if groups.iter().any(|g| dest(g) == Dest::TempFile) {
-        Some(TempOut::create()?.0)
+        Some(TempOut::create()?)
     } else {
         None
     };
@@ -483,13 +483,15 @@ impl Job<'_> {
                 (len, ns, Box::new(MemSource::new(bytes)) as Box<dyn Source>)
             }
             (Dest::TempFile, Some(temp)) => {
-                let file = File::options()
-                    .write(true)
-                    .truncate(true)
-                    .open(temp.path())?;
+                // Through the descriptor `create` made, never the name
+                // again (HOST-9): emptied and rewound for this row.
+                let mut file = temp.handle()?;
+                file.set_len(0)?;
+                file.seek(SeekFrom::Start(0))?;
                 let dst = BufWriter::with_capacity(CHUNK, file);
                 let ns = self.compress(group, Box::new(dst), clock, progress)?;
-                let file = File::open(temp.path())?;
+                let mut file = temp.handle()?;
+                file.seek(SeekFrom::Start(0))?;
                 let len = file.metadata()?.len();
                 let src = temp_source(GuardedSeek::new(counted(file)), len);
                 (len, ns, Box::new(src) as Box<dyn Source>)
@@ -775,13 +777,20 @@ static TEMP_SEQ: AtomicU32 = AtomicU32::new(0);
 /// lives, removed when it drops (a panic included).
 pub(super) struct TempOut {
     path: PathBuf,
+    /// The descriptor `create` opened (read and write, `create_new`, 0600):
+    /// every use of the file goes through it ([`Self::handle`]), never
+    /// through the name, so nothing put at the name after the create —
+    /// a symlink to a victim file — is ever opened, truncated or written
+    /// (HOST-9). Only the memory child, another process, opens it by name,
+    /// and checks what it opened (`memory::open_copy`).
+    file: File,
     /// Dropped after `drop` has removed the file, so there is no moment the
     /// file exists unarmed.
     _armed: CleanupGuard,
 }
 
 impl TempOut {
-    pub(super) fn create() -> io::Result<(Self, File)> {
+    pub(super) fn create() -> io::Result<Self> {
         let dir = std::env::temp_dir();
         let mut tries = 0;
         loop {
@@ -789,13 +798,11 @@ impl TempOut {
             let path = dir.join(format!("stuffr-bench-{}-{n}", std::process::id()));
             match create_armed(&path) {
                 Ok((file, armed)) => {
-                    return Ok((
-                        Self {
-                            path,
-                            _armed: armed,
-                        },
+                    return Ok(Self {
+                        path,
                         file,
-                    ));
+                        _armed: armed,
+                    });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists && tries < 1000 => tries += 1,
                 Err(e) => return Err(e),
@@ -805,6 +812,12 @@ impl TempOut {
 
     pub(super) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Another handle on the file `create` made (`try_clone`: the same open
+    /// file, sharing its offset — callers seek before use).
+    pub(super) fn handle(&self) -> io::Result<File> {
+        self.file.try_clone()
     }
 }
 
@@ -1289,7 +1302,7 @@ mod tests {
         let _lock = armed_lock();
         let seen = std::sync::Mutex::new(None::<PathBuf>);
         let r = std::panic::catch_unwind(|| {
-            let (guard, _file) = TempOut::create().unwrap();
+            let guard = TempOut::create().unwrap();
             *seen.lock().unwrap() = Some(guard.path().to_path_buf());
             assert!(guard.path().exists());
             panic!("mid-run");
@@ -1308,7 +1321,7 @@ mod tests {
     #[test]
     fn the_temp_file_is_armed_for_signals() {
         let _lock = armed_lock();
-        let (guard, _file) = TempOut::create().unwrap();
+        let guard = TempOut::create().unwrap();
         let path = guard.path().to_path_buf();
         let name = path.file_name().unwrap().to_str().unwrap().to_owned();
         assert!(
@@ -1437,6 +1450,48 @@ mod tests {
             "{reads} reads reached the file for {} compressed bytes",
             m.bytes_out
         );
+    }
+
+    /// HOST-9: the temp file is used through the descriptor `create` made.
+    /// Its name is swapped for a symlink to a victim file mid-run (from the
+    /// progress callback, between timed pieces); the later repeats still
+    /// write and read the original file, the run succeeds and the victim is
+    /// untouched. Reopened by name, the next repeat truncated the victim.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_put_at_the_temp_name_is_never_written_through() {
+        let _lock = armed_lock();
+        let dir = std::env::temp_dir().join(format!("stuffr-benchvictim-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        fs::write(&victim, b"precious").unwrap();
+        let input = Input::Memory(vec![text(64 * 1024, 6)]);
+        let mut swapped = false;
+        let m = on_disk(|| {
+            measure(
+                "gzip",
+                None,
+                &input,
+                &plan(Mode::OneStream, 3),
+                &mut FakeClock(0),
+                &mut |_, _, _| {
+                    if swapped {
+                        return;
+                    }
+                    if let Some(name) = bench_temps().into_iter().next() {
+                        let path = std::env::temp_dir().join(name);
+                        fs::remove_file(&path).unwrap();
+                        std::os::unix::fs::symlink(&victim, &path).unwrap();
+                        swapped = true;
+                    }
+                },
+            )
+        });
+        let m = ok(m);
+        assert!(swapped, "the progress callback never ran");
+        assert!(m.on_disk);
+        assert_eq!(fs::read(&victim).unwrap(), b"precious");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// `compress` can write twice its input; near the limit that must not be

@@ -1570,7 +1570,7 @@ const BENCH_SIGNALS: Signals = &[libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc
 #[cfg(not(unix))]
 const BENCH_SIGNALS: Signals = &[];
 
-/// Create `path` (write-only, `create_new`, mode 0600) and arm its removal
+/// Create `path` (read and write, `create_new`, mode 0600) and arm its removal
 /// on SIGINT, SIGTERM, SIGHUP and SIGQUIT, which then kill the process as
 /// [`arm_cleanup`] describes; the signals are held back between the create
 /// and the arm, as in [`create_temp_armed`]. For a stuffr temporary that is
@@ -1580,6 +1580,7 @@ const BENCH_SIGNALS: Signals = &[];
 pub(crate) fn create_armed(path: &Path) -> io::Result<(File, CleanupGuard)> {
     held_back(BENCH_SIGNALS, || {
         private_new_file()
+            .read(true)
             .open(path)
             .map(|f| (f, arm_cleanup(&Host::Real, path, BENCH_SIGNALS)))
     })
