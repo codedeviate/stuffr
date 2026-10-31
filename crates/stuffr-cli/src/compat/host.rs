@@ -766,8 +766,23 @@ pub(crate) fn zip_mesg_state(host: &Host, to_stderr: bool, line_started: bool) {
 ///
 /// As zip's, the handler takes SIGSEGV and SIGBUS too, without
 /// `SA_ONSTACK`: it replaces the Rust runtime's stack-overflow reporter, so
-/// a stack overflow or memory fault in stuffr would read as `Interrupted
-/// (aborting)`, exit 9 (or die silently, the handler having no stack).
+/// a stack overflow dies of the signal with no message (the handler has no
+/// stack to run on).
+///
+/// ruling: T7a (the 2026-10-31 security audit, UNSAFE-1; unzip's P28
+/// shape). Installed with `SA_SIGINFO`, the handler tells stuffr's own
+/// crashes from an interrupt: a signal the process sent itself (`si_pid`
+/// is our own: `abort()` after a double panic, `handle_alloc_error`, the
+/// allocator finding corruption) and, on Linux, a SIGSEGV, SIGBUS or
+/// SIGILL the kernel raised for a fault (`si_code` > 0) put the terminal
+/// back, remove the armed temporary (and zipsplit's parts), and re-raise
+/// at the default action, so a crash stays a crash (a core, the signal in
+/// the exit status), with no `Interrupted` line. A signal another process
+/// sends (`kill`) keeps zip's answer, exit 9. macOS reports a `kill -SEGV`
+/// (BUS, ILL) from another process with the same `si_code` and `si_pid` as
+/// a real fault (measured: code 2, pid 0, for both), so there a real
+/// memory fault still reads as `Interrupted (aborting)`, exit 9, as
+/// before; only a self-sent signal is told apart.
 pub(crate) fn install_zip_abort(host: &Host, text: &'static [u8]) {
     #[cfg(unix)]
     {
@@ -776,17 +791,19 @@ pub(crate) fn install_zip_abort(host: &Host, text: &'static [u8]) {
         }
         ZIP_ABORT_LEN.store(text.len(), Ordering::Release);
         ZIP_ABORT_TEXT.store(text.as_ptr().cast_mut(), Ordering::Release);
-        let handler = on_zip_abort as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        let handler = on_zip_abort
+            as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void)
+            as libc::sighandler_t;
         // SAFETY: zeroed sigaction structs filled before use; the handler
-        // only makes async-signal-safe calls, with every zip signal blocked
-        // while it runs.
+        // only makes async-signal-safe calls, takes the three arguments
+        // `SA_SIGINFO` passes, and runs with every zip signal blocked.
         unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
             libc::sigemptyset(&mut action.sa_mask);
             for &sig in ZIP_SIGNALS {
                 libc::sigaddset(&mut action.sa_mask, sig);
             }
-            action.sa_flags = libc::SA_RESTART;
+            action.sa_flags = libc::SA_RESTART | libc::SA_SIGINFO;
             action.sa_sigaction = handler;
             for &sig in ZIP_SIGNALS {
                 libc::sigaction(sig, &action, std::ptr::null_mut());
@@ -797,12 +814,63 @@ pub(crate) fn install_zip_abort(host: &Host, text: &'static [u8]) {
     let _ = (host, text);
 }
 
-/// zip.c:handler + ziperr(ZE_ABORT, "aborting") (zipcloak.c's handler is
-/// the same with its own text). It never allocates or locks.
+/// Whether `info` shows a signal stuffr caused itself rather than an
+/// interrupt (ruling T7a): sent by this process, or, on Linux, a fault the
+/// kernel raised (a positive `si_code` on SIGSEGV, SIGBUS or SIGILL). Only
+/// reads the `siginfo_t` and calls `getpid`: async-signal-safe.
 #[cfg(unix)]
-extern "C" fn on_zip_abort(_sig: libc::c_int) {
+fn own_or_fault(sig: libc::c_int, info: *const libc::siginfo_t) -> bool {
+    if info.is_null() {
+        return false;
+    }
+    // SAFETY: `SA_SIGINFO` passes a valid siginfo_t (checked non-null).
+    let code = unsafe { (*info).si_code };
+    // Sent by a process (`kill`, `tgkill`, `sigqueue`): only then is
+    // `si_pid` the sender (on Linux it shares its bytes with a fault's
+    // `si_addr`). Linux and the BSDs without SI_* above zero use codes
+    // <= 0; Apple and FreeBSD use SI_USER 0x10001 and SI_QUEUE 0x10002,
+    // and Apple gives `kill` 0 (measured).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let sent = code <= 0;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let sent = code <= 0 || code == 0x10001 || code == 0x10002;
+    if sent {
+        // SAFETY: a process-sent siginfo_t carries the sender's pid;
+        // getpid is async-signal-safe.
+        return unsafe { (*info).si_pid() == libc::getpid() };
+    }
+    // Linux gives another process's `kill` SI_USER (above), so a positive
+    // code on a fault signal is the kernel's. Elsewhere it is not proof
+    // (macOS: a `kill -SEGV` reads as a fault), so the answer stays zip's.
+    cfg!(any(target_os = "linux", target_os = "android"))
+        && matches!(sig, libc::SIGSEGV | libc::SIGBUS | libc::SIGILL)
+}
+
+/// zip.c:handler + ziperr(ZE_ABORT, "aborting") (zipcloak.c's handler is
+/// the same with its own text), except for a crash of stuffr's own (ruling
+/// T7a, [`own_or_fault`]), which removes what an interrupt removes and is
+/// re-raised at the default action. It never allocates or locks.
+#[cfg(unix)]
+extern "C" fn on_zip_abort(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
     // echon(): a password prompt's terminal mode put back (zip -e, zipcloak)
     restore_saved_tty();
+    if own_or_fault(sig, info) {
+        // ruling T7a: no message, the temporary and the parts removed, and
+        // the signal re-raised. SAFETY: unlink, sigaction and raise are
+        // async-signal-safe; the slot is read only when `ARMED` says it
+        // holds a NUL-terminated path. The re-raised signal is blocked
+        // until this handler returns, then delivered at SIG_DFL (a fault
+        // re-executes and faults again at SIG_DFL), ending the process.
+        unsafe {
+            if ARMED.load(Ordering::Acquire) {
+                libc::unlink(SLOT.0.get().cast::<libc::c_char>());
+            }
+            remove_split_files();
+            reset_to_default(sig);
+            libc::raise(sig);
+        }
+        return;
+    }
     let fd = ZIP_MESG_FD.load(Ordering::Acquire);
     // SAFETY: write, unlink and _exit are async-signal-safe; the text is a
     // `'static` slice stored before the handler was installed, and the
@@ -3575,5 +3643,117 @@ mod tests {
         unsafe { libc::kill(sent.id() as libc::pid_t, libc::SIGABRT) };
         let st = sent.wait().unwrap();
         assert_eq!(st.code(), Some(80), "{st:?}");
+    }
+
+    /// ruling: T7a. Under `install_zip_abort`, a SIGABRT the process raises
+    /// itself (`abort()`, as a double panic or `handle_alloc_error` ends)
+    /// still kills it by the signal, with no `Interrupted` line and the
+    /// armed temporary removed; on Linux so does a real memory fault (a
+    /// read of a `PROT_NONE` page), which macOS cannot tell from a `kill`
+    /// and answers as zip does (exit 9). One another process sends ends it
+    /// with zip's exit 9 and message. The handler would end this test
+    /// process, so the test runs its own binary as the child
+    /// (`STUFFR_HOST_ZIP_ABORT_CHILD`, the temporary's path in
+    /// `STUFFR_HOST_ZIP_ABORT_TEMP`).
+    #[cfg(unix)]
+    #[test]
+    fn a_zip_run_s_own_crash_stays_a_crash() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Command, Stdio};
+        const VAR: &str = "STUFFR_HOST_ZIP_ABORT_CHILD";
+        const TEMP: &str = "STUFFR_HOST_ZIP_ABORT_TEMP";
+        const NAME: &str = "compat::host::tests::a_zip_run_s_own_crash_stays_a_crash";
+        const TEXT: &[u8] = b"\nzip error: Interrupted (aborting)\n";
+        if let Some(mode) = std::env::var_os(VAR) {
+            install_zip_abort(&Host::Real, TEXT);
+            let temp = PathBuf::from(std::env::var_os(TEMP).unwrap());
+            let (_f, _armed) = create_new_armed_if(true, &temp, ZIP_SIGNALS).unwrap();
+            println!("armed");
+            let _ = io::stdout().flush();
+            if mode == "own" {
+                std::process::abort();
+            }
+            if mode == "fault" {
+                // SAFETY: a fresh PROT_NONE page; reading it faults, which
+                // is the point (the handler ends the process).
+                unsafe {
+                    let page = libc::mmap(
+                        std::ptr::null_mut(),
+                        4096,
+                        libc::PROT_NONE,
+                        libc::MAP_PRIVATE | libc::MAP_ANON,
+                        -1,
+                        0,
+                    );
+                    assert_ne!(page, libc::MAP_FAILED);
+                    std::ptr::read_volatile(page.cast::<u8>());
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            std::process::exit(0);
+        }
+        let dir = std::env::temp_dir().join(format!("stuffr-host-zipabort-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let child = |mode: &str| {
+            let temp = dir.join(mode);
+            let mut c = Command::new(&exe);
+            c.args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+                .env(VAR, mode)
+                .env(TEMP, &temp)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            (c, temp)
+        };
+        let linux = cfg!(any(target_os = "linux", target_os = "android"));
+        for mode in ["own", "fault"] {
+            let (mut c, temp) = child(mode);
+            let out = c.output().unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                text.contains("armed"),
+                "{mode}: the child never armed: {text}"
+            );
+            assert!(!temp.exists(), "{mode}: the armed temporary is left");
+            if mode == "own" || linux {
+                let want = if mode == "own" {
+                    vec![libc::SIGABRT]
+                } else {
+                    vec![libc::SIGSEGV, libc::SIGBUS]
+                };
+                assert!(
+                    out.status.signal().is_some_and(|s| want.contains(&s)),
+                    "{mode}: {:?}",
+                    out.status
+                );
+                assert!(!text.contains("Interrupted"), "{mode}: {text}");
+            } else {
+                assert_eq!(out.status.code(), Some(9), "{mode}: {:?}", out.status);
+            }
+        }
+
+        let (mut c, temp) = child("sent");
+        let mut sent = c.spawn().unwrap();
+        let mut out = io::BufReader::new(sent.stdout.take().unwrap());
+        let mut line = String::new();
+        while out.read_line(&mut line).unwrap() > 0 && !line.contains("armed") {
+            line.clear();
+        }
+        assert!(line.contains("armed"), "the child never armed");
+        // SAFETY: kill on a child we spawned and have not reaped.
+        unsafe { libc::kill(sent.id() as libc::pid_t, libc::SIGABRT) };
+        let mut rest = String::new();
+        let _ = io::Read::read_to_string(&mut out, &mut rest);
+        let st = sent.wait().unwrap();
+        assert_eq!(st.code(), Some(9), "{st:?}");
+        assert!(
+            rest.contains("zip error: Interrupted (aborting)"),
+            "{rest:?}"
+        );
+        assert!(!temp.exists(), "the armed temporary is left");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

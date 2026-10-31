@@ -40,7 +40,10 @@
 //! `-g`, `-U`, `--out`, `-A`, `-J`, `-c`/`-z` over old entries, `-T`/`-TT`
 //! (`check_zipfile`), and zip's interrupt handler (INT, TERM, ABRT, BUS,
 //! ILL, SEGV: the temporary removed, `Interrupted (aborting)`, exit 9;
-//! `host::install_zip_abort`).
+//! `host::install_zip_abort`; since ruling T7a of the 2026-10-31 security
+//! audit, a signal stuffr sent itself, such as its own `abort()`, and on
+//! Linux a real memory fault, removes the temporary and is re-raised, so
+//! stuffr's own crash is not reported as an interrupt: deviation 34).
 //!
 //! **Task 8 (`split.rs`, `fix.rs`, `readzip.rs`):** split archives read
 //! (every part through `Host::track`, zip's questions when a part cannot be
@@ -376,6 +379,18 @@
 //!     only in a holder that zeroes it when dropped (ruling T6b); the
 //!     process's own arguments, and the parser's copies of them (which
 //!     `-sc` and `-R`'s hint print), are not zeroed.
+//! 34. Hardening (ruling T7a of the 2026-10-31 security audit): zip's
+//!     handler answers every INT, TERM, ABRT, BUS, ILL and SEGV with
+//!     `Interrupted (aborting)`, exit 9. stuffr's answers a signal it sent
+//!     itself (its own `abort()`: a double panic, an allocation failure, a
+//!     corrupted heap) and, on Linux, a SEGV, BUS or ILL the kernel raised
+//!     for a real fault by removing the temporary (and zipsplit's parts)
+//!     and dying of the signal at its default action, without the line: a
+//!     crash in stuffr stays a crash. A signal another process sends
+//!     (`kill -SEGV` too) keeps zip's answer. On macOS, which reports a
+//!     `kill -SEGV`/`-BUS`/`-ILL` exactly as a fault, a real fault still
+//!     answers as zip does. A stack overflow dies of the signal with no
+//!     message (the handler has no stack to run on).
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};

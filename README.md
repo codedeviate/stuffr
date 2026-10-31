@@ -2072,6 +2072,12 @@ before the command line, as the reference does.
     `--password=pw`, ...), creates a new log 0600 and opens it, `-la`'s too,
     without following a symlink (`could not open logfile`, exit 16). zip
     and zipcloak keep the password only in a buffer zeroed when dropped.
+34. **stuffr's own crash is not an interrupt** (hardening). zip answers
+    SIGABRT, SIGSEGV, SIGBUS and SIGILL as it answers Ctrl-C (`Interrupted
+    (aborting)`, exit 9). stuffr does so only for a signal another process
+    sends; its own `abort()` (and, on Linux, a real memory fault) removes
+    the temporary and dies of the signal, with no message. macOS cannot
+    tell a `kill -SEGV` from a fault, so a fault there still answers as zip.
 
 The full set is in the code's module docs
 (`crates/stuffr-cli/src/compat/zip/mod.rs`), which is the source of truth.
