@@ -107,14 +107,25 @@ impl Codec for Zstd {
     /// different payload — never complete, and the exact count is
     /// payload-dependent. There is no way for this decoder to tell, ahead of
     /// reading, whether an incoming stream carries the checksum at all.
+    ///
+    /// **`DecodeOpts::memory_limit` bounds the window** (the 2026-10-31
+    /// audit, T13): see [`window_log_max`] and [`WindowLimit`]. Under a
+    /// limit, a frame declaring a larger window is refused before libzstd
+    /// allocates it, as `Error::ResourceLimit` (exit 6). Without a limit the
+    /// cap stays libzstd's own default (`ZSTD_WINDOWLOG_LIMIT_DEFAULT`, 27:
+    /// 128 MiB), exactly as before.
     fn decoder<'a>(
         &self,
         src: Box<dyn Source + 'a>,
-        _o: &DecodeOpts,
+        o: &DecodeOpts,
     ) -> Result<Box<dyn Source + 'a>> {
-        let dec = zstd::stream::read::Decoder::new(src)?;
+        let mut dec = zstd::stream::read::Decoder::new(src)?;
+        let cap = o.memory_limit.map(|limit| (window_log_max(limit), limit));
+        if let Some((log, _)) = cap {
+            dec.window_log_max(log)?;
+        }
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
-            dec,
+            WindowLimit { inner: dec, cap },
             ZSTD_MALFORMED_AS_OTHER_EOF,
         ))))
     }
@@ -170,6 +181,99 @@ impl Codec for Zstd {
         };
         Ok(Box::new(ZstdSink { enc, _lease: lease }))
     }
+}
+
+/// The `ZSTD_d_windowLogMax` a `memory_limit` allows: the largest `log`
+/// with `2^log <= limit`, clamped to what libzstd accepts for the parameter
+/// (`ZSTD_WINDOWLOG_ABSOLUTEMIN` 10 up to `ZSTD_WINDOWLOG_MAX`, 31 on a
+/// 64-bit target and 30 on a 32-bit one). A limit below 1 KiB still sets
+/// 10: every frame declaring more than 1 KiB is then refused.
+///
+/// libzstd refuses a frame whose window exceeds `2^windowLogMax`, so the
+/// bound has power-of-two granularity: under a limit of 100 MiB the cap is
+/// 64 MiB, and a frame declaring 96 MiB is refused although it is under the
+/// limit (the pure tier, which judges the declaration itself, accepts it).
+/// The error is on the safe side; raising the limit to the next power of two
+/// lets such a file through.
+///
+/// A limit above libzstd's own default of 128 MiB RAISES the cap, up to
+/// 2 GiB: a `--long=31` file decodes under a large enough limit, as it does
+/// with `zstd -d --memory=2048MB`. The CLI's default limit (a quarter of the
+/// available memory) therefore admits windows the old fixed 128 MiB cap
+/// refused; the cost is the declared window, which the limit allows.
+fn window_log_max(limit: u64) -> u32 {
+    use crate::zstd_opts::{WINDOWLOG_ABSOLUTEMIN, WINDOWLOG_MAX};
+    let floor_log2 = 63 - limit.max(1).leading_zeros();
+    floor_log2.clamp(WINDOWLOG_ABSOLUTEMIN, WINDOWLOG_MAX)
+}
+
+/// The decoder, with libzstd's `frameParameter_windowTooLarge` turned into a
+/// resource refusal. The `zstd` crate reports every libzstd error as
+/// `io::ErrorKind::Other` carrying `ZSTD_getErrorName`'s text, which
+/// `ZSTD_MALFORMED_AS_OTHER_EOF` folds onto "corrupt" (exit 5); a window
+/// over `ZSTD_d_windowLogMax` is not damage, so it is re-kinded here as
+/// `OutOfMemory`, which `Error::from_decode_io` classifies as
+/// `Error::ResourceLimit` (exit 6) — the shape `xz_pure.rs` and
+/// `zstd_pure.rs` use.
+///
+/// The error is recognised by its text, compared with libzstd's own name for
+/// the code at run time (the same library produced both), so no message is
+/// hard-coded here. libzstd does not say how large the declared window was,
+/// so the message names the cap and the limit, not the declaration.
+struct WindowLimit<R> {
+    inner: R,
+    /// `(windowLogMax, memory_limit)` when a limit was set.
+    cap: Option<(u32, u64)>,
+}
+
+impl<R: std::io::Read> std::io::Read for WindowLimit<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf).map_err(|e| match self.cap {
+            Some((log, limit)) if is_window_too_large(&e) => window_refusal(log, limit),
+            _ => e,
+        })
+    }
+}
+
+/// Whether `e` is the `zstd` crate's rendering of libzstd's
+/// `ZSTD_error_frameParameter_windowTooLarge`.
+fn is_window_too_large(e: &std::io::Error) -> bool {
+    use zstd::zstd_safe::zstd_sys::ZSTD_ErrorCode;
+    let code = ZSTD_ErrorCode::ZSTD_error_frameParameter_windowTooLarge as usize;
+    // libzstd's `ERROR(x)` is `(size_t)-ZSTD_error_x`.
+    let name = zstd::zstd_safe::get_error_name(0usize.wrapping_sub(code));
+    e.kind() == std::io::ErrorKind::Other && e.to_string() == name
+}
+
+/// The resource refusal for a window over `2^log`, the cap `limit` set.
+fn window_refusal(log: u32, limit: u64) -> std::io::Error {
+    use stuffr_core::format_size;
+    let cap = 1u64 << log;
+    let text = if cap < limit && log == crate::zstd_opts::WINDOWLOG_MAX {
+        // The limit is not what refused it: libzstd decodes no larger window
+        // on this platform.
+        format!(
+            "zstd: frame header declares a window larger than {}, the most libzstd \
+             decodes on this platform",
+            format_size(cap)
+        )
+    } else if cap < limit {
+        // A limit between two powers of two: name the cap it rounds down to.
+        format!(
+            "zstd: frame header declares a window larger than {}, the largest power \
+             of two within --memory-limit {} — raise --memory-limit to decode this file",
+            format_size(cap),
+            format_size(limit)
+        )
+    } else {
+        format!(
+            "zstd: frame header declares a window larger than {}, but --memory-limit \
+             allows only {} — raise --memory-limit to decode this file",
+            format_size(cap),
+            format_size(limit)
+        )
+    };
+    std::io::Error::new(std::io::ErrorKind::OutOfMemory, text)
 }
 
 /// This codec's per-worker demand for `acquire_many` — level-aware, unlike
@@ -696,6 +800,165 @@ mod tests {
             .read_to_end(&mut out)
             .unwrap();
         assert_eq!(out, plain);
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use std::io::Read;
+    use stuffr_core::ReaderSource;
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// Window_Descriptor bytes (RFC 8878 §3.1.1.1.2: window =
+    /// 2^(10+e) · (1 + m/8), e the top five bits, m the low three).
+    const WD_1_MIB: u8 = 10 << 3;
+    const WD_96_MIB: u8 = (16 << 3) | 4;
+    const WD_144_MIB: u8 = (17 << 3) | 1;
+    /// 2^(10+22) = 4 GiB: above `ZSTD_WINDOWLOG_MAX` on every platform.
+    const WD_4_GIB: u8 = 22 << 3;
+
+    /// One frame of `payload` from this codec's encoder, its
+    /// Window_Descriptor rewritten. The streaming encoder pledges no size, so
+    /// the header is never single-segment and always carries the
+    /// descriptor at byte 5; declaring a larger window than the encoder used
+    /// leaves a valid frame.
+    fn frame_declaring(window_descriptor: u8, payload: &[u8]) -> Vec<u8> {
+        let buf = stuffr_core::testing::SharedBuf::new();
+        let mut sink = Zstd
+            .encoder(Box::new(buf.clone()), &EncodeOpts::default())
+            .unwrap();
+        sink.write_all(payload).unwrap();
+        sink.finish().unwrap();
+        let mut frame = buf.contents();
+        assert_eq!(
+            frame[4] & 0x20,
+            0,
+            "the encoder wrote a single-segment header"
+        );
+        frame[5] = window_descriptor;
+        frame
+    }
+
+    fn decode(bytes: Vec<u8>, memory_limit: Option<u64>) -> std::result::Result<Vec<u8>, Error> {
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(bytes)));
+        let mut dec = Zstd
+            .decoder(
+                src,
+                &DecodeOpts {
+                    memory_limit,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).map_err(Error::from_decode_io)?;
+        Ok(out)
+    }
+
+    fn payload() -> Vec<u8> {
+        b"window bound payload ".repeat(40)
+    }
+
+    #[test]
+    fn the_window_log_is_the_largest_power_of_two_within_the_limit() {
+        use crate::zstd_opts::WINDOWLOG_MAX;
+        assert_eq!(window_log_max(0), 10);
+        assert_eq!(window_log_max(512), 10);
+        assert_eq!(window_log_max(1024), 10);
+        assert_eq!(window_log_max(2047), 10);
+        assert_eq!(window_log_max(MIB), 20);
+        assert_eq!(window_log_max(100 * MIB), 26);
+        assert_eq!(window_log_max(128 * MIB), 27);
+        assert_eq!(window_log_max(256 * MIB), 28);
+        assert_eq!(window_log_max(1 << 40), WINDOWLOG_MAX);
+        assert_eq!(window_log_max(u64::MAX), WINDOWLOG_MAX);
+    }
+
+    #[test]
+    fn a_window_over_the_memory_limit_is_a_resource_limit() {
+        let err = decode(frame_declaring(WD_96_MIB, &payload()), Some(MIB)).unwrap_err();
+        assert!(
+            matches!(err, Error::ResourceLimit(_)),
+            "a window over --memory-limit is exit 6, not {err:?}"
+        );
+        assert_eq!(err.exit_code(), 6);
+        let text = err.to_string();
+        assert!(
+            text.contains("--memory-limit") && text.contains("1 MiB"),
+            "the refusal names the limit: {text}"
+        );
+    }
+
+    #[test]
+    fn a_window_under_the_memory_limit_decodes() {
+        let got = decode(frame_declaring(WD_96_MIB, &payload()), Some(256 * MIB)).unwrap();
+        assert_eq!(got, payload());
+        // Exactly at the limit is allowed: libzstd refuses only "exceeds".
+        let got = decode(frame_declaring(WD_1_MIB, &payload()), Some(MIB)).unwrap();
+        assert_eq!(got, payload());
+        // No limit: libzstd's own 128 MiB default, as before.
+        let got = decode(frame_declaring(WD_96_MIB, &payload()), None).unwrap();
+        assert_eq!(got, payload());
+    }
+
+    #[test]
+    fn a_large_limit_raises_the_cap_above_libzstds_default() {
+        // 144 MiB is over libzstd's default `windowLogMax` (27): refused
+        // without a limit (as before, by libzstd), decoded under 256 MiB.
+        assert!(decode(frame_declaring(WD_144_MIB, &payload()), None).is_err());
+        let got = decode(frame_declaring(WD_144_MIB, &payload()), Some(256 * MIB)).unwrap();
+        assert_eq!(got, payload());
+    }
+
+    #[test]
+    fn a_limit_between_powers_of_two_rounds_down_and_says_so() {
+        // 100 MiB rounds down to a 64 MiB cap, so 96 MiB is refused (the
+        // pure tier, which judges the declaration, would accept it).
+        let err = decode(frame_declaring(WD_96_MIB, &payload()), Some(100 * MIB)).unwrap_err();
+        assert!(matches!(err, Error::ResourceLimit(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(
+            text.contains("64 MiB") && text.contains("100 MiB") && text.contains("power of two"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_later_frame_declaring_a_larger_window_is_refused() {
+        let mut two = frame_declaring(WD_1_MIB, &payload());
+        two.extend_from_slice(&frame_declaring(WD_96_MIB, &payload()));
+        let mut both = payload();
+        both.extend_from_slice(&payload());
+        assert_eq!(decode(two.clone(), None).unwrap(), both);
+
+        let err = decode(two, Some(8 * MIB)).unwrap_err();
+        assert!(
+            matches!(err, Error::ResourceLimit(_)),
+            "the second frame's window is bounded too, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_window_above_libzstds_maximum_names_libzstd_not_the_limit() {
+        let err = decode(frame_declaring(WD_4_GIB, &payload()), Some(1 << 40)).unwrap_err();
+        assert!(matches!(err, Error::ResourceLimit(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(
+            text.contains("libzstd") && !text.contains("--memory-limit"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn corruption_is_still_corrupt_under_a_limit() {
+        // The re-kinding is for the window error only.
+        let mut frame = frame_declaring(WD_1_MIB, &payload());
+        let n = frame.len();
+        frame[n - 2] ^= 0xff; // the content checksum
+        let err = decode(frame, Some(MIB)).unwrap_err();
+        assert!(matches!(err, Error::Corrupt(_)), "{err:?}");
     }
 }
 

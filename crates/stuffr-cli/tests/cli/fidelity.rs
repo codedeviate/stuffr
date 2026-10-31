@@ -443,7 +443,6 @@ fn a_legitimate_archive_of_the_same_size_still_works_on_every_verb() {
 /// A zstd frame of one raw (stored) block holding `payload`, declaring
 /// `window_descriptor` (RFC 8878: window = 2^(10+e) * (1 + m/8), e the top
 /// five bits, m the low three). Valid zstd: no checksum, no content size.
-#[cfg(not(feature = "zstd-c"))]
 fn raw_zstd_frame(window_descriptor: u8, payload: &[u8]) -> Vec<u8> {
     let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, window_descriptor];
     let block = ((payload.len() as u32) << 3) | 1; // last block, raw
@@ -510,6 +509,66 @@ fn pure_zstd_refuses_a_window_over_the_memory_limit_on_every_frame() {
         stderr.contains("c-backed") && !stderr.contains("corrupt"),
         "{stderr}"
     );
+}
+
+/// T13 (2026-10-31 audit): the C-tier zstd decoder honours `--memory-limit`
+/// too, through libzstd's `ZSTD_d_windowLogMax` (the largest power of two
+/// within the limit), on every frame; the refusal is exit 6, not "corrupt".
+/// A large limit raises the cap above libzstd's default 128 MiB.
+#[cfg(feature = "zstd-c")]
+#[test]
+fn c_zstd_refuses_a_window_over_the_memory_limit_on_every_frame() {
+    let dir = tmp("zstd-c-window");
+    std::fs::create_dir_all(&dir).unwrap();
+    let small = raw_zstd_frame(10 << 3, b"first-"); // 1 MiB window
+    let big = raw_zstd_frame((16 << 3) | 4, b"second"); // 96 MiB window
+    let over_default = raw_zstd_frame((17 << 3) | 1, b"third"); // 144 MiB window
+
+    let run = |name: &str, bytes: &[u8], limit: &str| {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        Command::new(STUFFR)
+            .args(["cat", path.to_str().unwrap(), "--memory-limit", limit])
+            .output()
+            .unwrap()
+    };
+
+    let out = run("small.zst", &small, "1M");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"first-");
+
+    let out = run("big.zst", &big, "1M");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(6), "stderr: {stderr}");
+    assert!(
+        stderr.contains("memory-limit") && !stderr.contains("corrupt"),
+        "{stderr}"
+    );
+
+    // The second frame declares more than the first: bounded too.
+    let out = run("two.zst", &[small.clone(), big.clone()].concat(), "8M");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(6), "stderr: {stderr}");
+    let out = run("two-ok.zst", &[small, big].concat(), "128M");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"first-second");
+
+    // Above libzstd's default cap, decodable under a large enough limit.
+    let out = run("over-default.zst", &over_default, "256M");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"third");
 }
 
 /// `--memory-limit` is now ACCEPTED and honoured on the entry-aware paths,
@@ -1909,6 +1968,133 @@ fn real_tool_zips_raise_no_header_warning() {
                 "{verb} {}: {stderr}",
                 z.display()
             );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// PARSE-1: what follows a verified gzip member / bzip2 stream.
+// ---------------------------------------------------------------------
+
+/// Packs `plain` with stuffr itself into `dir/name` (the extension picks the
+/// codec) and returns the compressed bytes.
+fn packed(dir: &Path, name: &str, plain: &[u8]) -> Vec<u8> {
+    let src = dir.join(format!("{name}.in"));
+    std::fs::write(&src, plain).unwrap();
+    let dst = dir.join(name);
+    let out = run_output(&["pack", src.to_str().unwrap(), "-o", dst.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    std::fs::read(dst).unwrap()
+}
+
+/// Two members, the second's first magic byte flipped to `flip`: `unpack`
+/// recovers the first, warns on stderr naming the format and the ignored
+/// byte count, exits 0 without and 4 with `--strict-fidelity` — never 0
+/// silently, which dropped every later member before the fix.
+fn flipped_second_member_warns(ext: &str, format: &str, flip: u8) {
+    let dir = tmp_dir();
+    let first = b"first member\n".repeat(100);
+    let a = packed(&dir, &format!("a.{ext}"), &first);
+    let b = packed(&dir, &format!("b.{ext}"), &b"SECOND MEMBER\n".repeat(100_000));
+    let mut x = [a.clone(), b.clone()].concat();
+    x[a.len()] = flip;
+    let input = dir.join(format!("two-flip.{ext}"));
+    std::fs::write(&input, &x).unwrap();
+
+    for (strict, code) in [(false, 0), (true, 4)] {
+        let output = dir.join(format!("out-{strict}"));
+        let mut args = vec![
+            "unpack",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+        ];
+        if strict {
+            args.push("--strict-fidelity");
+        }
+        let out = run_output(&args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(code), "strict={strict}: {stderr}");
+        assert!(
+            stderr.contains(&format!("`{format}` stream is followed by {} byte(s)", b.len())),
+            "strict={strict}: {stderr}"
+        );
+        if !strict {
+            assert_eq!(std::fs::read(&output).unwrap(), first);
+        }
+    }
+}
+
+#[test]
+fn a_flipped_gzip_member_boundary_warns_and_fails_strict_fidelity() {
+    flipped_second_member_warns("gz", "gzip", 0x1e);
+}
+
+#[test]
+fn a_flipped_bzip2_stream_boundary_warns_and_fails_strict_fidelity() {
+    flipped_second_member_warns("bz2", "bzip2", 0x41);
+}
+
+/// A tail that starts as a member header and cannot be one is corrupt.
+#[test]
+fn a_damaged_later_member_header_is_exit_5() {
+    let dir = tmp_dir();
+    let gz = packed(&dir, "a.gz", b"first");
+    let bz = packed(&dir, "a.bz2", b"first");
+    let mut gz_method = [gz.clone(), gz.clone()].concat();
+    gz_method[gz.len() + 2] = 7;
+    let mut bz_level = [bz.clone(), bz.clone()].concat();
+    bz_level[bz.len() + 3] = b'0';
+    let mut bz_block = [bz.clone(), bz.clone()].concat();
+    bz_block[bz.len() + 5] ^= 0xff;
+    let cases = [
+        ("method.gz", gz_method),
+        ("cut.gz", [gz.clone(), vec![0x1f]].concat()),
+        ("level.bz2", bz_level),
+        ("block.bz2", bz_block),
+    ];
+    for (name, bytes) in cases {
+        let input = dir.join(name);
+        std::fs::write(&input, &bytes).unwrap();
+        let output = dir.join(format!("{name}.out"));
+        let out = run_output(&[
+            "unpack",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            out.status.code(),
+            Some(5),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!output.exists(), "{name}: nothing published");
+    }
+}
+
+/// NUL and `'X'` padding after the last member stays silent, strict or not.
+#[test]
+fn padding_after_the_last_member_passes_strict_fidelity() {
+    let dir = tmp_dir();
+    for ext in ["gz", "bz2"] {
+        let plain = b"padded payload".repeat(20);
+        let c = packed(&dir, &format!("p.{ext}"), &plain);
+        for pad in [0u8, b'X'] {
+            let input = dir.join(format!("pad-{pad}.{ext}"));
+            std::fs::write(&input, [c.clone(), vec![pad; 512]].concat()).unwrap();
+            let output = dir.join(format!("pad-{pad}-{ext}.out"));
+            let out = run_output(&[
+                "unpack",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--strict-fidelity",
+            ]);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(0), "{ext} pad {pad}: {stderr}");
+            assert!(!stderr.contains("warning"), "{ext} pad {pad}: {stderr}");
+            assert_eq!(std::fs::read(&output).unwrap(), plain);
         }
     }
 }
