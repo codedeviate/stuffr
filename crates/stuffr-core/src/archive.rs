@@ -8,6 +8,16 @@ use crate::fidelity::FidelityReport;
 use crate::format::{CodecCaps, ContainerCaps, FormatId};
 use crate::source::Source;
 
+/// What a codec's decoder is opened with.
+///
+/// **Clones share one [`FidelitySink`](crate::FidelitySink).** `Clone`
+/// copies the [`fidelity`](Self::fidelity) handle, not the warnings behind
+/// it, so every clone of one value — and every decoder opened with any of
+/// them — records into the same sink. Reusing one `DecodeOpts` (or clones of
+/// it) across independent decodes therefore accumulates their warnings
+/// together until the sink is drained; give each decode whose fidelity is
+/// reported on its own a fresh value (`DecodeOpts::default()`, or a new
+/// sink in `fidelity`).
 #[derive(Clone, Default)]
 pub struct DecodeOpts {
     /// Worker hint. The governor has final say; this is only a request.
@@ -33,7 +43,8 @@ pub struct DecodeOpts {
     /// gzip or bzip2 file's last verified member that are neither another
     /// member nor padding ([`crate::Fidelity::TrailingDataIgnored`]). The
     /// default is a fresh, empty sink; a driver that reports fidelity keeps a
-    /// clone and drains it into its report once the stream has been read. See
+    /// clone and drains it into its report once the stream has been read.
+    /// Shared by every clone of this value (see the type's doc). See
     /// [`crate::FidelitySink`].
     pub fidelity: crate::fidelity::FidelitySink,
 }
