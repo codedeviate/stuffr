@@ -381,7 +381,7 @@ impl Run<'_, '_> {
 
         let out_path = self.path(&ofname);
         // A second descriptor of the output, for `copy_stat` (HOST-8).
-        let mut out_fd = None;
+        let mut out_fd: Option<io::Result<File>> = None;
         let mut out = if !self.s.zcat {
             // `access(ofname, F_OK)`: follows a link.
             if fs::metadata(&out_path).is_ok() {
@@ -407,7 +407,7 @@ impl Run<'_, '_> {
             let file = match host::create_excl_armed(self.host, &out_path) {
                 Ok((f, guard)) => {
                     self.armed = Some(guard);
-                    out_fd = f.try_clone().ok();
+                    out_fd = Some(f.try_clone());
                     f
                 }
                 Err(e) => {
@@ -476,7 +476,9 @@ impl Run<'_, '_> {
                     }
                     let _ = self.err.write_all(m::NEWLINE.as_bytes());
                 }
-                self.copy_stat(&ofname, out_fd.as_ref(), &infstat);
+                if let Some(out_fd) = &out_fd {
+                    self.copy_stat(&ofname, out_fd, &infstat);
+                }
                 self.armed = None;
                 if !self.s.keep
                     && let Err(e) = fs::remove_file(&in_path)
@@ -538,13 +540,27 @@ impl Run<'_, '_> {
     /// the output's own descriptor `out` (HOST-8: a name swapped for a
     /// symlink meanwhile is never followed), the times in whole seconds as
     /// `utime` gives them.
-    fn copy_stat(&mut self, ofname: &[u8], out: Option<&File>, st: &Metadata) {
+    ///
+    /// `out` is the descriptor's duplicate, taken when the output was
+    /// created. When that duplicate could not be taken (`EMFILE`), none of
+    /// the three can be set, and each is reported as its own failure would
+    /// be, with the duplicate's error — never skipped in silence. No
+    /// differential case reaches that branch; every case it covers takes
+    /// the duplicate and is unchanged.
+    fn copy_stat(&mut self, ofname: &[u8], out: &io::Result<File>, st: &Metadata) {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
             use std::os::unix::fs::MetadataExt;
-            let Some(out) = out else {
-                return;
+            let out = match out {
+                Ok(out) => out,
+                Err(e) => {
+                    for msg in [m::UTIME_ERROR, m::CHMOD_ERROR, m::CHOWN_ERROR] {
+                        let _ = self.err.write_all(msg.as_bytes());
+                        self.perror(ofname, e);
+                    }
+                    return;
+                }
             };
             let fd = out.as_raw_fd();
             let last = || io::Error::last_os_error();
@@ -648,6 +664,46 @@ mod tests {
 
     /// `prratio` in the C's fixed point: two decimals, the sign first, the
     /// large-number branch, and 100% for an empty input.
+    /// Final security review, Minor 6: a duplicate descriptor that could
+    /// not be taken reports all three steps, each as its own failure would
+    /// be, instead of skipping them in silence.
+    #[cfg(unix)]
+    #[test]
+    fn copy_stat_without_a_descriptor_reports_every_step() {
+        let super::super::args::Parsed::Run(s) = super::super::args::parse("compress", &[]) else {
+            panic!("no settings");
+        };
+        let mut host = Host::Real;
+        let mut err = Vec::new();
+        let mut r = Run {
+            host: &mut host,
+            err: &mut err,
+            s,
+            fgnd: false,
+            exit_code: -1,
+            ifname: Vec::new(),
+            ofname: None,
+            armed: None,
+            inbuf: Vec::new(),
+            enc: None,
+            dec: None,
+            stdio: Vec::new(),
+        };
+        let st = std::fs::metadata("/").unwrap();
+        let emfile = Err(io::Error::from_raw_os_error(libc::EMFILE));
+        r.copy_stat(b"f.Z", &emfile, &st);
+        let text = host::strerror(emfile.as_ref().unwrap_err());
+        let mut want = Vec::new();
+        for msg in [m::UTIME_ERROR, m::CHMOD_ERROR, m::CHOWN_ERROR] {
+            want.extend_from_slice(msg.as_bytes());
+            m::printf(&mut want, m::PERROR, &[b"f.Z", &text]);
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&err),
+            String::from_utf8_lossy(&want)
+        );
+    }
+
     #[test]
     fn prratio_is_fixed_point() {
         assert_eq!(prratio(50_000 - 21_313, 50_000), b"57.37%");
