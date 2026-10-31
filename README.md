@@ -2610,8 +2610,11 @@ symlink at the output name (intersected with that file's own mode, like any
 destination `--force` replaces). Setting the mode is best effort: on a
 filesystem that refuses `chmod` (vfat or exfat, SMB, NFS with root squash,
 some FUSE mounts) the output is kept as created (0600) and the run warns
-that the output `is missing metadata: mode` — exit 4 under `--strict-fidelity`, never a failed
-run. On macOS the input's quarantine attribute
+that the output `is missing metadata: mode` — exit 4 under
+`--strict-fidelity`, never a failed run. A file `salvage` recovers (`-C` or
+`-o`) is created 0600 and then given the mode the archive records for it,
+masked by the umask (setuid, setgid and sticky dropped), or the umask default
+when the archive records none. On macOS the input's quarantine attribute
 (`com.apple.quarantine`) is carried onto every file and directory `unpack` and
 `salvage` create and onto a single-stream output, as Apple's tar and unzip do,
 so Gatekeeper still checks what came out of a downloaded archive, and onto an

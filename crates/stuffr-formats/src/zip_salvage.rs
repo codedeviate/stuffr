@@ -979,6 +979,21 @@ pub fn salvage_zip(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
     let mut candidates = collect_candidates(&mut scanner, src)?;
 
     if let Some(cd_records) = cd_records {
+        // The mode lives only in the central record (a local header has no
+        // external attributes): a candidate the scan found takes it from the
+        // first record naming its offset, so salvage can give the recovered
+        // file its archived mode.
+        let mut modes: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        for record in &cd_records {
+            if let Some(mode) = record.unix_mode {
+                modes.entry(record.local_header_offset).or_insert(mode);
+            }
+        }
+        for candidate in &mut candidates {
+            if candidate.meta.mode.is_none() {
+                candidate.meta.mode = modes.get(&candidate.offset).copied();
+            }
+        }
         let mut found_offsets: HashSet<u64> = candidates.iter().map(|c| c.offset).collect();
 
         for record in &cd_records {
@@ -1144,6 +1159,11 @@ fn candidate_from_cd_record(
     // `zip.rs`'s record walk — no need to re-read the local header's copy
     // of it, which this function only touches at all to confirm the magic.
     meta.codec = codec_for_method(record.method);
+    // The mode lives only in the central record (a local header has no
+    // external attributes), so only a candidate found through the index
+    // carries one; salvage gives the recovered file this mode, masked by
+    // the umask.
+    meta.mode = record.unix_mode;
 
     // `marked_deleted` is left at `Candidate::new`'s `false`: ZIP has no
     // deleted flag at all — see `Candidate::marked_deleted`'s own doc for

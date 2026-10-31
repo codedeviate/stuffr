@@ -973,6 +973,12 @@ pub struct CdRecord {
     pub crc32: u32,
     pub compressed_size: u64,
     pub uncompressed_size: u64,
+    /// The unix mode the record carries in the high half of its external
+    /// attributes, when its "version made by" names a unix host (3, or 19
+    /// for OS X) and that half is not zero — what `zip`'s `unix_mode()`
+    /// answers for the same record. `None` otherwise (a DOS-made archive).
+    /// Salvage gives a recovered file this mode, masked by the umask.
+    pub unix_mode: Option<u32>,
 }
 
 /// Ceiling on a central-directory record's declared `name_len`, checked
@@ -1055,7 +1061,12 @@ fn read_one_cd_record<R: Read + Seek>(r: &mut R, offset: u64) -> Result<Option<C
     let name_len = le16(&fixed[24..]);
     let extra_len = le16(&fixed[26..]);
     let comment_len = le16(&fixed[28..]);
+    let external_attributes = le32(&fixed[34..]);
     let local_header_offset = le32(&fixed[38..]);
+    // `fixed` starts after the signature: byte 1 is "version made by"'s
+    // host system (APPNOTE 4.4.2).
+    let unix_mode = (matches!(fixed[1], 3 | 19) && external_attributes >> 16 != 0)
+        .then_some(external_attributes >> 16);
 
     if u64::from(name_len) > MAX_CD_NAME_LEN {
         return Err(Error::ResourceLimit(format!(
@@ -1086,6 +1097,7 @@ fn read_one_cd_record<R: Read + Seek>(r: &mut R, offset: u64) -> Result<Option<C
         crc32,
         compressed_size: u64::from(compressed_size),
         uncompressed_size: u64::from(uncompressed_size),
+        unix_mode,
     }))
 }
 

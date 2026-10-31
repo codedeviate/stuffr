@@ -157,3 +157,92 @@ fn pack_and_unpack_keep_a_private_inputs_mode() {
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(mode_of(&back), 0o600);
 }
+
+/// A zip holding `secret` (0600) and `public` (0644), as `stuffr pack`
+/// records them.
+fn zip_with_modes(dir: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let src = dir.join("src");
+    std::fs::create_dir(&src).unwrap();
+    for (name, mode) in [("secret", 0o600), ("public", 0o644)] {
+        let p = src.join(name);
+        std::fs::write(&p, name).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let archive = dir.join("m.zip");
+    let out = run_output(&[
+        "pack",
+        src.to_str().unwrap(),
+        "-o",
+        archive.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    archive
+}
+
+fn salvage_under_umask(mask: u32, args: &[&str]) {
+    let out = run_under_umask(mask, args);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Final security review, Minor 1: a salvaged file gets the archived mode
+/// masked by the umask, with `-C` and with `-o`, instead of the umask
+/// default — a 0600 member never lands 0644.
+#[test]
+fn salvage_gives_a_recovered_file_its_archived_mode_masked_by_the_umask() {
+    let dir = tmp_dir();
+    let archive = zip_with_modes(&dir);
+
+    let dest = dir.join("out");
+    salvage_under_umask(
+        0o022,
+        &[
+            "salvage",
+            archive.to_str().unwrap(),
+            "-C",
+            dest.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(mode_of(&dest.join("src/secret")), 0o600);
+    assert_eq!(mode_of(&dest.join("src/public")), 0o644);
+
+    let dest = dir.join("out077");
+    salvage_under_umask(
+        0o077,
+        &[
+            "salvage",
+            archive.to_str().unwrap(),
+            "-C",
+            dest.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(mode_of(&dest.join("src/public")), 0o600);
+
+    // `-o`: the staged file's mode survives the move into place. Scan
+    // positions: 0 is `src/`, then the files in archive (sorted) order.
+    for (index, name, want) in [("1", "public", 0o644), ("2", "secret", 0o600)] {
+        let file = dir.join(format!("one-{name}"));
+        salvage_under_umask(
+            0o022,
+            &[
+                "salvage",
+                archive.to_str().unwrap(),
+                "-o",
+                file.to_str().unwrap(),
+                "--index",
+                index,
+            ],
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), name.as_bytes());
+        assert_eq!(mode_of(&file), want, "{name}");
+    }
+}

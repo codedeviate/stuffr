@@ -3044,6 +3044,7 @@ pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
     // carries the archive's identity: never replaced (EXTRACT-1).
     let mut made = MadeByRun::reading(Some(path));
     made.quarantine = quarantine;
+    made.umask = process_umask();
 
     let mut entries = Vec::with_capacity(scan.entries.len());
     for entry in &scan.entries {
@@ -3385,7 +3386,7 @@ fn place_salvaged_file(
     // `SalvageDisposition::SkippedUnwritable` for the measurement (exit 1
     // on a 404-character entry name, every later entry lost) and for why
     // the fold is kind-blind.
-    let mut out = match open_salvage_target(dest, &write_target, &entry.meta.name, made) {
+    let mut out = match open_salvage_target(dest, &write_target, &entry.meta, made) {
         Ok(out) => out,
         Err(skipped) => return Ok(skipped),
     };
@@ -3492,12 +3493,19 @@ fn place_salvaged_file(
 /// The placement is the same one [`extract`] makes: the difference between
 /// the two verbs is what happens when it refuses, and here every refusal is
 /// the entry's own [`SalvageDisposition::SkippedUnwritable`].
+///
+/// **The mode** (final security review, Minor 1): the file is created 0600
+/// and widened by descriptor to [`salvaged_file_mode`] — the archived mode
+/// masked by the umask, or the umask default when the archive records none
+/// — before a byte is written, so a 0600 member never lands 0644. Best
+/// effort: a filesystem that refuses the `fchmod` leaves it 0600.
 fn open_salvage_target(
     dest: &Path,
     write_target: &Path,
-    name: &str,
+    meta: &EntryMeta,
     made: &mut MadeByRun,
 ) -> std::result::Result<std::fs::File, SalvageDisposition> {
+    let name = meta.name.as_str();
     // No `--force` concept exists for salvage, and `force: false` here:
     // salvage never removes or overwrites anything it did not write in this
     // run (security audit EXTRACT-1 — this used to pass `true`, so `place`
@@ -3513,20 +3521,40 @@ fn open_salvage_target(
     // follows a symlink planted at the target and never truncates a file
     // that appeared after the check — the open itself is the refusal.
     place_salvaged(dest, write_target, name, false, made, false)?;
-    let created = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(write_target);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let created = opts.open(write_target);
     let out = match skip_if_name_refused(created, name) {
         Ok(Ok(out)) => out,
         Ok(Err(w)) => return Err(unwritable_skip(w)),
         Err(e) => return Err(unwritable(e)),
     };
+    let mode = salvaged_file_mode(meta.mode, made.umask);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = out.set_permissions(std::fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
     if let Some(v) = &made.quarantine {
         let _ = crate::quarantine::apply(&out, v);
     }
     made.record_path(write_target, MadeKind::File);
     Ok(out)
+}
+
+/// The mode a salvaged file is given: the archived permission bits masked
+/// by `umask` (set-id and sticky never restored, as `unpack` without `-p`),
+/// or `0o666 & !umask` — what `File::create` would have made — when the
+/// archive records no mode for the entry.
+fn salvaged_file_mode(archived: Option<u32>, umask: u32) -> u32 {
+    match archived {
+        Some(mode) => mode & RESTORED_MODE_BITS & !umask,
+        None => 0o666 & !umask,
+    }
 }
 
 /// A skip [`place_entry`]'s rules decided, as salvage's own disposition:
@@ -5849,6 +5877,9 @@ struct MadeByRun {
     /// The archive's quarantine (macOS), for the parents [`place`] creates
     /// and what salvage writes (security audit EXTRACT-3).
     quarantine: Option<Vec<u8>>,
+    /// The process umask, read once per salvage run: what a salvaged file's
+    /// mode is masked by ([`salvaged_file_mode`]). `0` elsewhere (unused).
+    umask: u32,
 }
 
 /// The archive being read, as [`place`] and salvage compare it against a
@@ -8515,6 +8546,18 @@ mod salvage_tests {
     use super::*;
     use stuffr_core::EncodeOpts;
     use stuffr_core::salvage::{SalvagePolicy, SalvageStatus};
+
+    #[test]
+    fn a_salvaged_file_mode_is_the_archived_one_masked_by_the_umask() {
+        assert_eq!(salvaged_file_mode(Some(0o600), 0o022), 0o600);
+        assert_eq!(salvaged_file_mode(Some(0o100644), 0o022), 0o644);
+        assert_eq!(salvaged_file_mode(Some(0o777), 0o027), 0o750);
+        // Set-id and sticky are never restored.
+        assert_eq!(salvaged_file_mode(Some(0o7755), 0o022), 0o755);
+        // No archived mode: what `File::create` would have made.
+        assert_eq!(salvaged_file_mode(None, 0o022), 0o644);
+        assert_eq!(salvaged_file_mode(None, 0o077), 0o600);
+    }
 
     /// CRC-32/ISO-HDLC — the same algorithm `zip_salvage.rs`'s own
     /// `crc32_ieee` computes, reimplemented here rather than reused because

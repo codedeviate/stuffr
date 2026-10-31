@@ -1220,6 +1220,14 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
       So re-running salvage into the same out/ writes `NAME.salvaged-N`
       copies beside the earlier run's output rather than over it.
 
+      Permissions. A recovered file is created private (0600) and then
+      given the mode the archive records for it, masked by your umask as
+      `unpack` does (a 0600 entry stays 0600, a 0644 one lands 0644 under
+      umask 022; setuid, setgid and sticky are never restored), or your
+      umask's default when the archive records none. zip keeps modes only
+      in its central directory, so an entry found through the raw scan
+      alone, with no intact directory naming it, gets the default.
+
       The default (non---list) report — counts only — goes to stderr, the
       same destination `unpack`'s and `test`'s own summary lines use.
 
@@ -1228,7 +1236,8 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
       directory at all. Requires exactly one `--index`; refused (exit 2)
       with zero, with more than one, or together with `-C`. A `Partial`
       entry still lands under `recovered.bin.partial`, never the literal
-      name given — the same rule `-C` follows, for the same reason.
+      name given — the same rule `-C` follows, for the same reason. The
+      file gets the same mode `-C` would give it.
 
   stuffr salvage broken.zip -C out/ --index 6
       --index selects by SCAN POSITION — 0-based, counting every record the
