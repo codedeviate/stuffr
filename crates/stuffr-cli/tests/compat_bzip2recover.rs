@@ -7,12 +7,13 @@
 //! `open(O_WRONLY|O_CREAT|O_EXCL, 0600)` instead of `fopen(.., "wb")`. That
 //! makes the outputs mode 0600 whatever the umask, and refuses (`can't
 //! write`, exit 1) an output name that already exists, where upstream
-//! truncates it or writes through a symlink. stuffr keeps upstream's
-//! behaviour. [`debian_reference`] probes for the patch; on such a reference
-//! the cases with a pre-existing output are skipped with a note naming the
-//! patch, and the reference's 0600 output modes are checked and then set to
-//! stuffr's before comparing. That is a deviation of the test oracle, not of
-//! stuffr.
+//! truncates it or writes through a symlink. stuffr does what Debian does
+//! (a stated hardening deviation from 1.0.8). [`debian_reference`] probes
+//! for the patch; on an upstream reference the cases with a pre-existing
+//! output are skipped with a note naming the deviation (stuffr's side of them
+//! is pinned by `existing_outputs_are_refused`), and the reference's
+//! `0o666 & !umask` output modes are checked and then set to stuffr's 0600
+//! before comparing.
 //!
 //! **A reference that caps one magic early.** Debian's 1.0.8-6 build stops
 //! at the 50000th magic with "appears to contain more than 50000 blocks"
@@ -278,10 +279,13 @@ mod differential {
 
     const NONE_SKIPPED: Skipped<'static> = Skipped { count: 0, why: "" };
 
-    /// On a Debian reference, check its outputs are 0600, check stuffr's
-    /// are upstream's `0o666 & !umask`, then make them equal for comparing.
-    fn debian_modes(r: &mut Run, s: &mut Run) {
-        if debian_reference() != Some(true) {
+    /// stuffr's outputs are always 0600 (Debian's patch, a hardening
+    /// deviation). On an upstream reference, check its outputs are
+    /// `0o666 & !umask` and stuffr's 0600, then make them equal for
+    /// comparing; on a Debian reference both are 0600 and compared as they
+    /// are.
+    fn rec_modes(r: &mut Run, s: &mut Run) {
+        if debian_reference() != Some(false) {
             return;
         }
         for (name, (_, mode, _)) in r.tree.iter_mut() {
@@ -289,13 +293,13 @@ mod differential {
             if !base.starts_with("rec") || name.ends_with('/') {
                 continue;
             }
-            assert_eq!(*mode, 0o600, "Debian reference output {name} is not 0600");
+            assert_eq!(
+                *mode,
+                created_mode(),
+                "upstream reference output {name} is not 0666 less the umask"
+            );
             if let Some((_, m, _)) = s.tree.get(name) {
-                assert_eq!(
-                    *m,
-                    created_mode(),
-                    "stuffr's output {name} is not 0666 less the umask"
-                );
+                assert_eq!(*m, 0o600, "stuffr's output {name} is not 0600");
                 *mode = *m;
             }
         }
@@ -325,7 +329,7 @@ mod differential {
                     return false;
                 };
                 let mut s = stuffr_as(c);
-                debian_modes(&mut r, &mut s);
+                rec_modes(&mut r, &mut s);
                 assert_same(c, &r, &s);
                 true
             }))
@@ -602,20 +606,21 @@ mod differential {
             with_setup(case(&["d.bz2"], d()), first_output_is_a_directory),
             with_setup(case(&["d.bz2"], d()), second_output_is_a_directory),
         ];
-        let upstream_only = vec![
+        let debian_only = vec![
             with_setup(case(&["d.bz2"], d()), first_output_exists),
             with_setup(case(&["d.bz2"], d()), first_output_is_a_symlink),
             with_setup(case(&["d.bz2"], d()), first_output_dangles),
         ];
         let skipped = if debian {
-            Skipped {
-                count: upstream_only.len(),
-                why: "pre-existing outputs: the reference carries Debian's \
-                      bzip2recover-race-open-output.diff",
-            }
-        } else {
-            cases.extend(upstream_only);
+            cases.extend(debian_only);
             NONE_SKIPPED
+        } else {
+            Skipped {
+                count: debian_only.len(),
+                why: "pre-existing outputs: stuffr refuses them as Debian's \
+                      bzip2recover-race-open-output.diff does (hardening \
+                      deviation); upstream 1.0.8 overwrites",
+            }
         };
         check_all_skipping("outputs", &cases, skipped);
     }
@@ -808,5 +813,54 @@ mod differential {
             all.extend(ref_decompress(bytes).unwrap());
         }
         assert_eq!(all, mixed(420_000, 11));
+    }
+
+    /// Hardening deviation (Debian's patch): an output name that already
+    /// exists, as a file, a live symlink or a dangling one, is refused with
+    /// "can't write", exit 1, and left as it was; nothing is written through
+    /// the link. Reference-free, so it runs whatever the reference is.
+    #[test]
+    fn existing_outputs_are_refused() {
+        let setups = [
+            ("file", first_output_exists as fn(&Path)),
+            ("live symlink", first_output_is_a_symlink),
+            ("dangling symlink", first_output_dangles),
+        ];
+        for (what, setup) in setups {
+            let c = with_setup(
+                case(&["d.bz2"], vec![("d.bz2", zero_block_stream(200))]),
+                setup,
+            );
+            let s = stuffr_as(&c);
+            assert_eq!(s.code, 1, "{what}: {}", s.stderr);
+            assert!(
+                s.stderr.contains("can't write `rec00001d.bz2'"),
+                "{what}: {}",
+                s.stderr
+            );
+            let rec = &s.tree["rec00001d.bz2"].0;
+            match what {
+                "file" => assert_eq!(rec, b"an older, longer file to truncate"),
+                "live symlink" => {
+                    assert_eq!(rec, b"target", "the link was replaced");
+                    assert_eq!(s.tree["target"].0, b"old target", "written through");
+                }
+                _ => {
+                    assert_eq!(rec, b"nowhere", "the link was replaced");
+                    assert!(!s.tree.contains_key("nowhere"), "created through");
+                }
+            }
+        }
+    }
+
+    /// Hardening deviation (Debian's patch): outputs are created mode 0600
+    /// whatever the umask.
+    #[test]
+    fn outputs_are_owner_only() {
+        let c = case(&["d.bz2"], vec![("d.bz2", zero_block_stream(200))]);
+        let s = stuffr_as(&c);
+        assert_eq!(s.code, 0, "{}", s.stderr);
+        assert_eq!(s.tree["rec00001d.bz2"].0, zero_block_stream(200));
+        assert_eq!(s.tree["rec00001d.bz2"].1, 0o600);
     }
 }

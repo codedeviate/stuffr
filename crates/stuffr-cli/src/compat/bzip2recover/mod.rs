@@ -19,10 +19,8 @@
 //!   CRC: nothing is decompressed, recompressed or checked;
 //! - outputs are `rec%05d` and the input's base name, split at the last
 //!   `/`, with `.bz2` appended unless the result already ends in it, opened
-//!   as `fopen(.., "wb")` does (created mode 0666 less the umask, or an
-//!   existing file truncated). So, as upstream does, an output is written
-//!   through a symlink already at its name and truncates a file already
-//!   there; Debian's `bzip2recover-race-open-output.diff` refuses both;
+//!   as Debian's `bzip2recover-race-open-output.diff` opens them (see the
+//!   first deviation below);
 //! - the limits: `BZ_MAX_FILENAME` (an operand of 1980 bytes or more is
 //!   refused) and `BZ_MAX_HANDLED_BLOCKS` (50000), with their messages; every
 //!   failure exits 1.
@@ -32,6 +30,15 @@
 //!
 //! Known deviations from bzip2recover 1.0.8:
 //!
+//! - Hardening: each output is opened `O_WRONLY|O_CREAT|O_EXCL`, mode 0600,
+//!   as Debian's `bzip2recover-race-open-output.diff` does. 1.0.8 opens it
+//!   with `fopen(.., "wb")` (mode 0666 less the umask), so it truncates a
+//!   file already at an output name and writes through a symlink planted
+//!   there, dangling or not, onto whatever the link names. stuffr refuses
+//!   any existing name (file, live or dangling symlink) with 1.0.8's own
+//!   "can't write" message, exit 1, leaving it untouched, and the recovered
+//!   blocks are readable only by their owner, as the damaged input may be
+//!   private.
 //! - At exactly 50000 magics (for example 49999 blocks plus the
 //!   end-of-stream marker) with at least 40 bits after the last, 1.0.8
 //!   writes past its `bEnd` array and, on macOS, silently drops block 1;
@@ -98,7 +105,7 @@ pub fn run_in(dir: &Path, argv0: &[u8], args: &[OsString]) -> (i32, Vec<u8>) {
 pub trait Fs {
     /// `fopen(name, "rb")`.
     fn open(&mut self, name: &[u8]) -> io::Result<Box<dyn Read>>;
-    /// `fopen(name, "wb")`.
+    /// Create a new output; an existing name is an error.
     fn create(&mut self, name: &[u8]) -> io::Result<Box<dyn Write>>;
 }
 
@@ -126,14 +133,17 @@ impl Fs for DirFs {
     }
 }
 
-/// `fopen(.., "wb")`: O_WRONLY|O_CREAT|O_TRUNC, mode 0666 less umask.
+/// Debian's `open(name, O_WRONLY|O_CREAT|O_EXCL, 0600)`: an existing name,
+/// a symlink included (`O_EXCL` never follows one), is refused.
 fn create(p: &Path) -> io::Result<Box<dyn Write>> {
-    let f = File::options()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(p)?;
-    Ok(Box::new(f))
+    let mut o = File::options();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    Ok(Box::new(o.open(p)?))
 }
 
 fn bytes(s: &OsStr) -> Vec<u8> {

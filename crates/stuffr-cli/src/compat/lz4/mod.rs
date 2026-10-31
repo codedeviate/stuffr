@@ -101,6 +101,21 @@
 //! 9. `--list` of a regular file that cannot be opened (mode 000): lz4
 //!    aborts on an assertion (exit 134); stuffr names the error
 //!    (`NAME: Permission denied`) and exits 1.
+//! 10. Hardening (ruling T5 of the 2026-10-31 security audit): a symlink
+//!     at an output name is never written through. lz4 checks for an
+//!     existing output with `stat` and opens it with `fopen(.., "wb")`, so a
+//!     dangling symlink looks absent and a live one is truncated, and the
+//!     data lands wherever the link points. stuffr checks with `lstat`: a
+//!     symlink, dangling or not, is an existing file (`already exists` /
+//!     the overwrite question); overwriting it (`-f`, or `y`) unlinks the
+//!     link and creates a fresh file, its target untouched, and every
+//!     output is opened `O_NOFOLLOW`. An output that takes the input's mode
+//!     (a frame from a regular file) is created 0600 and given that mode,
+//!     owner and time through its own descriptor at the end, where lz4
+//!     creates it 0666 less the umask and sets them by name; one whose run
+//!     fails before that is given lz4's 0666 less the umask then. Why: a
+//!     planted link must not redirect a write, and a private input must not
+//!     sit readable while it is written.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};

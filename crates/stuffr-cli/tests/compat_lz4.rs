@@ -4362,4 +4362,88 @@ mod unix {
             assert_eq!(ours.1, "", "stuffr as {name}");
         }
     }
+
+    // ---- deviation 10: a symlink at an output name (stuffr only) ----
+
+    fn out_links_to_target(w: &Path) {
+        fs::write(w.join("target"), b"old target").unwrap();
+        std::os::unix::fs::symlink("target", w.join("o")).unwrap();
+    }
+    fn out_dangles(w: &Path) {
+        std::os::unix::fs::symlink("nowhere", w.join("o")).unwrap();
+    }
+
+    /// Deviation 10: a symlink at the output name, live or dangling, is an
+    /// existing file: refused without `-f` (the question, answered by end
+    /// of input), nothing written through it; with `-f` the link is
+    /// replaced by a regular file and its target is untouched. The
+    /// reference writes through the link, so this is stuffr alone.
+    #[test]
+    fn a_symlink_at_the_output_name_is_never_written_through() {
+        let a = || ("a", text());
+        let b = || ("b.lz4", fx("b.lz4"));
+        for (setup, live) in [
+            (out_links_to_target as fn(&Path), true),
+            (out_dangles, false),
+        ] {
+            for (name, args, input) in [
+                ("lz4", &["a", "o"][..], a()),
+                ("lz4", &["-d", "b.lz4", "o"], b()),
+            ] {
+                let what = format!("{name} {args:?}, live {live}");
+                let s = stuffr_as(&set_up(lz4_case(name, args, vec![input.clone()]), setup));
+                assert_ne!(s.code, 0, "{what}: {}", s.stderr);
+                let link = if live { &b"target"[..] } else { b"nowhere" };
+                assert_eq!(s.tree["o"].0, link, "{what}: the link was replaced");
+                if live {
+                    assert_eq!(s.tree["target"].0, b"old target", "{what}");
+                } else {
+                    assert!(!s.tree.contains_key("nowhere"), "{what}: created");
+                }
+
+                let mut forced = vec!["-f"];
+                forced.extend_from_slice(args);
+                let forced: &'static [&'static str] = Box::leak(forced.into_boxed_slice());
+                let s = stuffr_as(&set_up(lz4_case(name, forced, vec![input]), setup));
+                assert_eq!(s.code, 0, "-f {what}: {}", s.stderr);
+                let o = &s.tree["o"].0;
+                assert_ne!(o.as_slice(), link, "-f {what}: still the link");
+                if args[0] == "-d" {
+                    assert_eq!(o, &text(), "-f {what}");
+                } else {
+                    assert!(o.starts_with(&[0x04, 0x22, 0x4d, 0x18]), "-f {what}");
+                }
+                if live {
+                    assert_eq!(s.tree["target"].0, b"old target", "-f {what}");
+                } else {
+                    assert!(!s.tree.contains_key("nowhere"), "-f {what}: created");
+                }
+            }
+        }
+    }
+
+    /// Deviation 10: an output that takes the input's mode is created 0600
+    /// and given it through its descriptor at the end; one whose decode
+    /// fails part way gets the mode the reference creates it with (the
+    /// differential rows compare that), never 0600 left behind. The 0600
+    /// window itself is pinned by `compat::host`'s unit tests.
+    #[test]
+    fn an_output_is_private_until_its_mode_is_set() {
+        let frame = fx("b.lz4");
+        let cut = frame[..frame.len() - 6].to_vec();
+        let s = stuffr_as(&lz4_case(
+            "lz4",
+            &["-d", "c.lz4", "o"],
+            vec![("c.lz4", cut)],
+        ));
+        assert_ne!(s.code, 0, "{}", s.stderr);
+        assert_ne!(s.tree["o"].1, 0o600, "a failed run left its output private");
+        // A successful one gets the input's mode.
+        let s = stuffr_as(&set_up(
+            lz4_case("lz4", &["-d", "b.lz4", "o"], vec![("b.lz4", frame)]),
+            mode_604_b,
+        ));
+        assert_eq!(s.code, 0, "{}", s.stderr);
+        assert_eq!(s.tree["o"].1, 0o604);
+    }
 }

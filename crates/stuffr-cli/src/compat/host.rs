@@ -2479,6 +2479,11 @@ pub(crate) fn printf(w: &mut dyn Write, fmt: &str, args: &[&[u8]]) {
 
 /// Set only the access and modification times (`utime`).
 pub(crate) fn set_times(meta: &Metadata, to: &Path) -> io::Result<()> {
+    set_times_fd(meta, &open_nofollow_for_write(to)?)
+}
+
+/// [`set_times`] through an open descriptor (`futimens`).
+pub(crate) fn set_times_fd(meta: &Metadata, f: &File) -> io::Result<()> {
     let mut times = fs::FileTimes::new();
     if let Ok(t) = meta.accessed() {
         times = times.set_accessed(t);
@@ -2486,12 +2491,162 @@ pub(crate) fn set_times(meta: &Metadata, to: &Path) -> io::Result<()> {
     if let Ok(t) = meta.modified() {
         times = times.set_modified(t);
     }
-    File::options().write(true).open(to)?.set_times(times)
+    f.set_times(times)
+}
+
+/// Open an existing `path` for writing, without truncating it and without
+/// following a symlink at its last component (`O_NOFOLLOW` on unix), for
+/// setting an output's metadata by descriptor.
+pub(crate) fn open_nofollow_for_write(path: &Path) -> io::Result<File> {
+    let mut o = File::options();
+    o.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW);
+    }
+    o.open(path)
+}
+
+/// Whether something, a symlink included (live or dangling), is at `path`:
+/// `lstat`, never `stat`. Ruling T5: a symlink at an output name is an
+/// existing file.
+pub(crate) fn output_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+/// `0o666 & !umask`: the mode `open(.., O_CREAT, 0666)` gives a new file.
+/// For an output created 0600 (ruling T5) whose run ends before it is given
+/// the input's mode. The umask is read through
+/// [`stuffr::entries::process_umask`] (serialised, and never wider while
+/// it is swapped).
+pub(crate) fn default_file_mode() -> u32 {
+    0o666 & !stuffr::entries::process_umask()
+}
+
+/// A second descriptor of an output created 0600 (ruling T5), for setting
+/// its metadata through the descriptor rather than by name (HOST-8). Unless
+/// [`OutFd::settle`] is called, dropping it gives a file this run created
+/// the mode the reference would have created it with
+/// ([`default_file_mode`]), so a run that ends before copying the input's
+/// mode leaves what the reference leaves.
+pub(crate) struct OutFd {
+    file: File,
+    widen: bool,
+}
+
+impl OutFd {
+    /// `file` is the output; `fresh` says this run created it 0600 (an
+    /// existing file opened over keeps its own mode and is never widened).
+    pub(crate) fn new(file: &File, fresh: bool) -> Option<OutFd> {
+        Some(OutFd {
+            file: file.try_clone().ok()?,
+            widen: fresh,
+        })
+    }
+    pub(crate) fn file(&self) -> &File {
+        &self.file
+    }
+    /// The output's mode has been set: leave it alone on drop.
+    pub(crate) fn settle(&mut self) {
+        self.widen = false;
+    }
+}
+
+impl Drop for OutFd {
+    fn drop(&mut self) {
+        if self.widen {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::Permissions::from_mode(default_file_mode());
+                let _ = self.file.set_permissions(mode);
+            }
+        }
+    }
+}
+
+/// Whether [`create_output`] at `path` will create a new file: nothing is
+/// there, or only a symlink (which it replaces). Call it just before.
+pub(crate) fn output_is_fresh(path: &Path) -> bool {
+    fs::symlink_metadata(path).map_or(true, |m| m.file_type().is_symlink())
+}
+
+/// Create the output `path` for writing, never through a symlink at that
+/// name (ruling T5, the 2026-10-31 security audit). A symlink there, live or
+/// dangling, is unlinked and a fresh file is created in its place
+/// (`O_CREAT|O_EXCL`), so the link's target is never touched; anything else
+/// is opened `O_CREAT|O_TRUNC|O_NOFOLLOW`, so a symlink planted after the
+/// check fails the open (`ELOOP`) instead of being followed. `mode` is the
+/// creation mode before the umask (an existing file keeps its own). The
+/// caller has already decided that an existing name may be overwritten.
+/// Off unix: `File::create`.
+pub(crate) fn create_output(path: &Path, mode: u32) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut o = File::options();
+        o.write(true).mode(mode).custom_flags(libc::O_NOFOLLOW);
+        if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+            fs::remove_file(path)?;
+            o.create_new(true);
+        } else {
+            o.create(true).truncate(true);
+        }
+        o.open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        File::create(path)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ruling T5: `create_output` replaces a symlink (live or dangling) at
+    /// the name with a fresh file created with the given mode, leaving the
+    /// link's target alone; an [`OutFd`] not settled widens a fresh file to
+    /// the default mode on drop, a settled one leaves it.
+    #[cfg(unix)]
+    #[test]
+    fn create_output_never_writes_through_a_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("stuffr-host-out-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        fs::write(dir.join("target"), b"old").unwrap();
+        for (link, to) in [("live", "target"), ("dangling", "nowhere")] {
+            let p = dir.join(link);
+            std::os::unix::fs::symlink(to, &p).unwrap();
+            assert!(output_exists(&p) && output_is_fresh(&p));
+            let mut f = create_output(&p, 0o600).unwrap();
+            f.write_all(b"new").unwrap();
+            assert!(!fs::symlink_metadata(&p).unwrap().file_type().is_symlink());
+            assert_eq!(mode(&p), 0o600, "{link}: created wider than 0600");
+            {
+                let mut fd = OutFd::new(&f, true).unwrap();
+                fd.settle();
+            }
+            assert_eq!(mode(&p), 0o600, "{link}: a settled descriptor widened");
+            drop(OutFd::new(&f, true).unwrap());
+            assert_eq!(mode(&p), default_file_mode(), "{link}: not widened");
+        }
+        assert_eq!(fs::read(dir.join("target")).unwrap(), b"old");
+        assert!(!dir.join("nowhere").exists());
+        // An existing file is truncated in place and keeps its mode.
+        let p = dir.join("plain");
+        fs::write(&p, b"longer old data").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(!output_is_fresh(&p));
+        let f = create_output(&p, 0o600).unwrap();
+        drop(OutFd::new(&f, false));
+        assert_eq!((fs::read(&p).unwrap().len(), mode(&p)), (0, 0o640));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn detected_counts_are_positive() {

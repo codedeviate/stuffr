@@ -1220,10 +1220,13 @@ and mtimes.
   bits after the last, bzip2recover 1.0.8 writes past its arrays and, on
   macOS, silently drops block 1. stuffr writes it. Upstream's undefined
   behaviour is never reproduced.
-- **bzip2recover and existing files.** As upstream does, it writes its
-  `rec*` files through a symlink already at that name and truncates a file
-  already there. This differs from Debian's patched build, which refuses
-  both (it opens with `O_EXCL`, mode 0600).
+- **bzip2recover and existing files (hardening).** Upstream 1.0.8 writes
+  its `rec*` files through a symlink already at that name (dangling or not)
+  and truncates a file already there, mode 0666 less the umask. stuffr
+  opens them as Debian's patched build does (`O_EXCL`, mode 0600): an
+  existing name is refused with "can't write", exit 1, and left untouched,
+  so a planted symlink cannot redirect the write, and recovered blocks of
+  a private file stay private.
 
 ### The gzip family
 
@@ -1604,6 +1607,16 @@ included.
 - **`--list` of a regular file that cannot be opened** (mode 000) aborts lz4
   on an assertion (exit 134); stuffr prints `NAME: Permission denied` and
   exits 1.
+- **A symlink at an output name is never written through** (hardening).
+  lz4 checks for an existing output with `stat` and opens it with
+  `fopen`, so a dangling symlink looks absent, a live one is truncated, and
+  the data lands where the link points. stuffr treats any symlink there as
+  an existing file (`already exists`, or the overwrite question); `-f` (or
+  `y`) replaces the link with a fresh file and leaves its target alone. An
+  output that takes the input's mode is created 0600 and given the mode,
+  owner and time through its descriptor at the end (a failed run's output
+  gets lz4's 0666 less the umask then), so a private input is never
+  readable through its output while it is written.
 
 **Known differences, pure tier only** (without `lz4-c`):
 

@@ -290,6 +290,9 @@ pub(super) struct Sink {
     /// The error a failed write ends the run with (`Error 38` compressing,
     /// `Error 70` decoding).
     write_error: (&'static str, i32),
+    /// A second descriptor of a file output, for its metadata (HOST-8: set
+    /// by descriptor, never by name; deviation 10).
+    fd: Option<host::OutFd>,
 }
 
 /// A sandbox's standard output is a pipe: it cannot be seeked.
@@ -576,12 +579,21 @@ impl Run<'_> {
     }
 
     /// Create the output `name`, asking first if it exists (module doc).
-    /// `input` is the input's metadata, for deviation 3.
-    fn open_output(&mut self, name: &[u8], input: Option<&Metadata>) -> Result<File, Fail> {
+    /// `input` is the input's metadata, for deviation 3. Deviation 10: a
+    /// symlink at `name`, dangling or not, exists, and is replaced, never
+    /// written through; `private` creates a new file 0600 (widened by
+    /// [`Run::copy_metadata`] to the input's mode).
+    fn open_output(
+        &mut self,
+        name: &[u8],
+        input: Option<&Metadata>,
+        private: bool,
+    ) -> Result<File, Fail> {
         let path = self.host.path(name);
-        if let Ok(existing) = fs::metadata(&path) {
+        if host::output_exists(&path) {
             // Spec deviation 3: the input is never opened over.
             if let Some(i) = input
+                && let Ok(existing) = fs::metadata(&path)
                 && host::same_file(i, &existing) == Some(true)
             {
                 printf(self.err, m::SAME_FILE, &[name]);
@@ -599,7 +611,8 @@ impl Run<'_> {
                 }
             }
         }
-        File::create(&path)
+        let mode = if private { 0o600 } else { 0o666 };
+        host::create_output(&path, mode)
             .map_err(|e| self.fail(m::OPEN_OUTPUT_FAILED, &[name, &host::strerror(&e)]))
     }
 
@@ -625,6 +638,7 @@ impl Run<'_> {
         // disabled on stdout)"; probe: compressing never seeks (`lz4
         // --sparse -c zeros | cat` succeeds).
         let sparse_asked = decoding && self.cmd.sparse != Some(false);
+        let mut fd = None;
         let write_error = if decoding {
             (m::E70_WRITE_DECODED, 70)
         } else {
@@ -651,7 +665,13 @@ impl Run<'_> {
                 (SinkKind::Stdout(fd), sparse)
             }
             Target::File(name) => {
-                let f = self.open_output(name, input)?;
+                // Only an output that will be given the input's mode is
+                // created private (HOST-4): a frame from a regular file.
+                let private =
+                    input.is_some_and(Metadata::is_file) && (decoding || !self.cmd.opts.legacy);
+                let fresh = private && host::output_is_fresh(&self.host.path(name));
+                let f = self.open_output(name, input, private)?;
+                fd = host::OutFd::new(&f, fresh);
                 match self.host {
                     Host::Real if sparse_asked => (SinkKind::SparseFile(f), true),
                     _ => (SinkKind::File(self.host.out_writer(Some(f))), sparse_asked),
@@ -663,6 +683,7 @@ impl Run<'_> {
             sparse,
             skips: 0,
             write_error,
+            fd,
         })
     }
 
@@ -670,30 +691,28 @@ impl Run<'_> {
     /// a o` over an existing `o`): the input's modification time,
     /// permission bits and owner (a refused `chown` is ignored); the
     /// access time is left as the run made it. Only for a file read from a
-    /// file. Failures are ignored, as lz4 reports none.
-    fn copy_metadata(&self, target: &Target, input: Option<&Metadata>) {
-        let (Target::File(name), Some(meta)) = (target, input) else {
+    /// file. Failures are ignored, as lz4 reports none. Set through the
+    /// output's own descriptor `fd` (HOST-8), never by name.
+    fn copy_metadata(target: &Target, input: Option<&Metadata>, fd: Option<&mut host::OutFd>) {
+        let (Target::File(_), Some(meta), Some(fd)) = (target, input, fd) else {
             return;
         };
-        let path = self.host.path(name);
+        let f = fd.file();
         // Only a regular file to a regular file (probe: `lz4 -f b fifo`
         // leaves the FIFO's own mode; a device is never touched).
-        if !meta.is_file() || !fs::metadata(&path).is_ok_and(|m| m.is_file()) {
+        if !meta.is_file() || !f.metadata().is_ok_and(|m| m.is_file()) {
             return;
         }
         if let Ok(t) = meta.modified() {
-            let times = fs::FileTimes::new().set_modified(t);
-            let _ = File::options()
-                .write(true)
-                .open(&path)
-                .and_then(|f| f.set_times(times));
+            let _ = f.set_times(fs::FileTimes::new().set_modified(t));
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            let _ = std::os::unix::fs::chown(&path, Some(meta.uid()), Some(meta.gid()));
+            let _ = std::os::unix::fs::fchown(f, Some(meta.uid()), Some(meta.gid()));
         }
-        let _ = fs::set_permissions(&path, meta.permissions());
+        let _ = f.set_permissions(meta.permissions());
+        fd.settle();
     }
 
     /// `--rm`: remove the input once processed (probe: `lz4 -c --rm < a`
@@ -801,7 +820,7 @@ impl Run<'_> {
     /// Compress `name` into `target`.
     fn compress_one(&mut self, name: &[u8], target: &Target) -> Result<Stats, Fail> {
         let (src, meta) = self.open_input(name)?;
-        let r = match self.open_sink(target, meta.as_ref(), false) {
+        let (r, mut fd) = match self.open_sink(target, meta.as_ref(), false) {
             Ok(mut sink) => {
                 // Standard input is taken only now: the overwrite question
                 // reads it first (probe: `printf 'y\nhello' | lz4 - e`
@@ -809,16 +828,17 @@ impl Run<'_> {
                 let mut src = src.unwrap_or_else(|| self.take_stdin());
                 let r = self.compress_from(name, &mut src, meta.as_ref(), &mut sink);
                 self.put_back(name, src);
-                r
+                (r, sink.fd.take())
             }
-            Err(f) => Err(f),
+            Err(f) => (Err(f), None),
         };
         let stats = r?;
         // probe: `lz4 -l a` leaves `a.lz4` with the run's time and the
         // default mode; a frame gets the input's.
         if !self.cmd.opts.legacy {
-            self.copy_metadata(target, meta.as_ref());
+            Self::copy_metadata(target, meta.as_ref(), fd.as_mut());
         }
+        drop(fd);
         self.total += stats.read;
         self.show_compress_summary(&stats);
         self.remove_input(name)?;
@@ -968,8 +988,7 @@ impl Run<'_> {
                 // empty `u` with `u.lz4`'s mode and time (a directory's are
                 // not copied: `lz4 -d -f dd.lz4 o`).
                 let _ = sink.flush(self.out);
-                drop(sink);
-                self.copy_metadata(target, pre.as_ref());
+                Self::copy_metadata(target, pre.as_ref(), sink.fd.as_mut());
                 return Err(f);
             }
         };
@@ -988,12 +1007,14 @@ impl Run<'_> {
             }
         };
         sink.finish(self)?;
+        let mut fd = sink.fd.take();
         drop(sink);
         let stats = Stats {
             read: decoded.read,
             written: decoded.written,
         };
-        self.copy_metadata(target, meta.as_ref());
+        Self::copy_metadata(target, meta.as_ref(), fd.as_mut());
+        drop(fd);
         self.total += stats.written;
         self.show_decode_summary(name, &stats);
         self.remove_input(name)?;
