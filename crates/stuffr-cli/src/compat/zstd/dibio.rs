@@ -280,7 +280,7 @@ fn load_files(
 fn save_dict(host: &Host, name: &[u8], dict: &[u8], force: bool, err: &mut dyn Write) -> Fio<()> {
     let path = host.path(name);
     let opened = if force {
-        host::create_output(&path, 0o666)
+        host::create_output(&path, 0o666).map(|(f, _)| f)
     } else {
         let mut o = File::options();
         o.write(true).create(true).truncate(true);

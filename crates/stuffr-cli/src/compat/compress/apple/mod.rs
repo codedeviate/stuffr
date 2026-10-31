@@ -108,10 +108,12 @@
 //!   creates a fresh file (`O_NOFOLLOW`), its target untouched. A file it
 //!   creates is created 0600 and given the input's mode, owner, times and
 //!   flags through its own descriptor at the end (a run that ends first
-//!   gives it Apple's 0666 less the umask), so a private input is never
-//!   readable through its output while it is written, and a "no saving"
-//!   or failed output removed is always the file this run created. Why: a
-//!   planted link must not redirect a write.
+//!   gives it Apple's 0666 less the umask intersected with the input's
+//!   permission bits: Apple's mode for an ordinary 0644 input, and a
+//!   private input's partial output stays private), so a private input is
+//!   never readable through its output while it is written, and a "no
+//!   saving" or failed output removed is always the file this run created.
+//!   Why: a planted link must not redirect a write.
 //! - The overwrite question's answer is judged by the C locale's
 //!   `rpmatch` (`y` or `Y`), whatever `LC_MESSAGES` says; Apple loads the
 //!   user's locale first.

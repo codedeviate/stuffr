@@ -378,7 +378,7 @@ fn open_output(ctx: &mut Ctx, input: Option<&Metadata>) -> bool {
         return false;
     }
     let opened = if force {
-        host::create_output(&path, 0o600)
+        host::create_output(&path, 0o600).map(|(f, _)| f)
     } else {
         let mut opts = File::options();
         opts.write(true).truncate(true).create_new(true);
@@ -475,10 +475,10 @@ pub(super) fn close_files(ctx: &mut Ctx, rm_input: bool, rm_output: bool) -> boo
 ///
 /// The times follow the reference's build: `HAVE_UTIMENSAT` holds only
 /// where `_POSIX_C_SOURCE >= 200809L` is defined, which glibc's headers do
-/// by default and macOS's and the BSDs' do not. So on glibc the times are
-/// set with nanoseconds and `AT_SYMLINK_NOFOLLOW` (`utimensat`); elsewhere
-/// in whole seconds through a symlink (`utime`): probed, Homebrew's 1.2.1
-/// on macOS leaves the nanoseconds 0.
+/// by default and macOS's and the BSDs' do not. So on glibc the times keep
+/// their nanoseconds; elsewhere they are whole seconds (`utime`): probed,
+/// Homebrew's 1.2.1 on macOS leaves the nanoseconds 0. Both are set
+/// through a descriptor (deviation 11).
 pub(super) fn copy_stat(ctx: &mut Ctx) {
     let (Some(input), Some(output)) = (ctx.input_path.clone(), ctx.output_path.clone()) else {
         return;
@@ -488,50 +488,66 @@ pub(super) fn copy_stat(ctx: &mut Ctx) {
     };
     let out = ctx.host.path(cli::bytes(&output));
     let name = cli::bytes(&output);
-    // Deviation 11: the attributes go by name, after the close, as the
-    // reference sets them (its `close(2)` result is checked first, T4-g,
-    // so no second descriptor is held open past it). Only onto the file
-    // this run opened: a symlink or another file now at the name is left
-    // alone, attributes not copied.
-    if let Some(opened) = &ctx.fout_meta
-        && fs::symlink_metadata(&out)
-            .map_or(true, |now| host::same_file(opened, &now) != Some(true))
-    {
-        return;
-    }
+    // Deviation 11: the attributes are set after the close, as the
+    // reference sets them (its `close(2)` result is checked first, T4-g),
+    // but through a descriptor of the output reopened `O_NOFOLLOW` and
+    // checked against the file this run opened (device and inode): a
+    // symlink or another file now at the name is left alone, attributes
+    // not copied.
     #[cfg(unix)]
     {
-        use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        let Some(opened) = &ctx.fout_meta else {
+            return;
+        };
+        // Read-only first; write-only for an output its owner cannot read.
+        // `O_NONBLOCK`: a FIFO with no peer must not block the reopen.
+        let reopen = |write: bool| {
+            File::options()
+                .read(!write)
+                .write(write)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&out)
+        };
+        let f = match reopen(false) {
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => reopen(true),
+            r => r,
+        };
+        let Ok(f) = f else {
+            return;
+        };
+        if f.metadata()
+            .map_or(true, |now| host::same_file(opened, &now) != Some(true))
+        {
+            return;
+        }
         let glibc = cfg!(all(target_os = "linux", target_env = "gnu"));
         let nsec = |n: i64| if glibc { n } else { 0 };
-        if let Ok(c) = std::ffi::CString::new(out.as_os_str().as_bytes()) {
-            let times = [
-                libc::timespec {
-                    tv_sec: meta.atime() as libc::time_t,
-                    tv_nsec: nsec(meta.atime_nsec()) as _,
-                },
-                libc::timespec {
-                    tv_sec: meta.mtime() as libc::time_t,
-                    tv_nsec: nsec(meta.mtime_nsec()) as _,
-                },
-            ];
-            let flags = if glibc { libc::AT_SYMLINK_NOFOLLOW } else { 0 };
-            // SAFETY: `c` is a NUL-terminated path and `times` two valid
-            // timespecs, both alive for the call. The result is ignored, as
-            // the reference ignores it.
-            unsafe {
-                libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), flags);
-            }
+        let times = [
+            libc::timespec {
+                tv_sec: meta.atime() as libc::time_t,
+                tv_nsec: nsec(meta.atime_nsec()) as _,
+            },
+            libc::timespec {
+                tv_sec: meta.mtime() as libc::time_t,
+                tv_nsec: nsec(meta.mtime_nsec()) as _,
+            },
+        ];
+        // SAFETY: `f` is an open descriptor and `times` two valid
+        // timespecs, both alive for the call. The result is ignored, as
+        // the reference ignores it.
+        unsafe {
+            libc::futimens(f.as_raw_fd(), times.as_ptr());
         }
         let mode = fs::Permissions::from_mode(meta.mode() & 0o777);
-        if let Err(e) = fs::set_permissions(&out, mode) {
+        if let Err(e) = f.set_permissions(mode) {
             ctx.say(m::ACCESS_BITS_FAILED, &[name, &host::strerror(&e)]);
         }
-        if let Err(e) = std::os::unix::fs::chown(&out, None, Some(meta.gid())) {
+        if let Err(e) = std::os::unix::fs::fchown(&f, None, Some(meta.gid())) {
             ctx.say(m::GROUP_FAILED, &[name, &host::strerror(&e)]);
         }
-        if let Err(e) = std::os::unix::fs::chown(&out, Some(meta.uid()), None) {
+        if let Err(e) = std::os::unix::fs::fchown(&f, Some(meta.uid()), None) {
             ctx.say(m::USER_FAILED, &[name, &host::strerror(&e)]);
         }
     }

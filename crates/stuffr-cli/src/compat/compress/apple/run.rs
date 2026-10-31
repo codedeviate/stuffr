@@ -357,7 +357,18 @@ impl Run<'_, '_> {
         &mut self,
         out: Name,
         same: bool,
+        input: Option<&Metadata>,
     ) -> io::Result<(Target, Option<File>, Option<host::OutFd>)> {
+        #[cfg(unix)]
+        let input_mode = {
+            use std::os::unix::fs::PermissionsExt;
+            input.map(|m| m.permissions().mode())
+        };
+        #[cfg(not(unix))]
+        let input_mode = {
+            let _ = input;
+            None
+        };
         let Name::File(o) = out else {
             return Ok((Target::Stdout, None, None));
         };
@@ -369,7 +380,7 @@ impl Run<'_, '_> {
             };
             let (tmp, f, guard) =
                 host::create_temp_armed(self.host, &dir, "compress", TEMP_SIGNALS)?;
-            let fd = host::OutFd::new(&f, true);
+            let fd = host::OutFd::new(&f, true, input_mode);
             return Ok((
                 Target::Temp {
                     tmp,
@@ -380,9 +391,8 @@ impl Run<'_, '_> {
                 fd,
             ));
         }
-        let fresh = host::output_is_fresh(&path);
-        let f = host::create_output(&path, 0o600)?;
-        let fd = host::OutFd::new(&f, fresh);
+        let (f, fresh) = host::create_output(&path, 0o600)?;
+        let fd = host::OutFd::new(&f, fresh, input_mode);
         Ok((Target::Direct(path), Some(f), fd))
     }
 
@@ -465,7 +475,7 @@ impl Run<'_, '_> {
             return;
         }
         let same = self.is_same(&sb, &isb);
-        let (target, file, mut fd) = match self.open_output(out, same) {
+        let (target, file, mut fd) = match self.open_output(out, same, isb.as_ref()) {
             Ok(t) => t,
             Err(e) => {
                 self.cwarn_io(out_shown, &e);
@@ -579,7 +589,7 @@ impl Run<'_, '_> {
         // (deviation A3).
         debug_assert!(nr > 0 || dec.was_empty());
         let same = self.is_same(&sb, &isb);
-        let (target, file, mut fd) = match self.open_output(out, same) {
+        let (target, file, mut fd) = match self.open_output(out, same, isb.as_ref()) {
             Ok(t) => t,
             Err(e) => {
                 self.cwarn_io(out_shown, &e);

@@ -71,11 +71,13 @@
 //!     there, dangling or not, is followed and the file it names is
 //!     created or truncated. stuffr unlinks the link and creates a fresh
 //!     file (`O_NOFOLLOW`), its target untouched; without `-f` both refuse
-//!     it (`O_EXCL`), as before. The attributes `CopyStat` copies are still
-//!     set by name after the close, as the reference sets them, but only
-//!     onto the file this run opened (same device and inode, not a
-//!     symlink): if the name was swapped meanwhile they are not copied.
-//!     Why: a planted link must not redirect a write.
+//!     it (`O_EXCL`), as before. The attributes `CopyStat` copies are set
+//!     after the checked close, as the reference sets them, but by name it
+//!     follows a symlink there; stuffr reopens the output `O_NOFOLLOW`,
+//!     checks it is the file this run opened (device and inode) and sets
+//!     times, mode and owner through that descriptor: if the name was
+//!     swapped meanwhile they are not copied. Why: a planted link must not
+//!     redirect a write or a `chmod`.
 //!
 //! `files.rs` is the file handling (`NextFile`, `OpenFiles`, `CloseFiles`,
 //! `CopyStat`, `ReadDictionary`), `codec.rs` compression and the

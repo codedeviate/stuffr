@@ -429,6 +429,18 @@ impl Sink {
     }
 }
 
+/// The mode a new output file is created with (deviation 10, HOST-4):
+/// 0600 when it will be given the input's mode at the end (from a regular
+/// file, a frame or a decode; legacy compression keeps lz4's default), else
+/// lz4's 0666 less the umask.
+fn output_mode(input: Option<&Metadata>, decoding: bool, legacy: bool) -> u32 {
+    if input.is_some_and(Metadata::is_file) && (decoding || !legacy) {
+        0o600
+    } else {
+        0o666
+    }
+}
+
 // ---- the run ----
 
 /// What every input of a run shares.
@@ -581,14 +593,14 @@ impl Run<'_> {
     /// Create the output `name`, asking first if it exists (module doc).
     /// `input` is the input's metadata, for deviation 3. Deviation 10: a
     /// symlink at `name`, dangling or not, exists, and is replaced, never
-    /// written through; `private` creates a new file 0600 (widened by
-    /// [`Run::copy_metadata`] to the input's mode).
+    /// written through; a new file is created with `mode` ([`output_mode`]).
+    /// The `bool` says whether this run created it.
     fn open_output(
         &mut self,
         name: &[u8],
         input: Option<&Metadata>,
-        private: bool,
-    ) -> Result<File, Fail> {
+        mode: u32,
+    ) -> Result<(File, bool), Fail> {
         let path = self.host.path(name);
         if host::output_exists(&path) {
             // Spec deviation 3: the input is never opened over.
@@ -611,7 +623,6 @@ impl Run<'_> {
                 }
             }
         }
-        let mode = if private { 0o600 } else { 0o666 };
         host::create_output(&path, mode)
             .map_err(|e| self.fail(m::OPEN_OUTPUT_FAILED, &[name, &host::strerror(&e)]))
     }
@@ -665,13 +676,16 @@ impl Run<'_> {
                 (SinkKind::Stdout(fd), sparse)
             }
             Target::File(name) => {
-                // Only an output that will be given the input's mode is
-                // created private (HOST-4): a frame from a regular file.
-                let private =
-                    input.is_some_and(Metadata::is_file) && (decoding || !self.cmd.opts.legacy);
-                let fresh = private && host::output_is_fresh(&self.host.path(name));
-                let f = self.open_output(name, input, private)?;
-                fd = host::OutFd::new(&f, fresh);
+                let mode = output_mode(input, decoding, self.cmd.opts.legacy);
+                let (f, fresh) = self.open_output(name, input, mode)?;
+                #[cfg(unix)]
+                let input_mode = {
+                    use std::os::unix::fs::PermissionsExt;
+                    input.map(|m| m.permissions().mode())
+                };
+                #[cfg(not(unix))]
+                let input_mode = None;
+                fd = host::OutFd::new(&f, fresh && mode == 0o600, input_mode);
                 match self.host {
                     Host::Real if sparse_asked => (SinkKind::SparseFile(f), true),
                     _ => (SinkKind::File(self.host.out_writer(Some(f))), sparse_asked),
@@ -1171,4 +1185,30 @@ fn files(run: &mut Run, plan: &Plan) -> Result<usize, i32> {
     }
     done(run, failed);
     Ok(failed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deviation 10: a frame or a decode from a regular file is created
+    /// 0600 (its mode comes at the end, through its descriptor); from
+    /// standard input, a FIFO, or legacy compression, lz4's 0666.
+    #[test]
+    fn a_frame_from_a_regular_file_is_created_owner_only() {
+        let dir = std::env::temp_dir().join(format!("stuffr-lz4-mode-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a");
+        fs::write(&file, b"x").unwrap();
+        let reg = fs::metadata(&file).unwrap();
+        let dirm = fs::metadata(&dir).unwrap();
+        assert_eq!(output_mode(Some(&reg), false, false), 0o600);
+        assert_eq!(output_mode(Some(&reg), true, false), 0o600);
+        assert_eq!(output_mode(Some(&reg), true, true), 0o600);
+        assert_eq!(output_mode(Some(&reg), false, true), 0o666);
+        assert_eq!(output_mode(None, false, false), 0o666);
+        assert_eq!(output_mode(Some(&dirm), true, false), 0o666);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

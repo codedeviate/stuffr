@@ -2664,6 +2664,7 @@ pub(crate) fn output_exists(path: &Path) -> bool {
 /// the input's mode. The umask is read through
 /// [`stuffr::entries::process_umask`] (serialised, and never wider while
 /// it is swapped).
+#[cfg(unix)]
 pub(crate) fn default_file_mode() -> u32 {
     0o666 & !stuffr::entries::process_umask()
 }
@@ -2672,20 +2673,25 @@ pub(crate) fn default_file_mode() -> u32 {
 /// its metadata through the descriptor rather than by name (HOST-8). Unless
 /// [`OutFd::settle`] is called, dropping it gives a file this run created
 /// the mode the reference would have created it with
-/// ([`default_file_mode`]), so a run that ends before copying the input's
-/// mode leaves what the reference leaves.
+/// ([`default_file_mode`]) intersected with the input's permission bits,
+/// so a run that ends before copying the input's mode leaves what the
+/// reference leaves for an ordinary input, and a private input's partial
+/// output stays private.
 pub(crate) struct OutFd {
     file: File,
     widen: bool,
+    input_mode: u32,
 }
 
 impl OutFd {
     /// `file` is the output; `fresh` says this run created it 0600 (an
-    /// existing file opened over keeps its own mode and is never widened).
-    pub(crate) fn new(file: &File, fresh: bool) -> Option<OutFd> {
+    /// existing file opened over keeps its own mode and is never widened);
+    /// `input_mode` is the input's mode, `None` for none (standard input).
+    pub(crate) fn new(file: &File, fresh: bool, input_mode: Option<u32>) -> Option<OutFd> {
         Some(OutFd {
             file: file.try_clone().ok()?,
             widen: fresh,
+            input_mode: input_mode.unwrap_or(0o777) & 0o777,
         })
     }
     pub(crate) fn file(&self) -> &File {
@@ -2703,46 +2709,53 @@ impl Drop for OutFd {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let mode = fs::Permissions::from_mode(default_file_mode());
+                let mode = fs::Permissions::from_mode(default_file_mode() & self.input_mode);
                 let _ = self.file.set_permissions(mode);
             }
+            // Off unix there are no mode bits to widen.
+            #[cfg(not(unix))]
+            let _ = self.input_mode;
         }
     }
-}
-
-/// Whether [`create_output`] at `path` will create a new file: nothing is
-/// there, or only a symlink (which it replaces). Call it just before.
-pub(crate) fn output_is_fresh(path: &Path) -> bool {
-    fs::symlink_metadata(path).map_or(true, |m| m.file_type().is_symlink())
 }
 
 /// Create the output `path` for writing, never through a symlink at that
 /// name (ruling T5, the 2026-10-31 security audit). A symlink there, live or
 /// dangling, is unlinked and a fresh file is created in its place
-/// (`O_CREAT|O_EXCL`), so the link's target is never touched; anything else
-/// is opened `O_CREAT|O_TRUNC|O_NOFOLLOW`, so a symlink planted after the
-/// check fails the open (`ELOOP`) instead of being followed. `mode` is the
-/// creation mode before the umask (an existing file keeps its own). The
-/// caller has already decided that an existing name may be overwritten.
-/// Off unix: `File::create`.
-pub(crate) fn create_output(path: &Path, mode: u32) -> io::Result<File> {
+/// (`O_CREAT|O_EXCL`), so the link's target is never touched. Otherwise a
+/// new file is tried first (`O_CREAT|O_EXCL|O_NOFOLLOW`), and on `EEXIST`
+/// the existing one is truncated (`O_TRUNC|O_NOFOLLOW`): a symlink planted
+/// meanwhile fails the open (`ELOOP`) instead of being followed. `mode` is
+/// the creation mode before the umask (an existing file keeps its own).
+/// The `bool` says whether this call created the file. The caller has
+/// already decided that an existing name may be overwritten. Off unix:
+/// `File::create`, reported as created when nothing was there.
+pub(crate) fn create_output(path: &Path, mode: u32) -> io::Result<(File, bool)> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        let mut o = File::options();
-        o.write(true).mode(mode).custom_flags(libc::O_NOFOLLOW);
+        let opts = || {
+            let mut o = File::options();
+            o.write(true).mode(mode).custom_flags(libc::O_NOFOLLOW);
+            o
+        };
         if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
             fs::remove_file(path)?;
-            o.create_new(true);
-        } else {
-            o.create(true).truncate(true);
+            return Ok((opts().create_new(true).open(path)?, true));
         }
-        o.open(path)
+        match opts().create_new(true).open(path) {
+            Ok(f) => Ok((f, true)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                Ok((opts().truncate(true).open(path)?, false))
+            }
+            Err(e) => Err(e),
+        }
     }
     #[cfg(not(unix))]
     {
         let _ = mode;
-        File::create(path)
+        let fresh = fs::symlink_metadata(path).is_err();
+        Ok((File::create(path)?, fresh))
     }
 }
 
@@ -2766,18 +2779,22 @@ mod tests {
         for (link, to) in [("live", "target"), ("dangling", "nowhere")] {
             let p = dir.join(link);
             std::os::unix::fs::symlink(to, &p).unwrap();
-            assert!(output_exists(&p) && output_is_fresh(&p));
-            let mut f = create_output(&p, 0o600).unwrap();
+            assert!(output_exists(&p));
+            let (mut f, fresh) = create_output(&p, 0o600).unwrap();
+            assert!(fresh, "{link}: not reported created");
             f.write_all(b"new").unwrap();
             assert!(!fs::symlink_metadata(&p).unwrap().file_type().is_symlink());
             assert_eq!(mode(&p), 0o600, "{link}: created wider than 0600");
             {
-                let mut fd = OutFd::new(&f, true).unwrap();
+                let mut fd = OutFd::new(&f, true, Some(0o644)).unwrap();
                 fd.settle();
             }
             assert_eq!(mode(&p), 0o600, "{link}: a settled descriptor widened");
-            drop(OutFd::new(&f, true).unwrap());
-            assert_eq!(mode(&p), default_file_mode(), "{link}: not widened");
+            drop(OutFd::new(&f, true, Some(0o640)).unwrap());
+            assert_eq!(mode(&p), default_file_mode() & 0o640, "{link}: not widened");
+            // A private input's output stays private.
+            drop(OutFd::new(&f, true, Some(0o600)).unwrap());
+            assert_eq!(mode(&p), 0o600 & default_file_mode(), "{link}");
         }
         assert_eq!(fs::read(dir.join("target")).unwrap(), b"old");
         assert!(!dir.join("nowhere").exists());
@@ -2785,10 +2802,14 @@ mod tests {
         let p = dir.join("plain");
         fs::write(&p, b"longer old data").unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o640)).unwrap();
-        assert!(!output_is_fresh(&p));
-        let f = create_output(&p, 0o600).unwrap();
-        drop(OutFd::new(&f, false));
+        let (f, fresh) = create_output(&p, 0o600).unwrap();
+        assert!(!fresh);
+        drop(OutFd::new(&f, false, None));
         assert_eq!((fs::read(&p).unwrap().len(), mode(&p)), (0, 0o640));
+        // Nothing there: created, with the requested mode.
+        let (_f, fresh) = create_output(&dir.join("new"), 0o600).unwrap();
+        assert!(fresh);
+        assert_eq!(mode(&dir.join("new")), 0o600);
         let _ = fs::remove_dir_all(&dir);
     }
 

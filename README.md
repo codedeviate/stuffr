@@ -1625,8 +1625,8 @@ included.
   `y`) replaces the link with a fresh file and leaves its target alone. An
   output that takes the input's mode is created 0600 and given the mode,
   owner and time through its descriptor at the end (a failed run's output
-  gets lz4's 0666 less the umask then), so a private input is never
-  readable through its output while it is written.
+  gets lz4's 0666 less the umask, intersected with the input's permission
+  bits), so a private input is never readable through its output.
 
 **Known differences, pure tier only** (without `lz4-c`):
 
@@ -1787,8 +1787,10 @@ the output.
   (`already exists`, or the question); `-f` (or `y`) replaces the link with
   a fresh file and leaves its target alone. A new output is created 0600
   and given the input's mode, owner, times and flags through its
-  descriptor at the end (Apple sets them by name), so a private input is
-  never readable through its output while it is written.
+  descriptor at the end (Apple sets them by name; a run that ends first
+  leaves Apple's 0666 less the umask intersected with the input's
+  permission bits), so a private input is never readable through its
+  output.
 - **Smaller points.** The overwrite question's answer is judged by the C
   locale (`y` or `Y`); undefined behaviour (a table chain longer than 65536
   entries, an encoder writing past its buffer after a failed write) is not
@@ -2155,8 +2157,9 @@ The exit codes are 0 and 1 only, and the first failing file ends the run.
     there, dangling or not, is followed and the file it names created or
     truncated. stuffr replaces the link with a fresh file and leaves its
     target alone; without `-f` both refuse it. The input's attributes are
-    copied by name after the close, as the reference copies them, but only
-    onto the file this run opened.
+    copied after the close, as the reference copies them, but through the
+    output reopened without following a link and only when it is still the
+    file this run opened.
 
 ### Roadmap
 

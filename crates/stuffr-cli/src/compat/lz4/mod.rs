@@ -113,7 +113,9 @@
 //!     (a frame from a regular file) is created 0600 and given that mode,
 //!     owner and time through its own descriptor at the end, where lz4
 //!     creates it 0666 less the umask and sets them by name; one whose run
-//!     fails before that is given lz4's 0666 less the umask then. Why: a
+//!     fails before that is given lz4's 0666 less the umask intersected
+//!     with the input's permission bits (lz4's mode for an ordinary 0644
+//!     input; a private input's partial output stays private). Why: a
 //!     planted link must not redirect a write, and a private input must not
 //!     sit readable while it is written.
 
