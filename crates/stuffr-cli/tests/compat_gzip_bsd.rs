@@ -1382,6 +1382,12 @@ mod differential {
         let p_insane = b"\x1f\x1e\x00\x00\x00\x08\x1a".to_vec();
         let p_table = [&b"\x1f\x1e\x00\x00\x00\x08\x02\xff\xff"[..], &[0; 600]].concat();
         let p_junk = [p.clone(), b"junk".to_vec()].concat();
+        // An incomplete tree (two leaves at level 3 only): the header
+        // passes and the bitstream's first code runs past the last level,
+        // `PackReader`'s "File corrupt" from inside `read` (an
+        // `io::Error::other`), which must reach Apple's own message and
+        // exit 2, never stuffr's exit 1.
+        let p_corrupt = b"\x1f\x1e\x00\x00\x00\x04\x03\x00\x00\x00A\xff\xff".to_vec();
         let old = member(Member {
             magic2: 0x9e,
             name: Some(b"old"),
@@ -1437,6 +1443,7 @@ mod differential {
             ("insane.z", p_insane),
             ("table.z", p_table),
             ("junk.z", p_junk),
+            ("corrupt.z", p_corrupt),
             ("old.gz", old.clone()),
             ("gzZ.gz", gz_then(&z)),
             ("gzp.gz", gz_then(&p)),
@@ -1505,6 +1512,7 @@ mod differential {
             (&["-d", "-S", ".z"], "p.z"),
             (&["-d", "-S", ".z"], "cut.z"),
             (&["-d", "-S", ".z"], "levels.z"),
+            (&["-d", "-S", ".z"], "corrupt.z"),
             (&["-d"], "old.gz"),
             (&["-dN"], "old.gz"),
             (&["-d"], "gzZ.gz"),

@@ -1475,6 +1475,10 @@ mod differential {
         let p_many = b"\x1f\x1e\x00\x00\x00\x01\x02\x01\x01ABC\x00".to_vec();
         let p_levels = b"\x1f\x1e\x00\x00\x00\x01\x1a".to_vec();
         let p_junk = [p.clone(), b"junk".to_vec()].concat();
+        // An incomplete tree (two leaves at level 3 only): GNU refuses it
+        // in the header, the BSD flavour in the bitstream (PARSE-4's
+        // "For COMPAT" check); either way the family's own exit.
+        let p_corrupt = b"\x1f\x1e\x00\x00\x00\x04\x03\x00\x00\x00A\xff\xff".to_vec();
         let p_two = [p.clone(), pack(b"again\n")].concat();
         let stored = zip1(&t, 0, 0);
         let deflated = zip1(&t, 8, 0);
@@ -1518,6 +1522,7 @@ mod differential {
             ("many.z", p_many),
             ("levels.z", p_levels),
             ("junk.z", p_junk),
+            ("corrupt.z", p_corrupt),
             ("two.z", p_two),
             ("stored.zip", stored),
             ("deflated.zip", deflated),
@@ -1574,6 +1579,7 @@ mod differential {
             (&["-d"], "flags.Z"),
             (&["-d"], "p.z"),
             (&["-d"], "long.z"),
+            (&["-d"], "corrupt.z"),
             (&["-d", "-S", ".zip"], "deflated.zip"),
             (&["-dv", "-S", ".zip"], "two.zip"),
             (&["-d", "-S", ".zip"], "enc.zip"),
