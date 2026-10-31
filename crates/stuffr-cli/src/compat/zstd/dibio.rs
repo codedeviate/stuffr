@@ -40,7 +40,7 @@ use super::display::Display;
 use super::fileio::{Fio, Thrown};
 use super::messages::{self as m, printf};
 use super::util::{self, FILESIZE_UNKNOWN};
-use crate::compat::host::{Host, strerror};
+use crate::compat::host::{self, Host, strerror};
 
 /// dibio.c: `SAMPLESIZE_MAX`.
 const SAMPLESIZE_MAX: i64 = 128 << 10;
@@ -272,9 +272,26 @@ fn load_files(
     Ok(l)
 }
 
-/// dibio.c: `DiB_saveDict`.
-fn save_dict(host: &Host, name: &[u8], dict: &[u8], err: &mut dyn Write) -> Fio<()> {
-    let Ok(f) = File::create(host.path(name)) else {
+/// dibio.c: `DiB_saveDict`. As zstd does, an existing regular file is
+/// overwritten without `-f`. Deviation 8 (hardening): a symlink at the
+/// name, live or dangling, is never followed: without `-f` the open fails
+/// (`O_NOFOLLOW`, "cannot open", exit 3), with `-f` the link is replaced by
+/// a fresh file, its target untouched.
+fn save_dict(host: &Host, name: &[u8], dict: &[u8], force: bool, err: &mut dyn Write) -> Fio<()> {
+    let path = host.path(name);
+    let opened = if force {
+        host::create_output(&path, 0o666)
+    } else {
+        let mut o = File::options();
+        o.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.custom_flags(libc::O_NOFOLLOW);
+        }
+        o.open(&path)
+    };
+    let Ok(f) = opened else {
         return Err(exm(err, 3, m::DIB_CANNOT_OPEN, &[name]));
     };
     let mut w = host.out_writer(Some(f));
@@ -471,7 +488,7 @@ pub(crate) fn train_files(cmd: &Command, host: &mut Host, err: &mut dyn Write) -
     }
     let size = (trained.dict.len() as u32).to_string();
     d.at(2, err, m::DIB_SAVE, &[size.as_bytes(), out_name]);
-    save_dict(host, out_name, &trained.dict, err)?;
+    save_dict(host, out_name, &trained.dict, cmd.prefs.overwrite, err)?;
     Ok(0)
 }
 

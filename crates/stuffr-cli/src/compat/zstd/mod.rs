@@ -118,6 +118,22 @@
 //! from files, to standard output and from standard input). Without `lz4-c`
 //! the pure tier's `--format=lz4` is compatible: `lz4_flex`'s block
 //! compressor at every level, inside the same frame descriptor.
+//!
+//! 8. Hardening (ruling T5 of the 2026-10-31 security audit): a symlink at
+//!    an output name is never written through. zstd checks for an existing
+//!    output with `stat`, so a dangling symlink looks absent and is opened
+//!    `fopen(.., "wb")` through, creating the file it names, and a link to
+//!    a device or a directory is opened in place; `--train` writes its
+//!    dictionary with `fopen` whatever is there. stuffr checks with
+//!    `lstat`: a symlink, dangling or not, is an existing file (`already
+//!    exists; not overwritten`, or the question); overwriting it (`-f`, or
+//!    `y`) unlinks the link and writes a fresh file, its target untouched;
+//!    an output written in place is opened `O_NOFOLLOW`, and its times are
+//!    set with `AT_SYMLINK_NOFOLLOW` (on Apple's platforms too, whole
+//!    seconds as zstd's `utime`). `--train` still overwrites a regular
+//!    file without `-f`, as zstd does, but refuses a symlink at the
+//!    dictionary's name (`cannot open`, exit 3) unless `-f`, which replaces
+//!    the link. Why: a planted link must not redirect a write.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};

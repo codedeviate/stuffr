@@ -4242,4 +4242,108 @@ mod unix {
         // so any beyond the first depends on timing: normalise them alike.
         check_with("progress_decompressing", &cases, throttled_refreshes);
     }
+
+    // ---- deviation 8: a symlink at an output name (stuffr only) ----
+
+    fn out_links_to_target(d: &Path) {
+        fs::write(d.join("target"), b"old target").unwrap();
+        std::os::unix::fs::symlink("target", d.join("o")).unwrap();
+    }
+    fn out_dangles(d: &Path) {
+        std::os::unix::fs::symlink("nowhere", d.join("o")).unwrap();
+    }
+
+    /// Deviation 8: a symlink at the output name, live or dangling, is an
+    /// existing file: refused without `-f`, nothing written through it;
+    /// with `-f` the link is replaced by a regular file and its target is
+    /// untouched. The reference follows the link, so this is stuffr alone;
+    /// the frame to decode is stuffr's own.
+    #[test]
+    fn a_symlink_at_the_output_name_is_never_written_through() {
+        let made = stuffr_as(&with_files("zstd", &["-q", "a"], vec![("a", text())]));
+        assert_eq!(made.code, 0, "{}", made.stderr);
+        let frame = made.tree["a.zst"].0.clone();
+        for (setup, live) in [
+            (out_links_to_target as fn(&Path), true),
+            (out_dangles, false),
+        ] {
+            for (args, input, decoding) in [
+                (&["a", "-o", "o"][..], ("a", text()), false),
+                (&["-d", "a.zst", "-o", "o"], ("a.zst", frame.clone()), true),
+                (&["a", "b", "-o", "o"], ("a", text()), false),
+            ] {
+                let mut files = vec![input.clone()];
+                if args.contains(&"b") {
+                    files.push(("b", text()));
+                }
+                let what = format!("{args:?}, live {live}");
+                let c = with_setup(with_files("zstd", args, files.clone()), setup);
+                let s = stuffr_as(&c);
+                assert_ne!(s.code, 0, "{what}: {}", s.stderr);
+                let link = if live { &b"target"[..] } else { b"nowhere" };
+                assert_eq!(s.tree["o"].0, link, "{what}: the link was replaced");
+                if live {
+                    assert_eq!(s.tree["target"].0, b"old target", "{what}");
+                } else {
+                    assert!(!s.tree.contains_key("nowhere"), "{what}: created");
+                }
+
+                let mut forced = vec!["-f"];
+                forced.extend_from_slice(args);
+                let c = with_setup(with_files("zstd", &forced, files), setup);
+                let s = stuffr_as(&c);
+                assert_eq!(s.code, 0, "-f {what}: {}", s.stderr);
+                let o = &s.tree["o"].0;
+                if decoding {
+                    assert_eq!(o, &text(), "-f {what}");
+                } else {
+                    assert!(o.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]), "-f {what}");
+                }
+                if live {
+                    assert_eq!(s.tree["target"].0, b"old target", "-f {what}");
+                } else {
+                    assert!(!s.tree.contains_key("nowhere"), "-f {what}: created");
+                }
+            }
+        }
+    }
+
+    /// Deviation 8: `--train` refuses a symlink at the dictionary's name
+    /// without `-f` (`cannot open`, exit 3) and replaces the link with
+    /// `-f`; a regular file there is overwritten as zstd overwrites it.
+    #[cfg(feature = "zstd-c")]
+    #[test]
+    fn train_never_writes_its_dictionary_through_a_symlink() {
+        for (setup, live) in [
+            (out_links_to_target as fn(&Path), true),
+            (out_dangles, false),
+        ] {
+            let what = format!("live {live}");
+            let s = stuffr_as(&with_setup(training(&["--train", "-q", "-o", "o"]), setup));
+            assert_eq!(s.code, 3, "{what}: {}", s.stderr);
+            assert!(s.stderr.contains("cannot open o"), "{what}: {}", s.stderr);
+            let link = if live { &b"target"[..] } else { b"nowhere" };
+            assert_eq!(s.tree["o"].0, link, "{what}");
+            let s = stuffr_as(&with_setup(
+                training(&["--train", "-q", "-f", "-o", "o"]),
+                setup,
+            ));
+            assert_eq!(s.code, 0, "-f {what}: {}", s.stderr);
+            assert!(
+                s.tree["o"].0.starts_with(&[0x37, 0xa4, 0x30, 0xec]),
+                "-f {what}"
+            );
+            if live {
+                assert_eq!(s.tree["target"].0, b"old target", "-f {what}");
+            } else {
+                assert!(!s.tree.contains_key("nowhere"), "-f {what}");
+            }
+        }
+        // A regular file is overwritten without -f, as zstd does.
+        let mut c = training(&["--train", "-q", "-o", "o"]);
+        c.files.push(("o", b"old".to_vec()));
+        let s = stuffr_as(&c);
+        assert_eq!(s.code, 0, "{}", s.stderr);
+        assert!(s.tree["o"].0.starts_with(&[0x37, 0xa4, 0x30, 0xec]));
+    }
 }

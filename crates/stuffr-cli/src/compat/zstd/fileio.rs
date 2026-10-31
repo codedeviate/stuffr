@@ -809,6 +809,11 @@ impl<'a> Io<'a> {
             return Ok(false);
         }
         let is_reg = util::is_regular_file(self.host, dst);
+        // Deviation 8 (hardening): a symlink at the name, live or
+        // dangling, is an existing file, and is replaced, never followed.
+        let is_link =
+            fs::symlink_metadata(self.host.path(dst)).is_ok_and(|m| m.file_type().is_symlink());
+        let is_reg = is_reg || is_link;
         if self.prefs.sparse == 1 {
             self.prefs.sparse = super::cli::SPARSE_DEFAULT;
             if !is_reg {
@@ -817,7 +822,7 @@ impl<'a> Io<'a> {
             }
         }
         if is_reg {
-            if cfg!(not(windows)) && dst == NULMARK {
+            if cfg!(not(windows)) && dst == NULMARK && !is_link {
                 return Err(self.exm(40, m::NUL_IS_REGULAR, &[dst]));
             }
             if !self.prefs.overwrite {
@@ -830,7 +835,15 @@ impl<'a> Io<'a> {
                     return Ok(false);
                 }
             }
-            let _ = self.remove_file(dst);
+            if is_link {
+                // The link itself goes; its target is never touched.
+                if let Err(e) = fs::remove_file(self.host.path(dst)) {
+                    self.say(1, m::OPEN_DST_FAILED, &[dst, &strerror(&e)]);
+                    return Ok(false);
+                }
+            } else {
+                let _ = self.remove_file(dst);
+            }
         }
         let path = self.host.path(dst);
         let sandboxed = matches!(self.host, Host::Sandbox(_));
@@ -847,6 +860,8 @@ impl<'a> Io<'a> {
             {
                 use std::os::unix::fs::OpenOptionsExt;
                 o.mode(if transfer { 0o600 } else { 0o666 });
+                // Deviation 8: never through a symlink at the name.
+                o.custom_flags(libc::O_NOFOLLOW);
             }
             match o.open(&path) {
                 Ok(f) => (f, None, None),
@@ -1135,7 +1150,10 @@ fn set_fd_stat(file: &File, meta: &Metadata) {
 /// `PLATFORM_POSIX_VERSION` is 200809L (Linux, the BSDs), util.c uses
 /// `utimensat` with `UTIME_NOW` and `st_mtim`; on Apple's platforms
 /// (200112L) `utime`, whole seconds: `time(NULL)` and `st_mtime`. Failures
-/// are ignored, as zstd ignores them.
+/// are ignored, as zstd ignores them. Deviation (hardening, ruling T5): the
+/// times are set with `utimensat(.., AT_SYMLINK_NOFOLLOW)` on every unix,
+/// Apple's whole seconds included, so a symlink planted at the name after
+/// the output was written is never followed.
 fn set_times(path: &Path, meta: &Metadata) {
     #[cfg(unix)]
     {
@@ -1146,14 +1164,27 @@ fn set_times(path: &Path, meta: &Metadata) {
         };
         #[cfg(target_vendor = "apple")]
         {
-            let buf = libc::utimbuf {
-                // SAFETY: time with a null pointer only returns the time.
-                actime: unsafe { libc::time(std::ptr::null_mut()) },
-                modtime: meta.mtime() as libc::time_t,
+            let times = [
+                libc::timespec {
+                    // SAFETY: time with a null pointer only returns the time.
+                    tv_sec: unsafe { libc::time(std::ptr::null_mut()) },
+                    tv_nsec: 0,
+                },
+                libc::timespec {
+                    tv_sec: meta.mtime() as libc::time_t,
+                    tv_nsec: 0,
+                },
+            ];
+            // SAFETY: `c` is a NUL-terminated path and `times` two valid
+            // timespecs; utimensat only reads them.
+            unsafe {
+                libc::utimensat(
+                    libc::AT_FDCWD,
+                    c.as_ptr(),
+                    times.as_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
             };
-            // SAFETY: `c` is a NUL-terminated path and `buf` a valid
-            // utimbuf; utime only reads them.
-            unsafe { libc::utime(c.as_ptr(), &buf) };
         }
         #[cfg(not(target_vendor = "apple"))]
         {
@@ -1169,7 +1200,14 @@ fn set_times(path: &Path, meta: &Metadata) {
             ];
             // SAFETY: `c` is a NUL-terminated path and `times` two valid
             // timespecs; utimensat only reads them.
-            unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
+            unsafe {
+                libc::utimensat(
+                    libc::AT_FDCWD,
+                    c.as_ptr(),
+                    times.as_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
         }
     }
     #[cfg(not(unix))]

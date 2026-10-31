@@ -1474,6 +1474,16 @@ input through, at display level 1) and `zstdmt` compresses with `-T0`.
   layout, in zstd itself too. It is promised valid and usable by zstd, not
   byte for byte. `--train`, `--train-fastcover` and `--train-legacy` write
   zstd's bytes.
+- **A symlink at an output name is never written through** (hardening).
+  zstd checks for an existing output with `stat`, so a dangling symlink
+  looks absent and the write creates the file it names, and `--train`
+  writes its dictionary through whatever is at the name. stuffr treats any
+  symlink there as an existing file (`already exists; not overwritten`, or
+  the question); `-f` (or `y`) replaces the link with a fresh file and
+  leaves its target alone. Outputs written in place are opened
+  `O_NOFOLLOW` and their times set without following a link. `--train`
+  still overwrites a regular file without `-f`, as zstd does, but refuses
+  a symlink there (`cannot open`, exit 3) unless `-f`.
 
 **Known differences, pure tier only** (`zstd-pure` without `zstd-c`):
 
