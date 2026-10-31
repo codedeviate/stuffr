@@ -2495,3 +2495,31 @@ pub(crate) const EMPTY_XZ: &[u8] = &[
     0xfd, 0x37, 0x7a, 0x58, 0x5a, 0, 0, 0x04, 0xe6, 0xd6, 0xb4, 0x46, 0, 0, 0, 0, 0x1c, 0xdf, 0x44,
     0x21, 0x1f, 0xb6, 0xf3, 0x7d, 0x01, 0, 0, 0, 0, 0x04, 0x59, 0x5a,
 ];
+
+/// A whole Stored zip holding `entries` in order: local records, a central
+/// directory naming each, and the end record. For tests that need an
+/// archive whose entry names they choose freely (nested ones included).
+pub(crate) fn stored_zip_of(entries: &[(&'static str, &'static [u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut records = Vec::new();
+    for (name, payload) in entries {
+        let rec = salvage_fixture_local_record(u32::try_from(out.len()).unwrap(), name, payload);
+        out.extend_from_slice(&rec.bytes);
+        records.push(rec);
+    }
+    let cd_start = u32::try_from(out.len()).unwrap();
+    for rec in &records {
+        out.extend_from_slice(&salvage_fixture_central_record(rec));
+    }
+    let cd_size = u32::try_from(out.len()).unwrap() - cd_start;
+    let count = u16::try_from(records.len()).unwrap();
+    out.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06]);
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&cd_size.to_le_bytes());
+    out.extend_from_slice(&cd_start.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}

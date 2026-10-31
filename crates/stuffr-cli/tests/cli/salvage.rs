@@ -820,3 +820,131 @@ fn salvage_output_suffixes_a_partial_entry() {
         b"this payload's crc field below is wrong on purpose"
     );
 }
+
+/// Security audit EXTRACT-1 (a): `salvage -C` has no `--force`, and it used
+/// to replace whatever the destination already held under an entry's name —
+/// a hostile archive salvaged into a home directory replaced `.bashrc` and
+/// `.ssh/authorized_keys` (0600 became 0644) at exit 0. A file this run did
+/// not write is never removed or overwritten now: the recovered copy lands
+/// beside it as `NAME.salvaged-N`, and the run exits 4.
+#[cfg(unix)]
+#[test]
+fn salvage_never_replaces_a_file_the_destination_already_held() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp_dir();
+    let archive = dir.join("hostile.zip");
+    std::fs::write(
+        &archive,
+        stored_zip_of(&[
+            ("a.txt", b"attacker a\n"),
+            (".ssh/authorized_keys", b"ssh-ed25519 ATTACKER\n"),
+            ("fresh.txt", b"nothing was here\n"),
+        ]),
+    )
+    .unwrap();
+    let dest = dir.join("home");
+    std::fs::create_dir_all(dest.join(".ssh")).unwrap();
+    std::fs::write(dest.join("a.txt"), b"mine\n").unwrap();
+    let keys = dest.join(".ssh/authorized_keys");
+    std::fs::write(&keys, b"ssh-ed25519 MINE\n").unwrap();
+    std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let out = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(4), "stderr: {stderr}");
+
+    assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"mine\n");
+    assert_eq!(std::fs::read(&keys).unwrap(), b"ssh-ed25519 MINE\n");
+    assert_eq!(
+        std::fs::metadata(&keys).unwrap().permissions().mode() & 0o7777,
+        0o600,
+        "the pre-existing file's mode must not change"
+    );
+    assert_eq!(
+        std::fs::read(dest.join("a.txt.salvaged-0")).unwrap(),
+        b"attacker a\n"
+    );
+    assert_eq!(
+        std::fs::read(dest.join(".ssh/authorized_keys.salvaged-1")).unwrap(),
+        b"ssh-ed25519 ATTACKER\n"
+    );
+    assert_eq!(
+        std::fs::read(dest.join("fresh.txt")).unwrap(),
+        b"nothing was here\n",
+        "an entry whose name was free still lands under it"
+    );
+    assert!(
+        stderr.contains("2 renamed"),
+        "the summary must count both renames: {stderr}"
+    );
+    assert!(
+        stderr.contains("a.txt.salvaged-0") && stderr.contains("authorized_keys.salvaged-1"),
+        "stderr must name where each recovered copy went: {stderr}"
+    );
+}
+
+/// Security audit EXTRACT-1 (b): an entry carrying the archive's own name,
+/// salvaged into the archive's own directory, used to unlink the archive;
+/// every later entry then failed to re-read it and the run left the
+/// directory empty. The archive is byte-identical afterwards now, and the
+/// other entries are recovered.
+#[test]
+fn salvage_never_replaces_the_archive_it_is_reading() {
+    let dir = tmp_dir();
+    let work = dir.join("w");
+    std::fs::create_dir_all(&work).unwrap();
+    let archive = work.join("damaged.zip");
+    const LATER: &[u8] = &[b'x'; 1100];
+    let bytes = stored_zip_of(&[("damaged.zip", b"gone"), ("later.txt", LATER)]);
+    std::fs::write(&archive, &bytes).unwrap();
+
+    let out = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "-C",
+        work.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(4), "stderr: {stderr}");
+    assert_eq!(
+        std::fs::read(&archive).unwrap(),
+        bytes,
+        "the archive must survive"
+    );
+    assert_eq!(
+        std::fs::read(work.join("damaged.zip.salvaged-0")).unwrap(),
+        b"gone"
+    );
+    assert_eq!(std::fs::read(work.join("later.txt")).unwrap(), LATER);
+}
+
+/// Security audit EXTRACT-1, the `-o` half: `-o FILE` replaces an existing
+/// FILE (the caller named it), but never the archive being salvaged.
+#[test]
+fn salvage_output_refuses_to_name_the_archive_it_is_reading() {
+    let dir = tmp_dir();
+    let archive = dir.join("a.zip");
+    let bytes = stored_zip_of(&[("x.txt", b"recovered")]);
+    std::fs::write(&archive, &bytes).unwrap();
+
+    let out = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "--index",
+        "0",
+        "-o",
+        archive.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(&archive).unwrap(), bytes);
+}

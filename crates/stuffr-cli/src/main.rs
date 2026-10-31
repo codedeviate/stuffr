@@ -1023,6 +1023,15 @@ fn describe_salvage_row(record: &entries::SalvagedRecord) -> String {
     ) {
         line.push_str(" [not written: --strict demands proof this format cannot give]");
     }
+    // Security audit EXTRACT-1: the name was free of every record in this
+    // run, and the destination held it already — the row says so, since the
+    // `[name collision]` tag above is about the archive and cannot.
+    if matches!(
+        record.disposition,
+        entries::SalvageDisposition::WrittenDisambiguated { taken_by: None, .. }
+    ) {
+        line.push_str(" [the destination already held this name; it was left alone]");
+    }
     // The path actually written, named only when it is NOT the entry's own
     // name — a row a user reads to find their file must say where it went.
     if let entries::SalvageDisposition::WrittenDisambiguated { path, .. } = &record.disposition {
@@ -1174,6 +1183,75 @@ fn print_salvage_write_failures(entries: &[entries::SalvagedRecord]) {
     }
 }
 
+/// Names every record written BESIDE something the destination already
+/// held (security audit EXTRACT-1), on stderr every run: salvage never
+/// removes or overwrites a file it did not write in this run, so the
+/// recovered copy went to `NAME.salvaged-N`, and a user who finds their own
+/// file unchanged needs to be told where the recovered one is. Same shape
+/// as [`print_salvage_write_failures`]: a count, up to ten lines, the rest
+/// elided. The run exits 4 (a rename), which the summary counts too.
+fn print_salvage_kept_beside_existing(entries: &[entries::SalvagedRecord]) {
+    let kept: Vec<(&entries::SalvagedRecord, &Path)> = entries
+        .iter()
+        .filter_map(|r| match &r.disposition {
+            entries::SalvageDisposition::WrittenDisambiguated {
+                taken_by: None,
+                path,
+                ..
+            } => Some((r, path.as_path())),
+            _ => None,
+        })
+        .collect();
+    if kept.is_empty() {
+        return;
+    }
+    const SHOWN: usize = 10;
+    eprintln!(
+        "salvage -> {} entr{} written beside a file the destination already held, \
+         which salvage never replaces:",
+        kept.len(),
+        if kept.len() == 1 { "y" } else { "ies" },
+    );
+    for (record, path) in kept.iter().take(SHOWN) {
+        eprintln!(
+            "  - #{} {} -> {}",
+            record.scan_position,
+            stuffr::fmt_name(&record.name),
+            stuffr::fmt_name(&path.to_string_lossy())
+        );
+    }
+    if let Some(rest) = kept.len().checked_sub(SHOWN).filter(|n| *n > 0) {
+        eprintln!("  … and {rest} more");
+    }
+}
+
+/// Whether `candidate` exists and is the file `archive` names: `(dev, ino)`
+/// on unix, canonical paths elsewhere. A symlink at `candidate` is its own
+/// file (replacing it leaves the archive alone).
+fn is_same_existing_file(candidate: &Path, archive: &Path) -> bool {
+    let Ok(md) = std::fs::symlink_metadata(candidate) else {
+        return false;
+    };
+    if md.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(archive).is_ok_and(|a| a.dev() == md.dev() && a.ino() == md.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        match (
+            std::fs::canonicalize(candidate),
+            std::fs::canonicalize(archive),
+        ) {
+            (Ok(c), Ok(a)) => c == a,
+            _ => false,
+        }
+    }
+}
+
 /// The default (non-`--list`) report: counts only, to stderr — the same
 /// destination `unpack`'s and `test`'s own summary lines use. Takes whatever
 /// slice the caller passes — [`dispatch_salvage`] narrows it to `--index`'s
@@ -1267,8 +1345,8 @@ fn salvage_summary_lines(entries: &[entries::SalvagedRecord]) -> Vec<String> {
     let mut lines = vec![format!(
         "salvage -> {} scanned: {written} written, {partial} written as .partial, {skipped} \
          skipped, {unverified} unverified, {not_selected} not selected, {not_written} not \
-         written (no destination), {renamed} renamed to avoid a name collision, {unattested} \
-         unattested",
+         written (no destination), {renamed} renamed to avoid a name collision or an existing \
+         file, {unattested} unattested",
         entries.len()
     )];
     if unattested > 0 {
@@ -1367,6 +1445,7 @@ fn finish_single_file_recovery(
     outcome: &entries::SalvageOutcome,
     scan_position: usize,
     output_path: &Path,
+    archive: &Path,
 ) -> stuffr::Result<()> {
     let record = outcome
         .entries
@@ -1431,9 +1510,17 @@ fn finish_single_file_recovery(
     {
         std::fs::create_dir_all(parent)?;
     }
-    // No `--force` concept exists for salvage, same as `-C`'s own write path:
-    // recovery is meant to be re-run, and a stale file from a previous
-    // attempt must not block this one.
+    // `-o FILE` names the output explicitly, so an existing FILE is
+    // replaced (unlike `-C`, which never replaces what it did not write) —
+    // but never when FILE is the archive being read (security audit
+    // EXTRACT-1): that is a usage error, and the archive is left alone.
+    if is_same_existing_file(&final_path, archive) {
+        let _ = std::fs::remove_file(&from);
+        return Err(stuffr::Error::Usage(format!(
+            "{} is the archive being salvaged; choose another output name",
+            final_path.display()
+        )));
+    }
     let _ = std::fs::remove_file(&final_path);
     if std::fs::rename(&from, &final_path).is_err() {
         // `from` lives in a temp directory that may sit on a different
@@ -1633,6 +1720,7 @@ fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
     // invocation, not only under `--list`. See `print_salvage_write_failures` for what a missing
     // stderr line measured before this existed.
     print_salvage_write_failures(&outcome.entries);
+    print_salvage_kept_beside_existing(&outcome.entries);
 
     // `--list` always reports the FULL scan, `--index` included — narrowing
     // WHAT IS WRITTEN must never narrow what a diagnostic listing shows.
@@ -1641,7 +1729,7 @@ fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
     }
 
     if let Some(output_path) = &output {
-        finish_single_file_recovery(&outcome, index[0], Path::new(output_path))?;
+        finish_single_file_recovery(&outcome, index[0], Path::new(output_path), &path)?;
     } else if !list {
         // The default summary — like the exit code below — reports on what
         // the CALLER asked about: the whole scan when no `--index` was

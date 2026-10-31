@@ -1123,3 +1123,54 @@ fn an_entry_written_through_a_symlinked_path_component_is_refused() {
         "the entry escaped the destination through a symlinked path component"
     );
 }
+
+/// Security audit EXTRACT-8: `unpack --force` of an archive holding an
+/// entry with the archive's own name, into the archive's own directory,
+/// used to unlink the archive to make room. The entry is refused now and
+/// the archive is left intact. The refusal is a fidelity warning like every
+/// other entry `unpack` skips: exit 0, and 4 under `--strict-fidelity`.
+#[test]
+fn unpack_force_never_replaces_the_archive_it_is_reading() {
+    let dir = tmp_dir();
+    let work = dir.join("w");
+    std::fs::create_dir_all(&work).unwrap();
+    let archive = work.join("self.zip");
+    let bytes = stored_zip_of(&[("self.zip", b"gone"), ("later.txt", b"later")]);
+    std::fs::write(&archive, &bytes).unwrap();
+
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        work.to_str().unwrap(),
+        "--force",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(
+        std::fs::read(&archive).unwrap(),
+        bytes,
+        "the archive must survive"
+    );
+    assert!(
+        stderr.contains("self.zip") && stderr.contains("archive being read"),
+        "the skip must name the entry and why: {stderr}"
+    );
+    assert_eq!(std::fs::read(work.join("later.txt")).unwrap(), b"later");
+
+    let strict = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        work.to_str().unwrap(),
+        "--force",
+        "--strict-fidelity",
+    ]);
+    assert_eq!(
+        strict.status.code(),
+        Some(4),
+        "stderr: {}",
+        String::from_utf8_lossy(&strict.stderr)
+    );
+    assert_eq!(std::fs::read(&archive).unwrap(), bytes);
+}

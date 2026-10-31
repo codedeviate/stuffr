@@ -875,6 +875,8 @@ impl Default for ExtractOpts {
 pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) -> Result<Outcome> {
     refuse_directory_for(&src, "unpack")?;
     // Before `src` is consumed by `open_archive`, which takes it by value.
+    // The archive's identity, for `place`'s never-replace-the-archive rule.
+    let archive_id = src.path().and_then(ArchiveId::of);
     let compressed_total = o.compressed_total.or_else(|| {
         src.path()
             .and_then(|p| std::fs::metadata(p).ok())
@@ -906,8 +908,12 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
     // contradicting archive (a skip) from a destination that already held
     // something (exit 2) with, and what a later hard link resolves against.
     // Only what THIS run wrote: a file already in `dest` is never a link
-    // target.
-    let mut made = MadeByRun::default();
+    // target. It also carries the archive's identity, which is never
+    // removed (security audit EXTRACT-8).
+    let mut made = MadeByRun {
+        archive: archive_id,
+        ..MadeByRun::default()
+    };
 
     matched += visit_selected(ar.as_mut(), selection, |entry| {
         let meta = entry.meta().clone();
@@ -1978,7 +1984,17 @@ pub enum SalvageDisposition {
         /// (`x.partial`, which an earlier partial `x` or an entry literally
         /// named `x.partial` may hold). Always the claimant of that ORIGINAL
         /// name, never of a suffixed candidate stepped past on the way.
-        taken_by: usize,
+        ///
+        /// `None` when no record of this run holds it: the DESTINATION
+        /// already held something there before the run started (a user's
+        /// file, a symlink, the archive being read itself). Salvage has no
+        /// `--force` and never removes or overwrites a file it did not
+        /// write in this run (security audit EXTRACT-1: a hostile archive
+        /// salvaged into a home directory used to replace `.bashrc` and
+        /// `.ssh/authorized_keys`, and an entry carrying the archive's own
+        /// name unlinked the archive mid-run), so the record lands beside
+        /// it instead.
+        taken_by: Option<usize>,
         /// `Some` when this record is ALSO `Partial`, carrying the same
         /// cause [`Self::WrittenPartial`] would. The two facts are
         /// independent — a record can need disambiguating and be truncated —
@@ -2799,17 +2815,18 @@ pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
     // written, mapped to the scan position that claimed it. Salvage is the
     // one verb whose input can legitimately name the same file twice (that
     // is the whole feature), so "already there" has to mean "written by this
-    // run", not "exists on disk" — a stale file from a previous attempt must
-    // still be replaced, which is what `place_entry(.., force: true)` in
-    // `open_salvage_target` is for and why it is NOT what closes this.
-    // "Written by this run" is answered by spelling or by identity: see
-    // [`Claimed`].
+    // run", not "exists on disk". What the destination held before the run
+    // (a previous attempt's output included) is never replaced either: a
+    // record whose name it holds lands beside it as `NAME.salvaged-N`
+    // (security audit EXTRACT-1; see `place_salvaged_file`). "Written by
+    // this run" is answered by spelling or by identity: see [`Claimed`].
     let mut claimed = Claimed::default();
     // What this run made on disk, by path and kind — `place_entry`'s record,
     // shared with `extract`. Separate from `claimed` on purpose: `claimed`
     // decides which NAME a repeated file gets, this decides whether a path
-    // the run already made (a directory, a file) is in the way.
-    let mut made = MadeByRun::default();
+    // the run already made (a directory, a file) is in the way. It also
+    // carries the archive's identity: never replaced (EXTRACT-1).
+    let mut made = MadeByRun::reading(Some(path));
 
     let mut entries = Vec::with_capacity(scan.entries.len());
     for entry in &scan.entries {
@@ -2894,9 +2911,9 @@ fn place_salvaged_entry(
                 // entry's name is as archive-controlled as a file's, and
                 // `mkdir` refuses an over-long component identically.
                 //
-                // `force: false`: salvage's "replace a stale file" licence
-                // is for a FILE's own path. A directory never removes what
-                // is at its path — least of all a file this run recovered.
+                // `force: false`, as for a file (EXTRACT-1): salvage never
+                // removes what is at a path — least of all a file this run
+                // recovered.
                 match place_salvaged(dest, &target, &entry.meta.name, true, made, false) {
                     Ok(()) => {}
                     Err(skipped) => return Ok(skipped),
@@ -3063,7 +3080,7 @@ fn place_salvaged_file(
     // AND, for a partial record, of the `.partial` name it would land on
     // without disambiguating — the second is a path this run may have
     // written too (a partial `x` earlier, or an entry literally named
-    // `x.partial`), and `open_salvage_target` replaces what is there. Each
+    // `x.partial`), and writing there would lose that record. Each
     // is answered by exact spelling or by identity (0.10.2): on a volume
     // that folds case or Unicode normalisation, `readme` IS the `README` an
     // earlier record wrote, and replacing it lost that record's bytes at
@@ -3107,10 +3124,24 @@ fn place_salvaged_file(
     // name, and a run-made directory AT the original name stays `place`'s
     // own archive-made skip, as before.
     let run_made = |base: &Path| made.made(base) || (is_partial && made.made(&as_written(base)));
+    // Security audit EXTRACT-1: what the destination held BEFORE this run
+    // (anything but a directory at the path this record would be written
+    // to, that this run did not make) is never removed or overwritten —
+    // salvage has no `--force`. A user's file, a planted symlink and the
+    // archive being read (`made`'s [`ArchiveId`]) all answer yes here, so
+    // the record is disambiguated around them exactly as around an earlier
+    // record's file. A directory is left to `place`'s own skip, as before.
+    let pre_existing = |base: &Path| {
+        let written = as_written(base);
+        made.is_archive(&written)
+            || (std::fs::symlink_metadata(&written).is_ok_and(|md| !md.is_dir())
+                && !made.made(&written))
+    };
+    let found_existing = taken_by.is_none() && pre_existing(&target);
     let mut base_target = target.clone();
-    if taken_by.is_some() {
+    if taken_by.is_some() || found_existing {
         base_target = disambiguated_path(&base_target, entry.scan_position);
-        while held(&base_target).is_some() || run_made(&base_target) {
+        while held(&base_target).is_some() || run_made(&base_target) || pre_existing(&base_target) {
             base_target = disambiguated_path(&base_target, entry.scan_position);
         }
     }
@@ -3179,7 +3210,7 @@ fn place_salvaged_file(
         )
     });
 
-    if let Some(taken_by) = taken_by {
+    if taken_by.is_some() || found_existing {
         // Disambiguation and partiality are independent facts and both can
         // be true at once, so the one disposition carries both rather than
         // forcing a choice between two variants that are each correct.
@@ -3247,22 +3278,26 @@ fn open_salvage_target(
     name: &str,
     made: &mut MadeByRun,
 ) -> std::result::Result<std::fs::File, SalvageDisposition> {
-    // No `--force` concept exists for salvage (not in this feature's flag
-    // list) and none is needed: recovery is meant to be re-run, and a stale
-    // `.partial` (or a stale real-named file) from a previous attempt must
-    // not block this one. `true` unconditionally, unlike `extract`'s own
-    // `o.force`. `place_entry` is used rather than a bare `File::create`
-    // specifically because it also removes a pre-existing SYMLINK sitting
-    // at the target — `File::create` would instead follow it, landing the
-    // recovered bytes wherever it points.
+    // No `--force` concept exists for salvage, and `force: false` here:
+    // salvage never removes or overwrites anything it did not write in this
+    // run (security audit EXTRACT-1 — this used to pass `true`, so `place`
+    // removed whatever the destination held, a user's `.ssh/authorized_keys`
+    // or the archive being read included). The caller has already stepped
+    // `write_target` past every pre-existing non-directory and every path
+    // this run wrote (`NAME.salvaged-N`), so nothing should be there; if
+    // something appeared since, `place` answers `Held::Exists` and the
+    // entry is skipped. A re-run beside a previous run's output therefore
+    // lands as `NAME.salvaged-N`, never on top of it.
     //
-    // It is deliberately NOT what stops one salvage run overwriting its own
-    // earlier output: "replace what was already on disk" and "two records
-    // in this archive want one name" are different facts, and conflating
-    // them is exactly how eight recovered records became six files at exit
-    // 0. `claimed`, in the caller, is what separates them.
-    place_salvaged(dest, write_target, name, false, made, true)?;
-    let out = match skip_if_name_refused(std::fs::File::create(write_target), name) {
+    // `create_new` (O_CREAT|O_EXCL) rather than `File::create`: it never
+    // follows a symlink planted at the target and never truncates a file
+    // that appeared after the check — the open itself is the refusal.
+    place_salvaged(dest, write_target, name, false, made, false)?;
+    let created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(write_target);
+    let out = match skip_if_name_refused(created, name) {
         Ok(Ok(out)) => out,
         Ok(Err(w)) => return Err(unwritable_skip(w)),
         Err(e) => return Err(unwritable(e)),
@@ -3371,7 +3406,7 @@ fn partial_path(target: &Path) -> PathBuf {
 /// folds: on APFS (case-insensitive by default, and normalisation-
 /// insensitive) a tar holding `README` and `readme` reported "2 written"
 /// at exit 0 and left one file, because `readme` was unclaimed by spelling
-/// and `open_salvage_target` replaces what it finds. So `ids` also maps the
+/// and `open_salvage_target` then replaced what it found. So `ids` also maps the
 /// `(dev, ino)` of every file this run WROTE to the position that wrote
 /// it, and [`holder`](Self::holder) answers by either. `ids` is the
 /// scan-position index for the subset of [`MadeByRun`]'s identities that
@@ -3398,7 +3433,8 @@ impl Claimed {
     /// The earlier scan position holding `path`: claimed by this exact
     /// spelling, or a file this run wrote that the filesystem folds `path`
     /// onto. `None` otherwise — including a stale file a previous run left,
-    /// which is replaced, never disambiguated around.
+    /// which [`place_salvaged_file`] steps around as a pre-existing file
+    /// (EXTRACT-1), not as a claimed one.
     fn holder(&self, path: &Path) -> Option<usize> {
         if let Some(&position) = self.paths.get(path) {
             return Some(position);
@@ -5098,6 +5134,11 @@ fn conflict_reason_directory_in_the_way(name: &str) -> String {
     format!("a directory `{name}` from earlier in this archive is in the way")
 }
 
+/// Why [`place`] skips an entry whose path is the archive being read
+/// (security audit EXTRACT-8).
+const ARCHIVE_IN_THE_WAY_REASON: &str =
+    "its path is the archive being read, which is never replaced";
+
 /// Why an entry whose path the destination filesystem cannot hold
 /// (`ENAMETOOLONG`) is skipped, by `unpack` and by salvage alike.
 const PATH_TOO_LONG_REASON: &str = "its path is too long for this filesystem";
@@ -5527,6 +5568,50 @@ struct MadeByRun {
     /// links are never inserted (they are never candidates). A `BTreeSet`
     /// keeps the answer deterministic.
     spelled: HashMap<(u64, u64, PathBuf, String), std::collections::BTreeSet<PathBuf>>,
+    /// The archive this run is reading, when it is a file: never removed or
+    /// replaced by [`place`] (security audit EXTRACT-1/EXTRACT-8). Not
+    /// something the run made; it rides here because `made` is the one
+    /// record every placement already consults.
+    archive: Option<ArchiveId>,
+}
+
+/// The archive being read, as [`place`] and salvage compare it against a
+/// target: its `(dev, ino)` on unix, its canonical path elsewhere (or when
+/// identity could not be read). The compat unzip port's `same_as_archive`
+/// (T10-7) asks the same question.
+struct ArchiveId {
+    id: Option<(u64, u64)>,
+    canonical: Option<PathBuf>,
+}
+
+impl ArchiveId {
+    /// `path`'s identity, following a symlink (the archive is what it
+    /// points at). `None` when it cannot be read at all.
+    fn of(path: &Path) -> Option<Self> {
+        #[cfg(unix)]
+        let id = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(path).ok().map(|md| (md.dev(), md.ino()))
+        };
+        #[cfg(not(unix))]
+        let id = None;
+        let canonical = std::fs::canonicalize(path).ok();
+        (id.is_some() || canonical.is_some()).then_some(ArchiveId { id, canonical })
+    }
+
+    /// Whether the directory entry at `target` is the archive. Compared by
+    /// identity without following a symlink at `target` (removing a link to
+    /// the archive harms nothing); by canonical path only when no identity
+    /// is available.
+    fn is(&self, target: &Path) -> bool {
+        if let Some(id) = self.id {
+            return identity(target) == Some(id);
+        }
+        self.canonical.as_ref().is_some_and(|archive| {
+            std::fs::symlink_metadata(target).is_ok_and(|md| !md.file_type().is_symlink())
+                && std::fs::canonicalize(target).is_ok_and(|t| &t == archive)
+        })
+    }
 }
 
 /// The base letter of a Latin-1 letter that has a canonical decomposition
@@ -5589,6 +5674,20 @@ fn identity(path: &Path) -> Option<(u64, u64)> {
 }
 
 impl MadeByRun {
+    /// A record for a run reading the archive at `archive` (`None` for a
+    /// stream with no path): [`place`] never removes it.
+    fn reading(archive: Option<&Path>) -> Self {
+        MadeByRun {
+            archive: archive.and_then(ArchiveId::of),
+            ..MadeByRun::default()
+        }
+    }
+
+    /// Whether `path` is the archive this run is reading.
+    fn is_archive(&self, path: &Path) -> bool {
+        self.archive.as_ref().is_some_and(|a| a.is(path))
+    }
+
     /// An explicit entry `name`, written at `path`.
     fn record(&mut self, name: &str, path: &Path, kind: MadeKind) {
         self.names.insert(name.to_string(), path.to_path_buf());
@@ -5884,6 +5983,16 @@ fn place(
                 }
             }
             Ok(_) => {
+                // Security audit EXTRACT-8: the archive being read is never
+                // removed to make room for one of its own entries, with or
+                // without `--force` — a skip naming why, not a usage error,
+                // since `--force` would not help.
+                if made.is_archive(target) {
+                    return Ok(Placed::Skip(Fidelity::EntrySkipped {
+                        entry: name.to_string(),
+                        reason: ARCHIVE_IN_THE_WAY_REASON.to_string(),
+                    }));
+                }
                 if !force {
                     return Ok(Placed::Held(Held::Exists(target.to_path_buf())));
                 }
@@ -8649,7 +8758,7 @@ mod salvage_tests {
                     record(SalvageDisposition::Written(PathBuf::from("a"))),
                     record(SalvageDisposition::WrittenDisambiguated {
                         path: PathBuf::from("a.salvaged-1"),
-                        taken_by: 0,
+                        taken_by: Some(0),
                         partial: None,
                     }),
                 ],

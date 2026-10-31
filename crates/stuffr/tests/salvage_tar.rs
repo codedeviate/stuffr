@@ -395,7 +395,7 @@ fn a_run_made_directory_at_the_disambiguated_name_is_stepped_past() {
         two.disposition,
         SalvageDisposition::WrittenDisambiguated {
             path: landed.clone(),
-            taken_by: one.scan_position,
+            taken_by: Some(one.scan_position),
             partial: None,
         }
     );
@@ -486,7 +486,7 @@ fn assert_a_folded_pair_both_survive(scratch: &Scratch, first: &str, second: &st
         two.disposition,
         SalvageDisposition::WrittenDisambiguated {
             path: disambiguated.clone(),
-            taken_by: one.scan_position,
+            taken_by: Some(one.scan_position),
             partial: None,
         },
         "the second spelling folds onto the first: it is claimed, by identity"
@@ -578,7 +578,7 @@ fn a_case_pair_with_a_partial_second_survives() {
         two.disposition,
         SalvageDisposition::WrittenDisambiguated {
             path: landed.clone(),
-            taken_by: one.scan_position,
+            taken_by: Some(one.scan_position),
             partial: Some(PartialCause::Truncated),
         }
     );
@@ -639,7 +639,7 @@ fn a_partial_whose_partial_name_folds_onto_a_written_file_survives() {
         two.disposition,
         SalvageDisposition::WrittenDisambiguated {
             path: landed.clone(),
-            taken_by: one.scan_position,
+            taken_by: Some(one.scan_position),
             partial: Some(PartialCause::Truncated),
         }
     );
@@ -772,7 +772,7 @@ const CUT_KEEP: usize = 100;
 /// name.
 struct Landed<'a> {
     index: usize,
-    taken_by: usize,
+    taken_by: Option<usize>,
     path: &'a str,
     partial: Option<PartialCause>,
     bytes: &'a [u8],
@@ -821,7 +821,7 @@ fn a_disambiguated_name_never_replaces_a_literal_entry_of_that_name() {
         &outcome,
         Landed {
             index: 2,
-            taken_by: 1,
+            taken_by: Some(1),
             path: "x.salvaged-2.salvaged-2",
             partial: None,
             bytes: b"two",
@@ -851,7 +851,7 @@ fn a_disambiguated_name_never_replaces_a_literal_it_folds_onto() {
         &outcome,
         Landed {
             index: 2,
-            taken_by: 1,
+            taken_by: Some(1),
             path: "x.salvaged-2.salvaged-2",
             partial: None,
             bytes: b"two",
@@ -881,7 +881,7 @@ fn a_disambiguated_partial_never_replaces_a_literal_entry_of_that_name() {
         &outcome,
         Landed {
             index: 2,
-            taken_by: 1,
+            taken_by: Some(1),
             path: "x.salvaged-2.salvaged-2.partial",
             partial: Some(PartialCause::Truncated),
             bytes: &payload[..CUT_KEEP],
@@ -916,7 +916,7 @@ fn a_disambiguated_partial_never_replaces_a_literal_it_folds_onto() {
         &outcome,
         Landed {
             index: 2,
-            taken_by: 1,
+            taken_by: Some(1),
             path: "x.salvaged-2.salvaged-2.partial",
             partial: Some(PartialCause::Truncated),
             bytes: &payload[..CUT_KEEP],
@@ -942,7 +942,7 @@ fn a_partial_never_replaces_a_literal_entry_named_like_its_partial() {
         &outcome,
         Landed {
             index: 1,
-            taken_by: 0,
+            taken_by: Some(0),
             path: "x.salvaged-1.partial",
             partial: Some(PartialCause::Truncated),
             bytes: &payload[..CUT_KEEP],
@@ -970,7 +970,7 @@ fn a_name_folded_through_its_parent_both_survive_salvage() {
         outcome.entries[1].disposition,
         SalvageDisposition::WrittenDisambiguated {
             path: dest.join("dir/X.salvaged-1"),
-            taken_by: 0,
+            taken_by: Some(0),
             partial: None,
         }
     );

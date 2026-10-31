@@ -1184,6 +1184,12 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
       `stuffr salvage broken.zip -C out/ && rm broken.zip` is told rather
       than quietly losing a record to an overwrite.
 
+      salvage has no --force and never removes or overwrites a file it did
+      not write in this run. A name out/ already holds — a file of yours, a
+      previous run's output, a symlink, or broken.zip itself when out/ is
+      its own directory — is left alone, and the recovered copy lands
+      beside it as `NAME.salvaged-N`, listed on stderr; the run exits 4.
+
       The default (non---list) report — counts only — goes to stderr, the
       same destination `unpack`'s and `test`'s own summary lines use.
 

@@ -639,7 +639,13 @@ read list.
 > their content differs, both are recovered and the second lands as
 > `NAME.salvaged-N` rather than over the first — the same reasoning that
 > gives an unproven payload `.partial`: recover by default, and let the
-> filesystem carry the distinction. Cross-checked against Info-Zip's `zip
+> filesystem carry the distinction. `salvage` has no `--force` and never
+> removes or overwrites a file it did not write in the same run: a name
+> the destination already holds (a file of yours, a previous run's
+> output, a symlink, or the archive being read) gets the recovered copy
+> as `NAME.salvaged-N` beside it, named on stderr, exit 4. `unpack
+> --force` likewise never replaces the archive it is reading: an entry
+> carrying the archive's own path is skipped with a warning. Cross-checked against Info-Zip's `zip
 > -FF`: on a truncated archive, `-FF` copies a central-directory record from
 > elsewhere in the same file into the payload gap and reports success, where
 > `stuffr salvage` invents nothing — it reports the entry `Partial
