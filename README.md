@@ -506,6 +506,19 @@ read list.
 > **3630** tests under `--all-features`, **3509** on the default tier —
 > measured from this bump's own `make check FULL=1`, `GATE_EXIT=0`.
 >
+> `0.23.0` is for library callers and for zips that lie. Every codec now
+> decodes from a borrowed reader (`stuffr_core::decode_reader`), so a
+> compressed member inside a tar or zip, a `.Z` included, decodes without
+> copying it out first; `Source` and `SeekRead` no longer require `Send`.
+> A zip whose local headers and central directory disagree (name, method,
+> CRC, sizes, flags; on a pipe also count and order) is reported, and
+> `--strict-fidelity` makes that exit 4. A piped zip now reads its central
+> directory too, so a well-formed one passes `--strict-fidelity`. zip moves
+> to 9.1.3 and zstd to 0.14.3 (libzstd is still 1.5.7), clearing their
+> advisories; four exit codes on malformed zips moved (see CONTRIBUTING).
+> **3679** tests under `--all-features`, **3556** on the default tier —
+> measured from this bump's own `make check FULL=1`, `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
