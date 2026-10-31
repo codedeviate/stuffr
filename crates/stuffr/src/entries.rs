@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use stuffr_core::{
     ArchiveRead, ArchiveWrite, Chain, Codec, Container, ContainerCaps, Counting, CountingWriter,
     CreateOpts, DEFAULT_MAX_RATIO, DecodeOpts, EncodeOpts, Entry, EntryKind, EntryMeta, Error,
-    Fidelity, FidelityReport, FormatId, MetaFields, OpenOpts, PROBE_LEN, PlainSink, RATIO_FLOOR,
-    RatioGuard, Registry, Result, Rung, SeekRead, Sink, Source, SourceCaps, SpillPolicy,
-    SpillSource, SpillWriter, StreamPolicy, SymlinkVerdict, classify_symlink_target, ladder,
-    resolve_chain, resolve_chain_deep_with, safe_join,
+    Fidelity, FidelityReport, FidelitySink, FormatId, MetaFields, OpenOpts, PROBE_LEN, PlainSink,
+    RATIO_FLOOR, RatioGuard, Registry, Result, Rung, SeekRead, Sink, Source, SourceCaps,
+    SpillPolicy, SpillSource, SpillWriter, StreamPolicy, SymlinkVerdict, classify_symlink_target,
+    ladder, resolve_chain, resolve_chain_deep_with, safe_join,
 };
 
 use crate::link_cache::{CachePolicy, LinkCache, Tee};
@@ -271,11 +271,27 @@ impl Source for SharedSource {
 /// walking early — `cat`/`unpack --index` once the last selected entry is
 /// delivered — reads no further and so checks no trailer; that early stop is
 /// the point of the counted route.
+///
+/// The drain is also when the codecs' own fidelity findings become final —
+/// a gzip or bzip2 layer notices bytes after its last verified member
+/// ([`Fidelity::TrailingDataIgnored`]) only at the end of its stream — so
+/// once drained, [`ArchiveRead::fidelity`] answers the container's report
+/// with the codec sink ([`DecodeOpts::fidelity`]) folded in. Before T10b
+/// (security audit follow-up, 2026-10-31) the sink was dropped here, so a
+/// `.tar.gz` whose gzip member was followed by junk — or by a later member
+/// with a flipped magic byte — was reported clean by `unpack -C`, `test`,
+/// `list` and entry-mode `convert`, `--strict-fidelity` included.
 struct DrainAtEnd {
     inner: Box<dyn ArchiveRead>,
     /// `None` once drained, so the check runs once however often the walk is
     /// asked for its end.
     rest: Option<Rc<RefCell<Box<dyn Source>>>>,
+    /// The codec layers' sink, shared with every decoder of the chain.
+    sink: FidelitySink,
+    /// The container's report with `sink` folded in, built on the first
+    /// [`ArchiveRead::fidelity`] call after the drain. The walk is over by
+    /// then, so neither half can change any more.
+    merged: std::cell::OnceCell<FidelityReport>,
 }
 
 impl ArchiveRead for DrainAtEnd {
@@ -295,7 +311,14 @@ impl ArchiveRead for DrainAtEnd {
     }
 
     fn fidelity(&self) -> &FidelityReport {
-        self.inner.fidelity()
+        if self.rest.is_some() {
+            return self.inner.fidelity();
+        }
+        self.merged.get_or_init(|| {
+            let mut report = self.inner.fidelity().clone();
+            self.sink.drain_into(&mut report);
+            report
+        })
     }
 }
 
@@ -340,6 +363,7 @@ fn open_archive(
         registry,
         &chain,
         source,
+        &opts.fidelity,
         &consumed,
         max_ratio,
         &read_verb_policy,
@@ -362,10 +386,14 @@ fn open_archive(
 ///
 /// `policy_for` picks the ladder policy from the container's caps: the read
 /// verbs pass [`read_verb_policy`], `convert` passes [`convert_read_policy`].
+///
+/// `sink` is the [`DecodeOpts::fidelity`] the codec layers were built with;
+/// [`DrainAtEnd`] folds it into the archive's report once the walk is over.
 fn open_resolved(
     registry: &Registry,
     chain: &Chain,
     source: Box<dyn Source>,
+    sink: &FidelitySink,
     consumed: &Arc<AtomicU64>,
     max_ratio: u64,
     policy_for: &dyn Fn(&ContainerCaps) -> StreamPolicy,
@@ -416,6 +444,8 @@ fn open_resolved(
                     Some(rest) => Box::new(DrainAtEnd {
                         inner: archive,
                         rest: Some(rest),
+                        sink: sink.clone(),
+                        merged: std::cell::OnceCell::new(),
                     }),
                     None => archive,
                 };
@@ -4485,11 +4515,17 @@ pub fn convert_archive_source_with(
     let (kind, encoder) = convert_target(registry, container, codec, o)?;
     // The rung is the RAW source's; the container's own report, from the
     // ladder that actually opened it, is the one that describes this read.
+    let sink = src.fidelity_sink();
     let (chain, decoded, consumed, _raw_rung, compressed_total) = src.into_parts();
-    let (mut ar, source_container) =
-        open_resolved(registry, &chain, decoded, &consumed, o.max_ratio, &|caps| {
-            convert_read_policy(caps, &o.spill)
-        })?;
+    let (mut ar, source_container) = open_resolved(
+        registry,
+        &chain,
+        decoded,
+        &sink,
+        &consumed,
+        o.max_ratio,
+        &|caps| convert_read_policy(caps, &o.spill),
+    )?;
     let mut budget = ArchiveBudget::new(compressed_total, o.max_ratio).tracking(consumed);
 
     let ArchiveTarget {

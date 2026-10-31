@@ -2119,3 +2119,110 @@ fn padding_after_the_last_member_passes_strict_fidelity() {
         }
     }
 }
+
+// ---------------------------------------------------------------------
+// T10b: the same rule for a codec UNDER a container (`.tar.gz`).
+// ---------------------------------------------------------------------
+
+/// Packs a one-file tree into `dir/name` (the extension picks the chain) and
+/// returns the archive's bytes.
+fn packed_tree(dir: &Path, name: &str) -> Vec<u8> {
+    let tree = dir.join(format!("{name}.tree"));
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("a.txt"), b"tarred payload\n".repeat(50)).unwrap();
+    let dst = dir.join(name);
+    let out = run_output(&["pack", tree.to_str().unwrap(), "-o", dst.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::read(dst).unwrap()
+}
+
+/// A `.tar.gz` / `.tar.bz2` whose codec stream is followed by junk: every
+/// verb that walks the archive to its end says so, and `--strict-fidelity`
+/// turns it into exit 4. The codec's sink used to be dropped under a
+/// container, so all of them reported the archive clean at exit 0.
+fn junk_after_a_container_codec_warns(ext: &str, format: &str) {
+    let dir = tmp_dir();
+    let archive = packed_tree(&dir, &format!("t.tar.{ext}"));
+    let junk = b"this is not another member";
+    let input = dir.join(format!("junk.tar.{ext}"));
+    std::fs::write(&input, [archive, junk.to_vec()].concat()).unwrap();
+    let input = input.to_str().unwrap();
+    let said = format!("`{format}` stream is followed by {} byte(s)", junk.len());
+
+    let check = |what: &str, args: &[&str], code: i32| {
+        let out = run_output(args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(code), "{what}: {stderr}");
+        assert!(stderr.contains(&said), "{what}: {stderr}");
+    };
+    for strict in [false, true] {
+        let code = if strict { 4 } else { 0 };
+        fn flag(strict: bool, mut v: Vec<&str>) -> Vec<&str> {
+            if strict {
+                v.push("--strict-fidelity");
+            }
+            v
+        }
+        let dest = dir.join(format!("out-{strict}"));
+        check(
+            "unpack -C",
+            &flag(strict, vec!["unpack", input, "-C", dest.to_str().unwrap()]),
+            code,
+        );
+        assert!(dest.join(format!("t.tar.{ext}.tree/a.txt")).exists());
+        check("test", &flag(strict, vec!["test", input]), code);
+        check("list", &flag(strict, vec!["list", input]), code);
+        let converted = dir.join(format!("conv-{strict}.tar"));
+        check(
+            "convert",
+            &flag(
+                strict,
+                vec!["convert", input, "-o", converted.to_str().unwrap()],
+            ),
+            code,
+        );
+    }
+    let entry = format!("t.tar.{ext}.tree/a.txt");
+    let out = run_output(&["cat", input, &entry]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "cat ENTRY: {stderr}");
+    assert_eq!(out.stdout, b"tarred payload\n".repeat(50));
+    assert!(stderr.contains(&said), "cat ENTRY: {stderr}");
+}
+
+#[test]
+fn junk_after_a_tar_gz_warns_and_fails_strict_fidelity() {
+    junk_after_a_container_codec_warns("gz", "gzip");
+}
+
+#[test]
+fn junk_after_a_tar_bz2_warns_and_fails_strict_fidelity() {
+    junk_after_a_container_codec_warns("bz2", "bzip2");
+}
+
+/// NUL padding after a `.tar.gz`'s gzip member stays silent under a
+/// container too (GNU tar and some uploaders pad this way).
+#[test]
+fn nul_padding_after_a_tar_gz_passes_strict_fidelity() {
+    let dir = tmp_dir();
+    let archive = packed_tree(&dir, "p.tar.gz");
+    let input = dir.join("padded.tar.gz");
+    std::fs::write(&input, [archive, vec![0u8; 1024]].concat()).unwrap();
+    let input = input.to_str().unwrap();
+    let dest = dir.join("out");
+    for args in [
+        vec!["unpack", input, "-C", dest.to_str().unwrap()],
+        vec!["test", input],
+    ] {
+        let mut args = args;
+        args.push("--strict-fidelity");
+        let out = run_output(&args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{}: {stderr}", args[0]);
+        assert!(!stderr.contains("followed by"), "{}: {stderr}", args[0]);
+    }
+}

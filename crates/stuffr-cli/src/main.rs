@@ -653,14 +653,17 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 );
                 // The motivating case: `curl … | stuffr cat - log.txt`.
                 let mut out = std::io::stdout();
-                entries::cat(
+                let done = entries::cat(
                     input_of(&input),
                     &selection,
                     max_ratio.unwrap_or(stuffr::DEFAULT_MAX_RATIO),
                     memory_limit,
                     &mut out,
                 )?;
-                return Ok(());
+                // No --strict-fidelity here either, but what the read
+                // approximated is said, as for a bare stream below — a
+                // `.tar.gz` whose gzip member is followed by junk (T10b).
+                return report_fidelity(&done.fidelity, false);
             }
             // Same as `unpack`: bounds dictionary allocation for the pure
             // codecs; the CLI default is the bound, not unbounded.

@@ -2254,8 +2254,9 @@ inside the magic) is corrupt, exit 5; any other tail raises
 neither another member nor padding; they were ignored ``), printed by `unpack`,
 `cat` and `convert`, exit 4 under `--strict-fidelity`. Before, one flipped byte at
 a member boundary silently dropped every later member at exit 0. A codec under a
-container (`.tar.gz`) does not report it yet; the container's own end-of-archive
-check covers the boundary case there.
+container (`.tar.gz`, `.tar.bz2`) reports it the same way once the walk reaches
+the end of the archive: `list`, `test`, `unpack -C`, `cat FILE ENTRY` and
+entry-mode `convert` print it, and the verbs that take `--strict-fidelity` exit 4.
 
 ### 3. One governed thread budget, conservative by default
 

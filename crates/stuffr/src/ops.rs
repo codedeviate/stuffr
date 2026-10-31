@@ -1229,6 +1229,12 @@ impl ConvertSource {
     /// Takes the source apart for a write half outside this module
     /// (`entries`' container conversion), so the chain resolved at open is
     /// the one used — never a second detection.
+    /// The decoders' fidelity sink, for a container read that folds it into
+    /// its own report once the walk is over (`entries::open_resolved`).
+    pub(crate) fn fidelity_sink(&self) -> stuffr_core::FidelitySink {
+        self.fidelity.clone()
+    }
+
     pub(crate) fn into_parts(self) -> ConvertParts {
         (
             self.chain,
