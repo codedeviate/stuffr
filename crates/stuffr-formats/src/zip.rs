@@ -1705,7 +1705,11 @@ fn local_zip64_sizes(
     if block.len() >= 16 {
         return (Some(le64(&block[0..8])), Some(le64(&block[8..16])));
     }
-    let mut fields = block.chunks_exact(8).map(le64);
+    let mut fields = block
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c));
     let usize_ = if usize32 == u32::MAX {
         fields.next()
     } else {
@@ -2656,7 +2660,12 @@ fn central_claim(fixed: &[u8; CENTRAL_HEADER_FIXED], name: Vec<u8>, extra: &[u8]
     let csize32 = le32(&fixed[16..20]);
     let flags = le16(&fixed[4..6]);
     let shown = Some(shown_name(&name, flags, extra));
-    let mut fields = zip64_block(extra).unwrap_or(&[]).chunks_exact(8).map(le64);
+    let mut fields = zip64_block(extra)
+        .unwrap_or(&[])
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c));
     let usize_ = if usize32 == u32::MAX {
         fields.next()
     } else {
