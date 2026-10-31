@@ -2,7 +2,7 @@
 
 use std::io::Read;
 
-use super::{SeekRead, Source, SourceCaps};
+use super::{DecodeSideSource, SeekRead, Source, SourceCaps};
 use crate::archive::{Codec, DecodeOpts};
 use crate::error::{Error, Result};
 
@@ -48,6 +48,13 @@ impl Source for BorrowedSource<'_> {
 /// archive member's reader, which is neither `'static` nor `Send`. Needs no
 /// registry. A codec that cannot decode is refused with the same
 /// [`Error::CapabilityUnavailable`] `Registry::require_decoder` raises (exit 3).
+///
+/// Errors come back already classified, as on every other decode path: an
+/// `io::Error` from the decoder's construction is folded through
+/// [`Error::from_decode_io`], and the returned source is a
+/// [`DecodeSideSource`], so a malformed member read through it and converted
+/// with a bare `?` is the same [`Error::Corrupt`] (exit 5) as anywhere else,
+/// while a failure of `r` itself (a disk, a permission) stays [`Error::Io`].
 pub fn decode_reader<'a, R: Read + 'a>(
     codec: &dyn Codec,
     r: R,
@@ -60,7 +67,13 @@ pub fn decode_reader<'a, R: Read + 'a>(
             requested: "read",
         });
     }
-    codec.decoder(Box::new(BorrowedSource::new(r)), o)
+    let decoded = codec
+        .decoder(Box::new(BorrowedSource::new(r)), o)
+        .map_err(|e| match e {
+            Error::Io(io_err) => Error::from_decode_io(io_err),
+            other => other,
+        })?;
+    Ok(DecodeSideSource::wrap(decoded))
 }
 
 #[cfg(test)]

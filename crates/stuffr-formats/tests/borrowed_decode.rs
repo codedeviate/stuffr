@@ -74,7 +74,10 @@ fn every_codec_decodes_from_a_borrowed_reader() {
     {
         let fixture = include_bytes!("../fixtures/legacy/hello.Z");
         let out = decode_borrowed(&stuffr_formats::legacy::compress_z::CompressZ, fixture);
-        assert!(!out.is_empty(), "hello.Z decodes to its plaintext");
+        assert_eq!(
+            out, b"the quick brown fox jumps over the lazy dog\n",
+            "hello.Z decodes to its plaintext"
+        );
     }
 
     assert_eq!(
@@ -191,7 +194,10 @@ fn a_corrupt_borrowed_member_is_corrupt_not_io() {
         .unwrap()
         .read_to_end(&mut out)
         .expect_err("a flipped body must not decode");
-    let classified = Error::from_decode_io(err);
+    // The plain conversion a bare `?` performs, not `from_decode_io`:
+    // `decode_reader` must already have marked the read as decode-side.
+    let classified = Error::from(err);
+    assert!(matches!(classified, Error::Corrupt(_)), "{classified:?}");
     assert_eq!(classified.exit_code(), 5, "{classified:?}");
 }
 

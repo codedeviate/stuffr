@@ -131,29 +131,29 @@ pub fn is_decode_side(e: &io::Error) -> bool {
 /// block index — the case [`Source::as_seek`] exists for) must revisit this.
 ///
 /// [`StreamOnly`]: crate::source::StreamOnly
-pub struct DecodeSideSource {
-    inner: Box<dyn Source>,
+pub struct DecodeSideSource<'a> {
+    inner: Box<dyn Source + 'a>,
 }
 
-impl DecodeSideSource {
+impl<'a> DecodeSideSource<'a> {
     /// Wraps `inner`, which must be a codec decoder's output.
     ///
     /// Returns a `Box<dyn Source>` rather than `Self` because every caller
     /// immediately needs the trait object, and handing back the concrete type
     /// would invite a caller to keep it and lose the marking by passing the
     /// inner source on instead.
-    pub fn wrap(inner: Box<dyn Source>) -> Box<dyn Source> {
+    pub fn wrap(inner: Box<dyn Source + 'a>) -> Box<dyn Source + 'a> {
         Box::new(Self { inner })
     }
 }
 
-impl Read for DecodeSideSource {
+impl Read for DecodeSideSource<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.read(buf).map_err(mark_decode_side)
     }
 }
 
-impl Source for DecodeSideSource {
+impl Source for DecodeSideSource<'_> {
     fn caps(&self) -> SourceCaps {
         self.inner.caps()
     }

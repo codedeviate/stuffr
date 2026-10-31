@@ -37,7 +37,9 @@
 //!     }
 //! }
 //!
-//! let codec = stuffr::registry().codec(FormatId::new("compress")).expect("the `compress` feature");
+//! let codec = stuffr::registry()
+//!     .codec(FormatId::new("compress"))
+//!     .expect("the `compress` feature");
 //! let shared = Shared::default();
 //! let mut sink = codec.encoder(Box::new(shared.clone()), &EncodeOpts::default())?;
 //! sink.write_all(b"hello, borrowed world")?;
