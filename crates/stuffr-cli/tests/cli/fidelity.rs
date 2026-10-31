@@ -2029,6 +2029,34 @@ fn flipped_second_member_warns(ext: &str, format: &str, flip: u8) {
         }
     }
 
+    // Codec-mode `convert` (the T10 review's M1): the recompressed file
+    // holds the first member, the warning is said, strict exits 4.
+    for (strict, code) in [(false, 0), (true, 4)] {
+        let output = dir.join(format!("conv-{strict}.xz"));
+        let mut args = vec![
+            "convert",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+        ];
+        if strict {
+            args.push("--strict-fidelity");
+        }
+        let out = run_output(&args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "convert strict={strict}: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("`{format}` stream is followed by")),
+            "convert strict={strict}: {stderr}"
+        );
+        let back = run_output(&["cat", output.to_str().unwrap()]);
+        assert_eq!(back.stdout, first, "convert strict={strict}");
+    }
+
     // `cat` has no --strict-fidelity; it still says what it ignored.
     let out = run_output(&["cat", input.to_str().unwrap()]);
     let stderr = String::from_utf8_lossy(&out.stderr);

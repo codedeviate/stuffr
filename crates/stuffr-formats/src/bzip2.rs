@@ -686,6 +686,53 @@ mod tests {
         assert_eq!(decompress(packed), member.repeat(count));
     }
 
+    /// The T10 review's M2: bzip2's tail rule judges ten header bytes (`BZh`,
+    /// the level, and a block or end-of-stream magic), more than gzip's four,
+    /// so a source handing out one byte per read must still show all ten —
+    /// a short peek would judge a real stream as junk or a damaged header.
+    #[test]
+    fn the_ten_byte_header_is_judged_whole_through_a_one_byte_source() {
+        struct Trickle(std::io::Cursor<Vec<u8>>);
+        impl std::io::Read for Trickle {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let n = out.len().min(1);
+                self.0.read(&mut out[..n])
+            }
+        }
+        let trickled = |bytes: Vec<u8>| {
+            let src: Box<dyn Source> =
+                Box::new(ReaderSource::new(Trickle(std::io::Cursor::new(bytes))));
+            let opts = DecodeOpts::default();
+            let mut dec = Bzip2.decoder(src, &opts).unwrap();
+            let mut out = Vec::new();
+            let r = dec.read_to_end(&mut out).map(|_| out);
+            (r, opts.fidelity.warnings())
+        };
+
+        // Three streams, the middle one empty (`BZh9` + the end magic).
+        let x = [compress(b"one-"), compress(b""), compress(b"three")].concat();
+        let (out, warnings) = trickled(x);
+        assert_eq!(out.unwrap(), b"one-three");
+        assert!(warnings.is_empty());
+
+        // A flipped magic byte is still junk, counted whole.
+        let a = compress(b"first");
+        let b = compress(b"second");
+        let mut flipped = [a.clone(), b.clone()].concat();
+        flipped[a.len()] = 0x41;
+        let (out, warnings) = trickled(flipped);
+        assert_eq!(out.unwrap(), b"first");
+        assert_eq!(warnings, ignored(b.len() as u64));
+
+        // A damaged block magic (byte 9 of the header) is still corrupt.
+        let mut damaged = [a.clone(), b].concat();
+        damaged[a.len() + 9] ^= 0xff;
+        let (out, warnings) = trickled(damaged);
+        let err = out.expect_err("damaged block magic");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        assert!(warnings.is_empty());
+    }
+
     #[test]
     fn trailing_junk_that_is_not_padding_is_reported_with_its_length() {
         let plain = b"payload".repeat(10);

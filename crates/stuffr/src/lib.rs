@@ -16,6 +16,9 @@
 //! inside a tar or a zip), a `&mut &[u8]`, a `&mut File`. [`decode_reader`]
 //! is the one-call route and [`BorrowedSource`] the source under it; neither
 //! needs a registry, and a codec that cannot decode is refused with exit 3.
+//! Warnings (what the decode approximated) are recorded in the
+//! [`DecodeOpts::fidelity`] sink you pass, not returned with the bytes: read
+//! it after the source has reached its end, as the example does.
 //!
 //! ```
 //! # #[cfg(feature = "compress")]
@@ -50,9 +53,13 @@
 //! // lives no longer than that borrow.
 //! let mut input: &[u8] = &stream;
 //! let mut out = Vec::new();
-//! decode_reader(codec.as_ref(), &mut input, &DecodeOpts::default())?
-//!     .read_to_end(&mut out)?;
+//! let opts = DecodeOpts::default();
+//! decode_reader(codec.as_ref(), &mut input, &opts)?.read_to_end(&mut out)?;
 //! assert_eq!(out, b"hello, borrowed world");
+//! // What the decode approximated lands in `opts.fidelity`, and only once the
+//! // stream has been read to its end — trailing bytes a gzip or bzip2 decoder
+//! // ignored, say. Keep `opts` (or a clone of its sink) and look afterwards.
+//! assert!(opts.fidelity.warnings().is_empty());
 //! # Ok(())
 //! # }
 //! # #[cfg(not(feature = "compress"))]

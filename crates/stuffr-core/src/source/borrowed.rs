@@ -55,6 +55,15 @@ impl Source for BorrowedSource<'_> {
 /// [`DecodeSideSource`], so a malformed member read through it and converted
 /// with a bare `?` is the same [`Error::Corrupt`] (exit 5) as anywhere else,
 /// while a failure of `r` itself (a disk, a permission) stays [`Error::Io`].
+///
+/// **What the decode approximated is not in the returned source.** A codec
+/// records it in `o.fidelity` ([`crate::DecodeOpts::fidelity`]) — today
+/// [`crate::Fidelity::TrailingDataIgnored`], from gzip or bzip2, for bytes
+/// after the last verified member that were ignored — and only once it has
+/// reached the end of its stream. So keep a clone of the sink (or the
+/// `DecodeOpts` itself) and read it after the source has returned `Ok(0)`:
+/// [`crate::FidelitySink::warnings`], or [`crate::FidelitySink::drain_into`]
+/// a [`crate::FidelityReport`]. A caller that never looks loses the warning.
 pub fn decode_reader<'a, R: Read + 'a>(
     codec: &dyn Codec,
     r: R,

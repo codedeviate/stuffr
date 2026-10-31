@@ -545,6 +545,33 @@ mod tests {
         assert_eq!(decompress(packed), member.repeat(count));
     }
 
+    /// The T10 review's M3: a later member whose header carries the optional
+    /// fields GNU gzip and pigz write (FNAME, plus FEXTRA and FHCRC) is
+    /// another member — the tail rule judges only the method and the
+    /// reserved flag bits — and decodes whole.
+    #[test]
+    fn a_later_member_with_name_extra_and_header_crc_decodes_fully() {
+        let second = compress(b"second, with a named header");
+        // Re-head `second`: the same deflate body and trailer behind a header
+        // with FHCRC | FEXTRA | FNAME (0x02 | 0x04 | 0x08).
+        let mut header = vec![0x1f, 0x8b, 8, 0x0e, 0x78, 0x56, 0x34, 0x12, 0, 3];
+        header.extend_from_slice(&[6, 0]); // XLEN
+        header.extend_from_slice(b"AB\x02\x00hi"); // one subfield, 2 bytes
+        header.extend_from_slice(b"second.txt\0");
+        let mut crc = flate2::Crc::new();
+        crc.update(&header);
+        header.extend_from_slice(&((crc.sum() & 0xffff) as u16).to_le_bytes());
+        let named = [header, second[10..].to_vec()].concat();
+
+        let x = [compress(b"first, "), named.clone()].concat();
+        let (out, warnings) = decode_tail(x);
+        assert_eq!(out.unwrap(), b"first, second, with a named header");
+        assert!(warnings.is_empty());
+        // As the only member too, so the header itself is known good.
+        let (out, _) = decode_tail(named);
+        assert_eq!(out.unwrap(), b"second, with a named header");
+    }
+
     #[test]
     fn trailing_junk_that_is_not_padding_is_reported_with_its_length() {
         let plain = b"payload".repeat(10);
