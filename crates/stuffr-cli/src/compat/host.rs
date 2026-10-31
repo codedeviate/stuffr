@@ -128,19 +128,49 @@ const SLOT_LEN: usize = libc::PATH_MAX as usize;
 /// each read happens-after the write it reads (the publish store and the
 /// handler's load pair).
 ///
+/// [`HandlerSlot::disarm`] waits too, for BOTH counts to reach 0 after it
+/// cleared the armed bit, so once it returns no handler on any thread is
+/// still acting on the old value: a guard dropped after its output was
+/// published can no longer have that output unlinked by a handler that
+/// was mid-read on another thread (ruling T7, M4). A handler that loads
+/// `state` after the clear reads nothing; one that incremented before it
+/// either is waited for or, loading `state` again after the clear, backs
+/// off.
+///
 /// The writer's wait lasts while a handler is between its increment and
-/// its decrement: a few loads plus an `unlink(2)` or `tcsetattr(3)`. A
-/// handler on the writer's own thread never makes it wait: it has
-/// returned (its count back to 0) before the writer runs again. A child
-/// forked while a handler of the parent was inside that window inherits a
-/// count that never drops; it would wait for ever only if it re-armed
-/// before `exec`, which no family does (`disarm_inherited` clears the
-/// counts for the tests' forked children).
+/// its decrement: a few loads plus an `unlink(2)` or `tcsetattr(3)`. It
+/// cannot deadlock: a handler never publishes or disarms, and one on the
+/// writer's own thread has returned (its count back to 0) before the
+/// writer runs again — a handler runs to completion over the code it
+/// interrupted, never the other way round — so the only counts waited for
+/// are other threads' handlers, which take no lock and wait for nothing
+/// the writer holds. A child forked while a handler of the parent was
+/// inside that window inherits a count that never drops; it would wait
+/// for ever only if it re-armed or disarmed before `exec`, which no family
+/// does (`disarm_inherited` clears the counts for the tests' forked
+/// children).
 #[cfg(unix)]
 struct HandlerSlot<T: Copy> {
     bufs: [std::cell::UnsafeCell<T>; 2],
     state: std::sync::atomic::AtomicUsize,
     readers: [std::sync::atomic::AtomicUsize; 2],
+    /// Debug builds: set while `publish` or `disarm` runs, to catch a
+    /// second writer, which the protocol does not allow (ruling T7, M5).
+    /// Untouched in a release build.
+    writing: std::sync::atomic::AtomicBool,
+}
+
+/// A writer's turn on a [`HandlerSlot`] ([`HandlerSlot::writer`]).
+#[cfg(unix)]
+struct WriterTurn<'a>(&'a std::sync::atomic::AtomicBool);
+
+#[cfg(unix)]
+impl Drop for WriterTurn<'_> {
+    fn drop(&mut self) {
+        if cfg!(debug_assertions) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
 }
 
 // SAFETY: the buffers are only written by `publish` and read by `read`
@@ -167,13 +197,26 @@ impl<T: Copy> HandlerSlot<T> {
                 std::sync::atomic::AtomicUsize::new(0),
                 std::sync::atomic::AtomicUsize::new(0),
             ],
+            writing: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Debug builds: claims the single writer's turn, panicking if another
+    /// writer holds it; the turn ends when the returned value drops.
+    /// Release builds: nothing.
+    fn writer(&self) -> WriterTurn<'_> {
+        if cfg!(debug_assertions) {
+            let busy = self.writing.swap(true, Ordering::SeqCst);
+            assert!(!busy, "two writers on one HandlerSlot at once");
+        }
+        WriterTurn(&self.writing)
     }
 
     /// Fill the buffer that is not published with `fill` (it is given what
     /// that buffer last held), then publish it armed. Ordinary code only,
     /// one writer at a time; never from a handler.
     fn publish(&self, fill: impl FnOnce(&mut T)) {
+        let _turn = self.writer();
         let i = (self.state.load(Ordering::SeqCst) & 1) ^ 1;
         while self.readers[i].load(Ordering::SeqCst) != 0 {
             std::hint::spin_loop();
@@ -185,10 +228,17 @@ impl<T: Copy> HandlerSlot<T> {
         self.state.store(i | Self::ARMED, Ordering::SeqCst);
     }
 
-    /// Disarm: a handler that starts now reads nothing. One already
-    /// reading finishes with what it read.
+    /// Disarm: a handler that starts now reads nothing, and one already
+    /// reading, on any thread, has finished when this returns (the type's
+    /// doc says why that cannot deadlock). Ordinary code only.
     fn disarm(&self) {
+        let _turn = self.writer();
         self.state.fetch_and(!Self::ARMED, Ordering::SeqCst);
+        for count in &self.readers {
+            while count.load(Ordering::SeqCst) != 0 {
+                std::hint::spin_loop();
+            }
+        }
     }
 
     fn is_armed(&self) -> bool {
@@ -223,10 +273,13 @@ impl<T: Copy> HandlerSlot<T> {
     /// inherited from the parent.
     #[cfg(test)]
     fn reset_after_fork(&self) {
-        self.disarm();
+        // The counts first: `disarm` waits for them, and an inherited one
+        // never drops. A writer's turn the parent held is cleared too.
         for r in &self.readers {
             r.store(0, Ordering::SeqCst);
         }
+        self.writing.store(false, Ordering::SeqCst);
+        self.disarm();
     }
 }
 
@@ -928,10 +981,19 @@ fn own_or_fault(sig: libc::c_int, info: *const libc::siginfo_t) -> bool {
     // `si_pid` the sender (on Linux it shares its bytes with a fault's
     // `si_addr`). Linux and the BSDs without SI_* above zero use codes
     // <= 0; Apple and FreeBSD use SI_USER 0x10001 and SI_QUEUE 0x10002,
-    // and Apple gives `kill` 0 (measured).
+    // and Apple gives `kill` 0 (measured). FreeBSD and DragonFly also give
+    // a signal sent to one thread (`thr_kill`/`lwp_kill`, which their
+    // `raise` and so `abort` use) SI_LWP 0x10007, with the sender's pid.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let sent = code <= 0;
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+    let sent = code <= 0 || code == 0x10001 || code == 0x10002 || code == 0x10007;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )))]
     let sent = code <= 0 || code == 0x10001 || code == 0x10002;
     if sent {
         // SAFETY: a process-sent siginfo_t carries the sender's pid;
@@ -3886,6 +3948,49 @@ mod tests {
         });
         assert!(third_done.load(Ordering::SeqCst));
         assert_eq!(slot.read(|v| *v), Some([b'C'; 64]));
+    }
+
+    /// Ruling T7 M4: `disarm` returns only once a handler reading on
+    /// another thread has finished, so a guard dropped after its output was
+    /// published cannot have that output unlinked behind it; a reader that
+    /// starts after the disarm reads nothing.
+    #[cfg(unix)]
+    #[test]
+    fn disarm_waits_for_a_reader_on_another_thread() {
+        use std::sync::atomic::AtomicBool;
+        let slot: HandlerSlot<u8> = HandlerSlot::new(0);
+        slot.publish(|v| *v = 7);
+        let entered = AtomicBool::new(false);
+        let finished = AtomicBool::new(false);
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                slot.read(|v| {
+                    assert_eq!(*v, 7);
+                    entered.store(true, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    finished.store(true, Ordering::SeqCst);
+                })
+                .expect("armed");
+            });
+            while !entered.load(Ordering::SeqCst) {
+                std::hint::spin_loop();
+            }
+            slot.disarm();
+            assert!(
+                finished.load(Ordering::SeqCst),
+                "disarm returned while a handler was still acting"
+            );
+        });
+        assert_eq!(slot.read(|v| *v), None);
+    }
+
+    /// Ruling T7 M5: a second writer at once is a debug-build panic.
+    #[cfg(all(unix, debug_assertions))]
+    #[test]
+    #[should_panic(expected = "two writers on one HandlerSlot at once")]
+    fn a_second_writer_at_once_panics_in_debug_builds() {
+        let slot: HandlerSlot<u8> = HandlerSlot::new(0);
+        slot.publish(|_| slot.disarm());
     }
 
     /// Ruling T7b: one writer re-arming as fast as it can while readers
