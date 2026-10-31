@@ -2412,7 +2412,9 @@ that stores uid/gid warns about the missing `uid_gid` for every entry. A
 codec with no magic bytes nested inside another (gzip over brotli) is not
 peeled and stays in the output, as with `unpack`.
 
-`ARCHIVE` accepts `-` for stdin everywhere. Optional compat symlinks
+`ARCHIVE` accepts `-` for stdin everywhere but `salvage`, which seeks back
+and forth over its input and so refuses `-`, a FIFO, a character device and a
+socket (exit 2; copy it to a file first). Optional compat symlinks
 argv[0]-dispatch into the same binary, so the tools they are named for drop
 into existing scripts unchanged: `bzip2`, `bunzip2`, `bzcat` and
 `bzip2recover`, `gzip`, `xz`, `zstd`, `lz4`, `unzip` with its siblings,

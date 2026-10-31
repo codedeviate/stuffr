@@ -1734,6 +1734,47 @@ struct SalvageArgs {
 ///
 /// At least one of `-C`, `-o` or `--list` is required; `-C` and `-o` are
 /// mutually exclusive; `-o` requires exactly one `--index`.
+/// Refuses a salvage input that is neither a regular file, a block device
+/// nor a directory (final security review, Minor 3): a FIFO, a character
+/// device or a socket. Salvage reads its input more than once and seeks in
+/// it — a FIFO was read whole by format detection and then reopened (which
+/// blocks for a new writer, or reads nothing), and the scan's first seek
+/// failed `ESPIPE` at exit 1. Exit 2 here, before anything is read or
+/// created, like `-` and like a directory (which `entries::salvage`
+/// refuses with its own message). A path that cannot be `stat`ed is left
+/// to the open that follows, which names the error.
+fn refuse_unseekable_salvage_input(path: &Path) -> stuffr::Result<()> {
+    let Ok(md) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    let ft = md.file_type();
+    #[cfg(unix)]
+    let kind = {
+        use std::os::unix::fs::FileTypeExt;
+        if ft.is_fifo() {
+            Some("a FIFO")
+        } else if ft.is_char_device() {
+            Some("a character device")
+        } else if ft.is_socket() {
+            Some("a socket")
+        } else {
+            None
+        }
+    };
+    #[cfg(not(unix))]
+    let kind = (!ft.is_file() && !ft.is_dir()).then_some("not a regular file");
+    match kind {
+        Some(kind) => Err(stuffr::Error::Usage(format!(
+            "`{}` is {kind}; salvage scans back and forth over the archive, which needs \
+             a real seekable file. Copy it to a file first (`cat {} > copy`) and salvage \
+             the copy.",
+            path.display(),
+            path.display()
+        ))),
+        None => Ok(()),
+    }
+}
+
 fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
     let SalvageArgs {
         input,
@@ -1779,6 +1820,7 @@ fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
             ));
         }
     };
+    refuse_unseekable_salvage_input(&path)?;
     let partial_policy = match partial.as_deref() {
         None | Some("keep") => stuffr::salvage::PartialPolicy::Keep,
         Some("skip") => stuffr::salvage::PartialPolicy::Skip,

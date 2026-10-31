@@ -1074,3 +1074,24 @@ fn a_salvage_rerun_writes_beside_the_previous_output() {
         b"recovered"
     );
 }
+
+/// Final security review, Minor 3: a FIFO (or a character device) is
+/// refused at exit 2 before anything is read — it used to be read whole by
+/// detection, reopened, and the scan's seek failed `ESPIPE` at exit 1.
+#[cfg(unix)]
+#[test]
+fn salvage_refuses_a_fifo_or_a_character_device_as_input() {
+    let dir = tmp_dir();
+    let fifo = dir.join("pipe.zip");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let out_dir = dir.join("out");
+    for input in [fifo.to_str().unwrap(), "/dev/null"] {
+        let out = run_output(&["salvage", input, "-C", out_dir.to_str().unwrap()]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{input}: {stderr}");
+        assert!(stderr.contains("needs a real seekable file"), "{stderr}");
+        assert!(!out_dir.exists(), "nothing may be created for {input}");
+    }
+}

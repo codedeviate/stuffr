@@ -1231,6 +1231,11 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
       The default (non---list) report — counts only — goes to stderr, the
       same destination `unpack`'s and `test`'s own summary lines use.
 
+      salvage reads its input more than once and seeks in it, so the input
+      must be a real file (or a block device): `-`, a FIFO, a character
+      device or a socket is refused (exit 2) before anything is read.
+      Copy it to a file first and salvage the copy.
+
   stuffr salvage broken.zip -o recovered.bin --index 4
       Recovers exactly ONE entry's bytes to a named file — no `-C`
       directory at all. Requires exactly one `--index`; refused (exit 2)
