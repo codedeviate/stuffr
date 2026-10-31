@@ -703,6 +703,47 @@ mod tests {
         );
     }
 
+    /// RUSTSEC-2026-0344: one compressed block of `n` RLE-coded sequences
+    /// (match length 65539, offset 1) under a declared 1 KiB window. Each
+    /// sequence costs 18 bits and asks for 65539 bytes, far past the block's
+    /// `Block_Maximum_Size`. ruzstd 0.9.0 built the whole block before
+    /// returning a byte (a 9 KB file at n = 4000 allocated 538 MB, past
+    /// `--memory-limit`); 0.9.1 refuses the first sequence that overruns.
+    fn block_size_bomb(n: usize) -> Vec<u8> {
+        fn block_header(last: u32, kind: u32, size: usize) -> [u8; 3] {
+            let v = last | (kind << 1) | ((size as u32) << 3);
+            let b = v.to_le_bytes();
+            [b[0], b[1], b[2]]
+        }
+        let nbits = n * 18;
+        let mut bits = vec![0u8; (nbits + 1).div_ceil(8)];
+        bits[nbits / 8] |= 1 << (nbits % 8);
+        assert!(n < 128, "one-byte sequence count only");
+        // No literals; `n` sequences; all three tables RLE; LL=0, OF=2, ML=52.
+        let mut body = vec![0x00, n as u8, 0x54, 0, 2, 52];
+        body.extend_from_slice(&bits);
+        let mut f = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00];
+        f.extend_from_slice(&block_header(0, 0, 1));
+        f.push(b'A');
+        f.extend_from_slice(&block_header(1, 2, body.len()));
+        f.extend_from_slice(&body);
+        f
+    }
+
+    #[test]
+    fn a_block_that_overruns_its_maximum_size_is_corrupt_not_decoded() {
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(
+            block_size_bomb(64),
+        )));
+        let mut dec = Zstd.decoder(src, &DecodeOpts::default()).unwrap();
+        let mut out = Vec::new();
+        let err = dec
+            .read_to_end(&mut out)
+            .expect_err("a block decoding past Block_Maximum_Size must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        assert!(out.len() <= 1024, "{} bytes decoded before the refusal", out.len());
+    }
+
     /// A skippable frame as Blender writes one: magic `0x184D2A5E` and a
     /// 33-byte payload.
     fn skippable(magic: u32, payload: &[u8]) -> Vec<u8> {
