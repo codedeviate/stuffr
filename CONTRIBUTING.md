@@ -204,6 +204,52 @@ A name with no readable pid is never treated as live, so it is reported at
 once if it is left behind. A number such as a padding length goes after the
 pid, never before it.
 
+## Supply chain
+
+`make deny` is not part of `make check` (it needs `cargo-deny` and the
+network), but CI's `supply-chain` job runs the same three steps on every
+push, so run it before pushing a change to a manifest, a lockfile or the
+vendored C:
+
+| Step | Command |
+|---|---|
+| Workspace graph | `cargo deny --manifest-path Cargo.toml check` |
+| Fuzz lock | `cargo deny --manifest-path fuzz/Cargo.toml --config deny.toml check advisories` |
+| Vendored C | `scripts/check-vendored.sh` |
+
+Install it once with `cargo install --locked cargo-deny` (CI pins the
+version in `ci.yml`; match it when a check differs locally). `deny.toml`
+fails on every RustSec advisory (unmaintained and unsound notices included,
+unless an `ignore` entry records why), on a licence not listed by name, on
+a wildcard version and on any source but crates.io. A new licence in the
+graph is read before it ships: add it to `allow` and to the affected
+crates' SPDX `license` line in the same commit. `fuzz/` is its own
+workspace with its own lock, so it gets the advisories check separately —
+its targets run hostile input through the same decoders.
+
+**Vendored C.** `crates/stuffr-formats/c/VENDORED.md` records, for each
+vendored tree (today libbrotli 1.2.1), the upstream tag, commit, archive
+URL and SHA-256, and which directories were copied unmodified.
+`scripts/check-vendored.sh` downloads that archive, verifies the hash and
+compares every copied file with the tree. Never edit a vendored file in
+place: refresh it from a new upstream archive, update the pins in
+`VENDORED.md` (and the matching reference action under
+`.github/actions/`), and re-run the script.
+
+**Dependabot** (`.github/dependabot.yml`) opens weekly pull requests for
+the Cargo lock and for the GitHub Actions in the workflows and in the
+composite actions under `.github/actions/`. They run CI like any other
+pull request; nothing merges itself.
+
+**Actions are pinned by commit SHA**, with the tag in a trailing comment
+(`uses: actions/checkout@<40-hex> # v4`), so a moved or hijacked tag
+cannot change what CI runs. Bump one through Dependabot's pull request, or
+by hand: resolve the tag to its commit with
+`gh api repos/OWNER/REPO/commits/REF --jq .sha` (for example
+`gh api repos/actions/checkout/commits/v4 --jq .sha`), replace the SHA,
+update the comment, and change every workflow that uses the action in the
+same commit. Never pin by tag or branch name.
+
 ## Commit messages
 
 [Conventional Commits](https://www.conventionalcommits.org/). The `commit-msg`
@@ -294,6 +340,18 @@ you. Reach for `-p` on its own only to isolate a failure it reported.
 
 The real publish still goes in order: `stuffr-core`, `stuffr-formats`,
 `stuffr`, `stuffr-cli`.
+
+**At every release, re-check the C that ships pinned.** The workspace pins
+`zstd-sys` and `lz4-sys` EXACTLY (`Cargo.toml`'s `[workspace.dependencies]`:
+the bindings and the `const` asserts on libzstd's experimental parameter
+numbers are only right for the library those exact versions bundle), so a
+security fix upstream never arrives on its own — `cargo update` will not
+move an `=` pin. Look up the newest `zstd-sys`/`lz4-sys` on crates.io and
+the libzstd/liblz4 security advisories since the pinned release, and do
+the same for the vendored libbrotli against google/brotli's releases (see
+`crates/stuffr-formats/c/VENDORED.md`). Moving a pin means re-reading what
+it pins (the comment above each one says what), then `make deny` and
+`make check`. Record the answer, even "no change", in the release notes.
 
 ### While below 1.0
 

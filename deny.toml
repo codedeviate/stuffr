@@ -1,7 +1,7 @@
 # cargo-deny: advisories, licences, bans and sources for the whole graph.
 # Run with `make deny` (needs `cargo install --locked cargo-deny`); CI runs it
-# on every push. `cargo audit` covers `fuzz/Cargo.lock`, which is a separate
-# workspace this file does not see.
+# on every push. `fuzz/Cargo.lock` is a separate workspace: `make deny` and
+# CI check its advisories with this file passed as `--config`.
 
 [graph]
 all-features = true
