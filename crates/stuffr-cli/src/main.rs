@@ -737,7 +737,21 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 // a tar genuinely loses nothing; the rule is narrowed to the
                 // cases where loss is possible. The rung above is real in all
                 // three. See `ops::Inspection::fidelity_evaluated`.
-                if !i.fidelity_evaluated {
+                //
+                // The hint must name a verb that works on this input: `test`
+                // refuses a bare stream, so a bare `.gz` (withheld because
+                // gzip judges its trailing bytes only at the end) points at
+                // a full decode instead. "Bare" = the chain is the outer
+                // format alone and that format is not a container.
+                let bare_stream = i.chain == i.format.as_str()
+                    && stuffr::registry().container(i.format).is_none();
+                if !i.fidelity_evaluated && bare_stream {
+                    writeln!(
+                        out,
+                        "fidelity: not evaluated (info reads only the start of the \
+                         stream; run `stuffr cat FILE >/dev/null` for that)"
+                    )?;
+                } else if !i.fidelity_evaluated {
                     writeln!(
                         out,
                         "fidelity: not evaluated (info does not open the archive; \

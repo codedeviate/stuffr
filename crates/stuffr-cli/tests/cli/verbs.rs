@@ -359,27 +359,32 @@ fn info_on_a_piped_zip_does_not_claim_nothing_was_approximated() {
 /// open, so its empty warning list is a genuine finding and `info` must go on
 /// reporting it. Without this, "withhold the claim" could have been
 /// implemented by withholding it everywhere.
+///
+/// xz, not gzip: since the T10 review's I1 a codec declaring
+/// `reports_trailing_data` (gzip, bzip2) withholds the claim, because what
+/// follows its last member is judged only at the end of the stream — see
+/// `info_withholds_the_claim_for_a_codec_that_judges_its_trailing_bytes`.
 #[test]
 fn info_on_a_bare_codec_stream_still_reports_nothing_approximated() {
     let src = tmp("info-codec-fidelity.txt");
-    let gz = tmp("info-codec-fidelity.txt.gz");
-    let _ = std::fs::remove_file(&gz);
+    let xz = tmp("info-codec-fidelity.txt.xz");
+    let _ = std::fs::remove_file(&xz);
     std::fs::write(&src, b"payload").unwrap();
     assert!(
         Command::new(STUFFR)
-            .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
+            .args(["pack", src.to_str().unwrap(), "--format", "xz"])
             .status()
             .unwrap()
             .success()
     );
-    let bytes = std::fs::read(&gz).unwrap();
+    let bytes = std::fs::read(&xz).unwrap();
 
     for (what, text) in [
         (
             "a file",
             String::from_utf8(
                 Command::new(STUFFR)
-                    .args(["info", gz.to_str().unwrap()])
+                    .args(["info", xz.to_str().unwrap()])
                     .output()
                     .unwrap()
                     .stdout,
@@ -399,7 +404,7 @@ fn info_on_a_bare_codec_stream_still_reports_nothing_approximated() {
     // The JSON shape carries the same distinction, since `warnings: []` is
     // ambiguous on its own.
     let out = Command::new(STUFFR)
-        .args(["info", "--json", gz.to_str().unwrap()])
+        .args(["info", "--json", xz.to_str().unwrap()])
         .output()
         .unwrap();
     let v: serde_json::Value = serde_json::from_str(&String::from_utf8(out.stdout).unwrap())

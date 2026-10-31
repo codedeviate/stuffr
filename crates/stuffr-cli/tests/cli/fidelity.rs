@@ -797,6 +797,12 @@ fn a_gnu_tar_transform_rewritten_symlink_target_is_skipped_not_fatal() {
 /// Every cell is checked against ground truth from `test`, which actually
 /// opens the archive — so the assertions cannot drift into merely agreeing
 /// with the predicate.
+///
+/// The wrapper is xz, not gzip: since the T10 review's I1 a gzip layer
+/// withholds the claim by itself (it judges its trailing bytes only at the
+/// end of the stream — see
+/// `info_withholds_the_claim_for_a_codec_that_judges_its_trailing_bytes`), so
+/// a gzip wrapper would hide the container × rung rule this test is about.
 #[test]
 fn info_does_not_claim_nothing_was_approximated_for_a_container_under_a_codec() {
     let dir = tmp("info-codec-wrapped-matrix");
@@ -824,19 +830,13 @@ fn info_does_not_claim_nothing_was_approximated_for_a_container_under_a_codec() 
         // the clearest way to get exactly that byte sequence.
         assert!(
             Command::new(STUFFR)
-                .args([
-                    "pack",
-                    bare.to_str().unwrap(),
-                    "--format",
-                    "gzip",
-                    "--force"
-                ])
+                .args(["pack", bare.to_str().unwrap(), "--format", "xz", "--force"])
                 .status()
                 .unwrap()
                 .success(),
-            "wrapping the .{ext} in gzip must succeed"
+            "wrapping the .{ext} in xz must succeed"
         );
-        let wrapped = dir.join(format!("bundle.{ext}.gz"));
+        let wrapped = dir.join(format!("bundle.{ext}.xz"));
         let bytes = std::fs::read(&wrapped).unwrap();
 
         // Ground truth first, from the verb that opens the archive. Since
@@ -844,19 +844,13 @@ fn info_does_not_claim_nothing_was_approximated_for_a_container_under_a_codec() 
         // end, so a zip whose index agrees loses nothing even under a codec;
         // what a forward read CAN lose is shown by a cloaked one, whose
         // disagreement only that end-of-stream read finds. So the zip leg
-        // gzips a cloaked copy. info sees neither far and withholds for both.
+        // compresses a cloaked copy. info sees neither far and withholds for both.
         if has_trailing_index {
             let clean = std::fs::read(&bare).unwrap();
             std::fs::write(&bare, cloak_first_local_name(&clean)).unwrap();
             assert!(
                 Command::new(STUFFR)
-                    .args([
-                        "pack",
-                        bare.to_str().unwrap(),
-                        "--format",
-                        "gzip",
-                        "--force"
-                    ])
+                    .args(["pack", bare.to_str().unwrap(), "--format", "xz", "--force"])
                     .status()
                     .unwrap()
                     .success()
@@ -871,12 +865,12 @@ fn info_does_not_claim_nothing_was_approximated_for_a_container_under_a_codec() 
         let really_loses = !strict.status.success();
         assert_eq!(
             really_loses, has_trailing_index,
-            ".{ext}.gz: only a trailing index can be missed by a forward read; \
+            ".{ext}.xz: only a trailing index can be missed by a forward read; \
              stderr: {strict_err}"
         );
 
         // (a) A SEEKABLE FILE, where the path's extensions name the whole
-        //     chain (`bundle.zip.gz` -> zip over gzip). This is the cell
+        //     chain (`bundle.zip.xz` -> zip over xz). This is the cell
         //     I2 reported: `rung: exact`, because the FILE is seekable,
         //     over a container that is not read from that file at all.
         let text = String::from_utf8(
@@ -889,16 +883,16 @@ fn info_does_not_claim_nothing_was_approximated_for_a_container_under_a_codec() 
         .unwrap();
         assert!(
             text.contains("exact"),
-            ".{ext}.gz from a file: the rung is real and unchanged: {text}"
+            ".{ext}.xz from a file: the rung is real and unchanged: {text}"
         );
         assert!(
             text.contains(ext),
-            ".{ext}.gz from a file must resolve the whole chain: {text}"
+            ".{ext}.xz from a file must resolve the whole chain: {text}"
         );
         if has_trailing_index {
             assert!(
                 text.contains("not evaluated"),
-                ".{ext}.gz from a file: the zip is read out of a gzip decoder, which is \
+                ".{ext}.xz from a file: the zip is read out of an xz decoder, which is \
                  forward-only however seekable the FILE is — `test` on these very bytes \
                  exits 4. info has not looked and must not claim: {text}"
             );
@@ -906,7 +900,7 @@ fn info_does_not_claim_nothing_was_approximated_for_a_container_under_a_codec() 
         } else {
             assert!(
                 text.contains("nothing approximated"),
-                ".{ext}.gz from a file carries every entry's metadata inline, so a forward \
+                ".{ext}.xz from a file carries every entry's metadata inline, so a forward \
                  read loses nothing — withholding here would be a false negative, the \
                  round-3 defect repeating: {text}"
             );
@@ -916,17 +910,17 @@ fn info_does_not_claim_nothing_was_approximated_for_a_container_under_a_codec() 
         // (b) A PIPE with no path. `inspect` resolves the chain with the
         //     SHALLOW `resolve_chain` — it identifies a stream without
         //     decoding it, and seeing the zip inside would mean running the
-        //     gzip decoder. With no path to read extensions from, there is
+        //     xz decoder. With no path to read extensions from, there is
         //     nothing to name the inner layer, so the chain bottoms out at
         //     the codec and `info` reports on the codec alone. That is a
         //     documented limit of `info`, not the I2 defect: the claim it
         //     makes is about what it identified. Pinned so the two cells
         //     cannot be confused for one another later.
         let text = info_over_stdin(&bytes);
-        assert!(text.contains("forward-only"), ".{ext}.gz on a pipe: {text}");
+        assert!(text.contains("forward-only"), ".{ext}.xz on a pipe: {text}");
         assert!(
-            text.contains("chain:    gzip"),
-            ".{ext}.gz on a pipe resolves to the codec alone — info does not decode to \
+            text.contains("chain:    xz"),
+            ".{ext}.xz on a pipe resolves to the codec alone — info does not decode to \
              look inside: {text}"
         );
 
@@ -2224,5 +2218,60 @@ fn nul_padding_after_a_tar_gz_passes_strict_fidelity() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(0), "{}: {stderr}", args[0]);
         assert!(!stderr.contains("followed by"), "{}: {stderr}", args[0]);
+    }
+}
+
+/// The T10 review's I1: `info` printed "fidelity: nothing approximated" for a
+/// bare `.gz`/`.bz2` whose decode then warned about the bytes after its last
+/// member. gzip and bzip2 judge those only at the end of the stream, which
+/// `info` never reads, so it withholds the claim — and points at a verb that
+/// works on a bare stream (`test` refuses one), while a `.tar.gz` still
+/// points at `test`.
+#[test]
+fn info_withholds_the_claim_for_a_codec_that_judges_its_trailing_bytes() {
+    let dir = tmp_dir();
+    for (ext, flip) in [("gz", 0x1eu8), ("bz2", 0x41)] {
+        let a = packed(&dir, &format!("a.{ext}"), &b"first member\n".repeat(100));
+        let b = packed(&dir, &format!("b.{ext}"), &b"SECOND MEMBER\n".repeat(100));
+        let mut x = [a.clone(), b].concat();
+        x[a.len()] = flip;
+        let input = dir.join(format!("two-flip.{ext}"));
+        std::fs::write(&input, &x).unwrap();
+
+        let cat = run_output(&["cat", input.to_str().unwrap()]);
+        assert!(
+            String::from_utf8_lossy(&cat.stderr).contains("stream is followed by"),
+            ".{ext}: ground truth, the decode warns"
+        );
+        for (what, text) in [
+            (
+                "a file",
+                String::from_utf8(run_output(&["info", input.to_str().unwrap()]).stdout).unwrap(),
+            ),
+            ("a pipe", info_over_stdin(&x)),
+        ] {
+            assert!(
+                !text.contains("nothing approximated"),
+                ".{ext} {what}: {text}"
+            );
+            assert!(
+                text.contains("not evaluated") && text.contains("stuffr cat FILE >/dev/null"),
+                ".{ext} {what}: {text}"
+            );
+            assert!(!text.contains("stuffr test"), ".{ext} {what}: {text}");
+        }
+        let json = run_output(&["info", "--json", input.to_str().unwrap()]);
+        let v: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(json.stdout).unwrap()).unwrap();
+        assert_eq!(v["fidelity_evaluated"], false, ".{ext}: {v}");
+
+        let tarball = dir.join(format!("t.tar.{ext}"));
+        std::fs::write(&tarball, packed_tree(&dir, &format!("t.tar.{ext}"))).unwrap();
+        let text =
+            String::from_utf8(run_output(&["info", tarball.to_str().unwrap()]).stdout).unwrap();
+        assert!(
+            text.contains("not evaluated") && text.contains("stuffr test"),
+            ".tar.{ext}: {text}"
+        );
     }
 }

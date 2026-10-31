@@ -188,6 +188,9 @@ impl Codec for Gzip {
             // deflate's window is 32 KiB; miniz_oxide's encoder state plus our
             // 64 KiB copy buffer puts one worker comfortably under 256 KiB.
             memory_per_worker: Some(256 * 1024),
+            // What follows the last verified member is judged at the end of
+            // the stream (`member_tail`), and junk there is a warning.
+            reports_trailing_data: true,
             ..CodecCaps::round_trip()
         }
     }

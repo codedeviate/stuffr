@@ -1485,9 +1485,11 @@ pub struct Inspection {
     /// know what a real read would have approximated. The list is empty
     /// because nothing looked, not because nothing was lost.
     ///
-    /// `false` only when a forward read of THIS container could actually
-    /// have lost something — a container declaring `trailing_index` that
-    /// will NOT be read authoritatively. See
+    /// `false` only when a read could actually have lost something that
+    /// `inspect` did not look at: a container declaring `trailing_index`
+    /// that will NOT be read authoritatively, or a codec layer declaring
+    /// `CodecCaps::reports_trailing_data` (gzip, bzip2), whose trailing
+    /// bytes are judged only at the end of the stream. See
     /// `fidelity_is_knowable_without_opening` for the full rule and for
     /// which `ContainerCaps` flags count.
     ///
@@ -1495,8 +1497,9 @@ pub struct Inspection {
     /// (`bundle.zip.gz`) however seekable the file on disk is — the zip is
     /// read out of a decoder, not out of the file. `true` for a seekable
     /// bare zip (the central directory WAS read), for tar, ar and cpio
-    /// piped, wrapped or not (no trailing index to miss), and for a bare
-    /// codec stream (no container at all).
+    /// piped or under a codec that reports no trailing data (`.tar.xz`), and
+    /// for a bare stream of such a codec. `false` for a bare `.gz`/`.bz2`
+    /// and for a `.tar.gz`/`.tar.bz2`.
     ///
     /// This exists because the empty list was previously indistinguishable
     /// from a real one, and zip is the first container for which that was a
@@ -1677,7 +1680,20 @@ pub fn inspect_with_limit(
 /// * `needs_seek` — such a container cannot be read forward AT ALL; the
 ///   ladder spills instead, reaching an authoritative rung, so condition 1
 ///   already excludes it.
+///
+/// # A codec layer can withhold it too
+///
+/// A codec declaring [`stuffr_core::CodecCaps::reports_trailing_data`]
+/// (gzip, bzip2) judges what follows its last verified member only at the
+/// end of the stream, and junk there is
+/// [`stuffr_core::Fidelity::TrailingDataIgnored`]. `inspect` reads a prefix,
+/// so for such a layer — bare, or with a container beneath it — it has not
+/// looked either (the T10 review's I1: `info` said "nothing approximated"
+/// for a `.gz` that `cat` then warned about).
 fn fidelity_is_knowable_without_opening(registry: &Registry, chain: &Chain, rung: Rung) -> bool {
+    if any_codec_reports_trailing_data(registry, chain) {
+        return false;
+    }
     let Some(container) = chain.container() else {
         // A bare codec stream: no container to open, so the empty warning
         // list is a genuine finding rather than an absence of looking.
@@ -1703,6 +1719,23 @@ fn fidelity_is_knowable_without_opening(registry: &Registry, chain: &Chain, rung
     // `TrailingIndexUnread` and `EntryCountUnknown` and exits 4 on the very
     // bytes `info` was calling "nothing approximated".
     rung.is_authoritative() && !reaches_container_through_a_codec(chain)
+}
+
+/// Whether any codec layer of `chain` declares
+/// [`stuffr_core::CodecCaps::reports_trailing_data`]. A codec this build does
+/// not have cannot be decoded at all, so it withholds nothing.
+fn any_codec_reports_trailing_data(registry: &Registry, chain: &Chain) -> bool {
+    let mut layer = chain;
+    while let Chain::Codec { codec, inner } = layer {
+        if registry
+            .codec(*codec)
+            .is_some_and(|c| c.caps().reports_trailing_data)
+        {
+            return true;
+        }
+        layer = inner;
+    }
+    false
 }
 
 /// Whether `chain` reaches its container through at least one

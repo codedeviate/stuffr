@@ -207,6 +207,20 @@ pub struct CodecCaps {
     /// failure above — is unchanged; only `compress_z::CompressZ` sets this
     /// explicitly.
     pub truncation_undetectable: bool,
+
+    /// The decoder may record [`crate::Fidelity::TrailingDataIgnored`] in
+    /// [`crate::DecodeOpts::fidelity`]: the format is a concatenation of
+    /// members, and bytes after the last verified one that are neither a
+    /// member nor padding are read through and ignored with a warning (gzip,
+    /// bzip2).
+    ///
+    /// Such a stream's fidelity is only known once it has been read to the
+    /// end, so `stuffr info`, which decodes nothing beyond its probe prefix,
+    /// must not say "nothing approximated" for it — nor for a container
+    /// reached through it (`.tar.gz`). That is what reads this field: a
+    /// fact the codec declares, rather than a list of format names kept
+    /// elsewhere.
+    pub reports_trailing_data: bool,
 }
 
 /// What a container can do, and what it needs from its input.
@@ -445,6 +459,7 @@ impl CodecCaps {
             memory_per_worker: None,
             weak_encoder: false,
             truncation_undetectable: false,
+            reports_trailing_data: false,
         }
     }
 
@@ -461,6 +476,7 @@ impl CodecCaps {
             memory_per_worker: None,
             weak_encoder: false,
             truncation_undetectable: false,
+            reports_trailing_data: false,
         }
     }
 }

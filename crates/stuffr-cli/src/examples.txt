@@ -528,11 +528,20 @@ INSPECTING A STREAM (DECODING AT MOST ITS FIRST 4 KiB)
       "LISTING AND TESTING" below); one whose directory cannot be read
       exits 4 with two warnings.
 
+  gzip and bzip2 withhold it too, bare or with an archive inside
+  (`notes.txt.gz`, `bundle.tar.gz`, `bundle.tar.bz2`): those files are
+  concatenations of members, and what follows the last member is judged
+  only at the end of the stream — junk there is a warning (and exit 4
+  under --strict-fidelity). For a bare stream info points at
+  `stuffr cat FILE >/dev/null`, which reads it whole (`test` takes
+  archives only); for an archive, at `stuffr test`.
+
   Everywhere else the claim is true and info still makes it: a seekable
   bare zip read its central directory, a tar, ar or cpio has no trailing
-  index to miss piped, wrapped or not, and a bare codec stream has no
-  container at all. In `--json` the same distinction is the
-  `fidelity_evaluated` field, because `"warnings": []` cannot carry it.
+  index to miss piped or under xz, zstd and the rest, and a bare stream of
+  those codecs has no container at all. In `--json` the same distinction
+  is the `fidelity_evaluated` field, because `"warnings": []` cannot carry
+  it.
 
   The `detected:` line says how the outer format was decided: `magic`,
   `extension` (no magic matched; the name decided), or `magic-unconfirmed` /

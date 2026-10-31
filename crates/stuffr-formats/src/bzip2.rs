@@ -181,6 +181,9 @@ impl Codec for Bzip2 {
             // Wheeler transform buffers. 4 MiB is a defensible round figure
             // for "several times 900 KiB", not a profiled number.
             memory_per_worker: Some(4 * 1024 * 1024),
+            // What follows the last verified member is judged at the end of
+            // the stream (`member_tail`), and junk there is a warning.
+            reports_trailing_data: true,
             ..CodecCaps::round_trip()
         }
     }
