@@ -980,11 +980,15 @@ pub fn decompress_with(
             // written AND flushed. Publishing earlier risks a truncated file
             // visible under the real name.
             publish(finish)?;
+            // What the codec noticed only at the end of its stream — trailing
+            // bytes after the last member (`Fidelity::TrailingDataIgnored`).
+            let mut fidelity = FidelityReport::new(rung);
+            decode_opts.fidelity.drain_into(&mut fidelity);
             Ok(Outcome {
                 bytes_in: consumed.load(Ordering::Relaxed),
                 bytes_out: guard.produced(),
                 format,
-                fidelity: FidelityReport::new(rung),
+                fidelity,
                 notes: Vec::new(),
             })
         }
@@ -1113,6 +1117,9 @@ pub struct ConvertSource {
     /// mode's [`crate::entries::ArchiveBudget`] divides by. `None` on stdin,
     /// where the running `consumed` tally stands in for it.
     compressed_total: Option<u64>,
+    /// The decoders' fidelity sink (`DecodeOpts::fidelity`), drained into the
+    /// conversion's report once the source has been read.
+    fidelity: stuffr_core::FidelitySink,
 }
 
 /// What a [`ConvertSource`] carries, taken apart for the write half that
@@ -1168,6 +1175,7 @@ impl ConvertSource {
             consumed,
             rung,
             compressed_total,
+            fidelity: decode_opts.fidelity,
         })
     }
 
@@ -1304,6 +1312,7 @@ fn write_recompressed(
     o: &RecompressOpts,
 ) -> Result<Outcome> {
     let from = src.from_input.clone();
+    let codec_fidelity = src.fidelity.clone();
     let (chain, mut decoded, consumed, rung, _compressed_total) = src.into_parts();
 
     let format = match (o.codec, chain.outermost_codec(), chain.container()) {
@@ -1338,11 +1347,13 @@ fn write_recompressed(
     match run() {
         Ok(()) => {
             publish(finish)?;
+            let mut fidelity = FidelityReport::new(rung);
+            codec_fidelity.drain_into(&mut fidelity);
             Ok(Outcome {
                 bytes_in: consumed.load(Ordering::Relaxed),
                 bytes_out: written.load(Ordering::Relaxed),
                 format,
-                fidelity: FidelityReport::new(rung),
+                fidelity,
                 notes: Vec::new(),
             })
         }

@@ -5,16 +5,17 @@
 //! nonexistent `libbz2-rs-sys` feature flag) actually pulls in. No C
 //! toolchain is required to build this codec.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, Write};
 
 use bzip2::Compression;
 use bzip2::bufread::BzDecoder as BzMemberDecoder;
 use bzip2::write::BzEncoder;
 use stuffr_core::{
-    Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, FormatMeta,
-    MagicRule, Result, Sink, Source, StreamOnly,
+    Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FidelitySink, FormatId,
+    FormatMeta, MagicRule, Result, Sink, Source, StreamOnly,
 };
 
+use crate::member_tail::{self, Header, PeekBuf, Rule};
 use crate::normalize::{MALFORMED_AS_INVALID_INPUT_EOF, NormalizeDecodeErrors};
 
 pub const BZIP2: FormatId = FormatId::new("bzip2");
@@ -41,41 +42,92 @@ const BZIP2_MAGIC: &[MagicRule] = &[MagicRule {
 /// its `Ok(0)` is unambiguous proof of a complete, valid stream, never a
 /// probe result, and truncation anywhere up through that footer still
 /// errors straight out of `BzMemberDecoder` itself before this type's own
-/// peek ever runs. From there this type peeks (`BufRead::fill_buf`,
-/// non-consuming) for the `BZh` magic on the same `BufReader`, exactly as
-/// `MultiMemberGzip` peeks for gzip's: a match chains into a fresh
-/// `BzMemberDecoder` (the legitimate multi-stream case, e.g. `pbzip2`
-/// output, unchanged from before); anything else — a mismatch, or fewer
-/// than three bytes because the source is genuinely exhausted — stops
-/// cleanly, matching the reference tools.
+/// peek ever runs. From there [`crate::member_tail::after_member`] decides
+/// what the remaining bytes are, exactly as for `MultiMemberGzip`: a stream
+/// header chains into a fresh `BzMemberDecoder` (the legitimate
+/// multi-stream case, e.g. `pbzip2` output); NUL/`'X'` padding stops
+/// silently; a damaged header (`BZh` and a level outside `1`..`9`, or
+/// `BZh1`..`BZh9` followed by neither the block magic nor the end-of-stream
+/// magic, or the input ending inside `BZh`) is corrupt; any other tail is
+/// ignored with [`stuffr_core::Fidelity::TrailingDataIgnored`] recorded in
+/// [`DecodeOpts::fidelity`] (PARSE-1, security audit 2026-10-31: it used to
+/// stop silently, so one flipped byte at a stream boundary dropped every
+/// later stream at exit 0).
 struct MultiMemberBzip2<'a> {
-    /// `None` only once a clean stop has been decided; every further read
-    /// returns `Ok(0)` without repeating the peek.
-    cur: Option<BzMemberDecoder<BufReader<Box<dyn Source + 'a>>>>,
+    /// `None` once the stream has ended (or failed); see `failed`.
+    cur: Option<BzMemberDecoder<PeekBuf<Box<dyn Source + 'a>>>>,
+    /// Set when the tail check refused: later reads repeat the refusal
+    /// instead of reporting a clean end.
+    failed: bool,
+    sink: FidelitySink,
 }
 
 impl<'a> MultiMemberBzip2<'a> {
-    fn new(src: Box<dyn Source + 'a>) -> Self {
+    fn new(src: Box<dyn Source + 'a>, sink: FidelitySink) -> Self {
         Self {
-            cur: Some(BzMemberDecoder::new(BufReader::new(src))),
+            cur: Some(BzMemberDecoder::new(PeekBuf::new(src))),
+            failed: false,
+            sink,
         }
     }
 }
+
+/// bzip2's half of [`crate::member_tail`]'s rule: `BZh`, a level digit, then
+/// the first block's magic or (for an empty stream) the end-of-stream magic
+/// — the same fields [`confirm`] checks.
+const TAIL_RULE: Rule = Rule {
+    format: BZIP2,
+    magic: BZIP2_MAGIC_BYTES,
+    header_len: 10,
+    judge: |head| {
+        if !head.starts_with(BZIP2_MAGIC_BYTES) {
+            return Header::Junk;
+        }
+        if head.get(3).is_some_and(|d| !(b'1'..=b'9').contains(d)) {
+            return Header::Corrupt(
+                "a later bzip2 stream's header names a block size outside 1-9: a corrupt header \
+                 in a multi-stream file",
+            );
+        }
+        if let Some(next) = head.get(4..10)
+            && next != BLOCK_MAGIC
+            && next != END_MAGIC
+        {
+            return Header::Corrupt(
+                "a later bzip2 stream's header is followed by neither a block nor the \
+                 end-of-stream magic: a corrupt header in a multi-stream file",
+            );
+        }
+        Header::Next
+    },
+};
 
 impl std::io::Read for MultiMemberBzip2<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
             let Some(dec) = self.cur.as_mut() else {
+                if self.failed {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "bzip2 stream previously failed to decode",
+                    ));
+                }
                 return Ok(0);
             };
             match dec.read(buf)? {
                 0 => {
                     let mut rest = self.cur.take().unwrap().into_inner();
-                    if rest.fill_buf()?.starts_with(BZIP2_MAGIC_BYTES) {
-                        self.cur = Some(BzMemberDecoder::new(rest));
-                        continue;
+                    match member_tail::after_member(&mut rest, &TAIL_RULE, &self.sink) {
+                        Ok(true) => {
+                            self.cur = Some(BzMemberDecoder::new(rest));
+                            continue;
+                        }
+                        Ok(false) => return Ok(0),
+                        Err(e) => {
+                            self.failed = true;
+                            return Err(e);
+                        }
                     }
-                    return Ok(0);
                 }
                 n => return Ok(n),
             }
@@ -151,10 +203,10 @@ impl Codec for Bzip2 {
     fn decoder<'a>(
         &self,
         src: Box<dyn Source + 'a>,
-        _o: &DecodeOpts,
+        o: &DecodeOpts,
     ) -> Result<Box<dyn Source + 'a>> {
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
-            MultiMemberBzip2::new(src),
+            MultiMemberBzip2::new(src, o.fidelity.clone()),
             MALFORMED_AS_INVALID_INPUT_EOF,
         ))))
     }
@@ -517,13 +569,80 @@ mod tests {
             for pad_len in [1, 2, 5, 9, 10, 16, 40, 512] {
                 let mut padded = packed.clone();
                 padded.extend(std::iter::repeat_n(pad_byte, pad_len));
+                let (out, warnings) = decode_tail(padded);
                 assert_eq!(
-                    decompress(padded),
+                    out.unwrap(),
                     plain,
                     "pad_byte={pad_byte:#04x} pad_len={pad_len}: trailing padding after a \
                      valid stream must not lose or corrupt the real data"
                 );
+                assert!(
+                    warnings.is_empty(),
+                    "pad_byte={pad_byte:#04x} pad_len={pad_len}: padding stays silent"
+                );
             }
+        }
+    }
+
+    fn decode_tail(bytes: Vec<u8>) -> (std::io::Result<Vec<u8>>, Vec<stuffr_core::Fidelity>) {
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(bytes)));
+        let opts = DecodeOpts::default();
+        let mut dec = Bzip2.decoder(src, &opts).unwrap();
+        let mut out = Vec::new();
+        let r = dec.read_to_end(&mut out).map(|_| out);
+        (r, opts.fidelity.warnings())
+    }
+
+    fn ignored(bytes: u64) -> Vec<stuffr_core::Fidelity> {
+        vec![stuffr_core::Fidelity::TrailingDataIgnored {
+            format: BZIP2,
+            bytes,
+        }]
+    }
+
+    /// PARSE-1: a flipped first magic byte of the second stream used to end
+    /// the decode silently after the first, dropping the second at exit 0.
+    #[test]
+    fn a_later_stream_with_a_flipped_magic_byte_is_reported_not_dropped_silently() {
+        let a = compress(&b"first member\n".repeat(100));
+        let b = compress(&b"SECOND MEMBER\n".repeat(1000));
+        let mut x = [a.clone(), b.clone()].concat();
+        x[a.len()] = 0x41;
+        let (out, warnings) = decode_tail(x);
+        assert_eq!(out.unwrap(), b"first member\n".repeat(100));
+        assert_eq!(warnings, ignored(b.len() as u64));
+    }
+
+    #[test]
+    fn trailing_junk_that_is_not_padding_is_reported_with_its_length() {
+        let plain = b"payload".repeat(10);
+        for tail in [&b"BZx"[..], b"hello", b"\0\0X", b"ZZh9"] {
+            let (out, warnings) = decode_tail([compress(&plain), tail.to_vec()].concat());
+            assert_eq!(out.unwrap(), plain, "{tail:?}");
+            assert_eq!(warnings, ignored(tail.len() as u64), "{tail:?}");
+        }
+    }
+
+    /// A tail that starts like a stream header and then cannot be one is
+    /// corrupt (exit 5), as reference lzip's "Corrupt header in multimember
+    /// file" — never a warning and never silence.
+    #[test]
+    fn a_damaged_later_stream_header_is_corrupt() {
+        let a = compress(b"first");
+        let b = compress(b"second");
+        let mut bad_level = [a.clone(), b.clone()].concat();
+        bad_level[a.len() + 3] = b'0';
+        let mut bad_block = [a.clone(), b.clone()].concat();
+        bad_block[a.len() + 4] ^= 0xff;
+        let mut cases = vec![("level 0", bad_level), ("block magic", bad_block)];
+        for cut in [b"B".as_slice(), b"BZ", b"BZh", b"BZh9", b"BZh91AY"] {
+            cases.push(("cut header", [a.clone(), cut.to_vec()].concat()));
+        }
+        for (what, x) in cases {
+            let (out, warnings) = decode_tail(x);
+            let err = out.expect_err(what);
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{what}: {err}");
+            assert!(warnings.is_empty(), "{what}");
         }
     }
 

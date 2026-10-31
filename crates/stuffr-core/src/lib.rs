@@ -36,7 +36,7 @@ pub use containment::{
 };
 pub use display::fmt_name;
 pub use error::{Error, Result};
-pub use fidelity::{Fidelity, FidelityReport, MetaFields, Rung};
+pub use fidelity::{Fidelity, FidelityReport, FidelitySink, MetaFields, Rung};
 pub use format::{
     CodecCaps, ConfirmFn, ContainerCaps, CorruptionDetection, FormatId, FormatKind, FormatMeta,
     MagicRule,

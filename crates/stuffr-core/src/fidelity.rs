@@ -281,6 +281,86 @@ pub enum Fidelity {
         entry: String,
         field: &'static str,
     },
+
+    /// A codec stream whose last complete, verified member (or stream) is
+    /// followed by bytes that are neither another member nor padding, and
+    /// were ignored.
+    ///
+    /// gzip and bzip2 files are legitimately concatenations, and the tools
+    /// that write them sometimes pad the end with NUL or `'X'` bytes, which
+    /// stay silent. Anything else after a verified member is ambiguous: it
+    /// may be harmless junk, or it may be the next member with its first
+    /// magic byte flipped — one byte that drops every later member while the
+    /// members before it still verify. The data handed back is the members
+    /// that did verify, so this is a warning rather than
+    /// [`crate::Error::Corrupt`] (the reference tools likewise say "trailing
+    /// garbage ignored" and recover the data), and `--strict-fidelity` turns
+    /// it into exit 4. A tail that starts like a damaged member header — the
+    /// magic intact and a field behind it impossible — is `Corrupt` instead,
+    /// and never reaches this variant.
+    ///
+    /// `bytes` is how many bytes were ignored, counted while the tail was
+    /// read through (never buffered).
+    #[error(
+        "`{format}` stream is followed by {bytes} byte(s) that are neither another member \
+         nor padding; they were ignored"
+    )]
+    TrailingDataIgnored { format: FormatId, bytes: u64 },
+}
+
+/// Where a codec's decoder records what it approximated.
+///
+/// A codec layer hands back only a byte stream, and what it notices — trailing
+/// data after its last member, so far — is noticed at the END of that stream,
+/// long after [`crate::Codec::decoder`] returned. So the driver hands the
+/// decoder this shared, cloneable list through [`crate::DecodeOpts::fidelity`]
+/// and folds it into its own [`FidelityReport`] once the stream has been read
+/// ([`Self::drain_into`]). Cloning shares the list: every layer of a chain
+/// built from one `DecodeOpts` records into the same one.
+///
+/// A driver that never drains it loses the warnings, the same as a caller
+/// that never looks at a report; every driver that reports fidelity drains it.
+#[derive(Clone, Default)]
+pub struct FidelitySink(std::sync::Arc<std::sync::Mutex<Vec<Fidelity>>>);
+
+impl FidelitySink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records one warning.
+    pub fn warn(&self, w: Fidelity) {
+        self.lock().push(w);
+    }
+
+    /// Moves every recorded warning into `report` (de-duplicated as
+    /// [`FidelityReport::merge`] does), leaving the sink empty.
+    pub fn drain_into(&self, report: &mut FidelityReport) {
+        for w in std::mem::take(&mut *self.lock()) {
+            if !report.warnings.contains(&w) {
+                report.warn(w);
+            }
+        }
+    }
+
+    /// A copy of what has been recorded so far.
+    pub fn warnings(&self) -> Vec<Fidelity> {
+        self.lock().clone()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Fidelity>> {
+        // A panic while holding this lock leaves a Vec that is still whole;
+        // the warnings in it are as true as before.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl fmt::Debug for FidelitySink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("FidelitySink").field(&*self.lock()).finish()
+    }
 }
 
 /// What a read cost in fidelity. Returned alongside data, never logged and
@@ -576,5 +656,39 @@ mod tests {
         let r = FidelityReport::exact();
         assert!(!r.has_warnings());
         assert!(r.is_lossless());
+    }
+
+    #[test]
+    fn trailing_data_names_the_format_and_the_byte_count() {
+        let s = Fidelity::TrailingDataIgnored {
+            format: FormatId::new("gzip"),
+            bytes: 1_401_287,
+        }
+        .to_string();
+        assert!(s.contains("gzip") && s.contains("1401287"), "{s}");
+    }
+
+    #[test]
+    fn a_sink_shared_by_clones_drains_once_into_the_report() {
+        let sink = FidelitySink::new();
+        let layer = sink.clone();
+        let w = Fidelity::TrailingDataIgnored {
+            format: FormatId::new("bzip2"),
+            bytes: 3,
+        };
+        layer.warn(w.clone());
+        layer.warn(w.clone());
+        assert_eq!(
+            sink.warnings().len(),
+            2,
+            "a clone records into the same list"
+        );
+
+        let mut report = FidelityReport::exact();
+        sink.drain_into(&mut report);
+        assert_eq!(report.warnings, vec![w], "de-duplicated as merge does");
+        assert!(sink.warnings().is_empty(), "drained");
+        sink.drain_into(&mut report);
+        assert_eq!(report.warnings.len(), 1);
     }
 }

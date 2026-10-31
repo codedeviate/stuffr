@@ -29,6 +29,13 @@ pub struct DecodeOpts {
     /// `Corrupt` (exit 5) — the file is not damaged, this build simply will
     /// not allocate that much.
     pub memory_limit: Option<u64>,
+    /// Where the decoder records what it approximated — today, bytes after a
+    /// gzip or bzip2 file's last verified member that are neither another
+    /// member nor padding ([`crate::Fidelity::TrailingDataIgnored`]). The
+    /// default is a fresh, empty sink; a driver that reports fidelity keeps a
+    /// clone and drains it into its report once the stream has been read. See
+    /// [`crate::FidelitySink`].
+    pub fidelity: crate::fidelity::FidelitySink,
 }
 
 impl std::fmt::Debug for DecodeOpts {
@@ -37,6 +44,7 @@ impl std::fmt::Debug for DecodeOpts {
             .field("threads", &self.threads)
             .field("governor", &self.governor.as_ref().map(|_| "Governor"))
             .field("memory_limit", &self.memory_limit)
+            .field("fidelity", &self.fidelity)
             .finish()
     }
 }

@@ -1,15 +1,16 @@
 //! gzip, via `flate2`'s pure-Rust backend.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 
 use flate2::Compression;
 use flate2::bufread::GzDecoder as GzMemberDecoder;
 use flate2::write::GzEncoder;
 use stuffr_core::{
-    Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, FormatMeta,
-    MagicRule, Result, Sink, Source, StreamOnly,
+    Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FidelitySink, FormatId,
+    FormatMeta, MagicRule, Result, Sink, Source, StreamOnly,
 };
 
+use crate::member_tail::{self, Header, PeekBuf, Rule};
 use crate::normalize::{MALFORMED_AS_INVALID_INPUT_EOF, NormalizeDecodeErrors};
 
 pub const GZIP: FormatId = FormatId::new("gzip");
@@ -45,14 +46,12 @@ const GZIP_MAGIC: &[MagicRule] = &[MagicRule {
 /// stops the instant one member's footer CRC verifies, and never looks for
 /// a next one — reaching its `Ok(0)` is therefore unambiguous proof the
 /// member is complete and valid, never a probe result. From there this
-/// type does its OWN, unambiguous next-member check via `BufRead::fill_buf`
-/// (the same peek-without-consuming idiom `lzip.rs`'s `GuardedLzipReader`
-/// uses): if what remains starts with the gzip magic, chain into a fresh
-/// `GzMemberDecoder` over the same `BufReader` (this is the legitimate
-/// multi-member case, unchanged from before); otherwise — a mismatch, or
-/// fewer than two bytes because the source is genuinely exhausted — stop
-/// cleanly, exactly as the reference tools do. Genuine truncation anywhere
-/// up through and including the CURRENT member's own footer is untouched:
+/// type does its OWN, unambiguous next-member check by peeking without
+/// consuming (as `lzip.rs`'s `GuardedLzipReader` does): if what remains is
+/// a gzip member header, chain into a fresh `GzMemberDecoder` over the same
+/// buffer (the legitimate multi-member case); otherwise the tail rule
+/// described below decides. Genuine truncation anywhere up through and
+/// including the CURRENT member's own footer is untouched:
 /// that error still comes straight from `GzMemberDecoder` itself, before
 /// this type's peek ever runs.
 ///
@@ -60,37 +59,93 @@ const GZIP_MAGIC: &[MagicRule] = &[MagicRule {
 /// was considered and rejected: its own doc warns it "may have read past
 /// the end of the gzip data" and that `into_inner` then loses whatever was
 /// buffered past that point — exactly the bytes this peek needs. The
-/// `bufread` variant, operating directly on a caller-owned `BufReader`,
+/// `bufread` variant, operating directly on a caller-owned buffer,
 /// consumes precisely what the deflate stream needs and leaves the rest
-/// sitting in that same `BufReader` for `fill_buf` to see.
+/// sitting in that buffer for the peek to see.
+///
+/// **What follows a verified member** is decided by
+/// [`crate::member_tail::after_member`] since PARSE-1 (security audit,
+/// 2026-10-31): the "anything else stops cleanly" above dropped every later
+/// member at exit 0 when one byte at a member boundary was flipped. NUL/`'X'`
+/// padding still stops silently; a damaged header (`1f 8b` and a method other
+/// than 8 or a reserved flag bit, or the input ending after `1f`) is corrupt;
+/// any other tail is ignored with [`stuffr_core::Fidelity::TrailingDataIgnored`]
+/// recorded in [`DecodeOpts::fidelity`]. The buffer is a
+/// [`PeekBuf`](crate::member_tail::PeekBuf), not a `BufReader`, because a
+/// `BufReader` shows a member boundary one byte before the end of its buffer
+/// as a one-byte tail.
 struct MultiMemberGzip<'a> {
-    /// `None` only once a clean stop has been decided; every further read
-    /// returns `Ok(0)` without repeating the peek.
-    cur: Option<GzMemberDecoder<BufReader<Box<dyn Source + 'a>>>>,
+    /// `None` once the stream has ended (or failed); see `failed`.
+    cur: Option<GzMemberDecoder<PeekBuf<Box<dyn Source + 'a>>>>,
+    /// Set when the tail check refused: later reads repeat the refusal
+    /// instead of reporting a clean end.
+    failed: bool,
+    sink: FidelitySink,
 }
 
 impl<'a> MultiMemberGzip<'a> {
-    fn new(src: Box<dyn Source + 'a>) -> Self {
+    fn new(src: Box<dyn Source + 'a>, sink: FidelitySink) -> Self {
         Self {
-            cur: Some(GzMemberDecoder::new(BufReader::new(src))),
+            cur: Some(GzMemberDecoder::new(PeekBuf::new(src))),
+            failed: false,
+            sink,
         }
     }
 }
+
+/// gzip's half of [`crate::member_tail`]'s rule: the magic, then RFC 1952's
+/// compression method (8, the only one defined) and flag byte (bits 5-7
+/// reserved) — the same two fields [`confirm`] checks.
+const TAIL_RULE: Rule = Rule {
+    format: GZIP,
+    magic: GZIP_MAGIC_BYTES,
+    header_len: 4,
+    judge: |head| {
+        if !head.starts_with(GZIP_MAGIC_BYTES) {
+            return Header::Junk;
+        }
+        if head.get(2).is_some_and(|&cm| cm != 8) {
+            return Header::Corrupt(
+                "a later gzip member's header names a compression method other than deflate (8): \
+                 a corrupt header in a multi-member file",
+            );
+        }
+        if head.get(3).is_some_and(|&flg| flg & 0xe0 != 0) {
+            return Header::Corrupt(
+                "a later gzip member's header sets reserved flag bits: a corrupt header in a \
+                 multi-member file",
+            );
+        }
+        Header::Next
+    },
+};
 
 impl std::io::Read for MultiMemberGzip<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
             let Some(dec) = self.cur.as_mut() else {
+                if self.failed {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "gzip stream previously failed to decode",
+                    ));
+                }
                 return Ok(0);
             };
             match dec.read(buf)? {
                 0 => {
                     let mut rest = self.cur.take().unwrap().into_inner();
-                    if rest.fill_buf()?.starts_with(GZIP_MAGIC_BYTES) {
-                        self.cur = Some(GzMemberDecoder::new(rest));
-                        continue;
+                    match member_tail::after_member(&mut rest, &TAIL_RULE, &self.sink) {
+                        Ok(true) => {
+                            self.cur = Some(GzMemberDecoder::new(rest));
+                            continue;
+                        }
+                        Ok(false) => return Ok(0),
+                        Err(e) => {
+                            self.failed = true;
+                            return Err(e);
+                        }
                     }
-                    return Ok(0);
                 }
                 n => return Ok(n),
             }
@@ -157,10 +212,10 @@ impl Codec for Gzip {
     fn decoder<'a>(
         &self,
         src: Box<dyn Source + 'a>,
-        _o: &DecodeOpts,
+        o: &DecodeOpts,
     ) -> Result<Box<dyn Source + 'a>> {
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
-            MultiMemberGzip::new(src),
+            MultiMemberGzip::new(src, o.fidelity.clone()),
             MALFORMED_AS_INVALID_INPUT_EOF,
         ))))
     }
@@ -291,11 +346,16 @@ mod tests {
             for pad_len in [1, 2, 5, 9, 10, 16, 40, 512] {
                 let mut padded = packed.clone();
                 padded.extend(std::iter::repeat_n(pad_byte, pad_len));
+                let (out, warnings) = decode_tail(padded);
                 assert_eq!(
-                    decompress(padded),
+                    out.unwrap(),
                     plain,
                     "pad_byte={pad_byte:#04x} pad_len={pad_len}: trailing padding after a \
                      valid member must not lose or corrupt the real data"
+                );
+                assert!(
+                    warnings.is_empty(),
+                    "pad_byte={pad_byte:#04x} pad_len={pad_len}: padding stays silent"
                 );
             }
         }
@@ -376,6 +436,96 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Decodes `bytes` through `src`, returning the result and what the
+    /// decoder recorded in its fidelity sink.
+    fn decode_with(src: Box<dyn Source>) -> (std::io::Result<Vec<u8>>, Vec<stuffr_core::Fidelity>) {
+        let opts = DecodeOpts::default();
+        let mut dec = Gzip.decoder(src, &opts).unwrap();
+        let mut out = Vec::new();
+        let r = dec.read_to_end(&mut out).map(|_| out);
+        (r, opts.fidelity.warnings())
+    }
+
+    fn decode_tail(bytes: Vec<u8>) -> (std::io::Result<Vec<u8>>, Vec<stuffr_core::Fidelity>) {
+        decode_with(Box::new(ReaderSource::new(std::io::Cursor::new(bytes))))
+    }
+
+    fn ignored(bytes: u64) -> Vec<stuffr_core::Fidelity> {
+        vec![stuffr_core::Fidelity::TrailingDataIgnored {
+            format: GZIP,
+            bytes,
+        }]
+    }
+
+    /// PARSE-1: a flipped first magic byte of the second member used to end
+    /// the stream silently after the first, dropping the second at exit 0.
+    #[test]
+    fn a_later_member_with_a_flipped_magic_byte_is_reported_not_dropped_silently() {
+        let a = compress(&b"first member\n".repeat(100));
+        let b = compress(&b"SECOND MEMBER\n".repeat(1000));
+        let mut x = [a.clone(), b.clone()].concat();
+        x[a.len()] = 0x1e;
+        let (out, warnings) = decode_tail(x);
+        assert_eq!(out.unwrap(), b"first member\n".repeat(100));
+        assert_eq!(warnings, ignored(b.len() as u64));
+    }
+
+    #[test]
+    fn trailing_junk_that_is_not_padding_is_reported_with_its_length() {
+        let plain = b"payload".repeat(10);
+        for tail in [&b"\x1f\x00junk"[..], b"hello", b"\0\0X", b"XXXX\0", b"\x8b"] {
+            let (out, warnings) = decode_tail([compress(&plain), tail.to_vec()].concat());
+            assert_eq!(out.unwrap(), plain, "{tail:?}");
+            assert_eq!(warnings, ignored(tail.len() as u64), "{tail:?}");
+        }
+    }
+
+    /// A tail that starts like a member header and then cannot be one is
+    /// corrupt (exit 5), as reference lzip's "Corrupt header in multimember
+    /// file" — never a warning and never silence.
+    #[test]
+    fn a_damaged_later_member_header_is_corrupt() {
+        let a = compress(b"first");
+        let b = compress(b"second");
+        let mut bad_method = [a.clone(), b.clone()].concat();
+        bad_method[a.len() + 2] = 7;
+        let mut reserved = [a.clone(), b.clone()].concat();
+        reserved[a.len() + 3] |= 0x40;
+        let magic_cut = [a.clone(), vec![0x1f]].concat();
+        let header_cut = [a.clone(), vec![0x1f, 0x8b, 8]].concat();
+        for (what, x) in [
+            ("method 7", bad_method),
+            ("reserved flag", reserved),
+            ("1f then EOF", magic_cut),
+            ("header cut short", header_cut),
+        ] {
+            let (out, warnings) = decode_tail(x);
+            let err = out.expect_err(what);
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{what}: {err}");
+            assert!(warnings.is_empty(), "{what}");
+        }
+    }
+
+    /// A member boundary is found whatever the source's read sizes — a
+    /// `BufReader` showed a boundary one byte before its buffer's end as a
+    /// one-byte tail.
+    #[test]
+    fn members_chain_through_a_source_that_reads_one_byte_at_a_time() {
+        struct Trickle(std::io::Cursor<Vec<u8>>);
+        impl std::io::Read for Trickle {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let n = out.len().min(1);
+                self.0.read(&mut out[..n])
+            }
+        }
+        let x = [compress(b"one-"), compress(b"two-"), compress(b"three")].concat();
+        let (out, warnings) = decode_with(Box::new(ReaderSource::new(Trickle(
+            std::io::Cursor::new(x),
+        ))));
+        assert_eq!(out.unwrap(), b"one-two-three");
+        assert!(warnings.is_empty());
     }
 
     #[test]

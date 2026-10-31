@@ -219,6 +219,8 @@ pub(crate) mod confirm_test;
 #[cfg(any(feature = "lzma-c", feature = "lzma-pure"))]
 mod lzma_shared;
 mod normalize;
+#[cfg(any(feature = "gzip", feature = "bzip2"))]
+mod member_tail;
 #[cfg(any(feature = "lz4", feature = "zstd-c", feature = "zstd-pure"))]
 mod skippable;
 #[cfg(any(feature = "xz-c", feature = "xz-pure"))]

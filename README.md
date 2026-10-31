@@ -2245,6 +2245,18 @@ upgrade: an end record whose two counts disagree is exit 5 (was a warning), a
 multi-disk end record is exit 5 (was 3), AES method 99 without its extra field is
 exit 3 (was 5), and a Unicode Path extra field with a bad CRC is ignored (was exit 5).
 
+A gzip or bzip2 file is a concatenation of members, and what follows the last one
+that verified is now judged rather than dropped: NUL or `'X'` padding is silent,
+as before; a damaged member header (gzip `1f 8b` with a method other than 8 or a
+reserved flag bit, bzip2 `BZh` with a bad level or block magic, or the file ending
+inside the magic) is corrupt, exit 5; any other tail raises
+`Fidelity::TrailingDataIgnored` (`` `gzip` stream is followed by N byte(s) that are
+neither another member nor padding; they were ignored ``), printed by `unpack`,
+`cat` and `convert`, exit 4 under `--strict-fidelity`. Before, one flipped byte at
+a member boundary silently dropped every later member at exit 0. A codec under a
+container (`.tar.gz`) does not report it yet; the container's own end-of-archive
+check covers the boundary case there.
+
 ### 3. One governed thread budget, conservative by default
 
 One pool for the whole process; nothing spawns a thread outside it.
