@@ -41,6 +41,8 @@ const ZE_LOGIC: i32 = 5;
 const ZE_NONE: i32 = 12;
 /// ziperr.h:ZE_NAME
 const ZE_NAME: i32 = 13;
+/// ziperr.h:ZE_CREAT
+const ZE_CREAT: i32 = 15;
 
 /// What a name found on disk is, by the `stat` zip made of it (`lstat`
 /// under `-y`).
@@ -1409,6 +1411,19 @@ pub(crate) fn run(z: &mut Zr) -> Exit {
         return super::fix::run(z);
     }
     let zipfile = z.o.zipfile.clone().unwrap_or_default();
+    // deviation 31: a symlink at the output name zip must not write through
+    // is refused before the archive is read (`--out`: any link; in place:
+    // one that does not lead to a non-empty regular file, which reading
+    // would otherwise answer first)
+    let out_path = z.o.out_path.clone().unwrap_or_else(|| zipfile.clone());
+    if z.o.show_files == 0
+        && !z.o.zip_to_stdout
+        && !out_path.is_empty()
+        && out_path != b"-"
+        && super::sink::refused_output_link(&z.host.path(&out_path), !z.o.have_out)
+    {
+        return z.ziperr_os(ZE_CREAT, &out_path, &super::sink::link_refusal());
+    }
     // read the zip file if it exists (zipfile.c:readzipfile)
     let ar = match readzip::read_archive(z) {
         Ok(a) => a,

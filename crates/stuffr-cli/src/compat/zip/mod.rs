@@ -346,18 +346,22 @@
 //!     remove it. Pinned by
 //!     `tests::an_interrupt_during_replace_leaves_a_whole_archive` and
 //!     `tests::an_interrupt_after_a_failed_replace_keeps_the_temporary`.
-//! 31. Hardening (ruling T5 of the 2026-10-31 security audit): a symbolic
-//!     link at the archive's name that leads to no regular file (dangling,
-//!     or naming a directory or a device) is refused before any work: `zip
-//!     I/O error: Too many levels of symbolic links`, `zip error: Could not
-//!     create output file (NAME)`, exit 15, the link kept, no temporary
-//!     left. Info-ZIP follows it (`fopen`, then `fileio.c:replace`'s copy
-//!     for a symlinked archive), creating the file a dangling link names.
-//!     A link to an existing regular file is still updated through it, as
-//!     Info-ZIP updates it (`replace`'s copy), and `replace` itself refuses
-//!     a link that has gone dangling by then. `zipcloak`, `zipnote -w` and
-//!     `-F`/`-FF` share `replace`'s check. Why: a planted link must not
-//!     redirect where the archive is written.
+//! 31. Hardening (ruling T5 of the 2026-10-31 security audit): zip never
+//!     writes through a symbolic link at an output name that is not the
+//!     archive it read. Info-ZIP follows any link there (`fopen`, then
+//!     `fileio.c:replace`'s copy for a symlinked archive): a dangling one
+//!     creates the file it names, a live one at `-O`/`--out` truncates its
+//!     target. stuffr refuses, before any work, a link at `-O`/`--out`
+//!     (also `-F`/`-FF`'s output and `zipcloak -O`) whatever it points at,
+//!     and a link at the archive's own name unless it leads to a non-empty
+//!     regular file (an archive zip read): dangling, or naming an empty
+//!     file, a directory or a device. The refusal is `zip I/O error: Too
+//!     many levels of symbolic links`, `zip error: Could not create output
+//!     file (NAME)`, exit 15, the link kept, no temporary left. An archive
+//!     reached through a link to a non-empty file is still updated through
+//!     it, as Info-ZIP updates it (`replace`'s copy), and `replace` checks
+//!     again (split parts as `-O` names); `zipnote -w` shares it. Why: a
+//!     planted link must not redirect where an archive is written.
 //! 32. Hardening (ruling T5): `zipsplit` opens its index and each part
 //!     `O_NOFOLLOW`. zipsplit truncates whatever is at the name
 //!     (`fopen(.., "w")`), writing through a symlink there, live or

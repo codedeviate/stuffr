@@ -63,6 +63,7 @@ const ZE_EOF: i32 = 2;
 const ZE_FORM: i32 = 3;
 const ZE_BIG: i32 = 6;
 const ZE_TEMP: i32 = 10;
+const ZE_CREAT: i32 = 15;
 const ZE_READ: i32 = 11;
 const ZE_WRITE: i32 = 14;
 const ZIP_UWORD32_MAX: u64 = 0xffff_ffff;
@@ -103,6 +104,10 @@ pub(crate) fn run(z: &mut Zr) -> Exit {
     }
     let zipfile = z.o.zipfile.clone().unwrap_or_default();
     let out_path = z.o.out_path.clone().unwrap_or_else(|| zipfile.clone());
+    // deviation 31: `--out` is never written through a symlink
+    if super::sink::refused_output_link(&z.host.path(&out_path), false) {
+        return z.ziperr_os(ZE_CREAT, &out_path, &super::sink::link_refusal());
+    }
     let dir: Vec<u8> = match &z.o.tempath {
         Some(t) => {
             let mut d = t.clone();
@@ -190,7 +195,7 @@ pub(crate) fn run(z: &mut Zr) -> Exit {
     // Replace old zip file with new zip file, leaving only the new one
     if zipfile != b"-" {
         let tmp = temp.path.take().unwrap_or_default();
-        if let Err((code, err)) = replace(&z.host.path(&out_path), &tmp) {
+        if let Err((code, err)) = replace(&z.host.path(&out_path), &tmp, false) {
             z.zipwarn(m::NEW_ZIP_LEFT_AS.as_bytes(), &tempzip);
             return zerr(z, code, m::WAS_REPLACING.as_bytes(), Some(&err));
         }

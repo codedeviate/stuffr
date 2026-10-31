@@ -263,7 +263,7 @@ fn an_interrupt_during_replace_leaves_a_whole_archive() {
                 }
                 drop(f);
                 sink::RAISE_MID_REPLACE.store(true, Ordering::SeqCst);
-                let r = sink::replace(&archive, &tmp);
+                let r = sink::replace(&archive, &tmp, true);
                 // the signal is delivered when replace() restores the mask:
                 // reaching here means it was not answered
                 libc::_exit(if r.is_ok() { 22 } else { 23 });
@@ -356,7 +356,7 @@ fn an_interrupt_after_a_failed_replace_keeps_the_temporary() {
                 libc::_exit(24);
             }
             sink::RAISE_MID_REPLACE.store(true, Ordering::SeqCst);
-            let r = sink::replace(&archive, &tmp);
+            let r = sink::replace(&archive, &tmp, true);
             libc::_exit(if r.is_ok() { 22 } else { 23 });
         }
         let mut status = 0;

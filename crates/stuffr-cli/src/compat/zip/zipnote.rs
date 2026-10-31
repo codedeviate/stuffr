@@ -294,7 +294,7 @@ pub(crate) fn run(z: &mut Zr, o: NoteOptions) -> Exit {
     }
     drop(out);
     let tmp = temp.path.take().unwrap_or_default();
-    if let Err((code, err)) = replace(&z.host.path(&zipfile), &tmp) {
+    if let Err((code, err)) = replace(&z.host.path(&zipfile), &tmp, true) {
         // the new archive stays, under the temporary name
         z.zipwarn(m::NEW_ZIP_LEFT_AS.as_bytes(), &tempzip);
         return zerr(z, code, m::WAS_REPLACING.as_bytes(), Some(&err));

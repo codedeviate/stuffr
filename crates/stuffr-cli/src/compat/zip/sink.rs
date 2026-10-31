@@ -411,10 +411,12 @@ pub(crate) fn mkstemp_with(
 }
 
 /// fileio.c:replace: `rename` the temporary onto the archive, or copy it
-/// over it when the archive has other links or is a symbolic link to a
-/// regular file (respected: written through), or when the rename crosses
-/// devices. A symbolic link to anything else is refused (deviation 31).
-/// `Err` is the ziperr code and the system's answer.
+/// over it when the archive has other links or is a symbolic link
+/// (respected: written through, for an archive updated in place,
+/// `in_place`, whose link leads to a non-empty regular file), or when the
+/// rename crosses devices. Any other symbolic link at `d` is refused
+/// (deviation 31, [`refused_output_link`]). `Err` is the ziperr code and
+/// the system's answer.
 ///
 /// SIGINT and SIGTERM are held back meanwhile (ruling Z32, deviation 30):
 /// between the archive's unlink and the rename, or while the copy rewrites
@@ -425,9 +427,9 @@ pub(crate) fn mkstemp_with(
 /// when the archive was already unlinked or truncated: the handler then
 /// removes nothing (zip's would remove it).
 // port: fileio.c:replace
-pub(crate) fn replace(d: &Path, s: &Path) -> Result<(), (i32, io::Error)> {
+pub(crate) fn replace(d: &Path, s: &Path, in_place: bool) -> Result<(), (i32, io::Error)> {
     host::with_zip_signals_held(|| {
-        let r = replace_now(d, s);
+        let r = replace_now(d, s, in_place);
         if r.is_err() {
             host::disarm_cleanup();
         }
@@ -450,18 +452,22 @@ fn mid_replace() {
     }
 }
 
-/// Deviation 31 (hardening, ruling T5): a symbolic link at the archive's
-/// name that does not lead to a regular file (dangling, or naming a
-/// directory or a device). Info-ZIP writes the archive through it,
-/// creating the file a dangling link names; stuffr refuses it. A link to a
-/// regular file is still updated in place, as Info-ZIP updates it.
-pub(crate) fn dangling_archive_link(p: &Path) -> bool {
+/// Deviation 31 (hardening, ruling T5): a symbolic link at an output name
+/// zip must not write through. Info-ZIP writes through any link there,
+/// creating the file a dangling one names. stuffr refuses a link at an
+/// output name that is not the archive being read (`-O`/`--out`, `-F`'s
+/// output, split parts) whatever it points at; at the archive being
+/// updated in place (`in_place`) it keeps Info-ZIP's update through the
+/// link only when the link leads to a non-empty regular file, an archive
+/// zip actually read, and refuses a dangling link or one to an empty file,
+/// a directory or a device.
+pub(crate) fn refused_output_link(p: &Path, in_place: bool) -> bool {
     std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink())
-        && !std::fs::metadata(p).is_ok_and(|m| m.is_file())
+        && !(in_place && std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() > 0))
 }
 
-/// The error a refused [`dangling_archive_link`] is reported with: what
-/// an `O_NOFOLLOW` open of it answers (`ELOOP`).
+/// The error a [`refused_output_link`] is reported with: what an
+/// `O_NOFOLLOW` open of it answers (`ELOOP`).
 pub(crate) fn link_refusal() -> io::Error {
     #[cfg(unix)]
     {
@@ -473,8 +479,8 @@ pub(crate) fn link_refusal() -> io::Error {
     }
 }
 
-fn replace_now(d: &Path, s: &Path) -> Result<(), (i32, io::Error)> {
-    if dangling_archive_link(d) {
+fn replace_now(d: &Path, s: &Path, in_place: bool) -> Result<(), (i32, io::Error)> {
+    if refused_output_link(d, in_place) {
         return Err((ZE_CREAT, link_refusal()));
     }
     if let Ok(t) = std::fs::symlink_metadata(d) {

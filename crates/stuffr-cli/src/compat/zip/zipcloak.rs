@@ -116,6 +116,13 @@ pub(crate) fn run(z: &mut Zr, o: CloakOptions) -> Exit {
         return z.ziperr(ZE_NONE, h.as_bytes());
     }
 
+    // deviation 31: never through a symlink at the output name (`-O`: any
+    // link; in place: one that does not lead to a non-empty regular file)
+    let op = z.host.path(&out_path);
+    if super::sink::refused_output_link(&op, out_path == zipfile) {
+        return z.ziperr_os(ZE_CREAT, &out_path, &super::sink::link_refusal());
+    }
+
     // Before we get carried away, make sure zip file is writeable
     let zp = z.host.path(&zipfile);
     if let Err(e) = std::fs::File::options().append(true).create(true).open(&zp) {
@@ -244,7 +251,7 @@ pub(crate) fn run(z: &mut Zr, o: CloakOptions) -> Exit {
     }
     drop(out);
     let tmp = temp.path.take().unwrap_or_default();
-    if let Err((code, err)) = replace(&z.host.path(&out_path), &tmp) {
+    if let Err((code, err)) = replace(&z.host.path(&out_path), &tmp, out_path == zipfile) {
         // the new archive stays, under the temporary name
         z.zipwarn(m::NEW_ZIP_LEFT_AS.as_bytes(), &tempzip);
         return zerr(z, code, m::WAS_REPLACING.as_bytes(), Some(&err));

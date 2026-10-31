@@ -985,6 +985,42 @@ mod unix {
         assert!(t.windows(5).any(|w| w == b"a.txt") && t.windows(5).any(|w| w == b"x.txt"));
     }
 
+    /// Deviation 31: a symlink at `-O`/`--out` is refused whatever it
+    /// points at (Info-ZIP truncates the target), here a live link to a
+    /// regular file, also under `-FF`; an in-place update through a link to
+    /// an EMPTY file is refused too (zip read no archive there). Exit 15,
+    /// the link and its target untouched. stuffr alone.
+    #[test]
+    fn a_symlink_at_an_output_name_zip_did_not_read_is_refused() {
+        let cases: [(&[&'static str], &str); 3] = [
+            (&["t.zip", "a.txt", "--out", "o.zip"], "o.zip"),
+            (&["-FF", "t.zip", "--out", "o.zip"], "o.zip"),
+            (&["e.zip", "a.txt"], "e.zip"),
+        ];
+        for (args, out) in cases {
+            let tree = with_archive(&[(b"x.txt", b"x\n")])
+                .file("victim", b"old victim")
+                .file("empty", b"")
+                .symlink("o.zip", "victim")
+                .symlink("e.zip", "empty");
+            let s = stuffr_zip(&zip_case("zip", args, tree));
+            let text = String::from_utf8_lossy(&s.stdout);
+            assert_eq!(s.code, 15, "{args:?}: {text}");
+            assert!(
+                text.contains(&format!("zip error: Could not create output file ({out})")),
+                "{args:?}: {text}"
+            );
+            assert!(is_link_to(&s, "o.zip", "victim"), "{args:?}");
+            assert!(is_link_to(&s, "e.zip", "empty"), "{args:?}");
+            assert_eq!(archive_of(&s, b"victim"), b"old victim", "{args:?}");
+            assert_eq!(archive_of(&s, b"empty"), b"", "{args:?}");
+            assert!(
+                !s.tree.keys().any(|k| k.starts_with(b"zi")),
+                "{args:?}: a temporary is left"
+            );
+        }
+    }
+
     /// Deviation 32 (ruling T5): zipsplit never writes a part through a
     /// symlink at its name (live or dangling): `O_NOFOLLOW` fails the open
     /// (`ELOOP`'s text, `Could not create output file`), the link and its

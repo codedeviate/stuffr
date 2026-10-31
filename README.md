@@ -2056,12 +2056,15 @@ before the command line, as the reference does.
     answers Ctrl-C when it ends. When the replace fails after the archive
     was unlinked or cut (ruling Z34), the temporary is the only whole copy:
     it is kept under its own name, where zip's handler would remove it.
-31. **A dangling symlink as the archive's name is refused** (hardening).
-    Info-ZIP follows a symlink at the archive's name and creates the file a
-    dangling one names. stuffr refuses a link that leads to no regular file
-    before any work (`Could not create output file (NAME)`, exit 15), the
-    link kept. A link to an existing archive is still updated through it,
-    as Info-ZIP does.
+31. **zip never writes through a symlink at an output name it did not
+    read** (hardening). Info-ZIP follows any link at the output name: a
+    dangling one creates the file it names, one at `-O`/`--out` truncates
+    its target. stuffr refuses (`Could not create output file (NAME)`, exit
+    15, before any work, the link kept) a link at `-O`/`--out` (and `-F`'s
+    output, `zipcloak -O`) whatever it points at, and a link at the
+    archive's own name unless it leads to a non-empty regular file (dangling,
+    or an empty file, a directory, a device). An archive reached through a
+    link to a non-empty file is still updated through it, as Info-ZIP does.
 32. **`zipsplit` never writes a part through a symlink** (hardening). It
     opens its index and parts `O_NOFOLLOW`: a symlink at a part's name,
     live or dangling, is `Could not create output file`, exit 15, and is

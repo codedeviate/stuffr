@@ -132,9 +132,11 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
     // Make sure the zip file is writeable (the C leaves the check to the
     // end when -b names the temp's directory and there is no archive).
     let tempdir_check_later = z.o.tempdir && !has_files && ar.zipbeg == 0;
-    // deviation 31: a symlink at the archive's name that leads to no
-    // regular file is refused before any work, never written through
-    if !to_stdout && super::sink::dangling_archive_link(&z.host.path(&out_path)) {
+    // deviation 31: a symlink at an output name zip must not write through
+    // is refused before any work (`--out`: any link; in place: one that
+    // does not lead to a non-empty regular file)
+    let in_place = !z.o.have_out;
+    if !to_stdout && super::sink::refused_output_link(&z.host.path(&out_path), in_place) {
         return z.ziperr_os(ZE_CREAT, &out_path, &super::sink::link_refusal());
     }
     if !to_stdout && !tempdir_check_later {
@@ -809,7 +811,7 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
         // (ruling Z32, deviation 30): an interrupt is answered once the
         // archive is whole, and never says "attempting to restore" after it
         let r = crate::compat::host::with_zip_signals_held(|| {
-            let r = replace(&to, &tmp);
+            let r = replace(&to, &tmp, in_place && split.is_none());
             if r.is_ok() {
                 z.restoring = None;
                 crate::compat::host::zip_abort_extra(&z.host, None);

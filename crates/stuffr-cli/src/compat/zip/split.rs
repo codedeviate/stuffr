@@ -420,7 +420,7 @@ impl SplitW {
         drop(w);
         // zip.c:rename_split
         let to = self.env.path(&split_path);
-        if let Err((code, e)) = super::sink::replace(&to, &self.env.path(tempname)) {
+        if let Err((code, e)) = super::sink::replace(&to, &self.env.path(tempname), false) {
             return Err(io::Error::other(SplitFail {
                 code,
                 text: m::WAS_REPLACING_SPLIT.as_bytes().to_vec(),
