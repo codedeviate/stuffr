@@ -1014,4 +1014,55 @@ mod unix {
             }
         }
     }
+
+    /// Deviation 33 (ruling T6): the `-lf` log shows `-P`'s password as
+    /// `********`, a new log is created 0600, and a symlink at the log's
+    /// name (live or dangling, `-la` too) is not written through: `could
+    /// not open logfile`, exit 16, the link and its target untouched. zip
+    /// writes the password into a `0666 & ~umask` file through the link.
+    /// stuffr alone.
+    #[test]
+    fn the_log_hides_the_password_and_follows_no_symlink() {
+        let s = stuffr_zip(&zip_case(
+            "zip",
+            &["-q", "-P", "hunter2", "-lf", "z.log", "z.zip", "a.txt"],
+            ZipTree::standard(),
+        ));
+        assert_eq!(s.code, 0, "{}", String::from_utf8_lossy(&s.stdout));
+        match node(&s, "z.log") {
+            Some(UnzipNode::File { bytes, mode, .. }) => {
+                let log = String::from_utf8_lossy(bytes);
+                assert!(!log.contains("hunter2"), "{log}");
+                assert!(log.contains("-P ******** "), "{log}");
+                assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+            }
+            other => panic!("z.log is {other:?}"),
+        }
+        for append in [false, true] {
+            for live in [true, false] {
+                let mut tree = ZipTree::standard().symlink("z.log", "victim");
+                if live {
+                    tree = tree.file("victim", b"old victim");
+                }
+                let mut args = vec!["-q", "-P", "hunter2", "-lf", "z.log"];
+                if append {
+                    args.push("-la");
+                }
+                args.extend(["z.zip", "a.txt"]);
+                let s = stuffr_zip(&zip_case("zip", &args, tree));
+                let out = String::from_utf8_lossy(&s.stdout);
+                assert_eq!(s.code, 16, "append {append} live {live}: {out}");
+                assert!(
+                    out.contains("could not open logfile 'z.log'"),
+                    "append {append} live {live}: {out}"
+                );
+                assert!(is_link_to(&s, "z.log", "victim"));
+                if live {
+                    assert_eq!(archive_of(&s, b"victim"), b"old victim");
+                } else {
+                    assert!(node(&s, "victim").is_none(), "created through");
+                }
+            }
+        }
+    }
 }

@@ -2065,6 +2065,12 @@ before the command line, as the reference does.
     live or dangling, is `Could not create output file`, exit 15, and is
     left in place, where zipsplit writes through it. A regular file there
     is still overwritten, as zipsplit overwrites it.
+33. **The `-lf` log never holds the password** (hardening). zip writes its
+    whole command line to the log, `-P`'s password included, in a file
+    created `0666 & ~umask` through any symlink at its name. stuffr writes
+    `********` in place of the password (every form: `-P pw`, `-Ppw`,
+    `--password=pw`, ...), creates a new log 0600 and opens it, `-la`'s too,
+    without following a symlink (`could not open logfile`, exit 16).
 
 The full set is in the code's module docs
 (`crates/stuffr-cli/src/compat/zip/mod.rs`), which is the source of truth.

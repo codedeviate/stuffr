@@ -1181,3 +1181,69 @@ fn every_table_row_has_an_arm() {
         }
     }
 }
+
+/// Ruling T6 (deviation 33): the log's copy of the command line has every
+/// form of `-P`'s value replaced, and is otherwise exactly the arguments
+/// as the run's own parse permuted them.
+#[test]
+fn the_logged_command_line_hides_the_password() {
+    let cases: &[(&[&str], &[&str])] = &[
+        (
+            &["-q", "t.zip", "-P", "hunter2", "a"],
+            &["-q", "-P", "********", "t.zip", "a"],
+        ),
+        (&["-Phunter2", "t.zip", "a"], &["-P********", "t.zip", "a"]),
+        (
+            &["-P=hunter2", "t.zip", "a"],
+            &["-P=********", "t.zip", "a"],
+        ),
+        (
+            &["-qPhunter2", "t.zip", "a"],
+            &["-qP********", "t.zip", "a"],
+        ),
+        (
+            &["--password", "hunter2", "t.zip", "a"],
+            &["--password", "********", "t.zip", "a"],
+        ),
+        (
+            &["t.zip", "--pass=hunter2", "a"],
+            &["--pass=********", "t.zip", "a"],
+        ),
+        // a value that looks like an option, and two -P
+        (
+            &["-P", "-hunter2", "-P", "x y", "t.zip", "a"],
+            &["-P", "********", "-P", "********", "t.zip", "a"],
+        ),
+        // -i's value list ends where -P starts; nothing else changes
+        (&["t.zip", "a", "-i", "*.c", "*.h", "-P", "hunter2"], &[]),
+    ];
+    for f in [Flavour::Apple, Flavour::Ubuntu] {
+        let table = table(f);
+        for (argv, want) in cases {
+            let args = args_of(&[&["zip"], *argv].concat());
+            let mut parsed = args.clone();
+            let mut st = GetOpt::new();
+            while get_option(&table, &mut parsed, &mut st).unwrap().id != 0 {}
+            let logged = redact_password(&table, args);
+            let shown: Vec<String> = logged
+                .iter()
+                .skip(1)
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect();
+            assert!(
+                !shown.iter().any(|a| a.contains("hunter2")),
+                "{f:?} {argv:?}: {shown:?}"
+            );
+            if !want.is_empty() {
+                assert_eq!(shown, *want, "{f:?} {argv:?}");
+            }
+            // the same order as the run's own parse, `-P`'s value aside
+            assert_eq!(logged.len(), parsed.len(), "{f:?} {argv:?}");
+            for (l, p) in logged.iter().zip(&parsed) {
+                if l != p {
+                    assert!(l.ends_with(LOGGED_PASSWORD), "{f:?} {argv:?}: {shown:?}");
+                }
+            }
+        }
+    }
+}

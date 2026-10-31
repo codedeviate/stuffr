@@ -780,8 +780,16 @@ pub fn zip_differences(c: &Case, r: &ZipRun, s: &ZipRun) -> Vec<String> {
         };
         if !(archive_name(key) || looks_like_zip(rb)) {
             // a log's `Zip log opened <now>` line
-            if let Some(UnzipNode::File { bytes, .. }) = st.get_mut(key) {
+            if let Some(UnzipNode::File { bytes, mode, .. }) = st.get_mut(key) {
                 mask_asctimes(rb, rw, bytes, sw);
+                // zip deviation 33 (ruling T6): stuffr creates the log
+                // 0600 where zip's is `0666 & ~umask`
+                if log_name(c).as_deref() == Some(key.as_slice())
+                    && *mode & 0o777 == 0o600
+                    && let UnzipNode::File { mode: rm, .. } = rn
+                {
+                    *mode = *rm;
+                }
             }
             continue;
         }
@@ -821,6 +829,18 @@ pub fn zip_differences(c: &Case, r: &ZipRun, s: &ZipRun) -> Vec<String> {
         &tree_only(st, s.start, s.tty_mode),
     ));
     d
+}
+
+/// The `-lf` log `c` names, as zip completes it (`.log` added to a last
+/// component without a dot), if any.
+fn log_name(c: &Case) -> Option<Vec<u8>> {
+    let at = c.args.iter().position(|a| *a == "-lf")?;
+    let mut name = c.args.get(at + 1)?.as_bytes().to_vec();
+    let last = name.iter().rposition(|&b| b == b'/').unwrap_or(0);
+    if !name[last..].contains(&b'.') {
+        name.extend_from_slice(b".log");
+    }
+    Some(name)
 }
 
 /// The first offset where `a` and `b` differ (the shorter length when one

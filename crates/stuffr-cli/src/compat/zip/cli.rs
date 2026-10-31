@@ -2368,8 +2368,54 @@ pub(crate) fn parse_zip(z: &mut Zr, argv0: &[u8], rest: &[Vec<u8>]) -> Result<()
         return Err(finish(z, ZE_OK));
     }
 
-    open_log(z, &args)?;
+    // hardening (ruling T6): the log gets the command line with `-P`'s
+    // value replaced, re-parsed from the same arguments, so it is in the
+    // order `args` ended in
+    let logged = redact_password(&table, z.o.args.clone());
+    debug_assert_eq!(logged.len(), args.len());
+    open_log(z, &logged)?;
     checks(z)
+}
+
+/// What the `-lf` log shows in place of `-P`'s value (ruling T6, deviation
+/// 33): eight asterisks, whatever the password's length.
+pub(crate) const LOGGED_PASSWORD: &[u8] = b"********";
+
+/// `args` (as `envargs` left them, `argv[0]` first) parsed again exactly as
+/// `get_option` parsed them, with the value of every `-P`/`--password`
+/// replaced by [`LOGGED_PASSWORD`] the moment it is returned: a separate
+/// argument (`-P pw`, `--password pw`) whole, an attached one (`-Ppw`,
+/// `-P=pw`, `-qPpw`, `--password=pw`, an abbreviation such as `--pass=pw`)
+/// after its option. `get_option`'s permutation depends only on where the
+/// options and their values are, never on a value's bytes, so the result
+/// is the arguments in the order the run's own parse left them. The parse
+/// that already succeeded cannot fail here; a failure would stop the
+/// redaction there, so the arguments past it are returned as they were
+/// (unreachable: the run ended at that error before opening the log).
+fn redact_password(table: &[OptionSpec], mut args: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let mut st = GetOpt::new();
+    while let Ok(got) = get_option(table, &mut args, &mut st) {
+        if got.id == 0 {
+            break;
+        }
+        if got.id != ch('P') {
+            continue;
+        }
+        let Some(value) = got.value else { continue };
+        if st.optchar == SKIP_VALUE_ARG {
+            // the value was the next argument
+            set(&mut args, st.argnum + 1, LOGGED_PASSWORD.to_vec());
+        } else if let Some(a) = usize::try_from(st.argnum)
+            .ok()
+            .and_then(|i| args.get_mut(i))
+            && a.ends_with(&value)
+        {
+            // the value was the rest of this argument
+            a.truncate(a.len() - value.len());
+            a.extend_from_slice(LOGGED_PASSWORD);
+        }
+    }
+    args
 }
 
 /// zip.c:main, `case o_NON_OPTION_ARG`: the archive name first, then the
@@ -2470,6 +2516,15 @@ fn open_log(z: &mut Zr, args: &[Vec<u8>]) -> Result<(), Exit> {
         opts.append(true).create(true);
     } else {
         opts.write(true).create(true).truncate(true);
+    }
+    // hardening (ruling T6, deviation 33): a new log is the owner's alone
+    // (it holds the command line), and a symlink at the name, live or
+    // dangling, is never followed: the open fails, `could not open
+    // logfile`. An existing log keeps its own mode.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let file = match opts.open(z.host.path(&path)) {
         Ok(f) => f,

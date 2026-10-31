@@ -362,6 +362,17 @@
 //!     symbolic links`, `Could not create output file (NAME)`, exit 15) and
 //!     its cleanup leaves the link, which it did not make. A regular file
 //!     at a part's name is still truncated, as zipsplit truncates it.
+//! 33. Hardening (ruling T6 of the 2026-10-31 security audit): the `-lf`
+//!     log's command line shows `-P`'s password as `********` (eight
+//!     asterisks, whatever its length), in every form zip accepts (`-P pw`,
+//!     `-Ppw`, `-P=pw`, `-qPpw`, `--password pw`, `--password=pw` and its
+//!     abbreviations, from `ZIPOPT`/`ZIP` too); zip writes it as given. A
+//!     new log is created 0600 (zip: `0666 & ~umask`), an existing one
+//!     keeps its mode, and the log, `-la`'s included, is opened
+//!     `O_NOFOLLOW`: a symlink at its name, live or dangling, is `could not
+//!     open logfile`, exit 16, where zip writes through it. `-sc`'s listing
+//!     still shows the password, as zip's does (it goes to the terminal,
+//!     not to a file).
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
