@@ -13,9 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use stuffr_core::governor::detect_cpu_budget;
 use stuffr_core::{
     BudgetInputs, Chain, Codec, ContainerCaps, Counting, CountingWriter, DEFAULT_MAX_RATIO,
-    DecodeOpts, EncodeOpts, Error, FidelityReport, FileSource, FormatId, FormatKind, Governor,
-    PlainSink, RatioGuard, ReaderSource, Registry, Result, Rung, Sink, Source,
-    default_memory_limit,
+    DecodeOpts, EncodeOpts, Error, Fidelity, FidelityReport, FileSource, FormatId, FormatKind,
+    Governor, MetaFields, PlainSink, RatioGuard, ReaderSource, Registry, Result, Rung, Sink,
+    Source, default_memory_limit,
 };
 
 /// Per-process counter mixed into the temp file name alongside the pid, so
@@ -80,6 +80,52 @@ fn create_temp_file(
             Err(e) => return Err(Error::from(e)),
         }
     }
+}
+
+/// Sets `mode` on `f`, something this run just created or truncated for the
+/// output `target`, **best effort**: a filesystem that refuses `fchmod`
+/// (vfat/exfat mounted without `quiet`, SMB, NFS with root squash, some
+/// FUSE filesystems) must not turn a complete, correct output into a failed
+/// run at exit 1 (final security review, Important 1). The refusal comes
+/// back as the same warning `unpack` raises for a mode it could not restore
+/// ([`Fidelity::MetadataIncomplete`] naming `mode`), so it is printed and
+/// `--strict-fidelity` turns it into exit 4.
+///
+/// **What the file is left at.** Whatever it was created or found at: a
+/// fresh temp is 0600 ([`create_temp_file`]), so the output errs private,
+/// and no second, wider `chmod` is attempted — a filesystem that just
+/// refused one has no reason to accept the next, and on vfat/exfat the mode
+/// a user sees comes from the mount options whatever is asked for. The
+/// warning names the output, so a user who wanted it wider knows to look.
+#[cfg(unix)]
+fn set_mode_best_effort(f: &std::fs::File, mode: u32, target: &Path) -> Option<Fidelity> {
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(test)]
+    if FAIL_FCHMOD.with(|c| c.get()) {
+        return Some(mode_not_applied(target));
+    }
+    f.set_permissions(std::fs::Permissions::from_mode(mode))
+        .err()
+        .map(|_| mode_not_applied(target))
+}
+
+/// The warning [`set_mode_best_effort`] raises: the output, named as
+/// `unpack` names an entry whose mode it could not restore.
+fn mode_not_applied(target: &Path) -> Fidelity {
+    Fidelity::MetadataIncomplete {
+        entry: target.display().to_string(),
+        fields: MetaFields {
+            mode: true,
+            ..MetaFields::default()
+        },
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: makes [`set_mode_best_effort`] behave as a filesystem that
+    /// refuses `fchmod`, which no test machine can be relied on to mount.
+    static FAIL_FCHMOD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Where bytes come from. `Stdin` is what `-` means on the command line.
@@ -214,6 +260,9 @@ pub enum Output {
 pub(crate) struct Opened {
     pub(crate) writer: Box<dyn Write + Send>,
     pub(crate) finish: Option<Finish>,
+    /// What opening could not do to the output, for the caller's fidelity
+    /// report: a mode the filesystem refused ([`set_mode_best_effort`]).
+    pub(crate) warnings: Vec<Fidelity>,
 }
 
 /// What `Opened::writer` is actually writing to, and where it must end up.
@@ -261,12 +310,16 @@ impl Output {
     /// another tool locked down stays 0600) and never wider than the input
     /// (a 0600 secret never lands in a 0644 file because the name it replaced
     /// was 0644). Either way the temp is created 0600 and `fchmod`ed before
-    /// a byte is written.
+    /// a byte is written — best effort: a filesystem that refuses the
+    /// `fchmod` leaves the temp at 0600 and the refusal comes back as a
+    /// warning in [`Opened::warnings`], never as a failed run
+    /// ([`set_mode_best_effort`]).
     pub(crate) fn create(&self, force: bool, sync: bool, from: &FromInput) -> Result<Opened> {
         match self {
             Output::Stdout => Ok(Opened {
                 writer: Box::new(std::io::stdout()),
                 finish: None,
+                warnings: Vec::new(),
             }),
             Output::Path(p) => {
                 // `symlink_metadata` inspects the path itself rather than
@@ -299,15 +352,8 @@ impl Output {
                 // place.
                 let write_direct = link_meta.as_ref().is_ok_and(|m| !m.is_file());
                 if write_direct {
-                    let f = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .open(p)?;
-                    return Ok(Opened {
-                        writer: Box::new(f),
-                        finish: None,
-                    });
+                    let through_link = link_meta.as_ref().is_ok_and(|m| m.is_symlink());
+                    return Self::create_direct(p, through_link, from);
                 }
 
                 // Read the destination's permissions BEFORE creating or
@@ -343,6 +389,9 @@ impl Output {
                 let (tmp, f) =
                     create_temp_file(&parent, &file_name, exists || from.mode.is_some())?;
                 from.stamp(&f);
+                // Every mode below is set best effort (`set_mode_best_effort`):
+                // a refusal is a warning on the outcome, never a failed run.
+                let mut warnings = Vec::new();
                 if let Some(perms) = carry_over_perms {
                     // Mask off setuid/setgid and sticky (0o7000) before applying: a
                     // destination that happened to carry either bit must
@@ -357,18 +406,17 @@ impl Output {
                         if let Some(input) = from.mode {
                             masked &= input | !0o777;
                         }
-                        f.set_permissions(std::fs::Permissions::from_mode(masked))?;
+                        warnings.extend(set_mode_best_effort(&f, masked, p));
                     }
                     #[cfg(not(unix))]
-                    std::fs::set_permissions(&tmp, perms)?;
+                    if std::fs::set_permissions(&tmp, perms).is_err() {
+                        warnings.push(mode_not_applied(p));
+                    }
                 } else if let Some(_mode) = from.mode {
                     // Through the descriptor: the name is a temp in a
                     // directory others may write to.
                     #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        f.set_permissions(std::fs::Permissions::from_mode(_mode))?;
-                    }
+                    warnings.extend(set_mode_best_effort(&f, _mode, p));
                 }
                 // A second handle on the same temp file, taken before `f` is
                 // boxed away as the writer, so `publish` can `sync_all()` it
@@ -382,9 +430,63 @@ impl Output {
                         handle: Some(handle),
                         sync,
                     }),
+                    warnings,
                 })
             }
         }
+    }
+
+    /// The direct-write branch of [`Self::create`]: a destination that
+    /// exists and is not a regular file, written through in place.
+    ///
+    /// **Through a symlink** (`through_link`, under `--force`) the file the
+    /// link leads to gets what a replaced regular destination gets (final
+    /// security review, Minor 4): the input's quarantine, stamped by
+    /// descriptor, and its mode, best effort — the input's bits for a file
+    /// this open created (a dangling link; created 0600 first, as the temp
+    /// is), the existing file's own bits intersected with the input's and
+    /// stripped of setuid/setgid/sticky for one it truncated. Only when the
+    /// descriptor turns out to be a regular file: a link to `/dev/null` or a
+    /// FIFO is written through and nothing is set on it. A device or FIFO
+    /// named directly takes nothing either.
+    fn create_direct(p: &Path, through_link: bool, from: &FromInput) -> Result<Opened> {
+        // Followed: what the link leads to, before the open may create it.
+        #[cfg(unix)]
+        let before = std::fs::metadata(p).ok().filter(|m| m.is_file());
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        if through_link && from.mode.is_some() {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let f = opts.open(p)?;
+        let mut warnings = Vec::new();
+        if through_link && f.metadata().is_ok_and(|m| m.is_file()) {
+            from.stamp(&f);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let want = match &before {
+                    Some(md) => {
+                        let mut masked = md.permissions().mode() & 0o7777 & !0o7000;
+                        if let Some(input) = from.mode {
+                            masked &= input | !0o777;
+                        }
+                        (masked != md.permissions().mode() & 0o7777).then_some(masked)
+                    }
+                    None => from.mode,
+                };
+                if let Some(mode) = want {
+                    warnings.extend(set_mode_best_effort(&f, mode, p));
+                }
+            }
+        }
+        Ok(Opened {
+            writer: Box::new(f),
+            finish: None,
+            warnings,
+        })
     }
 }
 
@@ -860,6 +962,7 @@ pub fn compress_with(
         Rung::ForwardOnly
     };
     let opened = dst.create(o.force, o.sync, &from)?;
+    let open_warnings = opened.warnings;
     let (counted, written) = CountingWriter::new(opened.writer);
 
     let run = || -> Result<u64> {
@@ -889,11 +992,13 @@ pub fn compress_with(
             // above). Publishing any earlier risks a truncated file visible
             // under the real name.
             publish(opened.finish)?;
+            let mut fidelity = FidelityReport::new(rung);
+            open_warnings.into_iter().for_each(|w| fidelity.warn(w));
             Ok(Outcome {
                 bytes_in,
                 bytes_out: written.load(Ordering::Relaxed),
                 format,
-                fidelity: FidelityReport::new(rung),
+                fidelity,
                 notes: Vec::new(),
             })
         }
@@ -1020,6 +1125,7 @@ pub fn decompress_with(
 
     let opened = dst.create(o.force, o.sync, &from)?;
     let finish = opened.finish;
+    let open_warnings = opened.warnings;
     let mut writer = opened.writer;
 
     let mut run = || -> Result<()> {
@@ -1041,6 +1147,7 @@ pub fn decompress_with(
             // bytes after the last member (`Fidelity::TrailingDataIgnored`).
             let mut fidelity = FidelityReport::new(rung);
             decode_opts.fidelity.drain_into(&mut fidelity);
+            open_warnings.into_iter().for_each(|w| fidelity.warn(w));
             Ok(Outcome {
                 bytes_in: consumed.load(Ordering::Relaxed),
                 bytes_out: guard.produced(),
@@ -1402,6 +1509,7 @@ fn write_recompressed(
     let mut guard = RatioGuard::new(Arc::clone(&consumed), o.max_ratio);
     let opened = dst.create(o.force, o.sync, &from)?;
     let finish = opened.finish;
+    let open_warnings = opened.warnings;
     let (counted, written) = CountingWriter::new(opened.writer);
 
     let run = || -> Result<()> {
@@ -1420,6 +1528,7 @@ fn write_recompressed(
             publish(finish)?;
             let mut fidelity = FidelityReport::new(rung);
             codec_fidelity.drain_into(&mut fidelity);
+            open_warnings.into_iter().for_each(|w| fidelity.warn(w));
             Ok(Outcome {
                 bytes_in: consumed.load(Ordering::Relaxed),
                 bytes_out: written.load(Ordering::Relaxed),
@@ -1928,5 +2037,206 @@ mod tests {
 
         let _ = std::fs::remove_file(&tmp_path);
         let _ = std::fs::remove_file(&dst);
+    }
+
+    /// Runs `f` with [`set_mode_best_effort`] refusing every `fchmod`, as
+    /// vfat/exfat, SMB, NFS root squash or FUSE can.
+    fn with_refused_fchmod<T>(f: impl FnOnce() -> T) -> T {
+        FAIL_FCHMOD.with(|c| c.set(true));
+        let out = f();
+        FAIL_FCHMOD.with(|c| c.set(false));
+        out
+    }
+
+    fn mode_warning_for(outcome: &Outcome, target: &Path) -> bool {
+        outcome.fidelity.warnings.iter().any(|w| {
+            matches!(w, Fidelity::MetadataIncomplete { entry, fields }
+                if *entry == target.display().to_string()
+                    && fields.mode
+                    && fields.missing() == ["mode"])
+        })
+    }
+
+    #[test]
+    fn a_refused_fchmod_on_a_fresh_output_is_a_warning_and_the_file_stays_private() {
+        let src = tmp("refused-src");
+        let dst = tmp("refused-dst.gz");
+        let _ = std::fs::remove_file(&dst);
+        std::fs::write(&src, b"secret").unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let outcome = with_refused_fchmod(|| {
+            compress(
+                Input::Path(src.clone()),
+                Output::Path(dst.clone()),
+                &CompressOpts::default(),
+            )
+        })
+        .expect("a refused fchmod must not fail the run");
+        assert!(mode_warning_for(&outcome, &dst), "{:?}", outcome.fidelity);
+        assert!(!outcome.fidelity.is_lossless());
+        // Left as created: 0600, never wider than the input.
+        assert_eq!(
+            std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let back = tmp("refused-back");
+        let _ = std::fs::remove_file(&back);
+        decompress(
+            Input::Path(dst.clone()),
+            Output::Path(back.clone()),
+            &DecompressOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&back).unwrap(), b"secret");
+        for p in [&src, &dst, &back] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn a_refused_fchmod_on_a_forced_carry_over_is_a_warning() {
+        let src = tmp("refused-co-src.gz");
+        let dst = tmp("refused-co-dst");
+        std::fs::write(&dst, b"old").unwrap();
+        let plain = tmp("refused-co-plain");
+        std::fs::write(&plain, b"payload").unwrap();
+        let _ = std::fs::remove_file(&src);
+        compress(
+            Input::Path(plain.clone()),
+            Output::Path(src.clone()),
+            &CompressOpts::default(),
+        )
+        .unwrap();
+
+        let outcome = with_refused_fchmod(|| {
+            decompress(
+                Input::Path(src.clone()),
+                Output::Path(dst.clone()),
+                &DecompressOpts {
+                    force: true,
+                    ..Default::default()
+                },
+            )
+        })
+        .expect("a refused fchmod must not fail the run");
+        assert!(mode_warning_for(&outcome, &dst), "{:?}", outcome.fidelity);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"payload");
+        for p in [&src, &dst, &plain] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn an_applied_mode_raises_no_warning() {
+        let src = tmp("applied-src");
+        let dst = tmp("applied-dst.gz");
+        let _ = std::fs::remove_file(&dst);
+        std::fs::write(&src, b"x").unwrap();
+        let outcome = compress(
+            Input::Path(src.clone()),
+            Output::Path(dst.clone()),
+            &CompressOpts::default(),
+        )
+        .unwrap();
+        assert!(
+            outcome.fidelity.warnings.is_empty(),
+            "{:?}",
+            outcome.fidelity
+        );
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    #[test]
+    fn a_forced_write_through_a_symlink_takes_the_input_mode_on_the_file_it_reaches() {
+        let src = tmp("link-src");
+        std::fs::write(&src, b"secret").unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let force = CompressOpts {
+            force: true,
+            ..Default::default()
+        };
+
+        // A link to an existing 0644 file: intersected, the file goes 0600.
+        let real = tmp("link-real.gz");
+        std::fs::write(&real, b"old").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = tmp("link.gz");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let outcome =
+            compress(Input::Path(src.clone()), Output::Path(link.clone()), &force).unwrap();
+        assert!(
+            outcome.fidelity.warnings.is_empty(),
+            "{:?}",
+            outcome.fidelity
+        );
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+
+        // A dangling link: the file it creates takes the input's mode.
+        let made = tmp("link-made.gz");
+        let _ = std::fs::remove_file(&made);
+        let dangling = tmp("link-dangling.gz");
+        let _ = std::fs::remove_file(&dangling);
+        std::os::unix::fs::symlink(&made, &dangling).unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o640)).unwrap();
+        compress(
+            Input::Path(src.clone()),
+            Output::Path(dangling.clone()),
+            &force,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&made).unwrap().permissions().mode() & 0o7777,
+            0o640
+        );
+
+        // Refused: a warning, the run still succeeds.
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let outcome = with_refused_fchmod(|| {
+            compress(Input::Path(src.clone()), Output::Path(link.clone()), &force)
+        })
+        .unwrap();
+        assert!(mode_warning_for(&outcome, &link), "{:?}", outcome.fidelity);
+
+        for p in [&src, &real, &link, &made, &dangling] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn a_symlink_to_a_non_regular_file_is_written_through_untouched() {
+        let src = tmp("devnull-src");
+        std::fs::write(&src, b"x").unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = tmp("devnull-link.gz");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink("/dev/null", &link).unwrap();
+        let before = std::fs::metadata("/dev/null").unwrap().permissions().mode();
+        let outcome = compress(
+            Input::Path(src.clone()),
+            Output::Path(link.clone()),
+            &CompressOpts {
+                force: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            outcome.fidelity.warnings.is_empty(),
+            "{:?}",
+            outcome.fidelity
+        );
+        assert_eq!(
+            std::fs::metadata("/dev/null").unwrap().permissions().mode(),
+            before
+        );
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&link);
     }
 }

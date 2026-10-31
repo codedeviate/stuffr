@@ -343,8 +343,10 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             );
             // Honoured on the single-stream path too, rather than accepted
             // and ignored — the tree's rule for a flag that would otherwise
-            // mislead. A codec encode loses nothing today, so this reports
-            // nothing today; a codec that ever does will be heard.
+            // mislead. A codec encode loses nothing today; what it can
+            // report is an output mode the filesystem refused (best effort,
+            // `ops::set_mode_best_effort`), and a codec that ever loses
+            // something will be heard here too.
             report_fidelity(&out.fidelity, strict_fidelity)
         }
         Command::Unpack {

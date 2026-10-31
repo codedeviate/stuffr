@@ -4174,6 +4174,7 @@ pub fn create_archive(
         archive,
         finish,
         bytes_out,
+        open_warnings,
     } = create_target(
         kind.as_ref(),
         encoder,
@@ -4316,9 +4317,10 @@ pub fn create_archive(
     })();
 
     match result {
-        Ok((bytes_in, warnings)) => {
+        Ok((bytes_in, mut warnings)) => {
             // Only now: every byte, trailer included, is written and flushed.
             publish(finish)?;
+            warnings.extend(open_warnings);
             Ok(Outcome {
                 bytes_in,
                 bytes_out: bytes_out.load(Ordering::Relaxed),
@@ -4580,6 +4582,7 @@ pub fn convert_archive_source_with(
         archive,
         finish,
         bytes_out,
+        open_warnings,
     } = create_target(
         kind.as_ref(),
         encoder,
@@ -4614,8 +4617,9 @@ pub fn convert_archive_source_with(
     })();
 
     match result {
-        Ok((bytes_in, warnings)) => {
+        Ok((bytes_in, mut warnings)) => {
             publish(finish)?;
+            warnings.extend(open_warnings);
             let mut fidelity = ar.fidelity().clone();
             fidelity.merge(&FidelityReport {
                 rung: Rung::Exact,
@@ -4879,6 +4883,9 @@ struct ArchiveTarget {
     finish: Option<Finish>,
     /// Bytes that reached the destination, counted beneath any codec.
     bytes_out: Arc<AtomicU64>,
+    /// What opening the destination could not do (a refused mode under
+    /// `--force`), for the outcome's fidelity report.
+    open_warnings: Vec<Fidelity>,
 }
 
 /// The write side of every archive this module creates — `pack`'s and
@@ -4902,6 +4909,7 @@ fn create_target(
     // `pack` passes nothing; `convert` passes the source's quarantine.
     let opened = dst.create(force, sync, from)?;
     let finish = opened.finish;
+    let open_warnings = opened.warnings;
     // `CountingWriter` is innermost, closest to the file, so `bytes_out`
     // counts the bytes that actually land on disk — compressed, when there is
     // a codec.
@@ -4932,6 +4940,7 @@ fn create_target(
             archive,
             finish,
             bytes_out,
+            open_warnings,
         }),
         Err(e) => {
             discard(finish);

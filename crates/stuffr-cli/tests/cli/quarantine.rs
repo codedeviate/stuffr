@@ -198,3 +198,29 @@ fn convert_between_containers_carries_the_quarantine() {
     ]);
     assert_eq!(quarantine_of(&out), None);
 }
+
+#[test]
+fn a_forced_output_through_a_symlink_quarantines_the_file_it_reaches() {
+    let dir = tmp_dir();
+    let input = dir.join("q.txt");
+    std::fs::write(&input, b"downloaded").unwrap();
+    quarantine(&input);
+    let real = dir.join("real.gz");
+    std::fs::write(&real, b"old").unwrap();
+    let link = dir.join("link.gz");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    ok(&[
+        "pack",
+        input.to_str().unwrap(),
+        "-o",
+        link.to_str().unwrap(),
+        "--force",
+    ]);
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(quarantine_of(&real).as_deref(), Some(VALUE));
+}
