@@ -1207,6 +1207,8 @@ impl ConvertSource {
         let compressed_total = path
             .as_deref()
             .and_then(|p| std::fs::metadata(p).ok())
+            // A regular file's size only: a FIFO's metadata says 0 bytes.
+            .filter(std::fs::Metadata::is_file)
             .map(|m| m.len());
         let source = src.open()?;
         // From the RAW source, before anything wraps it — see `decompress_with`.

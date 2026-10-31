@@ -213,10 +213,10 @@ fn a_fifo_input_with_a_writer_still_decodes() {
     let dest = tmp("fifo-dest");
     let _ = std::fs::remove_dir_all(&dest);
     let (f2, d2) = (fifo.clone(), dest.clone());
-    // Only that it RETURNS: a path is opened as a seekable `FileSource`, and
-    // a FIFO's first seek fails ("Illegal seek", exit 1) — a limitation
-    // older than this check. Before it, the run never returned at all.
-    let _ = within(move || {
+    // Since `FileSource` says a FIFO does not seek, the tar is read forward,
+    // as from standard input; it used to fail its first seek ("Illegal
+    // seek", exit 1).
+    let extracted = within(move || {
         stuffr::entries::extract(
             Input::Path(f2),
             &d2,
@@ -226,6 +226,11 @@ fn a_fifo_input_with_a_writer_still_decodes() {
         .map(|_| ())
         .map_err(|e| e.to_string())
     });
+    assert_eq!(extracted, Ok(()));
+    assert_eq!(
+        std::fs::read(dest.join("fifo-tree/a.txt")).unwrap(),
+        b"alpha"
+    );
     // The writer is unblocked by our open; whatever it then meets, it ends.
     let _ = std::fs::OpenOptions::new()
         .read(true)

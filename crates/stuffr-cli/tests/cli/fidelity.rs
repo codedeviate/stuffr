@@ -2420,3 +2420,54 @@ fn info_on_nested_codecs_points_at_a_full_decode_not_test() {
         "a piped .tar.gz is an archive: {text}"
     );
 }
+
+/// A path naming a FIFO (`unpack <(curl ...) -C dir`, a named pipe) is read
+/// as a stream: `FileSource` used to call every opened path seekable, so a
+/// container's first seek failed with "Illegal seek" at exit 1. Now a zip
+/// and a `.tar.gz` sent down a FIFO extract as they do from standard input.
+#[cfg(unix)]
+#[test]
+fn unpack_from_a_fifo_reads_it_as_a_stream() {
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    let dir = tmp_dir();
+    for name in ["f.zip", "f.tar.gz"] {
+        let bytes = packed_tree(&dir, name);
+        let fifo = dir.join(format!("{name}.fifo"));
+        let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(made.success(), "mkfifo");
+        let path = fifo.clone();
+        let writer = std::thread::spawn(move || {
+            if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&path) {
+                let _ = f.write_all(&bytes);
+            }
+        });
+        let dest = dir.join(format!("{name}.out"));
+        let mut child = Command::new(STUFFR)
+            .args([
+                "unpack",
+                fifo.to_str().unwrap(),
+                "-C",
+                dest.to_str().unwrap(),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            assert!(start.elapsed() < Duration::from_secs(30), "{name}: hung");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let out = child.wait_with_output().unwrap();
+        writer.join().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{name}: {stderr}");
+        assert_eq!(
+            std::fs::read(dest.join(format!("{name}.tree/a.txt"))).unwrap(),
+            b"tarred payload\n".repeat(50),
+            "{name}"
+        );
+    }
+}

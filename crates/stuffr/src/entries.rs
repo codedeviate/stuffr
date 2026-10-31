@@ -784,6 +784,8 @@ pub fn test(src: Input, max_ratio: u64, memory_limit: Option<u64>) -> Result<Out
     let compressed_total = src
         .path()
         .and_then(|p| std::fs::metadata(p).ok())
+        // A regular file's size only: a FIFO's metadata says 0 bytes.
+        .filter(std::fs::Metadata::is_file)
         .map(|m| m.len());
     let (mut ar, format, consumed) = open_archive(crate::registry(), src, max_ratio, memory_limit)?;
     // `test` built no budget at all until the Phase 2 final review: a
@@ -973,6 +975,8 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
     let compressed_total = o.compressed_total.or_else(|| {
         src.path()
             .and_then(|p| std::fs::metadata(p).ok())
+            // A regular file's size only: a FIFO's metadata says 0 bytes.
+            .filter(std::fs::Metadata::is_file)
             .map(|m| m.len())
     });
     let (mut ar, format, consumed) =
@@ -1870,6 +1874,8 @@ pub fn cat(
     let compressed_total = src
         .path()
         .and_then(|p| std::fs::metadata(p).ok())
+        // A regular file's size only: a FIFO's metadata says 0 bytes.
+        .filter(std::fs::Metadata::is_file)
         .map(|m| m.len());
     let (mut ar, format, consumed) = open_archive(crate::registry(), src, max_ratio, memory_limit)?;
     let mut budget = ArchiveBudget::new(compressed_total, max_ratio).tracking(consumed);
