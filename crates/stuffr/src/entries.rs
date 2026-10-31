@@ -927,6 +927,9 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
         Some(p) => ArchiveId::of(p),
         None => ArchiveId::of_stdin(),
     };
+    // The archive's quarantine (macOS), for everything this run makes
+    // (security audit EXTRACT-3).
+    let quarantine = crate::ops::FromInput::of(&src).quarantine;
     let compressed_total = o.compressed_total.or_else(|| {
         src.path()
             .and_then(|p| std::fs::metadata(p).ok())
@@ -942,12 +945,21 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
     } else {
         RESTORED_MODE_BITS & !process_umask()
     };
+    let stamp = Stamp {
+        mode_bits,
+        quarantine: quarantine.as_deref(),
+    };
 
     // The destination itself, once, up front: an archive of plain files
     // names no directory entry to create it, and a destination that cannot
     // be created should fail before any entry is read. This is not an
-    // entry's path — it is the one the caller typed.
+    // entry's path — it is the one the caller typed. Quarantined only when
+    // this run made it.
+    let dest_existed = std::fs::symlink_metadata(dest).is_ok();
     std::fs::create_dir_all(dest)?;
+    if !dest_existed {
+        stamp.quarantine_dir(dest);
+    }
 
     let mut written = 0u64;
     let mut matched = 0u64;
@@ -972,6 +984,7 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
     // removed (security audit EXTRACT-8).
     let mut made = MadeByRun {
         archive: archive_id,
+        quarantine: quarantine.clone(),
         ..MadeByRun::default()
     };
 
@@ -1074,6 +1087,7 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
                     };
                     if created {
                         made.record_created_dir(&target);
+                        stamp.quarantine_dir(&target);
                     }
                     made.record(&meta.name, &target, MadeKind::Dir);
                     // Created by this run, by this entry or earlier (a parent
@@ -1125,12 +1139,13 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
                             return Ok(());
                         }
                     };
+                stamp.quarantine_file(&out);
                 // Charged as data streams, not from the declared size.
                 written += copy_charging(entry.reader(), &mut out, &meta.name, &mut budget)?;
                 out.flush()?;
                 // Through the open handle rather than the path: an fd cannot
                 // be redirected by a symlink appearing underneath it.
-                let missing = apply_metadata(&out, &meta, mode_bits);
+                let missing = apply_metadata(&out, &meta, stamp.mode_bits);
                 warn_metadata(&mut warnings, &meta.name, missing);
                 made.record(&meta.name, &target, MadeKind::File);
             }
@@ -1145,7 +1160,7 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
                         meta: &meta,
                         link_to,
                         force: o.force,
-                        mode_bits,
+                        stamp,
                     },
                     &mut made,
                     &mut budget,
@@ -1194,7 +1209,7 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
     deferred_dirs.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.components().count()));
     for (path, meta, id) in &deferred_dirs {
         let missing = match open_created_dir(path, *id) {
-            Ok(handle) => apply_metadata(&handle, meta, mode_bits),
+            Ok(handle) => apply_metadata(&handle, meta, stamp.mode_bits),
             // The directory is there — it was just created — so a failure to
             // reopen it is a metadata loss, not a reason to fail the
             // extraction after the data is already on disk. That includes
@@ -1297,8 +1312,49 @@ struct HardLinkSite<'a> {
     meta: &'a EntryMeta,
     link_to: &'a str,
     force: bool,
-    /// The permission bits a restored mode may keep ([`extract`]'s).
+    /// What [`extract`] stamps on what it makes.
+    stamp: Stamp<'a>,
+}
+
+/// What [`extract`] puts on everything it makes besides an entry's own
+/// metadata: the permission bits a restored mode may keep, and the
+/// archive's quarantine.
+#[derive(Clone, Copy)]
+struct Stamp<'a> {
+    /// [`RESTORED_MODE_BITS`] less the umask, or all of them under
+    /// `same_permissions`.
     mode_bits: u32,
+    /// The value [`crate::quarantine::read`] gave for the archive.
+    quarantine: Option<&'a [u8]>,
+}
+
+impl Stamp<'_> {
+    /// Quarantines a file this run just created, by its descriptor. Best
+    /// effort, as tar's: a filesystem without extended attributes cannot
+    /// hold it.
+    fn quarantine_file(&self, f: &std::fs::File) {
+        if let Some(v) = self.quarantine {
+            let _ = crate::quarantine::apply(f, v);
+        }
+    }
+
+    /// Quarantines a directory this run just created ([`quarantine_dir`]).
+    fn quarantine_dir(&self, path: &Path) {
+        quarantine_dir(self.quarantine, path);
+    }
+}
+
+/// Quarantines the directory this run just created at `path`, opened
+/// without following a symlink at its last component. Symlinks themselves
+/// are never quarantined: Gatekeeper checks what a link resolves to, and
+/// that is either something this run made (and stamped) or something it
+/// did not make.
+fn quarantine_dir(quarantine: Option<&[u8]>, path: &Path) {
+    if let Some(v) = quarantine
+        && let Ok(handle) = open_created_dir(path, None)
+    {
+        let _ = crate::quarantine::apply(&handle, v);
+    }
 }
 
 /// Recreates one hard-link entry, returning what it left at the link's path
@@ -1337,7 +1393,7 @@ fn extract_hard_link(
         meta,
         link_to,
         force,
-        mode_bits,
+        stamp,
     } = site;
     // The target is an archive-supplied path too: lexically checked before
     // anything else, exactly as an entry's own name is, so a target that
@@ -1482,7 +1538,7 @@ fn extract_hard_link(
                 link_path,
                 meta,
                 link_to,
-                mode_bits,
+                stamp,
                 budget,
                 warnings,
             )
@@ -1599,7 +1655,7 @@ fn copy_link_target(
     link_path: &Path,
     meta: &EntryMeta,
     link_to: &str,
-    mode_bits: u32,
+    stamp: Stamp<'_>,
     budget: &mut ArchiveBudget,
     warnings: &mut Vec<Fidelity>,
 ) -> Result<Option<(MadeKind, u64)>> {
@@ -1622,6 +1678,7 @@ fn copy_link_target(
             return Ok(None);
         }
     };
+    stamp.quarantine_file(&out);
     let mut buf = vec![0u8; 64 * 1024];
     let mut copied = 0u64;
     loop {
@@ -1642,7 +1699,7 @@ fn copy_link_target(
     out.flush()?;
     // The copy is a file of its own: it gets the link entry's metadata, as
     // the `File` arm gives a payload's, through the same open handle.
-    let missing = apply_metadata(&out, meta, mode_bits);
+    let missing = apply_metadata(&out, meta, stamp.mode_bits);
     warn_metadata(warnings, &meta.name, missing);
     Ok(Some((MadeKind::Hardlink, copied)))
 }
@@ -2898,8 +2955,13 @@ pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
         salvage_scan(format, &mut file, &opts.policy)?
     };
 
+    let quarantine = crate::ops::FromInput::of(&Input::Path(path.to_path_buf())).quarantine;
     if let Some(dest) = &opts.dest {
+        let existed = std::fs::symlink_metadata(dest).is_ok();
         std::fs::create_dir_all(dest)?;
+        if !existed {
+            quarantine_dir(quarantine.as_deref(), dest);
+        }
     }
 
     // Every destination path an earlier entry IN THIS RUN has already
@@ -2918,6 +2980,7 @@ pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
     // the run already made (a directory, a file) is in the way. It also
     // carries the archive's identity: never replaced (EXTRACT-1).
     let mut made = MadeByRun::reading(Some(path));
+    made.quarantine = quarantine;
 
     let mut entries = Vec::with_capacity(scan.entries.len());
     for entry in &scan.entries {
@@ -3009,8 +3072,11 @@ fn place_salvaged_entry(
                     Ok(()) => {}
                     Err(skipped) => return Ok(skipped),
                 }
-                match skip_if_name_refused(std::fs::create_dir_all(&target), &entry.meta.name) {
-                    Ok(Ok(())) => {
+                match skip_if_name_refused(create_dir_once(&target), &entry.meta.name) {
+                    Ok(Ok(created)) => {
+                        if created {
+                            quarantine_dir(made.quarantine.as_deref(), &target);
+                        }
                         made.record_path(&target, MadeKind::Dir);
                         Ok(SalvageDisposition::Directory(target))
                     }
@@ -3393,6 +3459,9 @@ fn open_salvage_target(
         Ok(Err(w)) => return Err(unwritable_skip(w)),
         Err(e) => return Err(unwritable(e)),
     };
+    if let Some(v) = &made.quarantine {
+        let _ = crate::quarantine::apply(&out, v);
+    }
     made.record_path(write_target, MadeKind::File);
     Ok(out)
 }
@@ -5675,6 +5744,9 @@ struct MadeByRun {
     /// names it and `at` records it. Only these get an entry's mode and
     /// mtime, and only while the identity still matches (EXTRACT-2/5).
     created_dirs: HashMap<PathBuf, Option<(u64, u64)>>,
+    /// The archive's quarantine (macOS), for the parents [`place`] creates
+    /// and what salvage writes (security audit EXTRACT-3).
+    quarantine: Option<Vec<u8>>,
 }
 
 /// The archive being read, as [`place`] and salvage compare it against a
@@ -6217,6 +6289,7 @@ fn place(
                 Ok(()) => {
                     made.record_created_dir(&path);
                     made.record_path(&path, MadeKind::Dir);
+                    quarantine_dir(made.quarantine.as_deref(), &path);
                 }
                 // Only this run writes here, and the walk above found it
                 // absent; a racing local writer is the TOCTOU window
@@ -7725,7 +7798,10 @@ mod tests {
                 meta,
                 link_to: target,
                 force: true,
-                mode_bits: RESTORED_MODE_BITS,
+                stamp: Stamp {
+                    mode_bits: RESTORED_MODE_BITS,
+                    quarantine: None,
+                },
             },
             extracted,
             &mut budget,
@@ -7891,7 +7967,10 @@ mod tests {
                 meta: &meta,
                 link_to: "b",
                 force: false,
-                mode_bits: RESTORED_MODE_BITS,
+                stamp: Stamp {
+                    mode_bits: RESTORED_MODE_BITS,
+                    quarantine: None,
+                },
             },
             &mut extracted,
             &mut budget,

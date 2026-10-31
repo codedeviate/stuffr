@@ -17,6 +17,7 @@ mod pack_edges;
 mod pack_findings;
 mod pack_walk;
 mod permissions;
+mod quarantine;
 mod reference_tools;
 mod salvage;
 mod salvage_checksumless;

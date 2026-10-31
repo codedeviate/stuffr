@@ -1520,6 +1520,10 @@ fn move_into_place(from: &Path, to: &Path) -> std::io::Result<()> {
             Err(e) => return Err(e),
         }
     };
+    // The staged file's quarantine (macOS) does not survive a byte copy.
+    if let Some(q) = stuffr::quarantine::read_raw(&input) {
+        let _ = stuffr::quarantine::apply(&out, &q);
+    }
     let copied = std::io::copy(&mut input, &mut out)
         .and_then(|_| out.set_permissions(mode))
         .and_then(|()| out.sync_all())

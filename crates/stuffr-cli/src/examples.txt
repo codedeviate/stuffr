@@ -746,6 +746,8 @@ EXTRACTING AN ARCHIVE'S ENTRIES
       warning says so), and a directory that already existed before the run
       keeps its own mode and mtime — the archive's metadata is only applied
       to what the run created.
+      On macOS everything the run creates (symlinks aside) also gets the
+      archive's quarantine attribute, so Gatekeeper still checks it.
 
   stuffr unpack backup.tar.gz -C out/ docs notes.txt
       PATTERNS after the input select what to extract: an exact entry name,

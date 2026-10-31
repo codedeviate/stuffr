@@ -2508,6 +2508,13 @@ existed before the run keeps its own mode and mtime. A directory's metadata is
 applied at the end of the run, through a descriptor opened `O_NOFOLLOW` and
 checked against the inode the run created, so a directory swapped for a
 symlink in the meantime is skipped with a warning rather than followed.
+A single-stream output (`pack a.txt -o a.txt.gz`, `unpack a.gz -o a`,
+`convert a.gz -o a.xz`) takes its input file's mode, as gzip does, so a 0600
+file stays 0600. On macOS the input's quarantine attribute
+(`com.apple.quarantine`) is carried onto every file and directory `unpack` and
+`salvage` create and onto a single-stream output, as Apple's tar and unzip do,
+so Gatekeeper still checks what came out of a downloaded archive (symlinks are
+not stamped).
 
 **One window is deliberately still open, and it is worth stating plainly.** The
 symlinked-component check is the only containment check that consults the

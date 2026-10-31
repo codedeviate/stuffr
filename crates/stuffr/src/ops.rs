@@ -113,20 +113,34 @@ impl Input {
 /// regular file only; standard input and anything else carry nothing, and
 /// the output keeps the umask default. An archive written from many inputs
 /// (`pack` of a tree, `convert` between containers) takes nothing either.
+///
+/// And, on macOS, its quarantine attribute (security audit EXTRACT-3,
+/// [`crate::quarantine`]): read from a regular-file input, or from standard
+/// input redirected from one, and set on the output by descriptor.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FromInput {
     /// `st_mode & 0o777` of a regular-file input (unix only).
     pub(crate) mode: Option<u32>,
+    /// The quarantine value what is made from the input gets (macOS only).
+    pub(crate) quarantine: Option<Vec<u8>>,
 }
 
 impl FromInput {
     /// What `src` hands its output: nothing unless it is a path to a
-    /// regular file (followed through a symlink, as the read is).
+    /// regular file (followed through a symlink, as the read is), or (the
+    /// quarantine alone) standard input redirected from one. Both are read
+    /// from one descriptor.
     pub(crate) fn of(src: &Input) -> Self {
         let Some(path) = src.path() else {
+            return Self {
+                mode: None,
+                quarantine: stdin_file().as_ref().and_then(crate::quarantine::read),
+            };
+        };
+        let Ok(file) = std::fs::File::open(path) else {
             return Self::default();
         };
-        let Ok(md) = std::fs::metadata(path) else {
+        let Ok(md) = file.metadata() else {
             return Self::default();
         };
         if !md.is_file() {
@@ -139,7 +153,34 @@ impl FromInput {
         };
         #[cfg(not(unix))]
         let mode = None;
-        Self { mode }
+        Self {
+            mode,
+            quarantine: crate::quarantine::read(&file),
+        }
+    }
+
+    /// Stamps `f`, something just made from this input, with the input's
+    /// quarantine. Best effort, as tar's: a filesystem without extended
+    /// attributes (FAT, some network shares) cannot hold it.
+    pub(crate) fn stamp(&self, f: &std::fs::File) {
+        if let Some(v) = &self.quarantine {
+            let _ = crate::quarantine::apply(f, v);
+        }
+    }
+}
+
+/// Standard input, duplicated, when it is redirected from a regular file.
+pub(crate) fn stdin_file() -> Option<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
+        let fd = std::io::stdin().as_fd().try_clone_to_owned().ok()?;
+        let f = std::fs::File::from(fd);
+        f.metadata().ok()?.is_file().then_some(f)
+    }
+    #[cfg(not(unix))]
+    {
+        None
     }
 }
 
@@ -286,6 +327,7 @@ impl Output {
                 // the mode this starts at and why.
                 let (tmp, f) =
                     create_temp_file(&parent, &file_name, exists || from.mode.is_some())?;
+                from.stamp(&f);
                 if let Some(perms) = carry_over_perms {
                     // Mask off setuid/setgid (0o6000) before applying: a
                     // destination that happened to carry either bit must

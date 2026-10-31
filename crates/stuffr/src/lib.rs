@@ -143,6 +143,8 @@ pub mod brotli_opts {
 pub mod entries;
 mod link_cache;
 pub mod ops;
+#[doc(hidden)]
+pub mod quarantine;
 mod walk;
 
 /// Builds a registry containing every format this build was compiled with.
