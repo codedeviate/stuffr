@@ -1562,8 +1562,9 @@ pub(crate) struct Filter {
 }
 
 /// Every zip.c option and the state the command line sets (the globals of
-/// zip.c and globals.c that `main()` writes, with the C's names).
-#[derive(Debug, Clone)]
+/// zip.c and globals.c that `main()` writes, with the C's names). Not
+/// `Clone`: it holds the password, which is never copied (ruling T6b).
+#[derive(Debug)]
 pub(crate) struct Options {
     pub(crate) action: Action,
     pub(crate) comadd: bool,
@@ -1622,7 +1623,9 @@ pub(crate) struct Options {
     /// 0 quit, 1 warn, 2 ignore, 3 no.
     pub(crate) unicode_mismatch: u8,
     pub(crate) special: Option<Vec<u8>>,
-    pub(crate) key: Option<Vec<u8>>,
+    /// `-P`'s value or the typed password, zeroed when dropped (ruling
+    /// T6b).
+    pub(crate) key: Option<crate::compat::unzip::ttyio::Password>,
     pub(crate) key_needed: bool,
     pub(crate) bad_open_is_error: bool,
     pub(crate) zipfile: Option<Vec<u8>>,
@@ -2125,7 +2128,8 @@ pub(crate) fn parse_zip(z: &mut Zr, argv0: &[u8], rest: &[Vec<u8>]) -> Result<()
             (Some(b'p'), _) => {}
             // -P
             (Some(b'P'), _) => {
-                z.o.key = value;
+                // ruling T6b: the parser's copy itself, zeroed on drop
+                z.o.key = value.map(crate::compat::unzip::ttyio::Password::from_vec);
                 z.o.key_needed = false;
             }
             // -q
@@ -2337,10 +2341,11 @@ pub(crate) fn parse_zip(z: &mut Zr, argv0: &[u8], rest: &[Vec<u8>]) -> Result<()
         if key.key() != e.key() {
             return Err(z.ziperr(ZE_PARMS, m::PASSWORD_VERIFICATION_FAILED.as_bytes()));
         }
-        z.o.key = Some(key.key().to_vec());
+        // ruling T6b: the typed answer itself, never a copy
+        z.o.key = Some(key);
     }
     if let Some(key) = &z.o.key
-        && key.is_empty()
+        && key.key().is_empty()
     {
         // if -P "" could get here
         return Err(z.ziperr(ZE_PARMS, m::ZERO_LENGTH_PASSWORD.as_bytes()));
@@ -2404,16 +2409,26 @@ fn redact_password(table: &[OptionSpec], mut args: Vec<Vec<u8>>) -> Vec<Vec<u8>>
         let Some(value) = got.value else { continue };
         if st.optchar == SKIP_VALUE_ARG {
             // the value was the next argument
-            set(&mut args, st.argnum + 1, LOGGED_PASSWORD.to_vec());
+            if let Some(a) = usize::try_from(st.argnum + 1)
+                .ok()
+                .and_then(|i| args.get_mut(i))
+            {
+                // the old value's bytes zeroed before they are freed
+                let mut old = std::mem::replace(a, LOGGED_PASSWORD.to_vec());
+                crate::compat::unzip::ttyio::wipe(&mut old);
+            }
         } else if let Some(a) = usize::try_from(st.argnum)
             .ok()
             .and_then(|i| args.get_mut(i))
             && a.ends_with(&value)
         {
             // the value was the rest of this argument
-            a.truncate(a.len() - value.len());
+            let at = a.len() - value.len();
+            crate::compat::unzip::ttyio::wipe(&mut a[at..]);
+            a.truncate(at);
             a.extend_from_slice(LOGGED_PASSWORD);
         }
+        drop(crate::compat::unzip::ttyio::Password::from_vec(value));
     }
     args
 }

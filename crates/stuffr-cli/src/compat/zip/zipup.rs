@@ -630,8 +630,9 @@ pub(crate) fn add_entry(
     // assume first that an extended local header is needed
     e.flg = if isdir { 0 } else { 8 };
     // the password, when this entry is encrypted (never a directory)
-    let key = if isdir { None } else { z.o.key.clone() };
-    if key.is_some() {
+    // ruling T6b: borrowed where it is used, never copied
+    let encrypt = !isdir && z.o.key.is_some();
+    if encrypt {
         e.flg |= 1;
         // the CRC is not known yet: the header's check is the time's, and
         // so is the local header's CRC until it is rewritten
@@ -653,8 +654,8 @@ pub(crate) fn add_entry(
     // crypt.c:crypthead: the encryption header, its ten random bytes from
     // the system (not rand()), its check the time's high bytes
     let mut keys = None;
-    if let Some(k) = &key {
-        let mut ks = Keys::new(k);
+    if encrypt && let Some(k) = &z.o.key {
+        let mut ks = Keys::new(k.key());
         let Ok(random) = super::ttyio::random_header() else {
             return Err(z.ziperr(ZE_LOGIC, m::NO_RANDOM_BYTES.as_bytes()));
         };

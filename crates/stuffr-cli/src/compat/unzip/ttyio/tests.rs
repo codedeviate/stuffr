@@ -239,6 +239,28 @@ fn a_password_shows_nothing_and_is_zeroed() {
     assert!(q.is_empty_answer());
 }
 
+/// Ruling T6b of the 2026-10-31 security audit: `from_vec` keeps the
+/// caller's buffer (no copy is left behind), and `clear`, which `Drop`
+/// calls, zeroes those bytes in place before the vector lets them go.
+/// Freed memory cannot be read, so the zeroing is observed through the
+/// live allocation `clear` keeps (it never shrinks the capacity).
+#[test]
+fn a_password_is_zeroed_in_place_and_never_copied() {
+    let v = b"hunter2".to_vec();
+    let at = v.as_ptr();
+    let mut p = Password::from_vec(v);
+    assert_eq!(p.0.as_ptr(), at, "taken over without a copy");
+    p.clear();
+    assert_eq!(p.0.as_ptr(), at, "the same allocation");
+    // SAFETY: seven initialised bytes inside the vector's live allocation;
+    // nothing else holds a reference to them.
+    let held = unsafe { std::slice::from_raw_parts(at, 7) };
+    assert_eq!(held, [0u8; 7]);
+    let mut copy = *b"secret";
+    wipe(&mut copy[2..]);
+    assert_eq!(&copy, b"se\0\0\0\0");
+}
+
 /// ruling: T11-3. A terminal whose master has closed returns nothing for
 /// ever (macOS: `read` gives 0 and `poll` reports `POLLHUP`; Linux: `read`
 /// fails with `EIO`), where the C would store the stale byte for ever:

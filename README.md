@@ -2070,7 +2070,8 @@ before the command line, as the reference does.
     created `0666 & ~umask` through any symlink at its name. stuffr writes
     `********` in place of the password (every form: `-P pw`, `-Ppw`,
     `--password=pw`, ...), creates a new log 0600 and opens it, `-la`'s too,
-    without following a symlink (`could not open logfile`, exit 16).
+    without following a symlink (`could not open logfile`, exit 16). zip
+    and zipcloak keep the password only in a buffer zeroed when dropped.
 
 The full set is in the code's module docs
 (`crates/stuffr-cli/src/compat/zip/mod.rs`), which is the source of truth.

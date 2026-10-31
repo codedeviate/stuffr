@@ -162,7 +162,8 @@ pub(crate) fn run(z: &mut Zr, o: CloakOptions) -> Exit {
             return z.ziperr(ZE_PARMS, m::ZERO_LENGTH_PASSWORD.as_bytes());
         }
     }
-    let pw = passwd.key().to_vec();
+    // ruling T6b: borrowed from the zeroing holder, never copied
+    let pw = passwd.key();
 
     // Open input zip file again, copy preamble if any
     let mut ia = InArchive { f: None };
@@ -195,7 +196,7 @@ pub(crate) fn run(z: &mut Zr, o: CloakOptions) -> Exit {
             let mut l = Vec::new();
             printf(&mut l, m::DECRYPTING, &[&zf.zname]);
             z.stdout_write(&l);
-            match zipbare(z, &mut ia, &mut out, &mut tempzn, zf, &pw) {
+            match zipbare(z, &mut ia, &mut out, &mut tempzn, zf, pw) {
                 Ok(()) => {}
                 Err(CopyFail::Code(ZE_MISS, _)) => {
                     z.stdout_write(m::WRONG_PASSWORD_JUST_COPYING.as_bytes());
@@ -207,7 +208,7 @@ pub(crate) fn run(z: &mut Zr, o: CloakOptions) -> Exit {
             let mut l = Vec::new();
             printf(&mut l, m::ENCRYPTING, &[&zf.zname]);
             z.stdout_write(&l);
-            if let Err(f) = zipcloak(z, &mut ia, &mut out, &mut tempzn, zf, &pw) {
+            if let Err(f) = zipcloak(z, &mut ia, &mut out, &mut tempzn, zf, pw) {
                 return fail_exit(z, f, m::WAS_ENCRYPTING.as_bytes());
             }
         } else {

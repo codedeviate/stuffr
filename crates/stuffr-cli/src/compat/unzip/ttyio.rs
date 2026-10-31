@@ -37,6 +37,12 @@ impl Password {
         Password(bytes.to_vec())
     }
 
+    /// `bytes` itself, taken over without a copy (zip's `-P` value as the
+    /// option parser returned it), so no unzeroed copy is left behind.
+    pub(crate) fn from_vec(bytes: Vec<u8>) -> Password {
+        Password(bytes)
+    }
+
     /// The password as `init_keys()` reads it: a C string, up to its first
     /// NUL.
     pub(crate) fn key(&self) -> &[u8] {
@@ -55,14 +61,21 @@ impl Password {
     /// Volatile writes, so the zeroing is not optimised away as dead
     /// stores before the buffer is freed.
     fn clear(&mut self) {
-        for b in self.0.iter_mut() {
-            // SAFETY: `b` is a valid, aligned, exclusive reference to a byte
-            // of the vector.
-            unsafe { std::ptr::write_volatile(b, 0) };
-        }
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        wipe(&mut self.0);
         self.0.clear();
     }
+}
+
+/// Zero `bytes` with volatile writes, so the zeroing is not optimised away
+/// as dead stores before the memory is freed or reused: for a copy of a
+/// password that is not a [`Password`] (zip's `-lf` redaction).
+pub(crate) fn wipe(bytes: &mut [u8]) {
+    for b in bytes.iter_mut() {
+        // SAFETY: `b` is a valid, aligned, exclusive reference to a byte of
+        // the slice.
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 impl Drop for Password {

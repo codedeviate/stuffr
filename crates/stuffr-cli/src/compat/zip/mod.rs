@@ -372,7 +372,10 @@
 //!     `O_NOFOLLOW`: a symlink at its name, live or dangling, is `could not
 //!     open logfile`, exit 16, where zip writes through it. `-sc`'s listing
 //!     still shows the password, as zip's does (it goes to the terminal,
-//!     not to a file).
+//!     not to a file). zip and zipcloak keep the password, given or typed,
+//!     only in a holder that zeroes it when dropped (ruling T6b); the
+//!     process's own arguments, and the parser's copies of them (which
+//!     `-sc` and `-R`'s hint print), are not zeroed.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
