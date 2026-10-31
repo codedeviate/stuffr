@@ -25,7 +25,14 @@ lz4_flex = "0.14"
 # (`lz4-c`): `stuffr_formats::lz4_opts` drives `LZ4F_*` as the lz4 CLI does,
 # so its `.lz4` output is byte-identical to the reference's. Reachable only
 # through `lz4-c`; the `pure` graph is unaffected.
-lz4-sys = "1.11.1"
+#
+# Exact, not a caret: `lz4_opts/c.rs` hand-declares six lz4frame 1.10
+# functions and the `LZ4F_preferences_t` layout, and the reference figures
+# (byte-identical `.lz4`) are lz4 1.10.0's. A crates.io consumer's resolver
+# must not pick a later 1.11.x that bundles another liblz4 behind those
+# declarations (UNSAFE-4, 2026-10-31 audit). Bump deliberately: re-check the
+# declarations against the new `lz4frame.h` and re-run the compat suite.
+lz4-sys = "=1.11.1"
 # xxHash32 for `lz4_opts`' own frame writer and reader (header, block and
 # content checksums). Already in every `lz4` build's graph: `lz4_flex`'s
 # default `frame` feature depends on this exact crate, so naming it adds no
@@ -46,6 +53,17 @@ snap = "1"
 # in zstd-sys's pregenerated experimental bindings; the C library compiled is
 # the same whole 1.5.7 tree either way.
 zstd = { version = "0.14.3", features = ["zstdmt", "experimental"] }
+# Not used directly (`zstd::zstd_safe::zstd_sys` is): named only to bound the
+# version `zstd` resolves to. `zstd_opts/c.rs` passes libzstd 1.5.7's
+# `ZSTD_c_experimentalParamN` numbers, whose meaning is fixed per libzstd
+# release, and the compat link's byte-identity is 1.5.7's — so a consumer's
+# resolver must not pick a later zstd-sys bundling another libzstd (UNSAFE-4,
+# 2026-10-31 audit). The same crate `zstd-safe` already pulls: one copy, no
+# features added. Bump deliberately: re-check the numbering asserts in
+# `zstd_opts/c.rs` against the new `zstd.h`. (zstd-sys's own `pkg-config`
+# feature, enabled by a consumer, would still link a system libzstd; that
+# is outside a version bound's reach.)
+zstd-sys = { version = "=2.1.2", default-features = false }
 # The exact pin is gone. Under the old 1.85 floor there was no choice: 0.9.0
 # declares `rust-version = "1.87"` and cargo refused it, and 0.8.2 declares no
 # `rust-version` at all while using a 1.87 stdlib method, so it built on a modern

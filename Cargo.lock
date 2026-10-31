@@ -906,6 +906,7 @@ dependencies = [
  "unarj-rs",
  "zip",
  "zstd",
+ "zstd-sys",
 ]
 
 [[package]]
