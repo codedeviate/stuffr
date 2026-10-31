@@ -966,13 +966,22 @@ pub(crate) fn install_zip_abort(host: &Host, text: &'static [u8]) {
     let _ = (host, text);
 }
 
-/// Whether `info` shows a signal stuffr caused itself rather than an
+/// Whether `info` shows a crash signal (SIGABRT, SIGSEGV, SIGBUS, SIGILL)
+/// stuffr caused itself rather than an
 /// interrupt (ruling T7a): sent by this process, or, on Linux, a fault the
 /// kernel raised (a positive `si_code` on SIGSEGV, SIGBUS or SIGILL). Only
 /// reads the `siginfo_t` and calls `getpid`: async-signal-safe.
 #[cfg(unix)]
 fn own_or_fault(sig: libc::c_int, info: *const libc::siginfo_t) -> bool {
-    if info.is_null() {
+    // Only a crash signal can be stuffr's own crash. SIGINT and SIGTERM are
+    // an interrupt whoever sent them, this process included (a `raise`
+    // from a test harness or an embedding caller): zip's answer, exit 9.
+    if info.is_null()
+        || !matches!(
+            sig,
+            libc::SIGABRT | libc::SIGSEGV | libc::SIGBUS | libc::SIGILL
+        )
+    {
         return false;
     }
     // SAFETY: `SA_SIGINFO` passes a valid siginfo_t (checked non-null).
