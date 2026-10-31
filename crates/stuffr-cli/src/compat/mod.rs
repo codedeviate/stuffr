@@ -263,8 +263,9 @@ pub(crate) fn stdout_is_tty() -> bool {
 ///
 /// Takes metadata rather than a path because bzip2 saves its input's
 /// metadata before reading it, so the access time it copies is the one from
-/// before the read. `to` is opened for writing to set the times, so call
-/// this before restricting `to`'s permissions any further.
+/// before the read. `to` is opened for writing (`O_NOFOLLOW`) and every
+/// attribute set through that descriptor, so call this before restricting
+/// `to`'s permissions any further.
 pub(crate) fn copy_metadata_from(meta: &std::fs::Metadata, to: &Path) -> io::Result<()> {
     copy_metadata_with_mtime(meta, to, None)
 }
@@ -283,20 +284,21 @@ pub(crate) fn copy_metadata_with_mtime(
     if let Some(t) = mtime.or_else(|| meta.modified().ok()) {
         times = times.set_modified(t);
     }
-    std::fs::File::options()
-        .write(true)
-        .open(to)?
-        .set_times(times)?;
+    // HOST-8: one descriptor, opened without following a symlink at `to`,
+    // carries the times, owner and mode, so a name swapped meanwhile is
+    // never followed.
+    let f = host::open_nofollow_for_write(to)?;
+    f.set_times(times)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        match std::os::unix::fs::chown(to, Some(meta.uid()), Some(meta.gid())) {
+        match std::os::unix::fs::fchown(&f, Some(meta.uid()), Some(meta.gid())) {
             Err(e) if e.kind() != io::ErrorKind::PermissionDenied => return Err(e),
             _ => {}
         }
     }
     // After `chown`, which may clear set-id bits.
-    std::fs::set_permissions(to, meta.permissions())
+    f.set_permissions(meta.permissions())
 }
 
 #[cfg(test)]
