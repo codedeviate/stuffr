@@ -402,7 +402,16 @@ impl bzip2recover::Fs for CountedFs {
     }
     fn create(&mut self, name: &[u8]) -> io::Result<Box<dyn Write>> {
         self.created += 1;
-        let f = File::create(self.dir.join(os_path(name)))?;
+        // As `RealFs` (Debian's O_EXCL, 0600; ruling T5): an existing name
+        // is refused, never truncated or written through.
+        let f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            File::options()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(self.dir.join(os_path(name)))?
+        };
         Ok(Box::new(CountedWrite(f, self.written.clone())))
     }
 }
