@@ -1,4 +1,5 @@
-//! Pins C2's ruling in isolation: `umask` is a process-global setting, not a
+//! Pins the fresh-destination mode ruling (C2, revised by HOST-1) in
+//! isolation: `umask` is a process-global setting, not a
 //! per-thread one, so a test that changes it cannot safely share a process
 //! with any other test that creates files and cares about the mode it gets —
 //! which is most of `ops_compress.rs`. Cargo gives each file under `tests/`
@@ -19,21 +20,22 @@ fn tmp(name: &str) -> std::path::PathBuf {
     p
 }
 
+/// Ruling C2 said a fresh destination lands at `0o666 & !umask`, what
+/// `File::create` produces. Security audit HOST-1 replaced it for a
+/// regular-file input: the output takes the INPUT's mode exactly, as gzip,
+/// bzip2, xz and zstd do, and that copy is not masked by the umask either
+/// (theirs is not). Only a stream input (stdin) still gets the umask
+/// default. This file keeps its own process because it sets the umask.
 #[test]
-fn a_fresh_destination_respects_the_umask_not_a_hardcoded_0600() {
-    // C2's ruling: 0600-at-creation exists to close a race when carrying
-    // permissions over from an existing destination. A brand-new destination
-    // has nothing to protect, so its mode must be the user's own umask
-    // policy — what `File::create` would produce — not a hardcoded 0600
-    // gzip, zstd and xz would never impose.
+fn a_fresh_destination_takes_the_inputs_mode_not_the_umask() {
     let src = tmp("in.txt");
     let dst = tmp("out.gz");
     let _ = std::fs::remove_file(&dst);
     std::fs::write(&src, b"payload").unwrap();
+    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o666)).unwrap();
 
-    // A concrete, non-default umask so this does not depend on whatever the
-    // test runner's environment happens to have set. Safe here specifically
-    // because this file has no other test to race against.
+    // A concrete umask that would clear bits of the input's mode. Safe here
+    // specifically because this file has no other test to race against.
     let old_umask = unsafe { libc_umask(0o022) };
 
     let result = compress(
@@ -49,10 +51,8 @@ fn a_fresh_destination_respects_the_umask_not_a_hardcoded_0600() {
 
     let mode = std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777;
     assert_eq!(
-        mode,
-        0o666 & !0o022,
-        "a fresh destination must land at 0o666 & !umask, exactly what File::create would \
-         produce, not a hardcoded 0600: got {mode:o}"
+        mode, 0o666,
+        "a fresh destination takes the input's mode exactly, as gzip does: got {mode:o}"
     );
 
     let _ = std::fs::remove_file(&src);

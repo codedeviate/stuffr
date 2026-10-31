@@ -681,8 +681,10 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             }
             // The motivating case: `curl … | stuffr cat - | grep pattern`.
             ops::refuse_directory_for(&input_of(&input), "cat")?;
-            ops::decompress(input_of(&input), Output::Stdout, &opts)?;
-            Ok(())
+            let out = ops::decompress(input_of(&input), Output::Stdout, &opts)?;
+            // `cat` has no --strict-fidelity, but a loss is still said: trailing
+            // data a codec ignored (PARSE-1) is the one a bare stream can carry.
+            report_fidelity(&out.fidelity, false)
         }
         Command::Info {
             input,
@@ -1424,22 +1426,113 @@ impl Drop for TempDirGuard {
     }
 }
 
+/// How many taken names [`fresh_temp_dir`] steps over before giving up.
+const MAX_TEMP_DIR_ATTEMPTS: u32 = 100;
+
 /// A fresh, empty directory under the system temp root, for [`TempDirGuard`]
 /// to own. No dependency on the `tempfile` crate: that is a dev-dependency
 /// of `stuffr` (used by `entries.rs`'s own unit tests), not available to
 /// this crate's production code.
+///
+/// Made by this call or not at all (security audit HOST-7): `mkdir`, never
+/// `create_dir_all`, so a directory or symlink another user planted at the
+/// predictable name is never adopted — a taken name is stepped over, a
+/// bounded number of times — and mode 0700, so nothing staged in it (a
+/// recovered member, at the umask default) is readable by anyone else.
 fn fresh_temp_dir(label: &str) -> stuffr::Result<TempDirGuard> {
+    fresh_temp_dir_in(&std::env::temp_dir(), label)
+}
+
+/// [`fresh_temp_dir`] under `root` (the seam its tests use).
+fn fresh_temp_dir_in(root: &Path, label: &str) -> stuffr::Result<TempDirGuard> {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let mut dir = std::env::temp_dir();
-    dir.push(format!(
-        "stuffr-salvage-{label}-{}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir)?;
-    Ok(TempDirGuard(dir))
+    let mut attempt = 0;
+    loop {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = root.join(format!(
+            "stuffr-salvage-{label}-{}-{nanos}-{n}",
+            std::process::id()
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        match builder.create(&dir) {
+            Ok(()) => return Ok(TempDirGuard(dir)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt += 1;
+                if attempt >= MAX_TEMP_DIR_ATTEMPTS {
+                    return Err(e.into());
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Moves the staged `from` onto `to`, replacing what is there. A `rename`
+/// replaces `to` atomically (a symlink at `to` is replaced, never followed).
+/// When `from` sits on another filesystem (`EXDEV`), its bytes are copied
+/// into a `create_new` file beside `to` — which no planted name can
+/// redirect — and THAT is renamed into place (security audit HOST-7: the
+/// old fallback removed `to` and then `fs::copy`ed onto the same name, which
+/// follows a symlink planted in between).
+fn move_into_place(from: &Path, to: &Path) -> std::io::Result<()> {
+    // Windows' rename does not replace an existing file.
+    #[cfg(not(unix))]
+    let _ = std::fs::remove_file(to);
+    match std::fs::rename(from, to) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {}
+        Err(e) => return Err(e),
+    }
+    let parent = match to.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let name = to
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut input = std::fs::File::open(from)?;
+    let mode = input.metadata()?.permissions();
+    let mut attempt = 0;
+    let (tmp, mut out) = loop {
+        let tmp = parent.join(format!(
+            ".{name}.{}-{attempt}.salvage-tmp",
+            std::process::id()
+        ));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+        match opts.open(&tmp) {
+            Ok(f) => break (tmp, f),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AlreadyExists
+                    && attempt + 1 < MAX_TEMP_DIR_ATTEMPTS =>
+            {
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    let copied = std::io::copy(&mut input, &mut out)
+        .and_then(|_| out.set_permissions(mode))
+        .and_then(|()| out.sync_all())
+        .and_then(|()| {
+            #[cfg(not(unix))]
+            let _ = std::fs::remove_file(to);
+            std::fs::rename(&tmp, to)
+        });
+    if let Err(e) = copied {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::remove_file(from)
 }
 
 /// `-o FILE`'s second half: given the outcome of a `select = {scan_position}`
@@ -1532,15 +1625,10 @@ fn finish_single_file_recovery(
             final_path.display()
         )));
     }
-    let _ = std::fs::remove_file(&final_path);
-    if std::fs::rename(&from, &final_path).is_err() {
-        // `from` lives in a temp directory that may sit on a different
-        // filesystem than `final_path`'s — `rename(2)` refuses that
-        // (`EXDEV`), so fall back to copying the bytes across and removing
-        // the source.
-        std::fs::copy(&from, &final_path)?;
-        std::fs::remove_file(&from)?;
-    }
+    // `from` lives in a temp directory that may sit on a different
+    // filesystem than `final_path`'s; `move_into_place` handles `EXDEV`
+    // without ever writing through `final_path` by name.
+    move_into_place(&from, &final_path)?;
     eprintln!("salvage -> wrote {}", final_path.display());
     // Salvage Stage 3 Task 3, R1 (routed from Task 1): an `Unattested`
     // entry written through `-o` exits 4, and until this line nothing said
@@ -2525,6 +2613,52 @@ fn salvage_column(registry: &stuffr::Registry, id: FormatId) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// HOST-7: `salvage -o` stages in a directory this call made, 0700.
+    #[cfg(unix)]
+    #[test]
+    fn the_salvage_staging_directory_is_new_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("stuffr-staging-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let a = fresh_temp_dir_in(&root, "t").unwrap();
+        let b = fresh_temp_dir_in(&root, "t").unwrap();
+        assert_ne!(a.0, b.0);
+        let md = std::fs::symlink_metadata(&a.0).unwrap();
+        assert!(md.is_dir());
+        assert_eq!(md.permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::read_dir(&a.0).unwrap().count(), 0);
+        drop((a, b));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// HOST-7: the move replaces a symlink planted at the output name; it
+    /// never writes through it.
+    #[cfg(unix)]
+    #[test]
+    fn moving_the_recovered_file_replaces_a_planted_symlink() {
+        let root = std::env::temp_dir().join(format!("stuffr-move-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let victim = root.join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let from = root.join("from");
+        std::fs::write(&from, b"recovered").unwrap();
+        let to = root.join("out");
+        std::os::unix::fs::symlink(&victim, &to).unwrap();
+        move_into_place(&from, &to).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert!(
+            !std::fs::symlink_metadata(&to)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&to).unwrap(), b"recovered");
+        assert!(!from.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     /// `salvage_format_by_name`'s own doc explains why its table cannot be
     /// gated by feature (naming an uncompiled format must still answer

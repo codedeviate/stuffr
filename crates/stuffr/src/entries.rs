@@ -4737,7 +4737,8 @@ fn create_target(
     force: bool,
     sync: bool,
 ) -> Result<ArchiveTarget> {
-    let opened = dst.create(force, sync)?;
+    // An archive written from many inputs takes no single input's mode.
+    let opened = dst.create(force, sync, &crate::ops::FromInput::default())?;
     let finish = opened.finish;
     // `CountingWriter` is innermost, closest to the file, so `bytes_out`
     // counts the bytes that actually land on disk — compressed, when there is

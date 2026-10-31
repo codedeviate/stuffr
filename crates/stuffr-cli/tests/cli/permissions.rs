@@ -123,3 +123,37 @@ fn same_permissions_needs_entry_extraction() {
     );
     assert!(!dir.join("a").exists());
 }
+
+/// HOST-1: a single-stream output takes the input file's mode, as gzip does.
+#[test]
+fn pack_and_unpack_keep_a_private_inputs_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp_dir();
+    let src = dir.join("s.txt");
+    std::fs::write(&src, b"secret").unwrap();
+    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let packed = dir.join("s.txt.gz");
+    let out = run_under_umask(
+        0o022,
+        &[
+            "pack",
+            src.to_str().unwrap(),
+            "-o",
+            packed.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(mode_of(&packed), 0o600);
+    let back = dir.join("back.txt");
+    let out = run_under_umask(
+        0o022,
+        &[
+            "unpack",
+            packed.to_str().unwrap(),
+            "-o",
+            back.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(mode_of(&back), 0o600);
+}

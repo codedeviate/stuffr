@@ -33,14 +33,15 @@ const MAX_TMP_ATTEMPTS: u32 = 100;
 /// Creates a fresh, uniquely-named temp file beside `parent`/`file_name`, at
 /// the mode this destination's carry-over case demands.
 ///
-/// `exists` selects between the two modes this project cares about: 0600
-/// (`exists: true`) when a pre-existing destination's permissions are about
-/// to be carried over onto this file — closing the window between creation
-/// and that later widening, during which another local user could otherwise
-/// open the file while it is still world/group-readable and keep reading
-/// from that descriptor even after permissions are narrowed — or the
-/// ordinary umask-derived default (`exists: false`) a brand-new destination
-/// has nothing to protect and should not silently override.
+/// `restrict` selects between the two modes this project cares about: 0600
+/// (`restrict: true`) when a mode is about to be set on this file — a
+/// pre-existing destination's, or the input file's (security audit HOST-1)
+/// — closing the window between creation and that later widening, during
+/// which another local user could otherwise open the file while it is still
+/// world/group-readable and keep reading from that descriptor even after
+/// permissions are narrowed; or the ordinary umask-derived default
+/// (`restrict: false`) when there is no mode to set (a stream input, or an
+/// archive written from many inputs).
 ///
 /// Split out from `Output::create` specifically so this one decision is
 /// independently testable: inlined, the widening `set_permissions` call that
@@ -53,7 +54,7 @@ const MAX_TMP_ATTEMPTS: u32 = 100;
 fn create_temp_file(
     parent: &Path,
     file_name: &str,
-    exists: bool,
+    restrict: bool,
 ) -> Result<(PathBuf, std::fs::File)> {
     let mut attempt = 0u32;
     loop {
@@ -64,7 +65,7 @@ fn create_temp_file(
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            if exists {
+            if restrict {
                 opts.mode(0o600);
             }
         }
@@ -101,6 +102,44 @@ impl Input {
             Input::Path(p) => Some(p),
             Input::Stdin => None,
         }
+    }
+}
+
+/// What a single-stream output takes from its input file: its permission
+/// bits (security audit HOST-1). gzip, bzip2, xz and zstd give their output
+/// the input's mode exactly, setuid/setgid/sticky dropped and NOT masked by
+/// the umask, and so does stuffr — a 0600 secret compressed or decompressed
+/// stays 0600 instead of landing at the umask default (0644). Read from a
+/// regular file only; standard input and anything else carry nothing, and
+/// the output keeps the umask default. An archive written from many inputs
+/// (`pack` of a tree, `convert` between containers) takes nothing either.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FromInput {
+    /// `st_mode & 0o777` of a regular-file input (unix only).
+    pub(crate) mode: Option<u32>,
+}
+
+impl FromInput {
+    /// What `src` hands its output: nothing unless it is a path to a
+    /// regular file (followed through a symlink, as the read is).
+    pub(crate) fn of(src: &Input) -> Self {
+        let Some(path) = src.path() else {
+            return Self::default();
+        };
+        let Ok(md) = std::fs::metadata(path) else {
+            return Self::default();
+        };
+        if !md.is_file() {
+            return Self::default();
+        }
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            Some(md.permissions().mode() & 0o777)
+        };
+        #[cfg(not(unix))]
+        let mode = None;
+        Self { mode }
     }
 }
 
@@ -158,7 +197,16 @@ impl Output {
     /// `sync` is carried through unchanged into the returned `Opened`'s
     /// `Finish` (when there is one), for `publish` to act on later — see its
     /// docs for what turning it off costs.
-    pub(crate) fn create(&self, force: bool, sync: bool) -> Result<Opened> {
+    ///
+    /// **The mode.** `from.mode` (the input file's bits, [`FromInput`]) is
+    /// what a fresh destination gets. A destination replaced under `--force`
+    /// keeps its own mode as before, now INTERSECTED with the input's when
+    /// there is one: never wider than the file it replaces (a 0600 output
+    /// another tool locked down stays 0600) and never wider than the input
+    /// (a 0600 secret never lands in a 0644 file because the name it replaced
+    /// was 0644). Either way the temp is created 0600 and `fchmod`ed before
+    /// a byte is written.
+    pub(crate) fn create(&self, force: bool, sync: bool, from: &FromInput) -> Result<Opened> {
         match self {
             Output::Stdout => Ok(Opened {
                 writer: Box::new(std::io::stdout()),
@@ -236,7 +284,8 @@ impl Output {
                 // rather than letting it permanently lock the destination out
                 // of being compressed to at all. See `create_temp_file` for
                 // the mode this starts at and why.
-                let (tmp, f) = create_temp_file(&parent, &file_name, exists)?;
+                let (tmp, f) =
+                    create_temp_file(&parent, &file_name, exists || from.mode.is_some())?;
                 if let Some(perms) = carry_over_perms {
                     // Mask off setuid/setgid (0o6000) before applying: a
                     // destination that happened to carry either bit must
@@ -247,11 +296,22 @@ impl Output {
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        let masked = perms.mode() & !0o6000;
-                        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(masked))?;
+                        let mut masked = perms.mode() & !0o6000;
+                        if let Some(input) = from.mode {
+                            masked &= input | !0o777;
+                        }
+                        f.set_permissions(std::fs::Permissions::from_mode(masked))?;
                     }
                     #[cfg(not(unix))]
                     std::fs::set_permissions(&tmp, perms)?;
+                } else if let Some(_mode) = from.mode {
+                    // Through the descriptor: the name is a temp in a
+                    // directory others may write to.
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        f.set_permissions(std::fs::Permissions::from_mode(_mode))?;
+                    }
                 }
                 // A second handle on the same temp file, taken before `f` is
                 // boxed away as the writer, so `publish` can `sync_all()` it
@@ -731,6 +791,7 @@ pub fn compress_with(
     // Before any filesystem work: a rejected option must cost nothing.
     let (codec, encode) = checked_encoder(registry, format, o)?;
 
+    let from = FromInput::of(&src);
     let mut reader = src.open()?;
     // Computed from the source's actual seekability, the same way
     // `decompress` computes it — not assumed. `stuffr pack - -o x.gz` reads a
@@ -741,7 +802,7 @@ pub fn compress_with(
     } else {
         Rung::ForwardOnly
     };
-    let opened = dst.create(o.force, o.sync)?;
+    let opened = dst.create(o.force, o.sync, &from)?;
     let (counted, written) = CountingWriter::new(opened.writer);
 
     let run = || -> Result<u64> {
@@ -863,6 +924,7 @@ pub fn decompress_with(
     o: &DecompressOpts,
 ) -> Result<Outcome> {
     let path = src.path().map(Path::to_path_buf);
+    let from = FromInput::of(&src);
 
     let source = src.open()?;
     // Read the rung from the RAW source's capabilities, before `probe` runs.
@@ -899,7 +961,7 @@ pub fn decompress_with(
     let mut decoder = codec.decoder(Box::new(counting), &decode_opts)?;
     let mut guard = RatioGuard::new(Arc::clone(&consumed), o.max_ratio);
 
-    let opened = dst.create(o.force, o.sync)?;
+    let opened = dst.create(o.force, o.sync, &from)?;
     let finish = opened.finish;
     let mut writer = opened.writer;
 
@@ -1041,6 +1103,8 @@ pub fn resolve_source_chain(
 /// is counted for [`RecompressOpts::max_ratio`], and every decoder is built
 /// under the `memory_limit` given here.
 pub struct ConvertSource {
+    /// What a single-stream output of this source takes from it.
+    from_input: FromInput,
     chain: Chain,
     decoded: Box<dyn Source>,
     consumed: Arc<AtomicU64>,
@@ -1075,6 +1139,7 @@ impl ConvertSource {
             )
         })?;
         let path = src.path().map(Path::to_path_buf);
+        let from_input = FromInput::of(&src);
         let compressed_total = path
             .as_deref()
             .and_then(|p| std::fs::metadata(p).ok())
@@ -1097,6 +1162,7 @@ impl ConvertSource {
         let (chain, decoded) =
             resolve_source_chain(registry, path.as_deref(), Box::new(counting), &decode_opts)?;
         Ok(Self {
+            from_input,
             chain,
             decoded,
             consumed,
@@ -1237,6 +1303,7 @@ fn write_recompressed(
     dst: Output,
     o: &RecompressOpts,
 ) -> Result<Outcome> {
+    let from = src.from_input.clone();
     let (chain, mut decoded, consumed, rung, _compressed_total) = src.into_parts();
 
     let format = match (o.codec, chain.outermost_codec(), chain.container()) {
@@ -1253,7 +1320,7 @@ fn write_recompressed(
     };
 
     let mut guard = RatioGuard::new(Arc::clone(&consumed), o.max_ratio);
-    let opened = dst.create(o.force, o.sync)?;
+    let opened = dst.create(o.force, o.sync, &from)?;
     let finish = opened.finish;
     let (counted, written) = CountingWriter::new(opened.writer);
 
@@ -1665,7 +1732,9 @@ mod tests {
         std::fs::write(&dst, b"PRE-EXISTING").unwrap();
         std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o6644)).unwrap();
 
-        let opened = Output::Path(dst.clone()).create(true, true).unwrap();
+        let opened = Output::Path(dst.clone())
+            .create(true, true, &FromInput::default())
+            .unwrap();
         let tmp_path = opened.finish.as_ref().unwrap().tmp.clone();
 
         let mode = std::fs::metadata(&tmp_path).unwrap().permissions().mode() & 0o7777;
