@@ -732,16 +732,19 @@ mod tests {
 
     #[test]
     fn a_block_that_overruns_its_maximum_size_is_corrupt_not_decoded() {
-        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(
-            block_size_bomb(64),
-        )));
+        let src: Box<dyn Source> =
+            Box::new(ReaderSource::new(std::io::Cursor::new(block_size_bomb(64))));
         let mut dec = Zstd.decoder(src, &DecodeOpts::default()).unwrap();
         let mut out = Vec::new();
         let err = dec
             .read_to_end(&mut out)
             .expect_err("a block decoding past Block_Maximum_Size must be refused");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
-        assert!(out.len() <= 1024, "{} bytes decoded before the refusal", out.len());
+        assert!(
+            out.len() <= 1024,
+            "{} bytes decoded before the refusal",
+            out.len()
+        );
     }
 
     /// A skippable frame as Blender writes one: magic `0x184D2A5E` and a
