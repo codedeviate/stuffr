@@ -2557,8 +2557,9 @@ full disk, for example) shows `-`, a footnote under the table names the first
 reason, and JSON and CSV carry it in `mem_error`; the row's other figures
 stand, it takes no part in `least memory`, and the exit code is unchanged. A
 row whose timed run failed, a refusal by `--memory-limit` included, has no
-memory run. On the C tier the decoders take no memory limit, so `d-mem` can
-exceed `--memory-limit`. The memory runs add one compression and one
+memory run. On the C tier only the zstd, xz and lzma decoders honour the memory
+limit; the others (gzip, zlib, bzip2, lz4, brotli) take none, so `d-mem` can
+exceed `--memory-limit` for them. The memory runs add one compression and one
 decompression per row, so a run takes up to about twice as long (1.8x for
 every level of xz and lz4 on 19 MiB of text), most for slow compressors such
 as xz. `--no-memory` skips them: no memory columns and no `least memory` line.

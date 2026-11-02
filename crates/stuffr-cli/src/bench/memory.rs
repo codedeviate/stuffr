@@ -1252,13 +1252,9 @@ mod tests {
         );
     }
 
-    /// The pure xz decoder refuses a header whose dictionary exceeds the
-    /// limit; the child reports that as a refusal. (The C tier's decoder
-    /// takes no limit, so this is pure-tier only.)
-    #[cfg(all(
-        any(target_vendor = "apple", target_os = "linux"),
-        not(feature = "xz-c")
-    ))]
+    /// The xz decoder (either tier) refuses a header whose dictionary exceeds
+    /// the limit; the child reports that as a refusal.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     #[test]
     fn a_child_refusal_names_the_memory_limit() {
         let dir = Scratch::new();

@@ -1536,8 +1536,9 @@ BENCHMARKING FORMATS ON YOUR OWN DATA
       fails (a full disk, for example) shows -, with a footnote under
       the table naming the first reason, and never fails the row or
       changes the exit code. A row whose timed run failed (a refusal by
-      --memory-limit included) has no memory run; on the C tier the
-      decoders take no memory limit, so d-mem can exceed --memory-limit.
+      --memory-limit included) has no memory run; on the C tier only
+      the zstd, xz and lzma decoders honour the limit; the others (gzip,
+      zlib, bzip2, lz4, brotli) take none, so d-mem can exceed it.
       The memory runs add one compression and one decompression per row,
       so a run takes up to about twice as long (1.8x for every level of
       xz and lz4 on 19 MiB of text), most for slow compressors such as
