@@ -1944,8 +1944,13 @@ fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
 
     // Things the run could not do that did not stop an entry being written
     // (a mode the filesystem refused): every run, never the exit code.
-    for note in &outcome.notes {
-        eprintln!("stuffr: {note}");
+    // Not under `-o`: the library names files relative to the throwaway
+    // directory, and the later move onto FILE may apply the mode anyway;
+    // `finish_single_file_recovery`'s `mode_refused` speaks about FILE.
+    if output.is_none() {
+        for note in &outcome.notes {
+            eprintln!("salvage -> {note}");
+        }
     }
 
     // Computed on the FULL scan: "nothing recoverable at all" is a fact
