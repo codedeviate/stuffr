@@ -2327,6 +2327,18 @@ fn cat_strict_fidelity_exits_4_on_gzip_trailing_junk() {
 }
 
 #[test]
+fn cat_strict_fidelity_on_stdin_exits_4_on_gzip_trailing_junk() {
+    let dir = tmp_dir();
+    let f = gz_with_junk(&dir, "j.gz");
+    let bytes = std::fs::read(&f).unwrap();
+    let out = run_with_stdin_output(&["cat", "--strict-fidelity", "-"], &bytes);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.stdout, b"hello\n", "{stderr}");
+    assert_eq!(out.status.code(), Some(4), "{stderr}");
+    assert!(stderr.contains("followed by 8 byte(s)"), "{stderr}");
+}
+
+#[test]
 fn cat_without_strict_still_exits_0_on_gzip_trailing_junk() {
     let dir = tmp_dir();
     let f = gz_with_junk(&dir, "j.gz");
