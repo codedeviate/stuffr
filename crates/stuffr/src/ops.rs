@@ -131,7 +131,8 @@ fn mode_not_applied(target: &Path) -> Fidelity {
 
 #[cfg(test)]
 thread_local! {
-    /// Test seam: makes [`set_mode_best_effort`] behave as a filesystem that
+    /// Test seam: makes [`set_mode_by_descriptor`] (so [`set_mode_best_effort`]
+    /// and salvage's file creation) behave as a filesystem that
     /// refuses `fchmod`, which no test machine can be relied on to mount.
     static FAIL_FCHMOD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

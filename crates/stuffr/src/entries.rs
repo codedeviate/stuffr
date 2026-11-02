@@ -3068,7 +3068,7 @@ pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
         entries,
         sightings: scan.sightings,
         walk_stop: scan.walk_stop,
-        notes: std::mem::take(&mut made.notes),
+        notes: made.take_notes(),
     })
 }
 
@@ -3392,8 +3392,9 @@ fn place_salvaged_file(
     // `SalvageDisposition::SkippedUnwritable` for the measurement (exit 1
     // on a 404-character entry name, every later entry lost) and for why
     // the fold is kind-blind.
-    let mut out = match open_salvage_target(dest, &write_target, &entry.meta, made) {
-        Ok(out) => out,
+    let (mut out, mode_refused) = match open_salvage_target(dest, &write_target, &entry.meta, made)
+    {
+        Ok(opened) => opened,
         Err(skipped) => return Ok(skipped),
     };
     let completed =
@@ -3429,6 +3430,12 @@ fn place_salvaged_file(
     // Only once the bytes are really there: a file removed on a failed write
     // above frees its inode, and a stale identity must never name a holder.
     claimed.record_written(&write_target, entry.scan_position);
+    // The note is for a file that is KEPT: raised here, not at the open, so
+    // an entry that failed or was removed above never claims "written".
+    if let Some(e) = &mode_refused {
+        let shown = write_target.strip_prefix(dest).unwrap_or(&write_target);
+        made.note_mode_refused(shown, e);
+    }
 
     let partial_cause = is_partial.then(|| {
         partial_cause(
@@ -3504,13 +3511,15 @@ fn place_salvaged_file(
 /// and widened by descriptor to [`salvaged_file_mode`] — the archived mode
 /// masked by the umask, or the umask default when the archive records none
 /// — before a byte is written, so a 0600 member never lands 0644. Best
-/// effort: a filesystem that refuses the `fchmod` leaves it 0600.
+/// effort: a filesystem that refuses the `fchmod` leaves it 0600, and the
+/// refusal is returned beside the file so the caller can raise a
+/// [`SalvageOutcome::notes`] entry once the file is known to be kept.
 fn open_salvage_target(
     dest: &Path,
     write_target: &Path,
     meta: &EntryMeta,
     made: &mut MadeByRun,
-) -> std::result::Result<std::fs::File, SalvageDisposition> {
+) -> std::result::Result<(std::fs::File, Option<std::io::Error>), SalvageDisposition> {
     let name = meta.name.as_str();
     // No `--force` concept exists for salvage, and `force: false` here:
     // salvage never removes or overwrites anything it did not write in this
@@ -3539,21 +3548,16 @@ fn open_salvage_target(
     };
     let mode = salvaged_file_mode(meta.mode, made.umask);
     #[cfg(unix)]
-    {
-        if let Err(e) = crate::ops::set_mode_by_descriptor(&out, mode) {
-            made.notes.push(format!(
-                "`{}`: written, but its mode could not be applied ({e}); it stays 0600",
-                stuffr_core::fmt_name(name)
-            ));
-        }
-    }
+    let mode_refused = crate::ops::set_mode_by_descriptor(&out, mode).err();
+    #[cfg(not(unix))]
+    let mode_refused: Option<std::io::Error> = None;
     #[cfg(not(unix))]
     let _ = mode;
     if let Some(v) = &made.quarantine {
         let _ = crate::quarantine::apply(&out, v);
     }
     made.record_path(write_target, MadeKind::File);
-    Ok(out)
+    Ok((out, mode_refused))
 }
 
 /// The mode a salvaged file is given: the archived permission bits masked
@@ -3736,6 +3740,13 @@ fn disambiguated_path(target: &Path, scan_position: usize) -> PathBuf {
     target.with_file_name(name)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: makes [`write_salvaged_payload`] fail as a full disk would,
+    /// after the target was opened.
+    static FAIL_SALVAGE_PAYLOAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Dispatches to the format's own salvage payload writer — matching
 /// [`salvage_scan`]'s own dispatch exactly, so each scanner task's own
 /// scanner drops in as one more arm here too, alongside the
@@ -3812,6 +3823,10 @@ fn write_salvaged_payload(
     // scanners are constructed here and dropped immediately because none of
     // the five carries write-side state; `LhaSalvage`'s `seen` is scan-side
     // only.
+    #[cfg(test)]
+    if FAIL_SALVAGE_PAYLOAD.with(|c| c.get()) {
+        return Err(Error::Io(std::io::Error::other("injected write failure")));
+    }
     use stuffr_core::salvage::SalvageScan as _;
     match format.as_str() {
         #[cfg(feature = "zip")]
@@ -5893,6 +5908,40 @@ struct MadeByRun {
     /// What a salvage run could not do without failing an entry, moved into
     /// [`SalvageOutcome::notes`] at the end of the run.
     notes: Vec<String>,
+    /// How many notes past [`MAX_SALVAGE_NOTES`] were counted, not kept.
+    notes_dropped: usize,
+}
+
+/// The most mode notes a salvage run keeps; a filesystem that refuses every
+/// `fchmod` (vfat) would otherwise give one line per entry. Past it the run
+/// only counts, and [`MadeByRun::take_notes`] ends with one summary line.
+const MAX_SALVAGE_NOTES: usize = 64;
+
+impl MadeByRun {
+    /// Records that the file written at `shown` (relative to the destination)
+    /// kept mode 0600 because `err` refused the `fchmod`.
+    fn note_mode_refused(&mut self, shown: &Path, err: &std::io::Error) {
+        if self.notes.len() >= MAX_SALVAGE_NOTES {
+            self.notes_dropped += 1;
+            return;
+        }
+        self.notes.push(format!(
+            "`{}`: written, but its mode could not be applied ({err}); it stays 0600",
+            stuffr_core::fmt_name(&shown.to_string_lossy())
+        ));
+    }
+
+    /// The run's notes, with one closing line for any that were dropped.
+    fn take_notes(&mut self) -> Vec<String> {
+        let mut notes = std::mem::take(&mut self.notes);
+        if self.notes_dropped > 0 {
+            notes.push(format!(
+                "… and {} more salvaged files whose mode could not be applied (they stay 0600)",
+                std::mem::take(&mut self.notes_dropped)
+            ));
+        }
+        notes
+    }
 }
 
 /// The archive being read, as [`place`] and salvage compare it against a
@@ -9222,6 +9271,88 @@ mod salvage_tests {
         )
         .unwrap();
         assert!(clean.notes.is_empty(), "{:?}", clean.notes);
+    }
+
+    /// The note is for a file that is kept: an entry whose chmod was refused
+    /// and whose write then failed (a full disk, injected) is removed and
+    /// skipped, and gives no note.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_chmod_gives_no_note_for_an_entry_that_is_not_written() {
+        let bytes = local_header_entry("gone.txt", b"x", crc32(b"x"));
+        let (_archive_dir, archive) = write_archive(&bytes);
+        let out_dir = tempfile::tempdir().unwrap();
+        let opts = SalvageOpts {
+            dest: Some(out_dir.path().to_path_buf()),
+            policy: SalvagePolicy::default(),
+            select: None,
+            format: None,
+        };
+        FAIL_SALVAGE_PAYLOAD.with(|c| c.set(true));
+        let outcome = crate::ops::with_refused_fchmod(|| salvage(&archive, &opts));
+        FAIL_SALVAGE_PAYLOAD.with(|c| c.set(false));
+        let outcome = outcome.unwrap();
+        assert!(
+            matches!(
+                outcome.entries[0].disposition,
+                SalvageDisposition::SkippedUnwritable { .. }
+            ),
+            "{:?}",
+            outcome.entries
+        );
+        assert!(!out_dir.path().join("gone.txt").exists());
+        assert!(outcome.notes.is_empty(), "{:?}", outcome.notes);
+    }
+
+    /// A destination that refuses every `fchmod` gives at most
+    /// `MAX_SALVAGE_NOTES` notes plus one closing count.
+    #[cfg(unix)]
+    #[test]
+    fn refused_chmod_notes_are_capped_with_a_closing_count() {
+        let total = MAX_SALVAGE_NOTES + 6;
+        let mut bytes = Vec::new();
+        for i in 0..total {
+            bytes.extend(local_header_entry(&format!("f{i}.txt"), b"x", crc32(b"x")));
+        }
+        let (_archive_dir, archive) = write_archive(&bytes);
+        let out_dir = tempfile::tempdir().unwrap();
+        let opts = SalvageOpts {
+            dest: Some(out_dir.path().to_path_buf()),
+            policy: SalvagePolicy::default(),
+            select: None,
+            format: None,
+        };
+        let outcome = crate::ops::with_refused_fchmod(|| salvage(&archive, &opts)).unwrap();
+        assert_eq!(outcome.notes.len(), MAX_SALVAGE_NOTES + 1);
+        assert_eq!(
+            outcome.notes.last().unwrap(),
+            "… and 6 more salvaged files whose mode could not be applied (they stay 0600)"
+        );
+    }
+
+    /// The note names the file as written: `x.salvaged-N`, not the entry's name.
+    #[cfg(unix)]
+    #[test]
+    fn the_mode_note_names_the_file_as_written() {
+        let mut bytes = local_header_entry("dup.txt", b"x", crc32(b"x"));
+        bytes.extend(local_header_entry("dup.txt", b"y", crc32(b"y")));
+        let (_archive_dir, archive) = write_archive(&bytes);
+        let out_dir = tempfile::tempdir().unwrap();
+        let opts = SalvageOpts {
+            dest: Some(out_dir.path().to_path_buf()),
+            policy: SalvagePolicy::default(),
+            select: None,
+            format: None,
+        };
+        let outcome = crate::ops::with_refused_fchmod(|| salvage(&archive, &opts)).unwrap();
+        assert!(
+            outcome
+                .notes
+                .iter()
+                .any(|n| n.contains("dup.txt.salvaged-")),
+            "{:?}",
+            outcome.notes
+        );
     }
 
     /// Fix round 1, REQUIRED 1. Before this round, `SalvageOpts` had no
