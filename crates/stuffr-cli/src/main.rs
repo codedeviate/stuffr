@@ -1942,6 +1942,12 @@ fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
         eprintln!("salvage -> {}", stuffr::salvage::describe_walk_stop(stop));
     }
 
+    // Things the run could not do that did not stop an entry being written
+    // (a mode the filesystem refused): every run, never the exit code.
+    for note in &outcome.notes {
+        eprintln!("stuffr: {note}");
+    }
+
     // Computed on the FULL scan: "nothing recoverable at all" is a fact
     // about the archive, not about which scan positions the caller happened
     // to ask for.
@@ -2011,6 +2017,7 @@ fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
         entries: subset,
         sightings,
         walk_stop: outcome.walk_stop,
+        notes: Vec::new(),
     });
     // A file written without its mode is degraded, like the other bucket-4
     // outcomes; a higher bucket (5, 7) still wins.

@@ -99,14 +99,22 @@ fn create_temp_file(
 /// warning names the output, so a user who wanted it wider knows to look.
 #[cfg(unix)]
 fn set_mode_best_effort(f: &std::fs::File, mode: u32, target: &Path) -> Option<Fidelity> {
+    set_mode_by_descriptor(f, mode)
+        .err()
+        .map(|_| mode_not_applied(target))
+}
+
+/// `fchmod` of `f` to `mode`, the one call [`set_mode_best_effort`] and
+/// salvage's file creation both make, so a test that refuses it
+/// ([`with_refused_fchmod`]) reaches both.
+#[cfg(unix)]
+pub(crate) fn set_mode_by_descriptor(f: &std::fs::File, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     #[cfg(test)]
     if FAIL_FCHMOD.with(|c| c.get()) {
-        return Some(mode_not_applied(target));
+        return Err(std::io::Error::from_raw_os_error(1)); // EPERM
     }
     f.set_permissions(std::fs::Permissions::from_mode(mode))
-        .err()
-        .map(|_| mode_not_applied(target))
 }
 
 /// The warning [`set_mode_best_effort`] raises: the output, named as
@@ -126,6 +134,16 @@ thread_local! {
     /// Test seam: makes [`set_mode_best_effort`] behave as a filesystem that
     /// refuses `fchmod`, which no test machine can be relied on to mount.
     static FAIL_FCHMOD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with [`set_mode_by_descriptor`] refusing every `fchmod`, as
+/// vfat/exfat, SMB, NFS root squash or FUSE can.
+#[cfg(all(test, unix))]
+pub(crate) fn with_refused_fchmod<T>(f: impl FnOnce() -> T) -> T {
+    FAIL_FCHMOD.with(|c| c.set(true));
+    let out = f();
+    FAIL_FCHMOD.with(|c| c.set(false));
+    out
 }
 
 /// Where bytes come from. `Stdin` is what `-` means on the command line.
@@ -2090,15 +2108,6 @@ mod tests {
 
         let _ = std::fs::remove_file(&tmp_path);
         let _ = std::fs::remove_file(&dst);
-    }
-
-    /// Runs `f` with [`set_mode_best_effort`] refusing every `fchmod`, as
-    /// vfat/exfat, SMB, NFS root squash or FUSE can.
-    fn with_refused_fchmod<T>(f: impl FnOnce() -> T) -> T {
-        FAIL_FCHMOD.with(|c| c.set(true));
-        let out = f();
-        FAIL_FCHMOD.with(|c| c.set(false));
-        out
     }
 
     fn mode_warning_for(outcome: &Outcome, target: &Path) -> bool {

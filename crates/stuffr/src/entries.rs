@@ -2545,6 +2545,11 @@ pub struct SalvageOutcome {
     /// construction, not absent, and nothing else in the report says so. It
     /// never moves [`salvage_exit_code`].
     pub walk_stop: Option<stuffr_core::salvage::WalkStop>,
+    /// Things the run could not do that did not stop an entry being written;
+    /// printed on stderr every run. Today: a salvaged file whose mode the
+    /// filesystem refused, which stays 0600. Never moves
+    /// [`salvage_exit_code`].
+    pub notes: Vec<String>,
 }
 
 /// Ruling R-N (fix round 1): the exit-code bucket a COMPLETED salvage run's
@@ -3063,6 +3068,7 @@ pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
         entries,
         sightings: scan.sightings,
         walk_stop: scan.walk_stop,
+        notes: std::mem::take(&mut made.notes),
     })
 }
 
@@ -3534,8 +3540,12 @@ fn open_salvage_target(
     let mode = salvaged_file_mode(meta.mode, made.umask);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = out.set_permissions(std::fs::Permissions::from_mode(mode));
+        if let Err(e) = crate::ops::set_mode_by_descriptor(&out, mode) {
+            made.notes.push(format!(
+                "`{}`: written, but its mode could not be applied ({e}); it stays 0600",
+                stuffr_core::fmt_name(name)
+            ));
+        }
     }
     #[cfg(not(unix))]
     let _ = mode;
@@ -5880,6 +5890,9 @@ struct MadeByRun {
     /// The process umask, read once per salvage run: what a salvaged file's
     /// mode is masked by ([`salvaged_file_mode`]). `0` elsewhere (unused).
     umask: u32,
+    /// What a salvage run could not do without failing an entry, moved into
+    /// [`SalvageOutcome::notes`] at the end of the run.
+    notes: Vec<String>,
 }
 
 /// The archive being read, as [`place`] and salvage compare it against a
@@ -9158,6 +9171,59 @@ mod salvage_tests {
         assert_eq!(std::fs::read(path).unwrap(), data);
     }
 
+    /// A filesystem that refuses the `fchmod` (vfat, SMB, FUSE) leaves a
+    /// salvaged file 0600: the entry is still written, and the run says so
+    /// in [`SalvageOutcome::notes`] instead of ignoring the refusal.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_chmod_on_a_salvaged_file_is_a_note_and_the_file_stays_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let data = b"payload".to_vec();
+        let bytes = local_header_entry("fine.txt", &data, crc32(&data));
+        let (_archive_dir, archive) = write_archive(&bytes);
+        let out_dir = tempfile::tempdir().unwrap();
+        let opts = SalvageOpts {
+            dest: Some(out_dir.path().to_path_buf()),
+            policy: SalvagePolicy::default(),
+            select: None,
+            format: None,
+        };
+        let outcome = crate::ops::with_refused_fchmod(|| salvage(&archive, &opts)).unwrap();
+
+        let target = out_dir.path().join("fine.txt");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), data);
+        assert_eq!(outcome.notes.len(), 1, "{:?}", outcome.notes);
+        assert!(
+            outcome.notes[0].contains("`fine.txt`"),
+            "{:?}",
+            outcome.notes
+        );
+        assert!(
+            outcome.notes[0].ends_with("it stays 0600"),
+            "{:?}",
+            outcome.notes
+        );
+        assert!(matches!(
+            &outcome.entries[0].disposition,
+            SalvageDisposition::Written(p) if *p == target
+        ));
+        // Without the refusal there is nothing to say.
+        let again = tempfile::tempdir().unwrap();
+        let clean = salvage(
+            &archive,
+            &SalvageOpts {
+                dest: Some(again.path().to_path_buf()),
+                ..opts
+            },
+        )
+        .unwrap();
+        assert!(clean.notes.is_empty(), "{:?}", clean.notes);
+    }
+
     /// Fix round 1, REQUIRED 1. Before this round, `SalvageOpts` had no
     /// `select` at all: the CLI approximated `--index` by writing every
     /// eligible entry and then filtering the REPORT, so `salvage archive.zip
@@ -9257,7 +9323,8 @@ mod salvage_tests {
             salvage_exit_code(&SalvageOutcome {
                 entries: vec![],
                 sightings: Vec::new(),
-                walk_stop: None
+                walk_stop: None,
+                notes: Vec::new(),
             }),
             5,
             "nothing recoverable at all"
@@ -9267,6 +9334,7 @@ mod salvage_tests {
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
                 walk_stop: None,
+                notes: Vec::new(),
                 entries: vec![
                     record(SalvageDisposition::Written(PathBuf::from("a"))),
                     record(SalvageDisposition::Directory(PathBuf::from("b"))),
@@ -9280,6 +9348,7 @@ mod salvage_tests {
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
                 walk_stop: None,
+                notes: Vec::new(),
                 entries: vec![record(SalvageDisposition::WrittenPartial {
                     path: PathBuf::from("a.partial"),
                     cause: PartialCause::ChecksumMismatch,
@@ -9293,6 +9362,7 @@ mod salvage_tests {
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
                 walk_stop: None,
+                notes: Vec::new(),
                 entries: vec![record(SalvageDisposition::SkippedUnverified)],
             }),
             3,
@@ -9303,6 +9373,7 @@ mod salvage_tests {
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
                 walk_stop: None,
+                notes: Vec::new(),
                 entries: vec![
                     record(SalvageDisposition::Written(PathBuf::from("a"))),
                     record(SalvageDisposition::WrittenDisambiguated {
@@ -9321,6 +9392,7 @@ mod salvage_tests {
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
                 walk_stop: None,
+                notes: Vec::new(),
                 entries: vec![
                     record(SalvageDisposition::WrittenPartial {
                         path: PathBuf::from("a.partial"),
@@ -9343,6 +9415,7 @@ mod salvage_tests {
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
                 walk_stop: None,
+                notes: Vec::new(),
                 entries: vec![
                     record(SalvageDisposition::Written(PathBuf::from("a"))),
                     record(SalvageDisposition::NotSelected),
@@ -9356,6 +9429,7 @@ mod salvage_tests {
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
                 walk_stop: None,
+                notes: Vec::new(),
                 entries: vec![record(SalvageDisposition::NotWritten); 3],
             }),
             0,
@@ -9369,6 +9443,7 @@ mod salvage_tests {
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
                 walk_stop: None,
+                notes: Vec::new(),
                 entries: vec![record(SalvageDisposition::SkippedPartial(
                     PartialCause::Truncated
                 ))],
@@ -9386,6 +9461,7 @@ mod salvage_tests {
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
                 walk_stop: None,
+                notes: Vec::new(),
                 entries: vec![record(SalvageDisposition::SkippedUnsafePath {
                     reason: "path traversal above the destination".to_string()
                 })],
@@ -9397,6 +9473,7 @@ mod salvage_tests {
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
                 walk_stop: None,
+                notes: Vec::new(),
                 entries: vec![
                     record(SalvageDisposition::Written(PathBuf::from("a"))),
                     record(SalvageDisposition::SkippedUnverified),
@@ -9448,6 +9525,7 @@ mod salvage_tests {
             entries,
             sightings: seen(),
             walk_stop: None,
+            notes: Vec::new(),
         };
 
         assert_eq!(
@@ -9510,6 +9588,7 @@ mod salvage_tests {
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
                 walk_stop: None,
+                notes: Vec::new(),
                 entries: vec![record(
                     SalvageStatus::Unattested,
                     SalvageDisposition::Written(PathBuf::from("a")),
@@ -9525,6 +9604,7 @@ mod salvage_tests {
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
                 walk_stop: None,
+                notes: Vec::new(),
                 entries: vec![record(
                     SalvageStatus::Unattested,
                     SalvageDisposition::NotWritten,
@@ -9541,6 +9621,7 @@ mod salvage_tests {
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
                 walk_stop: None,
+                notes: Vec::new(),
                 entries: vec![record(
                     SalvageStatus::Unattested,
                     SalvageDisposition::Directory(PathBuf::from("d")),
@@ -9555,6 +9636,7 @@ mod salvage_tests {
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
                 walk_stop: None,
+                notes: Vec::new(),
                 entries: vec![
                     record(
                         SalvageStatus::Unattested,
@@ -9577,6 +9659,7 @@ mod salvage_tests {
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
                 walk_stop: None,
+                notes: Vec::new(),
                 entries: vec![
                     record(
                         SalvageStatus::Unattested,
@@ -9599,6 +9682,7 @@ mod salvage_tests {
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
                 walk_stop: None,
+                notes: Vec::new(),
                 entries: vec![record(
                     SalvageStatus::Complete,
                     SalvageDisposition::Written(PathBuf::from("a")),
@@ -10386,6 +10470,7 @@ mod salvage_strict_tests {
         let outcome = SalvageOutcome {
             sightings: Vec::new(),
             walk_stop: None,
+            notes: Vec::new(),
             entries: vec![SalvagedRecord {
                 scan_position: 0,
                 name: "x".into(),
