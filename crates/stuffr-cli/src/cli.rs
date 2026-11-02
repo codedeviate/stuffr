@@ -262,6 +262,9 @@ pub enum Command {
         #[arg(long, value_name = "SIZE")]
         memory_limit: Option<String>,
         /// Exit 4 if anything was approximated or ignored (the output is still written).
+        ///
+        /// In entry mode the verdict covers only what was read; `stuffr test
+        /// --strict-fidelity` checks the whole file.
         #[arg(long)]
         strict_fidelity: bool,
     },

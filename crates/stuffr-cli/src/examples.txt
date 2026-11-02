@@ -363,6 +363,9 @@ STREAMING TO STDOUT
   stuffr cat --strict-fidelity data.gz | wc -c
       Exit 4 if the decode ignored or approximated anything (trailing junk
       after the last gzip member, say) — the stream has been written by then.
+      In entry mode the verdict covers only what was read (`--index 0` stops
+      before the end of the archive); `stuffr test --strict-fidelity` checks
+      the whole file.
 
 
 CONVERTING BETWEEN FORMATS
@@ -545,7 +548,7 @@ INSPECTING A STREAM (DECODING AT MOST ITS FIRST 4 KiB)
   concatenations of members, and what follows the last member is judged
   only at the end of the stream — junk there is a warning (and exit 4
   under --strict-fidelity). For a bare stream, nested codecs included
-  (`notes.txt.gz.gz`), info points at `stuffr cat FILE >/dev/null`, which
+  (`notes.txt.gz.gz`), info points at `stuffr cat --strict-fidelity FILE >/dev/null`, which
   reads it whole (`test` takes archives only); for an archive, a piped
   `.tar.gz` included, at `stuffr test`.
 

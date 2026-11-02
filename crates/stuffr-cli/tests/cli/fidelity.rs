@@ -2369,6 +2369,43 @@ fn cat_strict_fidelity_entry_mode_exits_4_on_trailing_junk() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.stdout, b"hi\n", "{stderr}");
     assert_eq!(out.status.code(), Some(4), "{stderr}");
+    assert!(stderr.contains("followed by 8 byte(s)"), "{stderr}");
+}
+
+/// Documented limit: an entry walk that stops early never reaches the bytes
+/// after the gzip member, so `cat --strict-fidelity` cannot judge them;
+/// `test --strict-fidelity` reads the whole file and does.
+#[test]
+fn cat_strict_fidelity_selective_entry_judges_only_what_it_read() {
+    let dir = tmp_dir();
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("a"), b"hi\n").unwrap();
+    std::fs::write(tree.join("b"), b"yo\n").unwrap();
+    let archive = dir.join("x.tgz");
+    let out = run_output(&[
+        "pack",
+        tree.join("a").to_str().unwrap(),
+        tree.join("b").to_str().unwrap(),
+        "-o",
+        archive.to_str().unwrap(),
+    ]);
+    assert!(out.status.success());
+    let mut bytes = std::fs::read(&archive).unwrap();
+    bytes.extend_from_slice(b"JUNKJUNK");
+    std::fs::write(&archive, bytes).unwrap();
+    let a = archive.to_str().unwrap();
+    let out = run_output(&["cat", "--strict-fidelity", a, "--index", "0"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.stdout, b"hi\n", "{stderr}");
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    let out = run_output(&["test", "--strict-fidelity", a]);
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// The T10 review's I1: `info` printed "fidelity: nothing approximated" for a
@@ -2405,7 +2442,8 @@ fn info_withholds_the_claim_for_a_codec_that_judges_its_trailing_bytes() {
                 ".{ext} {what}: {text}"
             );
             assert!(
-                text.contains("not evaluated") && text.contains("stuffr cat FILE >/dev/null"),
+                text.contains("not evaluated")
+                    && text.contains("stuffr cat --strict-fidelity FILE >/dev/null"),
                 ".{ext} {what}: {text}"
             );
             assert!(!text.contains("stuffr test"), ".{ext} {what}: {text}");
@@ -2527,7 +2565,8 @@ fn info_on_nested_codecs_points_at_a_full_decode_not_test() {
                 "{outer_name} {what}: {text}"
             );
             assert!(
-                text.contains("not evaluated") && text.contains("stuffr cat FILE >/dev/null"),
+                text.contains("not evaluated")
+                    && text.contains("stuffr cat --strict-fidelity FILE >/dev/null"),
                 "{outer_name} {what}: {text}"
             );
             assert!(!text.contains("stuffr test"), "{outer_name} {what}: {text}");

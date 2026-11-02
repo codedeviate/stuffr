@@ -753,7 +753,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                     writeln!(
                         out,
                         "fidelity: not evaluated (info reads only the start of the \
-                         stream; run `stuffr cat FILE >/dev/null` for that)"
+                         stream; run `stuffr cat --strict-fidelity FILE >/dev/null` for that)"
                     )?;
                 } else if !i.fidelity_evaluated {
                     writeln!(
