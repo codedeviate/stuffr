@@ -538,6 +538,17 @@ read list.
 > **3814** tests under `--all-features`, **3675** on the default tier —
 > measured from this bump's own `make check FULL=1`, `GATE_EXIT=0`.
 >
+> `0.25.0` closes what the audit left open. The C-tier xz and lzma decoders
+> honour `--memory-limit` (exit 6), as zstd's do, so `--format xz` on the C
+> tier no longer decodes `.lzma` data (exit 5, as on the pure tier).
+> `stuffr cat` takes `--strict-fidelity`: the bytes still reach stdout, and
+> a warning such as data after a gzip member makes the exit 4 (in entry
+> mode it judges what was read; `stuffr test` checks the whole file).
+> `salvage` says on stderr when a recovered file's mode could not be
+> applied (it stays 0600). A MINOR: `SalvageOutcome` gained `notes`.
+> **3834** tests under `--all-features`, **3686** on the default tier —
+> measured from this bump's own `make check FULL=1`, `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
