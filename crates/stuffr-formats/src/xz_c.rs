@@ -54,7 +54,7 @@ use std::io::Write;
 
 use stuffr_core::{
     Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, Result, Sink,
-    Source, StreamOnly,
+    Source, StreamOnly, format_size,
 };
 
 use crate::normalize::{NormalizeDecodeErrors, XZ_MALFORMED_AS_INVALID_DATA_EOF};
@@ -111,10 +111,22 @@ impl Codec for Xz {
     /// `XZ_MALFORMED_AS_INVALID_DATA_EOF` doc for the measurement backing
     /// the kinds folded here.
     ///
-    /// **`new_multi_decoder`, not `new`.** See the module doc: `new` stops
-    /// after the first concatenated stream and returns `Ok`, silently
-    /// discarding the rest — the exact defect class that made lz4 lose
-    /// every frame after the first in Phase 1d.
+    /// **`CONCATENATED`, not a single stream.** See the module doc: a plain
+    /// `XzDecoder::new` stops after the first concatenated stream and
+    /// returns `Ok`, silently discarding the rest — the exact defect class
+    /// that made lz4 lose every frame after the first in Phase 1d. This is
+    /// `new_multi_decoder`'s own configuration, spelled out because that
+    /// constructor fixes the memory limit at `u64::MAX`.
+    ///
+    /// **`o.memory_limit` is liblzma's own `memlimit`** (unset means
+    /// unlimited, as before), applied to every stream of a concatenation, so
+    /// a later stream with a bigger dictionary is refused too. liblzma
+    /// reports `LZMA_MEMLIMIT_ERROR` as an `io::Error` of kind `Other` whose
+    /// inner error is `liblzma::stream::Error::MemLimit`; `MemLimitAsOom`
+    /// turns that into `ErrorKind::OutOfMemory` *before*
+    /// `NormalizeDecodeErrors` sees it (which would otherwise fold `Other`
+    /// into corruption), so it reaches `Error::from_decode_io` as
+    /// `ResourceLimit` — exit 6, as on the pure tier.
     ///
     /// **Reading a foreign stream.** [`CodecCaps::detects_corruption`] is
     /// `CorruptionDetection::WhenPresent` for this codec, and the doc on that
@@ -135,9 +147,16 @@ impl Codec for Xz {
     fn decoder<'a>(
         &self,
         src: Box<dyn Source + 'a>,
-        _o: &DecodeOpts,
+        o: &DecodeOpts,
     ) -> Result<Box<dyn Source + 'a>> {
-        let dec = liblzma::read::XzDecoder::new_multi_decoder(src);
+        let limit = o.memory_limit.unwrap_or(u64::MAX);
+        let stream =
+            liblzma::stream::Stream::new_stream_decoder(limit, liblzma::stream::CONCATENATED)
+                .map_err(|e| Error::ResourceLimit(format!("xz: cannot start the decoder: {e}")))?;
+        let dec = MemLimitAsOom {
+            inner: liblzma::read::XzDecoder::new_stream(src, stream),
+            limit: o.memory_limit,
+        };
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
             dec,
             XZ_MALFORMED_AS_INVALID_DATA_EOF,
@@ -388,6 +407,38 @@ fn ret_of(e: liblzma::stream::Error) -> u32 {
 /// file's own tests (which go through `Codec::encoder` like every other
 /// codec's test module), but present for Task 5's pure `lzma-rust2`
 /// counterpart and any cross-backend agreement tests it adds.
+/// Re-kinds liblzma's `LZMA_MEMLIMIT_ERROR` as `ErrorKind::OutOfMemory`, the
+/// kind `Error::from_decode_io` classifies as `ResourceLimit` (exit 6). The
+/// binding reports it as kind `Other` carrying `stream::Error::MemLimit`, and
+/// `NormalizeDecodeErrors` folds `Other` into corruption (exit 5), so this
+/// runs inside it.
+struct MemLimitAsOom<R> {
+    inner: R,
+    limit: Option<u64>,
+}
+
+impl<R: std::io::Read> std::io::Read for MemLimitAsOom<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf).map_err(|e| {
+            let is_memlimit = e
+                .get_ref()
+                .and_then(|i| i.downcast_ref::<liblzma::stream::Error>())
+                .is_some_and(|i| matches!(i, liblzma::stream::Error::MemLimit));
+            match (is_memlimit, self.limit) {
+                (true, Some(limit)) => std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    format!(
+                        "xz: decoding needs more memory than --memory-limit allows ({}) \
+                         — raise --memory-limit to decode this file",
+                        format_size(limit)
+                    ),
+                ),
+                _ => e,
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn encode_for_test(plain: &[u8]) -> Vec<u8> {
     let buf = stuffr_core::testing::SharedBuf::new();
@@ -410,6 +461,87 @@ mod tests {
     /// judged first; a stream decodes to `LZMA_STREAM_END` under
     /// `LZMA_FINISH`; a cut-short one is `LZMA_BUF_ERROR` (10) and a broken
     /// header `LZMA_DATA_ERROR` (9), as `unxz` names them.
+    fn encode_at(preset: i32, plain: &[u8]) -> Vec<u8> {
+        let buf = SharedBuf::new();
+        let mut sink = Xz
+            .encoder(
+                Box::new(buf.clone()),
+                &EncodeOpts {
+                    level: Some(preset),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sink.write_all(plain).unwrap();
+        sink.finish().unwrap();
+        buf.contents()
+    }
+
+    /// Decodes under `limit` and classifies a failure the way the CLI does.
+    fn decode_under(
+        bytes: Vec<u8>,
+        limit: Option<u64>,
+    ) -> std::result::Result<Vec<u8>, stuffr_core::Error> {
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(bytes)));
+        let mut dec = Xz
+            .decoder(
+                src,
+                &DecodeOpts {
+                    memory_limit: limit,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out)
+            .map_err(stuffr_core::Error::from_decode_io)?;
+        Ok(out)
+    }
+
+    /// 4 MiB of pseudo-random-ish bytes, so a preset-9 stream really
+    /// declares (and liblzma really wants) a 64 MiB dictionary.
+    fn big_plain() -> Vec<u8> {
+        let mut x = 0x9e3779b9u32;
+        (0..4 << 20)
+            .map(|_| {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn xz_c_refuses_a_dictionary_over_the_memory_limit() {
+        let packed = encode_at(9, &big_plain());
+        let err = decode_under(packed, Some(1 << 20)).expect_err("must refuse");
+        assert_eq!(err.exit_code(), 6, "{err}");
+        assert!(err.to_string().contains("--memory-limit"), "{err}");
+    }
+
+    #[test]
+    fn xz_c_decodes_two_concatenated_streams_under_a_sufficient_limit() {
+        let (a, b) = (b"first stream ".repeat(500), b"second stream ".repeat(500));
+        let mut packed = encode_at(1, &a);
+        packed.extend(encode_at(1, &b));
+        let mut want = a.clone();
+        want.extend(&b);
+        assert_eq!(decode_under(packed, Some(64 << 20)).unwrap(), want);
+    }
+
+    #[test]
+    fn xz_c_second_stream_over_the_limit_is_a_resource_limit() {
+        let mut packed = encode_at(0, &b"small first ".repeat(500));
+        packed.extend(encode_at(9, &big_plain()));
+        let err = decode_under(packed, Some(8 << 20)).expect_err("must refuse");
+        assert_eq!(err.exit_code(), 6, "{err}");
+    }
+
+    #[test]
+    fn xz_c_default_limit_decodes_preset_9() {
+        let plain = big_plain();
+        assert_eq!(decode_under(encode_at(9, &plain), None).unwrap(), plain);
+    }
+
     #[test]
     fn raw_xz_codes_like_lzma_code() {
         let plain = b"raw xz, one call at a time\n".repeat(400);
