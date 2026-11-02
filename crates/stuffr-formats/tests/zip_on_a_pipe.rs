@@ -1071,3 +1071,80 @@ fn a_piped_zip_holding_a_symlink_keeps_its_index_warnings() {
         report.warnings
     );
 }
+
+/// `fixture_zip(THREE)` with a zip64 end record and locator spliced in before
+/// the plain end record, whose count fields saturate to 0xFFFF. The zip64
+/// record declares `on_disk` records on this disk and `total` in all.
+fn zip64_fixture(on_disk: u64, total: u64) -> Vec<u8> {
+    let plain = fixture_zip(THREE);
+    let eocd = plain.len() - 22;
+    let cd_size = u32::from_le_bytes(plain[eocd + 12..eocd + 16].try_into().unwrap());
+    let cd_offset = u32::from_le_bytes(plain[eocd + 16..eocd + 20].try_into().unwrap());
+    let record_at = eocd as u64;
+    let mut out = plain[..eocd].to_vec();
+    out.extend_from_slice(b"PK\x06\x06");
+    out.extend_from_slice(&44u64.to_le_bytes());
+    out.extend_from_slice(&45u16.to_le_bytes()); // made by
+    out.extend_from_slice(&45u16.to_le_bytes()); // needed
+    out.extend_from_slice(&0u32.to_le_bytes()); // this disk
+    out.extend_from_slice(&0u32.to_le_bytes()); // cd disk
+    out.extend_from_slice(&on_disk.to_le_bytes());
+    out.extend_from_slice(&total.to_le_bytes());
+    out.extend_from_slice(&u64::from(cd_size).to_le_bytes());
+    out.extend_from_slice(&u64::from(cd_offset).to_le_bytes());
+    out.extend_from_slice(b"PK\x06\x07");
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&record_at.to_le_bytes());
+    out.extend_from_slice(&1u32.to_le_bytes()); // disks
+    let mut end = plain[eocd..].to_vec();
+    end[8..12].copy_from_slice(&[0xff; 4]);
+    out.extend_from_slice(&end);
+    out
+}
+
+/// The zip64 twin of the plain-record test above: a zip64 end record whose
+/// on-this-disk count (offset 24) disagrees with its total (offset 32). A
+/// seekable read refuses it (exit 5); the forward walk has read every entry
+/// by then and does not confirm the index (both warnings, strict exit 4).
+#[test]
+fn a_piped_zip64_whose_disk_and_total_counts_disagree_is_not_confirmed() {
+    // Control: agreeing counts confirm the index over the pipe and read fine.
+    let ok = zip64_fixture(3, 3);
+    let (end, report) = walk_piped(&ok);
+    assert_eq!(end.expect("whole"), 3);
+    assert_eq!(
+        index_warnings(&report),
+        (false, false),
+        "{:?}",
+        report.warnings
+    );
+    let dir = scratch("zip64-agree");
+    let path = write_temp_zip(&dir, &ok);
+    assert_eq!(
+        run_on_path(&["test", path.to_str().unwrap()]).status.code(),
+        Some(0)
+    );
+
+    for (on_disk, total) in [(2u64, 3u64), (4, 3), (1, 3)] {
+        let bytes = zip64_fixture(on_disk, total);
+        let (end, report) = walk_piped(&bytes);
+        assert_eq!(end.expect("the entries themselves are whole"), 3);
+        assert_eq!(
+            index_warnings(&report),
+            (true, true),
+            "{on_disk}/{total}: {:?}",
+            report.warnings
+        );
+        let out = run_piped(&["test", "-", "--strict-fidelity"], &bytes);
+        assert_eq!(out.status.code(), Some(4), "{on_disk}/{total}: {out:?}");
+        let out = run_piped(&["list", "-"], &bytes);
+        assert_eq!(out.status.code(), Some(0), "{on_disk}/{total}: {out:?}");
+
+        let dir = scratch("zip64-counts");
+        let path = write_temp_zip(&dir, &bytes);
+        let out = run_on_path(&["test", path.to_str().unwrap()]);
+        assert_eq!(out.status.code(), Some(5), "{on_disk}/{total}: {out:?}");
+        let out = run_on_path(&["list", path.to_str().unwrap()]);
+        assert_eq!(out.status.code(), Some(5), "{on_disk}/{total}: {out:?}");
+    }
+}
