@@ -34,6 +34,23 @@ impl Scratch {
         std::fs::write(self.0.join(name), b).unwrap();
     }
 
+    /// Sets `a.txt` and `b.txt`'s access and modification times to one
+    /// fixed instant. The Ubuntu flavour's UT field records the atime, and
+    /// the read by one `zip` run moves it whenever that read lands in a
+    /// later second, so a test that zips the same files twice and compares
+    /// the archives pins the times before each run.
+    fn pin_times(&self) {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        for name in ["a.txt", "b.txt"] {
+            std::fs::File::options()
+                .write(true)
+                .open(self.0.join(name))
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_accessed(t).set_modified(t))
+                .unwrap();
+        }
+    }
+
     /// The names in the directory, sorted.
     fn names(&self) -> Vec<String> {
         let mut v: Vec<String> = std::fs::read_dir(&self.0)
@@ -111,6 +128,7 @@ fn with_plain(tag: &str, flavour: Flavour) -> Scratch {
         .flat_map(|i| format!("line {i} of the b file, some text to compress\n").into_bytes())
         .collect();
     s.write("b.txt", &b);
+    s.pin_times();
     let r = run(
         &s.0,
         flavour,
@@ -249,6 +267,7 @@ fn zip_e_writes_what_zipcloak_d_takes_back_to_the_plain_archive() {
         let s = with_plain("zipe", f);
         let plain = s.read("t.zip");
         std::fs::remove_file(s.0.join("t.zip")).unwrap();
+        s.pin_times();
         let r = run(
             &s.0,
             f,
