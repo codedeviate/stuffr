@@ -261,6 +261,9 @@ pub enum Command {
         /// Defaults to 25% of available RAM, honouring cgroup limits.
         #[arg(long, value_name = "SIZE")]
         memory_limit: Option<String>,
+        /// Exit 4 if anything was approximated or ignored (the output is still written).
+        #[arg(long)]
+        strict_fidelity: bool,
     },
     /// Identify a stream, decoding at most its first 4 KiB.
     Info {

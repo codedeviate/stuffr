@@ -2410,7 +2410,7 @@ stuffr pack     [-o out.tar.zst] [--format F] [--level N] PATHS...
 stuffr unpack   [-C dir [-p]] ARCHIVE [PATTERNS... | --index N...]
 stuffr list     ARCHIVE                    # first column is the index
 stuffr ls       [-r] [-a] [-n] [FOLDER]    # alias: files; what a folder holds that stuffr opens
-stuffr cat      ARCHIVE [PATTERNS... | --index N...]  # entry data; works on a pipe
+stuffr cat      ARCHIVE [PATTERNS... | --index N...]  # entry data; works on a pipe; --strict-fidelity gates exit 4
 stuffr info     ARCHIVE                    # resolved chain, ladder rung, fidelity
 stuffr formats                             # capability matrix for THIS build
 stuffr test     ARCHIVE                    # integrity check, no extraction

@@ -355,8 +355,14 @@ STREAMING TO STDOUT
       What the read approximated is said on stderr, never mixed into the
       entry's bytes on stdout: a piped zip whose local header disagrees with
       its central directory, or junk after a `.tar.gz`'s gzip member (the
-      latter only once the walk reaches the end of the archive). cat has no
-      --strict-fidelity, so it still exits 0; `stuffr test` gates on them.
+      latter only once the walk reaches the end of the archive). cat still
+      exits 0 on them unless you pass --strict-fidelity, which turns any of
+      them into exit 4 with the bytes already written; `stuffr test` gates
+      on them too.
+
+  stuffr cat --strict-fidelity data.gz | wc -c
+      Exit 4 if the decode ignored or approximated anything (trailing junk
+      after the last gzip member, say) — the stream has been written by then.
 
 
 CONVERTING BETWEEN FORMATS

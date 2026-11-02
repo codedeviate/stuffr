@@ -642,6 +642,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             format,
             max_ratio,
             memory_limit,
+            strict_fidelity,
         } => {
             // Naming an entry is what asks for entry-aware streaming — the
             // same "decide before reading a byte" reasoning as `unpack`'s -C.
@@ -662,10 +663,11 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                     memory_limit,
                     &mut out,
                 )?;
-                // No --strict-fidelity here either, but what the read
-                // approximated is said, as for a bare stream below — a
-                // `.tar.gz` whose gzip member is followed by junk (T10b).
-                return report_fidelity(&done.fidelity, false);
+                // What the read approximated is said, as for a bare stream
+                // below — a `.tar.gz` whose gzip member is followed by junk
+                // (T10b); --strict-fidelity turns it into exit 4, the entry's
+                // bytes already written, as for pack.
+                return report_fidelity(&done.fidelity, strict_fidelity);
             }
             // Same as `unpack`: bounds dictionary allocation for the pure
             // codecs; the CLI default is the bound, not unbounded.
@@ -687,9 +689,10 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             // The motivating case: `curl … | stuffr cat - | grep pattern`.
             ops::refuse_directory_for(&input_of(&input), "cat")?;
             let out = ops::decompress(input_of(&input), Output::Stdout, &opts)?;
-            // `cat` has no --strict-fidelity, but a loss is still said: trailing
-            // data a codec ignored (PARSE-1) is the one a bare stream can carry.
-            report_fidelity(&out.fidelity, false)
+            // A loss is always said: trailing data a codec ignored (PARSE-1) is
+            // the one a bare stream can carry. --strict-fidelity makes it exit 4
+            // (the output is already written).
+            report_fidelity(&out.fidelity, strict_fidelity)
         }
         Command::Info {
             input,

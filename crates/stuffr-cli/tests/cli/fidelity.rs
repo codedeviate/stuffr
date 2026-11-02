@@ -2306,6 +2306,71 @@ fn nul_padding_after_a_tar_gz_passes_strict_fidelity() {
     }
 }
 
+/// `cat --strict-fidelity`: the bytes are still streamed, the warning is still
+/// said, and the flag turns it into exit 4 (as for every other verb).
+fn gz_with_junk(dir: &Path, name: &str) -> std::path::PathBuf {
+    let good = packed(dir, "good.gz", b"hello\n");
+    let path = dir.join(name);
+    std::fs::write(&path, [good, b"JUNKJUNK".to_vec()].concat()).unwrap();
+    path
+}
+
+#[test]
+fn cat_strict_fidelity_exits_4_on_gzip_trailing_junk() {
+    let dir = tmp_dir();
+    let f = gz_with_junk(&dir, "j.gz");
+    let out = run_output(&["cat", "--strict-fidelity", f.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.stdout, b"hello\n");
+    assert_eq!(out.status.code(), Some(4), "{stderr}");
+    assert!(stderr.contains("followed by 8 byte(s)"), "{stderr}");
+}
+
+#[test]
+fn cat_without_strict_still_exits_0_on_gzip_trailing_junk() {
+    let dir = tmp_dir();
+    let f = gz_with_junk(&dir, "j.gz");
+    let out = run_output(&["cat", f.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.stdout, b"hello\n");
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("followed by 8 byte(s)"), "{stderr}");
+}
+
+#[test]
+fn cat_strict_fidelity_clean_file_exits_0() {
+    let dir = tmp_dir();
+    let f = packed(&dir, "clean.gz", b"hello\n");
+    let path = dir.join("clean2.gz");
+    std::fs::write(&path, f).unwrap();
+    let out = run_output(&["cat", "--strict-fidelity", path.to_str().unwrap()]);
+    assert_eq!(out.stdout, b"hello\n");
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn cat_strict_fidelity_entry_mode_exits_4_on_trailing_junk() {
+    let dir = tmp_dir();
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("a"), b"hi\n").unwrap();
+    let archive = dir.join("x.tar.gz");
+    let out = run_output(&[
+        "pack",
+        tree.join("a").to_str().unwrap(),
+        "-o",
+        archive.to_str().unwrap(),
+    ]);
+    assert!(out.status.success());
+    let mut bytes = std::fs::read(&archive).unwrap();
+    bytes.extend_from_slice(b"JUNKJUNK");
+    std::fs::write(&archive, bytes).unwrap();
+    let out = run_output(&["cat", "--strict-fidelity", archive.to_str().unwrap(), "a"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.stdout, b"hi\n", "{stderr}");
+    assert_eq!(out.status.code(), Some(4), "{stderr}");
+}
+
 /// The T10 review's I1: `info` printed "fidelity: nothing approximated" for a
 /// bare `.gz`/`.bz2` whose decode then warned about the bytes after its last
 /// member. gzip and bzip2 judge those only at the end of the stream, which
