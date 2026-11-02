@@ -952,3 +952,41 @@ impl<W: Write> Write for CaptureWriteError<W> {
         self.inner.flush().map_err(|e| self.record(e))
     }
 }
+
+/// Re-kinds liblzma's `LZMA_MEMLIMIT_ERROR` as `ErrorKind::OutOfMemory`, the
+/// kind `Error::from_decode_io` classifies as `ResourceLimit` (exit 6). The
+/// binding reports it as kind `Other` carrying `stream::Error::MemLimit`, and
+/// [`NormalizeDecodeErrors`] folds `Other` into corruption (exit 5), so this
+/// wraps the liblzma decoder INSIDE it. Shared by `xz_c` and `lzma_c`;
+/// `codec` names the format in the message, worded as the pure tiers' is.
+/// With no limit set there is nothing to name, and the error passes through.
+#[cfg(any(feature = "xz-c", feature = "lzma-c"))]
+pub(crate) struct MemLimitAsOom<R> {
+    pub(crate) inner: R,
+    pub(crate) codec: &'static str,
+    pub(crate) limit: Option<u64>,
+}
+
+#[cfg(any(feature = "xz-c", feature = "lzma-c"))]
+impl<R: std::io::Read> std::io::Read for MemLimitAsOom<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf).map_err(|e| {
+            let is_memlimit = e
+                .get_ref()
+                .and_then(|i| i.downcast_ref::<liblzma::stream::Error>())
+                .is_some_and(|i| matches!(i, liblzma::stream::Error::MemLimit));
+            match (is_memlimit, self.limit) {
+                (true, Some(limit)) => std::io::Error::new(
+                    ErrorKind::OutOfMemory,
+                    format!(
+                        "{}: decoding this stream needs more memory than --memory-limit \
+                         allows ({}) — raise --memory-limit to decode this file",
+                        self.codec,
+                        stuffr_core::format_size(limit)
+                    ),
+                ),
+                _ => e,
+            }
+        })
+    }
+}

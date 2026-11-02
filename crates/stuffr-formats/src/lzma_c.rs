@@ -96,11 +96,11 @@ use std::io::{BufRead, BufReader, Read, Write};
 
 use stuffr_core::{
     Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, Result, Sink,
-    Source, StreamOnly, format_size,
+    Source, StreamOnly,
 };
 
 pub use crate::lzma_shared::{LZMA, lzma_meta as meta};
-use crate::normalize::{LZMA_MALFORMED_AS_INVALID_DATA_EOF, NormalizeDecodeErrors};
+use crate::normalize::{LZMA_MALFORMED_AS_INVALID_DATA_EOF, MemLimitAsOom, NormalizeDecodeErrors};
 
 #[derive(Debug)]
 pub struct Lzma;
@@ -157,6 +157,7 @@ impl Codec for Lzma {
                 BufReader::new(src),
                 stream,
             )),
+            codec: "lzma",
             limit: o.memory_limit,
         };
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
@@ -287,38 +288,6 @@ impl Sink for LzmaSink {
 /// counterpart cannot encode its own LZMA1 test input (it is the newer,
 /// less-trusted backend of the pair — see that task's own brief), so its
 /// cross-backend agreement test consumes this instead.
-/// Re-kinds liblzma's `LZMA_MEMLIMIT_ERROR` as `ErrorKind::OutOfMemory`, the
-/// kind `Error::from_decode_io` classifies as `ResourceLimit` (exit 6). The
-/// binding reports it as kind `Other` carrying `stream::Error::MemLimit`, and
-/// `NormalizeDecodeErrors` folds `Other` into corruption (exit 5), so this
-/// runs inside it.
-struct MemLimitAsOom<R> {
-    inner: R,
-    limit: Option<u64>,
-}
-
-impl<R: std::io::Read> std::io::Read for MemLimitAsOom<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.inner.read(buf).map_err(|e| {
-            let is_memlimit = e
-                .get_ref()
-                .and_then(|i| i.downcast_ref::<liblzma::stream::Error>())
-                .is_some_and(|i| matches!(i, liblzma::stream::Error::MemLimit));
-            match (is_memlimit, self.limit) {
-                (true, Some(limit)) => std::io::Error::new(
-                    std::io::ErrorKind::OutOfMemory,
-                    format!(
-                        "lzma: decoding needs more memory than --memory-limit allows ({}) \
-                         — raise --memory-limit to decode this file",
-                        format_size(limit)
-                    ),
-                ),
-                _ => e,
-            }
-        })
-    }
-}
-
 #[cfg(test)]
 pub(crate) fn encode_for_test(plain: &[u8]) -> Vec<u8> {
     let buf = stuffr_core::testing::SharedBuf::new();

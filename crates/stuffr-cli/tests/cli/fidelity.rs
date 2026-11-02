@@ -571,6 +571,63 @@ fn c_zstd_refuses_a_window_over_the_memory_limit_on_every_frame() {
     assert_eq!(out.stdout, b"third");
 }
 
+/// The C-tier xz and lzma decoders honour `--memory-limit` too, through
+/// liblzma's own `memlimit`: a preset-9 stream (64 MiB dictionary) under a
+/// 1 MiB limit is exit 6 naming the flag, never "corrupt", and the same file
+/// decodes under a sufficient limit.
+#[cfg(all(feature = "xz-c", feature = "lzma-c"))]
+#[test]
+fn c_xz_and_lzma_refuse_a_dictionary_over_the_memory_limit() {
+    let dir = tmp("xz-lzma-c-limit");
+    std::fs::create_dir_all(&dir).unwrap();
+    let plain: Vec<u8> = (0..1u32 << 20)
+        .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+        .collect();
+    let input = dir.join("plain.bin");
+    std::fs::write(&input, &plain).unwrap();
+    for (ext, fmt) in [("xz", "xz"), ("lzma", "lzma")] {
+        let packed = dir.join(format!("plain.{ext}"));
+        let out = Command::new(STUFFR)
+            .args([
+                "pack",
+                input.to_str().unwrap(),
+                "-o",
+                packed.to_str().unwrap(),
+                "--format",
+                fmt,
+                "--level",
+                "9",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let run = |limit: &str| {
+            Command::new(STUFFR)
+                .args(["cat", packed.to_str().unwrap(), "--memory-limit", limit])
+                .output()
+                .unwrap()
+        };
+        let out = run("1M");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(6), "{ext}: {stderr}");
+        assert!(
+            stderr.contains("--memory-limit") && !stderr.contains("corrupt"),
+            "{ext}: {stderr}"
+        );
+        let out = run("1G");
+        assert!(
+            out.status.success(),
+            "{ext}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, plain, "{ext}");
+    }
+}
+
 /// `--memory-limit` is now ACCEPTED and honoured on the entry-aware paths,
 /// where it used to be refused at exit 2 with "not yet honoured for a
 /// container". Raising it past the declaration lets the crafted archive

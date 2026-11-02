@@ -54,10 +54,10 @@ use std::io::Write;
 
 use stuffr_core::{
     Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, Result, Sink,
-    Source, StreamOnly, format_size,
+    Source, StreamOnly,
 };
 
-use crate::normalize::{NormalizeDecodeErrors, XZ_MALFORMED_AS_INVALID_DATA_EOF};
+use crate::normalize::{MemLimitAsOom, NormalizeDecodeErrors, XZ_MALFORMED_AS_INVALID_DATA_EOF};
 pub use crate::xz_shared::{XZ, xz_meta as meta};
 
 #[derive(Debug)]
@@ -155,6 +155,7 @@ impl Codec for Xz {
                 .map_err(|e| Error::ResourceLimit(format!("xz: cannot start the decoder: {e}")))?;
         let dec = MemLimitAsOom {
             inner: liblzma::read::XzDecoder::new_stream(src, stream),
+            codec: "xz",
             limit: o.memory_limit,
         };
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
@@ -407,38 +408,6 @@ fn ret_of(e: liblzma::stream::Error) -> u32 {
 /// file's own tests (which go through `Codec::encoder` like every other
 /// codec's test module), but present for Task 5's pure `lzma-rust2`
 /// counterpart and any cross-backend agreement tests it adds.
-/// Re-kinds liblzma's `LZMA_MEMLIMIT_ERROR` as `ErrorKind::OutOfMemory`, the
-/// kind `Error::from_decode_io` classifies as `ResourceLimit` (exit 6). The
-/// binding reports it as kind `Other` carrying `stream::Error::MemLimit`, and
-/// `NormalizeDecodeErrors` folds `Other` into corruption (exit 5), so this
-/// runs inside it.
-struct MemLimitAsOom<R> {
-    inner: R,
-    limit: Option<u64>,
-}
-
-impl<R: std::io::Read> std::io::Read for MemLimitAsOom<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.inner.read(buf).map_err(|e| {
-            let is_memlimit = e
-                .get_ref()
-                .and_then(|i| i.downcast_ref::<liblzma::stream::Error>())
-                .is_some_and(|i| matches!(i, liblzma::stream::Error::MemLimit));
-            match (is_memlimit, self.limit) {
-                (true, Some(limit)) => std::io::Error::new(
-                    std::io::ErrorKind::OutOfMemory,
-                    format!(
-                        "xz: decoding needs more memory than --memory-limit allows ({}) \
-                         — raise --memory-limit to decode this file",
-                        format_size(limit)
-                    ),
-                ),
-                _ => e,
-            }
-        })
-    }
-}
-
 #[cfg(test)]
 pub(crate) fn encode_for_test(plain: &[u8]) -> Vec<u8> {
     let buf = stuffr_core::testing::SharedBuf::new();
@@ -457,10 +426,6 @@ mod tests {
     use stuffr_core::ReaderSource;
     use stuffr_core::testing::SharedBuf;
 
-    /// `RawXz` an `lzma_code` at a time: a header with no output room is
-    /// judged first; a stream decodes to `LZMA_STREAM_END` under
-    /// `LZMA_FINISH`; a cut-short one is `LZMA_BUF_ERROR` (10) and a broken
-    /// header `LZMA_DATA_ERROR` (9), as `unxz` names them.
     fn encode_at(preset: i32, plain: &[u8]) -> Vec<u8> {
         let buf = SharedBuf::new();
         let mut sink = Xz
@@ -542,6 +507,10 @@ mod tests {
         assert_eq!(decode_under(encode_at(9, &plain), None).unwrap(), plain);
     }
 
+    /// `RawXz` an `lzma_code` at a time: a header with no output room is
+    /// judged first; a stream decodes to `LZMA_STREAM_END` under
+    /// `LZMA_FINISH`; a cut-short one is `LZMA_BUF_ERROR` (10) and a broken
+    /// header `LZMA_DATA_ERROR` (9), as `unxz` names them.
     #[test]
     fn raw_xz_codes_like_lzma_code() {
         let plain = b"raw xz, one call at a time\n".repeat(400);
