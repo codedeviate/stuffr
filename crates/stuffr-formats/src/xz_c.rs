@@ -19,8 +19,9 @@
 //! concatenated in the input. Measured directly: two real xz streams
 //! totalling 8,600 plain bytes decode to 4,300 bytes via `new` — `Ok`, no
 //! error, half the data missing — and to the full 8,600 via
-//! `new_multi_decoder`. `decoder` below uses `new_multi_decoder` for exactly
-//! this reason; `cat a.xz b.xz` produces ordinary concatenated xz, and
+//! `new_multi_decoder`. `decoder` below decodes every stream too, built as
+//! `Stream::new_stream_decoder(limit, CONCATENATED)` so that it can carry
+//! the memory limit (`new_multi_decoder` fixes it at `u64::MAX`); `cat a.xz b.xz` produces ordinary concatenated xz, and
 //! multi-threaded xz emits multi-stream output natively, so this is not an
 //! edge case. See `concatenated_streams_decode_completely_not_just_the_first`
 //! for the regression test, and the sibling module doc comments on
@@ -115,8 +116,14 @@ impl Codec for Xz {
     /// `XzDecoder::new` stops after the first concatenated stream and
     /// returns `Ok`, silently discarding the rest — the exact defect class
     /// that made lz4 lose every frame after the first in Phase 1d. This is
-    /// `new_multi_decoder`'s own configuration, spelled out because that
-    /// constructor fixes the memory limit at `u64::MAX`.
+    /// `new_multi_decoder`'s configuration minus its auto-detection:
+    /// `new_multi_decoder` is `Stream::new_auto_decoder(u64::MAX,
+    /// CONCATENATED)`, which for input beginning 0xFD is the same
+    /// `lzma_stream_decoder_init(memlimit, flags)`, but also accepts
+    /// LZMA_Alone (and lzip) data. Consequence: `--format xz` over a
+    /// `.lzma` file used to decode on the C tier and is now a decode error
+    /// (exit 5), as on the pure tier. Do not go back to `new_multi_decoder`:
+    /// it would drop the memory limit.
     ///
     /// **`o.memory_limit` is liblzma's own `memlimit`** (unset means
     /// unlimited, as before), applied to every stream of a concatenation, so
@@ -588,7 +595,7 @@ mod tests {
     /// caught in `zstd_pure` this cycle: proven directly against
     /// `liblzma::read::XzDecoder::new` in `xz_c.rs`'s own dev-only probe
     /// during this task (measured: 4,300 of 8,600 bytes, `Ok`) before this
-    /// codec ever used `new_multi_decoder` instead.
+    /// codec ever used `CONCATENATED` instead.
     #[test]
     fn concatenated_streams_decode_completely_not_just_the_first() {
         let mut two = compress(b"first-stream-");
@@ -599,8 +606,27 @@ mod tests {
     /// Confirms the claim in the module doc's "concatenated streams" section
     /// stays true against a real build of this crate: `XzDecoder::new`
     /// (single-stream) truncates silently — `Ok`, not an error — while
-    /// `new_multi_decoder` (what `decoder` actually uses) reads all of it.
+    /// `CONCATENATED` (what `decoder` actually uses) reads all of it.
     /// A regression turning this false is exactly RULING R20's failure mode.
+    /// `decoder` is a stream decoder, not liblzma's auto decoder, so LZMA_Alone
+    /// bytes under `--format xz` are corrupt (exit 5), as on the pure tier.
+    #[test]
+    fn lzma_alone_bytes_under_the_xz_decoder_are_corrupt() {
+        let opts = liblzma::stream::LzmaOptions::new_preset(6).unwrap();
+        let stream = liblzma::stream::Stream::new_lzma_encoder(&opts).unwrap();
+        let buf = SharedBuf::new();
+        let mut enc = liblzma::write::XzEncoder::new_stream(buf.clone(), stream);
+        enc.write_all(b"some lzma alone payload").unwrap();
+        enc.finish().unwrap();
+        let src: Box<dyn Source> =
+            Box::new(ReaderSource::new(std::io::Cursor::new(buf.contents())));
+        let mut dec = Xz.decoder(src, &DecodeOpts::default()).unwrap();
+        let err = dec.read_to_end(&mut Vec::new()).unwrap_err();
+        let err = Error::from_decode_io(err);
+        assert!(matches!(err, Error::Corrupt(_)), "{err}");
+        assert_eq!(err.exit_code(), 5);
+    }
+
     #[test]
     fn new_single_stream_decoder_would_silently_truncate_concatenated_input() {
         let mut two = compress(b"first-stream-");
@@ -615,7 +641,7 @@ mod tests {
             out.len() < full_len,
             "expected new() to silently drop the second stream; got the full {} bytes — if this \
              changed upstream, `decoder` could switch back to `new()`, but until then \
-             `new_multi_decoder` stays load-bearing",
+             `CONCATENATED` stays load-bearing",
             out.len()
         );
     }
