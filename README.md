@@ -549,6 +549,14 @@ read list.
 > **3834** tests under `--all-features`, **3686** on the default tier —
 > measured from this bump's own `make check FULL=1`, `GATE_EXIT=0`.
 >
+> `0.25.1` takes the dependency updates: brotli 9, lzma-rust2 0.23 (the
+> one zip 9 already used), clap, cc, twox-hash, and newer pinned CI actions.
+> A pure-tier `.lzma` with bytes after its end marker is still refused
+> (exit 5), and the pure-tier xz link now names corruption near the end of
+> an LZMA1 stream as liblzma does in all but a few cases. A PATCH.
+> **3834** tests under `--all-features`, **3686** on the default tier —
+> measured from this bump's own `make check FULL=1`, `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
