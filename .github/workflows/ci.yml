@@ -18,8 +18,13 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      # rust-toolchain's channel branches (`@stable`, `@nightly`, `@1.88`)
+      # carry the toolchain in their name; pinned to a SHA that name is gone,
+      # so every use pins `master` and names the toolchain as an input. One
+      # SHA for all of them is what Dependabot proposes (PR #1).
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -41,7 +46,7 @@ jobs:
       # rust-toolchain.toml pins 1.95 for local development, and rustup
       # honours it for every `cargo` invocation regardless of which toolchain
       # actions/steps selected above — without removing it, this job's
-      # `dtolnay/rust-toolchain@stable` step is inert and "gate (stable)"
+      # `toolchain: stable` step is inert and "gate (stable)"
       # silently runs on 1.95 instead of stable.
       - run: rm rust-toolchain.toml
       # `lzip.rs`'s reference-tool tests go through `require_lzip`, which
@@ -129,7 +134,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@360a4e93673de6630fac2478bc9e35244b01a759 # 1.88
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.88"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # rust-toolchain.toml pins 1.95 for local development and must not
       # constrain the MSRV check. Remove it so the toolchain action's choice
@@ -172,7 +179,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # rust-toolchain.toml pins 1.95 for local development, which would
       # otherwise make the toolchain selection above inert (see "gate"'s
@@ -229,8 +238,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: nightly
           components: miri
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # rust-toolchain.toml pins 1.95 for local development, which would
@@ -260,7 +270,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           # `fuzz/` is excluded from the workspace (its own Cargo.toml,
@@ -274,7 +286,7 @@ jobs:
       # toolchain actions/steps selected above — see "gate" and "miri"'s
       # identical step. `cargo fuzz` needs the nightly compiler (it passes
       # `-Zsanitizer=address` to rustc), and without removing this file
-      # `dtolnay/rust-toolchain@nightly` is inert and every `cargo fuzz`
+      # the `toolchain: nightly` step is inert and every `cargo fuzz`
       # call below fails with "the option `Z` is only accepted on the
       # nightly compiler" — reproduced locally while writing this job.
       - run: rm rust-toolchain.toml
@@ -424,7 +436,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: rm rust-toolchain.toml
       # Structural, not environmental: this cannot prove `cc` is absent from
@@ -450,7 +464,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
       - run: rm rust-toolchain.toml
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
@@ -478,7 +494,9 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # Same as "gate": rust-toolchain.toml would otherwise make the
       # toolchain action's choice inert.
