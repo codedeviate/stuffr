@@ -887,9 +887,11 @@ impl<R: BufRead> LzipPureDecoder<R> {
     /// contract for library callers (see
     /// `no_limit_means_no_bound_for_library_callers`).
     fn new(inner: R, memory_limit: Option<u64>) -> Self {
+        // `true`: decode every concatenated member, as lzip does (and as
+        // lzma-rust2 did unconditionally before 0.23 made it a choice).
         let stream = match memory_limit {
-            Some(limit) => LzipStream::new_mem_limit(mem_limit_kb(limit)),
-            None => LzipStream::new(),
+            Some(limit) => LzipStream::new_mem_limit(true, mem_limit_kb(limit)),
+            None => LzipStream::new(true),
         };
         Self {
             inner,

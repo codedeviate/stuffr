@@ -570,17 +570,24 @@ impl Read for LazyLzmaDecoder<'_> {
                     }
                     *finished = true;
                 }
-                LazyLzmaDecoder::Ready { inner, .. } => {
-                    if inner.inner_mut().hit_eof {
-                        *self = LazyLzmaDecoder::Failed;
+                LazyLzmaDecoder::Ready { .. } => {
+                    let LazyLzmaDecoder::Ready { inner, .. } =
+                        std::mem::replace(self, LazyLzmaDecoder::Failed)
+                    else {
+                        unreachable!("just matched Ready above")
+                    };
+                    // Since lzma-rust2 0.23 the reader reads ahead into its
+                    // own buffer, so bytes past the end marker may sit there
+                    // rather than in the source: both count as trailing.
+                    let (mut guarded, buffered) = inner.into_parts();
+                    if guarded.hit_eof {
                         return Err(std::io::Error::new(
                             ErrorKind::InvalidData,
                             "truncated LZMA1 stream: the decoder reached its end marker only \
                              by substituting a byte the source did not actually have",
                         ));
                     }
-                    if inner.inner_mut().has_more()? {
-                        *self = LazyLzmaDecoder::Failed;
+                    if !buffered.is_empty() || guarded.has_more()? {
                         return Err(std::io::Error::new(
                             ErrorKind::InvalidData,
                             "trailing byte(s) after the LZMA1 stream's end marker — the alone \

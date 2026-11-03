@@ -2089,8 +2089,10 @@ mod cross_tier {
         assert!(seen.keys().any(|k| k.starts_with("memlimit")), "{seen:?}");
         // Measured 2026-10-11: every one of these had liblzma stop within 16
         // bytes of the end. A change in the count means the sweep or the
-        // deviation moved; look before updating it.
-        assert_eq!(seen.get(TOLERATED), Some(&92), "{seen:?}");
+        // deviation moved; look before updating it. 92 under lzma-rust2
+        // 0.20; 3 under 0.23 (2026-11-03), whose reader decodes nearer the
+        // end of the input, so 89 of them now agree with liblzma outright.
+        assert_eq!(seen.get(TOLERATED), Some(&3), "{seen:?}");
     }
 }
 
