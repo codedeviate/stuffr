@@ -69,6 +69,10 @@ fn main() -> ExitCode {
     };
 
     let input = named_input(&command).map(str::to_owned);
+    if let Err(e) = refuse_unopenable_inputs(&command) {
+        report_error(&e, None);
+        return ExitCode::from(e.exit_code() as u8);
+    }
     match run(command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -87,10 +91,53 @@ fn named_input(cmd: &Command) -> Option<&str> {
         | Command::Cat { input, .. }
         | Command::Info { input, .. }
         | Command::List { input, .. }
-        | Command::Test { input, .. } => input,
+        | Command::Test { input, .. }
+        | Command::Salvage { input, .. } => input,
         _ => return None,
     };
     (input != "-").then_some(input.as_str())
+}
+
+/// Refuses, as a usage error (exit 2), a named input path that cannot be
+/// opened: missing, dangling, or unreadable. A directory, FIFO or device is accepted
+/// here, since each verb has its own handling for one. `-` (stdin) is never checked.
+///
+/// CLI-only on purpose: the library keeps `Error::Io` for these (changing it
+/// would be a source-visible change, and this is a PATCH). The check runs
+/// before anything is created, so a refused run leaves no output behind. It
+/// is a preflight, not a lock: a file that vanishes between this open and the
+/// verb's real open can still exit 1.
+fn refuse_unopenable_inputs(cmd: &Command) -> stuffr::Result<()> {
+    let paths: Vec<&str> = match cmd {
+        Command::Pack { paths, .. } => paths.iter().map(String::as_str).collect(),
+        Command::Unpack { input, .. }
+        | Command::Convert { input, .. }
+        | Command::Cat { input, .. }
+        | Command::Info { input, .. }
+        | Command::List { input, .. }
+        | Command::Test { input, .. }
+        | Command::Salvage { input, .. } => vec![input.as_str()],
+        _ => return Ok(()),
+    };
+    for p in paths.into_iter().filter(|p| *p != "-") {
+        // Only a regular file is opened: opening a FIFO for reading blocks
+        // until a writer appears, and a directory or device has its own
+        // verb-level handling.
+        let opened = std::fs::metadata(p).and_then(|md| {
+            if md.is_file() {
+                std::fs::File::open(p).map(drop)
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(e) = opened {
+            return Err(stuffr::Error::Usage(format!(
+                "cannot read {}: {e}",
+                stuffr::fmt_name(p)
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Prints `e` as `stuffr: …`. A foreign file (an Apple disk image) is a
