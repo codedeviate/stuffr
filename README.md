@@ -557,6 +557,14 @@ read list.
 > **3834** tests under `--all-features`, **3686** on the default tier —
 > measured from this bump's own `make check FULL=1`, `GATE_EXIT=0`.
 >
+> `0.25.2`: an input path that cannot be opened — missing, unreadable, or a
+> dangling symlink — is a usage error naming it (exit 2, was 1) in `pack`,
+> `unpack`, `convert`, `cat`, `info`, `list`, `test` and `salvage`, as
+> `stuffr ls` already said, and before anything is created. A container
+> `pack` still skips an unreadable named file with a warning. A PATCH.
+> **3841** tests under `--all-features`, **3693** on the default tier —
+> measured from this bump's own `make check FULL=1`, `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
