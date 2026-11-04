@@ -297,8 +297,9 @@ pub enum Command {
     /// decompress memory (resident; see --no-memory). Timings need a
     /// release build.
     Bench(BenchArgs),
-    /// Create compatibility symlinks (`bzip2`, `bunzip2`, `bzcat`,
-    /// `bzip2recover`) to this binary in a directory. Opt-in, never automatic.
+    /// Create compatibility symlinks to this binary in a directory: every
+    /// compatibility name (`gzip`, `bzip2`, `xz`, `zstd`, `zip`, `unzip` and
+    /// more). Opt-in, never automatic.
     InstallLinks {
         /// Directory to put the links in. It must already exist.
         #[arg(long, value_name = "DIR")]
