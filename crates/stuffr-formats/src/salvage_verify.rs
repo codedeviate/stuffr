@@ -192,6 +192,7 @@ fn crc32_ieee(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(feature = "lha", feature = "arc", feature = "zoo"))]
     use crate::legacy::crc::crc16_arc;
 
     // -------------------------------------------------------------------
@@ -199,6 +200,7 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
+    #[cfg(any(feature = "lha", feature = "arc", feature = "zoo"))]
     fn a_crc16_payload_that_agrees_is_intact() {
         let data = b"the quick brown fox";
         let v = Verifier::Crc16(crc16_arc(data));
@@ -209,6 +211,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "lha", feature = "arc", feature = "zoo"))]
     fn a_crc16_payload_that_disagrees_is_partial_by_checksum() {
         let data = b"the quick brown fox";
         let v = Verifier::Crc16(crc16_arc(data) ^ 1);

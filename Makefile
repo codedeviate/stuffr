@@ -235,12 +235,17 @@ lint-latest:
 #   six warnings nothing in the gate could see. `-D warnings` changes RUSTFLAGS,
 #   which would invalidate every dependency's cache in `target/`, so this one
 #   line gets its own target dir (`target/no-default-strict`).
+# - `stuffr-formats --lib --tests --no-default-features --features zip` compiles
+#   the zip-only test build: 0.25.0 parked a break there (`crc16_arc` was
+#   reached by tests the feature subset does not provide) because no gate
+#   command ever compiled that subset.
 release:
 	$(CARGO) build --release --workspace
 	$(CARGO) build -p stuffr-core --no-default-features
 	RUSTFLAGS="-D warnings" CARGO_TARGET_DIR=target/no-default-strict $(CARGO) build -p stuffr-formats --no-default-features
 	$(CARGO) check -p stuffr --features pure --no-default-features
 	$(CARGO) check -p stuffr --features legacy --no-default-features
+	$(CARGO) check -p stuffr-formats --lib --tests --no-default-features --features zip
 
 # NOT part of `check`, deliberately: Miri is 10-50x slower than a native run
 # and the gate is already 35-60s. Run it when you touch the self-referential

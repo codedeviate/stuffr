@@ -56,7 +56,8 @@ pub(crate) fn crc16_arc_continued(seed: u16, data: &[u8]) -> u16 {
     crc
 }
 
-#[cfg(test)]
+// `crc16_arc` (used by both tests) is gated on these three formats; see above.
+#[cfg(all(test, any(feature = "lha", feature = "arc", feature = "zoo")))]
 mod tests {
     use super::*;
 
