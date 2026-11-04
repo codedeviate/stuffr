@@ -138,3 +138,39 @@ fn stdin_is_never_checked() {
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(out.stdout, b"hi");
 }
+
+#[cfg(unix)]
+#[test]
+fn pack_keeps_skipping_an_unreadable_named_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp_dir();
+    let a = dir.join("a.txt");
+    std::fs::write(&a, b"a").unwrap();
+    let l = dir.join("locked.gz");
+    std::fs::write(&l, b"x").unwrap();
+    struct Restore<'a>(&'a Path);
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    std::fs::set_permissions(&l, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let _restore = Restore(&l);
+    if std::fs::File::open(&l).is_ok() {
+        eprintln!("skipped: root can read a mode-000 file");
+        return;
+    }
+    let o = dir.join("out.zip");
+    let out = run_output(&[
+        "pack",
+        a.to_str().unwrap(),
+        l.to_str().unwrap(),
+        "-o",
+        o.to_str().unwrap(),
+    ]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(o.exists());
+    assert!(err.contains("skipped entry"), "{err}");
+    assert!(err.contains("could not be opened"), "{err}");
+}

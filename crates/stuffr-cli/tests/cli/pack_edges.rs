@@ -33,15 +33,16 @@ fn packing_the_filesystem_root_is_a_usage_error_that_says_why() {
     );
 }
 
-/// A path ending in `..` that does not exist fails as the `Io` error it is
-/// (exit 1), not as a naming complaint.
+/// A path ending in `..` that does not exist is refused up front as an
+/// unreadable input (exit 2, since 0.25.2; it was exit 1), not as a naming
+/// complaint.
 ///
 /// `entry_name_for` reaches `canonicalize` for any path whose final component
 /// is `.` or `..`, and that call is what reports a missing path here — a
 /// deliberate exit-code decision (`Usage` before Phase 2c) with nothing
 /// pinning it.
 #[test]
-fn a_nonexistent_dotdot_path_is_reported_as_an_io_error() {
+fn a_nonexistent_dotdot_path_is_reported_as_a_usage_error() {
     let dir = tmp_dir();
     let out = dir.join("dd.tar");
     let missing = dir.join("nosuch/..");
@@ -56,8 +57,8 @@ fn a_nonexistent_dotdot_path_is_reported_as_an_io_error() {
         .unwrap();
     assert_eq!(
         st.status.code(),
-        Some(1),
-        "a path that does not exist is an i/o error, whatever its final component; \
+        Some(2),
+        "a path that does not exist is a usage error, whatever its final component; \
          stderr: {}",
         String::from_utf8_lossy(&st.stderr)
     );

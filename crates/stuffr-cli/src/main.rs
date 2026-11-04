@@ -105,9 +105,13 @@ fn named_input(cmd: &Command) -> Option<&str> {
 /// CLI-only on purpose: the library keeps `Error::Io` for these (changing it
 /// would be a source-visible change, and this is a PATCH). The check runs
 /// before anything is created, so a refused run leaves no output behind. It
-/// is a preflight, not a lock: a file that vanishes between this open and the
+/// `pack` is checked by `metadata` only and never opens a path: a container
+/// pack skips an unreadable named file with a fidelity warning (by design),
+/// so opening would turn that into exit 2. A single-stream `pack unreadable
+/// -o x.gz` therefore still exits 1 (a known residual). It is a preflight, not a lock: a file that vanishes between this open and the
 /// verb's real open can still exit 1.
 fn refuse_unopenable_inputs(cmd: &Command) -> stuffr::Result<()> {
+    let is_pack = matches!(cmd, Command::Pack { .. });
     let paths: Vec<&str> = match cmd {
         Command::Pack { paths, .. } => paths.iter().map(String::as_str).collect(),
         Command::Unpack { input, .. }
@@ -124,7 +128,7 @@ fn refuse_unopenable_inputs(cmd: &Command) -> stuffr::Result<()> {
         // until a writer appears, and a directory or device has its own
         // verb-level handling.
         let opened = std::fs::metadata(p).and_then(|md| {
-            if md.is_file() {
+            if md.is_file() && !is_pack {
                 std::fs::File::open(p).map(drop)
             } else {
                 Ok(())
