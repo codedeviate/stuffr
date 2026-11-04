@@ -99,17 +99,21 @@ fn named_input(cmd: &Command) -> Option<&str> {
 }
 
 /// Refuses, as a usage error (exit 2), a named input path that cannot be
-/// opened: missing, dangling, or unreadable. A directory, FIFO or device is accepted
-/// here, since each verb has its own handling for one. `-` (stdin) is never checked.
+/// opened: missing, dangling, or unreadable. A directory, FIFO or device is
+/// accepted here, since each verb has its own handling for one (and opening a
+/// FIFO would block until a writer appears). `-` (stdin) is never checked.
 ///
 /// CLI-only on purpose: the library keeps `Error::Io` for these (changing it
 /// would be a source-visible change, and this is a PATCH). The check runs
-/// before anything is created, so a refused run leaves no output behind. It
+/// before anything is created, so a refused run leaves no output behind.
+///
 /// `pack` is checked by `metadata` only and never opens a path: a container
 /// pack skips an unreadable named file with a fidelity warning (by design),
 /// so opening would turn that into exit 2. A single-stream `pack unreadable
-/// -o x.gz` therefore still exits 1 (a known residual). It is a preflight, not a lock: a file that vanishes between this open and the
-/// verb's real open can still exit 1.
+/// -o x.gz` therefore still exits 1 (a known residual).
+///
+/// It is a preflight, not a lock: a file that vanishes between this check
+/// and the verb's real open can still exit 1.
 fn refuse_unopenable_inputs(cmd: &Command) -> stuffr::Result<()> {
     let is_pack = matches!(cmd, Command::Pack { .. });
     let paths: Vec<&str> = match cmd {
