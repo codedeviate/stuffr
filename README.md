@@ -565,6 +565,14 @@ read list.
 > **3841** tests under `--all-features`, **3693** on the default tier —
 > measured from this bump's own `make check FULL=1`, `GATE_EXIT=0`.
 >
+> `0.25.3` takes lzma-rust2 0.24 together with zip 9.2.3 or later (zip
+> 9.2.3 is the first to use 0.24), so one lzma-rust2 is still compiled. A
+> zip entry whose method this build cannot decode is still refused as
+> unsupported (exit 3) when it is opened, as before; zip 9.2 had moved
+> that refusal to the first read, where it read as corruption. A PATCH.
+> **3843** tests under `--all-features`, **3695** on the default tier —
+> measured from this bump's own `make check FULL=1`, `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
