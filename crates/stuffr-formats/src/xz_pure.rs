@@ -14,7 +14,7 @@
 //!
 //! ## The dependency: pure Rust, below this workspace's MSRV floor
 //!
-//! `lzma-rust2` 0.20.1 depends only on `sha2` + `digest` (needed for xz's
+//! `lzma-rust2` 0.24 depends only on `sha2` + `digest` (needed for xz's
 //! optional SHA-256 check type; this codec always selects CRC64 instead, see
 //! below) — no `-sys` crate, no C toolchain, no bindgen. It declares
 //! `rust-version = "1.85"` — below this workspace's 1.88 floor, so it
@@ -1164,6 +1164,51 @@ mod tests {
         let mut two = compress(b"first-stream-");
         two.extend_from_slice(&compress(b"second-stream"));
         assert_eq!(decompress(two), b"first-stream-second-stream");
+    }
+
+    /// Stream padding is legal only in multiples of four bytes (xz file
+    /// format 1.2.1, section 2.2); three zero bytes after a stream are not
+    /// padding but corruption, and must be exit 5, never Ok and never exit 1.
+    /// lzma-rust2 0.24 moved this check (its changelog: `XzReader` rejects
+    /// unaligned padding at end of input); this pins the registered codec's
+    /// verdict, with four zero bytes as the legal control, and — where both
+    /// backends are compiled — that liblzma gives the same exit class.
+    #[test]
+    fn unaligned_stream_padding_is_corrupt_and_aligned_padding_is_not() {
+        fn exit_class(dec_result: std::io::Result<usize>) -> i32 {
+            match dec_result {
+                Ok(_) => 0,
+                Err(e) => stuffr_core::Error::from_decode_io(e).exit_code(),
+            }
+        }
+        let decode = |bytes: &[u8], pure: bool| -> i32 {
+            let src: Box<dyn Source> =
+                Box::new(ReaderSource::new(std::io::Cursor::new(bytes.to_vec())));
+            let mut out = Vec::new();
+            if pure {
+                let mut dec = Xz.decoder(src, &DecodeOpts::default()).unwrap();
+                exit_class(dec.read_to_end(&mut out))
+            } else {
+                #[cfg(feature = "xz-c")]
+                {
+                    let mut dec = crate::xz_c::Xz
+                        .decoder(src, &DecodeOpts::default())
+                        .unwrap();
+                    exit_class(dec.read_to_end(&mut out))
+                }
+                #[cfg(not(feature = "xz-c"))]
+                unreachable!("the C tier is consulted only when compiled")
+            }
+        };
+        let packed = compress(b"stream padding must be a multiple of four bytes");
+        for (pad, want) in [(3usize, 5), (4, 0), (5, 5), (8, 0)] {
+            let mut bytes = packed.clone();
+            bytes.extend(std::iter::repeat_n(0u8, pad));
+            assert_eq!(decode(&bytes, true), want, "pure tier, {pad} zero byte(s)");
+            if cfg!(feature = "xz-c") {
+                assert_eq!(decode(&bytes, false), want, "C tier, {pad} zero byte(s)");
+            }
+        }
     }
 
     /// The paired negative proof, mirroring `xz_c.rs`'s

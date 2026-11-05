@@ -124,7 +124,7 @@ libz-sys = { version = "1.1.31", default-features = false, features = ["static"]
 # imposes no constraint here — edition 2024, Apache-2.0 — the
 # first non-MIT dependency reachable from a *default* build (see Task 8's
 # README note).
-lzma-rust2 = "0.23"
+lzma-rust2 = "0.24"
 # `default-features = false` drops the `xattr` feature, which `tar` turns ON
 # by default (`default = ["xattr"]`) and which is the only optional
 # dependency in its graph — `xattr 1.1.3`, on unix. Nothing here needs it:
@@ -263,13 +263,14 @@ cpio = "0.4"
 # `deflate64` and `ppmd` are pure-Rust decoders, and zip's `xz` and `lzma`
 # features both resolve to `lzma-rust2` — the same crate this tree's pure xz
 # and LZMA1 backends use, so no new licence (Apache-2.0, already reachable
-# from a default build). Worth stating precisely rather than as "no new
-# dependency", because it is not quite that: zip 9.1.3 pins
-# `lzma-rust2 ^0.23.0` while this workspace is on 0.20, and 0.x versions are
-# semver-incompatible, so `cargo tree` shows BOTH 0.23.0 and 0.20.1 and both
-# get compiled (zip 8.6 pinned 0.16, the same shape). That
-# is compile time and binary size, not a new licence or a new C toolchain
-# requirement; it resolves itself when zip catches up.
+# from a default build), and ONE copy of it: zip 9.2.3 and later require
+# `lzma-rust2 ^0.24.0`, the version pinned above. 0.x versions are
+# semver-incompatible, so the two requirements must move together — zip
+# 9.1.3 wanted `^0.23.0`, zip 8.6 `^0.16`, and each time the workspace lagged
+# `cargo tree` showed two versions, both compiled. That is why the floor
+# below is 9.2.3 rather than 9: no resolution can pair this workspace's 0.24
+# with a zip that wants 0.23. When bumping either, check that
+# `cargo tree -i lzma-rust2 --workspace --all-features` names one version.
 #
 # `deflate-flate2` and NOT `deflate-flate2-zlib-rs`, which is the variant a
 # reading of zip's feature list suggests. The `-zlib-rs` suffix turns on
@@ -298,11 +299,17 @@ cpio = "0.4"
 # libc bindings, for its `extract`, which nothing here calls) and moves
 # `ppmd-rust` to 1.5; its `zstd` is 0.14, the same zstd-safe 8.2.0 /
 # zstd-sys 2.1.2 chain stuffr's own `zstd` uses, so `c-backed` builds ONE
-# libzstd. `bzip2 0.6` still resolves to `libbz2-rs-sys`.
+# libzstd. `bzip2 0.6` still resolves to `libbz2-rs-sys`. zip 9.2-9.4 add
+# `libc` (unix, already in the graph) and an OPTIONAL `rayon` behind their
+# `rayon` feature (parallel write and extract), which the list below does
+# not enable: `cargo tree -i rayon --workspace --all-features` finds nothing.
+# 9.2.0 also stopped refusing an undecodable method when an entry is opened
+# (the refusal moved to the first read); `zip.rs`'s
+# `refuse_undecodable_method` keeps that exit 3.
 #
 # Bumping `zip` (or its `lzma-rust2`/`zstd` decoders): re-trace the kind
 # list on `normalize::ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_UNSUPPORTED_EOF` first.
-zip = { version = "9", default-features = false, features = [
+zip = { version = "9.2.3", default-features = false, features = [
     "deflate-flate2",
     "bzip2",
     "deflate64",

@@ -891,6 +891,25 @@ mod tests {
         }
     }
 
+    /// The smallest trailing case, which the 16-byte test above does not
+    /// reach: since lzma-rust2 0.23 the reader reads ahead, so ONE byte past
+    /// the end marker can sit in its buffer rather than in the source, and
+    /// 0.24 changed how `total_in` is counted. Both the buffered and the
+    /// source-side byte must still be trailing data (`into_parts()` above).
+    #[test]
+    fn a_single_trailing_nul_byte_is_also_rejected() {
+        let mut padded = compress(b"payload-with-one-nul");
+        padded.push(0);
+
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(padded)));
+        let mut dec = Lzma.decoder(src, &DecodeOpts::default()).unwrap();
+        let mut out = Vec::new();
+        match dec.read_to_end(&mut out) {
+            Ok(_) => panic!("expected one trailing NUL byte to be reported as corrupt"),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
+        }
+    }
+
     #[test]
     fn a_single_stream_with_nothing_appended_decodes_cleanly() {
         let packed = compress(b"just one stream, nothing after it");

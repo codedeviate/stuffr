@@ -706,7 +706,18 @@ pub(crate) const CPIO_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
 /// **Re-traced for the zip 9 bump** (2026-10-31) in source, not sampled:
 /// `zip 9.1.3`, `lzma-rust2 0.23.0`, `zstd 0.14.3` (`zstd-safe 8.2.0`),
 /// `ppmd-rust 1.5.2`, `deflate64 0.1.12`, `flate2` and `bzip2 0.6` over
-/// `libbz2-rs-sys`. Two consumers: `zip.rs`'s payload readers (through
+/// `libbz2-rs-sys`. **Re-traced again for zip 9.4.0 and `lzma-rust2`
+/// 0.24.0** (2026-11-05): no new kind on the read path. zip 9.2-9.4 add
+/// `io::Error`s only in `read/extract.rs` (`PermissionDenied`, its own
+/// extractor, never called here) and propagate a source error unchanged in
+/// `validate_header_consistency`'s gap scan (`read/zip_archive.rs:643`, off
+/// while `enforce_header_consistency` is); `lzma-rust2` 0.24 adds one
+/// decode-side error, `InvalidData` ("stream padding size not multiple of
+/// 4", `xz/reader.rs:391`), which needs no folding, and `InvalidInput`s only
+/// in its new `MicroLzmaEncoder`. What zip 9.2 DID move is a refusal, not a
+/// kind: see the `Unsupported` pair below.
+///
+/// Two consumers: `zip.rs`'s payload readers (through
 /// [`NormalizeDecodeErrors`] and `normalize_payload_error`) and, since zip
 /// 9, `classify_zip_error`'s `ZipError::Io` arm for header parsing, which
 /// folds only an error carrying no OS error code (`raw_os_error()` is
@@ -728,18 +739,18 @@ pub(crate) const CPIO_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
 ///   `bzip2` over `libbz2-rs-sys`, the same pair; `Deflate64` through
 ///   `deflate64 0.1.12`, `InvalidData`/`InvalidInput` and `UnexpectedEof`
 ///   passed through.
-/// * `Lzma` (14) and `Xz` (95) decode through `lzma-rust2` **0.23.0** —
-///   zip 9's own dependency (`compression.rs:452` `LzmaReader::
-///   new_with_props`, `:467` `XzReader::new`), NOT the 0.20.1 this tree pins
-///   for `xz_pure.rs`, `lzma_pure.rs` and `lzip.rs`; two copies build side by
-///   side. `Other`: `"dist overflow"` (`lz/lz_decoder.rs:156`, the
+/// * `Lzma` (14) and `Xz` (95) decode through `lzma-rust2` **0.24.0** —
+///   zip's own dependency (`compression.rs:452` `LzmaReader::
+///   new_with_props`, `:467` `XzReader::new`) and, since 0.25.3, the same
+///   single copy `xz_pure.rs`, `lzma_pure.rs` and `lzip.rs` use.
+///   `Other`: `"dist overflow"` (`lz/lz_decoder.rs:156`, the
 ///   `v0.10.0` deep-fuzz finding that put `Other` on this list) and
 ///   `"slice doesn't match array size for u32 BE bytes"`
 ///   (`range_dec.rs:546`, `:690`; unreachable). **`Unsupported`, new with
-///   0.23**: `"invalid XZ stream flags"` (`xz/reader.rs:1056`) — reserved
+///   0.23**: `"invalid XZ stream flags"` (`xz/reader.rs:1076` in 0.24) — reserved
 ///   stream-flag bits set, which 0.16.5 raised as `InvalidData` — and
 ///   `"only one filter is supported"` (`lzma2_reader.rs:376`,
-///   `lzma_reader.rs:1339`). Measured before the fold: a zip whose xz entry
+///   `lzma_reader.rs:1350`). Measured before the fold: a zip whose xz entry
 ///   sets a reserved stream-flag bit (stream-header CRC fixed up) answered
 ///   `i/o error: invalid XZ stream flags`, exit 1, on both rungs, where zip
 ///   8.6 answered exit 5. `OutOfMemory` (dictionary and literal-decoder
@@ -763,19 +774,20 @@ pub(crate) const CPIO_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
 ///   `impl From<ZipError> for io::Error` (`result.rs:124-139`):
 ///   `InvalidArchive` → `InvalidData` (e.g. "unexpected LZMA properties
 ///   size"), and `CompressionMethodNotSupported`/`UnsupportedArchive` →
-///   `Unsupported`. That last pair is not reached in practice — `zip.rs`
-///   refuses an undecodable method by its own `codec_for` check before any
-///   read (exit 3) — and if it were, folding it to exit 5 is the wrong
-///   class but still never exit 1.
+///   `Unsupported`. That last pair is not reached in practice: zip 9.2.0
+///   stopped refusing an undecodable method when the entry is opened
+///   (zip-rs/zip2#1228), so `zip.rs`'s `refuse_undecodable_method` does it
+///   instead, on both rungs, before any read (exit 3). If one were reached,
+///   folding it to exit 5 is the wrong class but still never exit 1.
 ///
 /// Header parsing (`ZipError::Io`, before any payload): `Other` from an
 /// extended-timestamp extra field whose length disagrees with its flags
 /// (`extra_fields/extended_timestamp.rs:98`; exit 1 on zip 8.6's seekable
 /// rung and zip 9's forward rung before this fold) and `InvalidInput` from
 /// `SeekableTake::new` / its `seek` (`read/readers.rs:26`, `:48`) when a
-/// declared data range overflows `u64`. `types.rs:134`'s CP437 `Other` is
+/// declared data range overflows `u64`. `types.rs:137`'s CP437 `Other` is
 /// unreachable (all-ASCII is valid UTF-8, and `zip.rs` does not call
-/// `ZipFile::name()`); `types.rs:572`/`:594` are writer-side.
+/// `ZipFile::name()`); `types.rs:593`/`:615` are writer-side (9.4.0 lines).
 ///
 /// Folding is safe for the structural reason `TAR_MALFORMED_AS_OTHER`'s and
 /// `XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF`'s docs give,

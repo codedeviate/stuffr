@@ -1,6 +1,6 @@
 //! The pure tier of [`super`]: the same [`Encoder`], [`Decoder`],
 //! [`encoder_memusage`], [`decoder_memusage`] and [`liblzma_version`] as
-//! `c`, over `lzma-rust2` 0.20.1 and no C at all.
+//! `c`, over `lzma-rust2` 0.24 and no C at all.
 //!
 //! What it promises is the spec's pure-tier promise: the compressed bytes
 //! are *compatible*, not identical — `xz` 5.8.4 decodes them to the input,

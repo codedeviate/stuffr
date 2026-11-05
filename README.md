@@ -2869,11 +2869,10 @@ Neither licence extends to dependencies, and two are worth naming.
 **Apache-2.0**. It is the first non-MIT dependency in a *default* build — until
 Phase 1e, only the opt-in `c-backed` tier carried a licence caveat. Apache-2.0 is
 permissive and compatible, but a downstream consumer auditing licences should
-know it is there without having to read the lockfile. Since Phase 2, two
-versions of it build side by side — this project's own 0.20.1, and 0.16.5
-pulled in transitively by the `zip` dependency (pinned `^0.16.1`) for its own
-LZMA entry support. No new crate and no new licence, just a real duplicate in
-the tree (`cargo tree -p stuffr --all-features -i lzma-rust2` shows both).
+know it is there without having to read the lockfile. The `zip` dependency uses
+it too, for its own LZMA and xz entries; since 0.25.3 both resolve to one copy
+(0.24, which zip 9.2.3 and later require), so
+`cargo tree -p stuffr --all-features -i lzma-rust2` shows a single version.
 
 The `unrar` feature, if enabled, links a library whose upstream license permits
 decompression only and forbids using the source to build a RAR compressor. A
