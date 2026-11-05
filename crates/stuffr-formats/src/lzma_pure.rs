@@ -894,7 +894,8 @@ mod tests {
     /// The smallest trailing case, which the 16-byte test above does not
     /// reach: since lzma-rust2 0.23 the reader reads ahead, so ONE byte past
     /// the end marker can sit in its buffer rather than in the source, and
-    /// 0.24 changed how `total_in` is counted. Both the buffered and the
+    /// 0.24 counts a failed `process()` call's bytes in the streams'
+    /// `total_in` (its changelog). Both the buffered and the
     /// source-side byte must still be trailing data (`into_parts()` above).
     #[test]
     fn a_single_trailing_nul_byte_is_also_rejected() {
