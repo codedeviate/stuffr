@@ -1705,6 +1705,7 @@ impl ZipIndexed {
             return self.legacy_entry_at(index, method);
         }
         let mut file = self.archive.by_index(index).map_err(classify_zip_error)?;
+        refuse_undecodable_method(&file)?;
         let mut meta = entry_meta(&file, file.unix_mode());
 
         // A symlink's target is its payload — read it now, while the entry is
@@ -2510,6 +2511,12 @@ impl ArchiveRead for ZipStreamed {
                 return Err(classify_zip_error(e));
             }
         };
+        // Ends the walk, as zip 9.1.3's own refusal inside
+        // `read_zipfile_from_stream` did: the payload is not consumed.
+        if let Err(e) = refuse_undecodable_method(&file) {
+            self.ended = true;
+            return Err(e);
+        }
 
         // `unix_mode()` is documented as `None` on this path: the external
         // attributes that carry it live only in the central directory. Passed
@@ -3150,6 +3157,31 @@ impl<R: Read> Read for EntryPayload<R> {
 // ---------------------------------------------------------------------------
 // Entry metadata
 // ---------------------------------------------------------------------------
+
+/// Refuses an entry whose method this build has no decoder for, the moment
+/// the entry is opened — exit 3, never a later read error.
+///
+/// zip 9.1.3 did this itself (`make_crypto_reader` returned
+/// `CompressionMethodNotSupported` from `by_index` and from
+/// `read_zipfile_from_stream`). zip 9.2.0 dropped that check so metadata
+/// stays readable for such an entry (zip-rs/zip2#1228): the refusal moved to
+/// the decompressor's first `read`, as an `io::Error` of kind `Unsupported`,
+/// which [`NormalizeDecodeErrors`] folds to `Error::Corrupt` (exit 5) — a
+/// reduce entry, a zstd entry on the pure tier, or shrink/implode from a
+/// pipe would have been called damaged. This restores 9.1.3's answer on both
+/// rungs, by the test zip's own `instantiate` applies: a method zip parses
+/// as `CompressionMethod::Unsupported` on this build is exactly one it has
+/// no decoder for. Called after zip's own eager checks (an encrypted entry
+/// still gets zip's password refusal first, as on 9.1.3).
+fn refuse_undecodable_method<R: Read>(file: &zip::read::ZipFile<'_, R>) -> Result<()> {
+    #[allow(deprecated)]
+    if let CompressionMethod::Unsupported(id) = file.compression() {
+        return Err(classify_zip_error(ZipError::CompressionMethodNotSupported(
+            id,
+        )));
+    }
+    Ok(())
+}
 
 /// Everything this container reports about one entry.
 ///
