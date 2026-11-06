@@ -1784,7 +1784,9 @@ pub(crate) fn disarm_cleanup() {
 /// most call sites: `create_excl_armed`, `create_armed`, `create_temp_armed`,
 /// `create_new_armed_if`, `with_run_signals_held` and
 /// `with_zip_signals_held` run before codec workers exist or between rows,
-/// files or entries, when none is alive.
+/// files or entries, when none is alive. `with_zstd_signals_held` keeps it
+/// too: any libzstd worker alive when it runs was born under an earlier
+/// hold, with the signals already blocked.
 ///
 /// Threads a codec starts while the run goes on are the other case, and a
 /// family keeps the precondition by having them inherit a mask with its

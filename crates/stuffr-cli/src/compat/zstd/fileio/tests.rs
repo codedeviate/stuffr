@@ -273,6 +273,16 @@ fn libzstd_workers_are_born_with_sigint_blocked() {
         .spawn(|| {
             // SAFETY: gettid takes no arguments and cannot fail.
             let me = unsafe { libc::gettid() }.to_string();
+            // A launcher may hand the test process SIGINT already blocked
+            // (the mask survives exec): start from a known unblocked state.
+            // SAFETY: sigset_t is plain data set by sigemptyset/sigaddset;
+            // only this thread's mask changes.
+            unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGINT);
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+            }
             assert_eq!(
                 sigint_blocked(&me),
                 Some(false),
