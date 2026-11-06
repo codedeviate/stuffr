@@ -88,6 +88,14 @@ pub(crate) const BZIP2_SIGNALS: Signals = &[libc::SIGINT, libc::SIGTERM, libc::S
 #[cfg(not(unix))]
 pub(crate) const BZIP2_SIGNALS: Signals = &[];
 
+/// zstd 1.5.7 (fileio.c addHandler): SIGINT only, the signal
+/// [`arm_cleanup_exit`] hooks. [`create_temp_armed_exit`] and
+/// [`with_zstd_signals_held`] hold back this set.
+#[cfg(unix)]
+const ZSTD_SIGNALS: Signals = &[libc::SIGINT];
+#[cfg(not(unix))]
+const ZSTD_SIGNALS: Signals = &[];
+
 /// The slot's size: `PATH_MAX`, the terminating NUL included.
 #[cfg(unix)]
 const SLOT_LEN: usize = libc::PATH_MAX as usize;
@@ -553,8 +561,7 @@ pub(crate) fn arm_cleanup_exit(host: &Host, path: &Path) -> CleanupGuard {
             !SLOT.is_armed(),
             "arm_cleanup_exit: another output is still armed"
         );
-        const INT: Signals = &[libc::SIGINT];
-        fill_slot(bytes, INT);
+        fill_slot(bytes, ZSTD_SIGNALS);
         let handler = on_interrupt_exit as extern "C" fn(libc::c_int) as libc::sighandler_t;
         // SAFETY: a zeroed sigaction filled in before use. The handler only
         // makes async-signal-safe calls (`on_interrupt_exit`). SIGINT is
@@ -1711,11 +1718,7 @@ pub(crate) fn create_temp_armed_exit(
     family: &str,
     host: &Host,
 ) -> io::Result<(PathBuf, File, CleanupGuard)> {
-    #[cfg(unix)]
-    const INT: Signals = &[libc::SIGINT];
-    #[cfg(not(unix))]
-    const INT: Signals = &[];
-    held_back(INT, || {
+    held_back(ZSTD_SIGNALS, || {
         create_temp(dir, family).map(|(p, f)| {
             let g = arm_cleanup_exit(host, &p);
             (p, f, g)
@@ -1728,6 +1731,20 @@ pub(crate) fn create_temp_armed_exit(
 /// meanwhile is delivered once `f` is done. Off unix, just `f`.
 pub(crate) fn with_run_signals_held<T>(f: impl FnOnce() -> T) -> T {
     held_back(BENCH_SIGNALS, f)
+}
+
+/// Run `f` with the zstd family's signal (SIGINT, the one
+/// [`arm_cleanup_exit`] hooks) held back; one that arrived meanwhile is
+/// delivered once `f` is done. Off unix, just `f`.
+///
+/// For the first `ZSTD_compressStream2` call of every frame
+/// (`compat/zstd/fileio.rs`): that call is where libzstd creates its worker
+/// pool, or resizes it when the frame's worker count differs from the last
+/// one's, and a new thread starts with its creator's signal mask. So every
+/// libzstd worker is born with SIGINT blocked and never takes it, and
+/// [`held_back`]'s precondition holds for the whole run (see there).
+pub(crate) fn with_zstd_signals_held<T>(f: impl FnOnce() -> T) -> T {
+    held_back(ZSTD_SIGNALS, f)
 }
 
 /// The signals of [`ZIP_SIGNALS`] that come from outside the process.
@@ -1769,24 +1786,37 @@ pub(crate) fn disarm_cleanup() {
 /// `with_zip_signals_held` run before codec workers exist or between rows,
 /// files or entries, when none is alive.
 ///
-/// One exception, present since 0.14.0: the C-tier `zstd` family with several
-/// inputs. `compress_files` (`compat/zstd/fileio.rs`) keeps one compression
-/// context for the whole run, and libzstd's worker thread(s)
-/// (`ZSTD_c_nbWorkers`, set in `zstd_opts/c.rs`; the default is at least 1)
-/// stay alive, signals unblocked, until it is freed. So when
-/// `create_temp_armed_exit` runs for the second and later files, the kernel may
-/// deliver SIGINT to a worker while the calling thread sits between creating
-/// the temporary and arming it. The handler then finds nothing armed, and the
-/// just-created temporary is leaked. The cost is one leftover temporary file,
-/// never data: the input is untouched and no output was published.
+/// Threads a codec starts while the run goes on are the other case, and a
+/// family keeps the precondition by having them inherit a mask with its
+/// signals blocked: a new thread starts with its creator's mask. The C-tier
+/// `zstd` family with several inputs keeps one compression context for the
+/// whole run (`compress_files`, `compat/zstd/fileio.rs`), and libzstd's
+/// worker threads (`ZSTD_c_nbWorkers`, set in `zstd_opts/c.rs`; the default
+/// is at least 1) live until it is freed. libzstd creates the pool, or
+/// resizes it when the worker count changes, only inside
+/// `ZSTD_CCtx_init_compressStream2`, which runs on the first
+/// `ZSTD_compressStream2` call of each frame in the buffered input mode
+/// `zstd_opts/c.rs` uses (zstd 1.5.7 `zstd_compress.c`
+/// `ZSTDMT_createCCtx_advanced`, `zstdmt_compress.c` `ZSTDMT_resize`;
+/// `pool.c` is the only place it calls `pthread_create`). `fileio.rs` makes
+/// that call of every frame inside [`with_zstd_signals_held`], so every
+/// worker has SIGINT blocked from birth, and the SIGINT that
+/// `create_temp_armed_exit` holds back for the second and later files can
+/// only go to the calling thread. Until 0.25.4 the call was not held, and a
+/// SIGINT in that window could reach a worker and leak the new temporary.
 ///
-/// The xz family's threaded C-tier encoder does not share this: `coder::run`
-/// builds the encoder per file and drops it before the next file, and
-/// liblzma starts its MT workers lazily on the first `lzma_code`, which is
-/// after `create_temp_armed` returns (read from the source, not reproduced).
+/// The other formats the zstd tool writes start no threads: its
+/// `--format=xz` asks for the single-threaded `lzma_stream_encoder`
+/// (`threads: 0` in `compat/zstd/formats.rs`), and gzip, lzma and lz4 are
+/// single-threaded. The xz family's threaded C-tier encoder does not share
+/// the problem either: `coder::run` builds the encoder per file and drops
+/// it before the next file, and liblzma starts its MT workers lazily on the
+/// first `lzma_code`, which is after `create_temp_armed` returns (read from
+/// the source, not reproduced).
 ///
-/// Follow-up, not done here: block the signals in libzstd's workers, or before
-/// the first encoder call, so the hold covers every thread.
+/// The rule for any future threaded codec in a family that arms a cleanup:
+/// its threads must either be gone before the next hold, or be created
+/// while the family's signals are blocked on the creating thread.
 fn held_back<T>(signals: Signals, f: impl FnOnce() -> T) -> T {
     #[cfg(unix)]
     {

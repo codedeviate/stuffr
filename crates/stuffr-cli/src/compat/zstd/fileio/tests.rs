@@ -214,3 +214,116 @@ fn highbit64_is_fio_highbit64() {
     assert_eq!(highbit64(1 << 31), 31);
     assert_eq!(highbit64(u64::MAX), 63);
 }
+
+/// The SIGINT bit of a `/proc/<pid>/task/<tid>/status` `SigBlk` mask, or
+/// `None` when the task is gone.
+#[cfg(all(target_os = "linux", feature = "zstd-c"))]
+fn sigint_blocked(tid: &str) -> Option<bool> {
+    let status = fs::read_to_string(format!("/proc/self/task/{tid}/status")).ok()?;
+    let hex = status
+        .lines()
+        .find_map(|l| l.strip_prefix("SigBlk:"))?
+        .trim();
+    let mask = u64::from_str_radix(hex, 16).expect("SigBlk is hex");
+    Some(mask & (1 << (libc::SIGINT - 1)) != 0)
+}
+
+/// The tasks of this process named `name` (`/proc` `comm`) other than
+/// `me`, with whether each has SIGINT blocked.
+#[cfg(all(target_os = "linux", feature = "zstd-c"))]
+fn named_tasks(name: &str, me: &str) -> Vec<(String, bool)> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir("/proc/self/task").unwrap() {
+        let tid = entry.unwrap().file_name().into_string().unwrap();
+        if tid == me {
+            continue;
+        }
+        let comm = fs::read_to_string(format!("/proc/self/task/{tid}/comm")).unwrap_or_default();
+        if comm.trim_end() != name {
+            continue;
+        }
+        if let Some(blocked) = sigint_blocked(&tid) {
+            found.push((tid, blocked));
+        }
+    }
+    found
+}
+
+/// `compress_step`'s hold, through `compress_zstd_frame` (the production
+/// path): libzstd's workers are born with SIGINT blocked, so the SIGINT
+/// `create_temp_armed_exit` holds back for a later file can only reach the
+/// main thread; and the calling thread's own mask is put back.
+///
+/// Linux only: macOS has no view of another thread's signal mask. The
+/// compression runs on a thread of its own with a name nothing else in the
+/// test binary uses; a new thread inherits its creator's name (`comm`), so
+/// libzstd's workers are exactly the other tasks that carry it, whatever
+/// other tests start meanwhile.
+///
+/// Two frames on one context, as two files would be: the first is too
+/// small for workers (`ZSTDMT_JOBSIZE_MIN`, 512 KiB), so libzstd creates its
+/// pool on the second frame's first call. Holding only the run's first call
+/// would fail here.
+#[cfg(all(target_os = "linux", feature = "zstd-c"))]
+#[test]
+fn libzstd_workers_are_born_with_sigint_blocked() {
+    const NAME: &str = "stuffr-zsigblk";
+    std::thread::Builder::new()
+        .name(NAME.into())
+        .spawn(|| {
+            // SAFETY: gettid takes no arguments and cannot fail.
+            let me = unsafe { libc::gettid() }.to_string();
+            assert_eq!(
+                sigint_blocked(&me),
+                Some(false),
+                "the test starts unblocked"
+            );
+            let cmd = command(&["-T2"]);
+            assert_eq!(cmd.prefs.workers, 2);
+            let mut host = Host::Real;
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let mut io = Io::new(&cmd, &mut host, &mut out, &mut err);
+            // Into `out`, a vector: no sparse seeks.
+            io.prefs.sparse = 0;
+            io.sink = Sink::Stdout;
+            let mut ress = io
+                .create_cresources(&cmd, FILESIZE_UNKNOWN, cmd.level)
+                .expect("the context");
+            let mut seed = 0x2545_f491_4f6c_dd1du64;
+            for (frame, len) in [(1, 64usize << 10), (2, 2 << 20)] {
+                // Text-like noise: compressible, not trivially.
+                let data: Vec<u8> = (0..len)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        b"abcdefgh ijklmnop"[(seed % 17) as usize]
+                    })
+                    .collect();
+                let mut rp = ReadPool::new(Box::new(io::Cursor::new(data)), CSTREAM_IN_SIZE);
+                let mut read = 0;
+                io.compress_zstd_frame(&mut ress, &mut rp, b"in", len as u64, &mut read)
+                    .expect("compresses");
+                assert_eq!(read, len as u64);
+                let workers = named_tasks(NAME, &me);
+                if frame == 1 {
+                    assert!(workers.is_empty(), "frame 1 started workers: {workers:?}");
+                } else {
+                    assert!(workers.len() >= 2, "no libzstd workers seen: {workers:?}");
+                    let unblocked: Vec<_> = workers.iter().filter(|(_, b)| !b).collect();
+                    assert!(
+                        unblocked.is_empty(),
+                        "libzstd workers with SIGINT unblocked: {unblocked:?}"
+                    );
+                }
+                assert_eq!(sigint_blocked(&me), Some(false), "the mask is restored");
+            }
+            drop(ress);
+            drop(io);
+            // `err` holds progress lines only.
+            assert!(!out.is_empty());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

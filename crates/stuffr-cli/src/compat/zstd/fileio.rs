@@ -1257,6 +1257,32 @@ fn compressed_name(src: &[u8], out_dir: Option<&[u8]>, suffix: &str) -> Vec<u8> 
 
 // ---- compression ----
 
+/// One `ZSTD_compressStream2` call of `FIO_compressZstdFrame`'s loop. The
+/// first call of a frame (`frame_start`) is where libzstd creates its worker
+/// pool, or resizes it when the frame's worker count differs, so it runs
+/// with the zstd tool's signal held back
+/// ([`host::with_zstd_signals_held`]): every worker is born with SIGINT
+/// blocked, and the SIGINT [`create_temp_armed_exit`] holds back for a later
+/// file can only reach the main thread, whose handler sees the armed
+/// temporary. A SIGINT arriving during that call is answered when it
+/// returns. Every frame is held, not only the run's first: a frame too small
+/// for workers (`ZSTDMT_JOBSIZE_MIN`) creates no pool, and the next, larger
+/// one does.
+fn compress_step(
+    enc: &mut Encoder,
+    input: &[u8],
+    pos: &mut usize,
+    out: &mut Vec<u8>,
+    directive: EndOp,
+    frame_start: bool,
+) -> Result<usize, ZstdError> {
+    if frame_start {
+        host::with_zstd_signals_held(|| enc.compress_stream2(input, pos, out, directive))
+    } else {
+        enc.compress_stream2(input, pos, out, directive)
+    }
+}
+
 /// `cRess_t`: the one context every file is compressed with.
 struct CRess {
     enc: Encoder,
@@ -1499,6 +1525,7 @@ impl Io<'_> {
         }
         let mut adapt = Adapt::new();
         let mut level = level;
+        let mut frame_start = true;
         loop {
             let in_size = self.fill(rp, CSTREAM_IN_SIZE)?;
             let n = in_size.to_string();
@@ -1514,10 +1541,16 @@ impl Io<'_> {
                 let old_pos = pos;
                 let mut out = Vec::new();
                 let to_flush_now = ress.enc.to_flush_now();
-                still_to_flush = match ress
-                    .enc
-                    .compress_stream2(input, &mut pos, &mut out, directive)
-                {
+                let r = compress_step(
+                    &mut ress.enc,
+                    input,
+                    &mut pos,
+                    &mut out,
+                    directive,
+                    frame_start,
+                );
+                frame_start = false;
+                still_to_flush = match r {
                     Ok(r) => r,
                     Err(e) => return Err(self.check(e)),
                 };
