@@ -590,10 +590,12 @@ read list.
 > Apple-flavour `unzip` link refuses to make a symlink whose target leads
 > outside the extraction folder (`symlink error: Permission denied`, exit
 > 2), as macOS 27.2's `/usr/bin/unzip` does; the Ubuntu flavour is
-> unchanged. The zip and unzip links' `-v` names the new Apple build. A
-> PATCH. **3847** tests under `--all-features`, **3699** on the default
-> tier — measured from this bump's own `make check FULL=1`, `GATE_EXIT=0`,
-> nothing skipped.
+> unchanged. The zip and unzip links' `-v` names the new Apple build. An
+> `.xz` stream whose header sets reserved flag bits (with a valid checksum)
+> is now reported as corrupt (exit 5) on both tiers instead of as an i/o
+> error (exit 1). A PATCH. **3850** tests under `--all-features`, **3700**
+> on the default tier — measured from this bump's own `make check FULL=1`,
+> `GATE_EXIT=0`, nothing skipped.
 >
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
