@@ -582,6 +582,19 @@ read list.
 > Apple `unzip` comparison tests skipped (this Mac's `/usr/bin/unzip`
 > changed with a macOS update; see CONTRIBUTING).
 >
+> `0.25.5`: stuffr follows macOS 27.2 again. On macOS the quarantine value
+> given to extracted and decoded files (`unpack`, `salvage`, the
+> single-stream verbs, the `unzip` link) now comes from the system's own
+> quarantine library, as Apple's `unzip` and `bsdtar` do, so it matches the
+> installed macOS (27.2 keeps values with flags `4000` and above). The
+> Apple-flavour `unzip` link refuses to make a symlink whose target leads
+> outside the extraction folder (`symlink error: Permission denied`, exit
+> 2), as macOS 27.2's `/usr/bin/unzip` does; the Ubuntu flavour is
+> unchanged. The zip and unzip links' `-v` names the new Apple build. A
+> PATCH. **3847** tests under `--all-features`, **3699** on the default
+> tier — measured from this bump's own `make check FULL=1`, `GATE_EXIT=0`,
+> nothing skipped.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
