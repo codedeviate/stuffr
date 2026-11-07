@@ -573,6 +573,15 @@ read list.
 > **3843** tests under `--all-features`, **3695** on the default tier —
 > measured from this bump's own `make check FULL=1`, `GATE_EXIT=0`.
 >
+> `0.25.4`: the C-tier `zstd` link with several input files no longer can
+> leave an empty temporary file behind on Ctrl-C. libzstd's worker threads
+> now start with the tool's signals blocked, so its cleanup always runs. A
+> Ctrl-C during a file's first compression call is answered when that call
+> returns (one input chunk). A PATCH. **3843** tests under
+> `--all-features`, **3695** on the default tier; the gate ran with two
+> Apple `unzip` comparison tests skipped (this Mac's `/usr/bin/unzip`
+> changed with a macOS update; see CONTRIBUTING).
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
