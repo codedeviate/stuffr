@@ -37,7 +37,7 @@
 //! (flip every byte position of a real 4 KiB payload): 4,154 of 4,156
 //! positions detected as `InvalidData`, the remaining 2 as `UnexpectedEof`,
 //! zero silently wrong and zero silently unchanged — full detection. See
-//! `crate::normalize`'s `XZ_MALFORMED_AS_INVALID_DATA_EOF` doc for the full
+//! `crate::normalize`'s `XZ_MALFORMED_AS_INVALID_DATA_INPUT_EOF` doc for the full
 //! measurement and the source-level reasoning behind folding both kinds
 //! onto `InvalidData`.
 //!
@@ -58,7 +58,9 @@ use stuffr_core::{
     Source, StreamOnly,
 };
 
-use crate::normalize::{MemLimitAsOom, NormalizeDecodeErrors, XZ_MALFORMED_AS_INVALID_DATA_EOF};
+use crate::normalize::{
+    MemLimitAsOom, NormalizeDecodeErrors, XZ_MALFORMED_AS_INVALID_DATA_INPUT_EOF,
+};
 pub use crate::xz_shared::{XZ, xz_meta as meta};
 
 #[derive(Debug)]
@@ -109,7 +111,7 @@ impl Codec for Xz {
     /// could expose instead).
     ///
     /// Wrapped in `NormalizeDecodeErrors` — see `crate::normalize`'s
-    /// `XZ_MALFORMED_AS_INVALID_DATA_EOF` doc for the measurement backing
+    /// `XZ_MALFORMED_AS_INVALID_DATA_INPUT_EOF` doc for the measurement backing
     /// the kinds folded here.
     ///
     /// **`CONCATENATED`, not a single stream.** See the module doc: a plain
@@ -167,7 +169,7 @@ impl Codec for Xz {
         };
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
             dec,
-            XZ_MALFORMED_AS_INVALID_DATA_EOF,
+            XZ_MALFORMED_AS_INVALID_DATA_INPUT_EOF,
         ))))
     }
 
@@ -757,12 +759,56 @@ mod tests {
         );
     }
 
+    /// Deep fuzz 42402288603 (0.25.5): a stream header whose flags set
+    /// reserved bits but whose CRC32 matches is liblzma's options error
+    /// (`InvalidInput`, "invalid options"); it must read as corrupt
+    /// (`InvalidData`, exit 5), never as an i/o error (exit 1).
+    #[test]
+    fn reserved_stream_flags_read_as_corrupt() {
+        for flags in [[0xFFu8, 0xFF], [0x01, 0x00], [0x00, 0x10]] {
+            let mut xz = vec![0xFD, b'7', b'z', b'X', b'Z', 0x00, flags[0], flags[1]];
+            xz.extend_from_slice(&crate::xz_shared::crc32(&flags).to_le_bytes());
+            xz.extend_from_slice(&[0u8; 32]);
+            let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(xz)));
+            let mut dec = Xz.decoder(src, &DecodeOpts::default()).unwrap();
+            let err = dec
+                .read_to_end(&mut Vec::new())
+                .expect_err("reserved flags are refused");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidData,
+                "{flags:02x?}: {err}"
+            );
+        }
+    }
+
+    /// The other side of the `InvalidInput` fold: a source's own `EINVAL`
+    /// (an OS code) is the environment failing and keeps its kind.
+    #[test]
+    fn a_source_einval_is_not_folded() {
+        // EINVAL on Linux, macOS and the BSDs; any OS code would do.
+        const EINVAL: i32 = 22;
+        struct Einval;
+        impl std::io::Read for Einval {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from_raw_os_error(EINVAL))
+            }
+        }
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(Einval));
+        let mut dec = Xz.decoder(src, &DecodeOpts::default()).unwrap();
+        let err = dec
+            .read_to_end(&mut Vec::new())
+            .expect_err("the source fails");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+        assert_eq!(err.raw_os_error(), Some(EINVAL), "{err}");
+    }
+
     /// Sweeps every byte position of a real encoded payload rather than
     /// flipping one, mirroring `snappy.rs`'s and `zstd_pure.rs`'s probes.
     /// Backs `detects_corruption: CorruptionDetection::WhenPresent` with
     /// direct measurement instead of leaving it aspirational: see
     /// `crate::normalize`'s
-    /// `XZ_MALFORMED_AS_INVALID_DATA_EOF` doc for the same figures quoted
+    /// `XZ_MALFORMED_AS_INVALID_DATA_INPUT_EOF` doc for the same figures quoted
     /// there.
     #[test]
     fn corruption_sweep_is_detected_at_every_position() {

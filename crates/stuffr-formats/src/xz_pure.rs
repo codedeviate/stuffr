@@ -96,7 +96,7 @@
 //! comes from, which an incompressible stream's near-all-literal encoding
 //! almost never does. A separate truncation sweep at every prefix length is
 //! detected entirely as `UnexpectedEof`. See `crate::normalize`'s
-//! `XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF` doc for the full
+//! `XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_UNSUPPORTED_EOF` doc for the full
 //! measurement, both payload shapes, and the source-level reasoning behind
 //! folding all four kinds onto `InvalidData`, and `fn decoder`'s own doc
 //! below for the caveat this measurement does NOT cover (a foreign stream
@@ -288,7 +288,9 @@ use stuffr_core::{
     Source, StreamOnly, format_size,
 };
 
-use crate::normalize::{NormalizeDecodeErrors, XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF};
+use crate::normalize::{
+    NormalizeDecodeErrors, XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_UNSUPPORTED_EOF,
+};
 pub use crate::xz_shared::{XZ, xz_meta as meta};
 
 #[derive(Debug)]
@@ -335,7 +337,7 @@ impl Codec for Xz {
     /// `xz_c.rs`'s identical note.
     ///
     /// Wrapped in `NormalizeDecodeErrors` — see
-    /// `crate::normalize::XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF`'s doc
+    /// `crate::normalize::XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_UNSUPPORTED_EOF`'s doc
     /// for the measurement backing the kinds folded here.
     ///
     /// **`allow_multiple_streams: true`, always.** See the module doc: the
@@ -412,7 +414,7 @@ impl Codec for Xz {
         let dec = XzPureDecoder::new(buffered, o.memory_limit, true);
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
             dec,
-            XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF,
+            XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_UNSUPPORTED_EOF,
         ))))
     }
 
@@ -634,7 +636,7 @@ impl<R: BufRead> std::io::Read for XzPureDecoder<R> {
 ///
 /// The KIND is preserved exactly, and that is the load-bearing part:
 /// `OutOfMemory` is deliberately absent from
-/// [`XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF`], so it reaches
+/// [`XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_UNSUPPORTED_EOF`], so it reaches
 /// `Error::from_decode_io` unfolded and classifies as `Error::ResourceLimit`
 /// — exit 6, a bound on work, never exit 5's "this file is damaged".
 fn rename_oom(e: std::io::Error) -> std::io::Error {
@@ -1353,11 +1355,35 @@ mod tests {
         );
     }
 
+    /// Deep fuzz 42402288603 (0.25.5): a stream header whose flags set
+    /// reserved bits but whose CRC32 still matches (`ff ff`, CRC
+    /// `ffffffff`) is `Unsupported` in `lzma_rust2`; it must read as
+    /// corrupt (`InvalidData`, exit 5), never as an i/o error (exit 1). The
+    /// first flag byte `01` is the case the zip fold already pins.
+    #[test]
+    fn reserved_stream_flags_read_as_corrupt() {
+        for flags in [[0xFFu8, 0xFF], [0x01, 0x00], [0x00, 0x10]] {
+            let mut xz = vec![0xFD, b'7', b'z', b'X', b'Z', 0x00, flags[0], flags[1]];
+            xz.extend_from_slice(&crate::xz_shared::crc32(&flags).to_le_bytes());
+            xz.extend_from_slice(&[0u8; 32]);
+            let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(xz)));
+            let mut dec = Xz.decoder(src, &DecodeOpts::default()).unwrap();
+            let err = dec
+                .read_to_end(&mut Vec::new())
+                .expect_err("reserved flags are refused");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidData,
+                "{flags:02x?}: {err}"
+            );
+        }
+    }
+
     /// Sweeps every byte position of a real encoded payload rather than
     /// flipping one, mirroring `xz_c.rs`'s and `snappy.rs`'s probes. Backs
     /// `detects_corruption: CorruptionDetection::WhenPresent` with direct
     /// measurement instead of leaving it aspirational: see `crate::normalize`'s
-    /// `XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF` doc for the same
+    /// `XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_UNSUPPORTED_EOF` doc for the same
     /// figures quoted there, measured against the RAW `XzReader`.
     ///
     /// Run over BOTH an incompressible and a compressible payload, not just

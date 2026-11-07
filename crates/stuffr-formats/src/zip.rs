@@ -6941,7 +6941,7 @@ PK\x03\x04\x14\x00\x00\x00\x0e\x00\x00\x00\x00\x00\x00\x00\x00\x00\
     /// The sibling sweep behind the fix above: every byte of a real LZMA
     /// entry's compressed payload (Python's `zipfile`, a COMPRESSIBLE text,
     /// so corruption lands inside the LZ77 match machinery where `Other`
-    /// originates — see `XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF`'s
+    /// originates — see `XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_UNSUPPORTED_EOF`'s
     /// doc for what an incompressible payload hides) is flipped in turn, and
     /// no position may reach exit 1. A flip the crc32 and the decoder both
     /// miss would read clean, so `Ok` is allowed; an error must be exit 5.

@@ -57,7 +57,7 @@ fn confirm(prefix: &[u8], whole: bool) -> bool {
 /// CRC-32/ISO-HDLC, bitwise: two bytes per call is all it ever hashes, and
 /// the crate's other copies sit behind container features an xz-only build
 /// does not enable.
-fn crc32(data: &[u8]) -> u32 {
+pub(crate) fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xffff_ffffu32;
     for &b in data {
         crc ^= u32::from(b);

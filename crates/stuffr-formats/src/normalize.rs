@@ -186,7 +186,7 @@ pub(crate) const SNAPPY_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
 /// DecompressionError` (a corrupted block's own LZ77 match/literal
 /// validation — the `map_err(Error::DecompressionError)` call in
 /// `read_block`, the direct analogue of `xz-pure`'s `LzDecoder::repeat`
-/// "dist overflow" — see `XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF`'s
+/// "dist overflow" — see `XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_UNSUPPORTED_EOF`'s
 /// doc), `Error::CompressionError`, `Error::SkippableFrame` or `Error::
 /// DictionaryNotSupported`, none of which this codec's own `decoder` can
 /// ever receive from a wrapped source's I/O — so `Other` reaching this
@@ -341,14 +341,28 @@ pub(crate) const RUZSTD_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
 /// would otherwise leave this constant unused and warning under `-D
 /// warnings` — see `ZSTD_MALFORMED_AS_OTHER_EOF`'s doc for how this was
 /// caught for zstd once `make check` gained the pure-tier leg.
+///
+/// **`InvalidInput` (0.25.5):** `liblzma`'s `LZMA_OPTIONS_ERROR` — a stream
+/// or block header that passes its CRC but sets reserved flag bits — reaches
+/// here as `liblzma::stream::Error::Options`, which the crate maps to
+/// `InvalidInput` with no OS code (`liblzma` 0.4.9 `stream.rs:1338`; the
+/// decoder is started without `TELL_NO_CHECK`, the other `InvalidInput`).
+/// Unfolded, a 14-byte `.xz` with stream flags `ff ff` answered `i/o error:
+/// invalid options`, exit 1, on this tier (the pure tier's twin is
+/// `Unsupported`, folded in `XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_UNSUPPORTED_EOF`).
+/// A source's own `EINVAL` carries its OS code, and [`NormalizeDecodeErrors`]
+/// never folds one of those.
 #[cfg(feature = "xz-c")]
-pub(crate) const XZ_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
-    &[ErrorKind::InvalidData, ErrorKind::UnexpectedEof];
+pub(crate) const XZ_MALFORMED_AS_INVALID_DATA_INPUT_EOF: &[ErrorKind] = &[
+    ErrorKind::InvalidData,
+    ErrorKind::InvalidInput,
+    ErrorKind::UnexpectedEof,
+];
 
 /// The `InvalidData` + `InvalidInput` + `Other` + `UnexpectedEof` QUADRUPLE,
 /// measured independently against `lzma-rust2` 0.20.1 (backing `xz_pure.rs`)
 /// alone — a different implementation of the same format from
-/// [`XZ_MALFORMED_AS_INVALID_DATA_EOF`]'s `liblzma`, so its own constant for
+/// [`XZ_MALFORMED_AS_INVALID_DATA_INPUT_EOF`]'s `liblzma`, so its own constant for
 /// the same reason every other constant here is its own, even though several
 /// of its raw kinds coincide.
 ///
@@ -424,17 +438,29 @@ pub(crate) const XZ_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
 /// all, which would otherwise leave this constant unused and warning under
 /// `-D warnings` — see `ZSTD_MALFORMED_AS_OTHER_EOF`'s doc for how this was
 /// caught for zstd once `make check` gained the pure-tier leg.
+/// **`Unsupported` (0.25.5, deep fuzz 42402288603):** `lzma_rust2` (0.23
+/// onwards) raises it for an xz stream or block header that passes its CRC
+/// but sets a reserved flag bit (`invalid XZ stream flags`, `reserved block
+/// flag bits are set`) or names a check type it does not know. Unfolded, a
+/// 14-byte `.xz` with stream flags `ff ff` (whose CRC32 is `ffffffff`)
+/// answered `i/o error`, exit 1, in `list`, `cat` and `test`. Folded onto
+/// `InvalidData` (exit 5), as `ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_UNSUPPORTED_EOF`
+/// already does for the same error inside a zip entry (0.25.1); safe for the
+/// reason that constant's doc gives: `std` raises `Unsupported` only for an
+/// operation the platform lacks, never for a read of a file or a pipe, and
+/// `lzma_rust2` constructs it only from the stream's own header bytes.
 #[cfg(feature = "xz-pure")]
-pub(crate) const XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF: &[ErrorKind] = &[
+pub(crate) const XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_UNSUPPORTED_EOF: &[ErrorKind] = &[
     ErrorKind::InvalidData,
     ErrorKind::InvalidInput,
     ErrorKind::Other,
+    ErrorKind::Unsupported,
     ErrorKind::UnexpectedEof,
 ];
 
 /// The `InvalidData` + `UnexpectedEof` pair, measured independently against
 /// `liblzma`'s LZMA1 "alone" decode path (backing `lzma_c.rs`) — the same
-/// crate as [`XZ_MALFORMED_AS_INVALID_DATA_EOF`] but a different `Stream`
+/// crate as [`XZ_MALFORMED_AS_INVALID_DATA_INPUT_EOF`] but a different `Stream`
 /// constructor (`new_lzma_decoder`/`new_lzma_encoder` rather than the
 /// auto/easy xz ones) and a different container format entirely (no xz
 /// stream header, no block index, no per-writer check type). Its own
@@ -461,7 +487,7 @@ pub(crate) const XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF: &[ErrorKind]
 /// LZMA1 carrying no checksum field at all, unlike gzip/zlib/bzip2/snappy's
 /// mandatory CRCs or even xz's per-writer check type.
 ///
-/// Traced the same way as `XZ_MALFORMED_AS_INVALID_DATA_EOF`: a genuine
+/// Traced the same way as `XZ_MALFORMED_AS_INVALID_DATA_INPUT_EOF`: a genuine
 /// error reading the underlying SOURCE reaches the caller via
 /// `BufRead::fill_buf`'s `?`, kind intact; every other fallible path is this
 /// crate's own classification (`io::ErrorKind::UnexpectedEof` for "premature
@@ -790,7 +816,7 @@ pub(crate) const CPIO_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
 /// `ZipFile::name()`); `types.rs:593`/`:615` are writer-side (9.4.0 lines).
 ///
 /// Folding is safe for the structural reason `TAR_MALFORMED_AS_OTHER`'s and
-/// `XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF`'s docs give,
+/// `XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_UNSUPPORTED_EOF`'s docs give,
 /// re-verified for zip 9: a genuine source failure reaches this wrapper
 /// untouched — `Crc32Reader`, `LazyDecompressor` and the codec readers
 /// propagate their inner reader's error by `?` with its own kind, and none
@@ -891,7 +917,9 @@ impl<R> NormalizeDecodeErrors<R> {
 impl<R: Read> Read for NormalizeDecodeErrors<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.inner.read(buf).map_err(|e| {
-            if self.malformed.contains(&e.kind()) {
+            // An error carrying an OS code is the source failing, whatever its
+            // kind (an `EINVAL` is `InvalidInput`): never folded (0.25.5).
+            if e.raw_os_error().is_none() && self.malformed.contains(&e.kind()) {
                 std::io::Error::new(ErrorKind::InvalidData, e.to_string())
             } else {
                 e
