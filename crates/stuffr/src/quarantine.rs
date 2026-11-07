@@ -156,6 +156,7 @@ enum Repr {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Data(Vec<u8>),
     /// The raw attribute value; [`qtn_value`] decides what is written.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Raw(Vec<u8>),
 }
 
@@ -229,9 +230,8 @@ pub fn read(f: &std::fs::File) -> Option<Quarantine> {
     #[cfg(target_os = "macos")]
     {
         use std::os::fd::AsRawFd;
-        let raw = read_raw(f)?;
         let Some(q) = lib::get() else {
-            return Some(Quarantine(Repr::Raw(raw)));
+            return Some(Quarantine(Repr::Raw(read_raw(f)?)));
         };
         // SAFETY: `alloc` returns a handle (or null, checked); every later
         // call gets that live handle, `buf`/`len` describe a valid buffer,
@@ -283,14 +283,17 @@ pub fn apply(f: &std::fs::File, q: &Quarantine) -> io::Result<()> {
                 if h.is_null() {
                     return Err(io::Error::other("qtn_file_alloc failed"));
                 }
-                let rc = if (l.init_with_data)(h, d.as_ptr().cast(), d.len()) == 0 {
-                    (l.apply_to_fd)(h, f.as_raw_fd())
-                } else {
-                    -1
-                };
-                let err = io::Error::last_os_error();
+                // libquarantine returns its errno as the return value.
+                let mut rc = (l.init_with_data)(h, d.as_ptr().cast(), d.len());
+                if rc == 0 {
+                    rc = (l.apply_to_fd)(h, f.as_raw_fd());
+                }
                 (l.free)(h);
-                if rc == 0 { Ok(()) } else { Err(err) }
+                match rc {
+                    0 => Ok(()),
+                    n if n > 0 => Err(io::Error::from_raw_os_error(n)),
+                    n => Err(io::Error::other(format!("libquarantine: {n}"))),
+                }
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -365,13 +368,18 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn libquarantine_and_the_fallback_agree() {
-        if lib::get().is_none() {
-            return;
+        assert!(lib::get().is_some(), "libquarantine did not load on macOS");
+        struct Guard(std::path::PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
         }
         let dir =
             std::env::temp_dir().join(format!("stuffr-quarantine-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir).unwrap();
+        let _guard = Guard(dir.clone());
         let mut values: Vec<String> = Vec::new();
         for f in [0u32, 1, 2, 4, 0x18, 0x40, 0x81, 0x3de7, 0xfde7, 0xffff] {
             values.push(format!("{f:04x}"));
@@ -437,6 +445,5 @@ mod tests {
                 "libquarantine and the fallback disagree on {case:?}"
             );
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
