@@ -1641,7 +1641,7 @@ fn copy_into_place(from: &Path, to: &Path) -> std::io::Result<Option<std::io::Er
     };
     // The staged file's quarantine (macOS) does not survive a byte copy.
     if let Some(q) = stuffr::quarantine::read_raw(&input) {
-        let _ = stuffr::quarantine::apply(&out, &q);
+        let _ = stuffr::quarantine::apply_raw(&out, &q);
     }
     let mut mode_refused = None;
     let copied = std::io::copy(&mut input, &mut out)
@@ -2922,7 +2922,7 @@ mod tests {
             std::fs::write(&from, b"recovered").unwrap();
             std::fs::set_permissions(&from, std::fs::Permissions::from_mode(0o640)).unwrap();
             #[cfg(target_os = "macos")]
-            stuffr::quarantine::apply(&std::fs::File::open(&from).unwrap(), qtn).unwrap();
+            stuffr::quarantine::apply_raw(&std::fs::File::open(&from).unwrap(), qtn).unwrap();
             let to = root.join(name);
             std::os::unix::fs::symlink(&victim, &to).unwrap();
             assert!(copy_into_place(&from, &to).unwrap().is_none());

@@ -187,7 +187,7 @@ pub(crate) struct FromInput {
     /// `st_mode & 0o777` of a regular-file input (unix only).
     pub(crate) mode: Option<u32>,
     /// The quarantine value what is made from the input gets (macOS only).
-    pub(crate) quarantine: Option<Vec<u8>>,
+    pub(crate) quarantine: Option<crate::quarantine::Quarantine>,
 }
 
 impl FromInput {

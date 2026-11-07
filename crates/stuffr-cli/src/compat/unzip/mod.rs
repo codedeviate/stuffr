@@ -243,7 +243,7 @@ pub(crate) struct Uz<'a> {
     pub(crate) ck: unix::mapname::Checkdir,
     /// `G.qf`, what the archive's quarantine gives what is extracted from
     /// it (P7's rewritten value; `NULL`: none; apple: globals.c:165).
-    pub(crate) qf: Option<Vec<u8>>,
+    pub(crate) qf: Option<stuffr::quarantine::Quarantine>,
     /// `G.overwrite_mode`: query, always or never (`extract::OVERWRT_*`).
     pub(crate) overwrite_mode: i32,
     /// `G.answerbuf`: the last answer read from standard input (kept when

@@ -514,7 +514,10 @@ pub(crate) fn chmod_dir(uz: &Uz, full: &[u8], mode: u32) -> io::Result<()> {
 /// apple: fileio.c:263 (`qtn_file_init_with_fd(G.qf, G.zipfd)`): the value
 /// to give what is extracted from the open archive `f`, `None` when it has
 /// none (or under a sandbox, R7, or off macOS).
-pub(crate) fn archive_quarantine(host: &Host, f: &std::fs::File) -> Option<Vec<u8>> {
+pub(crate) fn archive_quarantine(
+    host: &Host,
+    f: &std::fs::File,
+) -> Option<stuffr::quarantine::Quarantine> {
     if !matches!(host, Host::Real) {
         return None;
     }
@@ -523,7 +526,7 @@ pub(crate) fn archive_quarantine(host: &Host, f: &std::fs::File) -> Option<Vec<u
 
 /// `qtn_file_apply_to_fd(G.qf, fd)` on an open file or directory.
 pub(crate) fn quarantine_fd(uz: &Uz, f: &std::fs::File) -> io::Result<()> {
-    let Some(v) = uz.qf.as_deref() else {
+    let Some(v) = uz.qf.as_ref() else {
         return Ok(());
     };
     stuffr::quarantine::apply(f, v)

@@ -991,7 +991,7 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
     };
     let stamp = Stamp {
         mode_bits,
-        quarantine: quarantine.as_deref(),
+        quarantine: quarantine.as_ref(),
     };
 
     // The destination itself, once, up front: an archive of plain files
@@ -1369,7 +1369,7 @@ struct Stamp<'a> {
     /// `same_permissions`.
     mode_bits: u32,
     /// The value [`crate::quarantine::read`] gave for the archive.
-    quarantine: Option<&'a [u8]>,
+    quarantine: Option<&'a crate::quarantine::Quarantine>,
 }
 
 impl Stamp<'_> {
@@ -1393,7 +1393,7 @@ impl Stamp<'_> {
 /// are never quarantined: Gatekeeper checks what a link resolves to, and
 /// that is either something this run made (and stamped) or something it
 /// did not make.
-fn quarantine_dir(quarantine: Option<&[u8]>, path: &Path) {
+fn quarantine_dir(quarantine: Option<&crate::quarantine::Quarantine>, path: &Path) {
     if let Some(v) = quarantine
         && let Ok(handle) = open_created_dir(path, None)
     {
@@ -3028,7 +3028,7 @@ pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
         let existed = std::fs::symlink_metadata(dest).is_ok();
         std::fs::create_dir_all(dest)?;
         if !existed {
-            quarantine_dir(quarantine.as_deref(), dest);
+            quarantine_dir(quarantine.as_ref(), dest);
         }
     }
 
@@ -3145,7 +3145,7 @@ fn place_salvaged_entry(
                 match skip_if_name_refused(create_dir_once(&target), &entry.meta.name) {
                     Ok(Ok(created)) => {
                         if created {
-                            quarantine_dir(made.quarantine.as_deref(), &target);
+                            quarantine_dir(made.quarantine.as_ref(), &target);
                         }
                         made.record_path(&target, MadeKind::Dir);
                         Ok(SalvageDisposition::Directory(target))
@@ -5901,7 +5901,7 @@ struct MadeByRun {
     created_dirs: HashMap<PathBuf, Option<(u64, u64)>>,
     /// The archive's quarantine (macOS), for the parents [`place`] creates
     /// and what salvage writes (security audit EXTRACT-3).
-    quarantine: Option<Vec<u8>>,
+    quarantine: Option<crate::quarantine::Quarantine>,
     /// The process umask, read once per salvage run: what a salvaged file's
     /// mode is masked by ([`salvaged_file_mode`]). `0` elsewhere (unused).
     umask: u32,
@@ -6486,7 +6486,7 @@ fn place(
                 Ok(()) => {
                     made.record_created_dir(&path);
                     made.record_path(&path, MadeKind::Dir);
-                    quarantine_dir(made.quarantine.as_deref(), &path);
+                    quarantine_dir(made.quarantine.as_ref(), &path);
                 }
                 // Only this run writes here, and the walk above found it
                 // absent; a racing local writer is the TOCTOU window
