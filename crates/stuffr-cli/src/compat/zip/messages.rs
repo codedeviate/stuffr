@@ -878,7 +878,7 @@ pub(super) const ZIP_V_APPLE_PRE: &str =
 pub(super) const ZIP_V_APPLE_POST: &str = concat!(
     "Please report bugs to Apple.\n",
     "\n",
-    "Compiled with gcc Apple LLVM 21.0.0 (clang-2100.3.31.1) [+internal-os] for Unix (Mac OS X) on Aug  8 2026.\n",
+    "Compiled with gcc Apple LLVM 21.0.0 (clang-2100.4.1.1) [+internal-os] for Unix (Mac OS X) on Oct  3 2026.\n",
     "\n",
     "Zip special compilation options:\n",
     "\tUSE_EF_UT_TIME       (store Universal Time)\n",
@@ -946,7 +946,7 @@ pub(super) const ZIPCLOAK_V_APPLE_PRE: &str = concat!(
 pub(super) const ZIPCLOAK_V_APPLE_POST: &str = concat!(
     "Please report bugs to Apple.\n",
     "\n",
-    "Compiled with gcc Apple LLVM 21.0.0 (clang-2100.3.31.1) [+internal-os] for Unix (Mac OS X) on Aug  8 2026.\n",
+    "Compiled with gcc Apple LLVM 21.0.0 (clang-2100.4.1.1) [+internal-os] for Unix (Mac OS X) on Oct  3 2026.\n",
     "\n",
     "ZipCloak special compilation options:\n",
     "\t[encryption, version 2.91 of 05 Jan 2007]\n",
@@ -980,7 +980,7 @@ pub(super) const ZIPNOTE_V_APPLE_PRE: &str =
 pub(super) const ZIPNOTE_V_APPLE_POST: &str = concat!(
     "Please report bugs to Apple.\n",
     "\n",
-    "Compiled with gcc Apple LLVM 21.0.0 (clang-2100.3.31.1) [+internal-os] for Unix (Mac OS X) on Aug  8 2026.\n",
+    "Compiled with gcc Apple LLVM 21.0.0 (clang-2100.4.1.1) [+internal-os] for Unix (Mac OS X) on Oct  3 2026.\n",
     "\n",
     "ZipNote special compilation options:\n",
     "\t[none]\n",
@@ -1011,7 +1011,7 @@ pub(super) const ZIPSPLIT_V_APPLE_PRE: &str = "";
 pub(super) const ZIPSPLIT_V_APPLE_POST: &str = concat!(
     "Please report bugs to Apple.\n",
     "\n",
-    "Compiled with gcc Apple LLVM 21.0.0 (clang-2100.3.31.1) [+internal-os] for Unix (Mac OS X) on Aug  8 2026.\n",
+    "Compiled with gcc Apple LLVM 21.0.0 (clang-2100.4.1.1) [+internal-os] for Unix (Mac OS X) on Oct  3 2026.\n",
     "\n",
     "ZipSplit special compilation options:\n",
     "\t[none]\n",

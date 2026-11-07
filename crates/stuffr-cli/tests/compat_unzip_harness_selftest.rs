@@ -162,7 +162,7 @@ mod unix {
     fn apple_drift_note_names_the_differing_identity_lines() {
         assert!(apple_drift_note(None).is_none());
         assert!(apple_drift_note(Some(APPLE_UNZIP_IDENTITY)).is_none());
-        let other = APPLE_UNZIP_IDENTITY.replace("on Aug  8 2026.", "on Jan  1 2027.");
+        let other = APPLE_UNZIP_IDENTITY.replace("on Oct  3 2026.", "on Jan  1 2027.");
         let (head, prefix) = apple_drift_note(Some(&other)).unwrap();
         assert_eq!(prefix, "[apple drift?] ");
         assert!(
@@ -172,7 +172,7 @@ mod unix {
         let recorded = head.find("recorded -v only:").unwrap();
         let installed = head.find("installed -v only:").unwrap();
         assert!(
-            head[recorded..installed].contains("on Aug  8 2026."),
+            head[recorded..installed].contains("on Oct  3 2026."),
             "{head}"
         );
         assert!(head[installed..].contains("on Jan  1 2027."), "{head}");
@@ -196,8 +196,8 @@ mod unix {
         };
         let a = "Compiled with gcc Apple LLVM 21.0.0 (clang-2100.0.123.2) [+internal-os] \
                  for Unix Mac OS X on Jul 31 2026.";
-        let b = "Compiled with gcc Apple LLVM 21.0.0 (clang-2100.3.31.1) [+internal-os] \
-                 for Unix Mac OS X on Aug  8 2026.";
+        let b = "Compiled with gcc Apple LLVM 21.0.0 (clang-2100.4.1.1) [+internal-os] \
+                 for Unix Mac OS X on Oct  3 2026.";
         let mut c = unzip_case("unzip", vec![], vec![]);
         c.unzip_flavour = Some("apple");
         assert!(unzip_differences(&c, &run(a, ""), &run(b, "")).is_empty());

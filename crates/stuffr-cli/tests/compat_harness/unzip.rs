@@ -32,7 +32,7 @@ pub const APPLE_UNZIP_IDENTITY: &str = concat!(
     "Latest sources and executables are at ftp://ftp.info-zip.org/pub/infozip/ ;\n",
     "see ftp://ftp.info-zip.org/pub/infozip/UnZip.html for other sites.\n",
     "\n",
-    "Compiled with gcc Apple LLVM 21.0.0 (clang-2100.3.31.1) [+internal-os] for Unix Mac OS X on Aug  8 2026.\n",
+    "Compiled with gcc Apple LLVM 21.0.0 (clang-2100.4.1.1) [+internal-os] for Unix Mac OS X on Oct  3 2026.\n",
     "\n",
     "UnZip special compilation options:\n",
     "        COPYRIGHT_CLEAN (PKZIP 0.9x unreducing method not supported)\n",

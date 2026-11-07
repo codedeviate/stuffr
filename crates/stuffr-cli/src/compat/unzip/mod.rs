@@ -838,8 +838,8 @@ mod tests {
         let (_, out, _) = run(Flavour::Apple, "unzip", &["-v"]);
         assert!(
             out.contains(
-                "\nCompiled with gcc Apple LLVM 21.0.0 (clang-2100.3.31.1) [+internal-os] \
-                 for Unix Mac OS X on Aug  8 2026.\n\n"
+                "\nCompiled with gcc Apple LLVM 21.0.0 (clang-2100.4.1.1) [+internal-os] \
+                 for Unix Mac OS X on Oct  3 2026.\n\n"
             ),
             "{out}"
         );

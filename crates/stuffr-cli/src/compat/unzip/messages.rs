@@ -186,7 +186,7 @@ pub(super) const UNZIP_USAGE_LINE2V: &str = concat!(
 /// the whole `-v` with the recorded build's). probe: `/usr/bin/unzip -v`
 /// (macOS, 2026-10-20).
 pub(super) const APPLE_COMPILED_WITH: &str = "Compiled with gcc Apple LLVM 21.0.0 \
-     (clang-2100.3.31.1) [+internal-os] for Unix Mac OS X on Aug  8 2026.\n\n";
+     (clang-2100.4.1.1) [+internal-os] for Unix Mac OS X on Oct  3 2026.\n\n";
 /// unix/unix.c:version()'s line of Ubuntu's build (13-remove-build-date.patch
 /// drops the date). probe: `unzip -v` (ubuntu:24.04, unzip 6.0-28ubuntu4.1).
 pub(super) const UBUNTU_COMPILED_WITH: &str = "Compiled with gcc 13.2.0 for Unix (Linux ELF).\n\n";
