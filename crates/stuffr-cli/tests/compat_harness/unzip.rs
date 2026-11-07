@@ -955,3 +955,67 @@ pub fn stale_blocks(out: &str) -> Vec<(bool, String)> {
     }
     v
 }
+
+/// The symlinks of the 0.25.5 probe table (macOS 27.2's Apple unzip, which
+/// refuses a link whose target leaves the extraction root), in archive
+/// order: name, target, and whether Apple refuses it when nothing else is
+/// in the destination. `viapre -> pre/x` is refused only when the
+/// destination already holds `pre -> ..` (else `pre` is absent: made).
+pub const ESCAPING_LINKS: &[(&str, &str, bool)] = &[
+    // out of the root
+    ("up1", "../outside/file", true),
+    ("dotdot", "..", true),
+    ("dot_up", "./../y", true),
+    ("upback", "../o/c", true),
+    ("abs", "/etc/hosts", true),
+    ("sub/esc2", "../../x", true),
+    ("a/b/esc3", "../../../c", true),
+    ("esc_dd", "a/../../x", true),
+    ("viapre", "pre/x", false),
+    // beneath, or the walk stops first (ENOENT, ENOTDIR, ELOOP)
+    ("dang", "nowhere", false),
+    ("dot", ".", false),
+    ("insub", "sub", false),
+    ("dotsname", "..x", false),
+    ("inner_dd", "a/../b", false),
+    ("a/b/stay", "../../c", false),
+    ("deep_ok", "a/b/../../c", false),
+    ("ghost_dd", "g/../../x", false),
+    ("sub/backup", "../up1", false),
+    ("notdir", "f/../c", false),
+    ("loop1", "loop2", false),
+    ("loop2", "loop1", false),
+    // a chain: `m` is made while `ghost` is absent, then `ghost` is made,
+    // and `n` through `m` climbs out
+    ("m", "ghost/../..", false),
+    ("ghost", "sub", false),
+    ("n", "m/x", true),
+];
+
+/// The archive of [`ESCAPING_LINKS`]: directories `a/`, `a/b/`, `sub/` and
+/// files `f`, `c` first (Apple defers every link to the end, in archive
+/// order), then the links.
+pub fn escaping_links_zip() -> Vec<u8> {
+    let dir = |n: &'static str| ZipEntrySpec {
+        external_attr: 0o40755 << 16,
+        ..ZipEntrySpec::new(n.as_bytes(), b"")
+    };
+    let file = |n: &'static str, d: &'static [u8]| ZipEntrySpec {
+        external_attr: 0o100644 << 16,
+        ..ZipEntrySpec::new(n.as_bytes(), d)
+    };
+    let mut entries = vec![
+        dir("a/"),
+        dir("a/b/"),
+        dir("sub/"),
+        file("f", b"f\n"),
+        file("c", b"c\n"),
+    ];
+    for (name, target, _) in ESCAPING_LINKS {
+        entries.push(ZipEntrySpec {
+            external_attr: 0o120755 << 16,
+            ..ZipEntrySpec::new(name.as_bytes(), target.as_bytes())
+        });
+    }
+    zip_with(&entries, b"", b"")
+}

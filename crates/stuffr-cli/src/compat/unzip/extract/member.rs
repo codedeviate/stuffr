@@ -625,7 +625,8 @@ pub(crate) fn decode_entry(uz: &mut Uz, ex: &mut Ex) -> i32 {
 /// `set_deferred_symlink()`: the placeholder checked (it must still hold
 /// exactly the target), removed, and the symlink made in its place, with
 /// the archive's quarantine (R9) and its attributes. `PK_ERR` on a failure
-/// (counted by Apple's tree only).
+/// (counted by Apple's tree only). Apple's flavour first refuses a target
+/// that leads out of the root (`beneath::symlink_escapes`).
 pub(crate) fn set_deferred_symlink(uz: &mut Uz, s: &SlinkEntry) -> i32 {
     use std::io::Read;
     let ucsize = s.target.len();
@@ -661,6 +662,15 @@ pub(crate) fn set_deferred_symlink(uz: &mut Uz, s: &SlinkEntry) -> i32 {
         let shown1 = mapname::shown(uz, &s.fname);
         let shown2 = fileio::fnfilter2(uz, &s.target);
         uz.info_fmt(0, m::SYM_LNK_FINISH, &[&pad22(&shown1), &shown2]);
+    }
+    // apple (macOS 27.2's build): a target that leads out of the root is
+    // refused, after the placeholder is gone and the line is printed.
+    if flavour::refuses_escaping_symlinks(uz.flavour)
+        && mapname::target(uz, &s.fname)
+            .is_ok_and(|(root, rel)| beneath::symlink_escapes(root, rel, &s.target))
+    {
+        mapname::perror(uz, m::SYMLINK_ERROR, &beneath::eacces());
+        return PK_ERR;
     }
     if let Err(e) = dir.symlink(&s.target, &name) {
         mapname::perror(uz, m::SYMLINK_ERROR, &e);

@@ -142,6 +142,43 @@ pub(crate) fn open_beneath(root: &Root, rel: &[u8], create: bool) -> io::Result<
     }
 }
 
+/// Whether a symlink at `rel` (beneath `root`) holding `target` would lead
+/// out of the root: what Apple's unzip (macOS 27.2's build) asks before it
+/// makes a deferred symlink, as `open(target, O_RESOLVE_BENEATH)` from the
+/// link's directory with the root as the boundary answers it. An absolute
+/// target, or a `..` that climbs above the root on the real tree (existing
+/// symlinks followed, the last component too), is an escape; a missing
+/// component, a non-directory on the way or too many links (`ENOENT`,
+/// `ENOTDIR`, `ELOOP`) is not, nor is any other error.
+///
+/// probe: Apple's `unzip` refuses `../outside/file`, `..`, `./../y`,
+/// `../o/c`, `/etc/hosts`, an absolute path inside the root, `sub/esc2 ->
+/// ../../x`, `a/../../x` with `a` present and `sub/backup -> ../up1` with
+/// `up1` an escaping symlink; it makes `nowhere`, `.`, `..x`, `a/../b`,
+/// `a/b/stay -> ../../c`, `a/../../x` with `a` absent, `f/../c` with `f` a
+/// file, and a two-link loop.
+///
+/// The walk is [`Root::stat`]'s: it opens nothing outside the root (a
+/// symlink's target is read and spliced in, never followed by the kernel).
+/// Off unix, where no symlink is made, the target is judged by its words
+/// alone.
+pub(crate) fn symlink_escapes(root: &Root, rel: &[u8], target: &[u8]) -> bool {
+    if target.first() == Some(&b'/') {
+        return true;
+    }
+    // the link's directory, then the target from it
+    let mut path = match rel.iter().rposition(|&b| b == b'/') {
+        Some(i) => rel[..=i].to_vec(),
+        None => Vec::new(),
+    };
+    path.extend_from_slice(target);
+    #[cfg(unix)]
+    let r = root.stat(&path).map(drop);
+    #[cfg(not(unix))]
+    let r = root.dir(&path).map(drop);
+    r.is_err_and(|e| is_escape(&e))
+}
+
 #[cfg(unix)]
 mod imp_unix {
     use super::{MAXSYMLINKS, Stat, components, escape, is_here};

@@ -181,3 +181,59 @@ fn stat_follows_a_last_link_to_a_file_beneath() {
 fn is_file(st: &Stat) -> bool {
     st.mode & 0o170000 == 0o100000
 }
+
+/// `symlink_escapes`, row by row of the 0.25.5 probe table (macOS 27.2's
+/// Apple unzip), an absolute target inside the root included; and the walk
+/// itself never leaves the root (`outside/` holds a directory the escaping
+/// paths would reach).
+#[test]
+fn symlink_escapes_follows_the_probe_table() {
+    let s = Scratch::new("escapes");
+    let r = s.root();
+    for d in ["a/b", "sub"] {
+        std::fs::create_dir_all(r.join(d)).unwrap();
+    }
+    std::fs::write(r.join("f"), b"f\n").unwrap();
+    std::fs::write(r.join("c"), b"c\n").unwrap();
+    std::fs::create_dir_all(s.outside().join("x")).unwrap();
+    symlink("../outside", r.join("up1")).unwrap();
+    symlink("loop2", r.join("loop1")).unwrap();
+    symlink("loop1", r.join("loop2")).unwrap();
+    symlink("sub", r.join("insub")).unwrap();
+    let root = s.open();
+    let inside = format!("{}/c", r.display());
+    let rows: &[(&str, &str, bool)] = &[
+        ("l", "../outside/file", true),
+        ("l", "..", true),
+        ("l", "./../y", true),
+        ("l", "../root/c", true),
+        ("l", "/etc/hosts", true),
+        ("l", &inside, true),
+        ("sub/l", "../../x", true),
+        ("a/b/l", "../../../c", true),
+        ("l", "a/../../x", true),
+        ("sub/l", "../up1", true),
+        ("insub/l", "../../x", true),
+        ("l", "nowhere", false),
+        ("l", "sub", false),
+        ("l", ".", false),
+        ("l", "", false),
+        ("l", "..x", false),
+        ("l", "a/../b", false),
+        ("a/b/l", "../../c", false),
+        ("l", "a/b/../../c", false),
+        ("l", "g/../../x", false),
+        ("sub/l", "../nothere", false),
+        ("l", "f/../c", false),
+        ("l", "loop1", false),
+        ("l", "loop1/../..", false),
+        ("l", "insub/..", false),
+    ];
+    for (link, target, escapes) in rows {
+        assert_eq!(
+            symlink_escapes(&root, link.as_bytes(), target.as_bytes()),
+            *escapes,
+            "{link} -> {target}"
+        );
+    }
+}

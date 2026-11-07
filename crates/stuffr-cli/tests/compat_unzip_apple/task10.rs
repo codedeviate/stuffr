@@ -357,6 +357,45 @@ fn names_and_attributes() {
     compare("names_and_attributes", &cases);
 }
 
+/// macOS 27.2's Apple unzip refuses a symlink whose target leaves the
+/// extraction root (`symlink error: Permission denied`, exit 2, the link
+/// not made, the run going on), with and without `-d`, under `-:` too; a
+/// pre-existing escaping link (`pre -> ..`) on the way counts. The
+/// archive is the harness's [`escaping_links_zip`] (every row of the 0.25.5
+/// probe table one archive can hold).
+#[test]
+fn escaping_symlinks() {
+    fn pre(w: &Path) {
+        symlink("..", w.join("pre")).unwrap();
+    }
+    fn pre_in_dst(w: &Path) {
+        std::fs::create_dir(w.join("dst")).unwrap();
+        symlink("..", w.join("dst/pre")).unwrap();
+    }
+    let z = escaping_links_zip();
+    let files = [("s.zip", z)];
+    let mut cases = Vec::new();
+    for r in [
+        &[][..],
+        &["-q"],
+        &["-:"],
+        &["-o"],
+        &["-o", "-:"],
+        &["-d", "dst"],
+        &["-:", "-d", "dst"],
+    ] {
+        let mut a = r.to_vec();
+        a.push("s.zip");
+        let dst = r.contains(&"dst");
+        cases.push(case(&a, &files));
+        cases.push(prepared(
+            case(&a, &files),
+            if dst { pre_in_dst } else { pre },
+        ));
+    }
+    compare("escaping_symlinks", &cases);
+}
+
 // ---- damage and passwords ----
 
 /// A bad CRC, an entry cut short, unsupported methods (only, and mixed

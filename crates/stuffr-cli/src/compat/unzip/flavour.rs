@@ -295,6 +295,18 @@ pub(crate) fn deferred_symlink_errors_count(f: Flavour) -> bool {
     f == Flavour::Apple
 }
 
+/// Apple's build of 2026-10-03 (macOS 27.2) refuses a deferred symlink
+/// whose target, resolved through the real tree from the link's directory,
+/// leaves the extraction root: `symlink error: Permission denied` after the
+/// `linking` line, the placeholder already gone, the link not made, the
+/// run going on (exit 2 through `deferred_symlink_errors_count`). `-:`
+/// does not lift it. Upstream (Ubuntu) makes every link as stored.
+/// probe: `/usr/bin/unzip` of `/usr/bin/zip -y` archives, the table in
+/// `beneath::symlink_escapes`.
+pub(crate) fn refuses_escaping_symlinks(f: Flavour) -> bool {
+    f == Flavour::Apple
+}
+
 /// apple: extract.c:701 (`if (error > error_in_archive)`): a failed
 /// directory attribute raises the exit code to its own; upstream's `if
 /// (!error_in_archive)` only sets it when it was 0.

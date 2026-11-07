@@ -180,10 +180,17 @@ mod unix {
                 let r = run(f, args, &[("c.zip", z.clone())], Some(outside), None);
                 let what = format!("{f} {args:?}: exit {} stderr {:?}", r.code, r.stderr);
                 assert!(under(&r.tree, "outside").is_empty(), "{what}");
-                assert!(
-                    matches!(r.tree.get(&b"dst/s"[..]), Some(UnzipNode::Symlink { target, .. }) if target == b"../outside"),
-                    "{what}"
-                );
+                // Apple (macOS 27.2's build) refuses both escaping links;
+                // Ubuntu makes them, as links only
+                if f == "apple" {
+                    assert!(!r.tree.contains_key(&b"dst/s"[..]), "{what}");
+                    assert!(!r.tree.contains_key(&b"dst/t"[..]), "{what}");
+                } else {
+                    assert!(
+                        matches!(r.tree.get(&b"dst/s"[..]), Some(UnzipNode::Symlink { target, .. }) if target == b"../outside"),
+                        "{what}"
+                    );
+                }
                 assert!(!r.tree.contains_key(&b"dst/s/k.txt"[..]), "{what}");
             }
         }
@@ -212,6 +219,72 @@ mod unix {
             );
             assert!(under(&r.tree, "outside").is_empty(), "{f}: {}", r.stderr);
             assert_eq!(r.code, 50, "{f}: {}", r.stderr);
+        }
+    }
+
+    /// 0.25.5: the Apple flavour (macOS 27.2's build) refuses every
+    /// symlink whose target leaves the extraction root, `symlink error:
+    /// Permission denied` each, exit 2, the rest made; with and without
+    /// `-d`, under `-:`, `-o` and `-q`; a pre-existing `pre -> ..` on the
+    /// way counts. The Ubuntu flavour makes every link as stored.
+    #[test]
+    fn escaping_symlinks_by_flavour() {
+        fn pre(w: &Path) {
+            symlink("..", w.join("pre")).unwrap();
+        }
+        fn pre_in_dst(w: &Path) {
+            std::fs::create_dir(w.join("dst")).unwrap();
+            symlink("..", w.join("dst/pre")).unwrap();
+        }
+        let files = [("s.zip", escaping_links_zip())];
+        for f in FLAVOURS {
+            for args in [
+                &[][..],
+                &["-:"],
+                &["-o"],
+                &["-q"],
+                &["-d", "dst"],
+                &["-:", "-d", "dst"],
+            ] {
+                for with_pre in [false, true] {
+                    let dst = args.contains(&"dst");
+                    let setup: Option<fn(&Path)> =
+                        with_pre.then_some(if dst { pre_in_dst } else { pre });
+                    let mut a = args.to_vec();
+                    a.push("s.zip");
+                    let r = run(f, &a, &files, setup, None);
+                    let what = format!(
+                        "{f} {a:?} pre {with_pre}: exit {} stderr {:?}",
+                        r.code, r.stderr
+                    );
+                    let prefix = if dst { "dst/" } else { "" };
+                    let mut refused = 0;
+                    for (name, target, escapes) in ESCAPING_LINKS {
+                        let refuse = f == "apple" && (*escapes || (*name == "viapre" && with_pre));
+                        let key = format!("{prefix}{name}");
+                        match r.tree.get(key.as_bytes()) {
+                            Some(UnzipNode::Symlink { target: t, .. }) => {
+                                assert!(!refuse, "{what}: {key} was made");
+                                assert_eq!(t, target.as_bytes(), "{what}: {key}");
+                            }
+                            None => assert!(refuse, "{what}: {key} was not made"),
+                            other => panic!("{what}: {key} is {other:?}"),
+                        }
+                        refused += usize::from(refuse);
+                    }
+                    if f == "apple" {
+                        assert_eq!(r.code, 2, "{what}");
+                        assert_eq!(
+                            r.stderr,
+                            "symlink error: Permission denied\n".repeat(refused),
+                            "{what}"
+                        );
+                    } else {
+                        assert_eq!(r.code, 0, "{what}");
+                        assert_eq!(r.stderr, "", "{what}");
+                    }
+                }
+            }
         }
     }
 
