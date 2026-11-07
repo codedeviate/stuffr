@@ -153,7 +153,9 @@ mod unix {
 
     /// A symlink the archive makes and a file meant to go through it, in one
     /// archive: symlinks are made last (deferred), so the file meets a
-    /// placeholder, not a door; and the symlink, once made, is only a link.
+    /// placeholder, not a door. The Ubuntu flavour then makes each symlink,
+    /// and it is only a link; the Apple flavour (macOS 27.2's build) refuses
+    /// both, as they leave the root.
     #[test]
     fn a_symlink_then_file_chain_never_leads_out() {
         let z = zip_with(
@@ -185,6 +187,12 @@ mod unix {
                 if f == "apple" {
                     assert!(!r.tree.contains_key(&b"dst/s"[..]), "{what}");
                     assert!(!r.tree.contains_key(&b"dst/t"[..]), "{what}");
+                    assert_eq!(r.code, 2, "{what}");
+                    assert_eq!(
+                        r.stderr.matches("symlink error: Permission denied").count(),
+                        2,
+                        "{what}"
+                    );
                 } else {
                     assert!(
                         matches!(r.tree.get(&b"dst/s"[..]), Some(UnzipNode::Symlink { target, .. }) if target == b"../outside"),

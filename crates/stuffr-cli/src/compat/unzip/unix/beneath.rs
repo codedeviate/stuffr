@@ -162,6 +162,12 @@ pub(crate) fn open_beneath(root: &Root, rel: &[u8], create: bool) -> io::Result<
 /// symlink's target is read and spliced in, never followed by the kernel).
 /// Off unix, where no symlink is made, the target is judged by its words
 /// alone.
+///
+/// One difference from the kernel: [`Root::stat`] and the walk under it
+/// count symlink hops separately, where the kernel has one `MAXSYMLINKS`
+/// budget per lookup. A chain of more than 32 hops that escapes past the
+/// kernel's `ELOOP` point is therefore refused here and made by Apple's
+/// unzip: an error on the safe side, left as it is.
 pub(crate) fn symlink_escapes(root: &Root, rel: &[u8], target: &[u8]) -> bool {
     if target.first() == Some(&b'/') {
         return true;
