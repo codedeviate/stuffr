@@ -282,8 +282,20 @@ mod unix {
                     }
                     if f == "apple" {
                         assert_eq!(r.code, 2, "{what}");
+                        // Off macOS the Apple flavour also reports each link
+                        // it made: `lchmod (file attributes) error: Operation
+                        // not supported` (Linux has no lchmod; CI 42402286726).
+                        let refusals: String = r
+                            .stderr
+                            .lines()
+                            .filter(|l| {
+                                cfg!(target_os = "macos")
+                                    || !l.starts_with("lchmod (file attributes) error: ")
+                            })
+                            .map(|l| format!("{l}\n"))
+                            .collect();
                         assert_eq!(
-                            r.stderr,
+                            refusals,
                             "symlink error: Permission denied\n".repeat(refused),
                             "{what}"
                         );
