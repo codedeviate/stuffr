@@ -597,6 +597,21 @@ read list.
 > on the default tier — measured from this bump's own `make check FULL=1`,
 > `GATE_EXIT=0`, nothing skipped.
 >
+> `0.26.0`: the `lz4`, `unlz4`, `lz4cat` and `lz4c` links follow **lz4
+> 1.11.0** (the lz4 Homebrew and current distributions ship): the new
+> options (`--fast=#`, `--best`, `--memory=#`, `--single-thread`,
+> `--[no-]mmap`, `LZ4_MEMORY`), 1.11.0's levels, help and messages
+> (`Using up to N threads`, `Done in` after a decode), outputs created
+> private (0600) until they succeed, mozlz4 decoding, the same-file
+> refusal, and `--list` validating each frame. On the C tier the bytes are
+> lz4 1.11.0's: liblz4 1.11.0 is now vendored (no `lz4-sys` release
+> carries it), and `zstd --format=lz4` follows it too. Both vendored C
+> libraries (liblz4 and libbrotli) now export only `stuffr_`-prefixed
+> symbols, so stuffr can share a binary with `lz4-sys` or another
+> libbrotli. Deep fuzzing gains C-tier legs. A MINOR. **3874** tests
+> under `--all-features`, **3719** on the default tier — measured from
+> this bump's own `make check FULL=1`, `GATE_EXIT=0`, nothing skipped.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
