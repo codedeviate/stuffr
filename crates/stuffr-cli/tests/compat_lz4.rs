@@ -5088,8 +5088,10 @@ mod unix {
     /// descriptor only, a warning at display level 2 and never `Error 54`
     /// (also under `--no-frame-crc`), nothing for `f` renamed and replaced,
     /// ` ; source kept` under `--rm`, nothing at level 1 (`-q`, `-c`). A
-    /// truncated standard input holds what was read before the truncation,
-    /// which is timing on both sides: only that it decodes is compared.
+    /// truncation answered with the warning (standard input, `-l`, a read
+    /// source) holds what was read before the cut, which is timing on both
+    /// sides: only that it decodes is compared, and the closing line's
+    /// figures are not (ruling L2, CI run 42463269275).
     ///
     /// C tier only: the pure tier compresses so fast that the change can
     /// come after it has finished (its rule is `io.rs`' unit tests').
@@ -5213,9 +5215,16 @@ mod unix {
                     .map(|o| o.stdout.len())
                     .unwrap()
             });
-            let decoded = match c {
-                Change::Truncate if stdin => decoded.map(|n| usize::from(n > 0)),
-                _ => decoded,
+            // A truncation answered with the warning (standard input, `-l`,
+            // `--no-mmap`: read, not mapped) holds what was read before the
+            // cut, which is timing on both sides (8, 12 or 16 MiB on CI's
+            // runners; ruling L2): only that it decodes is compared, and the
+            // closing line's figures go.
+            let read_to_cut = matches!(c, Change::Truncate) && out.status.code() == Some(0);
+            let decoded = if read_to_cut {
+                decoded.map(|n| usize::from(n > 0))
+            } else {
+                decoded
             };
             // Linux's `Error 53` leaves the output as far as it was written
             // when the cut was met, which is timing on both sides (lz4's
@@ -5231,6 +5240,12 @@ mod unix {
             while let Some(at) = err.find("\rRead : ") {
                 let end = err[at..].find("%   ").map_or(err.len(), |e| at + e + 4);
                 err.replace_range(at..end, "");
+            }
+            // The closing line follows the clearing `\r`, unlike `Compressed
+            // filename will be`.
+            if read_to_cut && let Some(at) = err.find("\rCompressed ") {
+                let end = err[at..].find('\n').map_or(err.len(), |e| at + e);
+                err.replace_range(at..end, "\rCompressed N bytes into M bytes");
             }
             (out.status.code(), err, decoded, w.join("f").exists())
         };
