@@ -772,7 +772,7 @@ fn the_verbose_table() {
     let (code, out, err) = d.run(&["--list", "-v", "two.lz4", "sub/two.lz4"]);
     assert_eq!(code, 0);
     assert!(
-        err.starts_with("*** lz4 v1.10.0 64-bit multithread (stuffr "),
+        err.starts_with("*** lz4 v1.11.0 64-bit multithread (stuffr "),
         "{err:?}"
     );
     assert_eq!(err.lines().count(), 1, "{err:?}");

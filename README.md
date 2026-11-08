@@ -1655,11 +1655,15 @@ included.
 
 - **Timing and host fields vary,** as between two runs of lz4: the `Done in`
   line's seconds, speed and cpu load, the progress refreshes, and the `Using
-  N threads` count where two programs count the host's cores differently.
-  Refreshes are drawn at most every 200 ms. While compressing, a refresh that
-  both draw shows the same figures (each job's refresh is over the input read
-  before that job, `inf` for the first, and a one-shot frame's over all of
-  it; the pure tier's ratio is of its own bytes). While decoding, stuffr
+  up to N threads` count where two programs count the host's cores
+  differently. Refreshes are drawn at most every 200 ms. While compressing
+  single-threaded (`--single-thread`, a custom `-B#`, `-l`) or a one-shot
+  frame, a refresh that both draw shows the same figures (a streamed frame's
+  after each update, over everything read and written by then; a legacy
+  job's over the input before it; a one-shot frame's over all of it; the
+  pure tier's ratio is of its own bytes). With liblz4's workers the figure is
+  what they had handed back when it was drawn, which varies from run to run
+  in lz4 1.11.0 itself, so it is timing too. While decoding, stuffr
   offers one refresh per MiB decoded, while lz4's count and figures vary from
   run to run with its writer thread (probed: the same legacy file drew `14,
   14` or `8, 14` MiB, a `-B4` frame `4, 7, 8`), so those are timing too.
@@ -1672,7 +1676,7 @@ included.
 - **Closed standard streams, and a parent that ignores `SIGPIPE`,** as in the
   other families. A closed pipe kills stuffr by SIGPIPE, as it kills lz4
   under the default disposition; where the parent ignores SIGPIPE lz4 answers
-  `Error 70` (decoding) or `Error 38` (compressing) and stuffr still dies of
+  `Error 70` (decoding) or `Error 46` (compressing) and stuffr still dies of
   the signal. A closed standard input or output is reopened on `/dev/null`
   by the Rust runtime, so `lz4 -c <&-` (lz4: `Error 40`) compresses an empty
   input.

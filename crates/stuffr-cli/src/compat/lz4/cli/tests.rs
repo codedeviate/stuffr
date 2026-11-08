@@ -143,17 +143,33 @@ fn each_name_presets_its_mode() {
 // ---- numbers ----
 
 #[test]
-fn numbers_wrap_and_take_k_and_m_suffixes() {
+fn numbers_take_k_and_m_suffixes_and_refuse_32_bit_overflow() {
     fn r(s: &str) -> (u32, &str) {
         let mut p = 0;
-        let n = read_u32(s.as_bytes(), &mut p);
+        let n = read_u32(s.as_bytes(), &mut p).unwrap();
         (n, &s[p..])
+    }
+    fn over(s: &str) -> bool {
+        read_u32(s.as_bytes(), &mut 0) == Err(Overflow)
     }
     assert_eq!(r("12x"), (12, "x"));
     assert_eq!(r(""), (0, ""));
     assert_eq!(r("x"), (0, "x"));
-    assert_eq!(r("4294967396"), (100, ""));
-    assert_eq!(r("42949672960"), (0, ""));
+    // 1.11.0: past 2^32 - 1, in the digits or after the suffix.
+    assert_eq!(r("4294967295"), (u32::MAX, ""));
+    assert_eq!(r("4194303K"), (4_294_966_272, ""));
+    assert_eq!(r("4095M"), (4095 << 20, ""));
+    for s in [
+        "4294967296",
+        "42949672960",
+        "99999999999",
+        "4194304K",
+        "4096M",
+        "4194305K",
+        "4294967296x",
+    ] {
+        assert!(over(s), "{s}");
+    }
     assert_eq!(r("64K"), (65536, ""));
     assert_eq!(r("64KB"), (65536, ""));
     assert_eq!(r("64KiB"), (65536, ""));
@@ -162,8 +178,6 @@ fn numbers_wrap_and_take_k_and_m_suffixes() {
     assert_eq!(r("64k"), (64, "k"));
     assert_eq!(r("1M"), (1 << 20, ""));
     assert_eq!(r("1MiB"), (1 << 20, ""));
-    assert_eq!(r("4194305K"), (1024, ""));
-    assert_eq!(r("4096M"), (0, ""));
     assert_eq!(r("K"), (0, ""));
     assert_eq!(r("1i"), (1, "i"));
 }
@@ -207,14 +221,17 @@ fn the_automatic_thread_count_is_logical_less_an_eighth_less_one() {
     ] {
         assert_eq!(auto(logical), (want, None), "{logical} logical cores");
     }
-    for (logical, asked) in [(250, 218), (256, 223), (300, 262), (1000, 874)] {
-        assert_eq!(auto(logical), (200, Some(asked)), "{logical} logical cores");
+    // 1.11.0's cap is 1024 (1.10.0's 200 reduced 250 cores' 218).
+    for (logical, want) in [(250, 218), (256, 223), (300, 262), (1000, 874)] {
+        assert_eq!(auto(logical), (want, None), "{logical} logical cores");
     }
+    assert_eq!(auto(1300), (THREADS_MAX, Some(1137)));
     let c = Cores::SANDBOX;
     assert_eq!(resolve_threads(0, c), (6, None));
     assert_eq!(resolve_threads(1, c), (1, None));
-    assert_eq!(resolve_threads(200, c), (200, None));
-    assert_eq!(resolve_threads(201, c), (200, Some(201)));
+    assert_eq!(resolve_threads(1024, c), (1024, None));
+    assert_eq!(resolve_threads(1025, c), (1024, Some(1025)));
+    assert_eq!(resolve_threads(u32::MAX, c), (1024, Some(u32::MAX)));
 }
 
 #[test]
@@ -226,15 +243,27 @@ fn threads_come_from_t_threads_and_lz4_nbworkers() {
     assert_eq!(ok(&["--threads=5"]).threads, 5);
     assert_eq!(ok(&["--threads", "5"]).threads, 5);
     assert_eq!(ok(&["--threads="]).threads, 6);
-    assert_eq!(ok(&["--threads=4294967297"]).threads, 1);
     let c = ok(&["-T1K"]);
-    assert_eq!((c.threads, c.threads_reduced_from), (200, Some(1024)));
+    assert_eq!((c.threads, c.threads_reduced_from), (1024, None));
+    let c = ok(&["-T1M"]);
+    assert_eq!((c.threads, c.threads_reduced_from), (1024, Some(1 << 20)));
+    assert!(ok(&["-T4"]).threads_asked && !ok(&["-T0"]).threads_asked);
     let env = |v: &str, args: &[&str]| {
         let (r, _, err) = run("lz4", args, &[("LZ4_NBWORKERS", v)]);
         (r.unwrap().threads, err)
     };
     assert_eq!(env("3", &[]), (3, String::new()));
-    assert_eq!(env("3x", &[]), (3, String::new()));
+    assert_eq!(env("1K", &[]), (1024, String::new()));
+    assert_eq!(env("2147483648", &[]), (1024, String::new()));
+    // 1.11.0 takes the whole value or nothing.
+    let bad = |v: &str| {
+        format!(
+            "Ignore environment variable setting LZ4_NBWORKERS={v}: not a valid unsigned value \n"
+        )
+    };
+    for v in ["3x", "4294967296", "1G", ""] {
+        assert_eq!(env(v, &[]), (6, bad(v)), "{v}");
+    }
     assert_eq!(env("3", &["-T0"]), (6, String::new()));
     assert_eq!(env("1", &["-T3"]), (3, String::new()));
     assert_eq!(
@@ -259,15 +288,34 @@ fn levels_come_from_digits_fast_best_and_lz4_clevel() {
     // liblz4 clamps above 12, not the command line.
     assert_eq!(level(&["-99"]), 99);
     assert_eq!(level(&["-1K"]), 1024);
-    assert_eq!(level(&["-4294967295"]), -1);
-    assert_eq!(level(&["-4294967297"]), 1);
+    assert_eq!(level(&["-2147483647"]), i32::MAX);
+    assert_eq!(level(&["-2097151K"]), 2_147_482_624);
     assert_eq!(level(&["--best"]), 12);
     assert_eq!(level(&["--fast"]), -1);
     assert_eq!(level(&["--fast=3"]), -3);
-    assert_eq!(level(&["--fast=1x"]), -1);
     assert_eq!(level(&["--fast=1K"]), -1024);
-    assert_eq!(level(&["--fast=4294967295"]), 1);
-    assert_eq!(level(&["--fast=2147483648"]), i32::MIN);
+    assert_eq!(level(&["--fast=1KiB"]), -1024);
+    assert_eq!(level(&["--fast=2147483647"]), -i32::MAX);
+    // 1.11.0: past `INT_MAX` a level is too large, past 32 bits overflow.
+    let too_large = "error: numeric value is too large \n";
+    let overflow = "error: numeric value overflows 32-bit unsigned int \n";
+    for (args, msg) in [
+        (&["-2147483648"][..], too_large),
+        (&["-4294967295"], too_large),
+        (&["-2097152K"], too_large),
+        (&["-2048M"], too_large),
+        (&["--fast=2147483648"], too_large),
+        (&["--fast=2147483648x"], too_large),
+        (&["--fast=4294967295"], too_large),
+        (&["-4294967296"], overflow),
+        (&["-99999999999"], overflow),
+        (&["-4194304K"], overflow),
+        (&["--fast=4294967296"], overflow),
+        (&["--fast=4294967296x"], overflow),
+    ] {
+        assert_eq!(stop(args), (USAGE_ERROR, msg.into()), "{args:?}");
+    }
+    assert_eq!(stop(&["-qq", "-2147483648"]), (USAGE_ERROR, String::new()));
     // The last one given wins (lz4.1, "--fast[=#]").
     assert_eq!(level(&["--fast=2", "-3"]), 3);
     assert_eq!(level(&["-3", "--fast"]), -1);
@@ -275,9 +323,20 @@ fn levels_come_from_digits_fast_best_and_lz4_clevel() {
     assert_eq!(env("9", &[]), 9);
     assert_eq!(env("9", &["-1"]), 1);
     assert_eq!(env("9", &["--fast=2"]), -2);
-    assert_eq!(env("4294967295", &[]), -1);
     assert_eq!(env("1K", &[]), 1024);
+    assert_eq!(env("2147483647", &[]), i32::MAX);
     assert_eq!(env("-1", &[]), 1);
+    // 1.11.0: not a level past `INT_MAX`, nor anything but a number.
+    for v in ["2147483648", "4294967295", "4294967296", "3x", "1Kx", "1G"] {
+        let (r, _, err) = run("lz4", &[], &[("LZ4_CLEVEL", v)]);
+        assert_eq!(r.unwrap().opts.level, 1, "{v}");
+        assert_eq!(
+            err,
+            format!(
+                "Ignore environment variable setting LZ4_CLEVEL={v}: not a valid unsigned value \n"
+            )
+        );
+    }
 }
 
 #[test]
@@ -372,14 +431,42 @@ fn block_sizes_flags_and_their_lines() {
         ("-B1023", 1023, "1023 bytes"),
         ("-B1024", 1024, "1 KB"),
         ("-B65537", 65537, "64 KB"),
-        ("-B4194305", 4 << 20, "4096 KB"),
-        ("-B99999999999", 4 << 20, "4096 KB"),
-        ("-B4194305K", 1024, "1 KB"),
     ] {
         let (r, _, err) = run("lz4", &[arg], &[]);
         assert_eq!(r.unwrap().opts.block_bytes, Some(bytes), "{arg}");
         assert_eq!(err, format!("using blocks of size {line} \n"), "{arg}");
     }
+    // 1.11.0: a standard size in bytes, or one capped to 4 MB, is its ID.
+    for (arg, id, line) in [
+        ("-B65536", BlockSizeId::Max64Kb, "64 KB"),
+        ("-B262144", BlockSizeId::Max256Kb, "256 KB"),
+        ("-B1M", BlockSizeId::Max1Mb, "1024 KB"),
+        ("-B4194304", BlockSizeId::Max4Mb, "4096 KB"),
+        ("-B4194305", BlockSizeId::Max4Mb, "4096 KB"),
+        ("-B4294967295", BlockSizeId::Max4Mb, "4096 KB"),
+        ("-B4194303K", BlockSizeId::Max4Mb, "4096 KB"),
+    ] {
+        let (r, _, err) = run("lz4", &[arg], &[]);
+        let c = r.unwrap();
+        assert_eq!((c.opts.block_size, c.opts.block_bytes), (id, None), "{arg}");
+        assert_eq!(err, format!("using blocks of size {line} \n"), "{arg}");
+    }
+    let overflow = "error: numeric value overflows 32-bit unsigned int \n";
+    for arg in [
+        "-B99999999999",
+        "-B4194305K",
+        "-B4096M",
+        "-T4294967296",
+        "-b4294967296",
+        "-e4294967296",
+        "-i4294967296",
+    ] {
+        assert_eq!(stop(&[arg]), (USAGE_ERROR, overflow.into()), "{arg}");
+    }
+    // A line printed before the error stays.
+    let (r, _, err) = run("lz4", &["-B4", "-T4294967296"], &[]);
+    assert_eq!(r.unwrap_err(), USAGE_ERROR);
+    assert_eq!(err, format!("using blocks of size 64 KB \n{overflow}"));
     for bad in ["-B0", "-B3", "-B8", "-B31", "-B1x", "-BK", "-B4-"] {
         assert_eq!(stop(&[bad]).0, USAGE_ERROR, "{bad}");
     }
@@ -532,7 +619,16 @@ fn threads_errors_name_their_cause() {
         "error: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB are allowed \n";
     assert_eq!(stop(&["--threads=x"]), (USAGE_ERROR, numeric.into()));
     assert_eq!(stop(&["--threads=4x"]), (USAGE_ERROR, numeric.into()));
-    assert_eq!(stop(&["--threads4", "a"]), (USAGE_ERROR, numeric.into()));
+    assert_eq!(stop(&["--threads=1G"]), (USAGE_ERROR, numeric.into()));
+    let overflow = "error: numeric value overflows 32-bit unsigned int \n";
+    assert_eq!(
+        stop(&["--threads=4294967296"]),
+        (USAGE_ERROR, overflow.into())
+    );
+    assert_eq!(
+        stop(&["--threads=4294967296x"]),
+        (USAGE_ERROR, overflow.into())
+    );
     assert_eq!(
         stop(&["a", "--threads"]),
         (USAGE_ERROR, "error: missing command argument \n".into())
@@ -541,7 +637,151 @@ fn threads_errors_name_their_cause() {
     assert_eq!(stop(&["--threads", "-c"]), (USAGE_ERROR, separated.into()));
     assert_eq!(stop(&["--threads", "-"]), (USAGE_ERROR, separated.into()));
     assert_eq!(stop(&["-qq", "--threads=x"]), (USAGE_ERROR, String::new()));
-    assert_eq!(ok(&["--threadsx", "4"]).threads, 4);
+    // 1.11.0: `--threads` is followed by `=`, its end, or nothing else.
+    assert_eq!(stop(&["--threadsx", "4"]).0, USAGE_ERROR);
+    assert!(
+        stop(&["--threads4", "a"])
+            .1
+            .starts_with("Incorrect parameters\n")
+    );
+}
+
+#[test]
+fn single_thread_mmap_and_memory() {
+    let c = ok(&[]);
+    assert!(!c.single_thread && c.mmap);
+    assert_eq!(c.memory, MEMORY_DEFAULT);
+    assert!(ok(&["--single-thread"]).single_thread);
+    assert!(!ok(&["--single-thread", "-T4"]).single_thread);
+    assert!(!ok(&["--single-thread", "--threads=4"]).single_thread);
+    assert!(ok(&["-T4", "--single-thread"]).single_thread);
+    assert!(!ok(&["--no-mmap"]).mmap);
+    assert!(ok(&["--no-mmap", "--mmap"]).mmap);
+    for bad in [
+        &["--mmap=1"][..],
+        &["--single-thread=1"],
+        &["--single-threadx"],
+        &["--memoryx=1M"],
+    ] {
+        assert!(stop(bad).1.starts_with("Incorrect parameters\n"), "{bad:?}");
+    }
+    for (arg, want) in [
+        ("--memory=50M", 50 << 20),
+        ("--memory=1", 1),
+        ("--memory=01", 1),
+        ("--memory=1K", 1 << 10),
+        ("--memory=1KB", 1 << 10),
+        ("--memory=1G", 1 << 30),
+        ("--memory=1Gi", 1 << 30),
+        ("--memory=1GiB", 1 << 30),
+        ("--memory=99999999999", 99_999_999_999),
+        ("--memory=18446744073709551615", u64::MAX),
+        ("--memory=17179869183G", 17_179_869_183 << 30),
+    ] {
+        assert_eq!(ok(&[arg]).memory, want, "{arg}");
+    }
+    assert_eq!(ok(&["--memory", "50M"]).memory, 50 << 20);
+    let size = "error: --memory requires a size, with optional suffixes K, KB, KiB, M, MB, MiB, G, GB, GiB \n";
+    for v in [
+        "0",
+        "00",
+        "0K",
+        "",
+        "x",
+        "-1",
+        "1g",
+        "4T",
+        "1Q",
+        "1Mx",
+        "1KiBx",
+        "=1M",
+        "16777216T",
+    ] {
+        let arg = format!("--memory={v}");
+        assert_eq!(stop(&[&arg]), (USAGE_ERROR, size.into()), "{arg}");
+    }
+    assert_eq!(stop(&["--memory", "a"]), (USAGE_ERROR, size.into()));
+    let overflow = "error: --memory value overflows 64-bit unsigned int \n";
+    for v in [
+        "18446744073709551616",
+        "17179869184G",
+        "18446744073709551616x",
+    ] {
+        let arg = format!("--memory={v}");
+        assert_eq!(stop(&[&arg]), (USAGE_ERROR, overflow.into()), "{arg}");
+    }
+    assert_eq!(stop(&["--memory"]).1, "error: missing command argument \n");
+    assert_eq!(
+        stop(&["--memory", "-c"]).1,
+        "error: command cannot be separated from its argument by another command \n"
+    );
+    assert_eq!(stop(&["-qq", "--memory=0"]), (USAGE_ERROR, String::new()));
+    // LZ4_MEMORY: below `--memory`, after the other two variables' lines.
+    let mem = |v: &str, args: &[&str]| {
+        let (r, _, err) = run("lz4", args, &[("LZ4_MEMORY", v), ("LZ4_CLEVEL", "x")]);
+        (r.unwrap().memory, err)
+    };
+    let clevel = "Ignore environment variable setting LZ4_CLEVEL=x: not a valid unsigned value \n";
+    assert_eq!(mem("50M", &[]), (50 << 20, clevel.into()));
+    assert_eq!(mem("50M", &["--memory=1G"]), (1 << 30, clevel.into()));
+    for v in [
+        "0",
+        "x",
+        "1g",
+        "4T",
+        "",
+        "50Mx",
+        " 50M",
+        "-1",
+        "00",
+        "18446744073709551616",
+    ] {
+        assert_eq!(
+            mem(v, &[]),
+            (
+                MEMORY_DEFAULT,
+                format!(
+                    "{clevel}Ignore environment variable setting LZ4_MEMORY={v}: not a valid size \n"
+                )
+            ),
+            "{v}"
+        );
+    }
+}
+
+#[test]
+fn the_threading_and_the_encoder_options() {
+    // `-B#` prints its line: parse without asking for silence.
+    let ok = |args: &[&str]| run("lz4", args, &[]).0.unwrap();
+    let t = |args: &[&str]| ok(args).threading();
+    assert_eq!(t(&[]), Threading::Workers(6, false));
+    assert_eq!(t(&["-T5000"]), Threading::Workers(331, false));
+    assert_eq!(t(&["--memory=40M"]), Threading::Workers(1, false));
+    assert_eq!(t(&["--memory=1"]), Threading::Workers(1, true));
+    assert_eq!(t(&["-l", "-T4"]), Threading::Legacy);
+    assert_eq!(t(&["-B1024", "-T4"]), Threading::Custom(1024));
+    assert_eq!(
+        t(&["-B100000", "--single-thread"]),
+        Threading::Custom(100000)
+    );
+    assert_eq!(t(&["--single-thread"]), Threading::Single);
+    let o = ok(&["-T4"]).encode_options(false);
+    assert_eq!(
+        (o.workers, o.update_size, o.flush_each_update),
+        (4, None, false)
+    );
+    let o = ok(&["-T4"]).encode_options(true);
+    assert_eq!(o.workers, 1, "a sandbox keeps one worker");
+    let o = ok(&["-T4", "--single-thread"]).encode_options(false);
+    assert_eq!(
+        (o.workers, o.update_size, o.flush_each_update),
+        (0, None, false)
+    );
+    let o = ok(&["-B1024", "-T4"]).encode_options(false);
+    assert_eq!(
+        (o.workers, o.update_size, o.flush_each_update),
+        (0, Some(1024), true)
+    );
 }
 
 #[test]
@@ -558,7 +798,11 @@ fn usage_errors_print_at_display_level_1() {
         &["--fast=0"],
         &["--fast="],
         &["--fast3"],
-        &["--fast=4294967296"],
+        &["--fast=1x"],
+        &["--fast=1Kx"],
+        &["--fast=1G"],
+        &["-T1G"],
+        &["-B1G"],
         &["--best=1"],
         &["--decomp"],
         &["-d-c"],
@@ -581,7 +825,7 @@ fn usage_errors_print_at_display_level_1() {
 #[test]
 fn help_and_version_print_at_once_whatever_the_level() {
     let banner = format!(
-        "*** lz4 v1.10.0 64-bit multithread (stuffr {}), by Yann Collet ***\n",
+        "*** lz4 v1.11.0 64-bit multithread (stuffr {}), by Yann Collet ***\n",
         env!("CARGO_PKG_VERSION")
     );
     for args in [

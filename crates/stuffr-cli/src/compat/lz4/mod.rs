@@ -1,5 +1,5 @@
 //! The lz4 family (`lz4`, `unlz4`, `lz4cat`, `lz4c`): stuffr behaving as
-//! the LZ4 command line interface v1.10.0.
+//! the LZ4 command line interface v1.11.0 (0.26.0; v1.10.0 before).
 //!
 //! **A clean-room implementation** (spec decision 3): lz4's `programs/` is
 //! GPL-2.0-or-later and was never read. Every rule comes from the man page
@@ -39,19 +39,24 @@
 //! this list):
 //!
 //! 1. The banner names stuffr wherever lz4 prints it (`-V`, the first line
-//!    of `-h`/`-H`, `-v`): `*** lz4 v1.10.0 64-bit multithread (stuffr
-//!    X.Y.Z), by Yann Collet ***`. The prefix `*** lz4 v1.10.0 ` is
+//!    of `-h`/`-H`, `-v`): `*** lz4 v1.11.0 64-bit multithread (stuffr
+//!    X.Y.Z), by Yann Collet ***`. The prefix `*** lz4 v1.11.0 ` is
 //!    unchanged.
 //! 2. Timing and host fields vary, as between two runs of lz4: the `Done
 //!    in` line's seconds, speed and cpu load, the progress refreshes, and
-//!    the `Using N threads` count where two programs count the host's
+//!    the `Using up to N threads` count where two programs count the host's
 //!    cores differently. Refreshes are drawn at most every 200 ms (the
 //!    first one always; at display level 4 every chunk), which `display.rs`
 //!    pins from recordings; under a sandbox the clock is frozen at zero.
-//!    While compressing, a refresh that both draw shows the same figures
-//!    (each job's refresh is over the input read before that job, `inf` for
-//!    the first, and a one-shot frame's over all of it; the pure tier's
-//!    ratio is of its own bytes, deviation 6). While decoding, stuffr
+//!    While compressing single-threaded (`--single-thread`, a custom
+//!    `-B#`, `-l`) or a one-shot frame, a refresh that both draw shows the
+//!    same figures (a streamed frame's after each update, over everything
+//!    read and written by then; a legacy job's over the input before it; a
+//!    one-shot frame's over all of it; the pure tier's ratio is of its own
+//!    bytes, deviation 6). With liblz4's workers the figure is what they
+//!    had handed back when it was drawn, which varies from run to run in
+//!    lz4 1.11.0 itself (probed: 18.93% or 28.39% at 8 MiB of the same
+//!    `-B6` input), so it is timing too. While decoding, stuffr
 //!    offers one refresh per MiB decoded, while lz4's count and figures
 //!    vary from run to run with its writer thread (probed: the same legacy
 //!    file drew `14, 14` or `8, 14` MiB, a `-B4` frame `4, 7, 8`), so
@@ -66,7 +71,7 @@
 //! 4. Closed standard streams and a parent that ignores SIGPIPE behave as
 //!    in the earlier families: a closed pipe kills stuffr by SIGPIPE, as it
 //!    kills lz4 under the default disposition; where the parent ignores
-//!    SIGPIPE, lz4 answers `Error 70` (decoding) or `Error 38` (compressing)
+//!    SIGPIPE, lz4 answers `Error 70` (decoding) or `Error 46` (compressing)
 //!    and stuffr still dies of the signal (the Rust runtime ignores SIGPIPE
 //!    before `main`, so the inherited disposition cannot be told apart).
 //!    A closed standard input or output is reopened on `/dev/null` by the
@@ -179,9 +184,13 @@ pub fn run(name: &'static str, argv0: &OsStr, args: Vec<OsString>) -> ExitCode {
 /// frame's magic number is `Error 71 : Error reading NAME`, of one cut
 /// inside a header that promises a content size `Error 72 : Error
 /// reading NAME` (probed 2026-10-16, pinned by the `--list` rows).
+///
+/// 0.26.0 (lz4 1.11.0, Task 4): a write error while compressing is `Error
+/// 46` where 1.10.0 said `Error 38` (38 is gone), and a source file changed
+/// while it was compressed can be `Error 54` (probed 2026-11-08).
 #[doc(hidden)]
-pub const EXIT_CODES: [i32; 19] = [
-    0, 1, 26, 27, 34, 38, 40, 42, 43, 44, 50, 61, 63, 64, 69, 70, 71, 72, 74,
+pub const EXIT_CODES: [i32; 20] = [
+    0, 1, 26, 27, 34, 40, 42, 43, 44, 46, 50, 54, 61, 63, 64, 69, 70, 71, 72, 74,
 ];
 
 /// [`run`] without the process: operands resolve against `dir`, standard
@@ -288,6 +297,14 @@ fn announce(cmd: &Command, err: &mut dyn Write) {
         let v = posix_version();
         printf(err, m::POSIX_VERSION, &[v.as_bytes(), v.as_bytes()]);
     }
+    // probe (1.11.0): `lz4 --content-size < a`, `-d`, `-t`, `--list -`,
+    // `-m stdin a` (not `-m a stdin`): the first input is standard input,
+    // at display level 2 as parsed (`-c` lowers it only later; `-q` hides
+    // it).
+    let stdin_first = cmd.inputs.first().is_some_and(|i| i == cli::STDINMARK);
+    if cmd.content_size && stdin_first && cmd.display_level >= 2 {
+        printf(err, m::CONTENT_SIZE_STDIN, &[]);
+    }
 }
 
 /// `_POSIX_VERSION` as the system says it (200112 on macOS, probed with
@@ -333,7 +350,7 @@ mod tests {
     #[test]
     fn a_sandboxed_run_parses_and_plans() {
         let banner = format!(
-            "*** lz4 v1.10.0 64-bit multithread (stuffr {}), by Yann Collet ***\n",
+            "*** lz4 v1.11.0 64-bit multithread (stuffr {}), by Yann Collet ***\n",
             env!("CARGO_PKG_VERSION")
         );
         assert_eq!(run("lz4", &["-V"], b""), (0, banner.clone(), String::new()));

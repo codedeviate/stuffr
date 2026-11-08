@@ -48,9 +48,7 @@
 use std::fs::{self, File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
-use stuffr::lz4_opts::{
-    EncodeOptions, Encoder, FRAME_CHUNK, LEGACY_BLOCK_SIZE, parse_frame_header,
-};
+use stuffr::lz4_opts::{EncodeOptions, Encoder, FRAME_CHUNK, LEGACY_BLOCK_SIZE};
 
 use super::cli::{self, Command, Op, Plan, STDINMARK, Target};
 use super::decode;
@@ -114,12 +112,34 @@ struct Reader {
     eof: bool,
     /// A read failed (the input ended there).
     failed: bool,
+    /// The bytes still to be read where the input is read as it was when
+    /// opened (`--mmap`, [`Src::limit_to`]); `None`: to its end.
+    left: Option<u64>,
 }
 
 impl Reader {
     /// One read; an error ends the input, as a short read does (probe: `lz4
     /// -dc <&-` decodes nothing, exit 0), and is remembered in `failed`.
     fn read(&mut self, buf: &mut [u8]) -> usize {
+        let buf = match self.left {
+            Some(0) => {
+                self.eof = true;
+                return 0;
+            }
+            Some(left) => {
+                let n = usize::try_from(left).map_or(buf.len(), |l| l.min(buf.len()));
+                &mut buf[..n]
+            }
+            None => buf,
+        };
+        let n = self.read_some(buf);
+        if let Some(left) = &mut self.left {
+            *left -= n as u64;
+        }
+        n
+    }
+
+    fn read_some(&mut self, buf: &mut [u8]) -> usize {
         while !self.eof {
             let r = match &mut self.origin {
                 Origin::File(f) => f.read(buf),
@@ -170,6 +190,7 @@ impl Src {
                 origin,
                 eof: false,
                 failed: false,
+                left: None,
             },
             buf: Vec::new(),
             at: 0,
@@ -199,6 +220,22 @@ impl Src {
         let n = n.min(self.buf.len() - self.at);
         self.at += n;
         self.taken += n as u64;
+    }
+
+    /// Read no more than `n` bytes from here (`--mmap`: a file is
+    /// compressed as long as it was when opened; probe, 1.11.0: `lz4 f`
+    /// with `f` appended to meanwhile writes the bytes it had, `--no-mmap`
+    /// the bytes it then read).
+    fn limit_to(&mut self, n: u64) {
+        self.reader.left = Some(n);
+    }
+
+    /// The open file's metadata now (`fstat`), for a named input.
+    fn fstat(&self) -> Option<Metadata> {
+        match &self.reader.origin {
+            Origin::File(f) => f.metadata().ok(),
+            Origin::Stdin(_) | Origin::Stream(_) => None,
+        }
     }
 
     /// The bytes taken so far (`ftell`).
@@ -287,7 +324,7 @@ pub(super) struct Sink {
     sparse: bool,
     /// Zero bytes passed over and not yet seeked.
     skips: u64,
-    /// The error a failed write ends the run with (`Error 38` compressing,
+    /// The error a failed write ends the run with (`Error 46` compressing,
     /// `Error 70` decoding).
     write_error: (&'static str, i32),
     /// A second descriptor of a file output, for its metadata (HOST-8: set
@@ -438,6 +475,97 @@ fn output_mode(input: Option<&Metadata>, decoding: bool, legacy: bool) -> u32 {
         0o600
     } else {
         0o666
+    }
+}
+
+// ---- a source that changed while it was compressed (1.11.0) ----
+
+/// What became of a regular input while it was compressed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Change {
+    /// The open file itself changed: its size, or its modification or
+    /// status-change time in seconds (a rename moves the latter).
+    pub modified: bool,
+    /// It is now shorter than it was.
+    pub shrunk: bool,
+    /// The name is now another file, or none.
+    pub replaced: bool,
+}
+
+/// What `before` (the input's `fstat` when opened) became: `now` is the
+/// open file's `fstat` at the end, `by_name` the name's `stat`.
+///
+/// probe (1.11.0, `lz4 -12 -T1 f` over 30 MB, `f` changed 0.2 to 1.3 s
+/// in): an append, a truncation, a rewrite in place, `utime` to another
+/// second and `chmod` are seen, `utime` or `chmod` within the second the
+/// file was written are not (seconds are compared, the status-change time
+/// too: `chmod` 1.3 s in is seen every time); a rename with another file
+/// put in its place is `renamed or replaced`, and from another second on
+/// (the rename moves the file's own status-change time) the file counts
+/// as modified as well (`--no-frame-crc`: a warning at 0.2-0.4 s, `Error
+/// 54` at 0.6-1.1 s).
+pub(super) fn source_change(
+    before: &Metadata,
+    now: Option<Metadata>,
+    by_name: Option<Metadata>,
+) -> Change {
+    let replaced = by_name
+        .as_ref()
+        .is_none_or(|n| host::same_file(before, n) == Some(false));
+    let Some(now) = now else {
+        return Change {
+            replaced,
+            ..Change::default()
+        };
+    };
+    #[cfg(unix)]
+    let modified = {
+        use std::os::unix::fs::MetadataExt;
+        (before.size(), before.mtime(), before.ctime()) != (now.size(), now.mtime(), now.ctime())
+    };
+    #[cfg(not(unix))]
+    let modified = {
+        let secs = |m: &Metadata| {
+            m.modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+        };
+        (before.len(), secs(before)) != (now.len(), secs(&now))
+    };
+    Change {
+        modified,
+        shrunk: now.len() < before.len(),
+        replaced,
+    }
+}
+
+/// What lz4 1.11.0 makes of a [`Change`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Verdict {
+    Fine,
+    /// The warning (display level 2), the output kept, and the input too
+    /// under `--rm` ([`m::SOURCE_KEPT`]).
+    Warn(&'static str),
+    /// [`m::E54_SOURCE_MODIFIED`]: the output removed, the run ends with 54.
+    Fail,
+}
+
+/// probe (1.11.0, the 2026-11-08 probe's §1.13 table and Task 4's
+/// reruns): a mapped file (`mapped`: the default; not `--no-mmap`, not
+/// `-l`) that was itself modified is `Error 54` when it shrank or has no
+/// content checksum (`--no-frame-crc`); every other change is a warning,
+/// `renamed or replaced` before `modified`. Read without a map, every
+/// change is a warning. `--single-thread` behaves as the default.
+pub(super) fn verdict(c: Change, mapped: bool, checksum: bool) -> Verdict {
+    if mapped && c.modified && (c.shrunk || !checksum) {
+        Verdict::Fail
+    } else if c.replaced {
+        Verdict::Warn(m::SOURCE_REPLACED)
+    } else if c.modified {
+        Verdict::Warn(m::SOURCE_MODIFIED)
+    } else {
+        Verdict::Fine
     }
 }
 
@@ -653,7 +781,7 @@ impl Run<'_> {
         let write_error = if decoding {
             (m::E70_WRITE_DECODED, 70)
         } else {
-            (m::E38_WRITE_COMPRESSED, 38)
+            (m::E46_WRITE_COMPRESSED, 46)
         };
         let (kind, sparse) = match target {
             Target::Null => (SinkKind::Null, false),
@@ -833,20 +961,54 @@ impl Run<'_> {
 
     /// Compress `name` into `target`.
     fn compress_one(&mut self, name: &[u8], target: &Target) -> Result<Stats, Fail> {
-        let (src, meta) = self.open_input(name)?;
-        let (r, mut fd) = match self.open_sink(target, meta.as_ref(), false) {
+        let (mut src, meta) = self.open_input(name)?;
+        // A regular file is read as long as it was when opened, as lz4
+        // maps it, unless `--no-mmap` (or `-l`, which reads to the end:
+        // probe, 1.11.0, `lz4 -l f` with `f` appended to meanwhile writes
+        // the bytes appended too).
+        let regular = meta.as_ref().filter(|m| m.is_file());
+        let mapped = self.cmd.mmap && !self.cmd.opts.legacy;
+        if let (Some(s), Some(m), true) = (src.as_mut(), regular, mapped) {
+            s.limit_to(m.len());
+        }
+        let (r, mut fd, change) = match self.open_sink(target, meta.as_ref(), false) {
             Ok(mut sink) => {
                 // Standard input is taken only now: the overwrite question
                 // reads it first (probe: `printf 'y\nhello' | lz4 - e`
                 // compresses `hello`).
                 let mut src = src.unwrap_or_else(|| self.take_stdin());
                 let r = self.compress_from(name, &mut src, meta.as_ref(), &mut sink);
+                let change = match (regular, &r) {
+                    (Some(before), Ok(_)) => {
+                        source_change(before, src.fstat(), self.stat_name(name))
+                    }
+                    _ => Change::default(),
+                };
                 self.put_back(name, src);
-                (r, sink.fd.take())
+                (r, sink.fd.take(), change)
             }
-            Err(f) => (Err(f), None),
+            Err(f) => (Err(f), None, Change::default()),
         };
         let stats = r?;
+        let kept = match verdict(change, mapped, self.cmd.opts.content_checksum) {
+            Verdict::Fine => false,
+            Verdict::Warn(fmt) => {
+                let kept: &[u8] = if self.cmd.remove {
+                    m::SOURCE_KEPT.as_bytes()
+                } else {
+                    b""
+                };
+                self.say(2, fmt, &[name, kept]);
+                true
+            }
+            Verdict::Fail => {
+                drop(fd);
+                if let Target::File(out) = target {
+                    let _ = fs::remove_file(self.host.path(out));
+                }
+                return Err(self.exm(54, m::E54_SOURCE_MODIFIED, &[name]));
+            }
+        };
         // probe: `lz4 -l a` leaves `a.lz4` with the run's time and the
         // default mode; a frame gets the input's.
         if !self.cmd.opts.legacy {
@@ -855,8 +1017,16 @@ impl Run<'_> {
         drop(fd);
         self.total += stats.read;
         self.show_compress_summary(&stats);
-        self.remove_input(name)?;
+        if !kept {
+            self.remove_input(name)?;
+        }
         Ok(stats)
+    }
+
+    /// `name`'s metadata now, by name (following links, as the input was
+    /// opened).
+    fn stat_name(&self, name: &[u8]) -> Option<Metadata> {
+        fs::metadata(self.host.path(name)).ok()
     }
 
     fn compress_from(
@@ -874,7 +1044,9 @@ impl Run<'_> {
                 .filter(|m| self.cmd.content_size && m.is_file())
                 .map(Metadata::len),
             dictionary: self.dict.clone(),
-            ..self.cmd.opts.clone()
+            ..self
+                .cmd
+                .encode_options(matches!(self.host, Host::Sandbox(_)))
         };
         let legacy = opts.legacy;
         // probe: `lz4 -v --content-size - o < pipe`, `... /dev/null o`
@@ -885,41 +1057,34 @@ impl Run<'_> {
             self.say(3, m::CONTENT_SIZE_UNKNOWN, &[]);
         }
         let Ok(mut enc) = Encoder::new(&opts) else {
-            return Err(self.exm(38, m::E38_WRITE_COMPRESSED, &[]));
+            return Err(self.exm(46, m::E46_WRITE_COMPRESSED, &[]));
         };
-        // lz4_opts: a frame's input is read 4 MiB at a time, a legacy
-        // frame's 8 MiB (one block each).
-        let chunk = if legacy {
-            LEGACY_BLOCK_SIZE
-        } else {
-            FRAME_CHUNK
-        };
+        if legacy {
+            return self.compress_legacy(src, sink, &mut enc);
+        }
+        // lz4_opts: a frame's input is read one update at a time, 4 MiB or
+        // a custom `-B#`'s size.
+        let chunk = opts.update_size.unwrap_or(FRAME_CHUNK);
         let mut buf = vec![0u8; chunk];
         let mut packed = Vec::new();
         let mut stats = Stats::default();
         let mut first = true;
-        // The progress figures (probe: `lz4 -T1 -vvvv` over generated text
-        // of 2, 4, 4 MiB + 1, 8, 8 MiB + 1 and 9 MiB, `-l`, `-BD`,
-        // `--content-size` and `--no-frame-crc`, a job's size swept byte by
-        // byte across a rounding boundary of its ratio): a refresh is drawn
-        // once a job's blocks are written, over the input read before that
-        // job (`0 MiB ==> inf%` first). A streamed frame's figure counts its
-        // blocks only, neither its header nor its end mark and checksum; a
-        // legacy frame's counts everything, the magic too; a one-shot frame
-        // (input under 4 MiB) is drawn once complete, over all of it.
-        let mut before = 0u64;
-        // The frame is streamed in jobs (it had a whole job of input).
+        // The progress figures (probe, 1.11.0: `lz4 -vvvv` over 1 MiB and 9
+        // MiB + 123 bytes of text, threaded and `--single-thread`, `-B4`,
+        // `-B6`, `-B7`, `-BD`; a custom `-B32` and `-B1024` over 4000 and
+        // 20000 bytes): a streamed frame draws a refresh after each update,
+        // over all the input read so far and every byte written so far, the
+        // header included (`-B32`'s first is 43 of 32 bytes); threaded, that
+        // is what liblz4's workers have handed back by then (`0.00%` for
+        // the first 4 MiB here). The last update is compressed before its
+        // refresh, the end mark and checksum after it. A one-shot frame
+        // (shorter than a block) is drawn once complete, over all of it.
+        // (1.10.0 drew each job over the input before it, blocks only.)
         let mut streamed = false;
-        // A streamed frame's header, and its end mark and checksum.
-        let (mut header, mut trailer) = (0u64, 0u64);
-        // A last, partial job of a streamed or legacy frame: the encoder
-        // writes its blocks only in `finish`, so it is drawn after that.
-        let mut last_job = None;
         loop {
             let n = src.read_full(&mut buf);
-            // probe: `lz4 -c <&-` (a frame; `lz4 -l -c <&-` writes an empty
-            // legacy frame instead).
-            if n == 0 && first && !legacy && src.reader.failed {
+            // probe: `lz4 -c <&-` (a frame).
+            if n == 0 && first && src.reader.failed {
                 return Err(self.exm(
                     40,
                     m::E40_FIRST_CHUNK,
@@ -931,32 +1096,71 @@ impl Run<'_> {
                 break;
             }
             stats.read += n as u64;
-            if enc.update(&buf[..n], &mut packed).is_err() {
-                return Err(self.exm(38, m::E38_WRITE_COMPRESSED, &[]));
+            if enc.update(&buf[..n], &mut packed).is_err()
+                || (n < chunk && enc.end_of_input(&mut packed).is_err())
+            {
+                return Err(self.exm(46, m::E46_WRITE_COMPRESSED, &[]));
             }
             sink.write(self, &packed)?;
             stats.written += packed.len() as u64;
-            if !legacy && !streamed && n == chunk {
-                streamed = true;
-                // The first job's output opens with the header.
-                let parsed = parse_frame_header(&packed);
-                debug_assert!(
-                    matches!(parsed, Ok(Some(_))),
-                    "the first job of a streamed frame opens with its header"
-                );
-                if let Ok(Some(h)) = parsed {
-                    header = h.header_len as u64;
-                    trailer = if h.content_checksum { 8 } else { 4 };
-                }
-            }
             packed.clear();
-            if legacy || streamed {
-                if n == chunk {
-                    let blocks = stats.written.saturating_sub(header);
-                    self.show_read_progress_at(before, blocks, false);
-                } else {
-                    last_job = Some(before);
-                }
+            // The header is out once the frame is streamed.
+            streamed |= stats.written > 0;
+            if streamed {
+                self.show_read_progress_at(stats.read, stats.written, false);
+            }
+            if n < chunk {
+                break;
+            }
+        }
+        if enc.finish(&mut packed).is_err() {
+            return Err(self.exm(46, m::E46_WRITE_COMPRESSED, &[]));
+        }
+        sink.write(self, &packed)?;
+        stats.written += packed.len() as u64;
+        // probe: a one-shot frame (the empty one too: `lz4 e` says
+        // `1500.00%`) draws one refresh once complete, over the whole input.
+        if !streamed {
+            self.show_read_progress_at(stats.read, stats.written, true);
+        }
+        sink.finish(self)?;
+        Ok(stats)
+    }
+
+    /// `-l`: the legacy format, read 8 MiB at a time (one block each).
+    /// probe (1.10.0, unchanged in 1.11.0): a refresh is drawn once a job's
+    /// block is written, over the input read before that job; the figure
+    /// counts everything written, the magic too; a last, partial job is
+    /// drawn after `finish`, and an empty input draws none (`lz4 -l e`).
+    fn compress_legacy(
+        &mut self,
+        src: &mut Src,
+        sink: &mut Sink,
+        enc: &mut Encoder,
+    ) -> Result<Stats, Fail> {
+        let chunk = LEGACY_BLOCK_SIZE;
+        let mut buf = vec![0u8; chunk];
+        let mut packed = Vec::new();
+        let mut stats = Stats::default();
+        let mut before = 0u64;
+        let mut last_job = None;
+        loop {
+            // probe: `lz4 -l -c <&-` writes an empty legacy frame.
+            let n = src.read_full(&mut buf);
+            if n == 0 {
+                break;
+            }
+            stats.read += n as u64;
+            if enc.update(&buf[..n], &mut packed).is_err() {
+                return Err(self.exm(46, m::E46_WRITE_COMPRESSED, &[]));
+            }
+            sink.write(self, &packed)?;
+            stats.written += packed.len() as u64;
+            packed.clear();
+            if n == chunk {
+                self.show_read_progress_at(before, stats.written, false);
+            } else {
+                last_job = Some(before);
             }
             before = stats.read;
             if n < chunk {
@@ -964,19 +1168,12 @@ impl Run<'_> {
             }
         }
         if enc.finish(&mut packed).is_err() {
-            return Err(self.exm(38, m::E38_WRITE_COMPRESSED, &[]));
+            return Err(self.exm(46, m::E46_WRITE_COMPRESSED, &[]));
         }
         sink.write(self, &packed)?;
         stats.written += packed.len() as u64;
-        // probe: a one-shot frame (input under 4 MiB, the empty one too:
-        // `lz4 e` says `1500.00%`) draws one refresh once complete, over the
-        // whole input; a legacy frame only per job it compressed (`lz4 -l e`
-        // shows none).
         if let Some(before) = last_job {
-            let blocks = stats.written.saturating_sub(header + trailer);
-            self.show_read_progress_at(before, blocks, false);
-        } else if !legacy && !streamed {
-            self.show_read_progress_at(stats.read, stats.written, true);
+            self.show_read_progress_at(before, stats.written, false);
         }
         sink.finish(self)?;
         Ok(stats)
@@ -1190,6 +1387,100 @@ fn files(run: &mut Run, plan: &Plan) -> Result<usize, i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The §1.13 table of the 2026-11-08 probe (lz4 1.11.0), row by row:
+    /// mapped with the checksum, mapped without it, and read.
+    #[test]
+    fn a_changed_source_is_a_warning_or_error_54() {
+        let c = |modified, shrunk, replaced| Change {
+            modified,
+            shrunk,
+            replaced,
+        };
+        let warn = Verdict::Warn(m::SOURCE_MODIFIED);
+        let renamed = Verdict::Warn(m::SOURCE_REPLACED);
+        let fine = Verdict::Fine;
+        let fail = Verdict::Fail;
+        for (change, mapped_crc, mapped_no_crc, read) in [
+            (c(false, false, false), fine, fine, fine),
+            (c(true, false, false), warn, fail, warn),
+            (c(true, true, false), fail, fail, warn),
+            // A rename within the second: only the name says so.
+            (c(false, false, true), renamed, renamed, renamed),
+            // From another second the file's status-change time moved.
+            (c(true, false, true), renamed, fail, renamed),
+        ] {
+            assert_eq!(verdict(change, true, true), mapped_crc, "{change:?}");
+            assert_eq!(verdict(change, true, false), mapped_no_crc, "{change:?}");
+            assert_eq!(verdict(change, false, true), read, "{change:?}");
+            assert_eq!(verdict(change, false, false), read, "{change:?}");
+        }
+    }
+
+    /// What `source_change` sees: size, seconds of the modification and
+    /// status-change times, and the name's file.
+    #[test]
+    fn a_source_change_is_seen_by_size_time_and_identity() {
+        let dir = std::env::temp_dir().join(format!("stuffr-lz4-change-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("f");
+        fs::write(&f, b"0123456789").unwrap();
+        let open = File::open(&f).unwrap();
+        let before = open.metadata().unwrap();
+        let now = || (open.metadata().ok(), fs::metadata(&f).ok());
+        let ch = |modified, shrunk, replaced| Change {
+            modified,
+            shrunk,
+            replaced,
+        };
+        let (a, b) = now();
+        assert_eq!(source_change(&before, a, b), Change::default());
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&f)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        let (a, b) = now();
+        assert_eq!(source_change(&before, a, b), ch(true, false, false));
+        File::create(&f).unwrap().write_all(b"0123").unwrap();
+        let (a, b) = now();
+        assert_eq!(source_change(&before, a, b), ch(true, true, false));
+        let old = fs::FileTimes::new()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000));
+        let g = dir.join("g");
+        fs::write(&g, b"0123456789").unwrap();
+        let open_g = File::open(&g).unwrap();
+        let before_g = open_g.metadata().unwrap();
+        File::options()
+            .write(true)
+            .open(&g)
+            .unwrap()
+            .set_times(old)
+            .unwrap();
+        assert_eq!(
+            source_change(&before_g, open_g.metadata().ok(), fs::metadata(&g).ok()),
+            ch(true, false, false)
+        );
+        // A rename alone: the name, and the file's own status change only
+        // once a second has passed (not tested: it would take one).
+        let h = dir.join("h");
+        fs::write(&h, b"0123456789").unwrap();
+        let open_h = File::open(&h).unwrap();
+        let before_h = open_h.metadata().unwrap();
+        fs::rename(&h, dir.join("h.old")).unwrap();
+        let c = source_change(&before_h, open_h.metadata().ok(), fs::metadata(&h).ok());
+        assert!(c.replaced && !c.shrunk, "{c:?}");
+        fs::rename(&f, dir.join("f.old")).unwrap();
+        fs::write(&f, b"new").unwrap();
+        let (a, b) = now();
+        assert!(source_change(&before, a, b).replaced);
+        fs::remove_file(&f).unwrap();
+        let (a, b) = now();
+        assert!(source_change(&before, a, b).replaced);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// Deviation 10: a frame or a decode from a regular file is created
     /// 0600 (its mode comes at the end, through its descriptor); from

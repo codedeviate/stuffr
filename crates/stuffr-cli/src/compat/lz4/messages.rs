@@ -1,10 +1,12 @@
-//! Every string the lz4 family prints, as lz4 1.10.0 prints it (C locale;
+//! Every string the lz4 family prints, as lz4 1.11.0 prints it (C locale;
 //! lz4 has no NLS).
 //!
 //! **Clean room** (spec decision 3): lz4's `programs/` is GPL-2.0-or-later
 //! and was never read. Each literal names where it was taken from: the
 //! reference binary's own output (`// probe: <command>`, run as
-//! `/opt/homebrew/opt/lz4/bin/lz4` 1.10.0 under `LC_ALL=C`), its `-h`/`-H`
+//! `/opt/homebrew/opt/lz4/bin/lz4` 1.10.0 under `LC_ALL=C`, and since 0.26.0
+//! `/opt/homebrew/Cellar/lz4/1.11.0/bin/lz4`; every string was checked
+//! against 1.11.0, and the ones it changed or added say so), its `-h`/`-H`
 //! (`// lz4 -H`), or the man page (`// lz4.1`). Formats follow C's `printf`
 //! as [`printf`] renders them: `%s` and `%d` take the next argument (an
 //! integer is formatted by the caller).
@@ -17,13 +19,13 @@ pub(super) use crate::compat::host::printf;
 
 // ---- the banner and the help texts ----
 
-/// probe: `lz4 -V` prints `*** lz4 v1.10.0 64-bit multithread, by Yann
-/// Collet ***`; spec deviation 1 adds `(stuffr X.Y.Z)` (the argument)
-/// after `multithread`, so the prefix `*** lz4 v1.10.0 ` a script reads is
+/// probe: `lz4 -V` (1.11.0) prints `*** lz4 v1.11.0 64-bit multithread, by
+/// Yann Collet ***`; spec deviation 1 adds `(stuffr X.Y.Z)` (the argument)
+/// after `multithread`, so the prefix `*** lz4 v1.11.0 ` a script reads is
 /// unchanged. Printed by `-V` (standard output), first by `-h`/`-H`
 /// (standard error), and at `-v`.
 pub(super) const BANNER: &str =
-    "*** lz4 v1.10.0 64-bit multithread (stuffr %s), by Yann Collet ***\n";
+    "*** lz4 v1.11.0 64-bit multithread (stuffr %s), by Yann Collet ***\n";
 
 /// probe: `lz4 --bogus`: the line before the short usage on a usage error.
 pub(super) const INCORRECT_PARAMETERS: &str = "Incorrect parameters\n";
@@ -40,15 +42,18 @@ pub(super) const USAGE: &str = concat!(
     "Arguments : \n",
     " -1     : fast compression (default) \n",
     " -12    : slowest compression level \n",
-    " -T#    : use # threads for compression (default:0==auto) \n",
+    // lz4 -h (1.11.0): "worker" is new.
+    " -T#    : use # worker threads for compression (default:0==auto) \n",
     " -d     : decompression (default for .lz4 extension)\n",
     " -f     : overwrite output without prompting \n",
     " -k     : preserve source files(s)  (default) \n",
     "--rm    : remove source file(s) after successful de/compression \n",
     " -h/-H  : display help/long help and exit \n",
 );
-/// lz4 -h: the rest of the short help, after the usage (lines 16-43), the
-/// benchmark lines included (R8: printed though `-b` is refused).
+/// lz4 -h: the rest of the short help, after the usage (lines 16-48 in
+/// 1.11.0), the benchmark lines included (R8: printed though `-b` is
+/// refused). `%s` is the default memory budget in MB (4096; 1024 on a
+/// 32-bit build, lz4.1 1.11.0, `--memory`).
 pub(super) const HELP_REST: &str = concat!(
     "\n",
     "Advanced arguments :\n",
@@ -64,6 +69,8 @@ pub(super) const HELP_REST: &str = concat!(
     " -D FILE: use FILE as dictionary (compression & decompression)\n",
     " -B#    : cut file into blocks of size # bytes [32+] \n",
     "                     or predefined block size [4-7] (default: 7) \n",
+    // lz4 -h (1.11.0): new.
+    "                     (custom sizes : single-threaded compression) \n",
     " -BI    : Block Independence (default) \n",
     " -BD    : Block dependency (improves compression ratio) \n",
     " -BX    : enable block checksum (default:disabled) \n",
@@ -71,6 +78,12 @@ pub(super) const HELP_REST: &str = concat!(
     "--content-size : compressed frame includes original size (default:not present)\n",
     "--list FILE : lists information about .lz4 files (useful for files compressed with --content-size flag)\n",
     "--[no-]sparse  : sparse mode (default:enabled on file, disabled on stdout)\n",
+    // lz4 -h (1.11.0): the next four lines are new (`--memory=#` and the
+    // `note :` line end with a blank, the other two do not).
+    "--memory=#     : memory budget of multi-threaded compression (default: %s MB) ; suffixes K, M, G \n",
+    "--single-thread: compress frames with the main thread alone, not cut into jobs (output can differ from -T1 with -BD)\n",
+    "--[no-]mmap    : memory-map files to compress (default:enabled when supported)\n",
+    "                 note : compression fails if the file is truncated or rewritten meanwhile \n",
     "--favor-decSpeed: compressed files decompress faster, but are less compressed \n",
     "--fast[=#]: switch to ultra fast compression level (default: 1)\n",
     "--best  : same as -12\n",
@@ -110,8 +123,12 @@ pub(super) const LONG_HELP: &str = concat!(
     "\n",
     "Compression levels : \n",
     "---------------------\n",
-    "-0 ... -2  => Fast compression, all identical\n",
-    "-3 ... -12 => High compression; higher number == more compression but slower\n",
+    // lz4 -H (1.11.0): these five lines replace 1.10.0's two.
+    "-0  => Default level, identical to -1 \n",
+    "-1  => Fast compression \n",
+    "-2 .. -12 => High compression; higher number == more compression but slower\n",
+    "--best    => Highest available compression level (-12) \n",
+    "--fast=#  => Faster compression; higher number == faster but compress less\n",
     "\n",
     "stdin, stdout and the console : \n",
     "--------------------------------\n",
@@ -168,9 +185,34 @@ pub(super) const NUMERIC_ONLY: &str =
     "error: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB are allowed \n";
 
 /// probe: `LZ4_CLEVEL=x lz4 -qq -c` (printed before the arguments are
-/// read, under every name): the variable's name, then its value.
+/// read, under every name): the variable's name, then its value. 1.11.0
+/// prints it for anything that is not a whole number (`LZ4_CLEVEL=3x`,
+/// `=1G`, `=99999999999`, and `LZ4_CLEVEL=2147483648`).
 pub(super) const ENV_IGNORED: &str =
     "Ignore environment variable setting %s=%s: not a valid unsigned value \n";
+
+/// probe (1.11.0): `LZ4_MEMORY=x lz4 -qq -c`, `=0`, `=4T`, `=50Mx`
+/// (after the two above, also at `-qq`).
+pub(super) const ENV_MEMORY_IGNORED: &str =
+    "Ignore environment variable setting %s=%s: not a valid size \n";
+
+/// probe (1.11.0): `lz4 -T4294967296`, `-B4194304K`, `-99999999999`,
+/// `--fast=4294967296`, `--threads=4294967296`, `-b4294967296` (display
+/// level 1, exit 1, no usage).
+pub(super) const NUMERIC_OVERFLOW: &str = "error: numeric value overflows 32-bit unsigned int \n";
+
+/// probe (1.11.0): `lz4 -2147483648`, `-4294967295`, `-2097152K`,
+/// `--fast=2147483648` (a level above `INT_MAX`).
+pub(super) const NUMERIC_TOO_LARGE: &str = "error: numeric value is too large \n";
+
+/// probe (1.11.0): `lz4 --memory=0`, `=x`, `=4T`, `=1g`, `=1Mx`, `=`,
+/// `--memory a`.
+pub(super) const MEMORY_SIZE_REQUIRED: &str =
+    "error: --memory requires a size, with optional suffixes K, KB, KiB, M, MB, MiB, G, GB, GiB \n";
+
+/// probe (1.11.0): `lz4 --memory=18446744073709551616`,
+/// `--memory=17179869184G`.
+pub(super) const MEMORY_OVERFLOW: &str = "error: --memory value overflows 64-bit unsigned int \n";
 
 // ---- parsing notes ----
 
@@ -181,11 +223,46 @@ pub(super) const BLOCKS_KB: &str = "using blocks of size %d KB \n";
 /// probe: `lz4 -B32 -c`, `lz4 -B1023 -c`: a byte count under 1024.
 pub(super) const BLOCKS_BYTES: &str = "using blocks of size %d bytes \n";
 
-/// probe: `lz4 -v -T300 -c a` (display level 3, compression only; printed
-/// instead of [`USING_THREADS`] when the count was capped): the count asked
-/// for, then the cap.
+/// probe (1.11.0): `lz4 -T5000 a` (display level 2, compression only,
+/// after `Compressed filename will be :`; also with `-l`, `--single-thread`
+/// and a custom `-B#`): the count asked for, then the cap.
 pub(super) const THREADS_REDUCED: &str =
-    "Requested %d threads too large => automatically reduced to %d \n";
+    "Warning : requested %d threads too large => automatically reduced to %d \n";
+
+/// probe (1.11.0): `lz4 -v --memory=40M a` (display level 3, an automatic
+/// thread count lowered by the memory budget): the budget in MB, the
+/// threads, the count it replaces.
+pub(super) const MEMORY_BUDGET_AUTO: &str = "Memory budget (%d MB) : %d threads instead of %d \n";
+
+/// probe (1.11.0): `lz4 --memory=40M -T8 a` (display level 2, a count asked
+/// for, `-T#` or `LZ4_NBWORKERS`, lowered by the budget).
+pub(super) const MEMORY_BUDGET_ASKED: &str =
+    "Warning : memory budget (%d MB) : %d threads instead of %d (see --memory) \n";
+
+/// probe (1.11.0): `lz4 --memory=1 a`, `--memory=30017171 a` (display level
+/// 2, a budget below one worker's): the budget, then one worker's need in
+/// MB (`~28` with 4 MB blocks, `~13` with smaller ones).
+pub(super) const MEMORY_TOO_SMALL: &str =
+    "Warning : memory budget (%d MB) too small : compression requires ~%d MB \n";
+
+/// probe (1.11.0): `lz4 -v --single-thread a` (display level 3, instead of
+/// [`USING_THREADS`]).
+pub(super) const SINGLE_THREADED: &str =
+    "Single-threaded compression (frames not cut into jobs) \n";
+
+/// probe (1.11.0): `lz4 -v -B1024 a` (display level 3, a block size other
+/// than 64 KB, 256 KB, 1 MB and 4 MB, instead of [`USING_THREADS`]): the
+/// size in bytes.
+pub(super) const CUSTOM_BLOCKS: &str =
+    "Note : custom block size (%d bytes) : single-threaded compression (-T# ignored) \n";
+
+/// probe (1.11.0): `lz4 --content-size < a`, `lz4 --content-size -d`, `lz4
+/// --content-size -m stdin a` (display level 2 as parsed, before it is
+/// lowered for standard output; after the banner and the `_POSIX` lines;
+/// whenever the first input is standard input, whatever the operation).
+/// Lower-case, no blank before the newline.
+pub(super) const CONTENT_SIZE_STDIN: &str =
+    "warning : --content-size cannot determine size when used with stdin\n";
 
 // ---- where the output goes (the decision table in `cli.rs`) ----
 
@@ -265,9 +342,9 @@ pub(super) const CLEAR_LINE: &str = concat!(
 /// of at least one byte read: `lz4 e` says `1500.00%`).
 pub(super) const COMPRESSED_SUMMARY: &str = "Compressed %d bytes into %d bytes ==> %s%%\n";
 
-/// probe: `lz4 -l a`: the legacy format's summary has a blank before the
-/// newline.
-pub(super) const COMPRESSED_LEGACY_SUMMARY: &str = "Compressed %d bytes into %d bytes ==> %s%% \n";
+/// probe (1.11.0): `lz4 -l a`: the legacy format's summary is the frame's
+/// (1.10.0 had a blank before the newline).
+pub(super) const COMPRESSED_LEGACY_SUMMARY: &str = "Compressed %d bytes into %d bytes ==> %s%%\n";
 
 /// probe: `lz4 -t b.lz4`, `lz4 -d sub/x.lz4`: the input name as given
 /// (`stdin` for standard input), cut or padded to 30 bytes by the caller
@@ -302,9 +379,29 @@ pub(super) const E27_DICTIONARY: &str =
 /// probe: `lz4 -t bad_hc.lz4`: liblz4's error name (`LZ4F_getErrorName`).
 pub(super) const E34_DECOMPRESSION: &str = "Error 34 : Decompression error : %s \n";
 
-/// probe: `lz4 -c big | head -c1` with SIGPIPE ignored.
-pub(super) const E38_WRITE_COMPRESSED: &str =
-    "Error 38 : Write error : cannot write compressed block \n";
+/// probe (1.11.0): `lz4 -c big | head -c1` with SIGPIPE ignored (1.10.0
+/// said `Error 38`).
+pub(super) const E46_WRITE_COMPRESSED: &str =
+    "Error 46 : Write error : cannot write compressed block \n";
+
+/// probe (1.11.0): `lz4 -12 -T1 f` with `f` truncated, or (with
+/// `--no-frame-crc`) changed in any way, while it is compressed (display
+/// level 1, right after the last refresh; the output file is removed).
+pub(super) const E54_SOURCE_MODIFIED: &str = "Error 54 : %s : file modified during compression (memory-mapped) : output removed ; see --no-mmap \n";
+
+/// probe (1.11.0): `lz4 -12 -T1 f` with `f` appended to, rewritten,
+/// touched or chmod-ed meanwhile (display level 2, after the last refresh):
+/// the name, then [`SOURCE_KEPT`] or nothing.
+pub(super) const SOURCE_MODIFIED: &str =
+    "\rWarning : %s : file modified during processing : output holds the content read %s\n";
+
+/// probe (1.11.0): `lz4 -12 -T1 f` with `f` renamed and another file put
+/// in its place meanwhile.
+pub(super) const SOURCE_REPLACED: &str = "\rWarning : %s : file renamed or replaced during processing : output holds the content read %s\n";
+
+/// probe (1.11.0): `lz4 --rm -12 -T1 f`, `f` modified meanwhile: the end of
+/// [`SOURCE_MODIFIED`] or [`SOURCE_REPLACED`], and `f` is kept.
+pub(super) const SOURCE_KEPT: &str = "; source kept ";
 
 /// probe: `lz4 -c <&-` (closed standard input): the first read of a frame's
 /// input failed. Two blanks before the newline.
@@ -470,11 +567,12 @@ pub(super) const BENCH_REFUSED: &str = "Benchmark mode is not available in this 
 
 // ---- display levels 3 and 4 (Task 6) ----
 
-/// probe: `lz4 -v -T3 a` (display level 3, compression only, after
-/// `Compressed filename will be :` and before the first file): the worker
-/// count, when it is above 1 and was not capped (`-T1` prints nothing,
-/// `-T200` prints it, `-T201` prints [`THREADS_REDUCED`] instead).
-pub(super) const USING_THREADS: &str = "Using %d threads for compression \n";
+/// probe (1.11.0): `lz4 -v -T3 a` (display level 3, compression only,
+/// after `Compressed filename will be :` and before the first file): the
+/// worker count, `-T1`'s too, after the cap and the memory budget. Not
+/// for `-l`; [`SINGLE_THREADED`] or [`CUSTOM_BLOCKS`] instead where they
+/// apply.
+pub(super) const USING_THREADS: &str = "Using up to %d threads for compression \n";
 
 /// probe: `lz4 -v -l a` (display level 3): after the thread line.
 pub(super) const GENERATING_LEGACY: &str = "! Generating LZ4 Legacy format (deprecated) ! \n";

@@ -6,8 +6,10 @@
 //!
 //! **Clean room.** Every rule here was recovered from the man page
 //! (`lz4.1`), `lz4 -h`/`-H` and probes of the 1.10.0 binary (Task 3's
-//! report and `.claude/rules/compat.md`, "lz4 1.10.0 probes"); lz4's
-//! `programs/` was never read. Each rule carries its source.
+//! report and `.claude/rules/compat.md`, "lz4 1.10.0 probes"), then of the
+//! 1.11.0 binary (0.26.0: the 2026-11-08 probe and Task 4's; each rule it
+//! changed says `1.11.0`); lz4's `programs/` was never read. Each rule
+//! carries its source.
 //!
 //! The grammar, in short (all probed):
 //! - An argument not starting with `-`, the empty argument, and every
@@ -15,10 +17,12 @@
 //!   input was named yet, else standard output.
 //! - Short options aggregate (`-9dkf`). A digit run is a level; `-B`,
 //!   `-T`, `-e`, `-i`, `-b` read a number in place (`-T4`, `-B32`), and
-//!   `-D` takes the rest of the argument or the next one. Numbers wrap at
-//!   2^32 and take a `K`/`M` suffix, optionally `i` then `B` (`-B64KiB`).
-//! - Long options are matched whole, except `--fast[=#]` and
-//!   `--threads[=#| #]`.
+//!   `-D` takes the rest of the argument or the next one. Numbers take a
+//!   `K`/`M` suffix, optionally `i` then `B` (`-B64KiB`); since 1.11.0 a
+//!   number past 2^32 - 1 is an error ([`m::NUMERIC_OVERFLOW`]), and so is
+//!   a level past `INT_MAX` ([`m::NUMERIC_TOO_LARGE`]).
+//! - Long options are matched whole, except `--fast[=#]`,
+//!   `--threads[=#| #]` and `--memory[=#| #]`.
 //! - Under a name matching `lz4c`, the rest of a short argument equal to
 //!   `c0`, `c1`, `c2`, `hc` or `y` is a legacy argument (`-hc` compresses;
 //!   `-hc9` is `-h`).
@@ -56,10 +60,22 @@ pub(crate) const EXTENSION: &[u8] = b".lz4";
 /// probe: `lz4 -h` is printed at display level 2; `lz4cat -vv` is the
 /// first `lz4cat` to print the banner, so `lz4cat` starts at 1.
 pub(crate) const DISPLAY_LEVEL_DEFAULT: i32 = 2;
-/// lz4.1, LZ4_NBWORKERS: "capped at LZ4_NBWORKERS_MAX (200 by default)";
-/// probe: `lz4 -v -T201` says `Requested 201 threads too large =>
-/// automatically reduced to 200`.
-pub(crate) const THREADS_MAX: u32 = 200;
+/// lz4.1 (1.11.0), `-T#`: "At most 1024 threads (128 on 32-bit systems)";
+/// probe: `lz4 -T1025 a` says `Warning : requested 1025 threads too large
+/// => automatically reduced to 1024`, `-T1024` and `LZ4_NBWORKERS=1K` do
+/// not.
+pub(crate) const THREADS_MAX: u32 = if cfg!(target_pointer_width = "32") {
+    128
+} else {
+    1024
+};
+/// lz4.1 (1.11.0), `--memory=#`: "default 4 GB, 1 GB on 32-bit"; lz4 -H:
+/// `(default: 4096 MB)`.
+pub(crate) const MEMORY_DEFAULT: u64 = if cfg!(target_pointer_width = "32") {
+    1 << 30
+} else {
+    4 << 30
+};
 /// lz4 -H: "-B# : cut file into blocks of size # bytes [32+]"; probe:
 /// `-B31` is a usage error, `-B32` is accepted.
 const BLOCK_BYTES_MIN: u32 = 32;
@@ -152,13 +168,26 @@ pub(crate) struct Command {
     /// The display level as parsed: 2, or 1 under `lz4cat`, plus `-v`s,
     /// minus `-q`s. Lowering it for `-m` or standard output is the run's.
     pub display_level: i32,
-    /// The compression thread count lz4 would use (R4): `-T#`,
-    /// `--threads`, `LZ4_NBWORKERS`, or the automatic count; at most
-    /// [`THREADS_MAX`].
+    /// The compression thread count lz4 would use before its memory
+    /// budget (R4): `-T#`, `--threads`, `LZ4_NBWORKERS`, or the automatic
+    /// count; at most [`THREADS_MAX`].
     pub threads: u32,
-    /// The count asked for when it was above [`THREADS_MAX`] (the `-v`
-    /// line [`m::THREADS_REDUCED`] reports it).
+    /// The count asked for when it was above [`THREADS_MAX`] (the line
+    /// [`m::THREADS_REDUCED`] reports it).
     pub threads_reduced_from: Option<u32>,
+    /// The count was asked for (`-T#`, `--threads`, `LZ4_NBWORKERS`, not
+    /// 0): a memory budget that lowers it warns at display level 2
+    /// ([`m::MEMORY_BUDGET_ASKED`]), not 3 ([`m::MEMORY_BUDGET_AUTO`]).
+    pub threads_asked: bool,
+    /// `--single-thread`, not followed by `-T#` or `--threads`.
+    pub single_thread: bool,
+    /// The memory budget of multi-threaded compression in bytes
+    /// (`--memory=#`, `LZ4_MEMORY`, else [`MEMORY_DEFAULT`]).
+    pub memory: u64,
+    /// `--[no-]mmap`: on (the default), a regular file is compressed as it
+    /// was when opened, and a change is checked for at the end
+    /// (`io.rs`, `check_source`).
+    pub mmap: bool,
     /// `-D`'s file.
     pub dict_file: Option<Vec<u8>>,
     /// The name matches `lz4c`: the legacy arguments are read, and the help
@@ -167,6 +196,58 @@ pub(crate) struct Command {
     /// The hidden `-p`: wait for a key at a clean exit (probe: `lz4 -p -V
     /// < /dev/null` prints [`m::PRESS_ENTER`]).
     pub pause: bool,
+}
+
+/// How a frame is compressed, as lz4 1.11.0 drives liblz4 (probe §4 as
+/// Task 3 corrected it; the `lz4_opts` module doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Threading {
+    /// `-l`: the block API, no threads and no thread line.
+    Legacy,
+    /// A custom `-B#`: updates of `#` bytes, each flushed, no workers,
+    /// whatever `-T#` says ([`m::CUSTOM_BLOCKS`]).
+    Custom(u32),
+    /// `--single-thread`: no workers, 4 MiB updates
+    /// ([`m::SINGLE_THREADED`]).
+    Single,
+    /// Workers: the count after the memory budget, and whether the budget
+    /// is below one worker's need.
+    Workers(u32, bool),
+}
+
+impl Command {
+    /// How this command compresses its frames.
+    pub(crate) fn threading(&self) -> Threading {
+        if self.opts.legacy {
+            Threading::Legacy
+        } else if let Some(bytes) = self.opts.block_bytes {
+            Threading::Custom(bytes)
+        } else if self.single_thread {
+            Threading::Single
+        } else {
+            let (n, small) = fit_threads(self.threads, self.memory, self.opts.block_size_id());
+            Threading::Workers(n, small)
+        }
+    }
+
+    /// The frame options for liblz4 (C tier) or the pure writer: the
+    /// command's, with the workers, update size and flushing
+    /// [`Command::threading`] says. `sandboxed` keeps one worker, whatever
+    /// the count (R9; the bytes are the same for every count from 1 up).
+    pub(crate) fn encode_options(&self, sandboxed: bool) -> EncodeOptions {
+        let mut o = self.opts.clone();
+        match self.threading() {
+            Threading::Legacy => {}
+            Threading::Custom(bytes) => {
+                o.workers = 0;
+                o.update_size = Some(bytes as usize);
+                o.flush_each_update = true;
+            }
+            Threading::Single => o.workers = 0,
+            Threading::Workers(n, _) => o.workers = if sandboxed { 1 } else { n },
+        }
+        o
+    }
 }
 
 /// How a parse ended without a command: the exit code, and whether the
@@ -217,25 +298,39 @@ fn at(s: &[u8], p: usize) -> u8 {
     s.get(p).copied().unwrap_or(0)
 }
 
-/// Read a number at `s[*p..]`: decimal digits (none is 0), wrapping at
-/// 2^32, then an optional `K` or `M` (times 2^10 or 2^20, wrapping) with an
-/// optional `i` and then `B` after it. `*p` ends after what was read.
+/// A number argument lz4 1.11.0 refuses: past 32 bits
+/// ([`m::NUMERIC_OVERFLOW`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Overflow;
+
+/// Read a number at `s[*p..]`: decimal digits (none is 0), then an optional
+/// `K` or `M` (times 2^10 or 2^20) with an optional `i` and then `B` after
+/// it. `*p` ends after what was read.
 ///
-/// probe: `-B4294967396` is 100 bytes and `-B42949672960` is `-B0`;
-/// `-B64K`, `-B64KB`, `-B64KiB` and `-B64Ki` are 64 KB, `-B64k` is 64
-/// bytes; `-B4194305K` is 1 KB; `-T1i` is `-T1` then `-i`; `-TK` is `-T0`.
-fn read_u32(s: &[u8], p: &mut usize) -> u32 {
-    let mut n: u32 = 0;
+/// probe: `-B64K`, `-B64KB`, `-B64KiB` and `-B64Ki` are 64 KB, `-B64k` is
+/// 64 bytes; `-T1i` is `-T1` then `-i`; `-TK` is `-T0`. 1.11.0 refuses a
+/// value past 2^32 - 1, in the digits or after the suffix (probe:
+/// `-T4294967296`, `-B4194304K`, `-B4096M`, `-4294967296x` are
+/// [`m::NUMERIC_OVERFLOW`]; `-T4294967295`, `-B4194303K` are accepted),
+/// where 1.10.0 wrapped.
+fn read_u32(s: &[u8], p: &mut usize) -> Result<u32, Overflow> {
+    let mut n: u64 = 0;
     while at(s, *p).is_ascii_digit() {
-        n = n.wrapping_mul(10).wrapping_add(u32::from(at(s, *p) - b'0'));
+        n = n * 10 + u64::from(at(s, *p) - b'0');
+        if n > u64::from(u32::MAX) {
+            return Err(Overflow);
+        }
         *p += 1;
     }
     let shift = match at(s, *p) {
         b'K' => 10,
         b'M' => 20,
-        _ => return n,
+        _ => return Ok(n as u32),
     };
-    n = n.wrapping_shl(shift);
+    n <<= shift;
+    if n > u64::from(u32::MAX) {
+        return Err(Overflow);
+    }
     *p += 1;
     if at(s, *p) == b'i' {
         *p += 1;
@@ -243,24 +338,98 @@ fn read_u32(s: &[u8], p: &mut usize) -> u32 {
     if at(s, *p) == b'B' {
         *p += 1;
     }
-    n
+    Ok(n as u32)
+}
+
+/// Why a `--memory` value (or `LZ4_MEMORY`) is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemoryError {
+    /// [`m::MEMORY_SIZE_REQUIRED`]: no number, zero, or anything after it.
+    Size,
+    /// [`m::MEMORY_OVERFLOW`]: past 2^64 - 1.
+    Overflow,
+}
+
+/// A memory size, the whole of `s` (probe, 1.11.0: `--memory=50M`,
+/// `=99999999999`, `=18446744073709551615`, `=1G`, `=1GB`, `=1GiB`, `=1Gi`
+/// and `=01` are accepted; `=0`, `=00`, `=0K`, `=`, `=x`, `=-1`, `=1g`,
+/// `=4T`, `=1Kx`, `=1KiBx` need a size; `=18446744073709551616`,
+/// `=17179869184G` and `=18446744073709551616x` overflow, the overflow
+/// found before the junk).
+pub(crate) fn read_memory(s: &[u8]) -> Result<u64, MemoryError> {
+    let mut p = 0;
+    let mut n: u64 = 0;
+    while at(s, p).is_ascii_digit() {
+        n = n
+            .checked_mul(10)
+            .and_then(|n| n.checked_add(u64::from(at(s, p) - b'0')))
+            .ok_or(MemoryError::Overflow)?;
+        p += 1;
+    }
+    let shift = match at(s, p) {
+        b'K' => Some(10),
+        b'M' => Some(20),
+        b'G' => Some(30),
+        _ => None,
+    };
+    if let Some(shift) = shift {
+        if n.leading_zeros() < shift {
+            return Err(MemoryError::Overflow);
+        }
+        n <<= shift;
+        p += 1;
+        if at(s, p) == b'i' {
+            p += 1;
+        }
+        if at(s, p) == b'B' {
+            p += 1;
+        }
+    }
+    if p != s.len() || n == 0 {
+        return Err(MemoryError::Size);
+    }
+    Ok(n)
 }
 
 /// An environment variable's number: `None` (with [`m::ENV_IGNORED`],
-/// printed whatever the display level) when it is set and does not start
-/// with a digit; anything after the number is ignored.
+/// printed whatever the display level) when it is set and is not a whole
+/// number lz4 1.11.0 accepts; `level` adds the `INT_MAX` bound.
 ///
-/// probe: `LZ4_CLEVEL=3x` is 3, `=1K` is 1024, `=4294967297` is 1; `=x`,
-/// `=-1`, `=` and `= 4` print the warning, under every name and before the
-/// arguments are read (`LZ4_CLEVEL=x lz4 -qq -c` prints it).
-fn read_env(env: &dyn Fn(&str) -> Option<OsString>, var: &str, err: &mut dyn Write) -> Option<u32> {
+/// probe (1.11.0): `LZ4_CLEVEL=1K` is 1024, `=1KiB` and `=01` are
+/// accepted; `=x`, `=-1`, `=`, `= 4`, `=3x`, `=1Kx`, `=1G`, `=4294967296`
+/// and `=99999999999` print the warning, and for `LZ4_CLEVEL` also
+/// `=2147483648` and `=4294967295` (`LZ4_NBWORKERS=4294967295` is a
+/// count); printed under every name and before the arguments are read
+/// (`LZ4_CLEVEL=x lz4 -qq -c` prints it). 1.10.0 took the leading digits.
+fn read_env(
+    env: &dyn Fn(&str) -> Option<OsString>,
+    var: &str,
+    level: bool,
+    err: &mut dyn Write,
+) -> Option<u32> {
     let v = env(var)?;
     let s = v.as_encoded_bytes();
-    if !at(s, 0).is_ascii_digit() {
+    let mut p = 0;
+    let n = read_u32(s, &mut p)
+        .ok()
+        .filter(|&n| at(s, 0).is_ascii_digit() && p == s.len() && !(level && n > i32::MAX as u32));
+    if n.is_none() {
         printf(err, m::ENV_IGNORED, &[var.as_bytes(), s]);
-        return None;
     }
-    Some(read_u32(s, &mut 0))
+    n
+}
+
+/// `LZ4_MEMORY` (lz4.1, 1.11.0): a size as `--memory=` reads it; anything
+/// else is [`m::ENV_MEMORY_IGNORED`] (probe: `LZ4_MEMORY=x lz4 -qq -c`
+/// prints it after `LZ4_CLEVEL`'s and `LZ4_NBWORKERS`' warnings).
+fn read_env_memory(env: &dyn Fn(&str) -> Option<OsString>, err: &mut dyn Write) -> Option<u64> {
+    let v = env("LZ4_MEMORY")?;
+    let s = v.as_encoded_bytes();
+    let n = read_memory(s).ok();
+    if n.is_none() {
+        printf(err, m::ENV_MEMORY_IGNORED, &[b"LZ4_MEMORY", s]);
+    }
+    n
 }
 
 /// R4: the threads lz4 compresses with for a count of `requested` (0 is
@@ -271,9 +440,10 @@ fn read_env(env: &dyn Fn(&str) -> Option<OsString>, var: &str, err: &mut dyn Wri
 /// interposed `sysctlbyname("hw.logicalcpu")` (the one core count it asks
 /// for on macOS) answering 0..=13, 16, 20, 24, 32, 64, 100, 128, 200, 250,
 /// 256, 300 and 1000: 1, 1, 1, 2, 3, 4, 5, 6, 6, 7, 8, 9, 10, 11, 13, 17,
-/// 20, 27, 55, 87, 111, 174, and 218, 223, 262, 874 reduced to 200. This
-/// machine (12 logical cores) prints `Using 10 threads`. Elsewhere the
-/// logical count is [`Cores::detect`]'s (not probed off macOS).
+/// 20, 27, 55, 87, 111, 174, and 218, 223, 262, 874 reduced to 200 (1.10.0's
+/// cap). This machine (12 logical cores) prints `Using up to 10 threads`
+/// under 1.11.0 too. Elsewhere the logical count is [`Cores::detect`]'s
+/// (not probed off macOS). The cap is [`THREADS_MAX`] since 1.11.0.
 pub(crate) fn resolve_threads(requested: u32, cores: Cores) -> (u32, Option<u32>) {
     let n = if requested == 0 {
         let logical = cores.logical;
@@ -286,6 +456,65 @@ pub(crate) fn resolve_threads(requested: u32, cores: Cores) -> (u32, Option<u32>
     } else {
         (n, None)
     }
+}
+
+/// What one worker costs and what compression needs besides, in bytes, by
+/// the frame's block size (`per`, `base`).
+///
+/// probe (1.11.0): binary searches of `--memory=#` for the thread count of
+/// `-T#` (the 2026-11-08 probe, §1.6): `threads = clamp(floor((budget -
+/// base) / per), 1, asked)` fits every threshold, at every level, with or
+/// without `-BD`, for any input. 4 MB blocks: 2 threads from 42928860
+/// bytes, 3 from 55840548, 100 from 1308274284; 1 MB blocks: 2 from
+/// 17761128 (Task 4: `--memory=17761127 -B6 -T5` gives 1, `17761128` 2).
+pub(crate) fn worker_cost(id: BlockSizeId) -> (u64, u64) {
+    match id {
+        BlockSizeId::Max4Mb => (12_911_688, 17_105_484),
+        BlockSizeId::Max1Mb => (3_473_736, 10_813_656),
+        BlockSizeId::Max256Kb => (3_473_736, 10_813_704),
+        BlockSizeId::Max64Kb => (3_473_736, 10_813_896),
+    }
+}
+
+/// The threads a memory `budget` allows of `threads` with blocks of `id`,
+/// and whether the budget is below one worker's need (probe, 1.11.0:
+/// `--memory=30017171` is `too small`, `30017172 -T8` gives 1 thread
+/// without it; a budget too small still compresses, with one).
+pub(crate) fn fit_threads(threads: u32, budget: u64, id: BlockSizeId) -> (u32, bool) {
+    let (per, base) = worker_cost(id);
+    if budget < base + per {
+        return (1, true);
+    }
+    let fit = (budget - base) / per;
+    (
+        u32::try_from(fit)
+            .unwrap_or(u32::MAX)
+            .clamp(1, threads.max(1)),
+        false,
+    )
+}
+
+/// One worker's need in MB, as [`m::MEMORY_TOO_SMALL`] says it (probe,
+/// 1.11.0: `~28 MB` with 4 MB blocks, `~13 MB` with 1 MB ones; the bytes
+/// shifted down 20 bits).
+pub(crate) fn worker_need_mb(id: BlockSizeId) -> u64 {
+    let (per, base) = worker_cost(id);
+    (per + base) >> 20
+}
+
+/// The four standard block sizes in bytes (probe, 1.11.0: `-B65536`,
+/// `-B262144`, `-B4194304` and anything capped to 4 MB are the IDs: `Using
+/// up to 10 threads`, the IDs' bytes; any other count of 32 or more is a
+/// custom size).
+fn standard_block(bytes: u32) -> Option<BlockSizeId> {
+    [
+        BlockSizeId::Max64Kb,
+        BlockSizeId::Max256Kb,
+        BlockSizeId::Max1Mb,
+        BlockSizeId::Max4Mb,
+    ]
+    .into_iter()
+    .find(|id| id.bytes() == bytes as usize)
 }
 
 // ---- help, version, usage ----
@@ -302,7 +531,8 @@ pub(crate) fn print_banner(w: &mut dyn Write) {
 fn print_help(err: &mut dyn Write, program: &[u8], legacy: bool, long: bool) {
     print_banner(err);
     printf(err, m::USAGE, &[program]);
-    printf(err, m::HELP_REST, &[]);
+    let budget = (MEMORY_DEFAULT >> 20).to_string();
+    printf(err, m::HELP_REST, &[budget.as_bytes()]);
     if legacy {
         printf(err, m::HELP_LEGACY, &[]);
     }
@@ -325,8 +555,9 @@ pub(crate) fn bad_usage(err: &mut dyn Write, program: &[u8], display_level: i32)
     Stop::USAGE
 }
 
-/// An error line at display level 1 and exit 1 (`--threads`' errors, a
-/// surplus operand).
+/// An error line at display level 1 and exit 1 (`--threads`' and
+/// `--memory`'s errors, a number past 32 bits, a surplus operand; probe:
+/// `lz4 -p -T4294967296` does not pause).
 fn fail(err: &mut dyn Write, display_level: i32, fmt: &str, args: &[&[u8]]) -> Stop {
     if display_level >= 1 {
         printf(err, fmt, args);
@@ -353,6 +584,9 @@ struct State<'a> {
     content_size: bool,
     display_level: i32,
     threads: u32,
+    single_thread: bool,
+    memory: u64,
+    mmap: bool,
     dict_file: Option<Vec<u8>>,
     legacy_cli: bool,
     pause: bool,
@@ -388,10 +622,22 @@ impl State<'_> {
         self.output = Output::Stdout;
     }
 
+    /// A number at `s[*p..]` ([`read_u32`]), or [`m::NUMERIC_OVERFLOW`].
+    fn number(&self, s: &[u8], p: &mut usize, err: &mut dyn Write) -> Result<u32, Stop> {
+        read_u32(s, p).map_err(|Overflow| fail(err, self.display_level, m::NUMERIC_OVERFLOW, &[]))
+    }
+
+    /// A level of `n`, or [`m::NUMERIC_TOO_LARGE`] past `INT_MAX` (probe,
+    /// 1.11.0: `-2147483647` is level 12's, `-2147483648` too large).
+    fn level(&self, n: u32, err: &mut dyn Write) -> Result<i32, Stop> {
+        i32::try_from(n).map_err(|_| fail(err, self.display_level, m::NUMERIC_TOO_LARGE, &[]))
+    }
+
     /// `-B`'s number (probe: `-B4`..`-B7` are IDs, `-B32` and up a byte
     /// count, anything else a usage error; the line is printed while
     /// parsing, at display level 2: `lz4 -q -B4` prints nothing, `lz4 -B4
-    /// -q` prints it).
+    /// -q` prints it). A byte count of a standard size is its ID (1.11.0:
+    /// [`standard_block`]).
     fn block_size(&mut self, n: u32, err: &mut dyn Write) -> Result<(), Stop> {
         let (shown, unit) = if let Some(id) = u8::try_from(n).ok().and_then(BlockSizeId::from_id) {
             self.opts.block_size = id;
@@ -399,7 +645,12 @@ impl State<'_> {
             (id.bytes() as u32 >> 10, m::BLOCKS_KB)
         } else if n >= BLOCK_BYTES_MIN {
             let bytes = n.min(BLOCK_BYTES_MAX);
-            self.opts.block_bytes = Some(bytes);
+            if let Some(id) = standard_block(bytes) {
+                self.opts.block_size = id;
+                self.opts.block_bytes = None;
+            } else {
+                self.opts.block_bytes = Some(bytes);
+            }
             if bytes >= 1024 {
                 (bytes >> 10, m::BLOCKS_KB)
             } else {
@@ -490,37 +741,74 @@ fn long_option(
         b"--keep" => st.remove = false,
         b"--rm" => st.remove = true,
         b"--best" => st.opts.level = LEVEL_BEST,
+        // lz4.1 (1.11.0), `--single-thread`; probe: the later of it and
+        // `-T#` wins (`--single-thread -T4` is threaded, `-T4
+        // --single-thread` is not).
+        b"--single-thread" => st.single_thread = true,
+        // lz4.1 (1.11.0), `--[no-]mmap`: memory-map regular files to
+        // compress (the default) or read them; `--mmap=1` is a usage error.
+        b"--mmap" => st.mmap = true,
+        b"--no-mmap" => st.mmap = false,
         _ => {
             if let Some(rest) = a.strip_prefix(b"--fast") {
                 // lz4.1: "--fast[=#] ... If =# is not present, it defaults
                 // to 1". probe: `--fast=0`, `--fast=`, `--fast=x`,
-                // `--fast=-1`, `--fast=4294967296` and `--fast3` are usage
-                // errors; `--fast=1x` is `--fast=1`.
-                let n = match rest {
-                    [] => 1,
-                    [b'=', v @ ..] => read_u32(v, &mut 0),
-                    _ => 0,
+                // `--fast=-1` and `--fast3` are usage errors; 1.11.0 also
+                // refuses anything after the number (`--fast=1x`, `=1Kx`,
+                // `=1G`), and a number past 32 bits
+                // ([`m::NUMERIC_OVERFLOW`], found first: `=4294967296x`)
+                // or past `INT_MAX` ([`m::NUMERIC_TOO_LARGE`]:
+                // `=2147483648x`); `=1K`, `=1KiB` are accepted.
+                let (n, whole) = match rest {
+                    [] => (1, true),
+                    [b'=', v @ ..] => {
+                        let mut p = 0;
+                        let n = st.number(v, &mut p, err)?;
+                        (n, p == v.len())
+                    }
+                    _ => (0, true),
                 };
-                if n == 0 {
+                let level = st.level(n, err)?;
+                if n == 0 || !whole {
                     return Err(bad_usage(err, st.program, st.display_level));
                 }
-                // probe: `--fast=4294967295` writes level 1's bytes: the
-                // count is negated as a 32-bit int.
-                st.opts.level = (n as i32).wrapping_neg();
+                st.opts.level = -level;
             } else if let Some(rest) = a.strip_prefix(b"--threads") {
                 // lz4.1: "-T#, --threads=#". probe: `--threads=` is 0,
-                // `--threads 4` takes the next argument, and so does
-                // `--threadsx 4`; `--threads4 a` reads `a` and fails.
+                // `--threads 4` takes the next argument; 1.11.0 makes
+                // `--threads4 a` and `--threadsx 4` usage errors.
                 let v = match rest {
                     [b'=', v @ ..] => v,
-                    _ => next_field(args, i, st, err)?,
+                    [] => next_field(args, i, st, err)?,
+                    _ => return Err(bad_usage(err, st.program, st.display_level)),
                 };
                 let mut p = 0;
-                let n = read_u32(v, &mut p);
+                let n = st.number(v, &mut p, err)?;
                 if p != v.len() {
                     return Err(fail(err, st.display_level, m::NUMERIC_ONLY, &[]));
                 }
                 st.threads = n;
+                st.single_thread = false;
+            } else if let Some(rest) = a.strip_prefix(b"--memory") {
+                // lz4.1 (1.11.0): "--memory=#"; probe: `--memory 50M` takes
+                // the next argument (`--memory a` reads `a` and fails,
+                // `--memory -c` is [`m::SEPARATED_ARGUMENT`], a final
+                // `--memory` [`m::MISSING_ARGUMENT`]); `--memoryx=1M` is a
+                // usage error.
+                let v = match rest {
+                    [b'=', v @ ..] => v,
+                    [] => next_field(args, i, st, err)?,
+                    _ => return Err(bad_usage(err, st.program, st.display_level)),
+                };
+                st.memory = match read_memory(v) {
+                    Ok(n) => n,
+                    Err(MemoryError::Size) => {
+                        return Err(fail(err, st.display_level, m::MEMORY_SIZE_REQUIRED, &[]));
+                    }
+                    Err(MemoryError::Overflow) => {
+                        return Err(fail(err, st.display_level, m::MEMORY_OVERFLOW, &[]));
+                    }
+                };
             } else {
                 return Err(bad_usage(err, st.program, st.display_level));
             }
@@ -569,9 +857,11 @@ fn short_options(
         if c.is_ascii_digit() {
             // lz4 -H: "-1 : fast compression (default) / -12 : slowest
             // compression level"; probe: `-99` and `-1K` write level 12's
-            // bytes, `-4294967295` level -1's (liblz4 clamps, not the
-            // command line).
-            st.opts.level = read_u32(a, &mut p) as i32;
+            // bytes (liblz4 clamps, not the command line); 1.11.0 refuses
+            // `-2147483648` and `-4294967295` ([`m::NUMERIC_TOO_LARGE`])
+            // and `-4294967296` ([`m::NUMERIC_OVERFLOW`]).
+            let n = st.number(a, &mut p, err)?;
+            st.opts.level = st.level(n, err)?;
             continue;
         }
         p += 1;
@@ -635,7 +925,7 @@ fn short_options(
                         b'I' => st.opts.block_linked = false,
                         b'X' => st.opts.block_checksum = true,
                         d if d.is_ascii_digit() => {
-                            let n = read_u32(a, &mut p);
+                            let n = st.number(a, &mut p, err)?;
                             st.block_size(n, err)?;
                             continue;
                         }
@@ -644,7 +934,10 @@ fn short_options(
                     p += 1;
                 }
             }
-            b'T' => st.threads = read_u32(a, &mut p),
+            b'T' => {
+                st.threads = st.number(a, &mut p, err)?;
+                st.single_thread = false;
+            }
             // Spec deviation 5: `-b` alone starts the benchmark, which is
             // refused when the parse ends. probe: `-b` reads a number only
             // after a digit (`-bK` is a usage error).
@@ -652,7 +945,7 @@ fn short_options(
                 st.mode = Mode::Bench;
                 st.bench = true;
                 if at(a, p).is_ascii_digit() {
-                    read_u32(a, &mut p);
+                    st.number(a, &mut p, err)?;
                 }
             }
             // probe: `-e#` and `-i#` are the benchmark's own settings and
@@ -660,7 +953,7 @@ fn short_options(
             // bytes, `-e3d` decompresses); the number is optional (`-eK`
             // is accepted). Only `-b` starts the benchmark (deviation 5).
             b'e' | b'i' => {
-                read_u32(a, &mut p);
+                st.number(a, &mut p, err)?;
             }
             _ => return Err(bad_usage(err, st.program, st.display_level)),
         }
@@ -703,6 +996,9 @@ pub(crate) fn parse(
         content_size: false,
         display_level: if lz4cat { 1 } else { DISPLAY_LEVEL_DEFAULT },
         threads: 0,
+        single_thread: false,
+        memory: MEMORY_DEFAULT,
+        mmap: true,
         dict_file: None,
         legacy_cli: name_matches(program, "lz4c"),
         pause: false,
@@ -711,14 +1007,17 @@ pub(crate) fn parse(
     if lz4cat {
         st.set_stdout();
     }
-    // lz4.1, Environment Variables: LZ4_CLEVEL then LZ4_NBWORKERS (probe:
-    // both invalid print in that order), below the command line.
-    if let Some(level) = read_env(env, "LZ4_CLEVEL", err) {
-        // probe: `LZ4_CLEVEL=4294967295` writes `--fast=1`'s bytes.
+    // lz4.1, Environment Variables: LZ4_CLEVEL, LZ4_NBWORKERS, then
+    // (1.11.0) LZ4_MEMORY (probe: all invalid print in that order), below
+    // the command line (probe: `LZ4_MEMORY=50M lz4 --memory=1G` uses 1G).
+    if let Some(level) = read_env(env, "LZ4_CLEVEL", true, err) {
         st.opts.level = level as i32;
     }
-    if let Some(n) = read_env(env, "LZ4_NBWORKERS", err) {
+    if let Some(n) = read_env(env, "LZ4_NBWORKERS", false, err) {
         st.threads = n;
+    }
+    if let Some(n) = read_env_memory(env, err) {
+        st.memory = n;
     }
 
     let mut all_operands = false;
@@ -776,6 +1075,7 @@ pub(crate) fn parse(
         (vec![input], st.output.clone())
     };
     let (threads, threads_reduced_from) = resolve_threads(st.threads, cores);
+    let threads_asked = st.threads != 0;
     Ok(Command {
         program: program.to_vec(),
         mode: st.mode,
@@ -794,6 +1094,10 @@ pub(crate) fn parse(
         display_level: st.display_level,
         threads,
         threads_reduced_from,
+        threads_asked,
+        single_thread: st.single_thread,
+        memory: st.memory,
+        mmap: st.mmap,
         dict_file: st.dict_file,
         legacy_cli: st.legacy_cli,
         pause: st.pause,

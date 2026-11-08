@@ -11,10 +11,12 @@
 //!   when at least [`REFRESH_MS`] have passed since the last redraw (the
 //!   first one is always drawn: a run that ends within the interval still
 //!   shows one); level 4 and up redraws at every chance. A "chance" is,
-//!   compressing, each job written (4 MiB of a streamed frame's input, 8
-//!   MiB of a legacy frame's), drawn over the input read before that job,
-//!   or a one-shot frame (input under 4 MiB) once complete, drawn over all
-//!   of it; decoding, each new MiB decoded. How many redraws a
+//!   compressing, each update of a streamed frame (4 MiB of input, or a
+//!   custom `-B#`'s size), drawn over all the input read and all the bytes
+//!   written by then (lz4 1.11.0); each job of a legacy frame (8 MiB),
+//!   drawn over the input read before it; or a one-shot frame (input
+//!   shorter than a block) once complete, drawn over all of it; decoding,
+//!   each new MiB decoded. How many redraws a
 //!   run makes is therefore its timing, which spec deviation 2 leaves out of
 //!   the promise.
 //! - **`Done in`.** Seconds since the run started, megabytes per second of
@@ -26,7 +28,7 @@
 use std::io::Write;
 use std::time::Instant;
 
-use super::cli::{Plan, Target};
+use super::cli::{Command, Plan, Target, Threading, worker_need_mb};
 use super::io::{Run, Stats};
 use super::messages::{self as m, printf};
 
@@ -215,18 +217,57 @@ pub(crate) fn decode_summary(w: &mut dyn Write, name: &[u8], written: u64) {
 
 // ---- levels 3 and 4 ----
 
-/// The thread line of a compression (probe: `lz4 -v -T3 a`): `Using N
-/// threads for compression` for 2 to 200 workers, the cap's own line when
-/// the count asked for was above 200, nothing for one worker.
-pub(crate) fn threads_line(w: &mut dyn Write, threads: u32, reduced_from: Option<u32>) {
-    if let Some(asked) = reduced_from {
-        printf(
+/// The thread lines of a compression at display level `level` (probes,
+/// 1.11.0: `lz4 -T5000 a`, `-v --memory=40M a`, `--memory=40M -T8 a`,
+/// `--memory=1 a`, `-v -T1 a`, `-v -l a`, `-v --single-thread a`, `-v
+/// -B1024 a`), in this order:
+/// - level 2: the cap ([`m::THREADS_REDUCED`]), whatever the threading;
+/// - nothing more for `-l`; a custom `-B#` or `--single-thread` say so at
+///   level 3 instead of the rest;
+/// - the memory budget lowering the count: level 2 when the count was
+///   asked for ([`m::MEMORY_BUDGET_ASKED`]), else 3 ([`m::MEMORY_BUDGET_AUTO`]);
+/// - level 2: a budget below one worker's need ([`m::MEMORY_TOO_SMALL`]);
+/// - level 3: `Using up to N threads for compression` (`-T1` too).
+pub(crate) fn threads_lines(w: &mut dyn Write, level: i32, cmd: &Command) {
+    let say = |w: &mut dyn Write, min: i32, fmt: &str, args: &[&[u8]]| {
+        if level >= min {
+            printf(w, fmt, args);
+        }
+    };
+    let num = |n: u64| n.to_string().into_bytes();
+    if let Some(asked) = cmd.threads_reduced_from {
+        say(
             w,
+            2,
             m::THREADS_REDUCED,
-            &[asked.to_string().as_bytes(), threads.to_string().as_bytes()],
+            &[&num(asked.into()), &num(cmd.threads.into())],
         );
-    } else if threads > 1 {
-        printf(w, m::USING_THREADS, &[threads.to_string().as_bytes()]);
+    }
+    match cmd.threading() {
+        Threading::Legacy => {}
+        Threading::Custom(bytes) => say(w, 3, m::CUSTOM_BLOCKS, &[&num(bytes.into())]),
+        Threading::Single => say(w, 3, m::SINGLE_THREADED, &[]),
+        Threading::Workers(n, small) => {
+            let mb = num(cmd.memory >> 20);
+            if n < cmd.threads {
+                let (min, fmt) = if cmd.threads_asked {
+                    (2, m::MEMORY_BUDGET_ASKED)
+                } else {
+                    (3, m::MEMORY_BUDGET_AUTO)
+                };
+                say(
+                    w,
+                    min,
+                    fmt,
+                    &[&mb, &num(n.into()), &num(cmd.threads.into())],
+                );
+            }
+            if small {
+                let need = num(worker_need_mb(cmd.opts.block_size_id()));
+                say(w, 2, m::MEMORY_TOO_SMALL, &[&mb, &need]);
+            }
+            say(w, 3, m::USING_THREADS, &[&num(n.into())]);
+        }
     }
 }
 
@@ -293,8 +334,8 @@ impl Run<'_> {
     /// order:
     /// - display level 4, `-r`: the list it made, each name after its index
     ///   from 0 (printed for the names as expanded, missing ones too);
-    /// - display level 3, compressing: the thread line, then the legacy
-    ///   notice for `-l`;
+    /// - compressing: the thread lines ([`threads_lines`]), then the legacy
+    ///   notice for `-l` (level 3);
     /// - display level 4, decoding: the standard output note, when the
     ///   output is standard output or there are `-m` operands (the note is
     ///   printed though they write files: `lz4 -vv -d -m a.lz4` says it).
@@ -307,13 +348,7 @@ impl Run<'_> {
             }
         }
         if plan.op == super::cli::Op::Compress {
-            if self.level >= 3 {
-                threads_line(
-                    &mut *self.err,
-                    self.cmd.threads,
-                    self.cmd.threads_reduced_from,
-                );
-            }
+            threads_lines(&mut *self.err, self.level, self.cmd);
             if self.cmd.opts.legacy {
                 self.say(3, m::GENERATING_LEGACY, &[]);
             }
@@ -513,8 +548,10 @@ mod tests {
         let small = rec(SMALL_V);
         let all: Vec<u8> = small.iter().flat_map(|(_, b)| b.clone()).collect();
         let all = String::from_utf8(all).unwrap().replace("\r\n", "\n");
-        // The recording: `lz4 -f -v -T3 a a.lz4` over a 1760-byte input.
-        let want_threads = text(|w| threads_line(w, 3, None));
+        // The recording: `lz4 -f -v -T3 a a.lz4` over a 1760-byte input,
+        // by lz4 1.10.0, which said `Using 3 threads` where 1.11.0 says
+        // `Using up to 3 threads` (pinned in `the_thread_lines`).
+        let want_threads = lines(3, &["-T3"]).replace("up to ", "");
         assert!(all.contains(&want_threads), "{all:?}");
         let progress = text(|w| read_progress(w, 0, 1, false));
         // The reference's first refresh is drawn before the output exists
@@ -597,27 +634,138 @@ mod tests {
         assert!(short.ends_with(&format!("s{} : decoded 0 bytes \n", " ".repeat(29))));
     }
 
-    /// The thread line: counts to the cap, the cap's own line, none for one
-    /// worker (probe: `-T1`, `-T2`, `-T200`, `-T201`, `-T300`).
+    /// The command `args` parse into on a 12-core machine (this Mac's
+    /// count, which the probes below ran on).
+    fn command(args: &[&str]) -> Command {
+        let args: Vec<std::ffi::OsString> = args.iter().map(Into::into).collect();
+        let cores = crate::compat::host::Cores {
+            logical: 12,
+            physical: 12,
+        };
+        let r = super::super::cli::parse(
+            b"lz4",
+            &|_| None,
+            &args,
+            cores,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        r.unwrap_or_else(|_| panic!("{args:?} does not parse"))
+    }
+
+    /// The thread lines at display level `level`.
+    fn lines(level: i32, args: &[&str]) -> String {
+        text(|w| threads_lines(w, level, &command(args)))
+    }
+
+    /// The thread lines (probes, lz4 1.11.0 on 12 logical cores, each the
+    /// reference's whole stderr between `Compressed filename will be :` and
+    /// the first refresh).
     #[test]
-    fn the_thread_line() {
-        assert_eq!(text(|w| threads_line(w, 1, None)), "");
+    fn the_thread_lines() {
+        let using = |n: u32| format!("Using up to {n} threads for compression \n");
+        assert_eq!(lines(3, &["-T1"]), using(1));
+        assert_eq!(lines(2, &["-T1"]), "");
+        assert_eq!(lines(3, &[]), using(10));
+        assert_eq!(lines(3, &["-T300"]), using(300));
+        let cap = "Warning : requested 5000 threads too large => automatically reduced to 1024 \n";
+        let budget =
+            "Warning : memory budget (4096 MB) : 331 threads instead of 1024 (see --memory) \n";
+        assert_eq!(lines(2, &["-T5000"]), format!("{cap}{budget}"));
         assert_eq!(
-            text(|w| threads_line(w, 2, None)),
-            "Using 2 threads for compression \n"
+            lines(3, &["-T5000"]),
+            format!("{cap}{budget}{}", using(331))
+        );
+        assert_eq!(lines(1, &["-T5000"]), "");
+        assert_eq!(
+            lines(3, &["--memory=40M"]),
+            format!(
+                "Memory budget (40 MB) : 1 threads instead of 10 \n{}",
+                using(1)
+            )
+        );
+        assert_eq!(lines(2, &["--memory=40M"]), "");
+        assert_eq!(
+            lines(2, &["--memory=40M", "-T8"]),
+            "Warning : memory budget (40 MB) : 1 threads instead of 8 (see --memory) \n"
+        );
+        let small = "Warning : memory budget (0 MB) too small : compression requires ~28 MB \n";
+        assert_eq!(lines(2, &["--memory=1"]), small);
+        assert_eq!(
+            lines(3, &["--memory=1"]),
+            format!(
+                "Memory budget (0 MB) : 1 threads instead of 10 \n{small}{}",
+                using(1)
+            )
         );
         assert_eq!(
-            text(|w| threads_line(w, 200, None)),
-            "Using 200 threads for compression \n"
+            lines(3, &["-T1", "--memory=1"]),
+            format!("{small}{}", using(1))
         );
         assert_eq!(
-            text(|w| threads_line(w, 200, Some(201))),
-            "Requested 201 threads too large => automatically reduced to 200 \n"
+            lines(2, &["-T8", "--memory=1"]),
+            format!(
+                "Warning : memory budget (0 MB) : 1 threads instead of 8 (see --memory) \n{small}"
+            )
         );
         assert_eq!(
-            text(|w| threads_line(w, 200, Some(300))),
-            "Requested 300 threads too large => automatically reduced to 200 \n"
+            lines(2, &["--memory=30017171"]),
+            "Warning : memory budget (28 MB) too small : compression requires ~28 MB \n"
         );
+        assert_eq!(
+            lines(2, &["--memory=30017172", "-T8"]),
+            "Warning : memory budget (28 MB) : 1 threads instead of 8 (see --memory) \n"
+        );
+        assert_eq!(
+            lines(3, &["--memory=40M", "-B4"]),
+            format!(
+                "Memory budget (40 MB) : 8 threads instead of 10 \n{}",
+                using(8)
+            )
+        );
+        assert_eq!(
+            lines(3, &["--memory=17761127", "-B6", "-T5"]),
+            format!(
+                "Warning : memory budget (16 MB) : 1 threads instead of 5 (see --memory) \n{}",
+                using(1)
+            )
+        );
+        assert_eq!(
+            lines(3, &["--memory=17761128", "-B6", "-T5"]),
+            format!(
+                "Warning : memory budget (16 MB) : 2 threads instead of 5 (see --memory) \n{}",
+                using(2)
+            )
+        );
+        assert_eq!(lines(3, &["-T5000", "-l"]), cap);
+        assert_eq!(lines(3, &["-l"]), "");
+        assert_eq!(lines(2, &["--memory=40M", "-l", "-T8"]), "");
+        let single = "Single-threaded compression (frames not cut into jobs) \n";
+        assert_eq!(lines(3, &["--single-thread"]), single);
+        assert_eq!(
+            lines(3, &["-T5000", "--single-thread"]),
+            format!("{cap}{single}")
+        );
+        assert_eq!(lines(2, &["--memory=40M", "-T8", "--single-thread"]), "");
+        assert_eq!(
+            lines(2, &["--memory=40M", "--single-thread", "-T8"]),
+            "Warning : memory budget (40 MB) : 1 threads instead of 8 (see --memory) \n"
+        );
+        let custom =
+            "Note : custom block size (1024 bytes) : single-threaded compression (-T# ignored) \n";
+        assert_eq!(lines(3, &["-B1024"]), custom);
+        assert_eq!(lines(3, &["-T5000", "-B1024"]), format!("{cap}{custom}"));
+        assert_eq!(lines(2, &["--memory=40M", "-B1024", "-T8"]), "");
+        // Standard sizes given in bytes are the IDs, not custom sizes.
+        for b in [
+            "-B65536",
+            "-B262144",
+            "-B4194304",
+            "-B4194305",
+            "-B4294967295",
+        ] {
+            assert_eq!(lines(3, &[b]), using(10), "{b}");
+        }
     }
 
     /// `Done in`: the speed of the bytes over the seconds, the load of the

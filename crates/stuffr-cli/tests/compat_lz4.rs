@@ -45,12 +45,12 @@ mod unix {
     /// judged by the reference decoding them (spec deviation 6).
     const EXACT: bool = cfg!(feature = "lz4-c");
 
-    const REFERENCE_BANNER: &str = "*** lz4 v1.10.0 64-bit multithread, by Yann Collet ***\n";
+    const REFERENCE_BANNER: &str = "*** lz4 v1.11.0 64-bit multithread, by Yann Collet ***\n";
 
     /// Spec deviation 1: stuffr's banner.
     fn our_banner() -> String {
         format!(
-            "*** lz4 v1.10.0 64-bit multithread (stuffr {}), by Yann Collet ***\n",
+            "*** lz4 v1.11.0 64-bit multithread (stuffr {}), by Yann Collet ***\n",
             env!("CARGO_PKG_VERSION")
         )
     }
@@ -2606,7 +2606,7 @@ mod unix {
         // Deviation 2 covers which refreshes are drawn, not their figures
         // (read from the raw stderr; the pure tier's bytes, and so its
         // figures, are its own: deviation 6).
-        if EXACT {
+        if EXACT && !threaded_compression(c) {
             assert_lz4_read_figures(c, &r, &s);
         }
         // Spec deviation 8: off macOS the reference completes a block-size
@@ -2643,6 +2643,45 @@ mod unix {
         }
         assert_same(c, &r, &s);
         true
+    }
+
+    /// Whether `c` may compress a frame with liblz4's workers (lz4 1.11.0:
+    /// not `-l`, not a custom `-B#`, not `--single-thread` after the last
+    /// `-T#`). There a refresh's figure is what the workers had handed back
+    /// when it was drawn, which is timing: the reference itself gave 18.93%
+    /// and 28.39% at 8 MiB on two runs of `lz4 -vvvv -B6` over 9 MiB
+    /// (probe, 2026-11-08). Deviation 2 then covers the figures too; the
+    /// refreshes are still compared as the normalisers leave them.
+    fn threaded_compression(c: &Case) -> bool {
+        let mut single = false;
+        for a in &c.args {
+            if *a == "--" {
+                break;
+            }
+            if *a == "--single-thread" {
+                single = true;
+            } else if a.starts_with("--threads") {
+                single = false;
+            } else if let Some(short) = a.strip_prefix('-').filter(|s| !s.starts_with('-')) {
+                if short.contains('T') {
+                    single = false;
+                }
+                if short.contains('l') {
+                    return false;
+                }
+                if let Some(at) = short.find('B') {
+                    let digits: String = short[at + 1..]
+                        .chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect();
+                    let n: u64 = digits.parse().unwrap_or(0);
+                    if n >= 32 && ![65_536, 262_144, 1_048_576].contains(&n) && n < 4_194_304 {
+                        return false;
+                    }
+                }
+            }
+        }
+        !single
     }
 
     /// Whether `c` is a `--list -v` of a fixture whose first frame ends
@@ -2722,8 +2761,35 @@ mod unix {
     #[test]
     fn environment_variables_match_the_reference() {
         let mut cases = Vec::new();
-        for var in ["LZ4_CLEVEL", "LZ4_NBWORKERS"] {
-            for val in ["x", "-1", "", " 4", "3x", "1K", "4294967297", "201"] {
+        for var in ["LZ4_CLEVEL", "LZ4_NBWORKERS", "LZ4_MEMORY"] {
+            for val in [
+                "x",
+                "-1",
+                "",
+                " 4",
+                "3x",
+                "1K",
+                "4294967297",
+                "201",
+                // lz4 1.11.0: whole values only, 32 bits (64 for
+                // LZ4_MEMORY), and a level up to INT_MAX.
+                "2147483647",
+                "2147483648",
+                "4294967295",
+                "4294967296",
+                "99999999999",
+                "1KiB",
+                "1Kx",
+                "1G",
+                "1GiB",
+                "1g",
+                "0",
+                "00",
+                "01",
+                "50M",
+                "18446744073709551615",
+                "18446744073709551616",
+            ] {
                 for args in [&["-V"][..], &["-qq", "-V"], &["--bogus"]] {
                     let mut c = case(&row("Task 3", "env", "lz4", args, &[], 0, ""));
                     c.env.push((var, val));
@@ -2740,6 +2806,46 @@ mod unix {
         both.env
             .extend([("LZ4_NBWORKERS", "y"), ("LZ4_CLEVEL", "x")]);
         cases.push(both);
+        let mut all = case(&row("Task 3", "env", "lz4", &["-qq", "-V"], &[], 0, ""));
+        all.env.extend([
+            ("LZ4_MEMORY", "z"),
+            ("LZ4_NBWORKERS", "y"),
+            ("LZ4_CLEVEL", "x"),
+        ]);
+        cases.push(all);
+        // What a valid value does to a compression's thread lines.
+        let a = super::compat_harness::text(4000, 46);
+        for (var, val) in [
+            ("LZ4_MEMORY", "50M"),
+            ("LZ4_MEMORY", "1"),
+            ("LZ4_MEMORY", "1K"),
+            ("LZ4_MEMORY", "1G"),
+            ("LZ4_MEMORY", "18446744073709551615"),
+            ("LZ4_NBWORKERS", "3"),
+            ("LZ4_NBWORKERS", "1K"),
+            ("LZ4_NBWORKERS", "2000"),
+            ("LZ4_NBWORKERS", "2147483648"),
+            ("LZ4_NBWORKERS", "4294967295"),
+            ("LZ4_NBWORKERS", "0"),
+            ("LZ4_CLEVEL", "9"),
+            ("LZ4_CLEVEL", "2147483647"),
+        ] {
+            for args in [&["-v", "a", "o.lz4"][..], &["a", "o.lz4"]] {
+                let mut c = lz4_case("lz4", args, vec![("a", a.clone())]);
+                c.env.push((var, val));
+                cases.push(c);
+            }
+        }
+        let mut c = lz4_case(
+            "lz4",
+            &["-v", "--memory=1G", "a", "o.lz4"],
+            vec![("a", a.clone())],
+        );
+        c.env.push(("LZ4_MEMORY", "50M"));
+        cases.push(c);
+        let mut c = lz4_case("lz4", &["-v", "--memory=50M", "a", "o.lz4"], vec![("a", a)]);
+        c.env.push(("LZ4_MEMORY", "1G"));
+        cases.push(c);
         run_group("environment", &cases, Skipped::none(), &compare);
     }
 
@@ -4179,9 +4285,9 @@ mod unix {
     // disposition, no cleanup, no temporary file (lz4 writes the named
     // output directly).
 
-    /// SIGINT, SIGTERM and SIGHUP during `lz4 -12 -T1 big out.lz4` and
-    /// `unlz4 big.lz4 out`: both die by the signal and leave the partial
-    /// output.
+    /// SIGINT, SIGTERM and SIGHUP during `lz4 -12 -T1 big out.lz4`, `lz4
+    /// -12 -T4 big out.lz4` and `unlz4 big.lz4 out`: all die by the signal
+    /// and leave the partial output.
     #[test]
     fn an_interrupt_leaves_the_partial_output_and_dies_by_the_signal() {
         use interrupt::*;
@@ -4206,10 +4312,22 @@ mod unix {
             &'a str,
             &'a dyn Fn(usize) -> Vec<u8>,
         );
-        let jobs: [Job; 2] = [
+        let jobs: [Job; 3] = [
             (
                 "lz4",
                 &["-12", "-T1", "big", "out.lz4"],
+                "big",
+                "out.lz4",
+                &plain,
+            ),
+            // Review Focus (0.26.0 Task 4): liblz4 1.11.0's own workers on
+            // a multi-job input (C tier; the pure tier has none). No
+            // handler is installed, so whichever thread the signal lands
+            // on, the process dies of it and the partial output stays,
+            // as the reference's does.
+            (
+                "lz4",
+                &["-12", "-T4", "big", "out.lz4"],
                 "big",
                 "out.lz4",
                 &plain,
@@ -4284,7 +4402,7 @@ mod unix {
 
     /// Spec deviation 4, an expected difference: with SIGPIPE ignored by the
     /// parent, lz4 inherits the ignore and answers `Error 70` (decoding) or
-    /// `Error 38` (compressing) into a closed pipe; stuffr restores the
+    /// `Error 46` (compressing; 1.10.0's `Error 38`) into a closed pipe; stuffr restores the
     /// default action in `run`, as the earlier families do (ruling T3-c),
     /// and dies of the signal with nothing said. Review Focus 1's
     /// default-disposition case is `lz4cat_into_a_closed_pipe`.
@@ -4340,8 +4458,9 @@ mod unix {
             (
                 "lz4",
                 &["-T1", "-c", "big"][..],
-                38,
-                "Error 38 : Write error : cannot write compressed block \n",
+                46,
+                // lz4 1.11.0 (1.10.0: `Error 38`).
+                "Error 46 : Write error : cannot write compressed block \n",
             ),
         ] {
             let theirs = run(&reference, name, args);
@@ -4445,5 +4564,470 @@ mod unix {
         ));
         assert_eq!(s.code, 0, "{}", s.stderr);
         assert_eq!(s.tree["o"].1, 0o604);
+    }
+
+    // ---- lz4 1.11.0: options, levels, threads, messages (0.26.0 Task 4) ----
+    //
+    // Probed 2026-11-08 against /opt/homebrew/Cellar/lz4/1.11.0/bin/lz4
+    // (the probe's §1.1-1.8, §1.13-1.14, and Task 4's own probes).
+
+    /// Numbers past 32 bits, levels past `INT_MAX`, `--fast`'s and
+    /// `--threads`' new strictness, `--memory` and its errors, the new
+    /// long options; each case ends while parsing or compresses `a`.
+    #[test]
+    fn the_1_11_command_line_matches_the_reference() {
+        let a = super::compat_harness::text(4000, 47);
+        let parse_only: &[&[&str]] = &[
+            &["-2147483648", "a"],
+            &["-4294967295", "a"],
+            &["-4294967296", "a"],
+            &["-99999999999", "a"],
+            &["-2097152K", "a"],
+            &["-2048M", "a"],
+            &["-4194304K", "a"],
+            &["-4294967296x", "a"],
+            &["--fast=2147483648", "a"],
+            &["--fast=4294967295", "a"],
+            &["--fast=4294967296", "a"],
+            &["--fast=4294967296x", "a"],
+            &["--fast=2147483648x", "a"],
+            &["--fast=1x", "a"],
+            &["--fast=1Kx", "a"],
+            &["--fast=1G", "a"],
+            &["-T4294967296", "a"],
+            &["-T4194304K", "a"],
+            &["-T4294967296x", "a"],
+            &["-T1G", "a"],
+            &["--threads=4294967296", "a"],
+            &["--threads=4194304K", "a"],
+            &["--threads=1G", "a"],
+            &["--threads=1x", "a"],
+            &["--threads4", "a"],
+            &["--threadsx", "4", "-V"],
+            &["-B4294967296", "a"],
+            &["-B4194304K", "a"],
+            &["-B4096M", "a"],
+            &["-B99999999999", "a"],
+            &["-B4194305K", "a"],
+            &["-B4G", "a"],
+            &["-B1G", "a"],
+            &["-B4", "-T4294967296", "a"],
+            &["-b4294967296"],
+            &["-e4294967296", "a"],
+            &["-i4294967296", "a"],
+            &["-qq", "-2147483648", "a"],
+            &["-q", "-2147483648", "a"],
+            &["-2147483648", "-qq", "a"],
+            &["-p", "-T4294967296"],
+            &["--memory=0", "a"],
+            &["--memory=00", "a"],
+            &["--memory=0K", "a"],
+            &["--memory=", "a"],
+            &["--memory=x", "a"],
+            &["--memory=-1", "a"],
+            &["--memory=1g", "a"],
+            &["--memory=4T", "a"],
+            &["--memory=1Q", "a"],
+            &["--memory=1Mx", "a"],
+            &["--memory=1KiBx", "a"],
+            &["--memory==1M", "a"],
+            &["--memory=16777216T", "a"],
+            &["--memory=18446744073709551616", "a"],
+            &["--memory=17179869184G", "a"],
+            &["--memory=18446744073709551616x", "a"],
+            &["--memory", "a"],
+            &["--memory"],
+            &["--memory", "-c", "a"],
+            &["--memoryx=1M", "a"],
+            &["-qq", "--memory=0", "a"],
+            &["-q", "--memory=0", "a"],
+            &["-p", "--memory=0"],
+            &["--mmap=1", "a"],
+            &["--single-thread=1", "a"],
+            &["--single-threadx", "a"],
+            &["--threads", "-v"],
+            &["--threads"],
+            &["--threads", "-", "a"],
+        ];
+        // Compressions: the thread lines (level 2 to a file, 3 with -v).
+        let compress: &[&[&str]] = &[
+            &["-T1"],
+            &["-T0"],
+            &["-T300"],
+            &["-T1024"],
+            &["-T1025"],
+            &["-T5000"],
+            &["-T4294967295"],
+            &["-T1K"],
+            &["-T1M"],
+            &["--threads=", "-T3"],
+            &["--threads=1KiB"],
+            &["--memory=40M"],
+            &["--memory=40M", "-T8"],
+            &["--memory=1"],
+            &["--memory=1", "-T1"],
+            &["--memory=1", "-T8"],
+            &["--memory=1K"],
+            &["--memory=1KB"],
+            &["--memory=1M"],
+            &["--memory=1048575"],
+            &["--memory=30017171"],
+            &["--memory=30017172", "-T8"],
+            &["--memory=42928859", "-T8"],
+            &["--memory=42928860", "-T8"],
+            &["--memory=40M", "-B4"],
+            &["--memory=40M", "-B5"],
+            &["--memory=40M", "-B4", "-BD", "-9"],
+            &["--memory=17761127", "-B6", "-T5"],
+            &["--memory=17761128", "-B6", "-T5"],
+            &["--memory=14287391", "-B6"],
+            &["--memory=14287392", "-B6"],
+            &["--memory", "50M"],
+            &["--memory=1G"],
+            &["--memory=1GB"],
+            &["--memory=1GiB"],
+            &["--memory=1Gi"],
+            &["--memory=01"],
+            &["--memory=99999999999"],
+            &["--memory=18446744073709551615"],
+            &["--memory=17179869183G"],
+            &["-l"],
+            &["-l", "-T5000"],
+            &["--memory=40M", "-l", "-T8"],
+            &["--single-thread"],
+            &["-T5000", "--single-thread"],
+            &["--single-thread", "-T4"],
+            &["--memory=40M", "--single-thread", "-T8"],
+            &["--memory=40M", "-T8", "--single-thread"],
+            &["-B1024"],
+            &["-B32"],
+            &["-B100000", "-BD"],
+            &["-T5000", "-B1024"],
+            &["--memory=40M", "-B1024", "-T8"],
+            &["-B65536"],
+            &["-B262144"],
+            &["-B1048576"],
+            &["-B4194304"],
+            &["-B4194305"],
+            &["-B4294967295"],
+            &["-B4194303K"],
+            &["-B4095M"],
+            &["-B1Ki"],
+            &["-B1KiB"],
+            &["-B1KB"],
+            &["-B1MB"],
+            &["--mmap"],
+            &["--no-mmap"],
+            &["--fast=2147483647"],
+            &["--fast=1K"],
+            &["--fast=1KB"],
+            &["--fast=1Ki"],
+            &["--fast=1KiB"],
+            &["-2147483647"],
+            &["-2097151K"],
+            &["-1KiB"],
+            &["-13"],
+            &["-0"],
+            &["-2"],
+            &["-eK"],
+        ];
+        let mut cases = Vec::new();
+        for args in parse_only {
+            cases.push(lz4_case("lz4", args, vec![("a", a.clone())]));
+        }
+        for opts in compress {
+            for (pre, post) in [
+                (&["-v"][..], &["a", "o.lz4"][..]),
+                (&[][..], &["a", "o.lz4"][..]),
+                (&["-v"][..], &["-c", "a"][..]),
+                (&[][..], &["-c", "a"][..]),
+            ] {
+                // A legacy file's time is 0.26.0 Task 5's (1.11.0 copies
+                // it now): standard output only here.
+                if opts.contains(&"-l") && post[0] == "a" {
+                    continue;
+                }
+                let mut args = pre.to_vec();
+                args.extend_from_slice(opts);
+                args.extend_from_slice(post);
+                cases.push(lz4_case("lz4", &args, vec![("a", a.clone())]));
+            }
+        }
+        // Several files: the lines once, before the first (level 3), none at
+        // `-m`'s level 1.
+        for args in [
+            &["-v", "-T5000", "--memory=40M", "-m", "a", "b"][..],
+            &["-T5000", "-m", "a", "b"],
+        ] {
+            cases.push(lz4_case(
+                "lz4",
+                args,
+                vec![("a", a.clone()), ("b", a.clone())],
+            ));
+        }
+        for args in [
+            &["-vv", "-T3", "-c", "a"][..],
+            &["-vv", "--memory=40M", "-c", "a"],
+            &["-vv", "-T1", "a", "o.lz4"],
+        ] {
+            cases.push(lz4_case("lz4", args, vec![("a", a.clone())]));
+        }
+        // Decoding and listing print none of them.
+        let frame = made(&["-1", "-q", "-c"], &a);
+        for args in [
+            // (`-v` would add `Done in` after a clean decode: Task 5's.)
+            &["-T5000", "-d", "a.lz4", "o"][..],
+            &["--memory=1", "-d", "a.lz4", "o"],
+            &["-T5000", "-t", "a.lz4"],
+            &["-T5000", "--list", "a.lz4"],
+            &["-v", "-T5000", "--list", "a.lz4"],
+        ] {
+            cases.push(lz4_case("lz4", args, vec![("a.lz4", frame.clone())]));
+        }
+        check("the_1_11_command_line_matches_the_reference", &cases);
+    }
+
+    /// lz4 1.11.0's help: `-h`, `-H`, under each name, and the short help
+    /// after a usage error (Appendix A of the probe, verbatim).
+    #[test]
+    fn the_1_11_help_matches_the_reference() {
+        let mut cases = Vec::new();
+        for name in ["lz4", "unlz4", "lz4cat", "lz4c"] {
+            for args in [&["-h"][..], &["-H"], &["--help"], &["--bogus"], &["-V"]] {
+                cases.push(lz4_case(name, args, vec![]));
+            }
+        }
+        check("the_1_11_help_matches_the_reference", &cases);
+    }
+
+    /// `--content-size` with standard input first (probe, 1.11.0: a
+    /// warning at display level 2 as parsed, for every operation).
+    #[test]
+    fn content_size_from_standard_input_matches_the_reference() {
+        let a = super::compat_harness::text(3000, 48);
+        let frame = made(&["-1", "-q", "-c"], &a);
+        let mut cases = Vec::new();
+        for args in [
+            &["--content-size", "-", "o.lz4"][..],
+            &["--content-size", "-c"],
+            &["--content-size"],
+            &["-v", "--content-size", "-c"],
+            &["-vv", "--content-size", "-", "o.lz4"],
+            &["-q", "--content-size", "-c"],
+            // (`-m stdin a` writes both to standard output, which the pure
+            // tier's round trip cannot tell apart: one input here.)
+            &["--content-size", "-m", "stdin"],
+            &["--content-size", "-m", "a", "stdin"],
+            &["--content-size", "a", "-", "-m"],
+            &["--content-size", "stdin", "o.lz4"],
+            &["--content-size", "-c", "a"],
+            &["-v", "--content-size", "-l", "-", "o.lz4"],
+            &["-v", "--content-size", "-f", "-", "stdin"],
+        ] {
+            cases.push(piped("lz4", args, vec![("a", a.clone())], a.clone()));
+        }
+        for args in [
+            &["--content-size", "-d"][..],
+            // (`-v -t` would add `Done in`, 0.26.0 Task 5's.)
+            &["--content-size", "-t", "-"],
+            &["-v", "--content-size", "--list", "-"],
+            &["--content-size", "-dc"],
+        ] {
+            cases.push(piped("lz4", args, vec![], frame.clone()));
+        }
+        // The legacy summary (1.11.0: no blank before its newline).
+        for args in [&["-v", "-l", "-c", "a"][..], &["-v", "-l", "-c", "e"]] {
+            cases.push(lz4_case(
+                "lz4",
+                args,
+                vec![("a", a.clone()), ("e", Vec::new())],
+            ));
+        }
+        check(
+            "content_size_from_standard_input_matches_the_reference",
+            &cases,
+        );
+    }
+
+    /// The probe's §1.13 table (errors 53 and 54 are new in 1.11.0): a
+    /// source changed while it is compressed. Each case starts `lz4 -12 -T1
+    /// [opts] f` over 64 MiB, changes `f` once the output holds data, and
+    /// compares the exit, the message (refreshes dropped), whether the
+    /// output and the source are left, and how much the output decodes to.
+    ///
+    /// C tier only: the pure tier compresses so fast that the change can
+    /// come after it has finished (its rule is `io.rs`' unit tests').
+    #[test]
+    fn a_source_changed_while_compressed_matches_the_reference() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        if !EXACT {
+            return;
+        }
+        let Some(dir) = lz4_dir() else { return };
+        let _serial = interrupt::interrupt_lock();
+        let tag = std::process::id();
+        let data = super::compat_harness::text(64 << 20, 49);
+        #[derive(Clone, Copy, Debug)]
+        enum Change {
+            Append,
+            Truncate,
+            Rewrite,
+            Old,
+            Replace,
+        }
+        let change = |w: &Path, c: Change| {
+            let f = w.join("f");
+            match c {
+                Change::Append => {
+                    use std::io::Write;
+                    fs::OpenOptions::new()
+                        .append(true)
+                        .open(&f)
+                        .unwrap()
+                        .write_all(&[b'x'; 1000])
+                        .unwrap();
+                }
+                Change::Truncate => fs::OpenOptions::new()
+                    .write(true)
+                    .open(&f)
+                    .unwrap()
+                    .set_len(1000)
+                    .unwrap(),
+                Change::Rewrite => {
+                    use std::io::{Seek, SeekFrom, Write};
+                    let mut h = fs::OpenOptions::new().write(true).open(&f).unwrap();
+                    h.seek(SeekFrom::Start(100)).unwrap();
+                    h.write_all(b"ZZZZ").unwrap();
+                    // Another second, so that the times say so.
+                    let old = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+                    h.set_times(fs::FileTimes::new().set_modified(old)).unwrap();
+                }
+                Change::Old => {
+                    let old = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+                    fs::File::options()
+                        .write(true)
+                        .open(&f)
+                        .unwrap()
+                        .set_times(fs::FileTimes::new().set_modified(old))
+                        .unwrap();
+                }
+                Change::Replace => {
+                    // From another second than `f`'s own status change, so
+                    // that the rename moves it on both sides (the reference
+                    // then counts `f` as modified too: `--no-frame-crc` is
+                    // `Error 54`; within the second it is a warning).
+                    use std::os::unix::fs::MetadataExt;
+                    let born = fs::metadata(&f).unwrap().ctime();
+                    while std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64
+                        <= born
+                    {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    fs::rename(&f, w.join("f.old")).unwrap();
+                    fs::write(&f, b"new").unwrap();
+                }
+            }
+        };
+        // (status, stderr, output decoded size, source kept)
+        let run = |exe: &Path, w: &Path, opts: &[&str], c: Change| {
+            let _ = fs::remove_dir_all(w);
+            fs::create_dir_all(w).unwrap();
+            fs::write(w.join("f"), &data).unwrap();
+            let mut cmd = Command::new(exe);
+            cmd.arg0_lz4()
+                .args(["-12", "-T1"])
+                .args(opts)
+                .arg("f")
+                .current_dir(w)
+                .env_clear()
+                .env("LC_ALL", "C")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            let child = spawn(&mut cmd).unwrap();
+            let start = Instant::now();
+            while fs::metadata(w.join("f.lz4")).map_or(0, |m| m.len()) == 0 {
+                assert!(
+                    start.elapsed() < Duration::from_secs(60),
+                    "{opts:?}: no output"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            change(w, c);
+            let out = child.wait_with_output().unwrap();
+            let decoded = w.join("f.lz4").exists().then(|| {
+                Command::new(ref_lz4())
+                    .args(["-dc", "-q", "f.lz4"])
+                    .current_dir(w)
+                    .stdin(Stdio::null())
+                    .output()
+                    .map(|o| o.stdout.len())
+                    .unwrap()
+            });
+            // Every refresh goes, the one the error follows on its line too
+            // (where lz4 draws its last is timing: deviation 2).
+            let mut err = String::from_utf8_lossy(&out.stderr).into_owned();
+            while let Some(at) = err.find("\rRead : ") {
+                let end = err[at..].find("%   ").map_or(err.len(), |e| at + e + 4);
+                err.replace_range(at..end, "");
+            }
+            (out.status.code(), err, decoded, w.join("f").exists())
+        };
+        let ref_dir =
+            ScratchDir::at(std::env::temp_dir().join(format!("stuffr-lz4-mod-ref-{tag}")));
+        let our_dir = ScratchDir::at(std::env::temp_dir().join(format!("stuffr-lz4-mod-{tag}")));
+        let stuffr = Path::new(env!("CARGO_BIN_EXE_stuffr"));
+        let reference = Path::new(dir).join("lz4");
+        let mut differ = Vec::new();
+        let mut n = 0;
+        for c in [
+            Change::Append,
+            Change::Truncate,
+            Change::Rewrite,
+            Change::Old,
+            Change::Replace,
+        ] {
+            for opts in [
+                &[][..],
+                &["--no-mmap"],
+                &["--no-frame-crc"],
+                &["--rm"],
+                &["--no-mmap", "--rm"],
+                &["--single-thread"],
+                &["-l"],
+                &["-q"],
+            ] {
+                let theirs = run(&reference, &ref_dir, opts, c);
+                let ours = run(stuffr, &our_dir, opts, c);
+                n += 1;
+                if theirs != ours {
+                    differ.push(format!(
+                        "{c:?} {opts:?}:\n  reference {theirs:?}\n  stuffr    {ours:?}"
+                    ));
+                }
+            }
+        }
+        println!("{n} cases compared");
+        assert!(
+            differ.is_empty(),
+            "{} of {n} differ:\n{}",
+            differ.len(),
+            differ.join("\n")
+        );
+    }
+
+    /// `Command::arg0` as `lz4`, for a binary run under another name.
+    trait Arg0Lz4 {
+        fn arg0_lz4(&mut self) -> &mut Self;
+    }
+    impl Arg0Lz4 for std::process::Command {
+        fn arg0_lz4(&mut self) -> &mut Self {
+            use std::os::unix::process::CommandExt;
+            self.arg0("lz4")
+        }
     }
 }

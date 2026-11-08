@@ -933,7 +933,8 @@ fn lz4_failed(stderr: &str) -> bool {
 ///   all;
 /// - the fields of `Done in S s ==> T MiB/s  (cpu load : L%)` become
 ///   `<s>`, `<speed>`, `<cpu>`;
-/// - N in `Using N threads for compression ` becomes `<n>` (the cores).
+/// - N in `Using N threads for compression ` (1.11.0: `Using up to N
+///   threads`) becomes `<n>` (the cores).
 ///
 /// Every other byte stays, including the final summary, the 79-blank
 /// clearing line and a refresh-looking text of another shape (one not led
@@ -985,11 +986,14 @@ fn normalise_lz4_line(line: &str) -> String {
         t.split_once('.')
             .is_some_and(|(w, f)| digits(w) && digits(f))
     };
+    // lz4 1.11.0 says `Using up to N threads` (1.10.0: `Using N threads`).
     if let Some(rest) = line.strip_prefix("Using ")
         && let Some((n, tail)) = rest.split_once(" threads for compression ")
-        && digits(n)
     {
-        return format!("Using <n> threads for compression {tail}");
+        let (up_to, n) = n.strip_prefix("up to ").map_or(("", n), |n| ("up to ", n));
+        if digits(n) {
+            return format!("Using {up_to}<n> threads for compression {tail}");
+        }
     }
     if let Some(rest) = line.strip_prefix("Done in ")
         && let Some((secs, rest)) = rest.split_once(" s ==> ")

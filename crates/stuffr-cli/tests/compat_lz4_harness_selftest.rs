@@ -203,6 +203,15 @@ Using 12 threads for compression \n\
 \rRead : 0 MiB   ==> 0.50%   \rRead : 3 MiB   ==> 41.00%   \rRead : 7 MiB   ==> inf%   \r                                                                               \rCompressed 8800 bytes into 110 bytes ==> 1.25%\n\
 Done in 12.34 s ==> 1957.89 MiB/s  (cpu load : 367%)\n";
         assert_eq!(a, normalise_lz4_progress(other));
+        // lz4 1.11.0's `Using up to N threads` keeps its words.
+        assert_eq!(
+            normalise_lz4_progress("Using up to 331 threads for compression \n"),
+            "Using up to <n> threads for compression \n"
+        );
+        assert_eq!(
+            normalise_lz4_progress("Using up to x threads for compression \n"),
+            "Using up to x threads for compression \n"
+        );
         // ...including the decompress refresh.
         assert_eq!(
             normalise_lz4_progress(V_DECOMPRESS),
