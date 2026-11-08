@@ -1328,11 +1328,6 @@ impl Adapt {
     }
 }
 
-/// libzstd 1.5.7's `ZSTD_CCtxParams_setParameter` range checks for the
-/// parameters `FIO_createCResources` sets before the worker count, in that
-/// order: `Err` for the first out of bound (`parameter_outOfBound`). The C
-/// tier would answer the same from libzstd; checking here keeps the pure
-/// tier, which ignores the values, answering as the reference does.
 /// T7-1 (0.26.0), the sandbox's compression bound: the window, hash and
 /// chain logs the encoder would resolve (the level's own, unknown source
 /// size and the dictionary's size, as `ZSTD_getCParams`; a non-zero
@@ -1362,6 +1357,11 @@ fn clamp_compress_logs(o: &mut EncodeOptions, cap: u32) {
     o.ldm_params.hash_log = o.ldm_params.hash_log.min(cap);
 }
 
+/// libzstd 1.5.7's `ZSTD_CCtxParams_setParameter` range checks for the
+/// parameters `FIO_createCResources` sets before the worker count, in that
+/// order: `Err` for the first out of bound (`parameter_outOfBound`). The C
+/// tier would answer the same from libzstd; checking here keeps the pure
+/// tier, which ignores the values, answering as the reference does.
 fn check_cparam_bounds(o: &EncodeOptions) -> Result<(), ZstdError> {
     let oob = || Err(ZstdError::lib(zstd_opts::code::PARAMETER_OUT_OF_BOUND));
     let within = |v: i64, lo: i64, hi: i64| (lo..=hi).contains(&v);

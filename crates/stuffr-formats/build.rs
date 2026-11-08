@@ -37,8 +37,11 @@ fn main() {
 /// this way, so the sources themselves stay byte-identical to upstream.
 #[cfg(any(feature = "brotli-c", feature = "lz4-c"))]
 fn force_include(build: &mut cc::Build, header: &std::path::Path) {
-    let header = std::fs::canonicalize(header)
-        .unwrap_or_else(|e| panic!("resolving {}: {e}", header.display()));
+    // Built from `CARGO_MANIFEST_DIR`, not `canonicalize`: on Windows that
+    // yields a `\\?\` path, which MSVC's `/FI` does not accept.
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let header = std::path::Path::new(&manifest).join(header);
+    assert!(header.is_file(), "missing {}", header.display());
     println!("cargo:rerun-if-changed={}", header.display());
     if build.get_compiler().is_like_msvc() {
         build.flag(format!("/FI{}", header.display()));

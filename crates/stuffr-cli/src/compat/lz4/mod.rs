@@ -80,7 +80,10 @@
 //!    not overwritten`, display level 1) and counts that input as failed
 //!    (exit 1), whatever `-f` says. Every other same-file case (`lz4 -f a
 //!    a`, `lz4 -df s.lz4 s.lz4`, a hard or symbolic link, `-m`) lz4 1.11.0
-//!    refuses itself, with that message, and stuffr does as it does.
+//!    refuses itself, with that message, and stuffr does the same. A pipe
+//!    from the file, or standard output redirected onto it, loses the data
+//!    alike in both: the pipe or the shell has done it before either
+//!    program can see it.
 //! 4. Closed standard streams and a parent that ignores SIGPIPE behave as
 //!    in the earlier families: a closed pipe kills stuffr by SIGPIPE, as it
 //!    kills lz4 under the default disposition; where the parent ignores
@@ -222,7 +225,8 @@ pub const EXIT_CODES: [i32; 20] = [
 ///
 /// R9: nothing needs a cap beyond the shared output budget
 /// ([`SANDBOX_OUTPUT_CAP`], standard output and output files together):
-/// compression always runs on one thread, a frame's blocks are at most
+/// compression runs on the calling thread or, on the C tier, on at most one
+/// liblz4 worker (`encode_options` caps the count at 1), a frame's blocks are at most
 /// 4 MiB and a legacy block at most 8 MiB by format, and dictionary files
 /// are read through [`Host::track`] like every input. No signal handler is
 /// installed. For the fuzz target; not a stable interface.

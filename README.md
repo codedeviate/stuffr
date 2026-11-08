@@ -1677,11 +1677,14 @@ benchmark lines included.
   their place beside a failure message are not compared.
 - **Standard input redirected from the output file** (`lz4 -f - a < a`):
   lz4 truncates the file, reads nothing, warns `stdin : file modified during
-  processing` and exits 0, and the data is gone. stuffr refuses with lz4's
-  own same-file message (`a: input and output are the same file; not
+  processing : output holds the content read` and exits 0, and the data is
+  gone. stuffr refuses with lz4's own same-file message (`a: input and output are the same file; not
   overwritten`) and counts that input as failed (exit 1), whatever `-f`
   says. Every other same-file case (`lz4 -f a a`, a hard or symbolic link,
-  `-m`) lz4 1.11.0 refuses itself, with that message, and stuffr does too.
+  `-m`) lz4 1.11.0 refuses itself, with that message, and stuffr does the
+  same. A pipe from the file, or standard output redirected onto it, loses
+  the data alike in both: the pipe or the shell has done it before either
+  program can see it.
 - **Closed standard streams, and a parent that ignores `SIGPIPE`,** as in the
   other families. A closed pipe kills stuffr by SIGPIPE, as it kills lz4
   under the default disposition; where the parent ignores SIGPIPE lz4 answers

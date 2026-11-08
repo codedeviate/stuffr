@@ -250,9 +250,10 @@ impl Encoder {
     /// block that is not whole stays, as liblz4 keeps it until the end,
     /// unless a custom `-B#` flushes it; an input shorter than a block
     /// stays for the one-shot frame).
-    #[doc(hidden)]
+    ///
     /// `stable` (the C tier's `LZ4F_srcStableUntilFlush`) changes nothing
     /// here.
+    #[doc(hidden)]
     pub fn end_of_input(&mut self, out: &mut Vec<u8>, stable: bool) -> Result<(), Lz4Error> {
         let _ = stable;
         if self.legacy || self.plain {
