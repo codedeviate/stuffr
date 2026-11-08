@@ -397,13 +397,23 @@ FUZZ_SEED = 1
 # `fuzz_targets/cross_tier.rs` fails their build unless the vendored libbrotli
 # and liblz4 are linked. The feature switch rebuilds the stuffr crates once,
 # so they come last.
+#
+# The C legs export CFLAGS_x86_64_unknown_linux_gnu=-fno-merge-all-constants
+# (being last, only they see it). On x86_64 Linux cc-rs compiles the C with
+# `-fsanitize=address`, and GCC 13 there miscompiles zstd-sys's
+# `-fmerge-all-constants`: zstd_opt.c's local `getAllMatchesFns` table becomes
+# a global that still gets scope-end poisoning, so every btultra2 compression
+# (`zstd -19`) is a false stack-use-after-scope. fuzz-deep.yml's C-tier step
+# has the full argument. Elsewhere (macOS, aarch64 Linux) cc-rs leaves the C
+# uninstrumented and the variable names another target: it changes nothing.
 FUZZ_LEGS = codec container chain roundtrip salvage compat infozip \
 	compat:c-backed roundtrip:c-backed
 fuzz: fuzz-corpus
 	@status=0; \
 	for leg in $(FUZZ_LEGS); do \
 	  case $$leg in \
-	    *:*) target=$${leg%%:*}; features="--features $${leg#*:} " ;; \
+	    *:*) target=$${leg%%:*}; features="--features $${leg#*:} "; \
+	      export CFLAGS_x86_64_unknown_linux_gnu=-fno-merge-all-constants ;; \
 	    *) target=$$leg; features= ;; \
 	  esac; \
 	  corpus=$$(find fuzz/corpus/$$target -type f 2>/dev/null | wc -l | tr -d ' '); \

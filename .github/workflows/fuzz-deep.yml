@@ -194,6 +194,22 @@ jobs:
             exit 1
           fi
           if [ "$TIER" = c ]; then
+            # GCC 13 (this runner's `cc`) under ASan miscompiles zstd-sys's
+            # `-fmerge-all-constants`: a function-local const table (zstd_opt.c's
+            # `getAllMatchesFns`) becomes a global, but its scope-end
+            # use-after-scope poisoning is still emitted on that global, so the
+            # second call of ZSTD_compressBlock_opt_generic reads f8 shadow and
+            # every btultra2 compression (`zstd -19`, `--ultra -22`) is
+            # reported as stack-use-after-scope (run 42468380241, 3 s into the
+            # corpus). Not a stuffr or libzstd bug: a 20-line C program shows it
+            # with GCC 13.3, not with GCC 14.2 or clang 18, and not without the
+            # flag. cc-rs passes `-fsanitize=address` to C only on x86_64 Linux
+            # (CARGO_CFG_SANITIZE), so only this leg sees it. Undo just the
+            # non-conforming merge (GCC's default again; CFLAGS come last, so it
+            # overrides zstd-sys's flag); ASan and use-after-scope stay on in C.
+            # Exported: `cargo fuzz run` below must see the same flags or it
+            # rebuilds the C. The Makefile's `fuzz` C legs set it too.
+            export CFLAGS_x86_64_unknown_linux_gnu=-fno-merge-all-constants
             cargo fuzz build $features "$TARGET"
             bin="fuzz/target/x86_64-unknown-linux-gnu/release/$TARGET"
             # Defined symbols only, into a file: a `U` reference is no
