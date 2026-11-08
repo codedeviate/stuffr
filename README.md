@@ -608,8 +608,8 @@ read list.
 > carries it), and `zstd --format=lz4` follows it too. Both vendored C
 > libraries (liblz4 and libbrotli) now export only `stuffr_`-prefixed
 > symbols, so stuffr can share a binary with `lz4-sys` or another
-> libbrotli. Deep fuzzing gains C-tier legs. A MINOR. **3874** tests
-> under `--all-features`, **3719** on the default tier — measured from
+> libbrotli. Deep fuzzing gains C-tier legs. A MINOR. **3875** tests
+> under `--all-features`, **3720** on the default tier — measured from
 > this bump's own `make check FULL=1`, `GATE_EXIT=0`, nothing skipped.
 >
 > Two user-visible changes on archives that already exist. First, `salvage
