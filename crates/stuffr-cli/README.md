@@ -24,8 +24,8 @@ cargo install --locked stuffr-cli --features c-backed    # needs a C compiler, n
 ```
 
 `--locked` keeps the vendored C libraries at the versions the compatibility
-links promise (libzstd 1.5.7, liblz4 1.10.0); without it, cargo may resolve
-newer `-sys` crates.
+links promise (libzstd 1.5.7 through `zstd-sys`); without it, cargo may resolve
+newer `-sys` crates. liblz4 1.11.0 is vendored in `stuffr-formats` itself.
 
 The five legacy formats (Unix `compress` `.Z`, LHA/LZH, ARJ, ARC/PAK, ZOO)
 are in the default build too, pure Rust like the rest of it — no extra flag

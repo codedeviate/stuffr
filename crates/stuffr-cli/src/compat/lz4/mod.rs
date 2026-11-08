@@ -4,14 +4,14 @@
 //! **A clean-room implementation** (spec decision 3): lz4's `programs/` is
 //! GPL-2.0-or-later and was never read. Every rule comes from the man page
 //! (`lz4.1`), `NEWS`, `README.md`, `lz4 -h`/`-H` and probes of the 1.10.0
-//! binary, and carries its source in a comment; every string is in
+//! binary and then the 1.11.0 one, and carries its source in a comment; every string is in
 //! `messages.rs`. liblz4 itself (BSD-2-Clause, `LICENSE-lz4`) is reached
 //! through `stuffr::lz4_opts`. `cli.rs` holds the command line and the
 //! decision table for where output goes.
 //!
 //! **Names** (spec section 1, R12): dispatch registers the four exact
 //! names. The presets come from the invoked name's last path component
-//! (after `/` or `\`), matched as lz4 1.10.0 matches it, probed through
+//! (after `/` or `\`), matched as lz4 matches it (1.10.0 and 1.11.0 alike), probed through
 //! `exec -a`: the name itself, or the name followed by `.` and anything
 //! (`unlz4.exe`, `lz4cat.1`), case-sensitively; `unlz4-1`, `xunlz4` and
 //! `UNLZ4` match nothing. `unlz4` decompresses; `lz4cat` is `-dcfm` at
@@ -60,18 +60,27 @@
 //!    figure is what they had handed back when it was drawn, which varies
 //!    from run to run in lz4 1.11.0 itself (probed: 18.93% or 28.39% at 8
 //!    MiB of the same `-B6` input, 0.00% or 27.71% at 2.5 MB `-T3 -B4`), so
-//!    it is timing too. While decoding, stuffr
-//!    offers one refresh per MiB decoded, while lz4's count and figures
-//!    vary from run to run with its writer thread (probed: the same legacy
-//!    file drew `14, 14` or `8, 14` MiB, a `-B4` frame `4, 7, 8`), so
-//!    those are timing too.
-//! 3. An input that is also the output is never lost. Where the output
-//!    named is the input file itself (the same device and inode: `lz4 -f a
-//!    a`, `lz4 -df s.lz4 s.lz4`, a hard link, standard input redirected
-//!    from it), lz4 truncates it before reading it, and the data is gone;
-//!    stuffr opens nothing, prints `NAME is the input file; not overwritten
-//!    (stuffr)` and counts that input as failed (exit 1, or one more in
-//!    `-m`'s count), whatever `-f` says.
+//!    it is timing too. While decoding, the refreshes are drawn at other
+//!    moments. lz4 1.11.0 draws one after each piece it has decoded
+//!    without error (3 to 4 MiB of output; probed with `-vvvv`), so
+//!    a decode that fails inside its first piece shows none (`Error 34 :
+//!    ... ERROR_decompressionFailed` alone) and one that fails at the end
+//!    of the input shows what was decoded by then (`\rDecompressed : 3 MiB
+//!    Error 26 : ...`). That much is the same run after run (0.26.0 Task
+//!    6: 20 runs, 8 at a time, of 15 failing inputs), but a frame followed
+//!    by bytes that are no frame draws its refresh before or after the
+//!    `Error 34` line, run to run. stuffr offers one refresh before the
+//!    first block and then one per MiB decoded. So decode refreshes, their
+//!    figures and their place beside a failure message are not compared.
+//! 3. Standard input redirected from the output file (`lz4 -f - a < a`,
+//!    `lz4 -d -f - c.lz4 < c.lz4`): lz4 truncates the file, reads nothing,
+//!    warns `stdin : file modified during processing : output holds the
+//!    content read` and exits 0, and the data is gone. stuffr refuses with
+//!    lz4's own same-file message (`a: input and output are the same file;
+//!    not overwritten`, display level 1) and counts that input as failed
+//!    (exit 1), whatever `-f` says. Every other same-file case (`lz4 -f a
+//!    a`, `lz4 -df s.lz4 s.lz4`, a hard or symbolic link, `-m`) lz4 1.11.0
+//!    refuses itself, with that message, and stuffr does as it does.
 //! 4. Closed standard streams and a parent that ignores SIGPIPE behave as
 //!    in the earlier families: a closed pipe kills stuffr by SIGPIPE, as it
 //!    kills lz4 under the default disposition; where the parent ignores
@@ -92,21 +101,27 @@
 //!    `--favor-decSpeed` compress with its single level; a corrupt frame's
 //!    `Error N` text may differ, and output written before it may be a
 //!    strict prefix of lz4's. The summary's compressed size and ratio are
-//!    those of its own bytes.
+//!    those of its own bytes. A legacy or mozlz4 block cut short may decode
+//!    on the pure tier, as far as it goes, where liblz4 refuses it with
+//!    `Error 64` (liblz4 1.11.0's end-of-block rules refuse some cuts
+//!    `lz4_flex` takes: the `cut60` case of
+//!    `mozlz4_decodes_as_the_reference_decodes_it`; the C tier matches at
+//!    every cut).
 //! 7. A decode that fails keeps everything decoded before the fault in its
-//!    output (a file or standard output). lz4 writes on another thread and
-//!    exits from the failing one, so it leaves nothing or all of that, run
-//!    to run (probed: 0 or 8800 bytes of 8800 for the same input).
-//! 8. `--list` of a file that ends inside a block-size word: lz4
-//!    completes the word from an uninitialised buffer, which only the `-v`
-//!    size of that last frame shows. On macOS that is garbage once a frame
-//!    or skippable frame came before (probed: the same run to run, about
-//!    4.4 million, for a given shape) and zero before; on Linux it is
-//!    garbage even in the first frame, different on every run (probed: the
-//!    tarball build, `lz4 --list -v` of a header and one byte gave sizes
-//!    from 1.0 to 2.1 billion; CI run 39166896170). stuffr completes it from
-//!    the frame's previous block-size word, as lz4 does for a second block
-//!    (zero for the first).
+//!    output (a file or standard output). lz4 1.11.0 hands its output on
+//!    in 4 MiB pieces and writes the rest only at the end of a frame or of
+//!    the input, so a fault inside a frame loses what follows the last
+//!    whole piece (probed, 20 runs of 20: a 6.6 MiB frame corrupt in its
+//!    middle leaves 0 bytes, the same frame followed by 100 bytes of junk
+//!    leaves 4194304), and where a frame is followed by bytes that are no
+//!    frame it leaves nothing or the whole frame, run to run (0 or 10090
+//!    bytes of a small one). lz4 1.10.0 left nothing or everything, run to
+//!    run. stuffr's output is never shorter than lz4's on the C tier.
+//! 8. `Error 53` (lz4 1.11.0: the source file shrank while it was mapped,
+//!    met as a bus error) is never produced: stuffr reads its inputs and
+//!    never maps them. A source cut short while it is compressed is seen
+//!    by its size and answered as lz4 answers a change it sees, `Error 54`
+//!    or the `file modified during processing` warning.
 //! 9. `--list` of a regular file that cannot be opened (mode 000): lz4
 //!    aborts on an assertion (exit 134); stuffr names the error
 //!    (`NAME: Permission denied`) and exits 1.
@@ -114,19 +129,15 @@
 //!     at an output name is never written through. lz4 checks for an
 //!     existing output with `stat` and opens it with `fopen(.., "wb")`, so a
 //!     dangling symlink looks absent and a live one is truncated, and the
-//!     data lands wherever the link points. stuffr checks with `lstat`: a
-//!     symlink, dangling or not, is an existing file (`already exists` /
-//!     the overwrite question); overwriting it (`-f`, or `y`) unlinks the
-//!     link and creates a fresh file, its target untouched, and every
-//!     output is opened `O_NOFOLLOW`. An output that takes the input's mode
-//!     (a frame from a regular file) is created 0600 and given that mode,
-//!     owner and time through its own descriptor at the end, where lz4
-//!     creates it 0666 less the umask and sets them by name; one whose run
-//!     fails before that is given lz4's 0666 less the umask intersected
-//!     with the input's permission bits (lz4's mode for an ordinary 0644
-//!     input; a private input's partial output stays private). Why: a
-//!     planted link must not redirect a write, and a private input must not
-//!     sit readable while it is written.
+//!     data lands wherever the link points (lz4 1.11.0 also truncates a
+//!     link's target when the input is missing: `lz4 -d -f -m x.lz4` with
+//!     `x -> b.lz4`). stuffr checks with `lstat`: a symlink, dangling or
+//!     not, is an existing file (`already exists` / the overwrite
+//!     question); overwriting it (`-f`, or `y`) unlinks the link and
+//!     creates a fresh file, its target untouched, and every output is
+//!     opened `O_NOFOLLOW`. An output's mode, owner and time are set
+//!     through its own descriptor, where lz4 sets them by name. Why: a
+//!     planted link must not redirect a write.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -184,10 +195,10 @@ pub fn run(name: &'static str, argv0: &OsStr, args: Vec<OsString>) -> ExitCode {
 /// `Error 74 : Sparse skip error ; try --no-sparse`; probed 2026-10-16,
 /// pinned by `sparse_output_matches_the_reference`).
 ///
-/// Task 5 added 71 (and met 72 again): `--list` of a file that is only a
-/// frame's magic number is `Error 71 : Error reading NAME`, of one cut
-/// inside a header that promises a content size `Error 72 : Error
-/// reading NAME` (probed 2026-10-16, pinned by the `--list` rows).
+/// Task 5 added 71 (and met 72 again) for 1.10.0's `--list` of a cut
+/// header (`Error 71 : Error reading NAME`); lz4 1.11.0 says `File format
+/// not recognized` there (exit 1), so 0.26.0 Task 6 removed 71. 72 stays
+/// for `--sparse`.
 ///
 /// 0.26.0 (lz4 1.11.0, Task 4): a write error while compressing is `Error
 /// 46` where 1.10.0 said `Error 38` (38 is gone), and a source file changed
@@ -199,8 +210,8 @@ pub fn run(name: &'static str, argv0: &OsStr, args: Vec<OsString>) -> ExitCode {
 /// 2026-11-08). 50 stays for a named input `--rm` cannot remove (standard
 /// input is no longer removed by its name).
 #[doc(hidden)]
-pub const EXIT_CODES: [i32; 21] = [
-    0, 1, 26, 27, 34, 40, 42, 43, 44, 46, 50, 54, 61, 62, 63, 64, 69, 70, 71, 72, 74,
+pub const EXIT_CODES: [i32; 20] = [
+    0, 1, 26, 27, 34, 40, 42, 43, 44, 46, 50, 54, 61, 62, 63, 64, 69, 70, 72, 74,
 ];
 
 /// [`run`] without the process: operands resolve against `dir`, standard

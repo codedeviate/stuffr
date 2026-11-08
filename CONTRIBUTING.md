@@ -1347,14 +1347,15 @@ and is the second family, after GNU gzip, written **clean room**:
 - **Clean room.** lz4's `programs/` is GPL-2.0-or-later and is never read,
   opened, grepped or summarised, nor are its `tests/`, `contrib/` or
   `examples/`. The sources allowed are the man pages, `NEWS`, `README.md`,
-  `lz4 -h`/`-H`, the running 1.10.0 binary, and liblz4's own BSD sources and
-  frame/block format documents. A fact those lack is **probed on the binary**
-  and the probe recorded. Every literal and rule in `compat/lz4/` carries a
+  `lz4 -h`/`-H`, the running binary (1.11.0 since `0.26.0`; 1.10.0 before),
+  and liblz4's own BSD sources and frame/block format documents. A fact those
+  lack is **probed on the binary** and the probe recorded. Every literal and rule in `compat/lz4/` carries a
   comment naming its source (`// lz4.1: ...`, `// lz4 -H`, `// NEWS v1.9.3`,
   `// probe: <command>`); `messages.rs` holds every string. liblz4 itself is
   BSD-2-Clause (`crates/stuffr-cli/LICENSE-lz4`, which also states the
   clean-room fact); the expressions did not change.
-- **One version, the tarball.** Only 1.10.0 is promised. The reference is
+- **One version, the tarball.** Only 1.11.0 is promised (since `0.26.0`;
+  1.10.0 before). The reference is
   found by `lz4_dir()` in the harness: `$STUFFR_LZ4_REFERENCE`, then
   Homebrew's keg (`/opt/homebrew/opt/lz4/bin/lz4`), then `PATH`. CI builds
   the release tarball (SHA-256 pinned) in the composite action
@@ -1371,10 +1372,10 @@ and is the second family, after GNU gzip, written **clean room**:
   `/` or `\`) when it is the name, or the name followed by `.` and anything,
   case-sensitively. Dispatch still registers only the four exact names; the
   rule matters when `run` sees an `argv0` with a suffix.
-- **The tier promise.** Stdout, stderr and exit codes are lz4 1.10.0's on both
-  tiers; `.lz4` bytes are identical with `lz4-c` (in `c-backed`) and
-  compatible on the pure tier (`lz4_flex`). The module doc of
-  `compat/lz4/mod.rs` is the source of truth for the nine deviations; the
+- **The tier promise.** Stdout, stderr and exit codes are lz4 1.11.0's on both
+  tiers; `.lz4` bytes are identical with `lz4-c` (in `c-backed`, the vendored
+  liblz4 1.11.0) and compatible on the pure tier (`lz4_flex`). The module doc
+  of `compat/lz4/mod.rs` is the source of truth for the ten deviations; the
   README mirrors it.
 
 **The unzip family** (`compat/unzip/`) is a port of Info-ZIP UnZip 6.00 in

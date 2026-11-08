@@ -422,7 +422,7 @@ pub(super) const E42_SKIPPABLE_SIZE: &str =
 /// probe: `cat skip_trunc.lz4 | lz4 -dc` (on a pipe the area is read, and it
 /// ends early); lz4 1.11.0 also from a file whose skippable area runs past
 /// its end (`lz4 -t skip_trunc.lz4`, `skip_4g.lz4`; 1.10.0 seeked past the
-/// end silently).
+/// end silently), and `lz4 --list skip_trunc.lz4` (1.10.0 listed it).
 pub(super) const E43_SKIP: &str = "Error 43 : Stream error : cannot skip skippable area \n";
 
 /// probe: `lz4 -d unk_hdr.lz4`.
@@ -475,7 +475,7 @@ pub(super) const E72_SPARSE_SKIP: &str =
 /// the bytes after the last whole word).
 pub(super) const E74_SPARSE_TAIL_SKIP: &str = "Error 74 : Sparse skip error ; try --no-sparse \n";
 
-// ---- `--list` (probed on /opt/homebrew/opt/lz4/bin/lz4, 1.10.0) ----
+// ---- `--list` (probed on lz4 1.10.0, unchanged in 1.11.0: 0.26.0 Task 6) ----
 
 /// probe: `lz4 --list b.lz4` (standard output, once before the first file
 /// and even when none is read: `lz4 --list` on standard input prints only
@@ -551,14 +551,6 @@ pub(super) const LIST_NOT_REGULAR: &str = "lz4: %s is not a regular file \n";
 /// probe: `lz4 --list leg_huge.lz4` (a legacy block size above 8 MiB, or a
 /// size word cut short): printed before [`LIST_NOT_RECOGNIZED`].
 pub(super) const LIST_CORRUPTED_LEGACY: &str = "Corrupted legacy frame \n";
-
-/// probe: `lz4 --list c04.lz4` (a frame's magic number and nothing after
-/// it): the name as given.
-pub(super) const E71_READING: &str = "Error 71 : Error reading %s \n";
-
-/// probe: `lz4 --list c05.lz4` (magic number, then one to three bytes of a
-/// header that says it carries a content size).
-pub(super) const E72_READING: &str = "Error 72 : Error reading %s \n";
 
 /// probe: `lz4 -vv --list b.lz4` (display level 4, after the banner):
 /// `_POSIX_VERSION` as the system reports it (`sysconf(_SC_VERSION)`: on

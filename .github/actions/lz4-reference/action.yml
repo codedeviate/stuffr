@@ -8,9 +8,9 @@ description: >-
 # The binary is built from the tarball, not taken from a distro: ubuntu and
 # Homebrew ship other releases, and the promise is byte identity with 1.11.0.
 # lz4 links nothing but libc and pthreads (multithreading is the default on
-# POSIX since 1.10)
+# POSIX since 1.10), so the cached install needs no runtime libraries.
 # The whole tarball is extracted: since 1.11.0 the Makefiles include
-# build/make/, outside programs/ and lib/., so the cached install needs no runtime libraries.
+# build/make/, which lies outside programs/ and lib/.
 #
 # The reference is GPL-2.0-or-later and is only ever RUN here, as a test
 # oracle: nobody reads its programs/ sources (the family is a clean-room

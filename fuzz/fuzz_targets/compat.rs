@@ -1471,8 +1471,8 @@ fn lz4_unquieted(name: &str, args: &[&str]) -> Vec<String> {
 /// - `NAME already exists; not overwritten` (`ALREADY_EXISTS`), the same
 ///   after a declined prompt (`NAME already exists; do you want to
 ///   overwrite (y/N) ?     not overwritten`, one line, `OVERWRITE_PROMPT`
-///   then `NOT_OVERWRITTEN`), and `NAME is the input file; not
-///   overwritten (stuffr)` (`SAME_FILE`).
+///   then `NOT_OVERWRITTEN`), and `NAME: input and output are the same
+///   file; not overwritten` (`SAME_FILE`).
 fn is_lz4_failure_line(l: &str) -> bool {
     const ERRNO_TEXTS: &[&str] = &[
         "No such file or directory",
@@ -1495,7 +1495,6 @@ fn is_lz4_failure_line(l: &str) -> bool {
         || t.contains("Stream followed by undecodable data")
         || t.contains("; will not process file: ")
         || t.ends_with("not overwritten")
-        || t.ends_with(" is the input file; not overwritten (stuffr)")
 }
 
 /// The inputs an lz4 run reports as failed: one stderr line each, in the

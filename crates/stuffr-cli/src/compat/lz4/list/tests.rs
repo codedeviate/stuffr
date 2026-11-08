@@ -236,16 +236,17 @@ fn blocks_and_checksums_add_up() {
 }
 
 /// probe: a dictionary ID with a content size is listed (19-byte header);
-/// without one, never.
+/// lz4 1.11.0 lists one without a content size too (1.10.0 never did).
 #[test]
-fn a_dictionary_id_needs_a_content_size() {
+fn a_dictionary_id_is_listed_with_or_without_a_content_size() {
     let mut s = Shape::new();
     s.dictionary = Some(0x1234_5678);
     s.content_size = Some(7);
     let (frames, stop) = walk(&s.bytes());
     assert_eq!((stop, frames[0].content), (None, 7));
     s.content_size = None;
-    assert_eq!(stop_of(&s.bytes()), Some(Stop::NotRecognized));
+    let (frames, stop) = walk(&s.bytes());
+    assert_eq!((stop, frames[0].size), (None, 11 + 4 + 3 + 4 + 4));
 }
 
 /// probe: version, reserved bits, block size IDs 0..3, a bad header
@@ -273,99 +274,81 @@ fn headers_liblz4_refuses() {
     assert_eq!(stop_of(&bad), Some(Stop::NotRecognized));
 }
 
-/// probe: every prefix of a frame with a content size (header 15 bytes):
-/// nothing is an empty file, 1 to 3 bytes `Error 40`, the magic alone `71`,
-/// 1 to 3 bytes of header `72` (the flags promise a content size), up to
-/// the header and its end not recognized, a byte after it a frame.
+/// probe (1.11.0): every prefix of a frame with a content size (header 15
+/// bytes): nothing is an empty file, 1 to 3 bytes `Error 40`, and every
+/// other cut, from the magic number alone to the last byte of the content
+/// checksum, is not recognized (1.10.0 said `Error 71` for the magic alone
+/// and `Error 72` for 1 to 3 header bytes, and listed a frame cut after its
+/// header).
 #[test]
-fn every_prefix_of_a_header_with_a_content_size() {
+fn every_prefix_of_a_frame_with_a_content_size() {
     let mut s = Shape::new();
     s.content_size = Some(14);
+    s.blocks = vec![3, 5];
+    s.block_checksum = true;
     let f = s.bytes();
     for n in 0..=f.len() {
         let want = match n {
-            0 => Some(Stop::NotRecognized),
             1..=3 => Some(Stop::MagicUnreadable),
-            4 => Some(Stop::MagicOnly),
-            5..=7 => Some(Stop::HeaderCut),
-            8..=15 => Some(Stop::NotRecognized),
-            _ => None,
+            n if n == f.len() => None,
+            _ => Some(Stop::NotRecognized),
         };
         assert_eq!(stop_of(&f[..n]), want, "{n} bytes");
     }
 }
 
-/// probe: the same without a content size (header 7 bytes): 5 to 7 bytes are
-/// not recognized, not `Error 72`.
+/// probe (1.11.0): the same without a content size (header 7 bytes), and
+/// after a whole frame (the first is listed, then the walk stops).
 #[test]
-fn every_prefix_of_a_plain_header() {
+fn every_prefix_of_a_plain_frame() {
     let f = Shape::new().bytes();
     for n in 0..=f.len() {
         let want = match n {
-            0 => Some(Stop::NotRecognized),
             1..=3 => Some(Stop::MagicUnreadable),
-            4 => Some(Stop::MagicOnly),
-            5..=7 => Some(Stop::NotRecognized),
-            _ => None,
+            n if n == f.len() => None,
+            _ => Some(Stop::NotRecognized),
         };
         assert_eq!(stop_of(&f[..n]), want, "{n} bytes");
+        // After a whole frame, nothing more is the end of the file.
+        let want = if n == 0 { None } else { want };
+        let mut two = f.clone();
+        two.extend_from_slice(&f[..n]);
+        let (frames, stop) = walk(&two);
+        let listed = 1 + usize::from(want.is_none() && n > 0);
+        assert_eq!((frames.len(), stop), (listed, want), "1 + {n} bytes");
     }
-    // The same cuts after a whole frame are met the same way.
-    let mut two = f.clone();
-    two.extend_from_slice(&f[..6]);
-    assert_eq!(stop_of(&two), Some(Stop::NotRecognized));
 }
 
-/// probe: a block or checksum cut short is still counted as long as it
-/// said (`lz4 --list -v t_blk.lz4`: the size is the whole frame's, not the
-/// file's).
+/// probe (1.11.0): a frame must be all there: a frame with no end mark, a
+/// block or block checksum running past the end of the file, a content
+/// checksum cut short (`t_blk.lz4`, `t_crc.lz4`, `cs_mismatch.lz4`) are not
+/// recognized. A block ending exactly where the end mark starts is fine.
 #[test]
-fn a_frame_cut_short_counts_what_it_promised() {
+fn a_frame_cut_anywhere_is_not_recognized() {
     let f = Shape::new().bytes();
     // 7 header + 4 word + 3 data + 4 end + 4 checksum = 22.
     assert_eq!(f.len(), 22);
-    assert_eq!(sizes(&f[..14]), [22 - 4 - 4]);
-    assert_eq!(sizes(&f[..12]), [22 - 4 - 4]);
-    assert_eq!(sizes(&f[..20]), [22]);
-    // No end mark at all: the frame ends where the blocks do.
-    let mut s = Shape::new();
-    s.end = false;
-    assert_eq!(sizes(&s.bytes()), [7 + 4 + 3]);
-}
-
-/// probe: a word cut short is completed from the buffer, which held the
-/// frame's previous word (`lz4 --list -v` of `frame + 1/2/3 bytes`: sizes
-/// 132121, 131609, 66073 for a first block of 0x00010203 bytes and the new
-/// byte or bytes `07`, `07 00`, `07 00 00`); with no block before it the
-/// buffer is zero.
-#[test]
-fn a_word_cut_short_is_completed_from_the_last() {
-    let mut s = Shape::new();
-    s.blocks = vec![0x0001_0203];
-    s.end = false;
-    let head = s.bytes();
-    let at = 7 + 4 + 0x0001_0203;
-    assert_eq!(head.len(), at);
-    for (tail, size) in [
-        (&[7u8][..], 132_121),
-        (&[7, 0][..], 131_609),
-        (&[7, 0, 0][..], 66_073),
-        (&[0x34, 0x12][..], 136_262),
-    ] {
-        let mut f = head.clone();
-        f.extend_from_slice(tail);
-        assert_eq!(sizes(&f), [size], "{tail:?}");
+    for n in [12, 14, 18, 20, 21] {
+        assert_eq!(stop_of(&f[..n]), Some(Stop::NotRecognized), "{n}");
     }
     let mut s = Shape::new();
-    s.blocks = vec![];
     s.end = false;
-    let mut f = s.bytes();
-    f.push(9);
-    assert_eq!(sizes(&f), [7 + 4 + 9]);
+    assert_eq!(stop_of(&s.bytes()), Some(Stop::NotRecognized));
+    s.content_checksum = false;
+    assert_eq!(stop_of(&s.bytes()), Some(Stop::NotRecognized));
+    s.end = true;
+    assert_eq!(sizes(&s.bytes()), [7 + 4 + 3 + 4]);
+    let mut s = Shape::new();
+    s.block_checksum = true;
+    let f = s.bytes();
+    // The block's checksum cut: the next word is missing.
+    assert_eq!(stop_of(&f[..7 + 4 + 3 + 2]), Some(Stop::NotRecognized));
+    assert_eq!(sizes(&f), [7 + 4 + 3 + 4 + 4 + 4]);
 }
 
-/// probe: a frame with nothing after its header is not recognized; one
-/// byte is a (cut) block word.
+/// probe (1.11.0): a header with nothing after it, or one to three bytes of
+/// a word, is not recognized (1.10.0 completed a cut word from a stale
+/// buffer: deviation 8, gone with 1.11.0).
 #[test]
 fn a_header_alone_is_not_a_frame() {
     let mut s = Shape::new();
@@ -373,47 +356,109 @@ fn a_header_alone_is_not_a_frame() {
     s.end = false;
     let mut f = s.bytes();
     assert_eq!(stop_of(&f), Some(Stop::NotRecognized));
-    f.push(b'z');
-    assert_eq!(sizes(&f), [7 + 4 + 0x7A]);
+    for _ in 0..3 {
+        f.push(b'z');
+        assert_eq!(stop_of(&f), Some(Stop::NotRecognized));
+    }
     // The same after a whole frame.
     let mut two = Shape::new().bytes();
     two.extend_from_slice(&s.bytes());
+    two.push(b'z');
     let (frames, stop) = walk(&two);
     assert_eq!((frames.len(), stop), (1, Some(Stop::NotRecognized)));
 }
 
-/// probe: block-size words are not checked against the frame's maximum, and
-/// a seek past the end of the file ends the frame without a word: a block
-/// of 2 GiB - 1 in a 64 KiB frame lists, in time proportional to nothing.
+/// A file of `len` bytes, all zero but for `data` at their offsets: a
+/// stand-in for a sparse file of gigabytes.
+struct Sparse {
+    len: u64,
+    data: Vec<(u64, Vec<u8>)>,
+    pos: u64,
+}
+
+impl std::io::Read for Sparse {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let n = (self.len.saturating_sub(self.pos)).min(out.len() as u64) as usize;
+        out[..n].fill(0);
+        for (at, bytes) in &self.data {
+            for (k, &b) in bytes.iter().enumerate() {
+                let p = at + k as u64;
+                if p >= self.pos && p < self.pos + n as u64 {
+                    out[(p - self.pos) as usize] = b;
+                }
+            }
+        }
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl std::io::Seek for Sparse {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.pos = match to {
+            std::io::SeekFrom::Start(p) => p,
+            std::io::SeekFrom::End(d) => self.len.wrapping_add_signed(d),
+            std::io::SeekFrom::Current(d) => self.pos.wrapping_add_signed(d),
+        };
+        Ok(self.pos)
+    }
+}
+
+fn walk_sparse(len: u64, data: Vec<(u64, Vec<u8>)>) -> (Vec<FrameInfo>, Option<Stop>) {
+    let mut w = Walker::new(Sparse { len, data, pos: 0 });
+    let mut frames = Vec::new();
+    loop {
+        match w.next_frame() {
+            Ok(Some(f)) => frames.push(f),
+            Ok(None) => return (frames, None),
+            Err(s) => return (frames, Some(s)),
+        }
+    }
+}
+
+/// probe: block-size words are not checked against the frame's maximum
+/// (`0x10001` in a 64 KiB frame lists); a block of 2 GiB - 1 in a short
+/// file leaves no word after it (not recognized, 1.11.0), in time
+/// proportional to nothing: one seek.
 #[test]
 fn hostile_block_sizes_cost_one_seek() {
     let mut s = Shape::new();
     s.id = 4;
+    s.blocks = vec![0x1_0001];
+    assert_eq!(sizes(&s.bytes()), [7 + 4 + 0x1_0001 + 4 + 4]);
     s.blocks = vec![];
     s.end = false;
     let mut f = s.bytes();
     f.extend_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
     f.extend_from_slice(b"ab");
-    assert_eq!(sizes(&f), [7 + 4 + 0x7FFF_FFFF]);
+    assert_eq!(stop_of(&f), Some(Stop::NotRecognized));
     // The top bit is the stored flag, whatever follows it.
     let mut g = s.bytes();
     g.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-    assert_eq!(sizes(&g), [7 + 4 + 0x7FFF_FFFF]);
+    assert_eq!(stop_of(&g), Some(Stop::NotRecognized));
 }
 
-/// probe: a hostile frame whose blocks say 2 GiB each is counted in 64
-/// bits (a 6 GiB sparse file listed 6442450968), and the sum is not cut.
+/// probe: a frame whose blocks say 2 GiB each is counted in 64 bits (a 6
+/// GiB sparse file listed 6442450968), and the sum is not cut.
 #[test]
 fn sizes_are_sixty_four_bits() {
     let mut s = Shape::new();
     s.blocks = vec![];
     s.end = false;
-    let mut f = s.bytes();
-    let word = 0x7FFF_FFFFu32.to_le_bytes();
-    f.extend_from_slice(&word);
-    // A real reader would need 2 GiB here; the cursor stands in with a
-    // short file, so the second word is never reached: one block.
-    assert_eq!(sizes(&f), [7 + 4 + 0x7FFF_FFFF]);
+    s.content_checksum = false;
+    let head = s.bytes();
+    let block = 0x7FFF_FFFFu64;
+    let word = 0x7FFF_FFFFu32.to_le_bytes().to_vec();
+    let mut data = vec![(0, head)];
+    for k in 0..3 {
+        data.push((7 + k * (4 + block), word.clone()));
+    }
+    // The end mark is the zeros after the third block.
+    let len = 7 + 3 * (4 + block) + 4;
+    let (frames, stop) = walk_sparse(len, data);
+    assert_eq!(stop, None);
+    assert_eq!(frames[0].size, len);
+    assert!(len > 6 << 30);
 }
 
 // ---- skippable and legacy frames ----
@@ -434,37 +479,62 @@ fn skippable_frames() {
     let mut t = skippable(3);
     t.extend_from_slice(&[1, 1]);
     assert_eq!(stop_of(&t), Some(Stop::MagicUnreadable));
-    // A cut area is no error: the size stays what it said.
-    assert_eq!(sizes(&cut[..8]), [11]);
-    assert_eq!(sizes(&skippable(10)[..12]), [18]);
+    // probe (1.11.0): an area that runs past the end is `Error 43`
+    // (`skip_trunc.lz4`; 1.10.0 listed it), also after a frame.
+    assert_eq!(stop_of(&cut[..8]), Some(Stop::SkipPastEnd));
+    assert_eq!(stop_of(&skippable(10)[..17]), Some(Stop::SkipPastEnd));
+    let mut f = Shape::new().bytes();
+    f.extend_from_slice(&skippable(5)[..12]);
+    assert_eq!(
+        walk(&f),
+        (walk(&Shape::new().bytes()).0, Some(Stop::SkipPastEnd))
+    );
 }
 
 /// probe: a skippable frame of `0xFFFFFFFF` bytes lists as 7 (`size + 8` in
-/// 32 bits) and ends the file; `0xFFFFFFF0` is 4294967288.
+/// 32 bits) when the file holds it; `0xFFFFFFF0` is 4294967288; one byte
+/// short is `Error 43` (`skip_4g.lz4`, 1.11.0).
 #[test]
 fn a_huge_skippable_frame_wraps_its_size() {
-    let mut f = 0x184D_2A50u32.to_le_bytes().to_vec();
-    f.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-    f.extend_from_slice(b"ab");
-    f.extend_from_slice(&Shape::new().bytes());
-    let (frames, stop) = walk(&f);
+    let head = |n: u32| {
+        let mut f = 0x184D_2A50u32.to_le_bytes().to_vec();
+        f.extend_from_slice(&n.to_le_bytes());
+        vec![(0, f)]
+    };
+    let whole = 8 + u64::from(u32::MAX);
+    let (frames, stop) = walk_sparse(whole, head(u32::MAX));
     assert_eq!(
         (stop, frames.iter().map(|f| f.size).collect::<Vec<_>>()),
         (None, vec![7])
     );
-    f[4..8].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
-    assert_eq!(walk(&f).0[0].size, 4_294_967_288);
+    let (frames, stop) = walk_sparse(whole - 1, head(u32::MAX));
+    assert_eq!((stop, frames.len()), (Some(Stop::SkipPastEnd), 0));
+    let (frames, _) = walk_sparse(8 + 0xFFFF_FFF0, head(0xFFFF_FFF0));
+    assert_eq!(frames[0].size, 4_294_967_288);
 }
 
 /// probe: legacy frames: magic, then 4-byte sizes and blocks, to the end of
-/// the file or a word that is a magic number; a zero size is a block; more
-/// than 8 MiB, or a word cut short, is corrupted; a frame with no block is
-/// not recognized, whatever follows.
+/// the file or a word that is a magic number; more than 8 MiB, or a word
+/// cut short, is corrupted; a frame with no block is not recognized,
+/// whatever follows. lz4 1.11.0: a word of 0 ends the frame and is part of
+/// it (1.10.0 took it for an empty block), even as the first word.
 #[test]
 fn legacy_frames() {
     assert_eq!(sizes(&legacy(&[10])), [18]);
     assert_eq!(sizes(&legacy(&[10, 20])), [42]);
-    assert_eq!(sizes(&legacy(&[0, 0, 0])), [16]);
+    assert_eq!(sizes(&legacy(&[0])), [8]);
+    assert_eq!(sizes(&legacy(&[3, 0])), [15]);
+    // After the end mark comes a magic number: zeros are none.
+    assert_eq!(
+        walk(&legacy(&[0, 0, 0])),
+        (walk(&legacy(&[0])).0, Some(Stop::Trailing(12)))
+    );
+    let mut f = legacy(&[3, 0]);
+    f.extend_from_slice(&legacy(&[4]));
+    assert_eq!(sizes(&f), [15, 12]);
+    let mut f = legacy(&[0]);
+    f.extend_from_slice(&[1, 2]);
+    assert_eq!(stop_of(&f), Some(Stop::MagicUnreadable));
     let mut two = legacy(&[3]);
     two.extend_from_slice(&legacy(&[4]));
     assert_eq!(sizes(&two), [11, 12]);
@@ -522,13 +592,12 @@ fn unknown_magic_numbers() {
     assert_eq!(stop_of(&f), Some(Stop::Trailing(15)));
 }
 
-/// A hostile file of zero-size legacy blocks is walked once, the window
+/// A hostile file of one-byte legacy blocks is walked once, the window
 /// holding 64 KiB whatever its length.
 #[test]
 fn a_long_run_of_blocks_is_one_pass() {
-    let mut f = LEGACY_MAGIC.to_le_bytes().to_vec();
-    f.resize(4 + 4 * 300_000, 0);
-    assert_eq!(sizes(&f), [4 + 4 * 300_000]);
+    let f = legacy(&[1; 300_000]);
+    assert_eq!(sizes(&f), [4 + 5 * 300_000]);
 }
 
 // ---- the cells ----
@@ -828,7 +897,14 @@ fn failures_end_the_run() {
     sized.content_size = Some(14);
     let mut cut = sized.bytes();
     cut.truncate(6);
-    let d = Dir::new(&[("a.lz4", &f), ("notlz4", b"hello hello"), ("cut.lz4", &cut)]);
+    let mut past = f.clone();
+    past.extend_from_slice(&skippable(4)[..10]);
+    let d = Dir::new(&[
+        ("a.lz4", &f),
+        ("notlz4", b"hello hello"),
+        ("cut.lz4", &cut),
+        ("past.lz4", &past),
+    ]);
     let (code, out, err) = d.run(&["--list"]);
     assert_eq!((code, out.as_str(), err.as_str()), (0, HEADER, ""));
     let (code, out, _) = d.run(&["--list", "-"]);
@@ -845,9 +921,16 @@ fn failures_end_the_run() {
     assert_eq!(code, 1);
     assert_eq!(out.matches("a.lz4").count(), 1, "{out}");
     assert_eq!(err, "lz4: notlz4: File format not recognized \n");
+    // probe (1.11.0): a header cut short is no longer `Error 72`.
     let (code, out, err) = d.run(&["--list", "cut.lz4", "a.lz4"]);
-    assert_eq!((code, out.as_str()), (72, HEADER));
-    assert_eq!(err, "Error 72 : Error reading cut.lz4 \n");
+    assert_eq!((code, out.as_str()), (1, HEADER));
+    assert_eq!(err, "lz4: cut.lz4: File format not recognized \n");
+    let (code, out, err) = d.run(&["--list", "past.lz4", "a.lz4"]);
+    assert_eq!((code, out.as_str()), (43, HEADER));
+    assert_eq!(
+        err,
+        "Error 43 : Stream error : cannot skip skippable area \n"
+    );
 }
 
 /// probe: undecodable bytes after a frame say so only at level 3; a legacy

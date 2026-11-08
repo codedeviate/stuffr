@@ -287,6 +287,23 @@ mod unix {
             "leg_magic_only.lz4" => LEGACY.to_vec(),
             "leg_magics.lz4" => cat(&[&LEGACY, &LEGACY]),
             "leg_zero_blocks.lz4" => cat(&[&LEGACY, &le32(0), &le32(0), &le32(0)]),
+            // `--list` (0.26.0 Task 6, lz4 1.11.0's checks): the classes
+            // the random differential found.
+            "dictid_whole.lz4" => cat(&[&header(0x65, 0x40, &le32(0x1234_5678)), &end, &le32(0)]),
+            "no_endmark.lz4" => cat(&[&header(0x64, 0x40, &[]), &le32(0x8000_0003), b"abc"]),
+            "end_cut.lz4" => cat(&[
+                &header(0x60, 0x40, &[]),
+                &le32(0x8000_0003),
+                b"abc",
+                &[0, 0],
+            ]),
+            "leg_end_then3.lz4" => cat(&[&LEGACY, &le32(3), b"abc", &end, b"AB"]),
+            "leg_end_then_good.lz4" => cat(&[&LEGACY, &end, &good()]),
+            "leg_end_then_leg.lz4" => {
+                cat(&[&LEGACY, &le32(3), b"abc", &end, &LEGACY, &le32(3), b"abc"])
+            }
+            "skip_to_end.lz4" => cat(&[&good(), &[0x5f, 0x2a, 0x4d, 0x18], &le32(3), b"abc"]),
+            "skip_past_end.lz4" => cat(&[&good(), &[0x5f, 0x2a, 0x4d, 0x18], &le32(4), b"abc"]),
             other => panic!("no fixture named {other}"),
         }
     }
@@ -339,7 +356,10 @@ mod unix {
 
     // ---- the table ----
 
-    /// One probed command: what the reference did, as recorded 2026-10-16.
+    /// One probed command: what the reference did, as recorded 2026-10-16
+    /// against lz4 1.10.0 and re-recorded 2026-11-08 against 1.11.0 (the
+    /// 37 rows of the probe document's `-probe-recorded-rows.txt`, 0.26.0
+    /// Task 6).
     struct Row {
         label: &'static str,
         /// The task that enables the differential row (ruling P1).
@@ -406,7 +426,8 @@ mod unix {
     }
 
     /// Every probed row. Each `task` names who enables it; the codes and
-    /// messages are the reference's, 2026-10-16, `LC_ALL=C`.
+    /// messages are the reference's, `LC_ALL=C`: lz4 1.10.0 on 2026-10-16,
+    /// lz4 1.11.0 since 2026-11-08 (0.26.0).
     fn rows() -> Vec<Row> {
         const T3: &str = "Task 3";
         const T4: &str = "Task 4";
@@ -535,30 +556,30 @@ mod unix {
             ),
             row(
                 T3,
-                "-B wraps to 31",
+                "-B past 32 bits overflows (would wrap to 31)",
                 "lz4",
                 &["-B4294967327", "a"],
                 &["a"],
                 1,
-                usage,
+                "error: numeric value overflows 32-bit unsigned int \n",
             ),
             row(
                 T3,
-                "-B wraps to 0",
+                "-B past 32 bits overflows (would wrap to 0)",
                 "lz4",
                 &["-B42949672960", "a"],
                 &["a"],
                 1,
-                usage,
+                "error: numeric value overflows 32-bit unsigned int \n",
             ),
             row(
                 T3,
-                "-B4096M wraps to 0",
+                "-B4096M overflows",
                 "lz4",
                 &["-B4096M", "a"],
                 &["a"],
                 1,
-                usage,
+                "error: numeric value overflows 32-bit unsigned int \n",
             ),
             row(
                 T3,
@@ -625,21 +646,21 @@ mod unix {
             ),
             row(
                 T3,
-                "-B is capped at 4 MiB",
+                "-B past 32 bits overflows before -V",
                 "lz4",
                 &["-B99999999999", "-V"],
                 &[],
-                0,
-                "using blocks of size 4096 KB \n",
+                1,
+                "error: numeric value overflows 32-bit unsigned int \n",
             ),
             row(
                 T3,
-                "-B4194305K wraps to 1 KB",
+                "-B4194305K overflows before -V",
                 "lz4",
                 &["-B4194305K", "-V"],
                 &[],
-                0,
-                "using blocks of size 1 KB \n",
+                1,
+                "error: numeric value overflows 32-bit unsigned int \n",
             ),
             row(
                 T3,
@@ -708,12 +729,12 @@ mod unix {
             ),
             row(
                 T3,
-                "--threads4 reads the next argument",
+                "--threads4 is no --threads",
                 "lz4",
                 &["--threads4", "a"],
                 &["a"],
                 1,
-                "error: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB are allowed \n",
+                usage,
             ),
             row(
                 T3,
@@ -753,12 +774,12 @@ mod unix {
             ),
             row(
                 T3,
-                "--threadsx 4 then -V",
+                "--threadsx is no --threads",
                 "lz4",
                 &["--threadsx", "4", "-V"],
                 &[],
-                0,
-                "",
+                1,
+                usage,
             ),
             row(
                 T3,
@@ -792,12 +813,12 @@ mod unix {
             row(T3, "--fastx", "lz4", &["--fastx", "a"], &["a"], 1, usage),
             row(
                 T3,
-                "--fast wraps to 0",
+                "--fast past 32 bits overflows",
                 "lz4",
                 &["--fast=4294967296", "a"],
                 &["a"],
                 1,
-                usage,
+                "error: numeric value overflows 32-bit unsigned int \n",
             ),
             row(
                 T3,
@@ -810,12 +831,12 @@ mod unix {
             ),
             row(
                 T3,
-                "--fast=1x then -V",
+                "--fast=1x is a usage error",
                 "lz4",
                 &["--fast=1x", "-V"],
                 &[],
-                0,
-                "",
+                1,
+                usage,
             ),
             row(T3, "--best=1", "lz4", &["--best=1", "a"], &["a"], 1, usage),
             row(
@@ -1724,12 +1745,12 @@ mod unix {
             ),
             row(
                 T4,
-                "--rm of standard input",
+                "--rm of standard input removes nothing",
                 "lz4",
                 &["-c", "--rm"],
                 &[],
-                50,
-                "Error 50 : Remove error : stdin: No such file or directory \n",
+                0,
+                "",
             )
             .stdin_fx("a"),
             row(
@@ -2282,16 +2303,16 @@ mod unix {
             row(T4, "two frames -d", "lz4", &["-d", "two_frames.lz4"], &["two_frames.lz4"], 0, "decoded 17600 bytes"),
             row(T4, "skippable then frame -d", "lz4", &["-d", "skip_then_good.lz4"], &["skip_then_good.lz4"], 0, "decoded 8800 bytes"),
             row(T4, "skippable only -d", "lz4", &["-d", "skip_ok.lz4"], &["skip_ok.lz4"], 0, "decoded 0 bytes"),
-            row(T4, "skippable cut inside -t", "lz4", &["-t", "skip_trunc.lz4"], &["skip_trunc.lz4"], 0, "decoded 0 bytes"),
+            row(T4, "skippable cut inside -t", "lz4", &["-t", "skip_trunc.lz4"], &["skip_trunc.lz4"], 43, "Error 43 : Stream error : cannot skip skippable area \n"),
             row(T4, "skippable size cut -t", "lz4", &["-t", "skip_hdr_trunc.lz4"], &["skip_hdr_trunc.lz4"], 42, "Error 42 : Stream error : skippable size unreadable \n"),
             row(T4, "stored block -t", "lz4", &["-t", "blk_uncompressed.lz4"], &["blk_uncompressed.lz4"], 0, "decoded 5 bytes"),
             // ---- Task 4: legacy frames (and the Task 1 review's zero word) ----
             row(T4, "legacy -d", "lz4", &["-d", "leg.lz4"], &["leg.lz4"], 0, "decoded 8800 bytes"),
             row(T4, "legacy then frame -t", "lz4", &["-t", "leg_then_good.lz4"], &["leg_then_good.lz4"], 0, "decoded 17600 bytes"),
-            row(T4, "legacy magic only -d", "lz4", &["-d", "legzero.lz4"], &["legzero.lz4"], 64, "Error 64 : Decoding Failed ! Corrupted input detected ! \n"),
-            row(T4, "legacy zero word -t", "lz4", &["-t", "legzero.lz4"], &["legzero.lz4"], 64, "Error 64 : Decoding Failed ! Corrupted input detected ! \n"),
-            row(T4, "legacy zero word lz4cat", "lz4cat", &["legzero.lz4"], &["legzero.lz4"], 64, "Error 64 : Decoding Failed ! Corrupted input detected ! \n"),
-            row(T4, "legacy zero word -dc", "lz4", &["-dc", "legzero.lz4"], &["legzero.lz4"], 64, "Error 64 : Decoding Failed ! Corrupted input detected ! \n"),
+            row(T4, "legacy zero word ends the frame -d", "lz4", &["-d", "legzero.lz4"], &["legzero.lz4"], 0, "decoded 0 bytes"),
+            row(T4, "legacy zero word -t", "lz4", &["-t", "legzero.lz4"], &["legzero.lz4"], 0, "decoded 0 bytes"),
+            row(T4, "legacy zero word lz4cat", "lz4cat", &["legzero.lz4"], &["legzero.lz4"], 0, ""),
+            row(T4, "legacy zero word -dc", "lz4", &["-dc", "legzero.lz4"], &["legzero.lz4"], 0, ""),
             row(T4, "legacy size word cut", "lz4", &["-t", "leg_bsz_trunc.lz4"], &["leg_bsz_trunc.lz4"], 61, "Error 61 : Error: cannot read block size in Legacy format \n"),
             row(T4, "legacy block cut", "lz4", &["-t", "leg_blk_trunc.lz4"], &["leg_blk_trunc.lz4"], 63, "Error 63 : Read error : cannot access compressed block ! \n"),
             row(T4, "legacy block claims 8 MiB+", "lz4", &["-t", "leg_8m.lz4"], &["leg_8m.lz4"], 63, "Error 63 : Read error : cannot access compressed block ! \n"),
@@ -2299,13 +2320,13 @@ mod unix {
             row(T4, "legacy block not lz4", "lz4", &["-t", "leg_bad.lz4"], &["leg_bad.lz4"], 64, "Error 64 : Decoding Failed ! Corrupted input detected ! \n"),
             row(T4, "legacy then 3 bytes", "lz4", &["-t", "leg_garbage.lz4"], &["leg_garbage.lz4"], 61, "Error 61 : Error: cannot read block size in Legacy format \n"),
             row(T4, "legacy then 100 bytes", "lz4", &["-t", "leg_garbage100.lz4"], &["leg_garbage100.lz4"], 1, "Stream followed by undecodable data at position 103 \n"),
-            row(T4, "legacy then zeros", "lz4", &["-t", "leg_zeros.lz4"], &["leg_zeros.lz4"], 64, "Error 64 : Decoding Failed ! Corrupted input detected ! \n"),
+            row(T4, "legacy then zeros", "lz4", &["-t", "leg_zeros.lz4"], &["leg_zeros.lz4"], 1, "Stream followed by undecodable data at position 107 \n"),
             // ---- Task 4: dictionaries ----
             row(T4, "-D missing file", "lz4", &["-D", "nosuchdict", "a", "x.lz4"], &["a"], 27, "nosuchdict: No such file or directory \nError 27 : Dictionary error : could not open dictionary file \n"),
             row(T4, "-D missing file -d", "lz4", &["-D", "nosuchdict", "-d", "b.lz4"], &["b.lz4"], 27, "Error 27 : Dictionary error : could not open dictionary file \n"),
             row(T4, "-D is a directory", "lz4", &["-D", "d", "a", "x.lz4"], &["a"], 27, "lz4: d is a directory -- ignored \nError 27 : Dictionary error : could not open dictionary file \n")
                 .setup(mkdir_d),
-            row(T4, "-D empty file", "lz4", &["-D", "empty", "a", "x.lz4"], &["a", "empty"], 0, "Compressed 8800 bytes into 108 bytes ==> 1.23%"),
+            row(T4, "-D empty file", "lz4", &["-D", "empty", "a", "x.lz4"], &["a", "empty"], 0, "Compressed 8800 bytes into 107 bytes ==> 1.22%"),
             row(T4, "-D right dictionary -d", "lz4", &["-d", "-D", "dict", "dict_b.lz4", "o"], &["dict", "dict_b.lz4"], 0, "decoded 8800 bytes"),
             row(T4, "-D glued -D<file>", "lz4", &["-Ddict", "a", "x.lz4"], &["dict", "a"], 0, "Compressed 8800 bytes into 63 bytes ==> 0.72%"),
             row(T4, "-D wrong dictionary -d", "lz4", &["-d", "-D", "dict2", "dict_b.lz4", "o"], &["dict2", "dict_b.lz4"], 34, "Error 34 : Decompression error : ERROR_contentChecksum_invalid \n"),
@@ -2327,7 +2348,7 @@ mod unix {
             row(T4, "-B 7: 7 is a file name", "lz4", &["-B", "7", "a"], &["a"], 1, "7: No such file or directory \n"),
             row(T4, "level 13 is 12", "lz4", &["-13", "a"], &["a"], 0, "Compressed 8800 bytes into 107 bytes ==> 1.22%"),
             row(T4, "level 99 is 12", "lz4", &["-99", "a"], &["a"], 0, "Compressed 8800 bytes into 107 bytes ==> 1.22%"),
-            row(T4, "--fast=99999999999 saturates", "lz4", &["--fast=99999999999", "a"], &["a"], 0, "Compressed 8800 bytes into 8819 bytes ==> 100.22%"),
+            row(T4, "--fast=99999999999 overflows", "lz4", &["--fast=99999999999", "a"], &["a"], 1, "error: numeric value overflows 32-bit unsigned int \n"),
             row(T4, "-m with no names compresses stdin", "lz4", &["-m", "-c"], &[], 0, "").stdin(&text()),
             // ---- Task 4: standard streams and a terminal ----
             row(T4, "stdin a console", "lz4", &[], &[], 1, "refusing to read from a console\n").tty(true, true),
@@ -2351,7 +2372,7 @@ mod unix {
             row(T5, "--list a legacy frame", "lz4", &["--list", "leg.lz4"], &["leg.lz4"], 0, ""),
             row(T5, "--list a legacy magic only", "lz4", &["--list", "legzero.lz4"], &["legzero.lz4"], 0, ""),
             row(T5, "--list a frame of nothing", "lz4", &["--list", "empty.lz4"], &["empty.lz4"], 0, ""),
-            row(T5, "--list a cut block", "lz4", &["--list", "t_blk.lz4"], &["t_blk.lz4"], 0, ""),
+            row(T5, "--list a cut block", "lz4", &["--list", "t_blk.lz4"], &["t_blk.lz4"], 1, "lz4: t_blk.lz4: File format not recognized \n"),
             row(T5, "--list not lz4", "lz4", &["--list", "notlz4"], &["notlz4"], 1, "lz4: notlz4: File format not recognized \n"),
             row(T5, "--list a cut header", "lz4", &["--list", "t_hdr.lz4"], &["t_hdr.lz4"], 1, "lz4: t_hdr.lz4: File format not recognized \n"),
             row(T5, "--list a bad header checksum", "lz4", &["--list", "bad_hc.lz4"], &["bad_hc.lz4"], 1, "lz4: bad_hc.lz4: File format not recognized \n"),
@@ -2379,7 +2400,7 @@ mod unix {
             row(T5, "--list -v -D and a content size", "lz4", &["--list", "-v", "dict_cs.lz4"], &["dict_cs.lz4"], 0, ""),
             row(T5, "--list -D (the CLI writes no dictionary ID)", "lz4", &["--list", "dict_b.lz4"], &["dict_b.lz4"], 0, ""),
             row(T5, "--list a dictionary ID with a content size", "lz4", &["--list", "-v", "dictid_cs.lz4"], &["dictid_cs.lz4"], 0, ""),
-            row(T5, "--list a dictionary ID, no content size", "lz4", &["--list", "dictid.lz4"], &["dictid.lz4"], 1, "File format not recognized"),
+            row(T5, "--list a dictionary ID, its content checksum missing", "lz4", &["--list", "dictid.lz4"], &["dictid.lz4"], 1, "File format not recognized"),
             row(T5, "--list two frames with sizes", "lz4", &["--list", "cs_twice.lz4"], &["cs_twice.lz4"], 0, ""),
             row(T5, "--list -v two frames with sizes", "lz4", &["--list", "-v", "cs_twice.lz4"], &["cs_twice.lz4"], 0, ""),
             row(T5, "--list a size, then none", "lz4", &["--list", "cs_then_plain.lz4"], &["cs_then_plain.lz4"], 0, ""),
@@ -2390,34 +2411,34 @@ mod unix {
             row(T5, "--list -v a skippable then a legacy", "lz4", &["--list", "-v", "skip_then_leg.lz4"], &["skip_then_leg.lz4"], 0, ""),
             row(T5, "--list a skippable frame", "lz4", &["--list", "skip_ok.lz4"], &["skip_ok.lz4"], 0, ""),
             row(T5, "--list -v a skippable frame", "lz4", &["--list", "-v", "skip_ok.lz4"], &["skip_ok.lz4"], 0, ""),
-            row(T5, "--list a skippable frame cut short", "lz4", &["--list", "-v", "skip_trunc.lz4"], &["skip_trunc.lz4"], 0, ""),
+            row(T5, "--list a skippable frame cut short", "lz4", &["--list", "-v", "skip_trunc.lz4"], &["skip_trunc.lz4"], 43, "Error 43 : Stream error : cannot skip skippable area \n"),
             row(T5, "--list a skippable size cut", "lz4", &["--list", "skip_hdr_trunc.lz4"], &["skip_hdr_trunc.lz4"], 42, "skippable size unreadable"),
             row(T5, "--list a skippable size cut to two bytes", "lz4", &["--list", "-v", "skip_size_cut.lz4"], &["skip_size_cut.lz4"], 42, "skippable size unreadable"),
-            row(T5, "--list a skippable frame of 4 GiB", "lz4", &["--list", "-v", "skip_4g.lz4"], &["skip_4g.lz4"], 0, ""),
-            row(T5, "--list a block of 2 GiB", "lz4", &["--list", "-v", "blk_2g.lz4"], &["blk_2g.lz4"], 0, ""),
-            row(T5, "--list a block of 2 GiB, compact", "lz4", &["--list", "blk_2g.lz4"], &["blk_2g.lz4"], 0, ""),
+            row(T5, "--list a skippable frame of 4 GiB", "lz4", &["--list", "-v", "skip_4g.lz4"], &["skip_4g.lz4"], 43, "Error 43 : Stream error : cannot skip skippable area \n"),
+            row(T5, "--list a block of 2 GiB", "lz4", &["--list", "-v", "blk_2g.lz4"], &["blk_2g.lz4"], 1, "lz4: blk_2g.lz4: File format not recognized \n"),
+            row(T5, "--list a block of 2 GiB, compact", "lz4", &["--list", "blk_2g.lz4"], &["blk_2g.lz4"], 1, "lz4: blk_2g.lz4: File format not recognized \n"),
             row(T5, "--list a header and nothing", "lz4", &["--list", "hdr_only.lz4"], &["hdr_only.lz4"], 1, "File format not recognized"),
-            row(T5, "--list a header and one byte", "lz4", &["--list", "-v", "hdr_plus1.lz4"], &["hdr_plus1.lz4"], 0, ""),
+            row(T5, "--list a header and one byte", "lz4", &["--list", "-v", "hdr_plus1.lz4"], &["hdr_plus1.lz4"], 1, "lz4: hdr_plus1.lz4: File format not recognized \n"),
             row(T5, "--list a header with a content size and nothing", "lz4", &["--list", "hdr_cs_only.lz4"], &["hdr_cs_only.lz4"], 1, "File format not recognized"),
-            row(T5, "--list a magic number alone", "lz4", &["--list", "magic_only.lz4"], &["magic_only.lz4"], 71, "Error 71 : Error reading magic_only.lz4"),
+            row(T5, "--list a magic number alone", "lz4", &["--list", "magic_only.lz4"], &["magic_only.lz4"], 1, "lz4: magic_only.lz4: File format not recognized \n"),
             row(T5, "--list a content-size header cut at 9 bytes", "lz4", &["--list", "cs_trunc.lz4"], &["cs_trunc.lz4"], 1, "lz4: cs_trunc.lz4: File format not recognized"),
-            row(T5, "--list a content-size header cut at 6 bytes", "lz4", &["--list", "hdr_cs_cut.lz4"], &["hdr_cs_cut.lz4"], 72, "Error 72 : Error reading hdr_cs_cut.lz4"),
+            row(T5, "--list a content-size header cut at 6 bytes", "lz4", &["--list", "hdr_cs_cut.lz4"], &["hdr_cs_cut.lz4"], 1, "lz4: hdr_cs_cut.lz4: File format not recognized \n"),
             row(T5, "--list a header cut at 6 bytes, no content size", "lz4", &["--list", "hdr_cut6.lz4"], &["hdr_cut6.lz4"], 1, "lz4: hdr_cut6.lz4: File format not recognized"),
-            row(T5, "--list a cut frame, -v", "lz4", &["--list", "-v", "t_blk.lz4"], &["t_blk.lz4"], 0, ""),
-            row(T5, "--list a cut checksum, -v", "lz4", &["--list", "-v", "t_crc.lz4"], &["t_crc.lz4"], 0, ""),
-            row(T5, "--list a cut block size, -v", "lz4", &["--list", "-v", "t_bsz.lz4"], &["t_bsz.lz4"], 0, ""),
+            row(T5, "--list a cut frame, -v", "lz4", &["--list", "-v", "t_blk.lz4"], &["t_blk.lz4"], 1, "lz4: t_blk.lz4: File format not recognized \n"),
+            row(T5, "--list a cut checksum, -v", "lz4", &["--list", "-v", "t_crc.lz4"], &["t_crc.lz4"], 1, "lz4: t_crc.lz4: File format not recognized \n"),
+            row(T5, "--list a cut block size, -v", "lz4", &["--list", "-v", "t_bsz.lz4"], &["t_bsz.lz4"], 1, "lz4: t_bsz.lz4: File format not recognized \n"),
             row(T5, "--list a cut header, -v", "lz4", &["--list", "-v", "t_hdr.lz4"], &["t_hdr.lz4"], 1, "File format not recognized"),
-            row(T5, "--list a cut block of block checksums, -v", "lz4", &["--list", "-v", "t_bblk.lz4"], &["t_bblk.lz4"], 0, ""),
+            row(T5, "--list a cut block of block checksums, -v", "lz4", &["--list", "-v", "t_bblk.lz4"], &["t_bblk.lz4"], 1, "lz4: t_bblk.lz4: File format not recognized \n"),
             row(T5, "--list a cut magic number", "lz4", &["--list", "t_magic.lz4"], &["t_magic.lz4"], 40, "Magic Number unreadable"),
             row(T5, "--list a legacy magic number alone", "lz4", &["--list", "leg_magic_only.lz4"], &["leg_magic_only.lz4"], 1, "File format not recognized"),
             row(T5, "--list two legacy magic numbers", "lz4", &["--list", "leg_magics.lz4"], &["leg_magics.lz4"], 1, "File format not recognized"),
-            row(T5, "--list zero-size legacy blocks", "lz4", &["--list", "-v", "leg_zero_blocks.lz4"], &["leg_zero_blocks.lz4"], 0, ""),
+            row(T5, "--list zero-size legacy blocks", "lz4", &["--list", "-v", "leg_zero_blocks.lz4"], &["leg_zero_blocks.lz4"], 1, "Stream followed by undecodable data at position 12 \nlz4: leg_zero_blocks.lz4: File format not recognized \n"),
             row(T5, "--list a legacy size above 4 GiB - 16", "lz4", &["--list", "leg_huge.lz4"], &["leg_huge.lz4"], 1, "Corrupted legacy frame \nlz4: leg_huge.lz4: File format not recognized"),
             row(T5, "--list a legacy size just above 8 MiB", "lz4", &["--list", "leg_8m.lz4"], &["leg_8m.lz4"], 1, "Corrupted legacy frame \nlz4: leg_8m.lz4: File format not recognized"),
             row(T5, "--list a legacy size cut short", "lz4", &["--list", "leg_bsz_trunc.lz4"], &["leg_bsz_trunc.lz4"], 1, "Corrupted legacy frame"),
             row(T5, "--list a legacy block cut short, -v", "lz4", &["--list", "-v", "leg_blk_trunc.lz4"], &["leg_blk_trunc.lz4"], 0, ""),
             row(T5, "--list a legacy frame then 3 bytes", "lz4", &["--list", "leg_garbage.lz4"], &["leg_garbage.lz4"], 1, "Corrupted legacy frame"),
-            row(T5, "--list a legacy frame then 8 zeros", "lz4", &["--list", "-v", "leg_zeros.lz4"], &["leg_zeros.lz4"], 0, ""),
+            row(T5, "--list a legacy frame then 8 zeros", "lz4", &["--list", "-v", "leg_zeros.lz4"], &["leg_zeros.lz4"], 1, "Stream followed by undecodable data at position 107 \nlz4: leg_zeros.lz4: File format not recognized \n"),
             row(T5, "--list a frame then 1 byte", "lz4", &["--list", "-v", "frame_tail1.lz4"], &["frame_tail1.lz4"], 40, "Magic Number unreadable"),
             row(T5, "--list a frame then 4 zeros, -v", "lz4", &["--list", "-v", "frame_zero4.lz4"], &["frame_zero4.lz4"], 1, "Stream followed by undecodable data at position 114"),
             row(T5, "--list a frame then 8 zeros", "lz4", &["--list", "z.lz4"], &["z.lz4"], 1, "File format not recognized"),
@@ -2429,10 +2450,23 @@ mod unix {
             row(T5, "--list a bad version", "lz4", &["--list", "v0.lz4"], &["v0.lz4"], 1, "File format not recognized"),
             row(T5, "--list a block size ID of 3", "lz4", &["--list", "bd_size3.lz4"], &["bd_size3.lz4"], 1, "File format not recognized"),
             row(T5, "--list an empty frame, -v", "lz4", &["--list", "-v", "empty.lz4"], &["empty.lz4"], 0, ""),
-            row(T5, "--list a content size of 2^63, -v", "lz4", &["--list", "-v", "cs_2p63.lz4"], &["cs_2p63.lz4"], 0, ""),
-            row(T5, "--list a content size of 2^63, compact", "lz4", &["--list", "cs_2p63.lz4"], &["cs_2p63.lz4"], 0, ""),
-            row(T5, "--list a content size that disagrees", "lz4", &["--list", "cs_mismatch.lz4"], &["cs_mismatch.lz4"], 0, ""),
-            row(T5, "--list a content size cut", "lz4", &["--list", "hdr_cs_cut.lz4", "b.lz4"], &["hdr_cs_cut.lz4", "b.lz4"], 72, "Error 72"),
+            row(T5, "--list a content size of 2^63, its checksum missing, -v", "lz4", &["--list", "-v", "cs_2p63.lz4"], &["cs_2p63.lz4"], 1, "lz4: cs_2p63.lz4: File format not recognized \n"),
+            row(T5, "--list a content size of 2^63, its checksum missing", "lz4", &["--list", "cs_2p63.lz4"], &["cs_2p63.lz4"], 1, "lz4: cs_2p63.lz4: File format not recognized \n"),
+            row(T5, "--list a content size, its checksum missing", "lz4", &["--list", "cs_mismatch.lz4"], &["cs_mismatch.lz4"], 1, "lz4: cs_mismatch.lz4: File format not recognized \n"),
+            // 0.26.0 Task 6: the classes of lz4 1.11.0's `--list` checks
+            // that the random differential found (Task 6 report).
+            row(T5, "--list a dictionary ID, no content size, whole", "lz4", &["--list", "-v", "dictid_whole.lz4"], &["dictid_whole.lz4"], 0, ""),
+            row(T5, "--list a frame with no end mark", "lz4", &["--list", "no_endmark.lz4"], &["no_endmark.lz4"], 1, "lz4: no_endmark.lz4: File format not recognized \n"),
+            row(T5, "--list an end mark cut short, -v", "lz4", &["--list", "-v", "end_cut.lz4"], &["end_cut.lz4"], 1, "lz4: end_cut.lz4: File format not recognized \n"),
+            row(T5, "--list a corrupt block (nothing is decoded)", "lz4", &["--list", "-v", "bad_data.lz4"], &["bad_data.lz4"], 0, ""),
+            row(T5, "--list a wrong content checksum (nothing is checked)", "lz4", &["--list", "bad_ccrc.lz4"], &["bad_ccrc.lz4"], 0, ""),
+            row(T5, "--list a legacy end mark then 2 bytes", "lz4", &["--list", "-v", "leg_end_then3.lz4"], &["leg_end_then3.lz4"], 40, "Error 40 : Unrecognized header : Magic Number unreadable \n"),
+            row(T5, "--list a legacy end mark first, then a frame", "lz4", &["--list", "-v", "leg_end_then_good.lz4"], &["leg_end_then_good.lz4"], 0, ""),
+            row(T5, "--list a legacy end mark, then a legacy frame", "lz4", &["--list", "-v", "leg_end_then_leg.lz4"], &["leg_end_then_leg.lz4"], 0, ""),
+            row(T5, "--list a legacy end mark alone, -v", "lz4", &["--list", "-v", "legzero.lz4"], &["legzero.lz4"], 0, ""),
+            row(T5, "--list a skippable area up to the end", "lz4", &["--list", "-v", "skip_to_end.lz4"], &["skip_to_end.lz4"], 0, ""),
+            row(T5, "--list a skippable area past the end, after a frame", "lz4", &["--list", "-v", "skip_past_end.lz4"], &["skip_past_end.lz4"], 43, "Error 43 : Stream error : cannot skip skippable area \n"),
+            row(T5, "--list a content size cut", "lz4", &["--list", "hdr_cs_cut.lz4", "b.lz4"], &["hdr_cs_cut.lz4", "b.lz4"], 1, "lz4: hdr_cs_cut.lz4: File format not recognized \n"),
             // Several files, and the first failure ends the run.
             row(T5, "--list several files", "lz4", &["--list", "b.lz4", "cs.lz4", "leg.lz4"], &["b.lz4", "cs.lz4", "leg.lz4"], 0, ""),
             row(T5, "--list -v several files", "lz4", &["--list", "-v", "b.lz4", "cs.lz4", "leg.lz4"], &["b.lz4", "cs.lz4", "leg.lz4"], 0, ""),
@@ -2480,7 +2514,7 @@ mod unix {
             row(T5, "-p --list failing", "lz4", &["-p", "--list", "notlz4"], &["notlz4"], 1, "Press enter to continue"),
             row(T5, "-p --list Error 40", "lz4", &["-p", "--list", "t_magic.lz4"], &["t_magic.lz4"], 40, ""),
             // ---- Task 6: -v and the progress display ----
-            row(T6, "-v compress", "lz4", &["-v", "-T3", "a", "x.lz4"], &["a"], 0, "Using 3 threads for compression \n"),
+            row(T6, "-v compress", "lz4", &["-v", "-T3", "a", "x.lz4"], &["a"], 0, "Using up to 3 threads for compression \n"),
             row(T6, "-v decode", "lz4", &["-v", "-d", "b.lz4", "bo"], &["b.lz4"], 0, "decoded 8800 bytes"),
             row(T6, "-v test", "lz4", &["-v", "-t", "b.lz4"], &["b.lz4"], 0, "decoded 8800 bytes"),
             row(T6, "-vv compress", "lz4", &["-vv", "-T1", "a", "y.lz4"], &["a"], 0, "_POSIX_VERSION defined: "),
@@ -2609,13 +2643,6 @@ mod unix {
         if EXACT && !figures_are_timing(c) {
             assert_lz4_read_figures(c, &r, &s);
         }
-        // Spec deviation 8: off macOS the reference completes a block-size
-        // word cut short from uninitialised memory even in the first frame
-        // (probe: the tarball build on Linux, CI run 39166896170).
-        if !cfg!(target_os = "macos") && lists_a_cut_word(c) {
-            r.stdout = mask_frame_sizes(&r.stdout);
-            s.stdout = mask_frame_sizes(&s.stdout);
-        }
         // Spec deviation 2: refreshes, timing fields, thread count.
         // A run with a second file or frame to draw for is timing-exposed:
         // its refreshes are dropped, not collapsed (single-file rows still
@@ -2711,36 +2738,6 @@ mod unix {
             .max()
             .unwrap_or(0);
         (linked && size >= block) || size > MIB.max(block)
-    }
-
-    /// Whether `c` is a `--list -v` of a fixture whose first frame ends
-    /// inside a block-size word (deviation 8).
-    fn lists_a_cut_word(c: &Case) -> bool {
-        c.args.contains(&"--list")
-            && c.args.iter().any(|a| a.starts_with("-v"))
-            && c.files
-                .iter()
-                .any(|(name, _)| matches!(*name, "hdr_plus1.lz4" | "t_bsz.lz4"))
-    }
-
-    /// A `--list -v` table with the frame-size cell of every `LZ4Frame`
-    /// row masked (and each row's blanks collapsed, as the cell's width
-    /// moves them).
-    fn mask_frame_sizes(stdout: &[u8]) -> Vec<u8> {
-        let text = String::from_utf8_lossy(stdout);
-        let mut out = String::with_capacity(text.len());
-        for line in text.split_inclusive('\n') {
-            let cells: Vec<&str> = line.split_whitespace().collect();
-            if cells.get(1) == Some(&"LZ4Frame") && cells.len() >= 5 {
-                let mut cells = cells;
-                cells[4] = "<size>";
-                out.push_str(&cells.join(" "));
-                out.push('\n');
-            } else {
-                out.push_str(line);
-            }
-        }
-        out.into_bytes()
     }
 
     /// `Compressed A bytes into B bytes ==> R%` with B and R masked: the

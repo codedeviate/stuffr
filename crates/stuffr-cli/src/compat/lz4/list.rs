@@ -1,10 +1,13 @@
-//! `--list`: what lz4 1.10.0 prints about the frames in each file, without
+//! `--list`: what lz4 1.11.0 prints about the frames in each file, without
 //! decoding any of them.
 //!
 //! **Clean room.** Every rule below was recovered by probing the 1.10.0
-//! binary with hand-made files (the cases are in `.claude/rules/compat.md`,
-//! "lz4 1.10.0 probes", and in `tests/compat_lz4.rs`); lz4's `programs/` was
-//! never read. Messages are in `messages.rs`.
+//! binary and then the 1.11.0 one with hand-made files (the 1.10.0 cases
+//! are in `.claude/rules/compat.md`, "lz4 1.10.0 probes"; the 1.11.0 ones
+//! in the probe document's section 1.16, the `--list` rows of
+//! `tests/compat_lz4.rs` and a random differential of 4000 runs, recorded
+//! in the 0.26.0 Task 6 report); lz4's `programs/` was never read.
+//! Messages are in `messages.rs`.
 //!
 //! **What it does** (all probed):
 //! - Only regular files are listed (`stat`, so a symbolic link to one is);
@@ -21,45 +24,47 @@
 //! - A **walker** reads frame after frame and never decodes: a modern frame
 //!   is its header (checked as liblz4 checks it) and its block-size words
 //!   (the top bit is the "stored" flag; a word of 0, with or without it, is
-//!   the end mark), seeking over each block and block checksum, over the
-//!   content checksum after the end mark; a legacy frame is a run of
-//!   block-size words (at most 8 MiB each) up to a word that is a magic
-//!   number or the end of the file; a skippable frame is its size word and
-//!   that many bytes. A seek past the end of the file is no error: the next
-//!   read finds nothing and the file ends. Memory is a 64 KiB window and a
-//!   few counters whatever the input, and a seek only ever moves forward, so
-//!   a hostile size (a skippable frame of 4 GiB, a block of 2 GiB) costs
-//!   one seek.
-//! - A frame's **size** is the distance the walker moved (not clamped to the
-//!   file: a block cut short still counts as long as it said); a skippable
-//!   frame's is `size + 8` in 32 bits (probe: size `0xFFFFFFFF` says 7).
-//!   The content size in a header counts only when it is not 0 (probe: a
-//!   header saying 0 lists as `-`).
-//! - **Failures**, in the order they are met (probed with every prefix of a
-//!   frame: `tests/compat_lz4.rs`, the `--list` cut rows):
+//!   the end mark), seeking over each block and block checksum, then over
+//!   the content checksum after the end mark; a legacy frame is a run of
+//!   block-size words (at most 8 MiB each) up to a word of 0 (the end mark,
+//!   part of the frame), a word that is a magic number, or the end of the
+//!   file; a skippable frame is its size word and that many bytes. Memory
+//!   is a 64 KiB window and a few counters whatever the input, and a seek
+//!   only ever moves forward, so a hostile size (a skippable frame of 4
+//!   GiB, a block of 2 GiB) costs one seek.
+//! - **1.11.0 checks that a modern frame is all there** (1.10.0 did not):
+//!   every block-size word whole, the end mark present, the content
+//!   checksum's four bytes present when the header promises one. A block
+//!   that runs past the end of the file leaves no word after it, so it
+//!   fails the same way. Blocks are still not bounded by the frame's block
+//!   size, the content size is not compared with anything, and no block
+//!   or checksum is read (probe: a corrupt block, a wrong content checksum,
+//!   a content size of 5 over 3 stored bytes all list). A skippable frame
+//!   whose area runs past the end of the file is `Error 43`. A legacy
+//!   block that does is not checked: the next read finds nothing and the
+//!   frame ends.
+//! - A frame's **size** is the distance the walker moved (for a legacy
+//!   frame not clamped to the file: a block cut short still counts as long
+//!   as it said); a skippable frame's is `size + 8` in 32 bits (probe: size
+//!   `0xFFFFFFFF` says 7, when the file holds it). The content size in a
+//!   header counts only when it is not 0 (probe: a header saying 0 lists
+//!   as `-`).
+//! - **Failures**, in the order they are met:
 //!   - no byte where a magic number belongs ends the file (an empty file is
 //!     not recognized); one to three are `Error 40`;
-//!   - an unknown magic number is not recognized, with a line first at
-//!     display level 3 (`Stream followed by undecodable data at position N`,
-//!     also when it is the file's first);
-//!   - a frame's magic number alone is `Error 71`; with a header cut after
-//!     one to three bytes, `Error 72` when its flags promise a content size
-//!     and not recognized when not; a header cut anywhere else, a header
-//!     liblz4 refuses, a header carrying a dictionary ID but no content size
-//!     (liblz4 accepts it; lz4 does not), and a header with no byte at all
-//!     after it are not recognized;
-//!   - a legacy frame with no block, or with a word cut short or too large,
-//!     is not recognized, with `Corrupted legacy frame` first for the last
-//!     two; a skippable magic number with its size cut is `Error 42`.
-//! - The block-size word is read into a 4-byte buffer the walker keeps: a
-//!   word cut short by the end of the file is completed from what the
-//!   buffer held, which is the frame's previous block-size word (zero at
-//!   the first block). On macOS lz4's buffer is the same until a frame has
-//!   come before; then it holds garbage (probe: `frame + frame header + 1
-//!   byte`); on Linux it holds garbage from the first frame on, different
-//!   every run (probe: `header + 1 byte` with the tarball build). So only
-//!   the **-v frame size of a file cut inside a block-size word** can
-//!   differ (deviation 8).
+//!   - an unknown magic number (mozlz4's included) is not recognized, with
+//!     a line first at display level 3 (`Stream followed by undecodable
+//!     data at position N`, also when it is the file's first);
+//!   - a modern frame cut anywhere (its header, a block-size word, before
+//!     its end mark, inside its content checksum) and a header liblz4
+//!     refuses are not recognized (1.10.0's `Error 71` and `Error 72` are
+//!     gone; a header carrying a dictionary ID but no content size, which
+//!     1.10.0 refused, is listed);
+//!   - a legacy frame with no block (its magic number then the end of the
+//!     file or another magic number), is not recognized, and one with a
+//!     word cut short or too large is too, with `Corrupted legacy frame`
+//!     first; a skippable magic number with its size cut is `Error 42`,
+//!     one whose area runs past the end `Error 43`.
 //! - The table: without `-v` one row per file after a header printed once
 //!   (compressed = the file's size, not the frames'); with display level 3
 //!   and up (`-v`) a `name(i/n)` line and one row per frame as it is met,
@@ -89,9 +94,8 @@ impl<T: Read + Seek> Input for T {}
 const WINDOW: usize = 64 << 10;
 
 /// The header bytes after the magic number the walker needs to see: the
-/// largest header (19 bytes) less the magic, and one byte more (a header
-/// with nothing after it is not recognized).
-const PEEK: usize = 16;
+/// largest header (19 bytes) less the magic.
+const PEEK: usize = 15;
 
 /// What a frame is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,10 +139,8 @@ enum Stop {
     MagicUnreadable,
     /// Error 42.
     SkipSize,
-    /// Error 71.
-    MagicOnly,
-    /// Error 72.
-    HeaderCut,
+    /// Error 43.
+    SkipPastEnd,
 }
 
 /// A file read through a window at absolute positions.
@@ -149,6 +151,8 @@ struct Window<R> {
     base: u64,
     buf: Vec<u8>,
     start: u64,
+    /// The file's length from `base`, once asked.
+    len: Option<u64>,
 }
 
 impl<R: Read + Seek> Window<R> {
@@ -161,7 +165,22 @@ impl<R: Read + Seek> Window<R> {
             base,
             buf: Vec::new(),
             start: 0,
+            len: None,
         }
+    }
+
+    /// The file's length from position 0 (0 if it cannot be found, which
+    /// for the regular files `--list` reads does not happen).
+    fn len(&mut self) -> u64 {
+        if let Some(n) = self.len {
+            return n;
+        }
+        let n = self
+            .r
+            .seek(SeekFrom::End(0))
+            .map_or(0, |end| end.saturating_sub(self.base));
+        self.len = Some(n);
+        n
     }
 
     /// Read up to `out.len()` bytes at `pos`: short only at the end of the
@@ -219,8 +238,6 @@ struct Walker<R> {
     win: Window<R>,
     /// Where the next frame's magic number is.
     pos: u64,
-    /// The block-size word buffer (module doc).
-    word: [u8; 4],
     frames: u64,
 }
 
@@ -229,7 +246,6 @@ impl<R: Read + Seek> Walker<R> {
         Walker {
             win: Window::new(r),
             pos: 0,
-            word: [0; 4],
             frames: 0,
         }
     }
@@ -260,30 +276,20 @@ impl<R: Read + Seek> Walker<R> {
         Ok(Some(info))
     }
 
-    /// A modern frame whose magic number is at `start`.
+    /// A modern frame whose magic number is at `start`: not recognized
+    /// unless all of it is there (module doc).
     fn modern(&mut self, start: u64, magic: [u8; 4]) -> Result<FrameInfo, Stop> {
         let mut head = [0u8; PEEK];
         let k = self.win.read_at(start + 4, &mut head);
-        if k == 0 {
-            return Err(Stop::MagicOnly);
+        // FLG and BD are needed to know the header's length.
+        if k < 2 {
+            return Err(Stop::NotRecognized);
         }
         let content_size = head[0] & 8 != 0;
         let dictionary = head[0] & 1 != 0;
-        if k < 4 {
-            return Err(if content_size {
-                Stop::HeaderCut
-            } else {
-                Stop::NotRecognized
-            });
-        }
-        // probe: a dictionary ID without a content size is never listed.
-        if dictionary && !content_size {
-            return Err(Stop::NotRecognized);
-        }
         // The bytes after the magic number: FLG, BD, the fields, HC.
         let after = 3 + if content_size { 8 } else { 0 } + if dictionary { 4 } else { 0 };
-        // probe: the header must be followed by at least one byte.
-        if k <= after {
+        if k < after {
             return Err(Stop::NotRecognized);
         }
         let mut full = [0u8; 4 + PEEK];
@@ -293,31 +299,30 @@ impl<R: Read + Seek> Walker<R> {
             return Err(Stop::NotRecognized);
         };
         let mut p = start + h.header_len as u64;
-        let mut first = true;
         loop {
+            // probe (1.11.0): a word cut short, or none where one belongs
+            // (a frame with no end mark, a block running past the end of
+            // the file), is not recognized.
             let mut w = [0u8; 4];
-            let n = self.win.read_at(p, &mut w);
-            if n == 0 {
-                // probe: a frame with no word at all is not recognized; a
-                // later word missing just ends the frame.
-                if first {
-                    return Err(Stop::NotRecognized);
-                }
-                break;
+            if self.win.read_at(p, &mut w) < 4 {
+                return Err(Stop::NotRecognized);
             }
-            // probe: a word cut short keeps the rest of the last (module
-            // doc).
-            self.word[..n].copy_from_slice(&w[..n]);
             p += 4;
-            first = false;
-            let size = u64::from(u32::from_le_bytes(self.word) & 0x7FFF_FFFF);
+            let size = u64::from(u32::from_le_bytes(w) & 0x7FFF_FFFF);
             if size == 0 {
-                if h.content_checksum {
-                    p += 4;
-                }
                 break;
             }
             p += size + if h.block_checksum { 4 } else { 0 };
+        }
+        if h.content_checksum {
+            // probe (1.11.0): `cs_mismatch.lz4`, an end mark and no
+            // checksum after it, is not recognized; nothing checks the
+            // checksum itself.
+            let mut c = [0u8; 4];
+            if self.win.read_at(p, &mut c) < 4 {
+                return Err(Stop::NotRecognized);
+            }
+            p += 4;
         }
         self.pos = p;
         Ok(FrameInfo {
@@ -347,6 +352,13 @@ impl<R: Read + Seek> Walker<R> {
                 return Err(Stop::CorruptLegacy);
             }
             let v = u32::from_le_bytes(w);
+            // probe (1.11.0): a word of 0 ends the frame and is part of it
+            // (`LEGACY + 0` lists one frame of 8 bytes, also as the first
+            // word), as the decoder now reads it.
+            if v == 0 {
+                p += 4;
+                break;
+            }
             if v == MAGIC || v == LEGACY_MAGIC || is_skippable_magic(v) {
                 if first {
                     return Err(Stop::NotRecognized);
@@ -376,7 +388,13 @@ impl<R: Read + Seek> Walker<R> {
             return Err(Stop::SkipSize);
         }
         let size = u32::from_le_bytes(w);
-        self.pos = start + 8 + u64::from(size);
+        let end = start + 8 + u64::from(size);
+        // probe (1.11.0): `skip_trunc.lz4`, `skip_4g.lz4`; an area that
+        // ends exactly at the end of the file is fine.
+        if end > self.win.len() {
+            return Err(Stop::SkipPastEnd);
+        }
+        self.pos = end;
         Ok(FrameInfo {
             kind: Kind::Skippable,
             // probe: `size + 8` in 32 bits.
@@ -575,8 +593,7 @@ fn report(run: &mut Run, name: &[u8], stop: Stop) -> Fail {
         }
         Stop::MagicUnreadable => return run.exm(40, m::E40_MAGIC_UNREADABLE, &[]),
         Stop::SkipSize => return run.exm(42, m::E42_SKIPPABLE_SIZE, &[]),
-        Stop::MagicOnly => return run.exm(71, m::E71_READING, &[name]),
-        Stop::HeaderCut => return run.exm(72, m::E72_READING, &[name]),
+        Stop::SkipPastEnd => return run.exm(43, m::E43_SKIP, &[]),
     }
     run.say(1, m::LIST_NOT_RECOGNIZED, &[name]);
     Fail::File

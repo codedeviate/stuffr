@@ -295,9 +295,10 @@ lz4: Read : 0 MiB   ==> 1.25%   \n";
         );
     }
 
-    /// The reference's partial output after a failed decode is a race
-    /// (0 or all of what decoded): only a prefix, only in a run that failed
-    /// the same way, is tolerated.
+    /// The reference's partial output after a failed decode is less than
+    /// stuffr's, or a race (0 or all of what decoded): only a prefix, only in
+    /// a run that failed the same way, is tolerated; on the C tier only the
+    /// reference's may be the shorter.
     #[test]
     fn partial_output_is_tolerated_only_as_a_prefix_of_a_same_failure() {
         let mk = |code: i32, out: &[u8], file: &[u8]| {
@@ -306,15 +307,24 @@ lz4: Read : 0 MiB   ==> 1.25%   \n";
             r.tree.insert("o".into(), (file.to_vec(), 0o644, 0));
             r
         };
-        let verdict_of = |mut r: Run, mut s: Run| {
+        let verdict_on = |mut r: Run, mut s: Run, exact: bool| {
             let c = case("/nonexistent", vec!["-d", "x.lz4"]);
-            tolerate_lz4_partial_output(&c, &mut r, &mut s);
+            tolerate_lz4_partial_output_on(&c, &mut r, &mut s, exact);
             verdict(&c, &r, &s)
         };
+        let verdict_of = |r: Run, s: Run| verdict_on(r, s, false);
         // Nothing against everything, in either direction, and a shorter
-        // prefix, are the same failure.
+        // prefix, are the same failure on the pure tier.
         assert_eq!(verdict_of(mk(34, b"", b""), mk(34, b"abc", b"abc")), None);
         assert_eq!(verdict_of(mk(34, b"abc", b"abc"), mk(34, b"", b"")), None);
+        // On the C tier stuffr may write more than lz4, never less.
+        assert_eq!(
+            verdict_on(mk(34, b"", b""), mk(34, b"abc", b"abc"), true),
+            None
+        );
+        let m = verdict_on(mk(34, b"abc", b"abc"), mk(34, b"ab", b"abc"), true)
+            .expect("stuffr writing less than the reference passed on the C tier");
+        assert!(m.contains("stdout differs"), "{m}");
         assert_eq!(
             verdict_of(mk(34, b"ab", b"a"), mk(34, b"abc", b"abc")),
             None

@@ -1059,25 +1059,41 @@ pub fn assert_lz4_read_figures(c: &Case, r: &Run, s: &Run) {
     }
 }
 
-/// How much a failed lz4 decode had written is the reference's own race: it
-/// decodes on one thread and writes on another, and the failure exits the
-/// process, so what reached the output (stdout or the named file) is nothing,
-/// or everything decoded before the failing block (probe, 2026-10-16:
-/// `lz4 -d` over a frame with 1, 4 or 100 trailing bytes, or cut at its
-/// checksum, left 0 or 8800 bytes of 8800, run to run, in the reference
-/// alone). The comparison therefore accepts, in a run that failed the same
-/// way (same nonzero exit code), a stdout or a file that is a prefix of the
-/// other side's, by truncating both to the shorter. A run that succeeded, a
-/// failure with different exit codes, and bytes that are not a prefix are
-/// untouched, so every real difference is still reported.
+/// How much a failed lz4 decode had written differs from stuffr, and is
+/// partly the reference's own race (deviation 7). lz4 1.10.0 left nothing or
+/// everything decoded before the failing block, run to run (probe,
+/// 2026-10-16). lz4 1.11.0 is deterministic for most failures but writes
+/// less than stuffr: it hands its output on in 4 MiB pieces and flushes the
+/// rest only at the end of a frame or of the input, so a fault inside a
+/// frame loses what follows the last whole piece (`big_bad`, `big_g100` in
+/// the 0.26.0 Task 6 report: 0 and 4194304 bytes, 20 runs of 20), while
+/// stuffr keeps everything decoded before the fault. A frame followed by
+/// bytes that are no frame is still a race in 1.11.0 (`g100.lz4`, `z.lz4`:
+/// 0 or 10090 bytes, 20 runs, 8 at a time).
+///
+/// The comparison therefore accepts, in a run that failed the same way (same
+/// nonzero exit code), a stdout or a file of the reference's that is a
+/// prefix of stuffr's, by truncating stuffr's to it. On the C tier that is
+/// the only direction: stuffr writing less than lz4 1.11.0 would be a
+/// defect. On the pure tier stuffr's may also be a strict prefix of the
+/// reference's (deviation 6: a corrupt frame's output before the fault may
+/// be shorter), so either side is truncated to the shorter. A run that
+/// succeeded, a failure with different exit codes, and bytes that are not a
+/// prefix are untouched, so every real difference is still reported.
 pub fn tolerate_lz4_partial_output(c: &Case, r: &mut Run, s: &mut Run) {
-    fn common(a: &mut Vec<u8>, b: &mut Vec<u8>) {
-        if a.starts_with(b) || b.starts_with(a) {
+    tolerate_lz4_partial_output_on(c, r, s, cfg!(feature = "lz4-c"));
+}
+
+/// [`tolerate_lz4_partial_output`] with the tier named: `exact` (the C
+/// tier) accepts only a reference output that is a prefix of stuffr's.
+pub fn tolerate_lz4_partial_output_on(c: &Case, r: &mut Run, s: &mut Run, exact: bool) {
+    let common = |a: &mut Vec<u8>, b: &mut Vec<u8>| {
+        if b.starts_with(a) || (!exact && a.starts_with(b)) {
             let n = a.len().min(b.len());
             a.truncate(n);
             b.truncate(n);
         }
-    }
+    };
     // Only a decode (`-d`, `-t`, `--decompress`, `--test`, `unlz4`, `lz4cat`)
     // has the race, and only a failure that comes after data: every exit
     // but 1, and 1 only for "Stream followed by undecodable data". A
