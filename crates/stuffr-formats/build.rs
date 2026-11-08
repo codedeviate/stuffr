@@ -1,7 +1,15 @@
-//! Compiles the vendored libbrotli 1.2.1 (`c/brotli-1.2.1/`) for the
-//! `brotli-c` feature: every `.c` file under `common`, `enc` and `dec`, with
-//! `include` on the path, into `libbrotli_vendored.a` at `-O2`. Nothing
-//! happens without the feature, and the `pure` graph never sees `cc`.
+//! Compiles the vendored C libraries:
+//!
+//! - libbrotli 1.2.1 (`c/brotli-1.2.1/`) for the `brotli-c` feature: every
+//!   `.c` file under `common`, `enc` and `dec`, with `include` on the path,
+//!   into `libbrotli_vendored.a` at `-O2`.
+//! - liblz4 1.11.0 (`c/lz4-1.11.0/`) for the `lz4-c` feature: `lz4.c`,
+//!   `lz4hc.c`, `lz4frame.c` and `xxhash.c` into `liblz4_vendored.a` at
+//!   `-O3` (upstream's default), with `LZ4F_MULTITHREAD=1` and `-pthread` on
+//!   unix targets and `LZ4F_MULTITHREAD=0` elsewhere.
+//!
+//! Nothing happens without the features, and the `pure` graph never sees
+//! `cc`.
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -9,7 +17,11 @@ fn main() {
     let mut archives: Vec<std::path::PathBuf> = Vec::new();
     #[cfg(feature = "brotli-c")]
     archives.push(brotli::compile());
-    // The symbol test (`tests/vendored_symbols.rs`) reads this.
+    #[cfg(feature = "lz4-c")]
+    archives.push(lz4::compile());
+    // The symbol test (`tests/vendored_symbols.rs`) reads this. The `:`
+    // separator is unix-only, as the test is (a Windows path has a drive
+    // colon).
     if !archives.is_empty() {
         let joined: Vec<String> = archives.iter().map(|p| p.display().to_string()).collect();
         println!(
@@ -79,5 +91,49 @@ mod brotli {
             .collect();
         files.sort();
         files
+    }
+}
+
+#[cfg(feature = "lz4-c")]
+mod lz4 {
+    use std::path::{Path, PathBuf};
+
+    const ROOT: &str = "c/lz4-1.11.0";
+
+    /// Builds the archive and returns its path.
+    ///
+    /// `LZ4F_MULTITHREAD=1` gives `nbWorkers >= 1` real worker threads (the
+    /// lz4 1.11.0 CLI's `-T#`); the bytes are the same without it (liblz4
+    /// then runs the jobs serially on the calling thread), so Windows, where
+    /// it would need the Vista API, builds without it. The target, not the
+    /// host, decides: this script runs on the host.
+    pub fn compile() -> PathBuf {
+        println!("cargo:rerun-if-changed={ROOT}");
+        let root = Path::new(ROOT);
+        let unix = std::env::var("CARGO_CFG_TARGET_FAMILY")
+            .is_ok_and(|f| f.split(',').any(|f| f == "unix"));
+        let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        let mut build = cc::Build::new();
+        build.include(root).opt_level(3);
+        if unix {
+            build.define("LZ4F_MULTITHREAD", "1").flag("-pthread");
+            if os == "linux" {
+                println!("cargo:rustc-link-lib=pthread");
+            }
+        } else {
+            build.define("LZ4F_MULTITHREAD", "0");
+        }
+        super::force_include(&mut build, &root.join("stuffr-prefix.h"));
+        for file in ["lz4.c", "lz4hc.c", "lz4frame.c", "xxhash.c"] {
+            build.file(root.join(file));
+        }
+        build.compile("lz4_vendored");
+        let out = std::env::var_os("OUT_DIR").expect("OUT_DIR");
+        let name = if build.get_compiler().is_like_msvc() {
+            "lz4_vendored.lib"
+        } else {
+            "liblz4_vendored.a"
+        };
+        PathBuf::from(out).join(name)
     }
 }

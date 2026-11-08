@@ -12,8 +12,12 @@ const ARCHIVES: &str = env!("STUFFR_VENDORED_ARCHIVES");
 fn vendored_archives_export_only_prefixed_symbols() {
     let macos = cfg!(target_os = "macos");
     let mut offenders = Vec::new();
-    let mut seen = 0;
+    let mut archives = 0;
+    // `build.rs` joins the paths with `:`, which is unix-only (as this test
+    // is): a Windows path has a drive colon.
     for archive in ARCHIVES.split(':').filter(|a| !a.is_empty()) {
+        archives += 1;
+        let mut seen = 0;
         let mut nm = Command::new("nm");
         if macos {
             nm.arg("-gU");
@@ -43,8 +47,12 @@ fn vendored_archives_export_only_prefixed_symbols() {
                 offenders.push(format!("{archive}: {name}"));
             }
         }
+        // Each archive on its own: one that parses to nothing would
+        // otherwise hide behind another's symbols.
+        assert!(seen > 0, "no symbols found in {archive}");
     }
-    assert!(seen > 0, "no symbols found in {ARCHIVES}");
+    let want = usize::from(cfg!(feature = "brotli-c")) + usize::from(cfg!(feature = "lz4-c"));
+    assert_eq!(archives, want, "archives: {ARCHIVES}");
     assert!(
         offenders.is_empty(),
         "{} unprefixed exported symbol(s):\n{}",

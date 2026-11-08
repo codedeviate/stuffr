@@ -1,5 +1,5 @@
 //! `lz4_opts`' unit tests. The C tier's bytes are pinned against the lz4
-//! 1.10.0 CLI (and zstd 1.5.7's `--format=lz4`) through a vendored table of
+//! 1.11.0 CLI (and zstd 1.5.7's `--format=lz4` over liblz4 1.11.0) through a vendored table of
 //! digests, `tests/data/lz4_opts/ref.txt`; the binary fixtures beside it are
 //! the reference's own output, which the pure tier must read. The `README`
 //! there says how to regenerate both.
@@ -203,7 +203,7 @@ fn sha256(data: &[u8]) -> String {
     h.iter().map(|x| format!("{x:08x}")).collect()
 }
 
-/// The reference `lz4` 1.10.0, if this machine has it.
+/// The reference `lz4` 1.11.0, if this machine has it.
 #[cfg(unix)]
 fn reference() -> Option<std::path::PathBuf> {
     let path = std::env::var_os("STUFFR_LZ4_REFERENCE")
@@ -212,7 +212,7 @@ fn reference() -> Option<std::path::PathBuf> {
     let v = std::process::Command::new(&path).arg("-V").output().ok()?;
     let banner =
         String::from_utf8_lossy(&v.stdout).into_owned() + &String::from_utf8_lossy(&v.stderr);
-    banner.contains("lz4 v1.10.0").then_some(path)
+    banner.contains("lz4 v1.11.0").then_some(path)
 }
 
 /// `lz4 -q -c <args> FILE` (or `< pipe` when `file` is `None`, with
@@ -319,6 +319,12 @@ const FILE_FLAGS: &[&str] = &[
     "-l -2",
     "-B32",
     "-B100000",
+    "-BD --single-thread",
+    "-B4 -BD --single-thread",
+    "-B4 -BD -9 --single-thread",
+    "-B4 -BD -T3",
+    "-B1024 -BD",
+    "-B300000 -BD --single-thread",
     "-D d100",
     "-9 -D d100",
     "-BD -D d100",
@@ -349,13 +355,23 @@ fn options_for(flags: &str, len: usize, stdin: bool) -> EncodeOptions {
             "--no-frame-crc" => o.content_checksum = false,
             "--content-size" => o.content_size = (!stdin).then_some(len as u64),
             "--favor-decSpeed" => o.favor_dec_speed = true,
+            "--single-thread" => o.workers = 0,
+            _ if f.starts_with("-T") => o.workers = f[2..].parse().unwrap(),
             "-D" => o.dictionary = Some(dictionary(it.next().unwrap())),
             _ if f.starts_with("--fast=") => o.level = -f[7..].parse::<i32>().unwrap(),
             _ if f.starts_with("-B") => {
                 let n: u32 = f[2..].parse().unwrap();
                 match BlockSizeId::from_id(n as u8).filter(|_| n <= 7) {
                     Some(id) => o.block_size = id,
-                    None => o.block_bytes = Some(n),
+                    // lz4 1.11.0's custom `-B#`: updates of `#` bytes, each
+                    // ending its blocks (`autoFlush`), single-threaded
+                    // whatever `-T#` says (probe §4; Task 3's re-probe).
+                    None => {
+                        o.block_bytes = Some(n);
+                        o.update_size = Some(n as usize);
+                        o.flush_each_update = true;
+                        o.workers = 0;
+                    }
                 }
             }
             _ => o.level = f[1..].parse().unwrap(),
@@ -637,9 +653,10 @@ fn block_size_ids() {
     assert_eq!(BlockSizeId::from_id(8), None);
 }
 
-/// The one-shot rule (spike S1), on both tiers: an input shorter than one
-/// 4 MiB job gets the smallest block size that holds it and, as a single
-/// block, independence; one of exactly 4 MiB is streamed as asked.
+/// The one-shot rule, on both tiers: an input shorter than one block (of
+/// the size asked for) gets the smallest block size that holds it and, as a
+/// single block, independence; one of exactly a block or more is streamed
+/// as asked (lz4 1.11.0; Task 3's probe).
 #[test]
 fn short_inputs_are_one_shot_frames() {
     let linked = EncodeOptions {
@@ -665,13 +682,24 @@ fn short_inputs_are_one_shot_frames() {
         ..EncodeOptions::default()
     };
     assert_eq!(h(&sized, 1000).content_size, Some(1000));
-    // A multi-block one-shot frame stays linked.
+    // One block's worth or more is streamed, linked.
     let b4 = EncodeOptions {
         block_size: BlockSizeId::Max64Kb,
         block_linked: true,
         ..EncodeOptions::default()
     };
     assert!(h(&b4, 200_000).block_linked);
+    assert!(h(&b4, 65_536).block_linked);
+    assert!(!h(&b4, 65_535).block_linked);
+    // A custom `-B#`: shorter than `#` is one shot, `#` or more streamed
+    // (the C tier's `update_size`; the pure tier's comes with Task 4).
+    if cfg!(feature = "lz4-c") {
+        let custom = options_for("-B100000 -BD", 0, true);
+        let one = h(&custom, 99_999);
+        assert_eq!(one.block_size, BlockSizeId::Max256Kb);
+        assert!(!one.block_linked);
+        assert!(h(&custom, 100_000).block_linked);
+    }
     // Plain frames never shrink or unlink.
     let f = encode_plain(&linked, &text(1000, 0x2), 1 << 20);
     let p = parse_frame_header(&f).unwrap().unwrap();
@@ -1139,8 +1167,8 @@ fn large_fixtures_decode_one_byte_at_a_time() {
     assert!(out == want);
 }
 
-/// Regenerates `tests/data/lz4_opts/` from the reference lz4 1.10.0 and
-/// zstd 1.5.7: `STUFFR_LZ4_OPTS_REGEN=<dir> cargo test -p stuffr-formats
+/// Regenerates `tests/data/lz4_opts/` from the reference lz4 1.11.0 and
+/// zstd 1.5.7 linked to liblz4 1.11.0: `STUFFR_LZ4_OPTS_REGEN=<dir> cargo test -p stuffr-formats
 /// --features lz4 lz4_opts::tests::regenerate_fixtures -- --ignored`, then
 /// copy `<dir>/*` into `tests/data/lz4_opts/`.
 #[cfg(unix)]
@@ -1151,7 +1179,7 @@ fn regenerate_fixtures() {
         std::env::var_os("STUFFR_LZ4_OPTS_REGEN").expect("STUFFR_LZ4_OPTS_REGEN"),
     );
     std::fs::create_dir_all(&out).unwrap();
-    let lz4 = reference().expect("the reference lz4 1.10.0");
+    let lz4 = reference().expect("the reference lz4 1.11.0");
     let zstd = std::env::var_os("STUFFR_ZSTD_REFERENCE")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| "/opt/homebrew/opt/zstd/bin/zstd".into());
@@ -1212,10 +1240,10 @@ fn regenerate_fixtures() {
 /// `ref.txt`'s header, written by [`regenerate_fixtures`].
 const REF_HEADER: &str = "\
 # lz4_opts fixture: `<input>|<source>|<flags>|<sha256>`. Source `file`:
-# the SHA-256 of `lz4 -q -c <flags> <input>` (lz4 1.10.0,
-# /opt/homebrew/opt/lz4/bin/lz4, multithread); `stdin`: of
-# `lz4 -q -c <flags> < pipe`; `zstd`: of `zstd -q --format=lz4 <level> -c
-# <input>` (zstd 1.5.7). Inputs are `src/lz4_opts/tests.rs`' `inputs()`;
+# the SHA-256 of `lz4 -q -c <flags> <input>` (lz4 1.11.0,
+# multithread); `stdin`: of `lz4 -q -c <flags> < pipe`; `zstd`: of
+# `zstd -q --format=lz4 <level> -c <input>` (zstd 1.5.7 linked to liblz4
+# 1.11.0). Inputs are `src/lz4_opts/tests.rs`' `inputs()`;
 # `-D d100`/`-D d10` name its `dictionary()` files. Regenerate with
 # `regenerate_fixtures` (see its doc and this directory's README).
 ";
@@ -1251,12 +1279,13 @@ fn extreme_levels_compress_on_both_tiers() {
 mod c_tier {
     use super::*;
 
-    /// probe (2026-10-16, `lz4 -q -c [-l] LEVEL` over 60000 words): frames
-    /// at `i32::MIN` and `i32::MIN + 1` are level 1's bytes (liblz4 negates
-    /// the level plus one, which overflows there), and every level at or
-    /// below −65535 is −65536's (liblz4 caps the acceleration); legacy
-    /// frames at `i32::MIN` are level 1's (the CLI negates the level) and at
-    /// `i32::MIN + 1` −65536's.
+    /// probe (2026-11-08, lz4 1.11.0, `lz4 -q -c [-l] LEVEL` over 300,000
+    /// bytes): frames and legacy frames at `i32::MIN + 1`
+    /// (`--fast=2147483647`) are −65536's bytes, as is every level below it
+    /// (liblz4 1.11.0 caps the acceleration before negating the level; 1.10.0
+    /// overflowed and wrote level 1's frame). The CLI refuses `i32::MIN`
+    /// (`--fast=2147483648`, `-2147483648`) before compressing; here it is
+    /// capped like the rest.
     #[test]
     fn extreme_levels_give_the_references_bytes() {
         let data = text(100_000, 0xe7);
@@ -1271,29 +1300,87 @@ mod c_tier {
             )
         };
         for legacy in [false, true] {
-            assert_eq!(at(i32::MIN, legacy), at(1, legacy), "legacy {legacy}");
-            assert_eq!(at(-2_147_483_646, legacy), at(-65_536, legacy));
-            assert_eq!(at(-65_537, legacy), at(-65_536, legacy));
+            for level in [i32::MIN, i32::MIN + 1, -2_147_483_646, -65_537] {
+                assert_eq!(at(level, legacy), at(-65_536, legacy), "{level} {legacy}");
+            }
+            assert_ne!(at(-1, legacy), at(1, legacy), "legacy {legacy}");
         }
-        assert_eq!(at(i32::MIN + 1, false), at(1, false));
-        assert_eq!(at(i32::MIN + 1, true), at(-65_536, true));
     }
 
     #[test]
-    fn liblz4_is_1_10_0() {
-        assert_eq!(liblz4_version(), "1.10.0");
+    fn liblz4_is_1_11_0() {
+        assert_eq!(liblz4_version(), "1.11.0");
     }
 
     #[test]
     fn error_names_match_liblz4() {
         for code in 1..=23usize {
-            // SAFETY: LZ4F_getErrorName returns a pointer into a static
-            // table of NUL-terminated strings for any error code.
-            let name = unsafe {
-                std::ffi::CStr::from_ptr(lz4_sys::LZ4F_getErrorName(0usize.wrapping_sub(code)))
-            };
-            assert_eq!(Lz4fError::from_code(code).name(), name.to_str().unwrap());
+            assert_eq!(Lz4fError::from_code(code).name(), c::error_name(code));
         }
+    }
+
+    /// `-T#`'s bytes do not depend on the number of workers, nor on how the
+    /// input is sliced; `--single-thread` (0) differs from them only for
+    /// linked blocks over more than one 1 MB job (probe §2, §4).
+    #[test]
+    fn worker_counts_give_the_same_bytes() {
+        let data = text(FRAME_CHUNK + (3 << 20) + 11, 0x7a);
+        for flags in ["-1", "-B4 -BD", "-BD -9", "-B5 -BD -BX --content-size"] {
+            let at = |workers: u32, chunk: usize| {
+                let o = EncodeOptions {
+                    workers,
+                    ..options_for(flags, data.len(), false)
+                };
+                encode_chunked(&o, &data, chunk)
+            };
+            let one = at(1, 64 << 10);
+            for (w, chunk) in [(2, 7_777), (4, 1 << 20), (64, data.len())] {
+                assert!(at(w, chunk) == one, "{flags}: {w} workers");
+            }
+            let single = at(0, 64 << 10);
+            if !flags.contains("-BD") {
+                assert!(single == one, "{flags}");
+            } else if flags.contains("-B4") {
+                // 64 KiB linked blocks: 1 MB jobs restart from the previous
+                // 64 KiB, liblz4's single-threaded stream does not.
+                assert!(single != one, "{flags}");
+            }
+            assert!(decode(&DecodeOptions::default(), &single).unwrap() == data);
+            assert!(decode(&DecodeOptions::default(), &one).unwrap() == data);
+        }
+    }
+
+    /// A custom `-B#`: every block but the last holds exactly `#` bytes.
+    #[test]
+    fn a_custom_block_size_cuts_blocks_at_that_size() {
+        let data = text(50_000, 0xb1);
+        let o = options_for("-B1024 -BX", data.len(), false);
+        let f = encode(&o, &data);
+        let h = parse_frame_header(&f).unwrap().unwrap();
+        assert_eq!(h.block_size, BlockSizeId::Max64Kb);
+        // Walk the blocks: each decodes to 1024 bytes but the last.
+        let mut at = h.header_len;
+        let mut sizes = Vec::new();
+        loop {
+            let word = le32(&f, at);
+            at += 4;
+            if word == 0 {
+                break;
+            }
+            let n = (word & 0x7FFF_FFFF) as usize;
+            let mut dst = vec![0u8; 64 << 10];
+            let got = if word & 0x8000_0000 != 0 {
+                n
+            } else {
+                legacy_block_decode(&f[at..at + n], &mut dst).unwrap()
+            };
+            sizes.push(got);
+            at += n + 4;
+        }
+        let (last, rest) = sizes.split_last().unwrap();
+        assert!(rest.iter().all(|&n| n == 1024), "{sizes:?}");
+        assert_eq!(rest.len() * 1024 + last, data.len());
+        assert!(decode(&DecodeOptions::default(), &f).unwrap() == data);
     }
 
     #[test]
@@ -1438,7 +1525,7 @@ mod pure_tier {
 
     #[test]
     fn liblz4_version_is_the_c_tiers() {
-        assert_eq!(liblz4_version(), "1.10.0");
+        assert_eq!(liblz4_version(), "1.11.0");
     }
 
     /// Seeded cases over every option the pure tier accepts: each decodes
@@ -1478,6 +1565,14 @@ mod pure_tier {
                 favor_dec_speed: g.next().is_multiple_of(4),
                 dictionary: (g.next().is_multiple_of(3)).then(|| dictionary(dict_name)),
                 legacy: g.next().is_multiple_of(8),
+                workers: g.next() % 3,
+                ..EncodeOptions::default()
+            };
+            // A custom `-B#` also cuts its updates and flushes them.
+            let o = EncodeOptions {
+                update_size: o.block_bytes.map(|b| b as usize),
+                flush_each_update: o.block_bytes.is_some(),
+                ..o
             };
             let plain = !o.legacy && g.next().is_multiple_of(6);
             let slice = 1 + g.next() as usize % (1 << 20);

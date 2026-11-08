@@ -1,28 +1,38 @@
-//! The C tier: liblz4 1.10.0 (`lz4-sys`, vendored and built whole), driven
-//! through its frame API the way the lz4 CLI drives it (spike S1, measured
-//! against the reference binary; the CLI's source was not read).
+//! The C tier: liblz4 1.11.0, vendored under `c/lz4-1.11.0/` and built by
+//! this crate's `build.rs`, driven through its frame API the way the lz4
+//! CLI drives it (measured against the reference binary; the CLI's source
+//! was not read).
 //!
-//! `lz4-sys` declares the core frame API; the entry points it lacks — the
-//! one-shot `LZ4F_compressFrame_usingCDict`, the dictionary API that is
-//! stable since liblz4 1.10 (`LZ4F_createCDict`, `LZ4F_freeCDict`,
-//! `LZ4F_compressBegin_usingCDict`, `LZ4F_decompress_usingDict`) and
-//! `LZ4F_resetDecompressionContext` — are declared below from
-//! `lib/lz4frame.h`, and resolve against the same static `liblz4.a`.
+//! Every function is declared below from 1.11.0's `lib/lz4frame.h`,
+//! `lib/lz4.h` and `lib/lz4hc.h`. The vendored library's exports all carry
+//! a `stuffr_` prefix (`c/lz4-1.11.0/stuffr-prefix.h`), so each declaration
+//! names its symbol with `#[link_name = "stuffr_…"]`: another liblz4 in the
+//! same binary (`lz4-sys`, say) cannot clash with this one.
 //!
 //! Every `unsafe` block is an FFI call into liblz4 and states the invariant
 //! it relies on. The contexts own what liblz4 points at: a decoding
 //! dictionary lives in a `Box<[u8]>` beside the context, so its address is
 //! stable for as long as the context uses it.
 
-use std::ffi::{c_int, c_uint, c_void};
+use std::ffi::{c_char, c_int, c_uint};
 use std::ptr::NonNull;
-
-use lz4_sys as sys;
 
 use super::{
     DecodeOptions, EncodeOptions, FRAME_CHUNK, LEGACY_BLOCK_BOUND, LEGACY_BLOCK_SIZE, LEGACY_MAGIC,
     Lz4Error, Lz4fError,
 };
+
+/// `LZ4F_cctx` (opaque).
+#[repr(C)]
+struct Cctx {
+    _private: [u8; 0],
+}
+
+/// `LZ4F_dctx` (opaque).
+#[repr(C)]
+struct Dctx {
+    _private: [u8; 0],
+}
 
 /// `LZ4F_CDict` (opaque).
 #[repr(C)]
@@ -30,60 +40,8 @@ struct CDict {
     _private: [u8; 0],
 }
 
-// The declarations `lz4-sys` 1.11.1 does not make, with lib/lz4frame.h's
-// signatures (liblz4 1.10.0). Contexts are `void*` here, as `lz4-sys`'s own
-// context types wrap a `*mut c_void`.
-unsafe extern "C" {
-    fn LZ4F_compressFrame_usingCDict(
-        cctx: *mut c_void,
-        dst: *mut u8,
-        dst_capacity: usize,
-        src: *const u8,
-        src_size: usize,
-        cdict: *const CDict,
-        prefs: *const sys::LZ4FPreferences,
-    ) -> usize;
-    fn LZ4F_compressFrameBound(src_size: usize, prefs: *const sys::LZ4FPreferences) -> usize;
-    fn LZ4F_createCDict(dict: *const u8, dict_size: usize) -> *mut CDict;
-    fn LZ4F_freeCDict(cdict: *mut CDict);
-    fn LZ4F_compressBegin_usingDict(
-        cctx: *mut c_void,
-        dst: *mut u8,
-        dst_capacity: usize,
-        dict: *const u8,
-        dict_size: usize,
-        prefs: *const sys::LZ4FPreferences,
-    ) -> usize;
-    fn LZ4F_compressBegin_usingCDict(
-        cctx: *mut c_void,
-        dst: *mut u8,
-        dst_capacity: usize,
-        cdict: *const CDict,
-        prefs: *const sys::LZ4FPreferences,
-    ) -> usize;
-    fn LZ4F_decompress_usingDict(
-        dctx: *mut c_void,
-        dst: *mut u8,
-        dst_size: *mut usize,
-        src: *const u8,
-        src_size: *mut usize,
-        dict: *const u8,
-        dict_size: usize,
-        opts: *const sys::LZ4FDecompressOptions,
-    ) -> usize;
-    fn LZ4F_resetDecompressionContext(dctx: *mut c_void);
-    #[cfg(test)]
-    fn LZ4F_getFrameInfo(
-        dctx: *mut c_void,
-        info: *mut FrameInfo,
-        src: *const u8,
-        src_size: *mut usize,
-    ) -> usize;
-}
-
-/// `LZ4F_frameInfo_t` with plain integers for its enums, so whatever
-/// liblz4 writes is a valid Rust value (the tests' `LZ4F_getFrameInfo`).
-#[cfg(test)]
+/// `LZ4F_frameInfo_t` with plain integers for its enums (each a C `int`
+/// sized enum), so whatever liblz4 writes is a valid Rust value.
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct FrameInfo {
@@ -96,13 +54,164 @@ pub(super) struct FrameInfo {
     pub block_checksum_flag: c_uint,
 }
 
-/// `LZ4_versionNumber()` rendered as liblz4 renders it: `"1.10.0"` for
-/// `11000` (R7).
+/// `LZ4F_preferences_t` (lz4frame.h 1.11.0): 1.10.0's `reserved[3]` became
+/// `nbWorkers`, `reserved1`, `reserved0`, with the same layout.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+struct Preferences {
+    frame_info: FrameInfo,
+    compression_level: c_int,
+    auto_flush: c_uint,
+    favor_dec_speed: c_uint,
+    nb_workers: c_uint,
+    reserved1: c_uint,
+    reserved0: c_uint,
+}
+
+/// `LZ4F_compressOptions_t` / `LZ4F_decompressOptions_t`: four
+/// `unsigned`s. Only their size is pinned here; every call passes NULL.
+#[cfg(test)]
+#[repr(C)]
+struct FourUnsigned {
+    _a: [c_uint; 4],
+}
+
+/// `LZ4F_VERSION`.
+const LZ4F_VERSION: c_uint = 100;
+
+unsafe extern "C" {
+    #[link_name = "stuffr_LZ4_versionNumber"]
+    fn LZ4_versionNumber() -> c_int;
+    #[link_name = "stuffr_LZ4F_isError"]
+    fn LZ4F_isError(code: usize) -> c_uint;
+    #[cfg(test)]
+    #[link_name = "stuffr_LZ4F_getErrorName"]
+    fn LZ4F_getErrorName(code: usize) -> *const c_char;
+    #[cfg(test)]
+    #[link_name = "stuffr_LZ4F_getMaxNbWorkers"]
+    fn LZ4F_getMaxNbWorkers() -> c_uint;
+
+    #[link_name = "stuffr_LZ4F_createCompressionContext"]
+    fn LZ4F_createCompressionContext(cctx: *mut *mut Cctx, version: c_uint) -> usize;
+    #[link_name = "stuffr_LZ4F_freeCompressionContext"]
+    fn LZ4F_freeCompressionContext(cctx: *mut Cctx) -> usize;
+    #[link_name = "stuffr_LZ4F_compressBegin"]
+    fn LZ4F_compressBegin(
+        cctx: *mut Cctx,
+        dst: *mut u8,
+        dst_capacity: usize,
+        prefs: *const Preferences,
+    ) -> usize;
+    #[link_name = "stuffr_LZ4F_compressBegin_usingCDict"]
+    fn LZ4F_compressBegin_usingCDict(
+        cctx: *mut Cctx,
+        dst: *mut u8,
+        dst_capacity: usize,
+        cdict: *const CDict,
+        prefs: *const Preferences,
+    ) -> usize;
+    #[link_name = "stuffr_LZ4F_compressBound"]
+    fn LZ4F_compressBound(src_size: usize, prefs: *const Preferences) -> usize;
+    #[link_name = "stuffr_LZ4F_compressUpdate"]
+    fn LZ4F_compressUpdate(
+        cctx: *mut Cctx,
+        dst: *mut u8,
+        dst_capacity: usize,
+        src: *const u8,
+        src_size: usize,
+        opts: *const c_uint,
+    ) -> usize;
+    #[link_name = "stuffr_LZ4F_compressEnd"]
+    fn LZ4F_compressEnd(
+        cctx: *mut Cctx,
+        dst: *mut u8,
+        dst_capacity: usize,
+        opts: *const c_uint,
+    ) -> usize;
+    #[link_name = "stuffr_LZ4F_compressFrame_usingCDict"]
+    fn LZ4F_compressFrame_usingCDict(
+        cctx: *mut Cctx,
+        dst: *mut u8,
+        dst_capacity: usize,
+        src: *const u8,
+        src_size: usize,
+        cdict: *const CDict,
+        prefs: *const Preferences,
+    ) -> usize;
+    #[link_name = "stuffr_LZ4F_compressFrameBound"]
+    fn LZ4F_compressFrameBound(src_size: usize, prefs: *const Preferences) -> usize;
+    #[link_name = "stuffr_LZ4F_createCDict"]
+    fn LZ4F_createCDict(dict: *const u8, dict_size: usize) -> *mut CDict;
+    #[link_name = "stuffr_LZ4F_freeCDict"]
+    fn LZ4F_freeCDict(cdict: *mut CDict);
+
+    #[link_name = "stuffr_LZ4F_createDecompressionContext"]
+    fn LZ4F_createDecompressionContext(dctx: *mut *mut Dctx, version: c_uint) -> usize;
+    #[link_name = "stuffr_LZ4F_freeDecompressionContext"]
+    fn LZ4F_freeDecompressionContext(dctx: *mut Dctx) -> usize;
+    #[link_name = "stuffr_LZ4F_decompress"]
+    fn LZ4F_decompress(
+        dctx: *mut Dctx,
+        dst: *mut u8,
+        dst_size: *mut usize,
+        src: *const u8,
+        src_size: *mut usize,
+        opts: *const c_uint,
+    ) -> usize;
+    #[link_name = "stuffr_LZ4F_decompress_usingDict"]
+    fn LZ4F_decompress_usingDict(
+        dctx: *mut Dctx,
+        dst: *mut u8,
+        dst_size: *mut usize,
+        src: *const u8,
+        src_size: *mut usize,
+        dict: *const u8,
+        dict_size: usize,
+        opts: *const c_uint,
+    ) -> usize;
+    #[link_name = "stuffr_LZ4F_resetDecompressionContext"]
+    fn LZ4F_resetDecompressionContext(dctx: *mut Dctx);
+    #[cfg(test)]
+    #[link_name = "stuffr_LZ4F_getFrameInfo"]
+    fn LZ4F_getFrameInfo(
+        dctx: *mut Dctx,
+        info: *mut FrameInfo,
+        src: *const u8,
+        src_size: *mut usize,
+    ) -> usize;
+
+    #[link_name = "stuffr_LZ4_compress_fast"]
+    fn LZ4_compress_fast(
+        src: *const c_char,
+        dst: *mut c_char,
+        src_size: c_int,
+        dst_capacity: c_int,
+        acceleration: c_int,
+    ) -> c_int;
+    #[link_name = "stuffr_LZ4_compress_HC"]
+    fn LZ4_compress_HC(
+        src: *const c_char,
+        dst: *mut c_char,
+        src_size: c_int,
+        dst_capacity: c_int,
+        level: c_int,
+    ) -> c_int;
+    #[link_name = "stuffr_LZ4_decompress_safe"]
+    fn LZ4_decompress_safe(
+        src: *const c_char,
+        dst: *mut c_char,
+        compressed_size: c_int,
+        dst_capacity: c_int,
+    ) -> c_int;
+}
+
+/// `LZ4_versionNumber()` rendered as liblz4 renders it: `"1.11.0"` for
+/// `11100` (R7).
 pub fn liblz4_version() -> &'static str {
     // SAFETY: LZ4_versionNumber takes no arguments and returns a constant.
-    let n = unsafe { sys::LZ4_versionNumber() };
+    let n = unsafe { LZ4_versionNumber() };
     match n {
-        11000 => "1.10.0",
+        11100 => "1.11.0",
         _ => "unknown",
     }
 }
@@ -111,54 +220,37 @@ pub fn liblz4_version() -> &'static str {
 /// `(size_t)-code` (`LZ4F_isError`, `LZ4F_getErrorCode`).
 fn check(r: usize) -> Result<usize, Lz4Error> {
     // SAFETY: LZ4F_isError only compares its argument with a constant.
-    if unsafe { sys::LZ4F_isError(r) } != 0 {
+    if unsafe { LZ4F_isError(r) } != 0 {
         Err(Lz4Error::Lib(Lz4fError::from_code(0usize.wrapping_sub(r))))
     } else {
         Ok(r)
     }
 }
 
-/// `LZ4F_preferences_t` for `o`. `compressionLevel` is a C `int`;
-/// `lz4-sys` spells it `c_uint`, which has the same size and alignment, so
-/// a negative (`--fast`) level is passed as its bit pattern.
-fn preferences(o: &Settings, content_size: u64) -> sys::LZ4FPreferences {
-    sys::LZ4FPreferences {
-        frame_info: sys::LZ4FFrameInfo {
-            block_size_id: match o.block_size.id() {
-                4 => sys::BlockSize::Max64KB,
-                5 => sys::BlockSize::Max256KB,
-                6 => sys::BlockSize::Max1MB,
-                _ => sys::BlockSize::Max4MB,
-            },
-            block_mode: if o.linked {
-                sys::BlockMode::Linked
-            } else {
-                sys::BlockMode::Independent
-            },
-            content_checksum_flag: if o.content_checksum {
-                sys::ContentChecksum::ChecksumEnabled
-            } else {
-                sys::ContentChecksum::NoChecksum
-            },
-            frame_type: sys::FrameType::Frame,
+/// `LZ4F_preferences_t` for `o`.
+fn preferences(o: &Settings, content_size: u64) -> Preferences {
+    Preferences {
+        frame_info: FrameInfo {
+            block_size_id: c_uint::from(o.block_size.id()),
+            // LZ4F_blockLinked = 0, LZ4F_blockIndependent = 1.
+            block_mode: c_uint::from(!o.linked),
+            content_checksum_flag: c_uint::from(o.content_checksum),
+            frame_type: 0,
             content_size,
             dict_id: 0,
-            block_checksum_flag: if o.block_checksum {
-                sys::BlockChecksum::BlockChecksumEnabled
-            } else {
-                sys::BlockChecksum::NoBlockChecksum
-            },
+            block_checksum_flag: c_uint::from(o.block_checksum),
         },
-        compression_level: frame_level(o.level) as c_uint,
-        auto_flush: AUTO_FLUSH,
+        // liblz4 1.11.0 maps every `int` safely (`LZ4F_levelToAcceleration`
+        // caps a negative level before negating it; levels above 12 count
+        // as 12), so the CLI's level goes through as it is.
+        compression_level: o.level,
+        auto_flush: c_uint::from(o.flush_each_update),
         favor_dec_speed: c_uint::from(o.favor_dec_speed),
-        reserved: [0; 3],
+        nb_workers: o.workers,
+        reserved1: 0,
+        reserved0: 0,
     }
 }
-
-/// `autoFlush`: unobservable on every path the CLI takes (spike S1 found 0
-/// and 1 byte-identical), so liblz4's default.
-const AUTO_FLUSH: c_uint = 0;
 
 /// [`EncodeOptions`] without the dictionary, which the context keeps as a
 /// `CDict`.
@@ -172,46 +264,41 @@ struct Settings {
     content_size: Option<u64>,
     favor_dec_speed: bool,
     legacy: bool,
+    workers: c_uint,
+    update_size: usize,
+    flush_each_update: bool,
 }
 
 /// An lz4 compression context with the CLI's settings: frames (the module
-/// doc of `lz4_opts` for the one-shot rule and the 4 MiB jobs) or the
+/// doc of `lz4_opts` for the one-shot rule and the update schedule) or the
 /// legacy format.
 pub struct Encoder {
-    /// Writes the frame header, and compresses a one-shot frame.
-    cctx: NonNull<c_void>,
-    /// Compresses each 4 MiB job of a streamed frame.
-    job: NonNull<c_void>,
+    cctx: NonNull<Cctx>,
     /// The `-D` dictionary, digested (`LZ4F_createCDict` copies it).
     cdict: Option<NonNull<CDict>>,
     settings: Settings,
     /// [`Encoder::new_plain`]'s frames.
     plain: bool,
-    /// Input not yet compressed: less than one chunk (4 MiB for a frame,
-    /// 8 MiB for legacy).
+    /// Input not yet compressed: less than one update (8 MiB for legacy).
     pending: Vec<u8>,
     /// The frame header (or legacy magic) has been written.
     started: bool,
-    /// The last 64 KiB of a streamed frame's input so far: the next job's
-    /// dictionary when blocks are linked.
-    history: Vec<u8>,
-    /// A streamed frame's content checksum so far.
-    checksum: twox_hash::XxHash32,
     /// Output scratch, reused.
     scratch: Vec<u8>,
 }
 
-// SAFETY: the contexts are owned exclusively by this value and liblz4 keeps
-// no thread-affine state in them.
+// SAFETY: the context is owned exclusively by this value. liblz4's worker
+// threads (nbWorkers >= 1) belong to the context and are only driven from
+// the thread calling into it, which may change between calls.
 unsafe impl Send for Encoder {}
 
 impl Drop for Encoder {
     fn drop(&mut self) {
-        // SAFETY: cctx and job came from LZ4F_createCompressionContext and
-        // cdict from LZ4F_createCDict; each is freed exactly once, here.
+        // SAFETY: cctx came from LZ4F_createCompressionContext and cdict
+        // from LZ4F_createCDict; each is freed exactly once, here (freeing
+        // the context also joins its worker threads).
         unsafe {
-            sys::LZ4F_freeCompressionContext(sys::LZ4FCompressionContext(self.cctx.as_ptr()));
-            sys::LZ4F_freeCompressionContext(sys::LZ4FCompressionContext(self.job.as_ptr()));
+            LZ4F_freeCompressionContext(self.cctx.as_ptr());
             if let Some(d) = self.cdict {
                 LZ4F_freeCDict(d.as_ptr());
             }
@@ -219,42 +306,16 @@ impl Drop for Encoder {
     }
 }
 
-/// `LZ4F_createCompressionContext`.
-fn create_cctx() -> Result<NonNull<c_void>, Lz4Error> {
-    let mut ctx = sys::LZ4FCompressionContext(std::ptr::null_mut());
-    // SAFETY: ctx is a valid out-pointer; LZ4F_VERSION is the version this
-    // header set declares.
-    check(unsafe { sys::LZ4F_createCompressionContext(&mut ctx, sys::LZ4F_VERSION) })?;
-    NonNull::new(ctx.0).ok_or(Lz4Error::Lib(Lz4fError::AllocationFailed))
-}
-
-/// What a 4 MiB job is compressed against.
-#[derive(Clone, Copy)]
-enum JobDict<'a> {
-    None,
-    /// The digested `-D` dictionary.
-    CDict(NonNull<CDict>),
-    /// Raw bytes (`LZ4F_compressBegin_usingDict`).
-    Raw(&'a [u8]),
-}
-
 impl Encoder {
     /// A context for `o`.
     pub fn new(o: &EncodeOptions) -> Result<Encoder, Lz4Error> {
-        let cctx = create_cctx()?;
-        let job = match create_cctx() {
-            Ok(j) => j,
-            Err(e) => {
-                // SAFETY: cctx was just created and is freed once.
-                unsafe {
-                    sys::LZ4F_freeCompressionContext(sys::LZ4FCompressionContext(cctx.as_ptr()))
-                };
-                return Err(e);
-            }
-        };
+        let mut ctx: *mut Cctx = std::ptr::null_mut();
+        // SAFETY: ctx is a valid out-pointer; LZ4F_VERSION is the version
+        // these declarations were written for.
+        check(unsafe { LZ4F_createCompressionContext(&mut ctx, LZ4F_VERSION) })?;
+        let cctx = NonNull::new(ctx).ok_or(Lz4Error::Lib(Lz4fError::AllocationFailed))?;
         let mut e = Encoder {
             cctx,
-            job,
             cdict: None,
             plain: false,
             settings: Settings {
@@ -266,11 +327,12 @@ impl Encoder {
                 content_size: o.content_size,
                 favor_dec_speed: o.favor_dec_speed,
                 legacy: o.legacy,
+                workers: o.workers,
+                update_size: o.update_size.unwrap_or(FRAME_CHUNK).max(1),
+                flush_each_update: o.flush_each_update,
             },
             pending: Vec::new(),
             started: false,
-            history: Vec::new(),
-            checksum: twox_hash::XxHash32::with_seed(0),
             scratch: Vec::new(),
         };
         if let (Some(d), false) = (&o.dictionary, o.legacy) {
@@ -284,16 +346,20 @@ impl Encoder {
 
     /// A context for plain `LZ4F` streaming, not the lz4 CLI's: the header
     /// on the first call, one `LZ4F_compressUpdate` per block's worth of
-    /// input, `LZ4F_compressEnd` — never one-shot, so the block size, mode
-    /// and content size are exactly `o`'s. This is what zstd 1.5.7's
-    /// `--format=lz4` writes (spike S4: byte-identical to
-    /// `/opt/homebrew/opt/zstd/bin/zstd --format=lz4 -c FILE` at levels 1,
-    /// 3, 9 and 19 with `level` capped at 12, `block_size` 64 KiB,
-    /// `block_linked`, the content checksum and the file's size). `legacy`
-    /// is ignored.
+    /// input, `LZ4F_compressEnd` — never one-shot, single-threaded
+    /// (`nbWorkers` 0, whatever `o` says), so the block size, mode and
+    /// content size are exactly `o`'s. This is what zstd 1.5.7's
+    /// `--format=lz4` writes (spike S4: byte-identical to `zstd --format=lz4
+    /// -c FILE` at levels 1, 3, 9 and 19 with `level` capped at 12,
+    /// `block_size` 64 KiB, `block_linked`, the content checksum and the
+    /// file's size). `legacy`, `update_size` and `flush_each_update` are
+    /// ignored.
     pub fn new_plain(o: &EncodeOptions) -> Result<Encoder, Lz4Error> {
         let mut e = Encoder::new(&EncodeOptions {
             legacy: false,
+            workers: 0,
+            update_size: None,
+            flush_each_update: false,
             ..o.clone()
         })?;
         e.plain = true;
@@ -306,16 +372,18 @@ impl Encoder {
         } else if self.plain {
             self.settings.block_size.bytes()
         } else {
-            FRAME_CHUNK
+            self.settings.update_size
         }
     }
 
     /// Writes the frame header (or the legacy magic) on first call.
     ///
-    /// For a frame, "first" means once a whole 4 MiB chunk has arrived: an
-    /// input that ends sooner is one `LZ4F_compressFrame` call, written by
-    /// [`Encoder::finish`] (the module doc of `lz4_opts`). Whatever slices
-    /// the caller feeds, the output is the same.
+    /// For a frame, "first" means once a whole update's worth (4 MiB, or
+    /// [`EncodeOptions::update_size`]) has arrived: an input that ends
+    /// sooner is written by [`Encoder::finish`], as one
+    /// `LZ4F_compressFrame` call if it is shorter than one block (the
+    /// module doc of `lz4_opts`). Whatever slices the caller feeds, the
+    /// output is the same.
     pub fn update(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(), Lz4Error> {
         if self.plain && !self.started {
             // `LZ4F_compressBegin` comes before the first update: zstd
@@ -344,16 +412,14 @@ impl Encoder {
         Ok(())
     }
 
-    /// Ends the frame: the last block, the end mark and the content
+    /// Ends the frame: the last update, the end mark and the content
     /// checksum (a one-shot frame is written whole here). The context can
     /// then start another frame.
     pub fn finish(&mut self, out: &mut Vec<u8>) -> Result<(), Lz4Error> {
         let pending = std::mem::take(&mut self.pending);
         let r = if self.settings.legacy {
             self.finish_legacy(&pending, out)
-        } else if self.plain {
-            self.finish_plain(&pending, out)
-        } else if !self.started {
+        } else if !self.started && !self.plain && pending.len() < self.settings.block_size.bytes() {
             self.one_shot(&pending, out)
         } else {
             self.finish_stream(&pending, out)
@@ -361,8 +427,6 @@ impl Encoder {
         self.pending = pending;
         self.pending.clear();
         self.started = false;
-        self.history.clear();
-        self.checksum = twox_hash::XxHash32::with_seed(0);
         r
     }
 
@@ -378,23 +442,19 @@ impl Encoder {
         if !self.started {
             self.begin(out)?;
         }
-        if self.plain {
-            self.compress_update(chunk, out)
-        } else {
-            self.compress_job(chunk, out)
-        }
+        self.compress_update(chunk, out)
     }
 
-    /// `LZ4F_compressBegin`: the streamed frame's header, with the content
-    /// size if one was given.
+    /// `LZ4F_compressBegin` (with the `-D` dictionary, if any): the streamed
+    /// frame's header, with the content size if one was given.
     fn begin(&mut self, out: &mut Vec<u8>) -> Result<(), Lz4Error> {
         let prefs = preferences(&self.settings, self.settings.content_size.unwrap_or(0));
         let mut hdr = [0u8; super::HEADER_SIZE_MAX];
-        let n = match (self.plain, self.cdict) {
+        let n = match self.cdict {
             // SAFETY: cctx and the CDict are live; hdr has
             // LZ4F_HEADER_SIZE_MAX bytes of room, as the API requires;
             // prefs outlives the call.
-            (true, Some(cd)) => check(unsafe {
+            Some(cd) => check(unsafe {
                 LZ4F_compressBegin_usingCDict(
                     self.cctx.as_ptr(),
                     hdr.as_mut_ptr(),
@@ -403,15 +463,9 @@ impl Encoder {
                     &prefs,
                 )
             })?,
-            // SAFETY: as above, without a dictionary (a job-compressed
-            // frame applies its dictionary per job).
-            _ => check(unsafe {
-                sys::LZ4F_compressBegin(
-                    sys::LZ4FCompressionContext(self.cctx.as_ptr()),
-                    hdr.as_mut_ptr(),
-                    hdr.len(),
-                    &prefs,
-                )
+            // SAFETY: as above, without a dictionary.
+            None => check(unsafe {
+                LZ4F_compressBegin(self.cctx.as_ptr(), hdr.as_mut_ptr(), hdr.len(), &prefs)
             })?,
         };
         out.extend_from_slice(&hdr[..n]);
@@ -419,68 +473,20 @@ impl Encoder {
         Ok(())
     }
 
-    /// One job of a streamed frame (spike S1): `job` compressed as a frame
-    /// of its own by the job context — begun against the previous 64 KiB of
-    /// input when blocks are linked (the `-D` dictionary for the first job),
-    /// against the `-D` dictionary when they are independent — whose blocks,
-    /// stripped of that frame's header and end mark, are this frame's next
-    /// blocks.
-    fn compress_job(&mut self, job: &[u8], out: &mut Vec<u8>) -> Result<(), Lz4Error> {
-        let mut settings = self.settings;
-        settings.content_checksum = false;
-        settings.content_size = None;
-        let prefs = preferences(&settings, 0);
-        // The previous 64 KiB sit immediately before the job in memory, as
-        // the reference's do: liblz4 then compresses the job as a
-        // continuation of that prefix rather than against a detached
-        // dictionary, which changes the bytes (spike S1, `-B4 -BD -9`).
-        let mut window = std::mem::take(&mut self.history);
-        let prefix = window.len();
-        if self.settings.linked && prefix > 0 {
-            window.extend_from_slice(job);
-        }
-        let (dict, src) = match (self.settings.linked, self.cdict) {
-            (true, _) if prefix > 0 => (JobDict::Raw(&window[..prefix]), &window[prefix..]),
-            // Every job under independent blocks, and the first under
-            // linked ones, starts from the digested `-D` dictionary (spike
-            // S2; a raw `LZ4F_compressBegin_usingDict` differs).
-            (_, Some(cd)) => (JobDict::CDict(cd), job),
-            _ => (JobDict::None, job),
-        };
-        // SAFETY: prefs is a valid preferences struct for both calls.
-        let bound = unsafe {
-            sys::LZ4F_compressBound(src.len(), &prefs) + sys::LZ4F_compressBound(0, &prefs)
-        };
-        self.scratch.resize(super::HEADER_SIZE_MAX + bound, 0);
-        let r = job_frame(self.job, &mut self.scratch, src, dict, &prefs);
-        if self.settings.linked {
-            if prefix == 0 {
-                window.extend_from_slice(&job[job.len().saturating_sub(HISTORY)..]);
-            }
-            let excess = window.len().saturating_sub(HISTORY);
-            window.drain(..excess);
-        }
-        self.history = window;
-        let (h, n) = r?;
-        out.extend_from_slice(&self.scratch[h..h + n]);
-        if self.settings.content_checksum {
-            std::hash::Hasher::write(&mut self.checksum, job);
-        }
-        Ok(())
-    }
-
-    /// `LZ4F_compressUpdate` on the main context (a plain frame).
+    /// `LZ4F_compressUpdate` on the context.
     fn compress_update(&mut self, src: &[u8], out: &mut Vec<u8>) -> Result<(), Lz4Error> {
         let prefs = preferences(&self.settings, 0);
         // SAFETY: prefs is a valid preferences struct for the call.
-        let bound = unsafe { sys::LZ4F_compressBound(src.len(), &prefs) };
+        let bound = unsafe { LZ4F_compressBound(src.len(), &prefs) };
         self.scratch.resize(bound, 0);
         // SAFETY: cctx is live and begun; scratch has
-        // LZ4F_compressBound(src.len()) bytes, as the API requires; src is
-        // live; NULL options are allowed.
+        // LZ4F_compressBound(src.len()) bytes, which guarantees success
+        // (with workers too: completed jobs that do not fit are deferred);
+        // src is live; NULL options are the defaults (src unstable: liblz4
+        // copies what it keeps).
         let n = check(unsafe {
-            sys::LZ4F_compressUpdate(
-                sys::LZ4FCompressionContext(self.cctx.as_ptr()),
+            LZ4F_compressUpdate(
+                self.cctx.as_ptr(),
                 self.scratch.as_mut_ptr(),
                 bound,
                 src.as_ptr(),
@@ -492,45 +498,38 @@ impl Encoder {
         Ok(())
     }
 
-    /// The rest of a plain frame: the header if nothing came, the last
-    /// partial block, then `LZ4F_compressEnd`.
-    fn finish_plain(&mut self, rest: &[u8], out: &mut Vec<u8>) -> Result<(), Lz4Error> {
+    /// `LZ4F_compressEnd`, called until done: each call fills the buffer or
+    /// completes the frame, and one that returns exactly the buffer's size
+    /// may have more to give (lz4frame.h 1.11.0; with workers a call emits
+    /// at least one job per `LZ4F_compressBound(0)`). The call after a
+    /// completed one that filled the buffer returns 0.
+    fn end(&mut self, out: &mut Vec<u8>) -> Result<(), Lz4Error> {
+        let prefs = preferences(&self.settings, 0);
+        // SAFETY: prefs is a valid preferences struct for the call.
+        let cap = unsafe { LZ4F_compressBound(0, &prefs) };
+        self.scratch.resize(cap, 0);
+        loop {
+            let (ctx, dst) = (self.cctx.as_ptr(), self.scratch.as_mut_ptr());
+            // SAFETY: cctx is live with a frame in progress; scratch has
+            // cap (> 0) bytes; NULL options are allowed.
+            let n = check(unsafe { LZ4F_compressEnd(ctx, dst, cap, std::ptr::null()) })?;
+            out.extend_from_slice(&self.scratch[..n]);
+            if n < cap {
+                return Ok(());
+            }
+        }
+    }
+
+    /// The rest of a streamed frame: the header if nothing came (a plain
+    /// frame), the last partial update, then `LZ4F_compressEnd`.
+    fn finish_stream(&mut self, rest: &[u8], out: &mut Vec<u8>) -> Result<(), Lz4Error> {
         if !self.started {
             self.begin(out)?;
         }
         if !rest.is_empty() {
             self.compress_update(rest, out)?;
         }
-        let prefs = preferences(&self.settings, 0);
-        // SAFETY: prefs is a valid preferences struct for the call.
-        let bound = unsafe { sys::LZ4F_compressBound(0, &prefs) };
-        self.scratch.resize(bound, 0);
-        // SAFETY: cctx is live and begun; scratch has
-        // LZ4F_compressBound(0) bytes, the bound for a flush and the end
-        // mark and checksum; NULL options are allowed.
-        let n = check(unsafe {
-            sys::LZ4F_compressEnd(
-                sys::LZ4FCompressionContext(self.cctx.as_ptr()),
-                self.scratch.as_mut_ptr(),
-                bound,
-                std::ptr::null(),
-            )
-        })?;
-        out.extend_from_slice(&self.scratch[..n]);
-        Ok(())
-    }
-
-    /// The rest of a streamed frame: the last, partial job, the end mark
-    /// and the content checksum.
-    fn finish_stream(&mut self, rest: &[u8], out: &mut Vec<u8>) -> Result<(), Lz4Error> {
-        if !rest.is_empty() {
-            self.compress_job(rest, out)?;
-        }
-        out.extend_from_slice(&[0; 4]);
-        if self.settings.content_checksum {
-            out.extend_from_slice(&self.checksum.finish_32().to_le_bytes());
-        }
-        Ok(())
+        self.end(out)
     }
 
     /// `LZ4F_compressFrame_usingCDict` over the whole (short) input.
@@ -573,7 +572,7 @@ impl Encoder {
             // SAFETY: src is a live slice of `len` (≤ 8 MiB) bytes; scratch
             // has LZ4_COMPRESSBOUND(8 MiB) bytes, the most any block needs.
             unsafe {
-                sys::LZ4_compress_fast(
+                LZ4_compress_fast(
                     src.as_ptr().cast(),
                     self.scratch.as_mut_ptr().cast(),
                     len,
@@ -584,7 +583,7 @@ impl Encoder {
         } else {
             // SAFETY: as above, through the HC compressor.
             unsafe {
-                sys::LZ4_compress_HC(
+                LZ4_compress_HC(
                     src.as_ptr().cast(),
                     self.scratch.as_mut_ptr().cast(),
                     len,
@@ -614,105 +613,31 @@ impl Encoder {
     }
 }
 
-/// Compresses `job` into `scratch` as a frame of its own (through `job_ctx`): returns
-/// where its blocks start and how long they are (the end mark left
-/// out).
-fn job_frame(
-    job_ctx: NonNull<c_void>,
-    scratch: &mut [u8],
-    job: &[u8],
-    dict: JobDict<'_>,
-    prefs: &sys::LZ4FPreferences,
-) -> Result<(usize, usize), Lz4Error> {
-    let ctx = job_ctx.as_ptr();
-    let dst = scratch.as_mut_ptr();
-    let cap = scratch.len();
-    let h = check(match dict {
-        // SAFETY: ctx is live; dst has cap ≥ LZ4F_HEADER_SIZE_MAX
-        // bytes; prefs outlives the call.
-        JobDict::None => unsafe {
-            sys::LZ4F_compressBegin(sys::LZ4FCompressionContext(ctx), dst, cap, prefs)
-        },
-        // SAFETY: as above; the CDict is live for the whole session.
-        JobDict::CDict(cd) => unsafe {
-            LZ4F_compressBegin_usingCDict(ctx, dst, cap, cd.as_ptr(), prefs)
-        },
-        // SAFETY: as above; `d` outlives the session, which ends with
-        // the compressEnd below.
-        JobDict::Raw(d) => unsafe {
-            LZ4F_compressBegin_usingDict(ctx, dst, cap, d.as_ptr(), d.len(), prefs)
-        },
-    })?;
-    // SAFETY: the session is begun; dst + h has cap - h bytes, at least
-    // LZ4F_compressBound(job.len()) as the API requires; job is live;
-    // NULL options are allowed.
-    let n = check(unsafe {
-        sys::LZ4F_compressUpdate(
-            sys::LZ4FCompressionContext(ctx),
-            dst.add(h),
-            cap - h,
-            job.as_ptr(),
-            job.len(),
-            std::ptr::null(),
-        )
-    })?;
-    // SAFETY: as above; what is left is at least LZ4F_compressBound(0),
-    // the bound for the flush and the end mark.
-    let m = check(unsafe {
-        sys::LZ4F_compressEnd(
-            sys::LZ4FCompressionContext(ctx),
-            dst.add(h + n),
-            cap - h - n,
-            std::ptr::null(),
-        )
-    })?;
-    Ok((h, n + m - 4))
-}
-
-/// How much input a linked job sees before it: LZ4's 64 KiB window.
-const HISTORY: usize = 64 << 10;
-
 /// The first level the legacy format compresses with `LZ4_compress_HC`
-/// (spike S1).
-const LEGACY_HC_MIN: i32 = 3;
-
-/// The most negative level whose bytes differ from the next one's:
-/// liblz4 caps the acceleration of a negative level at 65537
-/// (`LZ4_ACCELERATION_MAX`), which −65536 already reaches (probe: `lz4
-/// --fast=65535`, `--fast=65536` and `--fast=2147483646` write the same
-/// bytes, frame and legacy).
-const LEVEL_FASTEST: i32 = -65_536;
+/// (2026-11-08 probe: lz4 1.11.0's `-l -2` is `LZ4_compress_HC` at level 2,
+/// liblz4's mid-way compressor; 1.10.0's was `-l -1`'s bytes).
+const LEGACY_HC_MIN: i32 = 2;
 
 /// `LZ4_ACCELERATION_MAX` (`lib/lz4.c`): liblz4 caps every acceleration
 /// here.
 const LZ4_ACCELERATION_MAX: c_int = 65_537;
 
-/// The level a frame's preferences carry for the CLI's `level` (ruling
-/// T3-d). liblz4 turns a negative level into the acceleration `-level + 1`,
-/// a signed overflow for `i32::MIN` and `i32::MIN + 1`, upstream undefined
-/// behaviour never reproduced: the reference was observed to write level
-/// 1's bytes for both (probe: `lz4 --fast=2147483647`, `--fast=2147483648`,
-/// `-2147483648`, `LZ4_CLEVEL=2147483648`), so they are level 1 here. Every
-/// other level below [`LEVEL_FASTEST`] is that level, which gives the same
-/// bytes and keeps liblz4's arithmetic in range.
-fn frame_level(level: i32) -> i32 {
-    match level {
-        i32::MIN | -2_147_483_647 => 1,
-        l => l.max(LEVEL_FASTEST),
-    }
-}
-
 /// `LZ4_compress_fast`'s acceleration for a legacy level below
-/// [`LEGACY_HC_MIN`] (spike S1): the level negated. Negating `i32::MIN`
-/// overflows (upstream undefined behaviour, ruling T3-d); the reference
-/// was observed to write level 1's bytes there (probe: `lz4 -l
-/// --fast=2147483648`), so it is level 1's acceleration, 1. `i32::MIN + 1`
-/// negates cleanly and is capped like any other level (probe: `lz4 -l
-/// --fast=2147483647` writes `--fast=65536`'s bytes).
+/// [`LEGACY_HC_MIN`]: 1 for levels 0 and 1, `-level + 1` for a negative
+/// one, capped at [`LZ4_ACCELERATION_MAX`] — `LZ4F_levelToAcceleration`'s
+/// rule (`lib/lz4frame.c` 1.11.0), which the frame path applies itself.
+/// 2026-11-08 probe (`lz4 -q -c -l LEVEL`, 1.11.0): `--fast=3` is
+/// acceleration 4 (1.10.0's was 3); `--fast=65535`, `--fast=65536` and
+/// `--fast=2147483647` (`i32::MIN + 1`) give the same bytes. The CLI
+/// refuses `i32::MIN` (`--fast=2147483648`) before compressing; here it is
+/// capped like the rest, without the overflow `-level + 1` would be.
 fn legacy_acceleration(level: i32) -> c_int {
-    match level.checked_neg() {
-        Some(a) if level < 0 => a.min(LZ4_ACCELERATION_MAX),
-        _ => 1,
+    if level >= 0 {
+        1
+    } else if level < 1 - LZ4_ACCELERATION_MAX {
+        LZ4_ACCELERATION_MAX
+    } else {
+        1 - level
     }
 }
 
@@ -723,7 +648,7 @@ pub(super) fn legacy_block_decode(src: &[u8], dst: &mut [u8]) -> Result<usize, L
     // LZ4_COMPRESSBOUND(8 MiB), dst = 8 MiB, both within c_int);
     // LZ4_decompress_safe never reads or writes past them.
     let n = unsafe {
-        sys::LZ4_decompress_safe(
+        LZ4_decompress_safe(
             src.as_ptr().cast(),
             dst.as_mut_ptr().cast(),
             src.len() as c_int,
@@ -738,7 +663,7 @@ const DST_CHUNK: usize = 256 << 10;
 
 /// An lz4 frame decompression context (`LZ4F_decompress` semantics).
 pub struct Decoder {
-    dctx: NonNull<c_void>,
+    dctx: NonNull<Dctx>,
     /// The `-D` dictionary, referenced by liblz4 in place for each frame.
     dict: Option<Box<[u8]>>,
     scratch: Vec<u8>,
@@ -752,7 +677,7 @@ impl Drop for Decoder {
         // SAFETY: dctx came from LZ4F_createDecompressionContext and is
         // freed exactly once, here.
         unsafe {
-            sys::LZ4F_freeDecompressionContext(sys::LZ4FDecompressionContext(self.dctx.as_ptr()));
+            LZ4F_freeDecompressionContext(self.dctx.as_ptr());
         }
     }
 }
@@ -760,10 +685,10 @@ impl Drop for Decoder {
 impl Decoder {
     /// A context for `o`.
     pub fn new(o: &DecodeOptions) -> Result<Decoder, Lz4Error> {
-        let mut ctx = sys::LZ4FDecompressionContext(std::ptr::null_mut());
+        let mut ctx: *mut Dctx = std::ptr::null_mut();
         // SAFETY: ctx is a valid out-pointer; LZ4F_VERSION matches.
-        check(unsafe { sys::LZ4F_createDecompressionContext(&mut ctx, sys::LZ4F_VERSION) })?;
-        let dctx = NonNull::new(ctx.0).ok_or(Lz4Error::Lib(Lz4fError::AllocationFailed))?;
+        check(unsafe { LZ4F_createDecompressionContext(&mut ctx, LZ4F_VERSION) })?;
+        let dctx = NonNull::new(ctx).ok_or(Lz4Error::Lib(Lz4fError::AllocationFailed))?;
         Ok(Decoder {
             dctx,
             dict: o.dictionary.as_deref().map(Box::from),
@@ -808,8 +733,8 @@ impl Decoder {
                 })?,
                 // SAFETY: as above, without a dictionary.
                 None => check(unsafe {
-                    sys::LZ4F_decompress(
-                        sys::LZ4FDecompressionContext(self.dctx.as_ptr()),
+                    LZ4F_decompress(
+                        self.dctx.as_ptr(),
                         dst,
                         &mut dst_size,
                         src,
@@ -851,58 +776,77 @@ impl Decoder {
     }
 }
 
+/// `LZ4F_getErrorName` for an error code (the tests' check of
+/// [`Lz4fError::name`]).
+#[cfg(test)]
+pub(super) fn error_name(code: usize) -> String {
+    // SAFETY: LZ4F_getErrorName returns a pointer into a static table of
+    // NUL-terminated strings for any value.
+    let p = unsafe { LZ4F_getErrorName(0usize.wrapping_sub(code)) };
+    // SAFETY: as above: a static NUL-terminated string.
+    unsafe { std::ffi::CStr::from_ptr(p) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// UNSAFE-4 (2026-10-31 audit): the declarations above are written by hand
-/// against liblz4 1.10.0's `lib/lz4frame.h`, and pass `lz4-sys`'s own
-/// structs through. The workspace pins `lz4-sys` exactly; these pin the
-/// layouts the declarations assume, so a bump that moves them fails here.
+/// against liblz4 1.11.0's `lib/lz4frame.h`; these pin the library they
+/// link and the layouts they assume, so a re-vendored liblz4 that moves
+/// either fails here.
 #[cfg(test)]
 mod layout_tests {
     use std::mem::{align_of, offset_of, size_of};
 
-    use super::{FrameInfo, sys};
+    use super::{FourUnsigned, FrameInfo, Preferences};
 
     #[test]
     fn the_linked_liblz4_is_the_one_the_declarations_were_written_for() {
         // SAFETY: LZ4_versionNumber takes no arguments and returns a constant.
-        assert_eq!(unsafe { sys::LZ4_versionNumber() }, 11000);
+        assert_eq!(unsafe { super::LZ4_versionNumber() }, 11100);
+    }
+
+    /// `LZ4F_MULTITHREAD` is on wherever `build.rs` turns it on (unix
+    /// targets): `-T#` then gets real worker threads.
+    #[test]
+    fn multithreading_is_compiled_in_on_unix() {
+        // SAFETY: LZ4F_getMaxNbWorkers takes no arguments and returns a
+        // constant.
+        let max = unsafe { super::LZ4F_getMaxNbWorkers() };
+        if cfg!(unix) {
+            assert_eq!(
+                max,
+                if cfg!(target_pointer_width = "64") {
+                    1024
+                } else {
+                    128
+                }
+            );
+        } else {
+            assert_eq!(max, 0);
+        }
     }
 
     #[test]
-    fn the_hand_declared_frame_info_matches_lz4_sys() {
-        assert_eq!(size_of::<FrameInfo>(), size_of::<sys::LZ4FFrameInfo>());
-        assert_eq!(align_of::<FrameInfo>(), align_of::<sys::LZ4FFrameInfo>());
-        assert_eq!(
-            offset_of!(FrameInfo, content_size),
-            offset_of!(sys::LZ4FFrameInfo, content_size)
-        );
-        assert_eq!(
-            offset_of!(FrameInfo, dict_id),
-            offset_of!(sys::LZ4FFrameInfo, dict_id)
-        );
-        assert_eq!(
-            offset_of!(FrameInfo, block_checksum_flag),
-            offset_of!(sys::LZ4FFrameInfo, block_checksum_flag)
-        );
-    }
-
-    #[test]
-    fn lz4_sys_preferences_match_lz4frame_h_1_10_0() {
-        // `LZ4F_preferences_t` (lz4frame.h:192): `LZ4F_frameInfo_t` (four
-        // enums, `unsigned long long contentSize`, `unsigned dictID`, an
-        // enum: 32 bytes, 8-aligned), then `int compressionLevel`,
-        // `unsigned autoFlush`, `unsigned favorDecSpeed`, `unsigned
-        // reserved[3]`: 56 bytes. The hand-declared one-shot and dictionary
-        // functions take a pointer to it.
-        assert_eq!(size_of::<sys::LZ4FFrameInfo>(), 32);
-        assert_eq!(offset_of!(sys::LZ4FFrameInfo, content_size), 16);
-        assert_eq!(size_of::<sys::LZ4FPreferences>(), 56);
-        assert_eq!(align_of::<sys::LZ4FPreferences>(), 8);
-        assert_eq!(offset_of!(sys::LZ4FPreferences, compression_level), 32);
-        assert_eq!(offset_of!(sys::LZ4FPreferences, auto_flush), 36);
-        assert_eq!(offset_of!(sys::LZ4FPreferences, favor_dec_speed), 40);
-        assert_eq!(offset_of!(sys::LZ4FPreferences, reserved), 44);
-        // `LZ4F_decompressOptions_t` (lz4frame.h:371): four `unsigned`s
-        // (`lz4-sys` names the last three `reserved`).
-        assert_eq!(size_of::<sys::LZ4FDecompressOptions>(), 16);
+    fn preferences_match_lz4frame_h_1_11_0() {
+        // `LZ4F_frameInfo_t` (four enums, `unsigned long long contentSize`,
+        // `unsigned dictID`, an enum: 32 bytes, 8-aligned), then `int
+        // compressionLevel`, `unsigned autoFlush`, `unsigned favorDecSpeed`,
+        // `unsigned nbWorkers`, `unsigned reserved1`, `unsigned reserved0`:
+        // 56 bytes.
+        assert_eq!(size_of::<FrameInfo>(), 32);
+        assert_eq!(align_of::<FrameInfo>(), 8);
+        assert_eq!(offset_of!(FrameInfo, content_size), 16);
+        assert_eq!(offset_of!(FrameInfo, dict_id), 24);
+        assert_eq!(offset_of!(FrameInfo, block_checksum_flag), 28);
+        assert_eq!(size_of::<Preferences>(), 56);
+        assert_eq!(align_of::<Preferences>(), 8);
+        assert_eq!(offset_of!(Preferences, compression_level), 32);
+        assert_eq!(offset_of!(Preferences, auto_flush), 36);
+        assert_eq!(offset_of!(Preferences, favor_dec_speed), 40);
+        assert_eq!(offset_of!(Preferences, nb_workers), 44);
+        assert_eq!(offset_of!(Preferences, reserved0), 52);
+        // `LZ4F_compressOptions_t` and `LZ4F_decompressOptions_t`: four
+        // `unsigned`s each, passed only as NULL here.
+        assert_eq!(size_of::<FourUnsigned>(), 16);
     }
 }

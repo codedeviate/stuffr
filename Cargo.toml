@@ -20,19 +20,6 @@ flate2 = "1"
 bzip2 = "0.6"
 brotli = "9"
 lz4_flex = "0.14"
-# liblz4 1.10.0, vendored and built whole by its `cc` build script (no
-# pkg-config, no system library), for the lz4 compatibility family's C tier
-# (`lz4-c`): `stuffr_formats::lz4_opts` drives `LZ4F_*` as the lz4 CLI does,
-# so its `.lz4` output is byte-identical to the reference's. Reachable only
-# through `lz4-c`; the `pure` graph is unaffected.
-#
-# Exact, not a caret: `lz4_opts/c.rs` hand-declares six lz4frame 1.10
-# functions and the `LZ4F_preferences_t` layout, and the reference figures
-# (byte-identical `.lz4`) are lz4 1.10.0's. A crates.io consumer's resolver
-# must not pick a later 1.11.x that bundles another liblz4 behind those
-# declarations (UNSAFE-4, 2026-10-31 audit). Bump deliberately: re-check the
-# declarations against the new `lz4frame.h` and re-run the compat suite.
-lz4-sys = "=1.11.1"
 # xxHash32 for `lz4_opts`' own frame writer and reader (header, block and
 # content checksums). Already in every `lz4` build's graph: `lz4_flex`'s
 # default `frame` feature depends on this exact crate, so naming it adds no

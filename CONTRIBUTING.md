@@ -342,13 +342,13 @@ The real publish still goes in order: `stuffr-core`, `stuffr-formats`,
 `stuffr`, `stuffr-cli`.
 
 **At every release, re-check the C that ships pinned.** The workspace pins
-`zstd-sys` and `lz4-sys` EXACTLY (`Cargo.toml`'s `[workspace.dependencies]`:
-the bindings and the `const` asserts on libzstd's experimental parameter
-numbers are only right for the library those exact versions bundle), so a
-security fix upstream never arrives on its own — `cargo update` will not
-move an `=` pin. Look up the newest `zstd-sys`/`lz4-sys` on crates.io and
-the libzstd/liblz4 security advisories since the pinned release, and do
-the same for the vendored libbrotli against google/brotli's releases (see
+`zstd-sys` EXACTLY (`Cargo.toml`'s `[workspace.dependencies]`: the bindings
+and the `const` asserts on libzstd's experimental parameter numbers are
+only right for the library that exact version bundles), so a security fix
+upstream never arrives on its own — `cargo update` will not move an `=`
+pin. Look up the newest `zstd-sys` on crates.io and the libzstd security
+advisories since the pinned release, and do the same for the vendored
+libbrotli and liblz4 against google/brotli's and lz4/lz4's releases (see
 `crates/stuffr-formats/c/VENDORED.md`). Moving a pin means re-reading what
 it pins (the comment above each one says what), then `make deny` and
 `make check`. Record the answer, even "no change", in the release notes.

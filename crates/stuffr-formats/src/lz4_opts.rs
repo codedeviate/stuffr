@@ -1,4 +1,4 @@
-//! The `lz4` tool's options seam: what the lz4 1.10.0 CLI hands liblz4, as
+//! The `lz4` tool's options seam: what the lz4 1.11.0 CLI hands liblz4, as
 //! Rust types, and a streaming encoder and decoder that take them.
 //!
 //! This is the layer the `stuffr` binary's lz4 compatibility family drives.
@@ -9,48 +9,54 @@
 //!
 //! The types, [`parse_frame_header`], [`LegacyDecoder`] and the constants
 //! are tier-independent. [`Encoder`], [`Decoder`] and [`liblz4_version`] are
-//! the C tier's (`lz4-c`, in `c`) whenever it is compiled, else the pure
-//! tier's (in `pure`). Not part of the stable API.
+//! the C tier's (`lz4-c`, in `c`: liblz4 1.11.0, vendored) whenever it is
+//! compiled, else the pure tier's (in `pure`). Not part of the stable API.
 //!
-//! ## What the CLI does with liblz4 (measured, spike S1)
+//! ## What the CLI does with liblz4 (measured)
 //!
-//! Everything below was found by comparing this module's output with
-//! `/opt/homebrew/opt/lz4/bin/lz4` 1.10.0, never by reading the CLI's source
-//! (GPL-2.0-or-later, not read; see `LICENSE-lz4` in `stuffr-cli`):
+//! Everything below was found by comparing this module's output with the
+//! lz4 CLI (spike S1 against 1.10.0; the 2026-11-08 probe against 1.11.0),
+//! never by reading the CLI's source (GPL-2.0-or-later, not read; see
+//! `LICENSE-lz4` in `stuffr-cli`):
 //!
-//! - **Small inputs are one `LZ4F_compressFrame` call.** The CLI reads its
-//!   input [`FRAME_CHUNK`] (4 MiB) at a time. An input that ends inside the
-//!   first chunk (shorter than 4 MiB, whatever the block size) is compressed
-//!   in one shot, which shrinks the block size ID to the smallest that holds
-//!   the input (never below 64 KiB, never above the one asked for), makes a
-//!   single-block frame independent even under `-BD`, and writes the content
-//!   size (the true one) only if it was asked for.
-//! - **Larger inputs are streamed in 4 MiB jobs** (lz4 1.10.0 is
-//!   multithreaded, and its bytes do not depend on `-T#`): the header is
-//!   `LZ4F_compressBegin`'s, at exactly the block size asked for; each job
-//!   is compressed as a frame of its own (`LZ4F_compressBegin_usingDict`,
-//!   one `LZ4F_compressUpdate`, `LZ4F_compressEnd`), whose blocks become the
-//!   frame's; the end mark and the content checksum close it. Under `-BD` a
-//!   job is begun against the previous 64 KiB of input lying immediately
-//!   before it in memory, so liblz4 continues that prefix (a detached copy of
-//!   the same 64 KiB gives different bytes). [`Encoder`] reproduces this
-//!   whatever slices its caller feeds it, so it writes nothing until 4 MiB
-//!   have arrived or [`Encoder::finish`] is called.
-//! - **`-D`** (spike S2) is digested once (`LZ4F_createCDict`) and used for
-//!   the one-shot frame, every job of an independent frame and the first
-//!   job of a linked one. liblz4 keeps only a dictionary's last 64 KiB, so
-//!   the whole file and its last 64 KiB give the same frame.
-//! - **`autoFlush`** is unobservable on every path above (0 and 1 give the
-//!   same bytes); it is left at 0.
-//! - **zstd 1.5.7's `--format=lz4`** (spike S4) is plain `LZ4F` streaming
-//!   instead — one `LZ4F_compressUpdate` per 64 KiB block, never one-shot —
-//!   which [`Encoder::new_plain`] reproduces.
-//! - **`-B#` with a byte count** (`32` up) only chooses the block size ID: the
-//!   smallest of 64 KiB, 256 KiB, 1 MiB and 4 MiB that holds `#` bytes (4 MiB
-//!   for anything larger). Blocks are then that ID's size; the input is not
-//!   cut at `#` bytes. See [`BlockSizeId::for_bytes`].
+//! - **Inputs shorter than one block are one `LZ4F_compressFrame` call.**
+//!   The CLI reads its input one update ([`FRAME_CHUNK`], 4 MiB, or a custom
+//!   `-B#`'s `#`) at a time. An input that ends inside the first update and
+//!   is shorter than the block size asked for is compressed in one shot,
+//!   which shrinks the block size ID to the smallest that holds the input
+//!   (never below 64 KiB), makes the frame independent even under `-BD`, and
+//!   writes the content size (the true one) only if it was asked for. One
+//!   of exactly a block or more is streamed (Task 3's probe of 1.11.0:
+//!   `-B4 -BD` over 65,535 bytes is one shot, over 65,536 linked; 1.10.0
+//!   compressed anything under 4 MiB in one shot).
+//! - **Larger inputs are streamed**: `LZ4F_compressBegin` (with the `-D`
+//!   dictionary's `CDict`), one `LZ4F_compressUpdate` per 4 MiB,
+//!   `LZ4F_compressEnd`. lz4 1.11.0 gives liblz4 its threads
+//!   ([`EncodeOptions::workers`], `nbWorkers`): the bytes of `-T#` are those
+//!   of any `nbWorkers >= 1` (liblz4 cuts 1 MB jobs, each linked job
+//!   restarting from the previous 64 KiB, whatever the update size), and
+//!   `--single-thread`'s are `nbWorkers` 0 in 4 MiB updates. Independent
+//!   blocks are the same either way.
+//! - **`-B#` with a byte count** (`32` up): updates of exactly `#` bytes
+//!   with `autoFlush` ([`EncodeOptions::update_size`],
+//!   [`EncodeOptions::flush_each_update`]), so every block holds `#` bytes,
+//!   and single-threaded (`nbWorkers` 0, `-T#` or not); the frame's block
+//!   size ID is the smallest of 64 KiB, 256 KiB, 1 MiB and 4 MiB that holds
+//!   `#` ([`BlockSizeId::for_bytes`]). An explicit `LZ4F_flush` after each
+//!   update gives other bytes under `-BD` over several blocks of a 1 MiB
+//!   frame (Task 3's re-probe of probe §4, which tried independent blocks).
+//! - **`-D`** (spike S2) is digested once (`LZ4F_createCDict`). liblz4
+//!   keeps only a dictionary's last 64 KiB, so the whole file and its last
+//!   64 KiB give the same frame.
+//! - **`autoFlush`** is unobservable on the 4 MiB paths above (0 and 1
+//!   give the same bytes); it is left at 0 there.
+//! - **zstd 1.5.7's `--format=lz4`** (spike S4) is plain single-threaded
+//!   `LZ4F` streaming instead — one `LZ4F_compressUpdate` per 64 KiB block,
+//!   never one-shot — which [`Encoder::new_plain`] reproduces.
 //! - **Legacy (`-l`)**: the magic, then the input in 8 MiB pieces, each
-//!   compressed as one block (always compressed, even when larger).
+//!   compressed as one block (always compressed, even when larger):
+//!   `LZ4_compress_HC` from level 2 up, `LZ4_compress_fast` below with the
+//!   frame API's acceleration (1, or `-level + 1` for a negative level).
 //!
 //! ## The pure tier
 //!
@@ -179,14 +185,17 @@ impl BlockSizeId {
 /// What [`Encoder::new`] builds: the preferences the lz4 CLI gives liblz4.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodeOptions {
-    /// lz4's level as the CLI passes it: --fast=N is -N; 0..=2 fast; 3..=12 HC (C tier).
+    /// lz4's level as the CLI passes it: --fast=N is -N; 0..=1 fast; 2 mid-way; 3..=12 HC (C tier).
     pub level: i32,
     /// The block size ID (`-B4`..`-B7`), unless [`block_bytes`](Self::block_bytes)
     /// is set.
     pub block_size: BlockSizeId,
-    /// -B# with a byte count (≥ 32): spike S1 found it only chooses the frame's
-    /// block size ID ([`BlockSizeId::for_bytes`]), which then overrides
-    /// [`block_size`](Self::block_size); the input is not chunked at `#` bytes.
+    /// -B# with a byte count (≥ 32): chooses the frame's block size ID
+    /// ([`BlockSizeId::for_bytes`]), which then overrides
+    /// [`block_size`](Self::block_size). The blocks themselves are cut at
+    /// `#` bytes only through [`update_size`](Self::update_size) and
+    /// [`flush_each_update`](Self::flush_each_update), which lz4 1.11.0's
+    /// `-B#` also sets.
     pub block_bytes: Option<u32>,
     /// `-BD`: linked blocks.
     pub block_linked: bool,
@@ -206,11 +215,28 @@ pub struct EncodeOptions {
     pub dictionary: Option<Vec<u8>>,
     /// `-l`: the legacy format. Every other frame option is ignored.
     pub legacy: bool,
+    /// liblz4's `nbWorkers` (C tier): `-T#` is any value from 1 up (its
+    /// bytes do not depend on the number; liblz4 caps it at 1024), and
+    /// `--single-thread` is 0, which differs from it only for linked blocks
+    /// over more than one 1 MB job. The CLI's default is threaded, so 1.
+    #[doc(hidden)]
+    pub workers: u32,
+    /// How much input each `LZ4F_compressUpdate` gets: `None` is
+    /// [`FRAME_CHUNK`] (the CLI's 4 MiB reads), `Some(n)` the custom `-B#`'s
+    /// `n`. An input shorter than one update is compressed in one shot.
+    #[doc(hidden)]
+    pub update_size: Option<usize>,
+    /// `autoFlush` (the custom `-B#`): each update ends its blocks, so every
+    /// block but the last holds [`update_size`](Self::update_size) bytes.
+    /// The CLI's custom `-B#` also sets [`workers`](Self::workers) to 0.
+    #[doc(hidden)]
+    pub flush_each_update: bool,
 }
 
 impl Default for EncodeOptions {
     /// `lz4` with no options: level 1, 4 MiB independent blocks, the
-    /// content checksum on, no block checksum, no content size.
+    /// content checksum on, no block checksum, no content size, threaded
+    /// (one worker; the bytes are any `-T#`'s), 4 MiB updates.
     fn default() -> Self {
         EncodeOptions {
             level: 1,
@@ -223,6 +249,9 @@ impl Default for EncodeOptions {
             favor_dec_speed: false,
             dictionary: None,
             legacy: false,
+            workers: 1,
+            update_size: None,
+            flush_each_update: false,
         }
     }
 }
@@ -249,7 +278,7 @@ macro_rules! lz4f_errors {
         /// LZ4F_errorCodes from lib/lz4frame.h (BSD); the pure tier maps its faults onto the same codes.
         ///
         /// In `LZ4F_LIST_ERRORS`' order (checked against the vendored
-        /// liblz4 1.10.0 header); the discriminant is the code
+        /// liblz4 1.11.0 header); the discriminant is the code
         /// `LZ4F_getErrorCode` returns.
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub enum Lz4fError {
@@ -295,7 +324,7 @@ lz4f_errors! {
     ReservedFlagSet = 8 => "ERROR_reservedFlag_set",
     AllocationFailed = 9 => "ERROR_allocation_failed",
     SrcSizeTooLarge = 10 => "ERROR_srcSize_tooLarge",
-    DstMaxSizeTooSmall = 11 => "ERROR_dstMaxSize_tooSmall",
+    DstCapacityTooSmall = 11 => "ERROR_dstCapacity_tooSmall",
     FrameHeaderIncomplete = 12 => "ERROR_frameHeader_incomplete",
     FrameTypeUnknown = 13 => "ERROR_frameType_unknown",
     FrameSizeWrong = 14 => "ERROR_frameSize_wrong",

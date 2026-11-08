@@ -1,5 +1,5 @@
 //! The pure tier: this crate's own LZ4 frame writer and reader over
-//! `lz4_flex::block`, following `doc/lz4_Frame_format.md` (liblz4 1.10.0,
+//! `lz4_flex::block`, following `doc/lz4_Frame_format.md` (liblz4 1.11.0,
 //! BSD-2-Clause) — no liblz4 code is ported.
 //!
 //! The writer lays a frame out exactly as the C tier does (the header,
@@ -32,7 +32,7 @@ use super::{
 
 /// The liblz4 version the C tier links, reported as-is on this tier (R7).
 pub fn liblz4_version() -> &'static str {
-    "1.10.0"
+    "1.11.0"
 }
 
 /// LZ4's window: how far back a match may reach.
@@ -243,12 +243,13 @@ impl Encoder {
             if self.plain {
                 self.begin(self.block_size, self.linked, self.content_size, out);
             } else {
-                // One shot (`LZ4F_compressFrame`): the smallest block size
-                // that holds the input, independent if it is one block, and
-                // the true content size if one was asked for.
+                // Shorter than a block, one shot (`LZ4F_compressFrame`): the
+                // smallest block size that holds the input, independent, and
+                // the true content size if one was asked for. A block or
+                // more is streamed as asked (lz4 1.11.0).
                 let n = self.pending.len();
                 let id = self.block_size.optimal_for(n);
-                let linked = self.linked && n > id.bytes();
+                let linked = self.linked && n >= self.block_size.bytes();
                 let size = self.content_size.map(|_| n as u64);
                 self.begin(id, linked, size, out);
             }
