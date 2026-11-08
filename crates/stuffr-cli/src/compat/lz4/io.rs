@@ -69,6 +69,9 @@ pub(crate) struct Stats {
     pub read: u64,
     /// Bytes written to the output (or discarded, under `-t`).
     pub written: u64,
+    /// A compressed frame's content checksum, as written (its last four
+    /// bytes), when it has one.
+    pub checksum: Option<u32>,
 }
 
 /// How one input's processing went wrong.
@@ -249,6 +252,24 @@ impl Src {
         let n = n.min(self.buf.len() - self.at);
         self.at += n;
         self.taken += n as u64;
+    }
+
+    /// The input ended before the size it had when opened (a file read as
+    /// mapped, [`Src::limit_to`], that was truncated meanwhile or could not
+    /// be read further).
+    fn cut_short(&self) -> bool {
+        self.reader.eof && self.reader.left.is_some_and(|l| l > 0)
+    }
+
+    /// The content checksum of a named input's first `len` bytes as they
+    /// are now, read again through its descriptor; `None` when they are
+    /// not all there (or cannot be read).
+    fn checksum_now(&mut self, len: u64) -> Option<u32> {
+        let Origin::File(f) = &mut self.reader.origin else {
+            return None;
+        };
+        f.seek(SeekFrom::Start(0)).ok()?;
+        stuffr::lz4_opts::content_checksum_of(f, len).ok()?
     }
 
     /// Read no more than `n` bytes from here (`--mmap`: a file is
@@ -596,16 +617,43 @@ pub(super) enum Verdict {
     Warn(&'static str),
     /// [`m::E54_SOURCE_MODIFIED`]: the output removed, the run ends with 54.
     Fail,
+    /// [`m::E53_SOURCE_TRUNCATED`] (Linux): the output left as it is, the
+    /// run ends with 53.
+    Truncated,
 }
 
+/// lz4 1.11.0 on Linux reads a mapped source through the page cache it
+/// shares with every writer, and so answers differently from macOS
+/// ([`verdict`]; probed in Docker `ubuntu:24.04` with the tarball build, and
+/// CI run 42458938478 on x86-64). Other systems keep the macOS rules (not
+/// probed).
+const LINUX_MAPPING: bool = cfg!(target_os = "linux");
+
 /// probe (1.11.0, the 2026-11-08 probe's §1.13 table and Task 4's
-/// reruns): a mapped file (`mapped`: the default; not `--no-mmap`, not
-/// `-l`) that was itself modified is `Error 54` when it shrank or has no
-/// content checksum (`--no-frame-crc`); every other change is a warning,
-/// `renamed or replaced` before `modified`. Read without a map, every
-/// change is a warning. `--single-thread` behaves as the default.
-pub(super) fn verdict(c: Change, mapped: bool, checksum: bool) -> Verdict {
-    if mapped && c.modified && (c.shrunk || !checksum) {
+/// reruns, macOS): a mapped file (`mapped`: the default for a named file;
+/// not `--no-mmap`, not `-l`, never standard input) that was itself
+/// modified is `Error 54` when it shrank or has no content checksum
+/// (`--no-frame-crc`); every other change is a warning, `renamed or
+/// replaced` before `modified`. Read without a map, every change is a
+/// warning. `--single-thread` behaves as the default.
+///
+/// `linux` (probe, 1.11.0 on Linux, `lz4 -12 -T1 [opts] f` over 64 MiB, each
+/// shape run 2 to 5 times with the same answer): a mapped file that shrank
+/// is `Error 53` (lz4 meets the cut while reading its mapping), and one
+/// changed in place where it had already been compressed (`rewritten`: the
+/// frame's content checksum no longer matches the file's first bytes) is
+/// `Error 54` even with a checksum; appended to, touched, or rewritten
+/// beyond what was compressed by then, it is the warning, as on macOS.
+pub(super) fn verdict(
+    c: Change,
+    mapped: bool,
+    checksum: bool,
+    rewritten: bool,
+    linux: bool,
+) -> Verdict {
+    if mapped && linux && c.shrunk {
+        Verdict::Truncated
+    } else if mapped && c.modified && (c.shrunk || !checksum || rewritten) {
         Verdict::Fail
     } else if c.replaced {
         Verdict::Warn(m::SOURCE_REPLACED)
@@ -1039,34 +1087,48 @@ impl Run<'_> {
         if let (Some(s), Some(m), true) = (src.as_mut(), regular, mapped) {
             s.limit_to(m.len());
         }
-        let (r, mut fd, change) = match self.open_sink(target, meta.as_ref(), named, false) {
-            Ok(mut sink) => {
-                // Standard input is taken only now: the overwrite question
-                // reads it first (probe: `printf 'y\nhello' | lz4 - e`
-                // compresses `hello`).
-                let mut src = src.unwrap_or_else(|| self.take_stdin());
-                let stable = mapped && regular.is_some();
-                let r = self.compress_from(name, &mut src, meta.as_ref(), stable, &mut sink);
-                let change = match (regular, &r) {
-                    // Standard input is never stat'ed by name (no file
-                    // named `stdin` is looked at): never `replaced`.
-                    (Some(before), Ok(_)) => {
-                        let by_name = if named {
-                            self.stat_name(name)
-                        } else {
-                            Some(before.clone())
-                        };
-                        source_change(before, src.fstat(), by_name)
-                    }
-                    _ => Change::default(),
-                };
-                self.put_back(name, src);
-                (r, sink.fd.take(), change)
-            }
-            Err(f) => (Err(f), None, Change::default()),
-        };
+        let (r, mut fd, change, rewritten) =
+            match self.open_sink(target, meta.as_ref(), named, false) {
+                Ok(mut sink) => {
+                    // Standard input is taken only now: the overwrite question
+                    // reads it first (probe: `printf 'y\nhello' | lz4 - e`
+                    // compresses `hello`).
+                    let mut src = src.unwrap_or_else(|| self.take_stdin());
+                    let stable = mapped && regular.is_some();
+                    let r = self.compress_from(name, &mut src, meta.as_ref(), stable, &mut sink);
+                    let change = match (regular, &r) {
+                        // Standard input is never stat'ed by name (no file
+                        // named `stdin` is looked at): never `replaced`.
+                        (Some(before), Ok(_)) => {
+                            let by_name = if named {
+                                self.stat_name(name)
+                            } else {
+                                Some(before.clone())
+                            };
+                            source_change(before, src.fstat(), by_name)
+                        }
+                        _ => Change::default(),
+                    };
+                    // Linux: bytes already compressed changed under the map
+                    // (only looked at when the file says it was modified).
+                    let rewritten = match (&r, regular) {
+                        (Ok(stats), Some(before))
+                            if LINUX_MAPPING && mapped && change.modified && !change.shrunk =>
+                        {
+                            stats
+                                .checksum
+                                .is_some_and(|c| src.checksum_now(before.len()) != Some(c))
+                        }
+                        _ => false,
+                    };
+                    self.put_back(name, src);
+                    (r, sink.fd.take(), change, rewritten)
+                }
+                Err(f) => (Err(f), None, Change::default(), false),
+            };
         let stats = r?;
-        let kept = match verdict(change, mapped, self.cmd.opts.content_checksum) {
+        let checksum = self.cmd.opts.content_checksum;
+        let kept = match verdict(change, mapped, checksum, rewritten, LINUX_MAPPING) {
             Verdict::Fine => false,
             Verdict::Warn(fmt) => {
                 let kept: &[u8] = if self.cmd.remove {
@@ -1083,6 +1145,12 @@ impl Run<'_> {
                     let _ = fs::remove_file(self.host.path(out));
                 }
                 return Err(self.exm(54, m::E54_SOURCE_MODIFIED, &[name]));
+            }
+            // The output stays as written (probe, Linux: `f.lz4` left with
+            // 794624 bytes, no frame end), and so does the source.
+            Verdict::Truncated => {
+                drop(fd);
+                return Err(self.exm(53, m::E53_SOURCE_TRUNCATED, &[name]));
             }
         };
         // probe (1.11.0): `lz4 -l a` gets `a`'s time and mode too (1.10.0
@@ -1178,6 +1246,11 @@ impl Run<'_> {
         let mut streamed = false;
         loop {
             let n = src.read_full(&mut buf);
+            // Linux: a mapped file cut short meanwhile ends the run while it
+            // is read, before the frame is finished ([`verdict`]).
+            if LINUX_MAPPING && stable && src.cut_short() {
+                return Err(self.exm(53, m::E53_SOURCE_TRUNCATED, &[name]));
+            }
             // probe: `lz4 -c <&-` (a frame).
             if n == 0 && first && src.reader.failed {
                 return Err(self.exm(
@@ -1213,6 +1286,12 @@ impl Run<'_> {
         }
         sink.write(self, &packed)?;
         stats.written += packed.len() as u64;
+        // The frame ends with its content checksum, written by `finish`
+        // (after the end mark).
+        if opts.content_checksum && packed.len() >= 8 {
+            let t = &packed[packed.len() - 4..];
+            stats.checksum = Some(u32::from_le_bytes([t[0], t[1], t[2], t[3]]));
+        }
         // probe: a one-shot frame (the empty one too: `lz4 e` says
         // `1500.00%`) draws one refresh once complete, over the whole input.
         if !streamed {
@@ -1318,6 +1397,7 @@ impl Run<'_> {
         let stats = Stats {
             read: decoded.read,
             written: decoded.written,
+            checksum: None,
         };
         if !decoded.undecodable {
             Self::copy_metadata(target, meta.as_ref().filter(|_| named), fd.as_mut());
@@ -1516,11 +1596,62 @@ mod tests {
             // From another second the file's status-change time moved.
             (c(true, false, true), renamed, fail, renamed),
         ] {
-            assert_eq!(verdict(change, true, true), mapped_crc, "{change:?}");
-            assert_eq!(verdict(change, true, false), mapped_no_crc, "{change:?}");
-            assert_eq!(verdict(change, false, true), read, "{change:?}");
-            assert_eq!(verdict(change, false, false), read, "{change:?}");
+            assert_eq!(
+                verdict(change, true, true, false, false),
+                mapped_crc,
+                "{change:?}"
+            );
+            assert_eq!(
+                verdict(change, true, false, false, false),
+                mapped_no_crc,
+                "{change:?}"
+            );
+            assert_eq!(
+                verdict(change, false, true, false, false),
+                read,
+                "{change:?}"
+            );
+            assert_eq!(
+                verdict(change, false, false, false, false),
+                read,
+                "{change:?}"
+            );
         }
+    }
+
+    /// The Linux rows (the 0.26.0 Linux probe): a mapped file that shrank
+    /// is `Error 53`, one rewritten where it was already compressed `Error
+    /// 54` with a checksum too; the rest as on macOS, and nothing changes
+    /// for a file read without a map.
+    #[test]
+    fn a_changed_source_on_linux() {
+        let c = |modified, shrunk, replaced| Change {
+            modified,
+            shrunk,
+            replaced,
+        };
+        let v = |change, mapped, crc, rewritten| verdict(change, mapped, crc, rewritten, true);
+        let warn = Verdict::Warn(m::SOURCE_MODIFIED);
+        let renamed = Verdict::Warn(m::SOURCE_REPLACED);
+        // Truncated: 53 mapped, whatever the checksum; a warning read.
+        assert_eq!(
+            v(c(true, true, false), true, true, false),
+            Verdict::Truncated
+        );
+        assert_eq!(
+            v(c(true, true, false), true, false, false),
+            Verdict::Truncated
+        );
+        assert_eq!(v(c(true, true, false), false, true, false), warn);
+        // Rewritten in place: 54 mapped, a warning read.
+        assert_eq!(v(c(true, false, false), true, true, true), Verdict::Fail);
+        assert_eq!(v(c(true, false, false), false, true, true), warn);
+        // Appended to or touched: as on macOS.
+        assert_eq!(v(c(true, false, false), true, true, false), warn);
+        assert_eq!(v(c(true, false, false), true, false, false), Verdict::Fail);
+        assert_eq!(v(c(true, false, true), true, true, false), renamed);
+        assert_eq!(v(c(false, false, true), true, true, false), renamed);
+        assert_eq!(v(c(false, false, false), true, true, false), Verdict::Fine);
     }
 
     /// What `source_change` sees: size, seconds of the modification and
@@ -1590,7 +1721,10 @@ mod tests {
         // file appended to is.
         let c = source_change(&before, open.metadata().ok(), Some(before.clone()));
         assert!(!c.replaced && c.modified, "{c:?}");
-        assert_eq!(verdict(c, false, false), Verdict::Warn(m::SOURCE_MODIFIED));
+        assert_eq!(
+            verdict(c, false, false, false, LINUX_MAPPING),
+            Verdict::Warn(m::SOURCE_MODIFIED)
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

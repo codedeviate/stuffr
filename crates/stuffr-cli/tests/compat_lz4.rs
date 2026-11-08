@@ -5077,6 +5077,12 @@ mod unix {
     /// compares the exit, the message (refreshes dropped), whether the
     /// output and the source are left, and how much the output decodes to.
     ///
+    /// On Linux the reference reads its mapping through the page cache, so
+    /// a truncation is `Error 53` (the output left, compared as left only)
+    /// and an in-place rewrite of bytes already compressed `Error 54`; the
+    /// rows are the same, the answers the platform's (the 0.26.0 Linux
+    /// probe, CI run 42458938478).
+    ///
     /// Then standard input redirected from `f` (`lz4 -12 -T1 [opts] - f.lz4
     /// < f`, or `-c` into `f.lz4`; Task 5 review I1): checked through its
     /// descriptor only, a warning at display level 2 and never `Error 54`
@@ -5210,6 +5216,14 @@ mod unix {
             let decoded = match c {
                 Change::Truncate if stdin => decoded.map(|n| usize::from(n > 0)),
                 _ => decoded,
+            };
+            // Linux's `Error 53` leaves the output as far as it was written
+            // when the cut was met, which is timing on both sides (lz4's
+            // workers and stdio buffer; ruling L1): only that it is left.
+            let decoded = if out.status.code() == Some(53) {
+                decoded.map(|_| 0)
+            } else {
+                decoded
             };
             // Every refresh goes, the one the error follows on its line too
             // (where lz4 draws its last is timing: deviation 2).

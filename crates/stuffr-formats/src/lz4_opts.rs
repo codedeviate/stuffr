@@ -452,6 +452,30 @@ pub struct FrameHeader {
     pub header_len: usize,
 }
 
+/// xxHash32 (seed 0, a frame's content checksum) of the first `len` bytes
+/// `r` gives, or `None` when it ends sooner. For the lz4 links' check of a
+/// source changed in place while it was compressed (lz4 1.11.0 on Linux
+/// compares the frame's checksum with its mapping's bytes).
+pub fn content_checksum_of(r: &mut dyn std::io::Read, len: u64) -> std::io::Result<Option<u32>> {
+    use std::hash::Hasher;
+    let mut h = twox_hash::XxHash32::with_seed(0);
+    let mut buf = vec![0u8; 1 << 16];
+    let mut left = len;
+    while left > 0 {
+        let want = usize::try_from(left).map_or(buf.len(), |l| l.min(buf.len()));
+        match r.read(&mut buf[..want]) {
+            Ok(0) => return Ok(None),
+            Ok(n) => {
+                h.write(&buf[..n]);
+                left -= n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Some(h.finish_32()))
+}
+
 /// xxHash32 of `data` with seed 0, the checksum every LZ4 frame field uses.
 pub(crate) fn xxh32(data: &[u8]) -> u32 {
     twox_hash::XxHash32::oneshot(0, data)

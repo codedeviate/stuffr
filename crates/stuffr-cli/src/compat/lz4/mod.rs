@@ -212,9 +212,14 @@ pub fn run(name: &'static str, argv0: &OsStr, args: Vec<OsString>) -> ExitCode {
 /// decompressed size in mozlz4 format`, `... too large (N)`; probed
 /// 2026-11-08). 50 stays for a named input `--rm` cannot remove (standard
 /// input is no longer removed by its name).
+///
+/// The 0.26.0 Linux fix added 53: on Linux, lz4 1.11.0 meets a mapped
+/// source truncated while it is compressed as `Error 53 : NAME : file
+/// truncated or unreadable during compression (memory-mapped) ; retry with
+/// --no-mmap` (CI run 42458938478; macOS says `Error 54` there).
 #[doc(hidden)]
-pub const EXIT_CODES: [i32; 20] = [
-    0, 1, 26, 27, 34, 40, 42, 43, 44, 46, 50, 54, 61, 62, 63, 64, 69, 70, 72, 74,
+pub const EXIT_CODES: [i32; 21] = [
+    0, 1, 26, 27, 34, 40, 42, 43, 44, 46, 50, 53, 54, 61, 62, 63, 64, 69, 70, 72, 74,
 ];
 
 /// [`run`] without the process: operands resolve against `dir`, standard

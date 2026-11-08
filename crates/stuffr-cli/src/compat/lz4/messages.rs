@@ -387,9 +387,18 @@ pub(super) const E34_DECOMPRESSION: &str = "Error 34 : Decompression error : %s 
 pub(super) const E46_WRITE_COMPRESSED: &str =
     "Error 46 : Write error : cannot write compressed block \n";
 
-/// probe (1.11.0): `lz4 -12 -T1 f` with `f` truncated, or (with
-/// `--no-frame-crc`) changed in any way, while it is compressed (display
-/// level 1, right after the last refresh; the output file is removed).
+/// probe (1.11.0, Linux, CI run 42458938478 and the 0.26.0 Linux probe):
+/// `lz4 -12 -T1 f` with `f` truncated while it is compressed from its
+/// mapping (default, `--no-frame-crc`, `--rm`, `--single-thread`; not
+/// `--no-mmap`, `-l` or standard input): display level 1, the run ends with
+/// 53 and the output is left as written so far. macOS's lz4 says
+/// [`E54_SOURCE_MODIFIED`] there instead.
+pub(super) const E53_SOURCE_TRUNCATED: &str = "Error 53 : %s : file truncated or unreadable during compression (memory-mapped) ; retry with --no-mmap \n";
+
+/// probe (1.11.0): `lz4 -12 -T1 f` with `f` truncated (macOS), or changed
+/// in any way with `--no-frame-crc`, or (Linux) rewritten in place where it
+/// was already compressed, while it is compressed (display level 1, right
+/// after the last refresh; the output file is removed).
 pub(super) const E54_SOURCE_MODIFIED: &str = "Error 54 : %s : file modified during compression (memory-mapped) : output removed ; see --no-mmap \n";
 
 /// probe (1.11.0): `lz4 -12 -T1 f` with `f` appended to, rewritten,
