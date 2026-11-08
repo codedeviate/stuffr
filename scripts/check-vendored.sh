@@ -50,7 +50,7 @@ fi
 # liblz4 1.11.0: only lib/ is extracted (programs/ is GPL and never read).
 fetch https://github.com/lz4/lz4/releases/download/v1.11.0/lz4-1.11.0.tar.gz \
     247e5fa64da5f7b75ee3dd3bed484076396c9ebe8254d9ccf693eb62800c5e26 lz4.tar.gz
-tar -xzf "$work/lz4.tar.gz" -C "$work" 'lz4-1.11.0/lib/*'
+tar -xzf "$work/lz4.tar.gz" -C "$work" lz4-1.11.0/lib
 up="$work/lz4-1.11.0/lib"
 vendored="$c/lz4-1.11.0"
 lz4=0
