@@ -2606,7 +2606,7 @@ mod unix {
         // Deviation 2 covers which refreshes are drawn, not their figures
         // (read from the raw stderr; the pure tier's bytes, and so its
         // figures, are its own: deviation 6).
-        if EXACT && !threaded_compression(c) {
+        if EXACT && !figures_are_timing(c) {
             assert_lz4_read_figures(c, &r, &s);
         }
         // Spec deviation 8: off macOS the reference completes a block-size
@@ -2645,15 +2645,24 @@ mod unix {
         true
     }
 
-    /// Whether `c` may compress a frame with liblz4's workers (lz4 1.11.0:
-    /// not `-l`, not a custom `-B#`, not `--single-thread` after the last
-    /// `-T#`). There a refresh's figure is what the workers had handed back
-    /// when it was drawn, which is timing: the reference itself gave 18.93%
-    /// and 28.39% at 8 MiB on two runs of `lz4 -vvvv -B6` over 9 MiB
-    /// (probe, 2026-11-08). Deviation 2 then covers the figures too; the
-    /// refreshes are still compared as the normalisers leave them.
-    fn threaded_compression(c: &Case) -> bool {
+    /// Whether `c`'s refresh figures are timing (deviation 2): a frame
+    /// compressed by liblz4's workers (lz4 1.11.0: not `-l`, not a custom
+    /// `-B#`, not `--single-thread` after the last `-T#`) over more than
+    /// one job (1 MiB, or a block when larger), or with linked blocks over
+    /// a block or more (a worker takes even one job then). There a refresh
+    /// shows what the workers had handed back when it was drawn, and the
+    /// reference varies run to run (probe, 2026-11-08: 2.5 MB `-T3 -B4`
+    /// drew `0.00%` and `27.71%`, 9 MiB `-B6` `18.93%` and `28.39%` at 8
+    /// MiB, 1 MiB of random bytes `-B4 -BD` `0.00%` and `100.01%`; `-T1`
+    /// over 1 MiB + 1 byte `0.00%` idle and `8.67%` under the suite's
+    /// load). A file of one job with independent blocks is compressed by
+    /// the calling thread, and a one-shot frame is drawn once complete:
+    /// those are compared.
+    fn figures_are_timing(c: &Case) -> bool {
+        const MIB: usize = 1 << 20;
         let mut single = false;
+        let mut block = 4 * MIB;
+        let mut linked = false;
         for a in &c.args {
             if *a == "--" {
                 break;
@@ -2670,18 +2679,38 @@ mod unix {
                     return false;
                 }
                 if let Some(at) = short.find('B') {
-                    let digits: String = short[at + 1..]
+                    let flags = &short[at + 1..];
+                    if let Some(i) = flags.rfind(['D', 'I']) {
+                        linked = flags.as_bytes()[i] == b'D';
+                    }
+                    let digits: String = flags
                         .chars()
+                        .skip_while(|c| !c.is_ascii_digit())
                         .take_while(char::is_ascii_digit)
                         .collect();
-                    let n: u64 = digits.parse().unwrap_or(0);
-                    if n >= 32 && ![65_536, 262_144, 1_048_576].contains(&n) && n < 4_194_304 {
-                        return false;
+                    let n: usize = digits.parse().unwrap_or(0);
+                    match n {
+                        4..=7 => block = (64 << 10) << (2 * (n - 4)),
+                        65_536 | 262_144 | 1_048_576 => block = n,
+                        32.. if n < 4 * MIB => return false,
+                        32.. => block = 4 * MIB,
+                        _ => {}
                     }
                 }
             }
         }
-        !single
+        if single {
+            return false;
+        }
+        let size = c
+            .files
+            .iter()
+            .filter(|(name, _)| *name != "dict")
+            .map(|(_, d)| d.len())
+            .chain(c.stdin.as_ref().map(Vec::len))
+            .max()
+            .unwrap_or(0);
+        (linked && size >= block) || size > MIB.max(block)
     }
 
     /// Whether `c` is a `--list -v` of a fixture whose first frame ends
@@ -4800,6 +4829,155 @@ mod unix {
         check("the_1_11_help_matches_the_reference", &cases);
     }
 
+    /// Refresh figures around the one-job rule (fix round 1 of 0.26.0 Task
+    /// 4; the reviewer ran each 10 times): a file of one job with
+    /// independent blocks is compressed by the calling thread (100,000
+    /// bytes and 1 MiB, at `-T1` and `-T3`, `-B4` to `-B6`), so its figure
+    /// is `--single-thread`'s, and compared; the cases of more than one job
+    /// or linked blocks run too, their figures being timing
+    /// ([`figures_are_timing`]). Every refresh is drawn (`-vvvv`).
+    #[test]
+    fn deterministic_refresh_figures_match_the_reference() {
+        let mut cases = Vec::new();
+        for (name, len) in [
+            ("k100", 100_000),
+            ("m1", 1 << 20),
+            ("m1p", (1 << 20) + 1),
+            ("m25", 2_500_000),
+        ] {
+            let data = mixed(len, 51);
+            for opts in [
+                &["-T3", "-B4"][..],
+                &["-T1", "-B4"],
+                &["-T3", "-B5"],
+                &["-T3", "-B6"],
+                &["-T3", "-B4", "-BD"],
+                &["-T3", "-B5", "-BD"],
+                &["-T1", "-B4", "--no-mmap"],
+                &["-T1", "-B5"],
+                &["-B4"],
+            ] {
+                let mut args = vec!["-vvvv"];
+                args.extend_from_slice(opts);
+                args.extend([name, "o.lz4"]);
+                cases.push(lz4_case("lz4", &args, vec![(name, data.clone())]));
+            }
+        }
+        check("deterministic_refresh_figures_match_the_reference", &cases);
+    }
+
+    /// Standard input redirected from a regular file (review I1 of 0.26.0
+    /// Task 4): its size is known (the one-job rule, `--content-size`), it
+    /// is never checked for changes (probe, 1.11.0: no warning, whatever a
+    /// file named `stdin` beside it), and its figures are the reference's.
+    #[test]
+    fn standard_input_redirected_from_a_file_matches_the_reference() {
+        use std::process::{Command, Stdio};
+        let Some(_) = lz4_dir() else { return };
+        // Safe as `at`: only this test builds the name, and it has the pid.
+        let dir = ScratchDir::at(
+            std::env::temp_dir().join(format!("stuffr-lz4-redir-{}", std::process::id())),
+        );
+        let data = mixed(1 << 20, 52);
+        let run = |exe: &Path, args: &[&str], stdin_file: bool| {
+            let _ = fs::remove_dir_all(&*dir);
+            fs::create_dir_all(&*dir).unwrap();
+            fs::write(dir.join("a"), &data).unwrap();
+            if stdin_file {
+                fs::write(dir.join("stdin"), b"a file named stdin\n").unwrap();
+            }
+            let o = Command::new(exe)
+                .args(args)
+                .current_dir(&*dir)
+                .stdin(Stdio::from(fs::File::open(dir.join("a")).unwrap()))
+                .env_clear()
+                .env("LC_ALL", "C")
+                .output()
+                .unwrap();
+            let raw = String::from_utf8_lossy(&o.stderr).replacen(
+                &format!("multithread (stuffr {})", env!("CARGO_PKG_VERSION")),
+                "multithread",
+                1,
+            );
+            let figures = lz4_read_refreshes(&raw);
+            let packed = fs::read(dir.join("o.lz4")).unwrap_or_default();
+            (
+                o.status.code(),
+                normalise_lz4_progress(&raw),
+                figures,
+                packed,
+                o.stdout,
+            )
+        };
+        let link_dir = ScratchDir::at(
+            std::env::temp_dir().join(format!("stuffr-lz4-redir-bin-{}", std::process::id())),
+        );
+        fs::create_dir_all(&*link_dir).unwrap();
+        let link = link_dir.join("lz4");
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
+        let reference = Path::new(ref_lz4());
+        let mut n = 0;
+        for args in [
+            &["-", "o.lz4"][..],
+            &["-v", "-", "o.lz4"],
+            &["-v", "-12", "-T4", "-", "o.lz4"],
+            &["-v", "--content-size", "-", "o.lz4"],
+            &["-vvvv", "-B4", "-", "o.lz4"],
+            &["-vvvv", "-T1", "-B6", "-", "o.lz4"],
+        ] {
+            for stdin_file in [false, true] {
+                let theirs = run(reference, args, stdin_file);
+                let mut ours = run(&link, args, stdin_file);
+                if !EXACT {
+                    // Deviation 6: the pure tier's own bytes and figures;
+                    // the reference decodes them.
+                    assert_eq!(
+                        decode_with_reference(&ours.3),
+                        data,
+                        "{args:?}: the reference decodes ours"
+                    );
+                    ours.1 = theirs.1.clone();
+                    ours.2 = theirs.2.clone();
+                    ours.3 = theirs.3.clone();
+                }
+                assert_eq!(
+                    ours, theirs,
+                    "{args:?} < a (a file `stdin` beside it: {stdin_file})"
+                );
+                n += 1;
+            }
+        }
+        // `--rm` of standard input is 0.26.0 Task 5's (1.11.0 removes
+        // nothing); here only: no change warning on either side.
+        for stdin_file in [false, true] {
+            for exe in [reference, link.as_path()] {
+                let (_, err, ..) = run(exe, &["-v", "--rm", "-", "o.lz4"], stdin_file);
+                assert!(!err.contains("Warning"), "{exe:?} --rm: {err:?}");
+            }
+        }
+        println!("{n} cases compared");
+    }
+
+    /// The reference's decode of an lz4 stream.
+    fn decode_with_reference(packed: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new(ref_lz4())
+            .args(["-dc", "-q"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let packed = packed.to_vec();
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&packed);
+        });
+        let out = child.wait_with_output().unwrap();
+        writer.join().unwrap();
+        out.stdout
+    }
+
     /// `--content-size` with standard input first (probe, 1.11.0: a
     /// warning at display level 2 as parsed, for every operation).
     #[test]
@@ -4996,10 +5174,7 @@ mod unix {
                 &["--no-mmap"],
                 &["--no-frame-crc"],
                 &["--rm"],
-                &["--no-mmap", "--rm"],
-                &["--single-thread"],
                 &["-l"],
-                &["-q"],
             ] {
                 let theirs = run(&reference, &ref_dir, opts, c);
                 let ours = run(stuffr, &our_dir, opts, c);

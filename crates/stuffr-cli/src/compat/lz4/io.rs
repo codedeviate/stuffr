@@ -503,7 +503,10 @@ pub(super) struct Change {
 /// put in its place is `renamed or replaced`, and from another second on
 /// (the rename moves the file's own status-change time) the file counts
 /// as modified as well (`--no-frame-crc`: a warning at 0.2-0.4 s, `Error
-/// 54` at 0.6-1.1 s).
+/// 54` at 0.6-1.1 s). So anything else that moves the status-change time
+/// meanwhile (an extended attribute, an ACL, another hard link, set by a
+/// backup or indexing agent) counts too; only `chmod` and the rename were
+/// probed.
 pub(super) fn source_change(
     before: &Metadata,
     now: Option<Metadata>,
@@ -965,8 +968,10 @@ impl Run<'_> {
         // A regular file is read as long as it was when opened, as lz4
         // maps it, unless `--no-mmap` (or `-l`, which reads to the end:
         // probe, 1.11.0, `lz4 -l f` with `f` appended to meanwhile writes
-        // the bytes appended too).
-        let regular = meta.as_ref().filter(|m| m.is_file());
+        // the bytes appended too). Only a named file: standard input
+        // redirected from one is read to its end and never checked (probe,
+        // 1.11.0: `lz4 - o.lz4 < f`, `-v`, `--rm` say no warning).
+        let regular = meta.as_ref().filter(|m| m.is_file() && name != STDINMARK);
         let mapped = self.cmd.mmap && !self.cmd.opts.legacy;
         if let (Some(s), Some(m), true) = (src.as_mut(), regular, mapped) {
             s.limit_to(m.len());
@@ -977,7 +982,8 @@ impl Run<'_> {
                 // reads it first (probe: `printf 'y\nhello' | lz4 - e`
                 // compresses `hello`).
                 let mut src = src.unwrap_or_else(|| self.take_stdin());
-                let r = self.compress_from(name, &mut src, meta.as_ref(), &mut sink);
+                let stable = mapped && regular.is_some();
+                let r = self.compress_from(name, &mut src, meta.as_ref(), stable, &mut sink);
                 let change = match (regular, &r) {
                     (Some(before), Ok(_)) => {
                         source_change(before, src.fstat(), self.stat_name(name))
@@ -1029,14 +1035,17 @@ impl Run<'_> {
         fs::metadata(self.host.path(name)).ok()
     }
 
+    /// `stable`: the input is a mapped file (lz4 hands its last update to
+    /// liblz4 as stable until the frame ends: `Encoder::end_of_input`).
     fn compress_from(
         &mut self,
         name: &[u8],
         src: &mut Src,
         meta: Option<&Metadata>,
+        stable: bool,
         sink: &mut Sink,
     ) -> Result<Stats, Fail> {
-        let opts = EncodeOptions {
+        let mut opts = EncodeOptions {
             // probe: `cat big | lz4 --content-size -c` records no size, `lz4
             // --content-size big` and `lz4 --content-size < big` do: the size
             // of a regular file, standard input's included.
@@ -1048,6 +1057,24 @@ impl Run<'_> {
                 .cmd
                 .encode_options(matches!(self.host, Host::Sandbox(_)))
         };
+        // lz4.1 (1.11.0), `-T#`: "no more threads than the jobs of each
+        // file (1 MB, or a single block when larger)". probe (1.11.0,
+        // `-vvvv -T1`/`-T3`): a file of one job and independent blocks is
+        // compressed by the calling thread (its refresh is `--single-thread`'s:
+        // 100,000 bytes `-B4` 43.30%, 1 MiB `-B4` 66.05%, 1 MiB `-B6`
+        // 75.63%, also standard input redirected from such a file); 1 MiB
+        // + 1 byte is two jobs, threaded (`0.00%`); linked blocks stay
+        // threaded even in one job (100,000 bytes `-B4 -BD` `0.01%`), and a
+        // pipe's size is unknown. Independent blocks are the same bytes
+        // either way (§4).
+        let job = (1usize << 20).max(opts.block_size_id().bytes());
+        if let Some(len) = meta.filter(|m| m.is_file()).map(Metadata::len)
+            && opts.workers > 0
+            && !opts.block_linked
+            && len <= job as u64
+        {
+            opts.workers = 0;
+        }
         let legacy = opts.legacy;
         // probe: `lz4 -v --content-size - o < pipe`, `... /dev/null o`
         // (display level 3, once the output is open): a frame that was to
@@ -1097,7 +1124,7 @@ impl Run<'_> {
             }
             stats.read += n as u64;
             if enc.update(&buf[..n], &mut packed).is_err()
-                || (n < chunk && enc.end_of_input(&mut packed).is_err())
+                || (n < chunk && enc.end_of_input(&mut packed, stable).is_err())
             {
                 return Err(self.exm(46, m::E46_WRITE_COMPRESSED, &[]));
             }

@@ -281,6 +281,11 @@ pub struct Encoder {
     plain: bool,
     /// Input not yet compressed: less than one update (8 MiB for legacy).
     pending: Vec<u8>,
+    /// The last update, handed to liblz4 as stable until the frame ends
+    /// ([`Encoder::end_of_input`] with `stable`): its jobs may read it in
+    /// place, so it is kept, untouched, until [`Encoder::finish`] (or the
+    /// context's drop, which joins the workers first) is done with it.
+    held: Vec<u8>,
     /// The frame header (or legacy magic) has been written.
     started: bool,
     /// Output scratch, reused.
@@ -296,7 +301,8 @@ impl Drop for Encoder {
     fn drop(&mut self) {
         // SAFETY: cctx came from LZ4F_createCompressionContext and cdict
         // from LZ4F_createCDict; each is freed exactly once, here (freeing
-        // the context also joins its worker threads).
+        // the context also joins its worker threads, before `held`, which
+        // they may read, is dropped with the fields after this).
         unsafe {
             LZ4F_freeCompressionContext(self.cctx.as_ptr());
             if let Some(d) = self.cdict {
@@ -332,6 +338,7 @@ impl Encoder {
                 flush_each_update: o.flush_each_update,
             },
             pending: Vec::new(),
+            held: Vec::new(),
             started: false,
             scratch: Vec::new(),
         };
@@ -426,6 +433,12 @@ impl Encoder {
         };
         self.pending = pending;
         self.pending.clear();
+        // A completed `end` has waited for every job: the stable input is
+        // free. After a failure it stays until the drop (workers joined
+        // first, as `Drop::drop` runs before the fields are dropped).
+        if r.is_ok() {
+            self.held = Vec::new();
+        }
         self.started = false;
         r
     }
@@ -440,8 +453,15 @@ impl Encoder {
     /// appear changes (probe, 1.11.0: `lz4 -vvvv --single-thread -B4` over
     /// 9 MiB + 123 refreshes at 9 MiB with the last update's blocks
     /// counted, `-B7` without its last, still buffered, block).
+    ///
+    /// `stable` hands that update to liblz4 as `LZ4F_srcStableUntilFlush`,
+    /// as lz4 does for a memory-mapped file: its workers read it in place
+    /// instead of a copy, so less is back by the time this returns (probe,
+    /// 1.11.0: `lz4 -vvvv -T1 -B4` over 2.5 MB refreshes `0.00%`,
+    /// `--no-mmap` `27.71%`, the copy's figure). The bytes do not change
+    /// (liblz4's own guarantee, and Task 3's re-probe).
     #[doc(hidden)]
-    pub fn end_of_input(&mut self, out: &mut Vec<u8>) -> Result<(), Lz4Error> {
+    pub fn end_of_input(&mut self, out: &mut Vec<u8>, stable: bool) -> Result<(), Lz4Error> {
         if self.settings.legacy
             || self.plain
             || (!self.started && self.pending.len() < self.settings.block_size.bytes())
@@ -452,11 +472,17 @@ impl Encoder {
             self.begin(out)?;
         }
         let pending = std::mem::take(&mut self.pending);
-        let r = if pending.is_empty() {
-            Ok(())
-        } else {
-            self.compress_update(&pending, out)
-        };
+        if pending.is_empty() {
+            self.pending = pending;
+            return Ok(());
+        }
+        if stable {
+            // Moving the Vec keeps its heap buffer where it is.
+            let r = self.compress_update_with(&pending, out, true);
+            self.held = pending;
+            return r;
+        }
+        let r = self.compress_update(&pending, out);
         self.pending = pending;
         self.pending.clear();
         r
@@ -505,8 +531,24 @@ impl Encoder {
         Ok(())
     }
 
-    /// `LZ4F_compressUpdate` on the context.
+    /// `LZ4F_compressUpdate` on the context, the source unstable (liblz4
+    /// copies what it keeps).
     fn compress_update(&mut self, src: &[u8], out: &mut Vec<u8>) -> Result<(), Lz4Error> {
+        self.compress_update_with(src, out, false)
+    }
+
+    /// `LZ4F_compressUpdate`; `stable`: `src` stays as it is until the
+    /// frame ends (`LZ4F_srcStableUntilFlush`, the caller's promise:
+    /// [`Encoder::end_of_input`] keeps it in `held`).
+    fn compress_update_with(
+        &mut self,
+        src: &[u8],
+        out: &mut Vec<u8>,
+        stable: bool,
+    ) -> Result<(), Lz4Error> {
+        // LZ4F_compressOptions_t: stableSrc, uncompressed, reserved1,
+        // reserved0 (lz4frame.h 1.11.0); 2 = LZ4F_srcStableUntilFlush.
+        let options: [c_uint; 4] = [if stable { 2 } else { 0 }, 0, 0, 0];
         let prefs = preferences(&self.settings, 0);
         // SAFETY: prefs is a valid preferences struct for the call.
         let bound = unsafe { LZ4F_compressBound(src.len(), &prefs) };
@@ -514,8 +556,10 @@ impl Encoder {
         // SAFETY: cctx is live and begun; scratch has
         // LZ4F_compressBound(src.len()) bytes, which guarantees success
         // (with workers too: completed jobs that do not fit are deferred);
-        // src is live; NULL options are the defaults (src unstable: liblz4
-        // copies what it keeps).
+        // src is live, and with `stable` stays so until the frame ends (the
+        // caller keeps it in `held`, freed only after `LZ4F_compressEnd` or
+        // after the context, which joins its workers, is freed); options
+        // is a valid LZ4F_compressOptions_t (four unsigned).
         let n = check(unsafe {
             LZ4F_compressUpdate(
                 self.cctx.as_ptr(),
@@ -523,7 +567,7 @@ impl Encoder {
                 bound,
                 src.as_ptr(),
                 src.len(),
-                std::ptr::null(),
+                options.as_ptr(),
             )
         })?;
         out.extend_from_slice(&self.scratch[..n]);

@@ -1337,11 +1337,12 @@ fn end_of_input_only_moves_bytes_earlier() {
             for c in input.chunks(o.update_size.unwrap_or(FRAME_CHUNK)) {
                 e.update(c, &mut out).unwrap();
             }
-            e.end_of_input(&mut out).unwrap();
+            e.end_of_input(&mut out, len % 2 == 0).unwrap();
             let early = out.len();
             e.finish(&mut out).unwrap();
             assert!(out == whole, "{flags} {len}");
-            let one_shot = len < o.block_size_id().bytes() && len < o.update_size.unwrap_or(FRAME_CHUNK);
+            let one_shot =
+                len < o.block_size_id().bytes() && len < o.update_size.unwrap_or(FRAME_CHUNK);
             if !o.legacy && one_shot {
                 assert_eq!(early, 0, "{flags} {len}: a one-shot frame waits");
             } else if !o.legacy && len > 0 {

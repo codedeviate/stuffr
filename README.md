@@ -1661,9 +1661,12 @@ included.
   frame, a refresh that both draw shows the same figures (a streamed frame's
   after each update, over everything read and written by then; a legacy
   job's over the input before it; a one-shot frame's over all of it; the
-  pure tier's ratio is of its own bytes). With liblz4's workers the figure is
-  what they had handed back when it was drawn, which varies from run to run
-  in lz4 1.11.0 itself, so it is timing too. While decoding, stuffr
+  pure tier's ratio is of its own bytes), and so does a file of one job (1 MB,
+  or a block when larger) with independent blocks, which both compress on the
+  calling thread. Where liblz4's workers take the frame (more than one job,
+  or linked blocks over a block or more) the figure is what they had handed
+  back when it was drawn, which varies from run to run in lz4 1.11.0 itself,
+  so it is timing too. While decoding, stuffr
   offers one refresh per MiB decoded, while lz4's count and figures vary from
   run to run with its writer thread (probed: the same legacy file drew `14,
   14` or `8, 14` MiB, a `-B4` frame `4, 7, 8`), so those are timing too.
