@@ -95,7 +95,9 @@ jobs:
         # merged into it (that is how `extra` below reaches `compat`), so a
         # `{target: compat, features: c-backed}` entry would have turned the
         # pure `compat` job into a C one. Overwriting `tier` makes it a new
-        # combination instead.
+        # combination instead. Every C entry needs BOTH `tier: c` and
+        # `features`; the fuzz step refuses `features` without `tier: c`,
+        # and the symbol check refuses `tier: c` without the C tier.
         tier: [pure]
         # Extra libFuzzer flags for one target. `compat` gets a per-input
         # timeout: a bzip2 stream of a few dozen bytes decodes to tens of
@@ -184,11 +186,23 @@ jobs:
           EXTRA: ${{ matrix.extra }}
         run: |
           features=${FEATURES:+--features $FEATURES}
+          # An entry with `features` but no `tier: c` is merged into the
+          # pure job of its target (see the matrix comment) and would skip
+          # the check below: refuse it.
+          if [ -n "$FEATURES" ] && [ "$TIER" != c ]; then
+            echo "::error::$TARGET has features '$FEATURES' but tier '$TIER': a C-tier entry needs tier: c"
+            exit 1
+          fi
           if [ "$TIER" = c ]; then
             cargo fuzz build $features "$TARGET"
             bin="fuzz/target/x86_64-unknown-linux-gnu/release/$TARGET"
+            # Defined symbols only, into a file: a `U` reference is no
+            # evidence, and `nm | grep -q` under pipefail would fail a good
+            # build when grep's early exit kills nm with SIGPIPE.
+            syms="$RUNNER_TEMP/$TARGET-symbols"
+            nm --defined-only "$bin" > "$syms"
             for sym in stuffr_BrotliDecoderDecompressStream stuffr_LZ4F_decompress; do
-              if ! nm "$bin" | grep -q "$sym"; then
+              if ! grep -q "$sym" "$syms"; then
                 echo "::error::$TARGET is a C-tier leg but $bin has no $sym: it was built without the C tier (features: '$FEATURES')"
                 exit 1
               fi

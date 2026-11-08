@@ -325,15 +325,16 @@ jobs:
       # otherwise.
       - run: make fuzz-corpus
       # Ruling I: pure tier only. `stuffr-fuzz` depends on `stuffr` (and
-      # `stuffr-core`) with no `c-backed` feature, so this already fuzzes
+      # `stuffr-core`) without its `c-backed` feature, so this already fuzzes
       # the default/pure selection. The two build tiers register different
       # IMPLEMENTATIONS behind the same slot names (see `stuffr-core`'s
       # `testing::CODEC_SLOTS`/`CONTAINER_SLOTS` and the Makefile's own
       # `test`/`test-pure` split for the identical reasoning) — fuzzing
       # `--features c-backed` here too would double this job's time for a
       # second pass over the same surface, not new coverage. The scheduled
-      # deep workflow (`fuzz-deep.yml`) is where that tier would be added
-      # if ever wanted.
+      # deep workflow (`fuzz-deep.yml`) is where that tier runs: since
+      # 0.26.0 its `tier: c` entries fuzz `compat` and `roundtrip` with
+      # `--features c-backed`.
       #
       # Phase 3b: `fuzz/Cargo.toml` also enables `legacy` (`compress`, `lha`,
       # `arj`) alongside `testing`. That is orthogonal to this ruling, not an

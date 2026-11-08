@@ -61,8 +61,8 @@ use std::sync::{Arc, Mutex};
 
 use stuffr_core::testing::{CODEC_SLOTS, CONTAINER_SLOTS, check_error_is_classified};
 use stuffr_core::{
-    Codec, Container, CreateOpts, DecodeOpts, EncodeOpts, EntryMeta, Error, FormatId, OpenOpts,
-    PlainSink, ReaderSource, Source, StreamPolicy,
+    BorrowedSource, Codec, Container, CreateOpts, DecodeOpts, EncodeOpts, EntryMeta, Error,
+    FormatId, OpenOpts, PlainSink, ReaderSource, Source, StreamPolicy,
 };
 
 #[cfg(feature = "c-backed")]
@@ -148,7 +148,9 @@ fn codec_round_trip(codec: &dyn Codec, content: &[u8]) -> Option<Vec<u8>> {
     }
 
     let encoded = cap.into_bytes();
-    let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(encoded.clone())));
+    // Borrowed, so the bytes stay here for the C-tier leg without a copy;
+    // like `ReaderSource`, not seekable and of unknown length.
+    let src: Box<dyn Source + '_> = Box::new(BorrowedSource::new(&encoded[..]));
     let opts = DecodeOpts {
         // Same bound and the same reason as `codec.rs`'s: a pure codec's
         // declared-dictionary pre-flight must not turn every later run into
@@ -172,6 +174,7 @@ fn codec_round_trip(codec: &dyn Codec, content: &[u8]) -> Option<Vec<u8>> {
         }
     };
 
+    drop(decoded);
     assert!(
         got == content,
         "round trip through codec `{id}` did not reproduce its input: wrote {} byte(s), \

@@ -21,6 +21,13 @@
 //! the whole input they must produce the same bytes. On the encoder side
 //! (`roundtrip.rs`) each tier must decode the other's output exactly.
 //!
+//! **What it cannot see:** the rule detects disagreement on bytes both
+//! decoders accepted, not disagreement about acceptance. An input only one
+//! tier accepts is compared up to the other's refusal and no further. The
+//! known example: liblz4 accepts a match of offset 0 and emits whatever its
+//! destination held there (as the lz4 tool does), while `lz4_flex` refuses
+//! the block, so that class is never compared.
+//!
 //! **The C tier is asserted, not assumed** (the 0.26.0 spec's anti-goal: a
 //! C-tier leg that silently builds the pure tier). [`stuffr::lz4_opts::c`]
 //! exists only under `lz4-c`, so the `use` below does not compile without
@@ -36,7 +43,7 @@ use std::sync::Once;
 
 use stuffr::brotli_opts::{self, EncoderParams, Operation, StreamResult};
 use stuffr::lz4_opts::{self, BlockSizeId, DecodeOptions, EncodeOptions};
-use stuffr_core::{DecodeOpts, FormatId, ReaderSource, Source};
+use stuffr_core::{BorrowedSource, DecodeOpts, FormatId, Source};
 
 // Compile-time half of the C-tier assert: this module is liblz4's, present
 // only under `stuffr/lz4-c`.
@@ -227,7 +234,7 @@ pub fn pure_decode(format: Format, input: &[u8]) -> Decoded {
     let codec = stuffr::registry()
         .codec(FormatId::new(format.name()))
         .expect("brotli and lz4 are registered in every build");
-    let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(input.to_vec())));
+    let src: Box<dyn Source + '_> = Box::new(BorrowedSource::new(input));
     let opts = DecodeOpts {
         // `roundtrip.rs`'s and `codec.rs`'s bound, for the same reason.
         memory_limit: Some(64 * 1024 * 1024),
