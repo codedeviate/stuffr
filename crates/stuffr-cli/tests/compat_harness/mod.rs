@@ -402,52 +402,144 @@ pub fn zstd_dir() -> Option<&'static str> {
     }
 }
 
-/// Whether the reference zstd's liblz4 is 1.10.x, so its `--format=lz4` bytes
+/// The input [`zstd_lz4_is_1_11`] compresses: 3 MB of [`text`] (seed 11),
+/// enough for liblz4 1.10.0 and 1.11.0 to part ways at level 1 (probe §2).
+fn zstd_lz4_probe_input() -> Vec<u8> {
+    text(3_000_000, 11)
+}
+
+/// SHA-256 of `zstd -c -q --format=lz4 -1` over [`zstd_lz4_probe_input`]
+/// with liblz4 1.11.0 linked (recorded 2026-11-08 with zstd 1.5.7 built
+/// against the lz4 1.11.0 tarball's static liblz4, as the zstd-reference
+/// action builds it). The same zstd linked to liblz4 1.10.0 writes
+/// [`ZSTD_LZ4_1_10_SHA256`] instead.
+pub const ZSTD_LZ4_1_11_SHA256: &str =
+    "669da1e65b951c279fd09fb9d57086f8baeca9c962f84b8739a8fe641e6c0d9d";
+/// What liblz4 1.10.0 gives for the same command (recorded alongside, for
+/// the self-test and as evidence the probe tells the two apart).
+pub const ZSTD_LZ4_1_10_SHA256: &str =
+    "091aa0b45e7bcd516338d4653e6735e17ac0d3eff66d53da0331c5274a5851b9";
+
+/// `zstd -c -q --format=lz4 <level>` over `data` with `<dir>/zstd`, or
+/// `None` if it failed.
+pub fn zstd_lz4_bytes(dir: &Path, level: &str, data: &[u8]) -> Option<Vec<u8>> {
+    let mut child = spawn(
+        Command::new(dir.join("zstd"))
+            .args(["-c", "-q", "--format=lz4", level])
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )
+    .ok()?;
+    let mut stdin = child.stdin.take()?;
+    let feed = data.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&feed));
+    let out = child.wait_with_output().ok()?;
+    let _ = writer.join();
+    out.status.success().then_some(out.stdout)
+}
+
+/// Whether `<dir>/zstd`'s liblz4 is 1.11.0's: its `--format=lz4 -1` bytes
+/// over [`zstd_lz4_probe_input`] hash to [`ZSTD_LZ4_1_11_SHA256`].
+pub fn zstd_lz4_is_1_11_at(dir: &Path) -> bool {
+    zstd_lz4_bytes(dir, "-1", &zstd_lz4_probe_input())
+        .is_some_and(|b| sha256(&b) == ZSTD_LZ4_1_11_SHA256)
+}
+
+/// Whether the reference zstd's liblz4 is 1.11.0, so its `--format=lz4` bytes
 /// are the ones stuffr promises. `zstd -vV` does not print liblz4's version,
-/// so this probes the one difference that matters: lz4 1.10.0 added a mid-way
-/// level 2 (1.9.x, ubuntu's `liblz4-dev`, treats 2 as 1), so on compressible
-/// text `--format=lz4 -1` and `-2` are the same bytes only on an old liblz4.
+/// so this compares the bytes it writes on a fixed input with liblz4
+/// 1.11.0's, recorded ([`zstd_lz4_is_1_11_at`]): 1.10.0 (and 1.9.x,
+/// ubuntu's `liblz4-dev`) write other bytes at level 1.
 ///
 /// `false` locally is a skip of the `--format=lz4` byte rows with a note;
 /// under `CI` it panics (the rule of [`require_reference`]): the
-/// `zstd-reference` action builds liblz4 1.10.0 statically for this. `false`
+/// `zstd-reference` action builds liblz4 1.11.0 statically for this. `false`
 /// without a reference at all (nothing to compare against).
-pub fn zstd_lz4_is_1_10() -> bool {
+pub fn zstd_lz4_is_1_11() -> bool {
     static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OK.get_or_init(|| {
         let Some(dir) = zstd_dir() else { return false };
-        let data = text(300_000, 7);
-        let at = |level: &str| -> Option<Vec<u8>> {
-            let mut child = spawn(
-                Command::new(Path::new(dir).join("zstd"))
-                    .args(["-c", "-q", "--format=lz4", level])
-                    .env_clear()
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null()),
-            )
-            .ok()?;
-            let mut stdin = child.stdin.take()?;
-            let feed = data.clone();
-            let writer = std::thread::spawn(move || stdin.write_all(&feed));
-            let out = child.wait_with_output().ok()?;
-            let _ = writer.join();
-            out.status.success().then_some(out.stdout)
-        };
-        let ok = matches!((at("-1"), at("-2")), (Some(a), Some(b)) if a != b);
+        let ok = zstd_lz4_is_1_11_at(Path::new(dir));
         if !ok {
             assert!(
                 std::env::var_os("CI").is_none(),
-                "CI is set but the reference zstd's liblz4 is not 1.10.x (`--format=lz4` \
-                 levels 1 and 2 give the same bytes, as liblz4 1.9 does): zstd must be \
-                 linked against liblz4 1.10.0, as the zstd-reference action builds it"
+                "CI is set but the reference zstd's liblz4 is not 1.11.0 (`--format=lz4 -1` \
+                 bytes differ from liblz4 1.11.0's): zstd must be linked against liblz4 \
+                 1.11.0, as the zstd-reference action builds it"
             );
             eprintln!(
-                "skipped: the reference zstd's liblz4 is not 1.10.x (--format=lz4 byte rows)"
+                "skipped: the reference zstd's liblz4 is not 1.11.0 (--format=lz4 byte rows)"
             );
         }
         ok
     })
+}
+
+/// SHA-256 (FIPS 180-4), small and slow, as lowercase hex.
+pub fn sha256(data: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&((data.len() as u64) * 8).to_be_bytes());
+    for block in msg.as_chunks::<64>().0 {
+        let mut w = [0u32; 64];
+        for (i, word) in block.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (x, y) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *x = x.wrapping_add(y);
+        }
+    }
+    h.iter().map(|x| format!("{x:08x}")).collect()
 }
 
 /// Replace the timing fields of zstd's `-vv` completion line, `<name> :
@@ -516,16 +608,16 @@ pub fn strip_bench_help(stdout: &str) -> String {
 
 const LZ4_LINKS: [&str; 3] = ["unlz4", "lz4cat", "lz4c"];
 
-/// Whether `<dir>/lz4`'s `-V` says release 1.10.0 (`*** lz4 v1.10.0 64-bit
+/// Whether `<dir>/lz4`'s `-V` says release 1.11.0 (`*** lz4 v1.11.0 64-bit
 /// multithread, by Yann Collet ***`).
-fn is_lz4_1_10_0(dir: &Path) -> bool {
+fn is_lz4_1_11_0(dir: &Path) -> bool {
     output(
         Command::new(dir.join("lz4"))
             .arg("-V")
             .env_clear()
             .stdin(Stdio::null()),
     )
-    .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("v1.10.0"))
+    .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("v1.11.0"))
 }
 
 /// `lz4` on `PATH`, like a shell's lookup.
@@ -535,10 +627,10 @@ fn lz4_on_path() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// The directory holding lz4 1.10.0's `lz4` and its links `unlz4`, `lz4cat`
+/// The directory holding lz4 1.11.0's `lz4` and its links `unlz4`, `lz4cat`
 /// and `lz4c`.
 ///
-/// Looked up in this order, the first one that [`is_lz4_1_10_0`] accepts
+/// Looked up in this order, the first one that [`is_lz4_1_11_0`] accepts
 /// winning:
 /// 1. `$STUFFR_LZ4_REFERENCE`, the path of an `lz4` (CI builds the release
 ///    tarball there; if the three links are not beside it they are made in a
@@ -549,7 +641,7 @@ fn lz4_on_path() -> Option<PathBuf> {
 /// `None` when there is none: a skip with a note locally, a panic under `CI`
 /// (the rule of [`require_reference`]), so every test that skips on it would
 /// otherwise pass vacuously. Another release is no reference: stuffr
-/// promises 1.10.0's behaviour.
+/// promises 1.11.0's behaviour.
 pub fn lz4_dir() -> Option<&'static str> {
     static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let found = DIR.get_or_init(|| {
@@ -567,7 +659,7 @@ pub fn lz4_dir() -> Option<&'static str> {
             let Some(dir) = dir_with_links_for(&exe, "lz4", &LZ4_LINKS) else {
                 continue;
             };
-            if is_lz4_1_10_0(&dir) {
+            if is_lz4_1_11_0(&dir) {
                 return dir.to_str().map(str::to_owned);
             }
         }
@@ -578,10 +670,10 @@ pub fn lz4_dir() -> Option<&'static str> {
         None => {
             assert!(
                 std::env::var_os("CI").is_none(),
-                "CI is set but there is no lz4 1.10.0 reference \
+                "CI is set but there is no lz4 1.11.0 reference \
                  (looked at $STUFFR_LZ4_REFERENCE, /opt/homebrew/opt/lz4/bin, PATH)"
             );
-            eprintln!("skipped: lz4 1.10.0 not installed");
+            eprintln!("skipped: lz4 1.11.0 not installed");
             None
         }
     }

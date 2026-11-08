@@ -96,6 +96,47 @@ mod unix {
         }
     }
 
+    /// `zstd_lz4_is_1_11` tells a zstd linked to liblz4 1.11.0 from one
+    /// linked to 1.10.0: the recorded digests differ, and each reference
+    /// found on this machine hashes to its own. The reference in use (the
+    /// one `zstd_dir` found) must be the 1.11.0 one under `CI`; the old
+    /// 1.10-linked build is checked when it is here
+    /// (`~/Library/Caches/stuffr-references/zstd-1.5.7/bin/zstd`, or
+    /// `$STUFFR_ZSTD_LZ4_1_10_REFERENCE`).
+    #[test]
+    fn the_lz4_guard_tells_liblz4_1_11_from_1_10() {
+        assert_ne!(ZSTD_LZ4_1_11_SHA256, ZSTD_LZ4_1_10_SHA256);
+        if let Some(dir) = zstd() {
+            let digest =
+                |d: &Path| zstd_lz4_bytes(d, "-1", &text(3_000_000, 11)).map(|b| sha256(&b));
+            let got = digest(Path::new(dir)).unwrap();
+            assert!(
+                got == ZSTD_LZ4_1_11_SHA256 || got == ZSTD_LZ4_1_10_SHA256,
+                "{dir}: {got}"
+            );
+            assert_eq!(
+                zstd_lz4_is_1_11_at(Path::new(dir)),
+                got == ZSTD_LZ4_1_11_SHA256
+            );
+            if std::env::var_os("CI").is_some() {
+                assert!(zstd_lz4_is_1_11(), "{dir}: {got}");
+            }
+        }
+        let old = std::env::var_os("STUFFR_ZSTD_LZ4_1_10_REFERENCE")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| {
+                    Path::new(&h).join("Library/Caches/stuffr-references/zstd-1.5.7/bin/zstd")
+                })
+            });
+        if let Some(old) = old.filter(|p| p.is_file()) {
+            let d = old.parent().unwrap();
+            assert!(!zstd_lz4_is_1_11_at(d), "{}", d.display());
+            let b = zstd_lz4_bytes(d, "-1", &text(3_000_000, 11)).unwrap();
+            assert_eq!(sha256(&b), ZSTD_LZ4_1_10_SHA256, "{}", d.display());
+        }
+    }
+
     #[test]
     fn normalise_hides_only_timing() {
         let a = normalise_zstd_progress(COMPLETED);

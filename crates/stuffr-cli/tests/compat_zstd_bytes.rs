@@ -24,7 +24,7 @@
 //! 0 and `--fast=1`: gzip is compared byte for byte with C zlib (`zlib-c`;
 //! spike S2 measured zlib's deflate and header identical to the
 //! reference's, the OS byte included), xz and lzma with liblzma (`xz-c`,
-//! 5.8.4 on both sides) and lz4 with liblz4 (`lz4-c`, 1.10.0 via
+//! 5.8.4 on both sides) and lz4 with liblz4 (`lz4-c`, 1.11.0 via
 //! `stuffr::lz4_opts`); elsewhere the reference decodes stuffr's output to
 //! the input.
 
@@ -223,7 +223,7 @@ mod bytes {
         inputs.push(("one", b"x".to_vec()));
         inputs.push(("block", text(65_536, 75)));
         inputs.push(("big", text(1_500_000, 76)));
-        let exact_lz4 = EXACT_LZ4 && zstd_lz4_is_1_10();
+        let exact_lz4 = EXACT_LZ4 && zstd_lz4_is_1_11();
         let mut cases = Vec::new();
         for level in [
             "-1", "-2", "-3", "-4", "-9", "-12", "-13", "-19", "--fast=3", "-0",

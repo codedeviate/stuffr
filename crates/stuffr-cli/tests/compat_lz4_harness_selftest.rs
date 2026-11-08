@@ -77,7 +77,7 @@ Done in 0.00 s ==> 20.94 MiB/s  (cpu load : 67%)\n";
     }
 
     #[test]
-    fn reference_is_1_10_0() {
+    fn reference_is_1_11_0() {
         let Some(dir) = lz4() else {
             assert!(
                 std::env::var_os("CI").is_none(),
@@ -91,7 +91,7 @@ Done in 0.00 s ==> 20.94 MiB/s  (cpu load : 67%)\n";
             .output()
             .unwrap();
         let v = String::from_utf8_lossy(&o.stdout).into_owned();
-        assert!(v.contains("v1.10.0"), "{v:?}");
+        assert!(v.contains("v1.11.0"), "{v:?}");
         for link in ["unlz4", "lz4cat", "lz4c"] {
             assert!(Path::new(dir).join(link).exists(), "{dir}/{link}");
         }

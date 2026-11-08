@@ -102,7 +102,7 @@ jobs:
       - uses: ./.github/actions/xz-reference
       # zstd 1.5.7 from the release tarball: the compat_zstd* oracle (see the action).
       - uses: ./.github/actions/zstd-reference
-      # lz4 1.10.0 from the release tarball: the compat_lz4* oracle (see the action).
+      # lz4 1.11.0 from the release tarball: the compat_lz4* oracle (see the action).
       - uses: ./.github/actions/lz4-reference
       - uses: ./.github/actions/brotli-reference
       - run: sudo apt-get update && sudo apt-get install -y lzip cpio zip unzip ncompress lhasa
@@ -152,7 +152,7 @@ jobs:
       - uses: ./.github/actions/xz-reference
       # zstd 1.5.7 from the release tarball: the compat_zstd* oracle (see the action).
       - uses: ./.github/actions/zstd-reference
-      # lz4 1.10.0 from the release tarball: the compat_lz4* oracle (see the action).
+      # lz4 1.11.0 from the release tarball: the compat_lz4* oracle (see the action).
       - uses: ./.github/actions/lz4-reference
       - uses: ./.github/actions/brotli-reference
       - run: sudo apt-get update && sudo apt-get install -y lzip cpio zip unzip ncompress lhasa
@@ -220,7 +220,7 @@ jobs:
       - uses: ./.github/actions/xz-reference
       # zstd 1.5.7 from the release tarball: the compat_zstd* oracle (see the action).
       - uses: ./.github/actions/zstd-reference
-      # lz4 1.10.0 from the release tarball: the compat_lz4* oracle (see the action).
+      # lz4 1.11.0 from the release tarball: the compat_lz4* oracle (see the action).
       - uses: ./.github/actions/lz4-reference
       - uses: ./.github/actions/brotli-reference
       - run: sudo apt-get update && sudo apt-get install -y lzip cpio zip unzip ncompress lhasa
@@ -522,7 +522,7 @@ jobs:
       - uses: ./.github/actions/xz-reference
       # zstd 1.5.7 from the release tarball: the compat_zstd* oracle (see the action).
       - uses: ./.github/actions/zstd-reference
-      # lz4 1.10.0 from the release tarball: the compat_lz4* oracle (see the action).
+      # lz4 1.11.0 from the release tarball: the compat_lz4* oracle (see the action).
       - uses: ./.github/actions/lz4-reference
       - uses: ./.github/actions/brotli-reference
       # Which releases this run compares against: the logs said neither.
