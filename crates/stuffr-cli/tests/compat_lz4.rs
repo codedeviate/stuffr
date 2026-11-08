@@ -1,4 +1,4 @@
-//! The lz4 compatibility family against lz4 1.10.0: stuffr invoked as `lz4`,
+//! The lz4 compatibility family against lz4 1.11.0: stuffr invoked as `lz4`,
 //! `unlz4`, `lz4cat` and `lz4c`, compared with the reference (stdout,
 //! stderr, exit code, the file tree) through `compat_harness`, every case
 //! under `LC_ALL=C`.

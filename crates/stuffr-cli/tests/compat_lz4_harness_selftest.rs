@@ -2,7 +2,7 @@
 //! must notice each single kind of difference and name it, the progress
 //! normaliser must hide deviation 2's fields (timing, refreshes, thread
 //! count) and nothing else, and the reference lookup must accept only
-//! lz4 1.10.0.
+//! lz4 1.11.0.
 //!
 //! Every run here is REFERENCE-shaped: stuffr is not run as `lz4` (the
 //! binary answers to that name from Task 3 on), so the sensitivity tests

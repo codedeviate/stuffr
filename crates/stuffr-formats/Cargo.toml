@@ -163,8 +163,13 @@ stuffr-core = { workspace = true, features = ["testing"] }
 # see that module's doc and `compress`'s comment above. Not a decoder this
 # build ships.
 newtua-lzw-z = { workspace = true }
+
 # A second, unprefixed liblz4 (1.10.0, `lz4-sys`'s own `cc` build) linked into
 # the same test binary as the vendored one (`tests/lz4_coexistence.rs`): the
 # proof that a downstream graph holding both links and calls each. A
-# dev-dependency only, so it never reaches a consumer's graph.
+# dev-dependency only, so it never reaches a consumer's graph. Unix only: a
+# dev-dependency cannot be feature-gated, so it is built for every test build,
+# and this keeps the Windows test build (checked from macOS without a C
+# cross-compiler) free of C, as it was before 0.26.0.
+[target.'cfg(unix)'.dev-dependencies]
 lz4-sys = "=1.11.1"

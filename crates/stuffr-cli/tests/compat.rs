@@ -559,7 +559,7 @@ mod unix {
         assert_eq!(std::fs::read_dir(&s.0).unwrap().count(), 34);
         let dir = s.0.canonicalize().unwrap();
         let banner = format!(
-            "*** lz4 v1.10.0 64-bit multithread (stuffr {}), by Yann Collet ***\n",
+            "*** lz4 v1.11.0 64-bit multithread (stuffr {}), by Yann Collet ***\n",
             env!("CARGO_PKG_VERSION")
         );
         for n in ["lz4", "unlz4", "lz4cat", "lz4c"] {

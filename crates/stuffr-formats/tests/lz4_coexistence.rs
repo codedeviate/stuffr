@@ -3,7 +3,7 @@
 //! (1.10.0, a dev-dependency only). Both must link, and each call must
 //! reach its own library — the situation of a downstream graph that holds
 //! `stuffr` and the `lz4` crate.
-#![cfg(feature = "lz4-c")]
+#![cfg(all(unix, feature = "lz4-c"))]
 
 use stuffr_formats::lz4_opts::{EncodeOptions, LEGACY_MAGIC, LegacyDecoder, liblz4_version};
 

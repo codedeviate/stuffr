@@ -1,5 +1,5 @@
 //! lz4's compressed bytes, case by case: stuffr as `lz4` and `lz4c` against
-//! lz4 1.10.0, over the spec's byte-identity catalogue.
+//! lz4 1.11.0, over the spec's byte-identity catalogue.
 //!
 //! On the C tier (`lz4-c`) every output is compared byte for byte. On the
 //! pure tier the same cases run with `compare_output_bytes: false`: the

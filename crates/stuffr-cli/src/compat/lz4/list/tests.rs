@@ -356,8 +356,9 @@ fn a_header_alone_is_not_a_frame() {
     s.end = false;
     let mut f = s.bytes();
     assert_eq!(stop_of(&f), Some(Stop::NotRecognized));
+    // One byte more each round, each length checked on its own.
     for _ in 0..3 {
-        f.push(b'z');
+        f.extend_from_slice(b"z");
         assert_eq!(stop_of(&f), Some(Stop::NotRecognized));
     }
     // The same after a whole frame.
