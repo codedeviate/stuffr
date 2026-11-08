@@ -1719,11 +1719,16 @@ benchmark lines included.
   fault inside a frame loses what follows the last whole piece, and a frame
   followed by bytes that are no frame leaves nothing or the whole frame, run
   to run. stuffr's output is never shorter than lz4's on the C tier.
-- **`Error 53`** (lz4 1.11.0: the source shrank while it was mapped) **is
-  never produced**: stuffr reads its inputs and never maps them; a source cut
-  short while it is compressed is seen by its size and answered as lz4
-  answers a change it sees (`Error 54`, or the `file modified during
-  processing` warning).
+- **A source changed while it is compressed is judged by reading, not by
+  mapping.** stuffr never maps its inputs; it follows lz4's answers from what
+  it reads and the file's size and times: on Linux a source cut short is
+  `Error 53` and bytes already compressed rewritten in place are `Error 54`,
+  as lz4 says there; on macOS lz4 says `Error 54` or the `file modified
+  during processing` warning, and so does stuffr. After `Error 53` the
+  output left behind holds what stuffr compressed, which differs in length
+  from lz4's (lz4's depends on its threads' timing). A rewrite within the
+  same second as the open, which changes no size or time stuffr can see,
+  is not noticed.
 - **`--list` of a regular file that cannot be opened** (mode 000) aborts lz4
   on an assertion (exit 134); stuffr prints `NAME: Permission denied` and
   exits 1.

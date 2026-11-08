@@ -120,11 +120,16 @@
 //!    frame it leaves nothing or the whole frame, run to run (0 or 10090
 //!    bytes of a small one). lz4 1.10.0 left nothing or everything, run to
 //!    run. stuffr's output is never shorter than lz4's on the C tier.
-//! 8. `Error 53` (lz4 1.11.0: the source file shrank while it was mapped,
-//!    met as a bus error) is never produced: stuffr reads its inputs and
-//!    never maps them. A source cut short while it is compressed is seen
-//!    by its size and answered as lz4 answers a change it sees, `Error 54`
-//!    or the `file modified during processing` warning.
+//! 8. A source changed while it is compressed is judged by reading, not by
+//!    mapping. stuffr never maps its inputs; it follows lz4's answers from
+//!    what it reads and the file's size and times: on Linux a source cut
+//!    short is `Error 53` and bytes already compressed rewritten in place
+//!    are `Error 54`, as lz4 says there; on macOS lz4 says `Error 54` or the
+//!    `file modified during processing` warning, and so does stuffr. After
+//!    `Error 53` the output left behind holds what stuffr compressed, which
+//!    differs in length from lz4's (lz4's depends on its threads' timing). A
+//!    rewrite within the same second as the open, which changes no size or
+//!    time stuffr can see, is not noticed.
 //! 9. `--list` of a regular file that cannot be opened (mode 000): lz4
 //!    aborts on an assertion (exit 134); stuffr names the error
 //!    (`NAME: Permission denied`) and exits 1.
