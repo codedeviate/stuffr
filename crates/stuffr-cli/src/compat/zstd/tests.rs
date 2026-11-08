@@ -233,3 +233,86 @@ fn sandboxed_training_is_bounded() {
         assert_eq!((code, err.as_str()), (1, "training mode not available \n"));
     }
 }
+
+/// T7-1: `zstd --ultra -22 -c` (window log 27, two workers) asked libzstd
+/// for 2.5 GiB in the sandbox, past libFuzzer's 2048 MB; the sandbox now
+/// holds the window, hash and chain logs at 20. The frame's window says so,
+/// and a child process running only that compression peaks far below.
+#[cfg(all(feature = "zstd-c", any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn sandboxed_ultra_compression_is_bounded() {
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "compat::zstd::tests::ultra_compression_child",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&child.stdout);
+    assert!(
+        child.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let peak: u64 = stdout
+        .lines()
+        .find_map(|l| l.split_once("ultra-peak-rss ").map(|(_, v)| v))
+        .and_then(|v| v.split_whitespace().next()?.parse().ok())
+        .unwrap_or_else(|| panic!("the child printed no peak: {stdout}"));
+    assert!(peak < 256 << 20, "peak resident memory {peak} bytes");
+}
+
+/// The child of [`sandboxed_ultra_compression_is_bounded`]: one sandboxed
+/// `zstd --ultra -22 -c` of 64 KiB (the fuzz input cap) on standard input,
+/// then the process's peak resident memory.
+#[cfg(all(feature = "zstd-c", any(target_os = "macos", target_os = "linux")))]
+#[test]
+#[ignore = "run by sandboxed_ultra_compression_is_bounded in its own process"]
+fn ultra_compression_child() {
+    let d = Dir::new("ultra");
+    let input: Vec<u8> = (0..64u32 << 10)
+        .map(|k| {
+            b"the quick brown fox 0123456789\n"[(k.wrapping_mul(2_654_435_761) >> 16) as usize % 31]
+        })
+        .collect();
+    let args: Vec<OsString> = ["--ultra", "-22", "-c"]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    let (code, out, err, _) = run_in_counted(&d.0, "zstd", &args, &input, &|_| None);
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+    match stuffr::zstd_opts::frame_header(&out) {
+        Ok(stuffr::zstd_opts::FrameHeader::Zstd { window_size, .. }) => {
+            assert!(window_size <= 1 << 20, "window {window_size}");
+        }
+        other => panic!("not a zstd frame: {other:?}"),
+    }
+    println!("ultra-peak-rss {}", peak_rss_bytes());
+}
+
+/// This process's peak resident memory: `ru_maxrss` (bytes) on macOS,
+/// `VmHWM` on Linux (`ru_maxrss` there carries a parent's peak across
+/// exec, as `bench/memory.rs` found).
+#[cfg(all(feature = "zstd-c", any(target_os = "macos", target_os = "linux")))]
+fn peak_rss_bytes() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let kib: u64 = status
+            .lines()
+            .find_map(|l| l.strip_prefix("VmHWM:"))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+            .unwrap();
+        kib * 1024
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: getrusage fills the zeroed struct it is given.
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) }, 0);
+        ru.ru_maxrss as u64
+    }
+}

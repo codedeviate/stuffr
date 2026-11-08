@@ -197,7 +197,10 @@ pub fn run(name: &'static str, argv0: &OsStr, args: Vec<OsString>) -> ExitCode {
 /// R9's input-independent bounds hold whatever the arguments say: the
 /// decoder's window log is at most 24 (16 MiB; a lower `--memory` or
 /// `--long` stands), `--train*` loads at most 256 KiB of samples with at
-/// most 4 optimiser steps, and compression runs at most 2 workers; xz and
+/// most 4 optimiser steps, and compression runs at most 2 workers with its
+/// window, hash and chain logs (and a given LDM hash log) at most 20 (T7-1:
+/// `--ultra -22` asked libzstd for 2.5 GiB; 2^20 is 16 times the fuzz
+/// input cap, so only the window descriptor and the matches change); xz and
 /// lzma frames decode under a 256 MiB memory limit and compress at preset
 /// 6 at most (`formats.rs`). Standard output and output files share the [`SANDBOX_OUTPUT_CAP`]
 /// budget. No signal handler is installed. For the fuzz target; not a

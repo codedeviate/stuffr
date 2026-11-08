@@ -293,6 +293,12 @@ pub(crate) struct Limits {
     pub train_steps: u32,
     /// Compression workers.
     pub workers: i32,
+    /// T7-1 (0.26.0): the compression window, hash and chain logs, and an
+    /// explicit LDM hash log, at most this (`None`: as resolved). libzstd's
+    /// C tier sizes its tables and buffers from them, so `--ultra -22` with
+    /// two workers asked for 2.5 GiB in the sandbox; the pure tier ignores
+    /// them.
+    pub max_compress_log: Option<u32>,
 }
 
 impl Limits {
@@ -302,6 +308,7 @@ impl Limits {
         train_bytes: 256 << 10,
         train_steps: 4,
         workers: 2,
+        max_compress_log: Some(20),
     };
 }
 
