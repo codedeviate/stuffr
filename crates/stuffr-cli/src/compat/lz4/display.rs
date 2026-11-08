@@ -337,8 +337,9 @@ impl Run<'_> {
     /// - compressing: the thread lines ([`threads_lines`]), then the legacy
     ///   notice for `-l` (level 3);
     /// - display level 4, decoding: the standard output note, when the
-    ///   output is standard output or there are `-m` operands (the note is
-    ///   printed though they write files: `lz4 -vv -d -m a.lz4` says it).
+    ///   output is standard output, the `-m` operands' included (1.11.0:
+    ///   `lz4 -vv -dc -m b.lz4` says it, `lz4 -vv -d -m b.lz4`, `-t -m` and
+    ///   `x null -m -d` do not; 1.10.0 said it for any `-m` operands).
     ///
     /// `names` is the expanded list of a run with `-m` operands.
     pub(super) fn announce_run(&mut self, plan: &Plan, names: &[Vec<u8>]) {
@@ -352,7 +353,11 @@ impl Run<'_> {
             if self.cmd.opts.legacy {
                 self.say(3, m::GENERATING_LEGACY, &[]);
             }
-        } else if plan.target == Target::Stdout || self.cmd.from_list {
+        } else if plan.target == Target::Stdout
+            || (self.cmd.from_list
+                && plan.op == super::cli::Op::Decompress
+                && self.cmd.output == super::cli::Output::Stdout)
+        {
             self.stdout_note();
         }
     }

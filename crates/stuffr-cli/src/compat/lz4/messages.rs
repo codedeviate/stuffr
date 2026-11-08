@@ -315,11 +315,14 @@ pub(super) const NOT_OVERWRITTEN: &str = "    not overwritten  \n";
 /// level.
 pub(super) const ALREADY_EXISTS: &str = "%s already exists; not overwritten  \n";
 
-/// Spec deviation 3 (stuffr's own text, in lz4's words): an output that is
-/// the input file itself is refused, so the input is never lost (lz4
-/// truncates it first: probe `lz4 -f a a` leaves an empty frame). Printed
-/// at every level, as [`ALREADY_EXISTS`] is.
-pub(super) const SAME_FILE: &str = "%s is the input file; not overwritten (stuffr)  \n";
+/// probe (1.11.0): `lz4 -f a a`, `lz4 a a`, `lz4 -df b.lz4 b.lz4`, a hard
+/// link or a symbolic link as the output (`lz4 -df b.lz4 h.lz4`, `lz4 -f a
+/// sa`), `lz4 -d -m y.lz4` with `y` a link to `y.lz4`: the output's name as
+/// given, display level 1 (`-q` shows it, `-qq` hides it), whatever `-f`
+/// says, asked before the overwrite question; that input fails (exit 1).
+/// 1.10.0 truncated the input instead (deviation 3, now only for standard
+/// input redirected from the output file).
+pub(super) const SAME_FILE: &str = "%s: input and output are the same file; not overwritten \n";
 
 // ---- progress and summaries (display level 2; stderr not a terminal) ----
 
@@ -417,7 +420,9 @@ pub(super) const E42_SKIPPABLE_SIZE: &str =
     "Error 42 : Stream error : skippable size unreadable \n";
 
 /// probe: `cat skip_trunc.lz4 | lz4 -dc` (on a pipe the area is read, and it
-/// ends early; a file is seeked past its end instead, silently).
+/// ends early); lz4 1.11.0 also from a file whose skippable area runs past
+/// its end (`lz4 -t skip_trunc.lz4`, `skip_4g.lz4`; 1.10.0 seeked past the
+/// end silently).
 pub(super) const E43_SKIP: &str = "Error 43 : Stream error : cannot skip skippable area \n";
 
 /// probe: `lz4 -d unk_hdr.lz4`.
@@ -436,9 +441,22 @@ pub(super) const E61_LEGACY_SIZE: &str =
 pub(super) const E63_LEGACY_BLOCK: &str =
     "Error 63 : Read error : cannot access compressed block ! \n";
 
-/// probe: `lz4 -t leg_bad.lz4`, `lz4 -t legzero.lz4`.
+/// probe: `lz4 -t leg_bad.lz4`; a mozlz4 block that does not decode within
+/// its declared size (1.11.0: `lz4 -t small.mozlz4`, `cut100.mozlz4`,
+/// `two.mozlz4`). (1.10.0 also said it for `legzero.lz4`, which 1.11.0
+/// reads as an empty legacy frame.)
 pub(super) const E64_LEGACY_DECODE: &str =
     "Error 64 : Decoding Failed ! Corrupted input detected ! \n";
+
+/// probe (1.11.0): `lz4 -t hdr9.mozlz4`, the mozlz4 magic then fewer than four
+/// bytes (`-dcf` too: no pass-through).
+pub(super) const E62_MOZLZ4_SIZE: &str =
+    "Error 62 : Error: cannot read decompressed size in mozlz4 format \n";
+
+/// probe (1.11.0): `lz4 -t ffff.mozlz4`, `v7e000001.mozlz4`: a declared size
+/// past `0x7E000000`, as `%u`.
+pub(super) const E62_MOZLZ4_TOO_LARGE: &str =
+    "Error 62 : Error: mozlz4 decompressed size too large (%d) \n";
 
 /// probe: `lz4 --sparse -dc z.lz4 | cat` (all zeros, so only the final
 /// skip, which a pipe refuses). The blank line is lz4's.
@@ -604,7 +622,10 @@ pub(super) const LIST_ENTRY: &str = "%d %s\n";
 
 /// probe: `lz4 -v a`, `lz4 -v -d -m b.lz4` (display level 3): after the
 /// last input of a compression (always), of a decode that has `-m`
-/// operands, or of a single decode where the input failed. The seconds
+/// operands, or (1.11.0) of a single decode that succeeded (`lz4 -v -t
+/// b.lz4`; not after `lz4 -v -d nosuch.lz4 o`, a declined overwrite, a
+/// same-file refusal or undecodable trailing data; 1.10.0 said it exactly
+/// there instead). The seconds
 /// and the speed are `%.2f`, the load `%.0f` (deviation 2: the harness
 /// normalises all three).
 pub(super) const DONE_IN: &str = "Done in %s s ==> %s MiB/s  (cpu load : %s%%)\n";
@@ -613,6 +634,17 @@ pub(super) const DONE_IN: &str = "Done in %s s ==> %s MiB/s  (cpu load : %s%%)\n
 /// magic number was read; said for each such frame, before its first
 /// refresh (not by `--list`).
 pub(super) const LEGACY_DETECTED: &str = "Detected : Legacy format \n";
+
+/// probe (1.11.0): `lz4 -vv -t good.jsonlz4` (display level 4, decoding):
+/// the mozlz4 magic was read whole, before the size word is.
+pub(super) const MOZLZ4_DETECTED: &str = "Detected : mozlz4 format \n";
+
+/// probe (1.11.0): `lz4 -qqq -r d`, `--list -r d`, `-d -r d` with `d/lnk` a
+/// link to a directory: at every display level, as the walk meets it
+/// (readdir order), before `-vvvv`'s list; no trailing blank. The link is
+/// not followed (1.10.0 followed it); one named as an operand still is.
+pub(super) const RECURSIVE_DIR_LINK: &str =
+    "Warning : %s is a symbolic link to a directory, ignoring\n";
 
 /// probe: `lz4 -vv -t skip_then_frame.lz4` (display level 4, decoding):
 /// a skippable frame's magic number was read, before its size is.

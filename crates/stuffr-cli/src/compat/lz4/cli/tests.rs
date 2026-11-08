@@ -1077,14 +1077,20 @@ fn where_each_input_of_a_list_goes() {
     assert_eq!(t(&["-m", "b.lz4", "x.lz4"], "x.lz4"), Some(tf("x")));
     assert_eq!(t(&["-m", "-d", ".lz4"], ".lz4"), None);
     assert_eq!(t(&["-m", "-c", "-d", "a"], "a"), Some(Target::Stdout));
+    // lz4 1.11.0 discards these (1.10.0 wrote them to standard output).
     assert_eq!(
         t(&["a", "null", "-m", "-d", "b.lz4"], "b.lz4"),
+        Some(Target::Null)
+    );
+    assert_eq!(t(&["-m", "-t", "b.lz4"], "b.lz4"), Some(Target::Null));
+    assert_eq!(t(&["-m", "-z", "-t", "a"], "a"), Some(Target::Null));
+    let cat = ok_as("lz4cat", &["-t", "b.lz4"]);
+    assert_eq!(list_target(&cat, Op::Test, b"b.lz4"), Some(Target::Null));
+    let cat = ok_as("lz4cat", &["b.lz4"]);
+    assert_eq!(
+        list_target(&cat, Op::Decompress, b"b.lz4"),
         Some(Target::Stdout)
     );
-    assert_eq!(t(&["-m", "-t", "b.lz4"], "b.lz4"), Some(Target::Stdout));
-    assert_eq!(t(&["-m", "-z", "-t", "a"], "a"), Some(Target::Stdout));
-    let cat = ok_as("lz4cat", &["-t", "b.lz4"]);
-    assert_eq!(list_target(&cat, Op::Test, b"b.lz4"), Some(Target::Stdout));
 }
 
 #[test]

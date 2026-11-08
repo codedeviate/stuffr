@@ -192,9 +192,15 @@ pub fn run(name: &'static str, argv0: &OsStr, args: Vec<OsString>) -> ExitCode {
 /// 0.26.0 (lz4 1.11.0, Task 4): a write error while compressing is `Error
 /// 46` where 1.10.0 said `Error 38` (38 is gone), and a source file changed
 /// while it was compressed can be `Error 54` (probed 2026-11-08).
+///
+/// 0.26.0 Task 5 added 62: a mozlz4 header cut inside its size word, or
+/// declaring more than `0x7E000000` bytes (`Error 62 : Error: cannot read
+/// decompressed size in mozlz4 format`, `... too large (N)`; probed
+/// 2026-11-08). 50 stays for a named input `--rm` cannot remove (standard
+/// input is no longer removed by its name).
 #[doc(hidden)]
-pub const EXIT_CODES: [i32; 20] = [
-    0, 1, 26, 27, 34, 40, 42, 43, 44, 46, 50, 54, 61, 63, 64, 69, 70, 71, 72, 74,
+pub const EXIT_CODES: [i32; 21] = [
+    0, 1, 26, 27, 34, 40, 42, 43, 44, 46, 50, 54, 61, 62, 63, 64, 69, 70, 71, 72, 74,
 ];
 
 /// [`run`] without the process: operands resolve against `dir`, standard
@@ -454,14 +460,64 @@ mod tests {
         assert_eq!((code, out.as_slice()), (0, &b"AAAAAAAA"[..]));
     }
 
-    /// Spec deviation 3 in the sandbox: an output that is the input is
-    /// refused and the input kept.
+    /// mozlz4 in the sandbox (the fuzz target's path): a good stream
+    /// decodes, and every hostile header ends with lz4's code, never a
+    /// panic nor an unclassified exit.
+    #[test]
+    fn mozlz4_decodes_in_the_sandbox() {
+        let plain = b"mozlz4 mozlz4 mozlz4 mozlz4 mozlz4\n".repeat(40);
+        let d = Scratch::new(&[("a", &plain)]);
+        assert_eq!(d.run("lz4", &["-q", "-l", "a", "l.lz4"], b"").0, 0);
+        let l = std::fs::read(d.0.join("l.lz4")).unwrap();
+        let block = &l[8..];
+        let moz = |size: u32, body: &[u8]| [&b"mozLz40\0"[..], &size.to_le_bytes(), body].concat();
+        let n = plain.len() as u32;
+        let (code, out, err, _) = d.run("lz4", &["-dc"], &moz(n, block));
+        assert_eq!((code, out.as_slice(), err.len()), (0, &plain[..], 0));
+        let good = moz(n, block);
+        let mut hostile: Vec<(Vec<u8>, i32)> = vec![
+            (moz(n - 1, block), 64),
+            (moz(u32::MAX, block), 62),
+            (moz(0x7E00_0000, &[0x1f, b'a', 1, 0, 0xff, 0xff]), 64),
+            ([&good[..], b"AAAA"].concat(), 64),
+            (b"mozLz41\0".to_vec(), 44),
+        ];
+        for k in 1..12 {
+            let code = match k {
+                1..=3 => 40,
+                4..=7 => 44,
+                _ => 62,
+            };
+            hostile.push((good[..k].to_vec(), code));
+        }
+        for (input, want) in hostile {
+            let (code, out, _, _) = d.run("lz4", &["-dc"], &input);
+            assert_eq!((code, out.len()), (want, 0), "{input:?}");
+            assert!(EXIT_CODES.contains(&code));
+        }
+        // A block cut anywhere: decoded (a cut can end exactly after a
+        // sequence's literals, which liblz4 accepts as the last) or `Error
+        // 64` with nothing written; the differential compares which.
+        for k in 12..good.len() {
+            let (code, out, _, _) = d.run("lz4", &["-dc"], &good[..k]);
+            assert!(
+                code == 0 || (code == 64 && out.is_empty()),
+                "cut at {k}: {code}"
+            );
+        }
+    }
+
+    /// lz4 1.11.0's same-file refusal in the sandbox: an output that is the
+    /// input is refused and the input kept.
     #[test]
     fn an_output_that_is_the_input_is_refused() {
         let d = Scratch::new(&[("a", b"keep me")]);
         let (code, _, err, _) = d.run("lz4", &["-f", "a", "a"], b"");
         assert_eq!(code, 1);
-        assert_eq!(err, b"a is the input file; not overwritten (stuffr)  \n");
+        assert_eq!(
+            err,
+            b"a: input and output are the same file; not overwritten \n"
+        );
         assert_eq!(std::fs::read(d.0.join("a")).unwrap(), b"keep me");
     }
 }

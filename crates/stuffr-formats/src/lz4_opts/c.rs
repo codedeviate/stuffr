@@ -717,11 +717,16 @@ fn legacy_acceleration(level: i32) -> c_int {
     }
 }
 
-/// One legacy block through `LZ4_decompress_safe`: the decoded length, or
-/// [`Lz4fError::DecompressionFailed`].
+/// One legacy or mozlz4 block through `LZ4_decompress_safe`: the decoded
+/// length, or [`Lz4fError::DecompressionFailed`].
 pub(super) fn legacy_block_decode(src: &[u8], dst: &mut [u8]) -> Result<usize, Lz4Error> {
-    // SAFETY: src and dst are live slices of the lengths passed (src ≤
-    // LZ4_COMPRESSBOUND(8 MiB), dst = 8 MiB, both within c_int);
+    if c_int::try_from(src.len()).is_err() || c_int::try_from(dst.len()).is_err() {
+        return Err(Lz4Error::Lib(Lz4fError::DecompressionFailed));
+    }
+    // SAFETY: src and dst are live slices of the lengths passed, both
+    // within c_int (checked above; the callers keep src to
+    // LZ4_COMPRESSBOUND(8 MiB) for a legacy block and to
+    // `mozlz4_block_bound(MOZLZ4_SIZE_MAX)` for a mozlz4 one);
     // LZ4_decompress_safe never reads or writes past them.
     let n = unsafe {
         LZ4_decompress_safe(

@@ -1,11 +1,13 @@
 //! Compressing, decompressing and testing over files and streams: every
 //! rule of what is opened, in which order, what is asked, what is kept and
 //! what the run's exit code becomes. The stream decoder itself (the magic
-//! numbers, legacy and skippable frames, trailing data) is in `decode.rs`.
+//! numbers, legacy and skippable frames, mozlz4, trailing data) is in
+//! `decode.rs`.
 //!
 //! **Clean room.** Every rule here was recovered from the man page
 //! (`lz4.1`), `lz4 -H` and probes of the 1.10.0 binary (Task 2's and Task
-//! 4's tables in `.claude/rules/compat.md`, "lz4 1.10.0 probes"); lz4's
+//! 4's tables in `.claude/rules/compat.md`, "lz4 1.10.0 probes"), then of
+//! the 1.11.0 one (the 2026-11-08 probe, 0.26.0 Tasks 4 and 5); lz4's
 //! `programs/` was never read. Each rule names its probe.
 //!
 //! The rules, in short (all probed):
@@ -16,25 +18,28 @@
 //!   anything else is opened.
 //! - **Outputs** are written directly under their names, with no temporary
 //!   file; an interrupt kills the run (no handler, ruling T2-a) and leaves
-//!   the partial output, as lz4 does. A finished file output gets the
-//!   input's modification time and permission bits (and owner where
-//!   allowed); its access time is the run's.
+//!   the partial output, as lz4 does. An output of a named regular file is
+//!   created 0600, and once its input succeeded it gets the input's
+//!   modification time and permission bits (and owner where allowed); its
+//!   access time is the run's. A failed one stays 0600 with the run's time;
+//!   one from standard input is created 0666 less the umask and keeps the
+//!   run's time ([`output_mode`]).
 //! - **An existing output** is asked about at display level 2 and up (the
 //!   answer read from standard input, terminal or not: R11; `y` or `Y`
 //!   first, the rest of the line consumed); below it, refused with a line
 //!   printed at every level. `-f` opens it over. An output that is the
-//!   input itself is never opened (spec deviation 3).
+//!   input itself is refused before that (lz4 1.11.0's refusal; for standard
+//!   input redirected from it, spec deviation 3).
 //! - **The exit code** is the number of inputs that failed (`lz4 -m a n1 n2
 //!   n3 e` exits 3); an `Error N` ends the run at once with N, and the
 //!   hidden `-p` pauses only after a run that was not ended that way.
 //! - **Display level 2 drops to 1** when the output is standard output or
 //!   several inputs are named (`lz4 -c a`, `lz4 -m a` print no summary;
 //!   `lz4 -t a.lz4 -` does, its output being discarded).
-//! - **`--rm`** removes an input once it was processed (also after `-t`,
-//!   `-c`, and a decode that met undecodable trailing data); standard input
-//!   is removed by its name, `stdin`, as lz4 does: a file named `stdin` in
-//!   the working directory is deleted (probe: `lz4 -c --rm < a` with a file
-//!   `stdin` present), and with none it is `Error 50`.
+//! - **`--rm`** removes a named input once it succeeded (also after `-c`),
+//!   never after `-t`, a decode that met undecodable trailing data, or for
+//!   standard input (1.11.0; 1.10.0 removed in the first two cases and
+//!   removed the name `stdin`, or said `Error 50`).
 //! - **Sparse output** (decompression only; on for files, off for standard
 //!   output unless `--sparse`): runs of zero words become seeks, and the
 //!   last skip ends with a written zero. lz4 seeks before each piece of data
@@ -88,10 +93,9 @@ pub(crate) struct Ended {
 /// slices: `decode.rs`).
 const READ_SIZE: usize = 64 << 10;
 
-/// probe: `lz4 -r d` with a symlink loop inside is lz4's own business; a
-/// walk deeper than this stops. The cap bounds depth only: two symlinks to
-/// `.` still give exponentially many paths, and `lz4 -r` then runs
-/// effectively forever, as the reference does.
+/// A walk deeper than this stops. Since lz4 1.11.0 a walk follows no
+/// symbolic link to a directory, so only a real tree this deep reaches it;
+/// the cap is a guard, not a rule of lz4's.
 const WALK_DEPTH_MAX: usize = 256;
 
 // ---- inputs ----
@@ -159,14 +163,39 @@ impl Reader {
         0
     }
 
-    /// Seek `n` bytes on, where the origin can.
-    fn seek_on(&mut self, n: u64) -> io::Result<u64> {
+    /// Seek `n` bytes on, where the origin can: `Ok(false)`, and no seek,
+    /// when that is past the file's end (lz4 1.11.0: `Error 43`).
+    fn seek_on(&mut self, n: u64) -> io::Result<bool> {
         let off = i64::try_from(n).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-        match &mut self.origin {
-            Origin::File(f) => f.seek(SeekFrom::Current(off)),
-            Origin::Stdin(f) => f.seek(SeekFrom::Current(off)),
-            Origin::Stream(_) => Err(io::Error::from(io::ErrorKind::Unsupported)),
+        let f: &mut dyn SeekFile = match &mut self.origin {
+            Origin::File(f) => f,
+            Origin::Stdin(f) => f,
+            Origin::Stream(_) => return Err(io::Error::from(io::ErrorKind::Unsupported)),
+        };
+        let at = f.stream_position()?;
+        let len = f.size()?;
+        if at.checked_add(n).is_none_or(|end| end > len) {
+            return Ok(false);
         }
+        f.seek(SeekFrom::Current(off))?;
+        Ok(true)
+    }
+}
+
+/// A file that can be seeked and measured (an input's [`Origin`]).
+trait SeekFile: Seek {
+    fn size(&self) -> io::Result<u64>;
+}
+
+impl SeekFile for File {
+    fn size(&self) -> io::Result<u64> {
+        Ok(self.metadata()?.len())
+    }
+}
+
+impl SeekFile for host::InFile {
+    fn size(&self) -> io::Result<u64> {
+        Ok(self.metadata()?.len())
     }
 }
 
@@ -270,10 +299,10 @@ impl Src {
         n
     }
 
-    /// Pass over `n` bytes: a seek on a file (past its end is no error:
-    /// probe `lz4 -t skip_trunc.lz4` exits 0), reading them elsewhere.
-    /// `false` when a stream ends first (probe: `cat skip_trunc.lz4 | lz4
-    /// -dc` is `Error 43`).
+    /// Pass over `n` bytes: a seek on a file, reading them elsewhere.
+    /// `false` when the input ends first (probe: `cat skip_trunc.lz4 | lz4
+    /// -dc` is `Error 43`, and with lz4 1.11.0 `lz4 -t skip_trunc.lz4` too,
+    /// where 1.10.0 seeked past the file's end and exited 0).
     pub(super) fn skip(&mut self, n: u64) -> bool {
         let buffered = (self.buf.len() - self.at) as u64;
         if n <= buffered {
@@ -282,9 +311,15 @@ impl Src {
         }
         let rest = n - buffered;
         self.consume(buffered as usize);
-        if self.seekable && self.reader.seek_on(rest).is_ok() {
-            self.taken += rest;
-            return true;
+        if self.seekable {
+            match self.reader.seek_on(rest) {
+                Ok(true) => {
+                    self.taken += rest;
+                    return true;
+                }
+                Ok(false) => return false,
+                Err(_) => {}
+            }
         }
         let mut left = rest;
         let mut scratch = vec![0u8; READ_SIZE];
@@ -466,12 +501,19 @@ impl Sink {
     }
 }
 
-/// The mode a new output file is created with (deviation 10, HOST-4):
-/// 0600 when it will be given the input's mode at the end (from a regular
-/// file, a frame or a decode; legacy compression keeps lz4's default), else
-/// lz4's 0666 less the umask.
-fn output_mode(input: Option<&Metadata>, decoding: bool, legacy: bool) -> u32 {
-    if input.is_some_and(Metadata::is_file) && (decoding || !legacy) {
+/// The mode a new output file is created with: 0600 when its input is a
+/// named regular file (it is given the input's mode once it succeeded),
+/// else 0666 less the umask.
+///
+/// probe (1.11.0; the 2026-11-08 probe's §1.11): `lz4 -d bad.lz4 o`, `lz4
+/// -d unreadable.lz4 o` (the name stats, the open fails) leave `o` 0600
+/// with the run's time, `lz4 -d nosuch.lz4 o` and every output from
+/// standard input (a pipe, or redirected from a file: `lz4 -d - o <
+/// b.lz4`) 0644 with the run's time, successful or not; a legacy frame
+/// (`-l`) is created and finished as any other (1.10.0 created every output
+/// 0666 less the umask and left `-l`'s so).
+fn output_mode(named_input: Option<&Metadata>) -> u32 {
+    if named_input.is_some_and(Metadata::is_file) {
         0o600
     } else {
         0o666
@@ -734,13 +776,14 @@ impl Run<'_> {
     ) -> Result<(File, bool), Fail> {
         let path = self.host.path(name);
         if host::output_exists(&path) {
-            // Spec deviation 3: the input is never opened over.
+            // The input is never opened over (lz4 1.11.0's refusal, also
+            // through a link; for standard input redirected from the output
+            // file, spec deviation 3).
             if let Some(i) = input
                 && let Ok(existing) = fs::metadata(&path)
                 && host::same_file(i, &existing) == Some(true)
             {
-                printf(self.err, m::SAME_FILE, &[name]);
-                return Err(Fail::File);
+                return Err(self.fail(m::SAME_FILE, &[name]));
             }
             if !self.cmd.force {
                 if self.level <= 1 {
@@ -768,12 +811,15 @@ impl Run<'_> {
         }
     }
 
-    /// The sink for `target`. `input` is the input's metadata (deviation
-    /// 3); `decoding` selects sparse writing and the write error.
+    /// The sink for `target`. `input` is the input's metadata, standard
+    /// input's included (the same-file check); `named` says the input is a
+    /// file named on the command line ([`output_mode`]); `decoding` selects
+    /// sparse writing and the write error.
     fn open_sink(
         &mut self,
         target: &Target,
         input: Option<&Metadata>,
+        named: bool,
         decoding: bool,
     ) -> Result<Sink, Fail> {
         // lz4 -H: "--[no-]sparse : sparse mode (default:enabled on file,
@@ -807,16 +853,11 @@ impl Run<'_> {
                 (SinkKind::Stdout(fd), sparse)
             }
             Target::File(name) => {
-                let mode = output_mode(input, decoding, self.cmd.opts.legacy);
-                let (f, fresh) = self.open_output(name, input, mode)?;
-                #[cfg(unix)]
-                let input_mode = {
-                    use std::os::unix::fs::PermissionsExt;
-                    input.map(|m| m.permissions().mode())
-                };
-                #[cfg(not(unix))]
-                let input_mode = None;
-                fd = host::OutFd::new(&f, fresh && mode == 0o600, input_mode);
+                let mode = output_mode(input.filter(|_| named));
+                let (f, _) = self.open_output(name, input, mode)?;
+                // A failed run leaves a created output 0600, as lz4 1.11.0
+                // does ([`output_mode`]): never widened.
+                fd = host::OutFd::new(&f, false, None);
                 match self.host {
                     Host::Real if sparse_asked => (SinkKind::SparseFile(f), true),
                     _ => (SinkKind::File(self.host.out_writer(Some(f))), sparse_asked),
@@ -833,11 +874,14 @@ impl Run<'_> {
     }
 
     /// The output's finishing touches (probe: `lz4 a`, `lz4 -d b.lz4`, `lz4
-    /// a o` over an existing `o`): the input's modification time,
-    /// permission bits and owner (a refused `chown` is ignored); the
-    /// access time is left as the run made it. Only for a file read from a
-    /// file. Failures are ignored, as lz4 reports none. Set through the
-    /// output's own descriptor `fd` (HOST-8), never by name.
+    /// a o` over an existing `o`, 1.11.0 `lz4 -l a`): the input's
+    /// modification time, permission bits and owner (a refused `chown` is
+    /// ignored); the access time is left as the run made it. Only for a
+    /// file named on the command line (`input` is `None` for standard
+    /// input), once its input succeeded (1.11.0: not after a failed open, an
+    /// `Error N` or undecodable trailing data). Failures are ignored, as lz4
+    /// reports none. Set through the output's own descriptor `fd` (HOST-8),
+    /// never by name.
     fn copy_metadata(target: &Target, input: Option<&Metadata>, fd: Option<&mut host::OutFd>) {
         let (Target::File(_), Some(meta), Some(fd)) = (target, input, fd) else {
             return;
@@ -860,10 +904,14 @@ impl Run<'_> {
         fd.settle();
     }
 
-    /// `--rm`: remove the input once processed (probe: `lz4 -c --rm < a`
-    /// removes the name `stdin`, `Error 50` when there is none).
-    fn remove_input(&mut self, name: &[u8]) -> Result<(), Fail> {
-        if !self.cmd.remove {
+    /// `--rm`: remove the input once it succeeded (probe, 1.11.0: `lz4 -c
+    /// --rm a > x` and `lz4 -d --rm b.lz4` remove it; `lz4 -t --rm b.lz4`,
+    /// standard input (`lz4 -c --rm < a`, a file named `stdin` beside it
+    /// or not, silent) and a decode followed by undecodable data keep it;
+    /// 1.10.0 removed after `-t` and the undecodable case, and removed the
+    /// name `stdin` or said `Error 50`). A failed removal is `Error 50`.
+    fn remove_input(&mut self, name: &[u8], op: Op) -> Result<(), Fail> {
+        if !self.cmd.remove || op == Op::Test || name == STDINMARK {
             return Ok(());
         }
         match fs::remove_file(self.host.path(name)) {
@@ -914,14 +962,17 @@ impl Run<'_> {
 
     /// The inputs, with `-r`'s directories walked (probe: `lz4 -r d`: every
     /// entry in the order the directory lists it, hidden ones too, a
-    /// directory's files where it stands, symbolic links followed; the
-    /// list is made before anything is written, so new outputs are not
-    /// inputs). Where that finds no file at all, the names stand as they
+    /// directory's files where it stands, symbolic links to files followed;
+    /// the list is made before anything is written, so new outputs are not
+    /// inputs). A symbolic link to a directory met in the walk is not
+    /// followed and is warned about at every display level
+    /// ([`m::RECURSIVE_DIR_LINK`], probe 1.11.0: `lz4 -qqq -r d`; 1.10.0
+    /// followed it); one named as an operand is walked (`lz4 -r d/lnk`). Where that finds no file at all, the names stand as they
     /// were given (probe: `lz4 -m -r e1 e2` over two empty directories says
     /// `e1 is a directory -- ignored` for each, exit 2; `--list -r e1` says
     /// `e1 is not a regular file`; with another file named, an empty
     /// directory vanishes: `--list -r e1 plain.lz4` lists `plain.lz4`).
-    pub(super) fn expand(&self, names: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    pub(super) fn expand(&mut self, names: &[Vec<u8>]) -> Vec<Vec<u8>> {
         if !self.cmd.recursive {
             return names.to_vec();
         }
@@ -941,7 +992,7 @@ impl Run<'_> {
         out
     }
 
-    fn walk(&self, dir: &[u8], depth: usize, out: &mut Vec<Vec<u8>>) {
+    fn walk(&mut self, dir: &[u8], depth: usize, out: &mut Vec<Vec<u8>>) {
         if depth >= WALK_DEPTH_MAX {
             return;
         }
@@ -952,7 +1003,11 @@ impl Run<'_> {
             let mut child = dir.to_vec();
             child.push(b'/');
             child.extend_from_slice(entry.file_name().as_encoded_bytes());
-            if fs::metadata(self.host.path(&child)).is_ok_and(|m| m.is_dir()) {
+            let is_dir = fs::metadata(self.host.path(&child)).is_ok_and(|m| m.is_dir());
+            let is_link = entry.file_type().is_ok_and(|t| t.is_symlink());
+            if is_dir && is_link {
+                printf(self.err, m::RECURSIVE_DIR_LINK, &[&child]);
+            } else if is_dir {
                 self.walk(&child, depth + 1, out);
             } else {
                 out.push(child);
@@ -976,7 +1031,8 @@ impl Run<'_> {
         if let (Some(s), Some(m), true) = (src.as_mut(), regular, mapped) {
             s.limit_to(m.len());
         }
-        let (r, mut fd, change) = match self.open_sink(target, meta.as_ref(), false) {
+        let named = name != STDINMARK;
+        let (r, mut fd, change) = match self.open_sink(target, meta.as_ref(), named, false) {
             Ok(mut sink) => {
                 // Standard input is taken only now: the overwrite question
                 // reads it first (probe: `printf 'y\nhello' | lz4 - e`
@@ -1015,16 +1071,14 @@ impl Run<'_> {
                 return Err(self.exm(54, m::E54_SOURCE_MODIFIED, &[name]));
             }
         };
-        // probe: `lz4 -l a` leaves `a.lz4` with the run's time and the
-        // default mode; a frame gets the input's.
-        if !self.cmd.opts.legacy {
-            Self::copy_metadata(target, meta.as_ref(), fd.as_mut());
-        }
+        // probe (1.11.0): `lz4 -l a` gets `a`'s time and mode too (1.10.0
+        // left the run's time and the default mode).
+        Self::copy_metadata(target, meta.as_ref().filter(|_| named), fd.as_mut());
         drop(fd);
         self.total += stats.read;
         self.show_compress_summary(&stats);
         if !kept {
-            self.remove_input(name)?;
+            self.remove_input(name, Op::Compress)?;
         }
         Ok(stats)
     }
@@ -1213,20 +1267,20 @@ impl Run<'_> {
     /// (the input then counts as failed, though it was finished).
     fn decompress_one(&mut self, name: &[u8], target: &Target) -> Result<(Stats, bool), Fail> {
         // probe: the output is opened before the input is.
-        let pre = if name == STDINMARK {
-            self.stdin_meta()
-        } else {
+        let named = name != STDINMARK;
+        let pre = if named {
             fs::metadata(self.host.path(name)).ok()
+        } else {
+            self.stdin_meta()
         };
-        let mut sink = self.open_sink(target, pre.as_ref(), true)?;
+        let mut sink = self.open_sink(target, pre.as_ref(), named, true)?;
         let (src, meta) = match self.open_input(name) {
             Ok(v) => v,
             Err(f) => {
-                // probe: `lz4 -d u.lz4` with `u.lz4` unreadable leaves an
-                // empty `u` with `u.lz4`'s mode and time (a directory's are
-                // not copied: `lz4 -d -f dd.lz4 o`).
+                // probe (1.11.0): `lz4 -d u.lz4` with `u.lz4` unreadable
+                // leaves an empty `u`, 0600, with the run's time (1.10.0
+                // gave it `u.lz4`'s mode and time).
                 let _ = sink.flush(self.out);
-                Self::copy_metadata(target, pre.as_ref(), sink.fd.as_mut());
                 return Err(f);
             }
         };
@@ -1251,11 +1305,20 @@ impl Run<'_> {
             read: decoded.read,
             written: decoded.written,
         };
-        Self::copy_metadata(target, meta.as_ref(), fd.as_mut());
+        if !decoded.undecodable {
+            Self::copy_metadata(target, meta.as_ref().filter(|_| named), fd.as_mut());
+        }
         drop(fd);
         self.total += stats.written;
         self.show_decode_summary(name, &stats);
-        self.remove_input(name)?;
+        if !decoded.undecodable {
+            let op = if self.cmd.mode == cli::Mode::Test {
+                Op::Test
+            } else {
+                Op::Decompress
+            };
+            self.remove_input(name, op)?;
+        }
         Ok((stats, !decoded.undecodable))
     }
 }
@@ -1354,13 +1417,15 @@ fn files(run: &mut Run, plan: &Plan) -> Result<usize, i32> {
         }
     };
     let mut failed = 0usize;
-    // `Done in` follows every compression and every decode that had `-m`
-    // operands or an input that failed (probe: `lz4 -v -d a.lz4 o` says
-    // none, `lz4 -v -d -m a.lz4`, `lz4 -v -d nosuch.lz4 o` and `lz4cat -v
-    // a.lz4` say it; `-dm -`, which lists no operand, says none); not when
-    // an `Error N` ended the run.
+    // `Done in` follows every compression, every decode that had `-m`
+    // operands, and (1.11.0) a single decode that succeeded (probe: `lz4 -v
+    // -d a.lz4 o`, `-v -t a.lz4`, `-v -t -m` of standard input, `lz4 -v -d
+    // -m a.lz4 nosuch.lz4` and `lz4cat -v a.lz4` say it; `lz4 -v -d
+    // nosuch.lz4 o`, a declined overwrite, the same-file refusal and
+    // undecodable trailing data say none, where 1.10.0 said it exactly
+    // there); not when an `Error N` ended the run.
     let done = |run: &mut Run, failed: usize| {
-        if plan.op == Op::Compress || cmd.from_list || failed > 0 {
+        if plan.op == Op::Compress || cmd.from_list || failed == 0 {
             run.show_done();
         }
     };
@@ -1509,11 +1574,12 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Deviation 10: a frame or a decode from a regular file is created
-    /// 0600 (its mode comes at the end, through its descriptor); from
-    /// standard input, a FIFO, or legacy compression, lz4's 0666.
+    /// lz4 1.11.0 (probe §1.11): an output whose input is a named regular
+    /// file, a frame, a legacy frame or a decode, is created 0600 (its mode
+    /// comes once the input succeeded, through its descriptor); from
+    /// standard input (`None`), a FIFO or a directory, 0666 less the umask.
     #[test]
-    fn a_frame_from_a_regular_file_is_created_owner_only() {
+    fn an_output_of_a_regular_file_is_created_owner_only() {
         let dir = std::env::temp_dir().join(format!("stuffr-lz4-mode-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -1521,12 +1587,9 @@ mod tests {
         fs::write(&file, b"x").unwrap();
         let reg = fs::metadata(&file).unwrap();
         let dirm = fs::metadata(&dir).unwrap();
-        assert_eq!(output_mode(Some(&reg), false, false), 0o600);
-        assert_eq!(output_mode(Some(&reg), true, false), 0o600);
-        assert_eq!(output_mode(Some(&reg), true, true), 0o600);
-        assert_eq!(output_mode(Some(&reg), false, true), 0o666);
-        assert_eq!(output_mode(None, false, false), 0o666);
-        assert_eq!(output_mode(Some(&dirm), true, false), 0o666);
+        assert_eq!(output_mode(Some(&reg)), 0o600);
+        assert_eq!(output_mode(None), 0o666);
+        assert_eq!(output_mode(Some(&dirm)), 0o666);
         let _ = fs::remove_dir_all(&dir);
     }
 }

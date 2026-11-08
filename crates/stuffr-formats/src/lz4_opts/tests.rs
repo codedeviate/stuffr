@@ -1719,3 +1719,100 @@ fn confirm_accepts_every_frame_option() {
         }
     }
 }
+
+/// The raw block of a one-block legacy frame of `data`.
+fn raw_block(data: &[u8]) -> Vec<u8> {
+    let l = encode(
+        &EncodeOptions {
+            legacy: true,
+            ..EncodeOptions::default()
+        },
+        data,
+    );
+    let n = u32::from_le_bytes([l[4], l[5], l[6], l[7]]) as usize;
+    assert_eq!(l.len(), 8 + n, "one block");
+    l[8..].to_vec()
+}
+
+/// lz4 1.11.0 ends a legacy frame at a zero word (consumed); 1.10.0 read
+/// it as an empty block and failed (`Error 64`). What follows is the
+/// caller's next magic, however the input is split.
+#[test]
+fn a_zero_word_ends_a_legacy_frame() {
+    let a = text(1000, 0xa1);
+    let legacy = encode(
+        &EncodeOptions {
+            legacy: true,
+            ..EncodeOptions::default()
+        },
+        &a,
+    );
+    // The bare magic and the end mark: nothing, the word consumed.
+    let s = [&LEGACY_MAGIC.to_le_bytes()[..], &[0; 4]].concat();
+    assert_eq!(legacy_feed(&s, s.len()), Ok((8, 0, Vec::new())));
+    for tail in [
+        encode(&EncodeOptions::default(), &text(2000, 0xb2)),
+        legacy.clone(),
+        b"AAAA".to_vec(),
+        vec![0; 4],
+        vec![1, 2],
+        Vec::new(),
+    ] {
+        let s = [&legacy[..], &[0; 4], &tail[..]].concat();
+        let whole = legacy_feed(&s, s.len());
+        assert_eq!(whole, Ok((legacy.len() + 4, 0, a.clone())), "{tail:?}");
+        for split in 0..=s.len() {
+            assert_eq!(legacy_feed(&s, split), whole, "split at {split}");
+        }
+    }
+}
+
+/// mozlz4 blocks (probe, lz4 1.11.0, the 2026-11-08 probe's §1.12 and Task
+/// 5's): a block decodes when its output fits the declared size (a larger
+/// declaration decodes the actual data), fails when it does not, and an
+/// empty block declaring 0 is the CLI's own empty output.
+#[test]
+fn mozlz4_blocks_decode_within_their_declared_size() {
+    let a = text(5330, 0x5e);
+    let block = raw_block(&a);
+    let n = a.len() as u32;
+    assert!(mozlz4_block_decode(&block, n).unwrap() == a);
+    assert!(mozlz4_block_decode(&block, n + 1000).unwrap() == a);
+    assert!(mozlz4_block_decode(&block, 1 << 30).unwrap() == a);
+    assert!(mozlz4_block_decode(&block, MOZLZ4_SIZE_MAX).unwrap() == a);
+    let failed = Lz4fError::DecompressionFailed;
+    assert_eq!(lib_err(mozlz4_block_decode(&block, n - 1)), failed);
+    assert_eq!(lib_err(mozlz4_block_decode(&block, 0)), failed);
+    assert_eq!(lib_err(mozlz4_block_decode(&block[..88], n)), failed);
+    let two = [&block[..], &block[..]].concat();
+    assert_eq!(lib_err(mozlz4_block_decode(&two, n)), failed);
+    let junk = [&block[..], b"AAAA"].concat();
+    assert_eq!(lib_err(mozlz4_block_decode(&junk, n)), failed);
+    // Empty blocks: `mozLz40\0` + size + nothing / one zero token.
+    assert_eq!(mozlz4_block_decode(&[], 0).unwrap(), Vec::<u8>::new());
+    assert_eq!(lib_err(mozlz4_block_decode(&[], n)), failed);
+    assert_eq!(mozlz4_block_decode(&[0], 0).unwrap(), Vec::<u8>::new());
+    assert_eq!(mozlz4_block_decode(&[0], 5).unwrap(), Vec::<u8>::new());
+    assert_eq!(lib_err(mozlz4_block_decode(&[0, 0], 0)), failed);
+    // Past the format's maximum, or a block longer than any that decodes
+    // within the declaration: refused before anything is reserved.
+    assert_eq!(
+        lib_err(mozlz4_block_decode(&block, MOZLZ4_SIZE_MAX + 1)),
+        failed
+    );
+    let long = vec![0u8; mozlz4_block_bound(10) + 1];
+    assert_eq!(lib_err(mozlz4_block_decode(&long, 10)), failed);
+}
+
+/// A block of literals only, the longest a declaration allows, is within
+/// [`mozlz4_block_bound`]: a reader that stops one byte past it never cuts a
+/// block that would have decoded.
+#[test]
+fn the_mozlz4_bound_holds_every_block_that_decodes() {
+    for len in [1usize, 14, 15, 16, 270, 271, 65_536, 1 << 20] {
+        let data = rand(len, len as u64 + 7);
+        let block = raw_block(&data);
+        assert!(block.len() <= mozlz4_block_bound(len as u32), "{len}");
+        assert!(mozlz4_block_decode(&block, len as u32).unwrap() == data);
+    }
+}

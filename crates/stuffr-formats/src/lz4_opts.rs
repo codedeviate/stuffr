@@ -111,6 +111,60 @@ pub const fn compress_bound(n: usize) -> usize {
     n + n / 255 + 16
 }
 
+/// The mozlz4 format's magic (Firefox's `.jsonlz4`, `.mozlz4`): these eight
+/// bytes, a little-endian 32-bit decoded size, then one raw LZ4 block that
+/// runs to the end of the input. lz4 1.11.0 decodes it (its `NEWS`; the
+/// 2026-11-08 probe's §1.12).
+pub const MOZLZ4_MAGIC: [u8; 8] = *b"mozLz40\0";
+/// The largest decoded size a mozlz4 header may declare: `LZ4_MAX_INPUT_SIZE`
+/// (probe, 1.11.0: `0x7E000000` decodes, `0x7E000001` is `Error 62 : Error:
+/// mozlz4 decompressed size too large (2113929217)`).
+pub const MOZLZ4_SIZE_MAX: u32 = 0x7E00_0000;
+
+/// The most bytes a mozlz4 block declaring `declared` decoded bytes can
+/// hold and still decode: any LZ4 block's compressed size is at most
+/// `LZ4_COMPRESSBOUND` of what it decodes to (literals cost a byte each plus
+/// one length byte per 255; a sequence with a match never costs more than it
+/// writes), plus slack. A longer block cannot decode within `declared`, so a
+/// reader may stop at one byte past this.
+pub const fn mozlz4_block_bound(declared: u32) -> usize {
+    compress_bound(declared as usize) + 64
+}
+
+/// Decode a mozlz4 block (the bytes after the header, to the end of the
+/// input) that its header says decodes to at most `declared` bytes, as lz4
+/// 1.11.0 does: `LZ4_decompress_safe` with `declared` bytes of room on the C
+/// tier, `lz4_flex` on the pure tier; [`Lz4fError::DecompressionFailed`]
+/// for a block that does not decode within that room (the CLI's `Error
+/// 64`). One case is the CLI's own, not liblz4's: an empty block declaring
+/// 0 bytes is an empty output (probe: `mozLz40\0` + four zero bytes and
+/// nothing else decodes, exit 0, where `LZ4_decompress_safe` answers -1).
+///
+/// The room is `declared`, cut to what `src` could ever decode to (255
+/// bytes per input byte, plus a margin past liblz4's end-of-buffer checks,
+/// which are relative to the room's end), so a 2 GiB declaration over a
+/// few bytes reserves no 2 GiB. The pure tier accepts some cut blocks that
+/// liblz4 refuses (`lz4_flex` does not apply liblz4's end-of-block rules
+/// in full: spec deviation 6). `src` is at most [`mozlz4_block_bound`] of
+/// [`MOZLZ4_SIZE_MAX`], within a C `int`.
+pub fn mozlz4_block_decode(src: &[u8], declared: u32) -> Result<Vec<u8>, Lz4Error> {
+    if declared == 0 && src.is_empty() {
+        return Ok(Vec::new());
+    }
+    if declared > MOZLZ4_SIZE_MAX || src.len() > mozlz4_block_bound(declared) {
+        return Err(Lz4fError::DecompressionFailed.into());
+    }
+    // The margin keeps liblz4's room-relative checks (its fast loop runs
+    // while 64 bytes of room are left; literals copy wide up to 64 short of
+    // the end) where a room of `declared` would put them.
+    let reachable = src.len().saturating_mul(255).saturating_add(1024);
+    let room = (declared as usize).min(reachable);
+    let mut out = vec![0u8; room];
+    let n = legacy_block_decode(src, &mut out)?;
+    out.truncate(n);
+    Ok(out)
+}
+
 /// Frame block-size IDs (lz4_Frame_format.md): 4 = 64 KiB … 7 = 4 MiB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BlockSizeId {
@@ -513,11 +567,13 @@ enum LegacyStage {
 /// each decoding to at most 8 MiB. Every size word is checked against
 /// `LZ4_compressBound(8 MiB)` before anything is allocated for it.
 ///
-/// The frame has no end mark (lz4_Frame_format.md, "Legacy frame"): it ends
-/// at end of input, or where a word too large to be a block size stands —
-/// a following frame's magic number. [`LegacyDecoder::decompress`] then
-/// returns a hint of `0` *without* consuming that word, so the caller reads
-/// it as the next frame's magic (or rejects it as garbage).
+/// The frame has no end mark in the format (lz4_Frame_format.md, "Legacy
+/// frame"): it ends at end of input, or where a word too large to be a
+/// block size stands — a following frame's magic number.
+/// [`LegacyDecoder::decompress`] then returns a hint of `0` *without*
+/// consuming that word, so the caller reads it as the next frame's magic
+/// (or rejects it as garbage). A word of zero also ends it, as lz4 1.11.0
+/// reads the Linux kernel's end mark, and is consumed.
 ///
 /// **A size word is only ever consumed whole, from one call's input.** When
 /// fewer than four bytes of one remain, they are left unconsumed and the
@@ -557,7 +613,8 @@ impl LegacyDecoder {
 
     /// Decodes from `input`, appending to `out`. Returns `(consumed, hint)`:
     /// `hint` is the number of bytes the decoder wants next, `0` once the
-    /// frame has ended (the word that ended it is not consumed).
+    /// frame has ended (a word that ended it is not consumed, unless it was
+    /// the zero end mark).
     /// [`Lz4fError::FrameTypeUnknown`] if `input` does not start with the
     /// legacy magic; [`Lz4fError::DecompressionFailed`] for a corrupt block.
     pub fn decompress(
@@ -591,6 +648,16 @@ impl LegacyDecoder {
                 }
                 LegacyStage::Size => {
                     let n = le32(&self.buf, 0) as usize;
+                    if n == 0 {
+                        // lz4 1.11.0: a zero word is the legacy frame's end
+                        // mark (the Linux kernel's), consumed; what follows
+                        // is read as the next magic (probe: `02 21 4c 18` +
+                        // `00000000` decodes to nothing, exit 0, where 1.10.0
+                        // said `Error 64`; + a frame decodes both).
+                        self.buf.clear();
+                        self.stage = LegacyStage::Done;
+                        return Ok((pos, 0));
+                    }
                     if n > LEGACY_BLOCK_BOUND {
                         // Not a block: the next frame's magic. Give it back
                         // (all four bytes came from this call's input).
@@ -604,8 +671,10 @@ impl LegacyDecoder {
                 LegacyStage::Block(_) => {
                     // No LZ4 block expands past 255 bytes per input byte (a
                     // match length grows by at most 255 per byte), so a
-                    // small block needs no 8 MiB of room.
-                    let room = self.buf.len().saturating_mul(255).saturating_add(64);
+                    // small block needs no 8 MiB of room. The margin keeps
+                    // liblz4's room-relative checks where 8 MiB would put
+                    // them ([`mozlz4_block_decode`]).
+                    let room = self.buf.len().saturating_mul(255).saturating_add(1024);
                     let start = out.len();
                     out.resize(start + room.min(LEGACY_BLOCK_SIZE), 0);
                     match legacy_block_decode(&self.buf, &mut out[start..]) {

@@ -4245,10 +4245,14 @@ mod unix {
         assert_eq!(mode_after(&link, "ours"), theirs);
     }
 
-    /// Spec deviation 3, an expected difference: an output that is the
-    /// input itself. lz4 truncates it before reading (the data is lost:
-    /// pinned on the reference); stuffr refuses it, keeps it, and counts the
-    /// input as failed.
+    /// An output that is the input itself (probe, lz4 1.11.0, §1.10): lz4
+    /// refuses it, `NAME: input and output are the same file; not
+    /// overwritten ` (the output's name; display level 1), exit 1, the input
+    /// kept, `-f` or not, through a hard link or a symbolic link too, and in
+    /// `-m` mode; stuffr does the same. Spec deviation 3 is left only for
+    /// standard input redirected from the output file, which lz4 truncates
+    /// before reading it (the data is lost: pinned on the reference) and
+    /// stuffr refuses with lz4's own words.
     #[test]
     fn an_input_that_is_its_output_is_never_lost() {
         // Safe as `at`: only this test builds the name, and it has the pid.
@@ -4261,8 +4265,19 @@ mod unix {
         let run = |exe: &Path, args: &[&str], stdin: Option<&str>| {
             fs::write(dir.join("a"), text()).unwrap();
             fs::write(dir.join("s.lz4"), fx("b.lz4")).unwrap();
-            let _ = fs::remove_file(dir.join("h"));
-            fs::hard_link(dir.join("a"), dir.join("h")).unwrap();
+            fs::write(dir.join("y.lz4"), fx("b.lz4")).unwrap();
+            for (name, to) in [
+                ("h", None),
+                ("sa", Some("a")),
+                ("sl", Some("s.lz4")),
+                ("y", Some("y.lz4")),
+            ] {
+                let _ = fs::remove_file(dir.join(name));
+                match to {
+                    None => fs::hard_link(dir.join("a"), dir.join(name)).unwrap(),
+                    Some(t) => std::os::unix::fs::symlink(t, dir.join(name)).unwrap(),
+                }
+            }
             let mut cmd = std::process::Command::new(exe);
             cmd.args(args).current_dir(&*dir).env("LC_ALL", "C");
             cmd.stdin(match stdin {
@@ -4275,30 +4290,57 @@ mod unix {
                 String::from_utf8_lossy(&o.stderr).into_owned(),
                 fs::read(dir.join("a")).unwrap(),
                 fs::read(dir.join("s.lz4")).unwrap(),
+                fs::read(dir.join("y.lz4")).unwrap(),
             )
         };
-        let cases: [(&[&str], Option<&str>, &str); 5] = [
-            (&["-f", "a", "a"], None, "a"),
-            (&["a", "a"], None, "a"),
-            (&["-df", "s.lz4", "s.lz4"], None, "s.lz4"),
-            (&["-f", "h", "a"], None, "a"),
-            (&["-f", "-", "a"], Some("a"), "a"),
+        let refused =
+            |out: &str| format!("{out}: input and output are the same file; not overwritten \n");
+        let kept = (text(), fx("b.lz4"), fx("b.lz4"));
+        let cases: [(&[&str], &str); 9] = [
+            (&["-f", "a", "a"], "a"),
+            (&["a", "a"], "a"),
+            (&["-q", "a", "a"], "a"),
+            (&["-df", "s.lz4", "s.lz4"], "s.lz4"),
+            (&["-d", "s.lz4", "s.lz4"], "s.lz4"),
+            (&["-f", "h", "a"], "a"),
+            (&["-f", "a", "sa"], "sa"),
+            (&["-df", "s.lz4", "sl"], "sl"),
+            (&["-d", "-m", "y.lz4"], "y"),
         ];
-        for (args, stdin, out) in cases {
-            let (code, err, a, s) = run(&link, args, stdin);
-            assert_eq!(code, Some(1), "{args:?}: {err}");
+        let reference = lz4_dir().map(|d| Path::new(d).join("lz4"));
+        for (args, out) in cases {
+            let (code, err, a, s, y) = run(&link, args, None);
             assert_eq!(
-                err,
-                format!("{out} is the input file; not overwritten (stuffr)  \n"),
+                (code, err.as_str()),
+                (Some(1), refused(out).as_str()),
                 "{args:?}"
             );
-            assert_eq!((a, s), (text(), fx("b.lz4")), "{args:?}: the input changed");
+            assert_eq!((a, s, y), kept, "{args:?}: the input changed");
+            if let Some(r) = &reference {
+                let (code, err, a, s, y) = run(r, args, None);
+                assert_eq!(
+                    (code, err.as_str()),
+                    (Some(1), refused(out).as_str()),
+                    "reference {args:?}"
+                );
+                assert_eq!((a, s, y), kept, "reference {args:?}: the input changed");
+            }
         }
-        // The reference loses the data (what the deviation is about).
-        if let Some(d) = lz4_dir() {
-            let (code, _, a, _) = run(&Path::new(d).join("lz4"), &["-f", "a", "a"], None);
+        // `-qq` hides the line; the refusal stands.
+        let (code, err, a, _, _) = run(&link, &["-qq", "-f", "a", "a"], None);
+        assert_eq!((code, err.as_str(), a), (Some(1), "", text()));
+        // Deviation 3: standard input redirected from the output.
+        let (code, err, a, _, _) = run(&link, &["-f", "-", "a"], Some("a"));
+        assert_eq!((code, err.as_str()), (Some(1), refused("a").as_str()));
+        assert_eq!(a, text(), "the input changed");
+        if let Some(r) = &reference {
+            let (code, _, a, _, _) = run(r, &["-f", "-", "a"], Some("a"));
             assert_eq!(code, Some(0));
-            assert_ne!(a, text(), "lz4 -f a a kept its input: deviation 3 is moot");
+            assert_ne!(
+                a,
+                text(),
+                "lz4 -f - a < a kept its input: deviation 3 is moot"
+            );
         }
     }
 
@@ -4570,22 +4612,23 @@ mod unix {
         }
     }
 
-    /// Deviation 10: an output that takes the input's mode is created 0600
-    /// and given it through its descriptor at the end; one whose decode
-    /// fails part way gets the mode the reference creates it with (the
-    /// differential rows compare that), never 0600 left behind. The 0600
-    /// window itself is pinned by `compat::host`'s unit tests.
+    /// An output whose input is a named regular file is created 0600 and
+    /// given the input's mode through its descriptor once its input
+    /// succeeded; a failed decode leaves it 0600 (lz4 1.11.0, probe §1.11:
+    /// 1.10.0 left 0644). From standard input it is created with 0666 less
+    /// the umask and keeps that. The differential rows compare all of this
+    /// with the reference; this pins stuffr's side without one.
     #[test]
-    fn an_output_is_private_until_its_mode_is_set() {
+    fn an_output_is_private_until_its_input_succeeded() {
         let frame = fx("b.lz4");
         let cut = frame[..frame.len() - 6].to_vec();
         let s = stuffr_as(&lz4_case(
             "lz4",
             &["-d", "c.lz4", "o"],
-            vec![("c.lz4", cut)],
+            vec![("c.lz4", cut.clone())],
         ));
         assert_ne!(s.code, 0, "{}", s.stderr);
-        assert_ne!(s.tree["o"].1, 0o600, "a failed run left its output private");
+        assert_eq!(s.tree["o"].1, 0o600, "a failed run widened its output");
         // A successful one gets the input's mode.
         let s = stuffr_as(&set_up(
             lz4_case("lz4", &["-d", "b.lz4", "o"], vec![("b.lz4", frame)]),
@@ -4593,6 +4636,10 @@ mod unix {
         ));
         assert_eq!(s.code, 0, "{}", s.stderr);
         assert_eq!(s.tree["o"].1, 0o604);
+        // From standard input: never 0600.
+        let s = stuffr_as(&piped("lz4", &["-d", "-", "o"], vec![], cut));
+        assert_ne!(s.code, 0, "{}", s.stderr);
+        assert_ne!(s.tree["o"].1, 0o600, "{}", s.stderr);
     }
 
     // ---- lz4 1.11.0: options, levels, threads, messages (0.26.0 Task 4) ----
@@ -5193,6 +5240,226 @@ mod unix {
             differ.len(),
             differ.join("\n")
         );
+    }
+
+    // ---- lz4 1.11.0: decoding, outputs, file handling (0.26.0 Task 5) ----
+    //
+    // Probed 2026-11-08 against /opt/homebrew/Cellar/lz4/1.11.0/bin/lz4
+    // (the probe's §1.8-1.12 and §1.15, and Task 5's own probes).
+
+    /// The mozlz4 layout: magic, a declared size, a block.
+    fn moz(size: u32, body: &[u8]) -> Vec<u8> {
+        cat(&[b"mozLz40\0", &le32(size), body])
+    }
+
+    /// mozlz4 streams: good, and every hostile shape of its header (cut at
+    /// every length, a size past `0x7E000000`, a wrong second half of the
+    /// magic), its block (too small a size, cut, followed by more, empty),
+    /// and after legacy, skippable and modern frames; from files and from a
+    /// pipe, decoded, tested, copied (`-dcf`) and named `.lz4`.
+    #[test]
+    fn mozlz4_decodes_as_the_reference_decodes_it() {
+        if lz4_dir().is_none() {
+            return;
+        }
+        let legacy = made(&["-c", "-q", "-l"], &text());
+        // One block (8800 bytes of text): the legacy frame's after its
+        // magic and size word.
+        let block = legacy[8..].to_vec();
+        let n = text().len() as u32;
+        let good = moz(n, &block);
+        let frame = made(&["-c", "-q"], &text());
+        let skip = cat(&[&[0x50, 0x2a, 0x4d, 0x18], &le32(3), b"abc"]);
+        let mut streams: Vec<(String, Vec<u8>)> = vec![
+            ("good.jsonlz4".into(), good.clone()),
+            ("large.mozlz4".into(), moz(n + 1000, &block)),
+            ("huge.mozlz4".into(), moz(1 << 30, &block)),
+            ("max.mozlz4".into(), moz(0x7E00_0000, &block)),
+            ("max1.mozlz4".into(), moz(0x7E00_0001, &block)),
+            ("2g.mozlz4".into(), moz(0x8000_0000, &block)),
+            ("ffff.mozlz4".into(), moz(u32::MAX, &block)),
+            ("small.mozlz4".into(), moz(n - 1, &block)),
+            ("cut100.mozlz4".into(), good[..100].to_vec()),
+            ("two.mozlz4".into(), cat(&[&good, &good])),
+            ("junk.mozlz4".into(), cat(&[&good, b"AAAA"])),
+            ("zero.mozlz4".into(), moz(0, &block)),
+            ("zero_empty.mozlz4".into(), moz(0, &[])),
+            ("zero_token.mozlz4".into(), moz(0, &[0])),
+            ("five_token.mozlz4".into(), moz(5, &[0])),
+            ("two_zeros.mozlz4".into(), moz(0, &[0, 0])),
+            ("empty_body.mozlz4".into(), moz(n, &[])),
+            (
+                "bomb.mozlz4".into(),
+                moz(0x7E00_0000, &[0x1f, b'a', 1, 0, 0xff, 0xff, 0x10]),
+            ),
+            (
+                "badmagic.mozlz4".into(),
+                cat(&[b"mozLz41\0", &le32(n), &block]),
+            ),
+            ("mozl.mozlz4".into(), cat(&[b"mozLxxxx", &le32(n), &block])),
+            ("leg_moz.lz4".into(), cat(&[&legacy, &good])),
+            ("skip_moz.lz4".into(), cat(&[&skip, &good])),
+            ("frame_moz.lz4".into(), cat(&[&frame, &good])),
+            ("moz_frame.lz4".into(), cat(&[&good, &frame])),
+            (
+                "leg_mozl.lz4".into(),
+                cat(&[&legacy, b"mozLxxxx", &le32(n)]),
+            ),
+        ];
+        for k in 1..=12 {
+            streams.push((format!("hdr{k}.mozlz4"), good[..k].to_vec()));
+            streams.push((format!("leg_hdr{k}.lz4"), cat(&[&legacy, &good[..k]])));
+        }
+        let mut cases = Vec::new();
+        for (name, s) in streams {
+            let name = leak(name);
+            cases.push(lz4_case("lz4", &["-t", name], vec![(name, s.clone())]));
+            cases.push(lz4_case("lz4", &["-d", name, "o"], vec![(name, s.clone())]));
+            cases.push(lz4_case("lz4", &["-dcf", name], vec![(name, s.clone())]));
+            cases.push(lz4_case("lz4cat", &[name], vec![(name, s.clone())]));
+            cases.push(piped("lz4", &["-dc"], vec![], s.clone()));
+            cases.push(piped("lz4", &["-dcf"], vec![], s));
+        }
+        // The block cut at every length: decoded where liblz4 accepts the
+        // cut as a block's end, `Error 64` elsewhere. The C tier only: the
+        // pure tier's `lz4_flex` also accepts some cuts liblz4 1.11.0
+        // refuses (one of these 79: `cut60`, where liblz4's end-of-block
+        // rules refuse the last sequence; spec deviation 6).
+        if EXACT {
+            for k in 13..good.len() {
+                let name = leak(format!("cut{k}.mozlz4"));
+                cases.push(lz4_case(
+                    "lz4",
+                    &["-dc", name],
+                    vec![(name, good[..k].to_vec())],
+                ));
+            }
+        }
+        let g = || ("good.jsonlz4", good.clone());
+        let named = || ("smoz.lz4", good.clone());
+        cases.extend([
+            lz4_case("lz4", &["-vv", "-t", "good.jsonlz4"], vec![g()]),
+            lz4_case("lz4", &["-vv", "-d", "good.jsonlz4", "o"], vec![g()]),
+            lz4_case("lz4", &["-d", "good.jsonlz4"], vec![g()]),
+            lz4_case("lz4", &["-d", "smoz.lz4"], vec![named()]),
+            lz4_case("lz4", &["-d", "--rm", "smoz.lz4"], vec![named()]),
+            lz4_case("unlz4", &["smoz.lz4"], vec![named()]),
+            lz4_case("lz4", &["smoz.lz4"], vec![named()]),
+            lz4_case(
+                "lz4",
+                &["-m", "-d", "smoz.lz4", "nosuch.lz4"],
+                vec![named()],
+            ),
+        ]);
+        check("mozlz4_decodes_as_the_reference_decodes_it", &cases);
+        // Review Focus 4: a declaration of up to 2 GiB over a few bytes
+        // reserves nothing near it.
+        for (name, data) in [
+            ("max.mozlz4", moz(0x7E00_0000, &block)),
+            (
+                "bomb.mozlz4",
+                moz(0x7E00_0000, &[0x1f, b'a', 1, 0, 0xff, 0xff, 0x10]),
+            ),
+            ("ffff.mozlz4", moz(u32::MAX, &block)),
+        ] {
+            #[cfg(target_os = "linux")]
+            {
+                let env = [("LC_ALL", "C")];
+                let free = data_limited_run("lz4", &["-t", name], name, &data, &env, None);
+                let capped =
+                    data_limited_run("lz4", &["-t", name], name, &data, &env, Some(32 << 20));
+                assert_eq!(
+                    capped, free,
+                    "{name}: under a 32 MiB data limit stuffr answers differently"
+                );
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let (_, _, _, peak) =
+                    peak_rss_run("lz4", &["-t", name], name, &data, &[("LC_ALL", "C")]);
+                assert!(
+                    peak < 32 << 20,
+                    "{name}: peak memory {peak} bytes is not under 32 MiB"
+                );
+            }
+        }
+    }
+
+    /// A legacy frame ended by a zero word (the Linux kernel's end mark),
+    /// then nothing, another frame, garbage or a cut magic (probe, 1.11.0:
+    /// `legzero` decodes to nothing, `leg_zeros` is undecodable data at the
+    /// zero word's end + 4; 1.10.0 said `Error 64` for all).
+    #[test]
+    fn a_zero_word_ends_a_legacy_frame() {
+        let legacy = made(&["-c", "-q", "-l"], &text());
+        let good = made(&["-c", "-q"], &text());
+        let z = le32(0);
+        let streams: Vec<Vec<u8>> = vec![
+            cat(&[&LEGACY, &z]),
+            cat(&[&legacy, &z]),
+            cat(&[&legacy, &z, &good]),
+            cat(&[&legacy, &z, &legacy]),
+            cat(&[&legacy, &z, &legacy, &z]),
+            cat(&[&legacy, &z, b"AAAA"]),
+            cat(&[&legacy, &z, &z]),
+            cat(&[&legacy, &z, b"AB"]),
+            cat(&[&LEGACY, &z, &z, &z]),
+        ];
+        let mut cases = Vec::new();
+        for (i, s) in streams.into_iter().enumerate() {
+            let name = leak(format!("lz{i}.lz4"));
+            cases.push(lz4_case("lz4", &["-d", name, "o"], vec![(name, s.clone())]));
+            cases.push(lz4_case(
+                "lz4",
+                &["-v", "-t", name],
+                vec![(name, s.clone())],
+            ));
+            cases.push(lz4_case("lz4cat", &[name], vec![(name, s.clone())]));
+            cases.push(piped("lz4", &["-d", "-", "o"], vec![], s));
+        }
+        check("a_zero_word_ends_a_legacy_frame", &cases);
+    }
+
+    fn tree_with_dir_links(w: &Path) {
+        for d in ["d/sub", "t", "e"] {
+            fs::create_dir_all(w.join(d)).unwrap();
+        }
+        fs::write(w.join("t/x"), b"behind a link\n").unwrap();
+        fs::write(w.join("d/f"), b"f\n").unwrap();
+        fs::write(w.join("d/sub/g"), b"g\n").unwrap();
+        for (target, at) in [
+            ("../t", "d/lnk"),
+            ("../../t", "d/sub/l2"),
+            ("f", "d/fl"),
+            ("../t", "e/only"),
+        ] {
+            std::os::unix::fs::symlink(target, w.join(at)).unwrap();
+        }
+    }
+
+    /// `-r` follows no symbolic link to a directory inside the walk and
+    /// warns about it at every display level, a link to a file is still
+    /// compressed, a link named as an operand is still walked, and a
+    /// directory whose only content was behind such a link is then a
+    /// directory operand (probe, 1.11.0, §1.15).
+    #[test]
+    fn recursion_follows_no_link_to_a_directory() {
+        let mut cases = Vec::new();
+        for args in [
+            &["-r", "d"][..],
+            &["-qqq", "-r", "d"],
+            &["-v", "-r", "d"],
+            &["-vvvv", "-r", "d"],
+            &["-q", "-r", "e"],
+            &["-r", "e"],
+            &["-r", "d/lnk"],
+            &["-r", "-m", "d", "e"],
+            &["-d", "-r", "-f", "d"],
+            &["-c", "-r", "d"],
+        ] {
+            cases.push(set_up(lz4_case("lz4", args, vec![]), tree_with_dir_links));
+        }
+        check("recursion_follows_no_link_to_a_directory", &cases);
     }
 
     /// `Command::arg0` as `lz4`, for a binary run under another name.

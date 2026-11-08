@@ -1234,16 +1234,17 @@ pub(crate) fn plan(cmd: &Command, stdin_tty: bool, stdout_tty: bool) -> Result<P
 /// decompressed name cannot be made ([`m::EXTENSION_MISMATCH`]: that input
 /// is skipped and the run ends with exit 1).
 ///
-/// probe: `lz4 -m -c a b` and `lz4 a - -m c` write standard output; a
-/// decompression or test whose output is standard output or `null` writes
-/// standard output (`lz4 -m -t b.lz4`, `lz4 a null -m -d b.lz4`, and
-/// `lz4cat -t`), which a terminal does not refuse; `lz4 -m a stdin` writes
-/// `stdin.lz4`.
+/// probe: `lz4 -m -c a b` and `lz4 a - -m c` write standard output, as
+/// does a decompression whose output is standard output (`lz4 -dc -m
+/// b.lz4`); lz4 1.11.0 discards a test's (`lz4 -m -t b.lz4`, `lz4cat -t`)
+/// and one whose output is `null` (`lz4 a null -m -d b.lz4`), where 1.10.0
+/// wrote them to standard output; `lz4 -m a stdin` writes `stdin.lz4`.
 pub(crate) fn list_target(cmd: &Command, op: Op, name: &[u8]) -> Option<Target> {
     match op {
-        Op::Test => Some(Target::Stdout),
+        Op::Test => Some(Target::Null),
         Op::Decompress => match cmd.output {
-            Output::Stdout | Output::Null => Some(Target::Stdout),
+            Output::Stdout => Some(Target::Stdout),
+            Output::Null => Some(Target::Null),
             Output::Auto | Output::File(_) => strip_extension(name).map(Target::File),
         },
         Op::Compress if cmd.output == Output::Stdout => Some(Target::Stdout),

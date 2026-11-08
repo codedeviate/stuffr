@@ -1,10 +1,11 @@
-//! One input's stream of lz4 frames, as lz4 1.10.0 reads it: modern frames
+//! One input's stream of lz4 frames, as lz4 1.11.0 reads it: modern frames
 //! (through liblz4's frame decoder, or the pure tier's), legacy frames,
-//! skippable frames, and whatever follows them.
+//! skippable frames, mozlz4, and whatever follows them.
 //!
 //! **Clean room.** The rules were recovered by probing the 1.10.0 binary
-//! with hand-made streams (Task 2's rows, Task 4's probes; lz4's
-//! `programs/` was never read):
+//! with hand-made streams (Task 2's rows, Task 4's probes), then the 1.11.0
+//! one (the 2026-11-08 probe's §1.12, 0.26.0 Task 5's probes); lz4's
+//! `programs/` was never read:
 //! - A magic number is read at the start and after each legacy or
 //!   skippable frame. No bytes at all end the input (an empty file decodes
 //!   to nothing, exit 0); one to three are `Error 40`.
@@ -15,11 +16,21 @@
 //!   a frame cut short, or 1 to 6 bytes after one, is `Error 26`).
 //!   Probed on a pipe and with the frame ending at 64 KiB, 128 KiB, 4 MiB
 //!   and 16 MiB: always so.
-//! - A **legacy frame** ends at the end of the input or at a word too large
-//!   to be a block size, which is read as the next magic number
-//!   (`LegacyDecoder`'s contract).
-//! - A **skippable frame** is seeked over in a file (past its end is no
-//!   error) and read over elsewhere (ending early is `Error 43`).
+//! - A **legacy frame** ends at the end of the input, at a zero word (1.11.0:
+//!   the Linux kernel's end mark, consumed), or at a word too large to be a
+//!   block size, which is read as the next magic number (`LegacyDecoder`'s
+//!   contract).
+//! - A **skippable frame** is seeked over in a file and read over elsewhere;
+//!   an area that runs past the end of the input is `Error 43` either way
+//!   (1.11.0; 1.10.0 seeked past a file's end silently).
+//! - **mozlz4** (1.11.0): `mozL` as a magic number, then `z40\0` (four more
+//!   bytes, as many as there are: anything else is an unknown magic number
+//!   of those bytes, `Error 44` or pass-through first, undecodable data
+//!   after a frame, its position counting them), a size word (`Error 62`
+//!   when cut, or past `0x7E000000`), and one raw block to the end of the
+//!   input, decoded at once (`Error 64` when it does not fit the size). No
+//!   refresh is drawn. It is met first or after legacy and skippable frames;
+//!   after a modern frame liblz4 judges it (`Error 34`).
 //! - An unknown magic number first in the input is `Error 44`, or, under
 //!   `-f` with standard output as the output (`lz4cat`, `lz4 -dcf`), the
 //!   whole input is copied as it is. After a legacy or skippable frame it
@@ -34,8 +45,8 @@
 //! reserved for it: `stuffr::lz4_opts`.
 
 use stuffr::lz4_opts::{
-    DecodeOptions, Decoder, LEGACY_MAGIC, LegacyDecoder, Lz4Error, Lz4fError, MAGIC,
-    is_skippable_magic,
+    DecodeOptions, Decoder, LEGACY_MAGIC, LegacyDecoder, Lz4Error, Lz4fError, MAGIC, MOZLZ4_MAGIC,
+    MOZLZ4_SIZE_MAX, is_skippable_magic, mozlz4_block_bound, mozlz4_block_decode,
 };
 
 use super::display::show_decode_progress;
@@ -87,28 +98,54 @@ pub(super) fn stream(
         let magic_bytes = [head[0], head[1], head[2], head[3]];
         let magic = le32(&magic_bytes);
         src.consume(4);
-        if is_skippable_magic(magic) {
-            // probe: `lz4 -vv -t sk.lz4` (skippable frame then a frame).
-            run.say(4, m::SKIPPABLE_DETECTED, &[]);
-            let size = src.fill(4);
-            if size.len() < 4 {
-                return Err(run.exm(42, m::E42_SKIPPABLE_SIZE, &[]));
+        // The bytes of a magic number lz4 does not know (four, or a
+        // mozlz4 magic's first eight, or fewer at the end).
+        let mut unknown = magic_bytes.to_vec();
+        if magic_bytes == MOZLZ4_MAGIC[..4] {
+            let rest = src.fill(4);
+            let k = rest.len().min(4);
+            unknown.extend_from_slice(&rest[..k]);
+            src.consume(k);
+            if unknown == MOZLZ4_MAGIC {
+                // probe (1.11.0): `lz4 -vv -t good.jsonlz4`.
+                run.say(4, m::MOZLZ4_DETECTED, &[]);
+                mozlz4(run, src, sink, &mut d)?;
+                break;
             }
-            let n = le32(size);
-            src.consume(4);
-            if !src.skip(u64::from(n)) {
-                return Err(run.exm(43, m::E43_SKIP, &[]));
+        }
+        // A mozlz4 magic that went wrong is an unknown one (below).
+        let known = unknown.len() == 4
+            && (is_skippable_magic(magic) || magic == LEGACY_MAGIC || magic == MAGIC);
+        if known {
+            if is_skippable_magic(magic) {
+                // probe: `lz4 -vv -t sk.lz4` (skippable frame then a frame).
+                run.say(4, m::SKIPPABLE_DETECTED, &[]);
+                let size = src.fill(4);
+                if size.len() < 4 {
+                    return Err(run.exm(42, m::E42_SKIPPABLE_SIZE, &[]));
+                }
+                let n = le32(size);
+                src.consume(4);
+                if !src.skip(u64::from(n)) {
+                    return Err(run.exm(43, m::E43_SKIP, &[]));
+                }
+            } else if magic == LEGACY_MAGIC {
+                // probe: `lz4 -vv -t h.leg`, `lz4 -vv -t two.leg` (said per
+                // frame).
+                run.say(4, m::LEGACY_DETECTED, &[]);
+                legacy(run, src, sink, &mut d)?;
+            } else {
+                modern(run, src, sink, &magic_bytes, &mut d, &mut shown)?;
+                break;
             }
-        } else if magic == LEGACY_MAGIC {
-            // probe: `lz4 -vv -t h.leg`, `lz4 -vv -t two.leg` (said per frame).
-            run.say(4, m::LEGACY_DETECTED, &[]);
-            legacy(run, src, sink, &mut d)?;
-        } else if magic == MAGIC {
-            modern(run, src, sink, &magic_bytes, &mut d, &mut shown)?;
-            break;
-        } else if first && passthrough {
-            sink.write(run, &magic_bytes)?;
-            d.written += 4;
+            first = false;
+            continue;
+        }
+        if first && passthrough {
+            // probe (1.11.0): `lz4 -dcf badmagic.mozlz4` copies the whole
+            // file, `mozLz` too.
+            sink.write(run, &unknown)?;
+            d.written += unknown.len() as u64;
             loop {
                 let rest = src.fill(1);
                 if rest.is_empty() {
@@ -132,7 +169,6 @@ pub(super) fn stream(
             d.undecodable = true;
             break;
         }
-        first = false;
     }
     d.read = src.taken();
     Ok(d)
@@ -191,6 +227,48 @@ fn modern(
     if hint != 0 {
         return Err(run.exm(26, m::E26_INCOMPLETE, &[]));
     }
+    Ok(())
+}
+
+/// A mozlz4 stream, its eight-byte magic read already (module doc). The
+/// block runs to the end of the input; it is read whole, but never past
+/// [`mozlz4_block_bound`] of the declared size (a longer one cannot decode:
+/// `Error 64` without reading the rest), and decoded in one call.
+fn mozlz4(run: &mut Run, src: &mut Src, sink: &mut Sink, d: &mut Decoded) -> Result<(), Fail> {
+    let size = src.fill(4);
+    if size.len() < 4 {
+        // probe (1.11.0): `lz4 -t hdr8.mozlz4` .. `hdr11.mozlz4`.
+        return Err(run.exm(62, m::E62_MOZLZ4_SIZE, &[]));
+    }
+    let declared = le32(size);
+    src.consume(4);
+    if declared > MOZLZ4_SIZE_MAX {
+        // probe (1.11.0): `lz4 -t ffff.mozlz4`, `v7e000001.mozlz4`.
+        let n = declared.to_string();
+        return Err(run.exm(62, m::E62_MOZLZ4_TOO_LARGE, &[n.as_bytes()]));
+    }
+    let bound = mozlz4_block_bound(declared);
+    let mut block = Vec::new();
+    loop {
+        let avail = src.fill(1);
+        if avail.is_empty() {
+            break;
+        }
+        let take = avail.len().min(bound + 1 - block.len());
+        block.extend_from_slice(&avail[..take]);
+        src.consume(take);
+        if block.len() > bound {
+            break;
+        }
+    }
+    // probe (1.11.0): `small.mozlz4` (4999 declared, 5000 decoded),
+    // `cut100.mozlz4`, `two.mozlz4`, `junk.mozlz4`: nothing written.
+    let Ok(out) = mozlz4_block_decode(&block, declared) else {
+        return Err(run.exm(64, m::E64_LEGACY_DECODE, &[]));
+    };
+    drop(block);
+    sink.write(run, &out)?;
+    d.written += out.len() as u64;
     Ok(())
 }
 
