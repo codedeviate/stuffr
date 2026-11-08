@@ -17,10 +17,10 @@
 //! else the pure tier's (in `pure`: the `brotli` crate, compatible but not
 //! byte-identical). Not part of the stable API.
 //!
-//! The vendored libbrotli exports libbrotli's public symbols unprefixed, so
-//! a downstream graph that also links another libbrotli (`brotli-sys`,
-//! `brotlic-sys`, or the `brotli` crate's `ffi-api` feature) together with
-//! `brotli-c` can fail to link or bind to the wrong implementation.
+//! The vendored libbrotli's exports all carry a `stuffr_` prefix
+//! (`c/brotli-1.2.1/stuffr-prefix.h`), so another libbrotli in a downstream
+//! graph (`brotli-sys`, `brotlic-sys`, the `brotli` crate's `ffi-api`)
+//! cannot clash with it.
 //!
 //! ## What the pure tier can do (Task 1's spikes, Rulings T1-b..e)
 //!

@@ -24,11 +24,12 @@ tar -xzf "$work/brotli.tar.gz" -C "$work"
 up="$work/brotli-1.2.1"
 status=0
 for d in common dec enc include; do
-    diff -r "$up/c/$d" "$vendored/$d" || status=1
+    diff -r -x stuffr-prefix.h "$up/c/$d" "$vendored/$d" || status=1
 done
 cmp "$up/LICENSE" "$vendored/LICENSE" || status=1
+# stuffr-prefix.h is ours (generated), not upstream's; it is exempt.
 # Nothing extra may sit in the vendored tree either.
-extra=$(cd "$vendored" && find . -type f | grep -vE '^\./(common|dec|enc|include)/|^\./LICENSE$' || true)
+extra=$(cd "$vendored" && find . -type f | grep -vE '^\./(common|dec|enc|include)/|^\./(LICENSE|stuffr-prefix\.h)$' || true)
 if [ -n "$extra" ]; then
     echo "check-vendored: files not from upstream: $extra" >&2
     status=1

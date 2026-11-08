@@ -62,16 +62,21 @@ const RESULT_ERROR: c_int = 0;
 const RESULT_SUCCESS: c_int = 1;
 const RESULT_NEEDS_MORE_INPUT: c_int = 2;
 
-// The libbrotli functions `brotli.c` 1.2.1 calls. Enums are C `int`s and
+// The libbrotli functions `brotli.c` 1.2.1 calls, under the `stuffr_` prefix
+// the vendored build gives every export (`c/brotli-1.2.1/stuffr-prefix.h`). Enums are C `int`s and
 // `BROTLI_BOOL` is `int` (types.h).
 unsafe extern "C" {
+    #[link_name = "stuffr_BrotliEncoderCreateInstance"]
     fn BrotliEncoderCreateInstance(
         alloc_func: AllocFunc,
         free_func: FreeFunc,
         opaque: *mut c_void,
     ) -> *mut EncoderState;
+    #[link_name = "stuffr_BrotliEncoderDestroyInstance"]
     fn BrotliEncoderDestroyInstance(state: *mut EncoderState);
+    #[link_name = "stuffr_BrotliEncoderSetParameter"]
     fn BrotliEncoderSetParameter(state: *mut EncoderState, param: c_int, value: u32) -> c_int;
+    #[link_name = "stuffr_BrotliEncoderCompressStream"]
     fn BrotliEncoderCompressStream(
         state: *mut EncoderState,
         op: c_int,
@@ -81,7 +86,9 @@ unsafe extern "C" {
         next_out: *mut *mut u8,
         total_out: *mut usize,
     ) -> c_int;
+    #[link_name = "stuffr_BrotliEncoderIsFinished"]
     fn BrotliEncoderIsFinished(state: *mut EncoderState) -> c_int;
+    #[link_name = "stuffr_BrotliEncoderPrepareDictionary"]
     fn BrotliEncoderPrepareDictionary(
         dictionary_type: c_int,
         data_size: usize,
@@ -91,31 +98,39 @@ unsafe extern "C" {
         free_func: FreeFunc,
         opaque: *mut c_void,
     ) -> *mut PreparedState;
+    #[link_name = "stuffr_BrotliEncoderDestroyPreparedDictionary"]
     fn BrotliEncoderDestroyPreparedDictionary(dictionary: *mut PreparedState);
+    #[link_name = "stuffr_BrotliEncoderAttachPreparedDictionary"]
     fn BrotliEncoderAttachPreparedDictionary(
         state: *mut EncoderState,
         dictionary: *const PreparedState,
     ) -> c_int;
 
+    #[link_name = "stuffr_BrotliDecoderCreateInstance"]
     fn BrotliDecoderCreateInstance(
         alloc_func: AllocFunc,
         free_func: FreeFunc,
         opaque: *mut c_void,
     ) -> *mut DecoderState;
+    #[link_name = "stuffr_BrotliDecoderDestroyInstance"]
     fn BrotliDecoderDestroyInstance(state: *mut DecoderState);
+    #[link_name = "stuffr_BrotliDecoderSetParameter"]
     fn BrotliDecoderSetParameter(state: *mut DecoderState, param: c_int, value: u32) -> c_int;
+    #[link_name = "stuffr_BrotliDecoderAttachDictionary"]
     fn BrotliDecoderAttachDictionary(
         state: *mut DecoderState,
         dictionary_type: c_int,
         data_size: usize,
         data: *const u8,
     ) -> c_int;
+    #[link_name = "stuffr_BrotliDecoderSetMetadataCallbacks"]
     fn BrotliDecoderSetMetadataCallbacks(
         state: *mut DecoderState,
         start_func: MetadataStartFunc,
         chunk_func: MetadataChunkFunc,
         opaque: *mut c_void,
     );
+    #[link_name = "stuffr_BrotliDecoderDecompressStream"]
     fn BrotliDecoderDecompressStream(
         state: *mut DecoderState,
         available_in: *mut usize,
@@ -124,7 +139,9 @@ unsafe extern "C" {
         next_out: *mut *mut u8,
         total_out: *mut usize,
     ) -> c_int;
+    #[link_name = "stuffr_BrotliDecoderGetErrorCode"]
     fn BrotliDecoderGetErrorCode(state: *const DecoderState) -> c_int;
+    #[link_name = "stuffr_BrotliDecoderErrorString"]
     fn BrotliDecoderErrorString(code: c_int) -> *const c_char;
 }
 
