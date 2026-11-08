@@ -5080,6 +5080,14 @@ mod unix {
     /// compares the exit, the message (refreshes dropped), whether the
     /// output and the source are left, and how much the output decodes to.
     ///
+    /// Then standard input redirected from `f` (`lz4 -12 -T1 [opts] - f.lz4
+    /// < f`, or `-c` into `f.lz4`; Task 5 review I1): checked through its
+    /// descriptor only, a warning at display level 2 and never `Error 54`
+    /// (also under `--no-frame-crc`), nothing for `f` renamed and replaced,
+    /// ` ; source kept` under `--rm`, nothing at level 1 (`-q`, `-c`). A
+    /// truncated standard input holds what was read before the truncation,
+    /// which is timing on both sides: only that it decodes is compared.
+    ///
     /// C tier only: the pure tier compresses so fast that the change can
     /// come after it has finished (its rule is `io.rs`' unit tests').
     #[test]
@@ -5158,7 +5166,7 @@ mod unix {
             }
         };
         // (status, stderr, output decoded size, source kept)
-        let run = |exe: &Path, w: &Path, opts: &[&str], c: Change| {
+        let run = |exe: &Path, w: &Path, opts: &[&str], c: Change, stdin: bool| {
             let _ = fs::remove_dir_all(w);
             fs::create_dir_all(w).unwrap();
             fs::write(w.join("f"), &data).unwrap();
@@ -5166,13 +5174,22 @@ mod unix {
             cmd.arg0_lz4()
                 .args(["-12", "-T1"])
                 .args(opts)
-                .arg("f")
                 .current_dir(w)
                 .env_clear()
                 .env("LC_ALL", "C")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped());
+            if !stdin {
+                cmd.arg("f");
+            } else {
+                cmd.stdin(fs::File::open(w.join("f")).unwrap());
+                if opts.contains(&"-c") {
+                    cmd.stdout(fs::File::create(w.join("f.lz4")).unwrap());
+                } else {
+                    cmd.args(["-", "f.lz4"]);
+                }
+            }
             let child = spawn(&mut cmd).unwrap();
             let start = Instant::now();
             while fs::metadata(w.join("f.lz4")).map_or(0, |m| m.len()) == 0 {
@@ -5193,6 +5210,10 @@ mod unix {
                     .map(|o| o.stdout.len())
                     .unwrap()
             });
+            let decoded = match c {
+                Change::Truncate if stdin => decoded.map(|n| usize::from(n > 0)),
+                _ => decoded,
+            };
             // Every refresh goes, the one the error follows on its line too
             // (where lz4 draws its last is timing: deviation 2).
             let mut err = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -5223,14 +5244,39 @@ mod unix {
                 &["--rm"],
                 &["-l"],
             ] {
-                let theirs = run(&reference, &ref_dir, opts, c);
-                let ours = run(stuffr, &our_dir, opts, c);
+                let theirs = run(&reference, &ref_dir, opts, c, false);
+                let ours = run(stuffr, &our_dir, opts, c, false);
                 n += 1;
                 if theirs != ours {
                     differ.push(format!(
                         "{c:?} {opts:?}:\n  reference {theirs:?}\n  stuffr    {ours:?}"
                     ));
                 }
+            }
+        }
+        // Standard input: 11 cases, the warning where it shows and where
+        // it does not, kept to what tells the rules apart.
+        let stdin_cases: [(Change, &[&str]); 11] = [
+            (Change::Append, &[]),
+            (Change::Append, &["--rm"]),
+            (Change::Append, &["-l"]),
+            (Change::Append, &["--no-frame-crc"]),
+            (Change::Append, &["-q"]),
+            (Change::Append, &["-c"]),
+            (Change::Old, &[]),
+            (Change::Old, &["-q"]),
+            (Change::Truncate, &[]),
+            (Change::Truncate, &["-l"]),
+            (Change::Replace, &[]),
+        ];
+        for (c, opts) in stdin_cases {
+            let theirs = run(&reference, &ref_dir, opts, c, true);
+            let ours = run(stuffr, &our_dir, opts, c, true);
+            n += 1;
+            if theirs != ours {
+                differ.push(format!(
+                    "stdin {c:?} {opts:?}:\n  reference {theirs:?}\n  stuffr    {ours:?}"
+                ));
             }
         }
         println!("{n} cases compared");

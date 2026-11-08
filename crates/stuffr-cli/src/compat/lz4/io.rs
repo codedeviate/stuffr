@@ -259,11 +259,13 @@ impl Src {
         self.reader.left = Some(n);
     }
 
-    /// The open file's metadata now (`fstat`), for a named input.
+    /// The open file's metadata now (`fstat`): a named input's, or
+    /// standard input's descriptor's (never its name's).
     fn fstat(&self) -> Option<Metadata> {
         match &self.reader.origin {
             Origin::File(f) => f.metadata().ok(),
-            Origin::Stdin(_) | Origin::Stream(_) => None,
+            Origin::Stdin(f) => f.metadata().ok(),
+            Origin::Stream(_) => None,
         }
     }
 
@@ -967,7 +969,8 @@ impl Run<'_> {
     /// inputs). A symbolic link to a directory met in the walk is not
     /// followed and is warned about at every display level
     /// ([`m::RECURSIVE_DIR_LINK`], probe 1.11.0: `lz4 -qqq -r d`; 1.10.0
-    /// followed it); one named as an operand is walked (`lz4 -r d/lnk`). Where that finds no file at all, the names stand as they
+    /// followed it); one named as an operand is walked (`lz4 -r d/lnk`).
+    /// Where that finds no file at all, the names stand as they
     /// were given (probe: `lz4 -m -r e1 e2` over two empty directories says
     /// `e1 is a directory -- ignored` for each, exit 2; `--list -r e1` says
     /// `e1 is not a regular file`; with another file named, an empty
@@ -1020,18 +1023,22 @@ impl Run<'_> {
     /// Compress `name` into `target`.
     fn compress_one(&mut self, name: &[u8], target: &Target) -> Result<Stats, Fail> {
         let (mut src, meta) = self.open_input(name)?;
-        // A regular file is read as long as it was when opened, as lz4
-        // maps it, unless `--no-mmap` (or `-l`, which reads to the end:
+        // A named regular file is read as long as it was when opened, as
+        // lz4 maps it, unless `--no-mmap` (or `-l`, which reads to the end:
         // probe, 1.11.0, `lz4 -l f` with `f` appended to meanwhile writes
-        // the bytes appended too). Only a named file: standard input
-        // redirected from one is read to its end and never checked (probe,
-        // 1.11.0: `lz4 - o.lz4 < f`, `-v`, `--rm` say no warning).
-        let regular = meta.as_ref().filter(|m| m.is_file() && name != STDINMARK);
-        let mapped = self.cmd.mmap && !self.cmd.opts.legacy;
+        // the bytes appended too). Standard input redirected from a regular
+        // file is never mapped: it is read to its end, and checked through
+        // its descriptor only (probe, 1.11.0, Task 5 review: `lz4 - o.lz4 <
+        // f` with `f` appended to, touched or truncated meanwhile warns
+        // `stdin : file modified during processing`, never Error 54, also
+        // under `--no-frame-crc`; `f` renamed and replaced meanwhile says
+        // nothing; an unchanged `f` says nothing).
+        let named = name != STDINMARK;
+        let regular = meta.as_ref().filter(|m| m.is_file());
+        let mapped = self.cmd.mmap && !self.cmd.opts.legacy && named;
         if let (Some(s), Some(m), true) = (src.as_mut(), regular, mapped) {
             s.limit_to(m.len());
         }
-        let named = name != STDINMARK;
         let (r, mut fd, change) = match self.open_sink(target, meta.as_ref(), named, false) {
             Ok(mut sink) => {
                 // Standard input is taken only now: the overwrite question
@@ -1041,8 +1048,15 @@ impl Run<'_> {
                 let stable = mapped && regular.is_some();
                 let r = self.compress_from(name, &mut src, meta.as_ref(), stable, &mut sink);
                 let change = match (regular, &r) {
+                    // Standard input is never stat'ed by name (no file
+                    // named `stdin` is looked at): never `replaced`.
                     (Some(before), Ok(_)) => {
-                        source_change(before, src.fstat(), self.stat_name(name))
+                        let by_name = if named {
+                            self.stat_name(name)
+                        } else {
+                            Some(before.clone())
+                        };
+                        source_change(before, src.fstat(), by_name)
                     }
                     _ => Change::default(),
                 };
@@ -1571,6 +1585,12 @@ mod tests {
         fs::remove_file(&f).unwrap();
         let (a, b) = now();
         assert!(source_change(&before, a, b).replaced);
+        // Standard input is judged by its descriptor alone (`by_name` is
+        // its own `before`): its name gone or replaced is never seen, its
+        // file appended to is.
+        let c = source_change(&before, open.metadata().ok(), Some(before.clone()));
+        assert!(!c.replaced && c.modified, "{c:?}");
+        assert_eq!(verdict(c, false, false), Verdict::Warn(m::SOURCE_MODIFIED));
         let _ = fs::remove_dir_all(&dir);
     }
 
