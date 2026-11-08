@@ -692,14 +692,15 @@ fn short_inputs_are_one_shot_frames() {
     assert!(h(&b4, 65_536).block_linked);
     assert!(!h(&b4, 65_535).block_linked);
     // A custom `-B#`: shorter than `#` is one shot, `#` or more streamed
-    // (the C tier's `update_size`; the pure tier's comes with Task 4).
-    if cfg!(feature = "lz4-c") {
-        let custom = options_for("-B100000 -BD", 0, true);
-        let one = h(&custom, 99_999);
-        assert_eq!(one.block_size, BlockSizeId::Max256Kb);
-        assert!(!one.block_linked);
-        assert!(h(&custom, 100_000).block_linked);
-    }
+    // (`update_size`, on both tiers).
+    let custom = options_for("-B100000 -BD", 0, true);
+    let one = h(&custom, 99_999);
+    assert_eq!(one.block_size, BlockSizeId::Max256Kb);
+    assert!(!one.block_linked);
+    assert!(h(&custom, 100_000).block_linked);
+    let custom = options_for("-B1024 -BD", 0, true);
+    assert!(!h(&custom, 1023).block_linked);
+    assert!(h(&custom, 1024).block_linked);
     // Plain frames never shrink or unlink.
     let f = encode_plain(&linked, &text(1000, 0x2), 1 << 20);
     let p = parse_frame_header(&f).unwrap().unwrap();
@@ -1275,6 +1276,81 @@ fn extreme_levels_compress_on_both_tiers() {
     }
 }
 
+/// A custom `-B#`: every block but the last holds exactly `#` bytes, on
+/// both tiers (lz4 1.11.0 cuts them: Task 3's re-probe).
+#[test]
+fn a_custom_block_size_cuts_blocks_at_that_size() {
+    let data = text(50_000, 0xb1);
+    let o = options_for("-B1024 -BX", data.len(), false);
+    let f = encode(&o, &data);
+    let h = parse_frame_header(&f).unwrap().unwrap();
+    assert_eq!(h.block_size, BlockSizeId::Max64Kb);
+    // Walk the blocks: each decodes to 1024 bytes but the last.
+    let mut at = h.header_len;
+    let mut sizes = Vec::new();
+    loop {
+        let word = le32(&f, at);
+        at += 4;
+        if word == 0 {
+            break;
+        }
+        let n = (word & 0x7FFF_FFFF) as usize;
+        let mut dst = vec![0u8; 64 << 10];
+        let got = if word & 0x8000_0000 != 0 {
+            n
+        } else {
+            legacy_block_decode(&f[at..at + n], &mut dst).unwrap()
+        };
+        sizes.push(got);
+        at += n + 4;
+    }
+    let (last, rest) = sizes.split_last().unwrap();
+    assert!(rest.iter().all(|&n| n == 1024), "{sizes:?}");
+    assert_eq!(rest.len() * 1024 + last, data.len());
+    assert!(decode(&DecodeOptions::default(), &f).unwrap() == data);
+}
+
+/// `end_of_input` changes when bytes appear, never which: the frame is
+/// the same as `finish` alone makes it, on both tiers, for one-shot,
+/// streamed, custom and legacy frames; a streamed frame has its header and
+/// last update out before the end, a one-shot one nothing.
+#[test]
+fn end_of_input_only_moves_bytes_earlier() {
+    let data = text(300_000, 0x3c);
+    for flags in [
+        "",
+        "-BD",
+        "--single-thread",
+        "-B4 -BD --single-thread",
+        "-B4 -BX",
+        "-B1024 -BD",
+        "-B100000",
+        "-l",
+        "-B4 -T3",
+    ] {
+        for len in [0, 1000, 65_535, 65_536, 200_000, 300_000] {
+            let o = options_for(flags, len, false);
+            let input = &data[..len];
+            let whole = encode(&o, input);
+            let mut e = Encoder::new(&o).unwrap();
+            let mut out = Vec::new();
+            for c in input.chunks(o.update_size.unwrap_or(FRAME_CHUNK)) {
+                e.update(c, &mut out).unwrap();
+            }
+            e.end_of_input(&mut out).unwrap();
+            let early = out.len();
+            e.finish(&mut out).unwrap();
+            assert!(out == whole, "{flags} {len}");
+            let one_shot = len < o.block_size_id().bytes() && len < o.update_size.unwrap_or(FRAME_CHUNK);
+            if !o.legacy && one_shot {
+                assert_eq!(early, 0, "{flags} {len}: a one-shot frame waits");
+            } else if !o.legacy && len > 0 {
+                assert!(early > 0, "{flags} {len}: a streamed frame starts");
+            }
+        }
+    }
+}
+
 #[cfg(feature = "lz4-c")]
 mod c_tier {
     use super::*;
@@ -1348,39 +1424,6 @@ mod c_tier {
             assert!(decode(&DecodeOptions::default(), &single).unwrap() == data);
             assert!(decode(&DecodeOptions::default(), &one).unwrap() == data);
         }
-    }
-
-    /// A custom `-B#`: every block but the last holds exactly `#` bytes.
-    #[test]
-    fn a_custom_block_size_cuts_blocks_at_that_size() {
-        let data = text(50_000, 0xb1);
-        let o = options_for("-B1024 -BX", data.len(), false);
-        let f = encode(&o, &data);
-        let h = parse_frame_header(&f).unwrap().unwrap();
-        assert_eq!(h.block_size, BlockSizeId::Max64Kb);
-        // Walk the blocks: each decodes to 1024 bytes but the last.
-        let mut at = h.header_len;
-        let mut sizes = Vec::new();
-        loop {
-            let word = le32(&f, at);
-            at += 4;
-            if word == 0 {
-                break;
-            }
-            let n = (word & 0x7FFF_FFFF) as usize;
-            let mut dst = vec![0u8; 64 << 10];
-            let got = if word & 0x8000_0000 != 0 {
-                n
-            } else {
-                legacy_block_decode(&f[at..at + n], &mut dst).unwrap()
-            };
-            sizes.push(got);
-            at += n + 4;
-        }
-        let (last, rest) = sizes.split_last().unwrap();
-        assert!(rest.iter().all(|&n| n == 1024), "{sizes:?}");
-        assert_eq!(rest.len() * 1024 + last, data.len());
-        assert!(decode(&DecodeOptions::default(), &f).unwrap() == data);
     }
 
     #[test]

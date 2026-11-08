@@ -88,6 +88,13 @@ pub struct Encoder {
     content_size: Option<u64>,
     legacy: bool,
     plain: bool,
+    /// How much input the header waits for ([`EncodeOptions::update_size`]:
+    /// [`FRAME_CHUNK`], or a custom `-B#`'s `#`): an input that ends sooner
+    /// is laid out as a one-shot frame.
+    update: usize,
+    /// [`EncodeOptions::flush_each_update`]: every block holds one update
+    /// (a custom `-B#`'s `#` bytes), not the frame's block size.
+    flushed_blocks: Option<usize>,
     /// The `-D` dictionary's last 64 KiB.
     dictionary: Vec<u8>,
     /// Input not yet compressed.
@@ -106,9 +113,17 @@ pub struct Encoder {
 
 impl Encoder {
     /// An encoder for `o`. The level is accepted and does not change the
-    /// bytes (deviation 6).
+    /// bytes (deviation 6); so is [`EncodeOptions::workers`] (this tier has
+    /// none). [`EncodeOptions::update_size`] and
+    /// [`EncodeOptions::flush_each_update`] lay the frame out as the C tier
+    /// does: the one-shot rule's threshold, and blocks of the update's size.
     pub fn new(o: &EncodeOptions) -> Result<Encoder, Lz4Error> {
         let block_size = o.block_size_id();
+        let update = o.update_size.unwrap_or(FRAME_CHUNK).max(1);
+        // An update larger than a block is cut into blocks: only a smaller
+        // one makes its own (as liblz4's autoFlush does).
+        let flushed_blocks =
+            Some(update).filter(|&u| o.flush_each_update && u < block_size.bytes());
         Ok(Encoder {
             block_size,
             linked: o.block_linked,
@@ -117,6 +132,8 @@ impl Encoder {
             content_size: o.content_size,
             legacy: o.legacy,
             plain: false,
+            update,
+            flushed_blocks,
             dictionary: o
                 .dictionary
                 .as_deref()
@@ -139,6 +156,8 @@ impl Encoder {
     pub fn new_plain(o: &EncodeOptions) -> Result<Encoder, Lz4Error> {
         let mut e = Encoder::new(&EncodeOptions {
             legacy: false,
+            update_size: None,
+            flush_each_update: false,
             ..o.clone()
         })?;
         e.plain = true;
@@ -161,9 +180,10 @@ impl Encoder {
     /// compresses whole blocks straight from the caller's slice; only the
     /// tail (under one block) is copied and kept.
     ///
-    /// As on the C tier, a frame's header waits until 4 MiB of input have
-    /// arrived (an input that ends sooner is laid out as a one-shot frame by
-    /// [`Encoder::finish`]); a plain frame's is written at once.
+    /// As on the C tier, a frame's header waits until one update (4 MiB, or
+    /// a custom `-B#`'s `#`) of input has arrived (an input that ends
+    /// sooner is laid out as a one-shot frame by [`Encoder::finish`] if it
+    /// is shorter than a block); a plain frame's is written at once.
     pub fn update(&mut self, mut input: &[u8], out: &mut Vec<u8>) -> Result<(), Lz4Error> {
         if self.legacy {
             if !self.started {
@@ -173,20 +193,28 @@ impl Encoder {
             return self.feed(LEGACY_BLOCK_SIZE, input, out);
         }
         if !self.started && !self.plain {
-            // The header waits for 4 MiB (or `finish`): hold only that much.
-            let take = FRAME_CHUNK
+            // The header waits for one update (or `finish`): hold only that
+            // much.
+            let take = self
+                .update
                 .saturating_sub(self.pending.len())
                 .min(input.len());
             self.pending.extend_from_slice(&input[..take]);
             input = &input[take..];
-            if self.pending.len() < FRAME_CHUNK {
+            if self.pending.len() < self.update {
                 return Ok(());
             }
         }
         if !self.started {
             self.begin(self.block_size, self.linked, self.content_size, out);
         }
-        self.feed(self.frame_block.bytes(), input, out)
+        self.feed(self.unit(), input, out)
+    }
+
+    /// The input each frame block holds (all but the last).
+    fn unit(&self) -> usize {
+        self.flushed_blocks
+            .unwrap_or_else(|| self.frame_block.bytes())
     }
 
     /// Compresses the pending units, then whole units straight from
@@ -215,6 +243,32 @@ impl Encoder {
         } else {
             self.frame_block_out(piece, out)
         }
+    }
+
+    /// The input ends here: lay out what is held as the C tier's
+    /// `end_of_input` does (a streamed frame's header and whole blocks; a
+    /// block that is not whole stays, as liblz4 keeps it until the end,
+    /// unless a custom `-B#` flushes it; an input shorter than a block
+    /// stays for the one-shot frame).
+    #[doc(hidden)]
+    pub fn end_of_input(&mut self, out: &mut Vec<u8>) -> Result<(), Lz4Error> {
+        if self.legacy || self.plain {
+            return Ok(());
+        }
+        if !self.started {
+            if self.pending.len() < self.block_size.bytes() {
+                return Ok(());
+            }
+            self.begin(self.block_size, self.linked, self.content_size, out);
+            let unit = self.unit();
+            self.drain(unit, out)?;
+        }
+        // A custom `-B#` flushes every update, the last one too.
+        if self.flushed_blocks.is_some() && !self.pending.is_empty() {
+            let rest = std::mem::take(&mut self.pending);
+            self.frame_block_out(&rest, out)?;
+        }
+        Ok(())
     }
 
     /// Ends the frame: the last block, the end mark and the content
@@ -254,7 +308,7 @@ impl Encoder {
                 self.begin(id, linked, size, out);
             }
         }
-        self.drain(self.frame_block.bytes(), out)?;
+        self.drain(self.unit(), out)?;
         let rest = std::mem::take(&mut self.pending);
         if !rest.is_empty() {
             self.frame_block_out(&rest, out)?;

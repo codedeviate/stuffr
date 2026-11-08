@@ -430,6 +430,38 @@ impl Encoder {
         r
     }
 
+    /// The input ends here: compress what is held as lz4 1.11.0 does before
+    /// its last refresh, so that only the end is left for
+    /// [`Encoder::finish`]. A streamed frame's last, partial update goes to
+    /// `LZ4F_compressUpdate` now (an input shorter than an update but of a
+    /// block or more is begun first); an input shorter than a block stays
+    /// for the one-shot frame, and legacy and plain frames are left as
+    /// they are. The bytes are those of `finish` alone; only when they
+    /// appear changes (probe, 1.11.0: `lz4 -vvvv --single-thread -B4` over
+    /// 9 MiB + 123 refreshes at 9 MiB with the last update's blocks
+    /// counted, `-B7` without its last, still buffered, block).
+    #[doc(hidden)]
+    pub fn end_of_input(&mut self, out: &mut Vec<u8>) -> Result<(), Lz4Error> {
+        if self.settings.legacy
+            || self.plain
+            || (!self.started && self.pending.len() < self.settings.block_size.bytes())
+        {
+            return Ok(());
+        }
+        if !self.started {
+            self.begin(out)?;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        let r = if pending.is_empty() {
+            Ok(())
+        } else {
+            self.compress_update(&pending, out)
+        };
+        self.pending = pending;
+        self.pending.clear();
+        r
+    }
+
     /// One whole chunk.
     fn push_chunk(&mut self, chunk: &[u8], out: &mut Vec<u8>) -> Result<(), Lz4Error> {
         if self.settings.legacy {
