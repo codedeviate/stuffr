@@ -7,6 +7,15 @@ edition = "2024"
 [package.metadata]
 cargo-fuzz = true
 
+# The deep fuzz C-tier leg (0.26.0): every C backend stuffr has, the two
+# vendored libraries (libbrotli 1.2.1, liblz4 1.11.0) among them, for
+# `compat` and `roundtrip` (`cargo fuzz run --features c-backed ...`).
+# `stuffr-cli/c-backed` already turns on `stuffr/c-backed`; naming both keeps
+# this crate's `stuffr::{brotli_opts, lz4_opts}` uses from depending on that.
+# `fuzz_targets/cross_tier.rs` refuses to build without the C tier.
+[features]
+c-backed = ["stuffr-cli/c-backed", "stuffr/c-backed"]
+
 [dependencies]
 libfuzzer-sys = "0.4"
 stuffr = { path = "../crates/stuffr", features = ["testing", "legacy"] }

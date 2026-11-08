@@ -22,8 +22,9 @@
 //! family's argument parser, its frame driver over `stuffr::zstd_opts`, the
 //! foreign formats it decodes and writes (`--format=gzip|lz4`; gzip, xz,
 //! lzma and lz4 input), `--filelist`, `-r`, the `-l` header walker and
-//! the dictionary paths, on the tier this crate builds: the pure one
-//! (`stuffr-cli` without `zstd-c`), where compressing with `-D` or
+//! the dictionary paths, on the tier this crate builds: by default the pure
+//! one (`stuffr-cli` without `zstd-c`; `c-backed`, below, builds the C
+//! tier of every family), where compressing with `-D` or
 //! `--patch-from`, and `--train*`, refuse with exit 1 (spec deviation 7;
 //! `-D` and `--patch-from` after reading the dictionary).
 //!
@@ -183,6 +184,12 @@
 //!   size.
 //!
 //! Inputs past `COMPAT_FUZZ_MAX_INPUT` (64 KiB; see its doc) are skipped.
+//! Built with this crate's `c-backed` feature (the deep fuzz C-tier leg,
+//! 0.26.0), the brotli and lz4 families run on libbrotli 1.2.1 and liblz4
+//! 1.11.0, and each such case's payload also goes through both tiers'
+//! decoders, which must agree (`cross_tier.rs`, ruling F-a of 0.20.0; it
+//! also asserts the C tier is the one built).
+//!
 //! Both families' output, to standard output and files together, is capped
 //! by `run_in` itself (8 MiB, failing as a full disk does: exit 1), because
 //! a bzip2 stream of a few dozen bytes can expand to tens of MiB, and a
@@ -203,6 +210,8 @@ use std::time::SystemTime;
 
 use libfuzzer_sys::fuzz_target;
 
+#[cfg(feature = "c-backed")]
+mod cross_tier;
 mod zip_readback;
 use stuffr_cli::compat::{self, bzip2recover, compress, gzip::Flavour, unzip, zip};
 use stuffr_core::testing::{
@@ -1454,8 +1463,8 @@ fn lz4_unquieted(name: &str, args: &[&str]) -> Vec<String> {
 /// reporting an input as failed. The forms (`messages.rs`; each is one
 /// line per failing input under `-m`, `lz4cat` and `--list`):
 ///
-/// - `Error N : ...` (every `E##_*`, `--list`'s `E71_READING` and
-///   `E72_READING` among them);
+/// - `Error N : ...` (every `E##_*`; `--list` has none of its own since
+///   1.11.0 validates its frames, and 72 is `--sparse`'s `E72_SPARSE_SKIP`);
 /// - `NAME: STRERROR ` (`OPEN_INPUT_FAILED`), and the same without the
 ///   blank for `OPEN_OUTPUT_FAILED`;
 /// - `lz4: NAME is a directory -- ignored` (`IS_A_DIRECTORY`);
@@ -2965,8 +2974,16 @@ fuzz_target!(|data: &[u8]| {
         }
         "bzip2" | "bunzip2" | "bzcat" => run_bzip2(&dir, case.name, &case.args, stdin),
         "zstd" | "unzstd" | "zstdcat" | "zstdmt" => run_zstd(&dir, case.name, &case.args, stdin),
-        "lz4" | "unlz4" | "lz4cat" | "lz4c" => run_lz4(&dir, case.name, &case.args, stdin),
-        "brotli" | "unbrotli" | "brcat" => run_brotli(&dir, case.name, &case.args, stdin),
+        "lz4" | "unlz4" | "lz4cat" | "lz4c" => {
+            run_lz4(&dir, case.name, &case.args, stdin);
+            #[cfg(feature = "c-backed")]
+            cross_tier::check_decoders_agree(cross_tier::Format::Lz4, case.payload);
+        }
+        "brotli" | "unbrotli" | "brcat" => {
+            run_brotli(&dir, case.name, &case.args, stdin);
+            #[cfg(feature = "c-backed")]
+            cross_tier::check_decoders_agree(cross_tier::Format::Brotli, case.payload);
+        }
         "unzip" | "zipinfo" | "funzip" => {
             run_unzip(&dir, case.name, case.flavour, &case.args, stdin)
         }

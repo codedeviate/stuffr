@@ -17,10 +17,19 @@ name: fuzz (deep, scheduled)
 # either may miss a crash, neither invents one.
 #
 # Ruling I's "pure tier only" reasoning does NOT apply here on principle —
-# this is exactly the workflow a `--features c-backed` pass would belong in if
-# one is ever wanted — but none is added yet: nothing has motivated the extra
-# time cost so far, and adding it is a one-line change to the matrix below
-# when it is.
+# this is exactly the workflow a `--features c-backed` pass belongs in — and
+# since 0.26.0 there is one: stuffr compiles two vendored C libraries itself
+# (libbrotli 1.2.1 and liblz4 1.11.0, every symbol prefixed `stuffr_`), so
+# `compat` (whose brotli and lz4 families, and every other, then run on the
+# C tier) and `roundtrip` (the registry's C zstd/xz/lzma/zlib codecs) also
+# run built with the fuzz crate's `c-backed` feature, 20 minutes each like
+# the rest (the `tier: c` matrix entries). Both add a cross-tier check for
+# brotli and lz4 (`fuzz/fuzz_targets/cross_tier.rs`, ruling F-a of 0.20.0):
+# the pure registry codec and the C seam must agree. A C-tier leg that
+# silently built the pure tier would be worse than none, so it is checked
+# twice: `cross_tier.rs` does not compile or link without the C tier, and
+# the job below refuses to run a `tier: c` binary that lacks the vendored
+# libraries' symbols.
 
 on:
   # EVERY TAG. This workflow used to say, here, that deep fuzzing was
@@ -65,7 +74,7 @@ permissions:
 
 jobs:
   fuzz-deep:
-    name: fuzz deep (${{ matrix.target }})
+    name: fuzz deep (${{ matrix.target }}${{ matrix.features && format(', {0}', matrix.features) || '' }})
     runs-on: ubuntu-latest
     # Ruling J: a scheduled workflow must not run in a fork of this
     # repository. `schedule` events aren't delivered to forks by GitHub in
@@ -75,12 +84,19 @@ jobs:
     # that gap, not the schedule trigger's own default behaviour. It covers
     # the `push: tags` trigger too, which a fork gets for free by pushing any
     # `v*` tag of its own; that one would otherwise burn a fork's runner
-    # minutes on seven 20-minute jobs without being asked.
+    # minutes on nine 20-minute jobs without being asked.
     if: github.repository == 'codedeviate/stuffr'
     strategy:
       fail-fast: false
       matrix:
         target: [codec, container, chain, roundtrip, salvage, compat, infozip]
+        # `pure` for the seven above. The C-tier legs are `include` entries
+        # with `tier: c`: an entry whose keys only ADD to a combination is
+        # merged into it (that is how `extra` below reaches `compat`), so a
+        # `{target: compat, features: c-backed}` entry would have turned the
+        # pure `compat` job into a C one. Overwriting `tier` makes it a new
+        # combination instead.
+        tier: [pure]
         # Extra libFuzzer flags for one target. `compat` gets a per-input
         # timeout: a bzip2 stream of a few dozen bytes decodes to tens of
         # MB, and `run_in`'s 8 MiB budget is what bounds that work (decode
@@ -100,6 +116,15 @@ jobs:
             extra: -timeout=60
           - target: infozip
             extra: -timeout=60 -max_len=40000
+          # The C-tier legs (0.26.0), after the entries above so neither is
+          # merged into them; `compat` keeps its own per-input timeout.
+          - target: compat
+            tier: c
+            features: c-backed
+            extra: -timeout=60
+          - target: roundtrip
+            tier: c
+            features: c-backed
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -111,6 +136,9 @@ jobs:
           # workspace and builds into its own `fuzz/target`, not the
           # workspace's `target/`.
           workspaces: "fuzz -> target"
+          # The C-tier legs build other artifacts; empty for the pure ones,
+          # which keeps their cache key as it was.
+          key: ${{ matrix.features }}
       # See ci.yml's `fuzz-smoke` job for why this is necessary at all:
       # rust-toolchain.toml pins 1.95, and cargo-fuzz needs nightly.
       - run: rm rust-toolchain.toml
@@ -128,7 +156,9 @@ jobs:
         run: cargo install cargo-fuzz --version 0.13.2 --locked
       # Generated, not committed (`fuzz/.gitignore`'s `/corpus`) — regenerated
       # fresh for every scheduled run, exactly as ci.yml's smoke job does.
-      # This step seeds ALL SEVEN matrix entries, `salvage` included. It said
+      # This step seeds ALL SEVEN targets, `salvage` included, and with them
+      # the two C-tier entries, which read the same `compat` and `roundtrip`
+      # corpora as their pure counterparts. It said
       # otherwise ("`salvage` ... has no seed generator, so its matrix entry
       # below runs from an empty corpus directory") from Salvage Stage 1 Task
       # 8 until Stage 2 Task 8, and it was false from the moment that task's
@@ -142,9 +172,30 @@ jobs:
       # three-way matrix under GitHub's per-job limits with headroom for
       # queueing, while still being an order of magnitude deeper than the
       # smoke job's few seconds.
-      - name: fuzz ${{ matrix.target }} (20 minutes)
+      #
+      # A `tier: c` entry is built first and its binary must carry the
+      # vendored libraries' prefixed symbols: a `tier: c` job that lost its
+      # `features` would otherwise fuzz the pure tier under a C-tier name.
+      - name: fuzz ${{ matrix.target }} (${{ matrix.tier }} tier, 20 minutes)
+        env:
+          TARGET: ${{ matrix.target }}
+          TIER: ${{ matrix.tier }}
+          FEATURES: ${{ matrix.features }}
+          EXTRA: ${{ matrix.extra }}
         run: |
-          cmd="cargo fuzz run ${{ matrix.target }} -- -max_total_time=1200 ${{ matrix.extra }}"
+          features=${FEATURES:+--features $FEATURES}
+          if [ "$TIER" = c ]; then
+            cargo fuzz build $features "$TARGET"
+            bin="fuzz/target/x86_64-unknown-linux-gnu/release/$TARGET"
+            for sym in stuffr_BrotliDecoderDecompressStream stuffr_LZ4F_decompress; do
+              if ! nm "$bin" | grep -q "$sym"; then
+                echo "::error::$TARGET is a C-tier leg but $bin has no $sym: it was built without the C tier (features: '$FEATURES')"
+                exit 1
+              fi
+            done
+            echo "C tier in: $bin carries libbrotli and liblz4 (stuffr_ prefix)"
+          fi
+          cmd="cargo fuzz run $features $TARGET -- -max_total_time=1200 $EXTRA"
           echo "==> $cmd"
           $cmd
       # A red scheduled run is opened by whoever gets the email, possibly
@@ -173,13 +224,18 @@ jobs:
           A deep fuzz run found something. There are no knowingly-parked
           crashes in this workflow, so treat this as a new finding.
 
-          1. Download the `fuzz-crash-${{ matrix.target }}` artifact from this
+          1. Download the `fuzz-crash-${{ matrix.target }}${{ matrix.features && format('-{0}', matrix.features) || '' }}` artifact from this
              run's summary page. It holds the crashing input, one file.
 
           2. Reproduce it locally (nightly + cargo-fuzz 0.13.2):
 
                  make fuzz-corpus
-                 cargo +nightly fuzz run ${{ matrix.target }} PATH/TO/INPUT
+                 cargo +nightly fuzz run ${{ matrix.features && format('--features {0} ', matrix.features) || '' }}${{ matrix.target }} PATH/TO/INPUT
+
+             A C-tier leg (`--features c-backed`) whose panic names "the C
+             and pure decoders disagree" or "did not read back" is the
+             cross-tier check of fuzz/fuzz_targets/cross_tier.rs: libbrotli
+             or liblz4 against the registry's pure codec.
 
              A single named input runs once and exits 77 on a finding, 0 if it
              no longer reproduces.
@@ -235,7 +291,9 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: fuzz-crash-${{ matrix.target }}
+          # The C-tier legs add `-c-backed`: two jobs of one target must not
+          # upload under one name.
+          name: fuzz-crash-${{ matrix.target }}${{ matrix.features && format('-{0}', matrix.features) || '' }}
           path: fuzz/artifacts/
           if-no-files-found: warn
           retention-days: 30

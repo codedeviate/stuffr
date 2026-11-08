@@ -522,6 +522,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "liblzma"
+version = "0.4.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa980ea6744074a5b5e0ac6b164aca94fc970121869b3e78ae12a2b0097dbea7"
+dependencies = [
+ "liblzma-sys",
+]
+
+[[package]]
+name = "liblzma-sys"
+version = "0.4.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c7e3581f367a78d7b7e7ae948d023310556f0cfc13156c2e4e00e25616492b9"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+]
+
+[[package]]
+name = "libz-sys"
+version = "1.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff20308ecabd635a2dc1dd5834a86c462cca20efba1d5d3ddab1f8aea3455cb2"
+dependencies = [
+ "cc",
+ "pkg-config",
+ "vcpkg",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -629,6 +660,12 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
+name = "pkg-config"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "powerfmt"
@@ -816,9 +853,13 @@ dependencies = [
  "ar",
  "brotli",
  "bzip2",
+ "cc",
  "cpio",
  "delharc",
  "flate2",
+ "liblzma",
+ "liblzma-sys",
+ "libz-sys",
  "lz4_flex",
  "lzma-rust2",
  "oxiarc-lzhuf",
@@ -830,6 +871,8 @@ dependencies = [
  "twox-hash",
  "unarj-rs",
  "zip",
+ "zstd",
+ "zstd-sys",
 ]
 
 [[package]]
@@ -973,6 +1016,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
+name = "vcpkg"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
 name = "wasm-bindgen"
 version = "0.2.128"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1105,6 +1154,7 @@ dependencies = [
  "time",
  "typed-path",
  "windows-sys",
+ "zstd",
 ]
 
 [[package]]
@@ -1118,3 +1168,31 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[package]]
+name = "zstd"
+version = "0.14.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "8.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ded520f16b29e1a9b771c722221b2b0a0398c2316d9bb3c42b458a5414d7434b"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.1.2+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
+dependencies = [
+ "cc",
+ "pkg-config",
+]

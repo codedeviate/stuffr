@@ -47,6 +47,13 @@
 //! correct `ResourceLimit`), which is the shape that gets a scheduled job
 //! muted. The exactness assertion is what carries the weight here, and it
 //! runs on every input the pair actually completes.
+//!
+//! **Built with this crate's `c-backed` feature** (the deep fuzz C-tier
+//! leg, 0.26.0), the registry's zstd, xz, lzma and zlib-family codecs are
+//! the C ones, and the `brotli` and `lz4` slots add a cross-tier check:
+//! the registry's (pure) encoder output must decode through libbrotli or
+//! liblz4, and their encoders' output through the pure decoders
+//! (`cross_tier.rs`, which also asserts the C tier is the one built).
 
 use libfuzzer_sys::fuzz_target;
 use std::io::{Read, Write};
@@ -57,6 +64,9 @@ use stuffr_core::{
     Codec, Container, CreateOpts, DecodeOpts, EncodeOpts, EntryMeta, Error, FormatId, OpenOpts,
     PlainSink, ReaderSource, Source, StreamPolicy,
 };
+
+#[cfg(feature = "c-backed")]
+mod cross_tier;
 
 /// The one entry name every writable container stores unaltered. See the
 /// module doc for why this is not fuzzed.
@@ -109,7 +119,9 @@ impl Write for Capture {
 }
 
 /// Encode `content`, decode it straight back, and require the two to agree.
-fn codec_round_trip(codec: &dyn Codec, content: &[u8]) {
+/// Returns what the encoder wrote when the round trip completed (for the
+/// C-tier leg's cross-tier check), `None` after a classified refusal.
+fn codec_round_trip(codec: &dyn Codec, content: &[u8]) -> Option<Vec<u8>> {
     let id = codec.id();
     let cap = Capture::default();
 
@@ -117,7 +129,7 @@ fn codec_round_trip(codec: &dyn Codec, content: &[u8]) {
         Ok(s) => s,
         Err(e) => {
             check_error_is_classified(&e).expect("codec encoder error classification");
-            return;
+            return None;
         }
     };
     if let Err(e) = sink.write_all(content) {
@@ -128,15 +140,15 @@ fn codec_round_trip(codec: &dyn Codec, content: &[u8]) {
         // correct classification — which is exactly what the oracle refuses.
         let e = Error::from(e);
         check_error_is_classified(&e).expect("codec encode write classification");
-        return;
+        return None;
     }
     if let Err(e) = sink.finish() {
         check_error_is_classified(&e).expect("codec encoder finish classification");
-        return;
+        return None;
     }
 
     let encoded = cap.into_bytes();
-    let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(encoded)));
+    let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(encoded.clone())));
     let opts = DecodeOpts {
         // Same bound and the same reason as `codec.rs`'s: a pure codec's
         // declared-dictionary pre-flight must not turn every later run into
@@ -148,7 +160,7 @@ fn codec_round_trip(codec: &dyn Codec, content: &[u8]) {
         Ok(d) => d,
         Err(e) => {
             check_error_is_classified(&e).expect("codec decoder error classification");
-            return;
+            return None;
         }
     };
     let got = match read_bounded(&mut decoded, content.len()) {
@@ -156,7 +168,7 @@ fn codec_round_trip(codec: &dyn Codec, content: &[u8]) {
         Err(e) => {
             let e = Error::from_decode_io(e);
             check_error_is_classified(&e).expect("codec decode read classification");
-            return;
+            return None;
         }
     };
 
@@ -172,6 +184,7 @@ fn codec_round_trip(codec: &dyn Codec, content: &[u8]) {
             ""
         }
     );
+    Some(encoded)
 }
 
 /// Write `content` as the single entry of a fresh archive, read it back, and
@@ -324,7 +337,25 @@ fuzz_target!(|data: &[u8]| {
         if !codec.caps().encode {
             return;
         }
-        codec_round_trip(codec.as_ref(), content);
+        let encoded = codec_round_trip(codec.as_ref(), content);
+        // The C-tier leg (0.26.0): brotli and lz4 are pure in the registry
+        // and C in the compatibility seams, so each tier must read the
+        // other's output (`cross_tier.rs`; it also asserts the C tier is
+        // the one built).
+        #[cfg(feature = "c-backed")]
+        if let Some(encoded) = encoded {
+            match name {
+                "brotli" => {
+                    cross_tier::check_encoders_cross(cross_tier::Format::Brotli, content, &encoded)
+                }
+                "lz4" => {
+                    cross_tier::check_encoders_cross(cross_tier::Format::Lz4, content, &encoded)
+                }
+                _ => {}
+            }
+        }
+        #[cfg(not(feature = "c-backed"))]
+        let _ = encoded;
     } else {
         let name = CONTAINER_SLOTS[idx % CONTAINER_SLOTS.len()];
         let Some(container) = registry.container(FormatId::new(name)) else {

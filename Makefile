@@ -389,16 +389,30 @@ FUZZ_SEED = 1
 # An execution count still is not evidence, and this recipe's check is only
 # that a target mutated. To measure whether the salvage oracle actually FIRES,
 # see CONTRIBUTING.md's `STUFFR_FUZZ_SALVAGE_TRACE` recipe.
+#
+# The last two legs (0.26.0) are the C tier: `compat` and `roundtrip` built
+# with the fuzz crate's `c-backed` feature (`TARGET:FEATURES`), as
+# fuzz-deep.yml's C-tier matrix entries run them, at the same budget and RSS
+# cap as the rest. They share their corpus with the pure legs.
+# `fuzz_targets/cross_tier.rs` fails their build unless the vendored libbrotli
+# and liblz4 are linked. The feature switch rebuilds the stuffr crates once,
+# so they come last.
+FUZZ_LEGS = codec container chain roundtrip salvage compat infozip \
+	compat:c-backed roundtrip:c-backed
 fuzz: fuzz-corpus
 	@status=0; \
-	for target in codec container chain roundtrip salvage compat infozip; do \
+	for leg in $(FUZZ_LEGS); do \
+	  case $$leg in \
+	    *:*) target=$${leg%%:*}; features="--features $${leg#*:} " ;; \
+	    *) target=$$leg; features= ;; \
+	  esac; \
 	  corpus=$$(find fuzz/corpus/$$target -type f 2>/dev/null | wc -l | tr -d ' '); \
 	  runs=$$((corpus + $(FUZZ_RUNS))); \
-	  cmd="cargo +nightly fuzz run $$target -- $(FUZZ_RSS_ARGS) -runs=$$runs -seed=$(FUZZ_SEED)"; \
+	  cmd="cargo +nightly fuzz run $$features$$target -- $(FUZZ_RSS_ARGS) -runs=$$runs -seed=$(FUZZ_SEED)"; \
 	  echo "==> $$cmd"; \
 	  tmp=$$(mktemp); \
 	  if ! $$cmd >"$$tmp" 2>&1; then \
-	    echo "make fuzz: target '$$target' crashed (or otherwise exited non-zero) — see output below" >&2; \
+	    echo "make fuzz: target '$$leg' crashed (or otherwise exited non-zero) — see output below" >&2; \
 	    cat "$$tmp"; rm -f "$$tmp"; status=1; continue; \
 	  fi; \
 	  : "No '|| true' on the next line, unlike ci.yml's otherwise-identical" ; \
@@ -410,10 +424,10 @@ fuzz: fuzz-corpus
 	  : "not here. Do not tidy either half into matching the other." ; \
 	  n=$$(grep -oE 'Done [0-9]+ runs' "$$tmp" | tail -1 | grep -oE '[0-9]+'); \
 	  if [ -z "$$n" ] || [ "$$n" -lt "$$runs" ]; then \
-	    echo "make fuzz: target '$$target' ran $$n executions, expected $$runs ($$corpus corpus + $(FUZZ_RUNS) mutated) — a short run means no full mutation budget; treating as a failure" >&2; \
+	    echo "make fuzz: target '$$leg' ran $$n executions, expected $$runs ($$corpus corpus + $(FUZZ_RUNS) mutated) — a short run means no full mutation budget; treating as a failure" >&2; \
 	    cat "$$tmp"; rm -f "$$tmp"; status=1; continue; \
 	  fi; \
-	  echo "target '$$target': $$n executions ($$corpus corpus + $$((n - corpus)) mutated) — OK"; \
+	  echo "target '$$leg': $$n executions ($$corpus corpus + $$((n - corpus)) mutated) — OK"; \
 	  rm -f "$$tmp"; \
 	done; \
 	exit $$status
