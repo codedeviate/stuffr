@@ -75,7 +75,8 @@ ported alongside Info-ZIP's own:
   - Apple's zip-33 changes to UnZip 6.0, which Apple distributes under the
     same Info-ZIP licence (zip-33's zip.plist: OpenSourceLicense Info-ZIP);
   - Debian's patch series for unzip 6.0, distributed under the same
-    licence (debian/copyright of unzip 6.0-28ubuntu4.1).
+    licence (debian/copyright of unzip 6.0-29+deb13u1; 6.0-28ubuntu4.1
+    until 0.26.0).
 
 This port is an altered version in the sense of clause 3 above, and is
 marked as such: it is not Info-ZIP's source, it is not compiled from
