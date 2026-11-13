@@ -375,6 +375,10 @@ impl ZipSalvage {
 }
 
 impl SalvageScan for ZipSalvage {
+    fn format(&self) -> stuffr_core::FormatId {
+        ZIP
+    }
+
     fn next_candidate(&mut self, src: &mut dyn SeekRead, from: u64) -> Result<Option<Candidate>> {
         let file_len = src.seek(SeekFrom::End(0))?;
         let budget = self
@@ -1031,7 +1035,9 @@ pub fn salvage_zip(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
     // pass above reaches by its own route, and a sighting there would say
     // "not listed or recovered" of an entry this very outcome lists.
     let recovered: HashSet<u64> = outcome.entries.iter().map(|e| e.offset).collect();
-    outcome.sightings = budget_sightings(scanner, &recovered);
+    outcome
+        .sightings
+        .extend(budget_sightings(scanner, &recovered));
     Ok(outcome)
 }
 
@@ -2733,5 +2739,48 @@ mod tests {
             "two zero-byte entries sharing a name must not shadow each other — a checksum of \
              zero bytes proves nothing, even under a matching name and length"
         );
+    }
+
+    /// Bug hunt 2026-11-14, H8: back-to-back stored local headers whose
+    /// sizes run past the end of the file. Each one's payload is "the rest
+    /// of the file", so the bytes the ops layer would decode for them grew
+    /// with the square of the input. Now they are bounded by the engine's
+    /// truncated budget and the rest are counted as sightings.
+    #[test]
+    fn back_to_back_truncated_local_headers_cost_linear_bytes() {
+        use stuffr_core::salvage::{OVERLAPPING_TRUNCATED_SHAPE, ScanBudget};
+        let mut bytes = Vec::new();
+        for i in 0u32..4000 {
+            bytes.extend_from_slice(b"PK\x03\x04");
+            bytes.extend_from_slice(&20u16.to_le_bytes()); // version
+            bytes.extend_from_slice(&0u16.to_le_bytes()); // flags
+            bytes.extend_from_slice(&0u16.to_le_bytes()); // stored
+            bytes.extend_from_slice(&[0; 4]); // time, date
+            bytes.extend_from_slice(&(i + 1).to_le_bytes()); // crc32
+            bytes.extend_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
+            bytes.extend_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
+            bytes.extend_from_slice(&1u16.to_le_bytes()); // name length
+            bytes.extend_from_slice(&0u16.to_le_bytes()); // extra length
+            bytes.push(b'A');
+        }
+        let len = bytes.len() as u64;
+        let out = salvage_zip(&mut Cursor::new(bytes), &SalvagePolicy::default()).unwrap();
+        let decoded: u64 = out
+            .entries
+            .iter()
+            .filter(|e| e.shadows.is_none())
+            .map(|e| len - e.payload_start)
+            .sum();
+        let limit = 2 * len + ScanBudget::SLACK;
+        assert!(decoded <= limit, "{decoded} > {limit}");
+        assert_eq!(out.entries[0].offset, 0);
+        assert_eq!(out.entries[0].status, SalvageStatus::Partial);
+        let refused: u64 = out
+            .sightings
+            .iter()
+            .filter(|s| s.shape == OVERLAPPING_TRUNCATED_SHAPE)
+            .map(|s| 1 + s.more)
+            .sum();
+        assert_eq!(out.entries.len() as u64 + refused, 4000);
     }
 }

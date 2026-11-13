@@ -915,6 +915,10 @@ impl CpioSalvage {
 }
 
 impl SalvageScan for CpioSalvage {
+    fn format(&self) -> stuffr_core::FormatId {
+        CPIO
+    }
+
     fn next_candidate(&mut self, src: &mut dyn SeekRead, from: u64) -> Result<Option<Candidate>> {
         let file_len = src.seek(SeekFrom::End(0))?;
         let budget = self
@@ -1117,7 +1121,7 @@ pub fn salvage_cpio(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sa
     // 0.10.3 Task 4b: beside them, every header the scan's budget left
     // unjudged — never an entry, and printed by the caller like any other
     // sighting.
-    outcome.sightings = scanner.sightings.into_sightings();
+    outcome.sightings.extend(scanner.sightings.into_sightings());
     // Stable, so each group keeps its ascending order and the sighting
     // carrying its `more`.
     outcome.sightings.sort_by_key(|s| s.offset);
@@ -2188,7 +2192,7 @@ mod tests {
     /// list before the cap (pinned from 7244937, where every one was stored).
     #[test]
     fn dense_sightings_are_bounded_and_the_sentence_is_unchanged() {
-        use stuffr_core::salvage::describe_sightings;
+        use stuffr_core::salvage::{OVERLAPPING_TRUNCATED_SHAPE, describe_sightings};
         use stuffr_core::testing::check_sightings_bounded;
         let legs: [(&str, Vec<u8>, u64, &[&str]); 4] = [
             (
@@ -2232,7 +2236,16 @@ mod tests {
         ];
         for (label, bytes, total, listed) in legs {
             let out = salvage_cpio(&mut Cursor::new(bytes), &SalvagePolicy::default()).unwrap();
-            check_sightings_bounded(&out.sightings, total)
+            // The truncated symlinks at the end overlap one another and
+            // are refused by the engine's own budget (bug hunt 2026-11-14,
+            // H8): a separate group, counted apart from this scanner's.
+            let scanner_sightings: Vec<_> = out
+                .sightings
+                .iter()
+                .filter(|s| s.shape != OVERLAPPING_TRUNCATED_SHAPE)
+                .cloned()
+                .collect();
+            check_sightings_bounded(&scanner_sightings, total)
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
             let note = describe_sightings(&out.sightings).unwrap();
             for fragment in listed {
@@ -2289,7 +2302,7 @@ mod tests {
     /// reported as verdict-bounded sightings.
     #[test]
     fn long_names_and_symlink_targets_spend_a_bounded_budget() {
-        use stuffr_core::salvage::SightingKind;
+        use stuffr_core::salvage::{OVERLAPPING_TRUNCATED_SHAPE, SightingKind};
         use stuffr_core::testing::{CountingSource, check_scan_is_linear};
         let fill = long_name_units;
         // A 65,419-byte name ends on byte 120 of a later unit: 110 + 65,419
@@ -2315,7 +2328,8 @@ mod tests {
                         .sightings
                         .iter()
                         .all(|s| s.kind == SightingKind::VerdictBounded
-                            && s.shape == VERDICT_BUDGET_SHAPE),
+                            && (s.shape == VERDICT_BUDGET_SHAPE
+                                || s.shape == OVERLAPPING_TRUNCATED_SHAPE)),
                 "{shape}: {:?}",
                 out.sightings.first()
             );

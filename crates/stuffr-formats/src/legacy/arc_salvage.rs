@@ -138,6 +138,10 @@ impl ArcSalvage {
 }
 
 impl SalvageScan for ArcSalvage {
+    fn format(&self) -> stuffr_core::FormatId {
+        super::arc::ARC
+    }
+
     fn next_candidate(&mut self, src: &mut dyn SeekRead, from: u64) -> Result<Option<Candidate>> {
         let file_len = src.seek(SeekFrom::End(0))?;
         let mut search_from = from;

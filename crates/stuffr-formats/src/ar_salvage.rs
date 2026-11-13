@@ -420,6 +420,10 @@ impl ArSalvage {
 }
 
 impl SalvageScan for ArSalvage {
+    fn format(&self) -> stuffr_core::FormatId {
+        crate::ar::AR
+    }
+
     fn next_candidate(&mut self, src: &mut dyn SeekRead, _from: u64) -> Result<Option<Candidate>> {
         if !self.walked {
             let Walk { candidates, stop } = walk(src)?;

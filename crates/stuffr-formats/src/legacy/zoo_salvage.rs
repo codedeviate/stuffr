@@ -261,6 +261,10 @@ impl ZooSalvage {
 }
 
 impl SalvageScan for ZooSalvage {
+    fn format(&self) -> stuffr_core::FormatId {
+        ZOO
+    }
+
     fn next_candidate(&mut self, src: &mut dyn SeekRead, from: u64) -> Result<Option<Candidate>> {
         let file_len = src.seek(SeekFrom::End(0))?;
         let budget = self
@@ -910,7 +914,9 @@ pub fn salvage_zoo(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
     let mut outcome = salvage_all(&mut scanner, src, policy)?;
     // 0.10.3 Task 4b: every record the scan's budget left unjudged — never
     // an entry, and printed by the caller like any other sighting.
-    outcome.sightings = scanner.over_budget.into_sightings();
+    outcome
+        .sightings
+        .extend(scanner.over_budget.into_sightings());
     Ok(outcome)
 }
 

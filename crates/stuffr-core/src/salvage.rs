@@ -1464,6 +1464,15 @@ pub trait SalvageScan {
         u64::MAX
     }
 
+    /// The format this scanner reads, for the [`Sighting`]s the engine
+    /// itself records — today only [`OVERLAPPING_TRUNCATED_SHAPE`], from
+    /// [`annotate_candidates`]. The default, `archive`, keeps a scanner
+    /// written outside this workspace compiling; every in-tree scanner
+    /// names its own format.
+    fn format(&self) -> FormatId {
+        FormatId::new("archive")
+    }
+
     /// Decide what was actually proven about a candidate's payload, after
     /// discovery — called once per candidate, in file order, by
     /// [`annotate_candidates`].
@@ -1699,6 +1708,32 @@ pub fn collect_candidates(
 /// rule [`Candidate::available_len`]'s own doc argues for and the reason a
 /// truncated tail's garbage declaration cannot decide anything: a candidate
 /// whose payload ran out can never cost more than the bytes that exist.
+///
+/// # Truncated candidates share one run-wide budget (bug hunt 2026-11-14, H8)
+///
+/// [`collect_candidates`] advances one byte past a truncated candidate, so
+/// every truncated candidate's surviving payload runs to the end of the
+/// file and each later one sits inside every earlier one's. One entry's
+/// tail is bounded by the file; their NUMBER was not, and the ops layer
+/// decodes every `Partial` entry (into a sink under `--list`, into a
+/// `NAME.partial` file under `-C`), so a file of back-to-back truncated
+/// headers cost about `file_len² / record_len` bytes read, decoded and
+/// written — 230 MB on disk from a 116 KB ARC. So every truncated
+/// candidate's bounded length is charged, in file order, against one
+/// [`ScanBudget::for_input`] (`2 × file_len + 32 KiB`); one that does not
+/// fit is not an entry at all but a [`Sighting::verdict_bounded`] of shape
+/// [`OVERLAPPING_TRUNCATED_SHAPE`], and the scan positions stay dense.
+///
+/// File order is the honest-case order: the first truncated candidate's
+/// tail is at most the file and always fits, so a single truncated last
+/// entry — the common damaged archive — is recovered as before, and the
+/// phantom headers coincidentally found INSIDE its payload are the ones
+/// refused once their (always smaller) tails have spent the rest. Every
+/// refused candidate starts inside an earlier, recovered truncated entry's
+/// bytes, which is what the shape says. Not charged: an untruncated
+/// candidate (they never overlap one another), one already over the entry
+/// ceiling (nothing is read for it) and a proven shadow (the ops layer
+/// skips it before decoding).
 pub fn annotate_candidates(
     scan: &dyn SalvageScan,
     src: &mut dyn SeekRead,
@@ -1707,6 +1742,10 @@ pub fn annotate_candidates(
 ) -> Result<SalvageOutcome> {
     let ceiling = policy.max_entry.min(scan.max_whole_entry());
     let mut entries = Vec::with_capacity(candidates.len());
+    // Built at the first truncated candidate, from the source's length.
+    let mut truncated_budget: Option<ScanBudget> = None;
+    let mut refused = SightingLog::new();
+    let format = scan.format();
     // Earliest scan_position to report each distinct (name, declared_len,
     // verifier) triple seen so far — a candidate reporting one already in
     // here is shadowing that position. A degenerate zero-length checksum
@@ -1723,20 +1762,10 @@ pub fn annotate_candidates(
     // would be wrong here, where nothing about content is being claimed.
     let mut names_seen: HashMap<String, usize> = HashMap::new();
 
-    for (scan_position, candidate) in candidates.into_iter().enumerate() {
-        // Bounded length, then the ceiling, then — only if it fits —
-        // verification. `verify` is what reads and (for a whole-decoding
-        // format) allocates, so refusing above it is refusing before the
-        // allocation, which is the property the two `Err`s this replaced
-        // existed for.
-        let bounded_len = candidate.available_len.or(candidate.declared_len);
-        let status = match bounded_len {
-            Some(needed) if needed > ceiling => {
-                SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling { needed, ceiling })
-            }
-            _ => scan.verify(src, &candidate)?,
-        };
-
+    for candidate in candidates {
+        // Dense: a candidate refused for the truncated budget below takes
+        // no position, so positions still run 0..entries.len().
+        let scan_position = entries.len();
         let declared_len = candidate.declared_len;
         let verifier = candidate.verifier;
         // A checksum over zero declared bytes is the same value for every
@@ -1755,6 +1784,42 @@ pub fn annotate_candidates(
                 seen.get(&(candidate.meta.name.clone(), declared_len, v))
                     .copied()
             })
+        };
+
+        // Bounded length, then the ceiling, then — only if it fits —
+        // verification. `verify` is what reads and (for a whole-decoding
+        // format) allocates, so refusing above it is refusing before the
+        // allocation, which is the property the two `Err`s this replaced
+        // existed for.
+        let bounded_len = candidate.available_len.or(candidate.declared_len);
+        let over_ceiling = matches!(bounded_len, Some(needed) if needed > ceiling);
+
+        // The run-wide truncated budget (see the doc comment): charged
+        // before anything else is recorded about the candidate, so a
+        // refused one leaves no position, shadow or name behind.
+        if let Some(available) = candidate.available_len
+            && !over_ceiling
+            && shadows.is_none()
+        {
+            let budget = match &mut truncated_budget {
+                Some(budget) => budget,
+                None => truncated_budget.insert(ScanBudget::for_input(source_len(src)?)),
+            };
+            if !budget.try_spend(available) {
+                refused.push(Sighting::verdict_bounded(
+                    format,
+                    candidate.offset,
+                    OVERLAPPING_TRUNCATED_SHAPE,
+                ));
+                continue;
+            }
+        }
+
+        let status = match bounded_len {
+            Some(needed) if over_ceiling => {
+                SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling { needed, ceiling })
+            }
+            _ => scan.verify(src, &candidate)?,
         };
 
         if !is_degenerate
@@ -1797,9 +1862,25 @@ pub fn annotate_candidates(
 
     Ok(SalvageOutcome {
         entries,
-        sightings: Vec::new(),
+        sightings: refused.into_sightings(),
         walk_stop: None,
     })
+}
+
+/// The phrase a [`Sighting::verdict_bounded`] carries for a truncated
+/// candidate [`annotate_candidates`] did not take because the run-wide
+/// truncated budget was spent. Every such candidate starts inside an
+/// earlier truncated entry the run did recover, whose `.partial` already
+/// holds its bytes.
+pub const OVERLAPPING_TRUNCATED_SHAPE: &str =
+    "truncated header(s) starting inside an earlier truncated entry";
+
+/// The source's length, leaving its position where it was.
+fn source_len(src: &mut dyn SeekRead) -> Result<u64> {
+    let here = src.stream_position()?;
+    let len = src.seek(SeekFrom::End(0))?;
+    src.seek(SeekFrom::Start(here))?;
+    Ok(len)
 }
 
 /// Streams `reader` into `out`, bounded to `expected_len` bytes — the
@@ -3249,5 +3330,166 @@ mod tests {
         assert!(shape.contains("the symbol table"), "{shape}");
         assert!(shape.contains("not evidence of damage"), "{shape}");
         assert!(!shape.contains("unreachable by construction"), "{shape}");
+    }
+
+    // -----------------------------------------------------------------
+    // Bug hunt 2026-11-14, H8: truncated candidates share one budget.
+    // -----------------------------------------------------------------
+
+    /// Reports a truncated candidate every `step` bytes of a `len`-byte
+    /// source (each one's payload running to the end of the file, as
+    /// `collect_candidates`' one-byte advance makes it), after `whole`
+    /// untruncated `step`-byte entries. Names and checksums differ, so
+    /// nothing is a shadow.
+    struct BackToBackTruncated {
+        len: u64,
+        step: u64,
+        whole: u64,
+    }
+
+    impl SalvageScan for BackToBackTruncated {
+        fn next_candidate(
+            &mut self,
+            _src: &mut dyn SeekRead,
+            from: u64,
+        ) -> Result<Option<Candidate>> {
+            let offset = from.div_ceil(self.step) * self.step;
+            if offset + 2 > self.len {
+                return Ok(None);
+            }
+            let payload_start = offset + 2;
+            let n = offset / self.step;
+            let candidate = Candidate::new(offset, payload_start, EntryMeta::file(format!("e{n}")))
+                .with_verifier(Some(Verifier::Crc32(n as u32 + 1)));
+            Ok(Some(if n < self.whole {
+                candidate.with_declared_len(Some(self.step - 2))
+            } else {
+                candidate
+                    .with_declared_len(Some(u64::from(u32::MAX)))
+                    .with_available_len(Some(self.len - payload_start))
+            }))
+        }
+
+        fn verify(&self, _src: &mut dyn SeekRead, c: &Candidate) -> Result<SalvageStatus> {
+            Ok(if c.available_len.is_some() {
+                SalvageStatus::Partial
+            } else {
+                SalvageStatus::Intact
+            })
+        }
+
+        fn format(&self) -> FormatId {
+            FormatId::new("mock")
+        }
+    }
+
+    fn run_back_to_back(len: u64, step: u64, whole: u64) -> SalvageOutcome {
+        let mut src = std::io::Cursor::new(vec![0u8; len as usize]);
+        let mut scan = BackToBackTruncated { len, step, whole };
+        salvage_all(&mut scan, &mut src, &SalvagePolicy::default()).unwrap()
+    }
+
+    /// The bytes the ops layer would decode for this outcome: every
+    /// non-shadow entry's bounded length.
+    fn bytes_to_decode(outcome: &SalvageOutcome, len: u64, step: u64, whole: u64) -> u64 {
+        outcome
+            .entries
+            .iter()
+            .filter(|e| e.shadows.is_none())
+            .map(|e| {
+                if e.offset / step < whole {
+                    step - 2
+                } else {
+                    len - e.payload_start
+                }
+            })
+            .sum()
+    }
+
+    #[test]
+    fn back_to_back_truncated_candidates_cost_linear_bytes_not_quadratic() {
+        let (len, step) = (116_000u64, 29u64);
+        let out = run_back_to_back(len, step, 0);
+        let decoded = bytes_to_decode(&out, len, step, 0);
+        let limit = ScanBudget::for_input(len).limit;
+        // Before the fix: every one of the 4000 candidates was an entry,
+        // ~ len² / (2 × step) = 232 MB to decode.
+        assert!(decoded <= limit, "{decoded} > {limit}");
+        assert!(!out.entries.is_empty());
+        // The first truncated candidate always fits, so nothing earlier
+        // than what was kept is lost.
+        assert_eq!(out.entries[0].offset, 0);
+        // Dense positions: `--index` validation counts entries.
+        for (i, e) in out.entries.iter().enumerate() {
+            assert_eq!(e.scan_position, i);
+        }
+        // Every candidate is either an entry or counted in a sighting.
+        let refused: u64 = out.sightings.iter().map(|s| 1 + s.more).sum();
+        assert_eq!(out.entries.len() as u64 + refused, len / step);
+        assert!(refused > 0);
+        assert!(out.sightings.iter().all(|s| {
+            s.kind == SightingKind::VerdictBounded
+                && s.shape == OVERLAPPING_TRUNCATED_SHAPE
+                && s.format == FormatId::new("mock")
+        }));
+        assert!(out.sightings.len() <= SightingLog::DEFAULT_CAP);
+        let note = describe_sightings(&out.sightings).unwrap();
+        assert!(note.contains(OVERLAPPING_TRUNCATED_SHAPE), "{note}");
+    }
+
+    /// The honest case: whole entries then one truncated tail. Nothing is
+    /// refused and nothing reported, exactly as before the budget.
+    #[test]
+    fn a_single_truncated_tail_is_still_recovered_whole() {
+        let (len, step) = (100_000u64, 1000u64);
+        // 99 whole entries, then the last one cut (its tail is 998 bytes).
+        let out = run_back_to_back(len, step, 99);
+        assert_eq!(out.entries.len(), 100);
+        assert!(out.sightings.is_empty(), "{:?}", out.sightings);
+        assert_eq!(out.entries[99].status, SalvageStatus::Partial);
+    }
+
+    /// A real truncated entry whose (long) payload holds many phantom
+    /// headers: the real one comes first and keeps its whole tail.
+    #[test]
+    fn the_earliest_truncated_candidate_keeps_its_tail() {
+        let (len, step) = (1 << 20, 64u64);
+        let out = run_back_to_back(len, step, 0);
+        assert_eq!(out.entries[0].offset, 0);
+        assert_eq!(out.entries[0].status, SalvageStatus::Partial);
+        assert!(bytes_to_decode(&out, len, step, 0) <= ScanBudget::for_input(len).limit);
+    }
+
+    /// A proven shadow is skipped by the ops layer before decoding, so it
+    /// is not charged and is still listed as a shadow.
+    #[test]
+    fn proven_shadows_are_not_charged() {
+        struct Same(u64);
+        impl SalvageScan for Same {
+            fn next_candidate(
+                &mut self,
+                _src: &mut dyn SeekRead,
+                from: u64,
+            ) -> Result<Option<Candidate>> {
+                if from + 2 > self.0 {
+                    return Ok(None);
+                }
+                Ok(Some(
+                    Candidate::new(from, from + 2, EntryMeta::file("A"))
+                        .with_declared_len(Some(u64::from(u32::MAX)))
+                        .with_verifier(Some(Verifier::Crc32(7)))
+                        .with_available_len(Some(self.0 - from - 2)),
+                ))
+            }
+            fn verify(&self, _: &mut dyn SeekRead, _: &Candidate) -> Result<SalvageStatus> {
+                Ok(SalvageStatus::Partial)
+            }
+        }
+        let len = 4096u64;
+        let mut src = std::io::Cursor::new(vec![0u8; len as usize]);
+        let out = salvage_all(&mut Same(len), &mut src, &SalvagePolicy::default()).unwrap();
+        assert_eq!(out.entries.len() as u64, len - 1);
+        assert!(out.sightings.is_empty());
+        assert!(out.entries[1..].iter().all(|e| e.shadows == Some(0)));
     }
 }

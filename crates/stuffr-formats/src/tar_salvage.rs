@@ -1071,6 +1071,10 @@ impl TarSalvage {
 }
 
 impl SalvageScan for TarSalvage {
+    fn format(&self) -> stuffr_core::FormatId {
+        TAR
+    }
+
     fn next_candidate(&mut self, src: &mut dyn SeekRead, from: u64) -> Result<Option<Candidate>> {
         let file_len = src.seek(SeekFrom::End(0))?;
         // The engine advances past a candidate by an amount of its own
@@ -1780,7 +1784,8 @@ pub fn salvage_tar(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
             ),
         ));
     }
-    outcome.sightings = std::mem::take(&mut scanner.seen).into_sightings(&outcome.entries);
+    let seen = std::mem::take(&mut scanner.seen).into_sightings(&outcome.entries);
+    outcome.sightings.extend(seen);
     Ok(outcome)
 }
 

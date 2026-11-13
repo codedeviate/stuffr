@@ -949,3 +949,80 @@ fn salvage_names_an_ungateable_tar_header_in_a_mixed_run() {
         "{stderr}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Bug hunt 2026-11-14, H8: back-to-back truncated candidates.
+// ---------------------------------------------------------------------
+
+/// `n` 29-byte ARC records, each a stored entry named `A` whose declared
+/// sizes run far past the end of the file, with a different CRC-16 per
+/// record so none is a proven shadow of another.
+fn back_to_back_truncated_arc(n: u16) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(usize::from(n) * 29);
+    for i in 0..n {
+        bytes.extend_from_slice(&[0x1A, 0x02]);
+        let mut name = [0u8; 13];
+        name[0] = b'A';
+        bytes.extend_from_slice(&name);
+        bytes.extend_from_slice(&0xFFFF_FFF0u32.to_le_bytes()); // compressed size
+        bytes.extend_from_slice(&[0; 4]); // date, time
+        bytes.extend_from_slice(&i.to_le_bytes()); // crc16
+        bytes.extend_from_slice(&0xFFFF_FFF0u32.to_le_bytes()); // original size
+    }
+    bytes
+}
+
+fn bytes_under(dir: &Path) -> (u64, usize) {
+    let (mut total, mut files) = (0, 0);
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        let meta = entry.metadata().unwrap();
+        if meta.is_dir() {
+            let (t, f) = bytes_under(&entry.path());
+            total += t;
+            files += f;
+        } else {
+            total += meta.len();
+            files += 1;
+        }
+    }
+    (total, files)
+}
+
+/// Each record's payload is "the rest of the file", so 4000 of them asked
+/// for ~230 MB of `.partial` files from a 116 KB input. What salvage writes
+/// is now bounded by a small multiple of the input; the first (outermost)
+/// truncated entry is still recovered, and the rest are counted on stderr.
+#[test]
+fn back_to_back_truncated_arc_entries_write_linear_bytes() {
+    let dir = tmp_dir();
+    let archive = dir.join("evil.arc");
+    let bytes = back_to_back_truncated_arc(4000);
+    let input_len = bytes.len() as u64;
+    std::fs::write(&archive, &bytes).unwrap();
+    let out_dir = dir.join("out");
+
+    let out = run_output(&[
+        "salvage",
+        "--format",
+        "arc",
+        archive.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(4), "{stderr}");
+    assert!(
+        stderr.contains("truncated header(s) starting inside an earlier truncated entry"),
+        "{stderr}"
+    );
+
+    let (written, files) = bytes_under(&out_dir);
+    assert!(
+        written <= 2 * input_len + 32 * 1024,
+        "{written} bytes in {files} files from a {input_len}-byte input"
+    );
+    // The outermost truncated entry keeps its whole surviving tail.
+    let first = std::fs::read(out_dir.join("A.partial")).unwrap();
+    assert_eq!(first, bytes[29..]);
+}
