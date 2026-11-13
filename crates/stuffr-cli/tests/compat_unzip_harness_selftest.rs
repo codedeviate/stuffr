@@ -207,7 +207,7 @@ mod unix {
             unzip_differences(&c, &run(a, ""), &run("Compiled with x", "")).len(),
             1
         );
-        c.unzip_flavour = Some("ubuntu");
+        c.unzip_flavour = Some("debian");
         assert_eq!(unzip_differences(&c, &run(a, ""), &run(b, "")).len(), 1);
     }
 
@@ -219,7 +219,7 @@ mod unix {
              with modifications by Apple Inc.).\n",
             env!("CARGO_PKG_VERSION")
         );
-        let ubuntu_ours = format!(
+        let debian_ours = format!(
             "UnZip 6.00 of 20 April 2009, by stuffr {} (altered; Debian's build, original by \
              Info-ZIP).\n",
             env!("CARGO_PKG_VERSION")
@@ -237,16 +237,16 @@ mod unix {
         assert!(unzip_differences(&c, &run(apple), &run(&ours)).is_empty());
         // The other flavour's banner, or the reference's own text, differs.
         assert_eq!(
-            unzip_differences(&c, &run(apple), &run(&ubuntu_ours)).len(),
+            unzip_differences(&c, &run(apple), &run(&debian_ours)).len(),
             1
         );
         assert_eq!(
             unzip_differences(&c, &run(apple), &run("UnZip 6.00")).len(),
             1
         );
-        c.unzip_flavour = Some("ubuntu");
-        let ubuntu = "UnZip 6.00 of 20 April 2009, by Debian. Original by Info-ZIP.\n";
-        assert!(unzip_differences(&c, &run(ubuntu), &run(&ubuntu_ours)).is_empty());
+        c.unzip_flavour = Some("debian");
+        let debian = "UnZip 6.00 of 20 April 2009, by Debian. Original by Info-ZIP.\n";
+        assert!(unzip_differences(&c, &run(debian), &run(&debian_ours)).is_empty());
     }
 
     #[test]
@@ -339,12 +339,12 @@ mod unix {
             return;
         }
         let mut c = unzip_case("env", vec![], vec![]);
-        c.unzip_flavour = Some("ubuntu");
+        c.unzip_flavour = Some("debian");
         let theirs = String::from_utf8(run_program(env, &c, false).stdout).unwrap();
         let ours = String::from_utf8(run_program(env, &c, true).stdout).unwrap();
         assert!(!theirs.contains("STUFFR_UNZIP_FLAVOR"), "{theirs}");
         assert!(
-            ours.lines().any(|l| l == "STUFFR_UNZIP_FLAVOR=ubuntu"),
+            ours.lines().any(|l| l == "STUFFR_UNZIP_FLAVOR=debian"),
             "{ours}"
         );
         for out in [&theirs, &ours] {

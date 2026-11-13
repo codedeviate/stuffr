@@ -71,8 +71,9 @@ stderr and exit codes (thirty-four names; `unzip -Z` is `zipinfo`).
 `stuffr install-links --dir DIR` makes the links, and nothing makes them for
 you. The gzip names follow the platform (GNU gzip, or
 Apple's on macOS and the BSDs); `STUFFR_GZIP_FLAVOR=gnu|bsd` overrides that.
-The unzip names are Info-ZIP UnZip 6.00 in Apple's or Ubuntu's build, the same
-way; `STUFFR_UNZIP_FLAVOR=apple|ubuntu` overrides that.
+The unzip names are Info-ZIP UnZip 6.00 in Apple's or Debian 13's build, the
+same way; `STUFFR_UNZIP_FLAVOR=apple|debian` overrides that (`ubuntu` is an
+alias of `debian`).
 The compress names are Apple's `compress` (487.0.1) on macOS and the BSDs and
 ncompress 5.0 elsewhere; `STUFFR_COMPRESS_FLAVOR=apple|ncompress` overrides that.
 
@@ -90,7 +91,7 @@ The notices ship as `LICENSE-bzip2`, `LICENSE-gzip-bsd`, `LICENSE-xz`,
 GPL-2.0-or-later and was not read; it is a clean-room implementation from lz4's
 documentation and behaviour); `LICENSE-lz4` is liblz4's BSD-2-Clause notice,
 for the `lz4-c` tier that links it. The unzip family is ported from Info-ZIP
-UnZip 6.0 (Apple's `zip-33` tree, with Debian's patches for the Ubuntu
+UnZip 6.0 (Apple's `zip-33` tree, with Debian's patches for the Debian
 flavour) under the Info-ZIP licence, `LICENSE-infozip`; it is an altered
 version, not an Info-ZIP release. The compress family is ported from Apple's
 `compress.c` and `zopen.c` (`LICENSE-compress-bsd`, BSD-3-Clause) and from

@@ -5,7 +5,7 @@
 //! The path is built as the C builds it, into [`Checkdir::buildpath`] and
 //! then `G.filename` (`uz.filename`): under Apple's tree it starts with the
 //! root's real absolute path (`G.rootpath`, no trailing `/`), under
-//! upstream's (Ubuntu) with the `-d` operand and a `/`, or nothing. Every
+//! upstream's (Debian) with the `-d` operand and a `/`, or nothing. Every
 //! file-system operation takes the part after the root ([`target`]) and
 //! goes through the beneath walk (`beneath.rs`, deviation 3).
 
@@ -42,9 +42,9 @@ pub(crate) struct Checkdir {
     /// upstream: the operand and a `/`), `G.rootlen` its length (0: none).
     pub(crate) rootpath: Vec<u8>,
     /// apple: unix.c:1169, `G.rootdir`: the root's descriptor. For the
-    /// Ubuntu flavour the `-d` root's (upstream keeps only the path).
+    /// Debian flavour the `-d` root's (upstream keeps only the path).
     pub(crate) rootdir: Option<Root>,
-    /// The Ubuntu flavour's paths without a root (no `-d`, or a name
+    /// The Debian flavour's paths without a root (no `-d`, or a name
     /// renamed to an absolute one): walked beneath the current directory
     /// (deviation 3).
     pub(crate) cwd: Option<Root>,
@@ -73,7 +73,7 @@ impl Checkdir {
 /// "No such file or directory"). Here such a path is "No such file or
 /// directory" for every operation. Upstream builds it relative (the
 /// leading `/` is dropped) and walks it from the current directory, as the
-/// Ubuntu flavour does here.
+/// Debian flavour does here.
 pub(crate) fn target<'a>(uz: &'a Uz, full: &'a [u8]) -> io::Result<(&'a Root, &'a [u8])> {
     let ck = &uz.ck;
     let rootlen = ck.rootlen();
@@ -131,7 +131,7 @@ pub(crate) fn shown(uz: &mut Uz, full: &[u8]) -> Vec<u8> {
 
 /// The text `strerror()` gives for `e`: an escape is `EACCES`, as Apple's
 /// `open_outfile()` converts `ENOTCAPABLE` (apple: fileio.c:314), and as
-/// the Ubuntu flavour answers for what it cannot create (deviation 3).
+/// the Debian flavour answers for what it cannot create (deviation 3).
 pub(crate) fn strerror(_uz: &Uz, e: &io::Error) -> Vec<u8> {
     if beneath::is_escape(e) {
         return host::strerror(&beneath::eacces());
@@ -282,7 +282,7 @@ pub(crate) fn checkdir_root(uz: &mut Uz, pathcomp: &[u8]) -> i32 {
     MPN_OK
 }
 
-/// The Ubuntu flavour's root for paths without one (deviation 3): the
+/// The Debian flavour's root for paths without one (deviation 3): the
 /// current directory, opened once.
 pub(crate) fn open_cwd(uz: &mut Uz) {
     if uz.ck.cwd.is_none() {
@@ -320,7 +320,7 @@ fn checkdir_append_dir(uz: &mut Uz, pathcomp: &[u8]) -> i32 {
     } else {
         // ruling: deviation 3. Upstream's `stat()` follows a symlink out of
         // the root and sees what is there; here such a path is taken for
-        // the directory Ubuntu would usually find, so the entry goes on to
+        // the directory Debian would usually find, so the entry goes on to
         // its create, which is refused ("cannot create ... Permission
         // denied"), and nothing outside is looked at to decide.
         match stat(uz, &b) {
@@ -443,7 +443,7 @@ pub(crate) fn filtattr(uz: &Uz, perms: u32) -> u32 {
 /// `.` and `..` as a last component become `_` and `__`. A directory entry
 /// is made here and answers `MPN_CREATED_DIR` (or `MPN_INF_SKIP` when it
 /// existed). `pinfo` is the entry's `G.pInfo` (its `file_attr` may change),
-/// `extra_field` its local extra field (`G.extra_field`), which the Ubuntu
+/// `extra_field` its local extra field (`G.extra_field`), which the Debian
 /// flavour's `-F` reads.
 pub(crate) fn mapname(
     uz: &mut Uz,
@@ -470,7 +470,7 @@ pub(crate) fn mapname(
 
     let mut pathcomp: Vec<u8> = Vec::new(); // initialize translation buffer
     let mut lastsemi: Option<usize> = None;
-    // ubuntu: -DACORN_FTYPE_NFS: `lastcomma` points into the C's
+    // debian: -DACORN_FTYPE_NFS: `lastcomma` points into the C's
     // `pathcomp[]` and is not reset between components, so the filetype
     // check can read what an earlier component left there; `image` is that
     // array as the C writes it (every byte put, every terminator).
@@ -518,7 +518,7 @@ pub(crate) fn mapname(
                 // keep for now; remove VMS ";##"
                 put(&mut pathcomp, &mut image, b';');
             }
-            // ubuntu: -DACORN_FTYPE_NFS
+            // debian: -DACORN_FTYPE_NFS
             b',' if acorn => {
                 // NFS filetype extension
                 lastcomma = Some(pathcomp.len());
@@ -618,7 +618,7 @@ pub(crate) fn mapname(
         }
     }
 
-    // ubuntu: -DACORN_FTYPE_NFS
+    // debian: -DACORN_FTYPE_NFS
     // translate Acorn filetype information if asked to do so
     if acorn
         && uz.o.acorn_nfs_ext
@@ -678,7 +678,7 @@ const SPARKID_2: u32 = 0x3043_5241;
 const EF_SPARK: u16 = 0x4341;
 
 // port: process.c:getRISCOSexfield
-/// ubuntu: -DACORN_FTYPE_NFS. `getRISCOSexfield()`: the extra field's
+/// debian: -DACORN_FTYPE_NFS. `getRISCOSexfield()`: the extra field's
 /// first SparkFS block of 20 or 24 bytes whose data starts `ARC0`, from its
 /// header on (`RO_extra_block`: the load address at offset 8), else `None`.
 fn get_riscos_exfield(ef: &[u8]) -> Option<&[u8]> {

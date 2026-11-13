@@ -1,4 +1,4 @@
-//! ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch's
+//! debian: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch's
 //! bomb detection (`flavour::detects_overlapped_entries`): a sorted list of
 //! the archive spans already covered (`cover_t`), and its three functions.
 //!

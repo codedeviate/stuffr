@@ -319,8 +319,10 @@ mod tests {
     /// The zip flavour `run_in_counted` gets; the other families ignore it.
     const Z: zip::Flavour = zip::Flavour::Apple;
 
-    /// `STUFFR_UNZIP_FLAVOR` selects `apple` or `ubuntu`, unset or empty is
-    /// the default, and anything else (another case, a blank) is refused.
+    /// `STUFFR_UNZIP_FLAVOR` selects `apple` or `debian` (`ubuntu`, the
+    /// Linux flavour's name until 0.27.0, is an alias of `debian`), unset or
+    /// empty is the default, and anything else (another case, a blank) is
+    /// refused.
     #[test]
     fn flavour_var_rejects_other_values() {
         let d = unzip::default_flavour();
@@ -331,10 +333,14 @@ mod tests {
             Ok(unzip::Flavour::Apple)
         );
         assert_eq!(
-            unzip::flavour_from(Some("ubuntu".into())),
-            Ok(unzip::Flavour::Ubuntu)
+            unzip::flavour_from(Some("debian".into())),
+            Ok(unzip::Flavour::Debian)
         );
-        for bad in ["Apple", "UBUNTU", " apple", "debian", "bsd"] {
+        assert_eq!(
+            unzip::flavour_from(Some("ubuntu".into())),
+            Ok(unzip::Flavour::Debian)
+        );
+        for bad in ["Apple", "UBUNTU", " apple", "Debian", "DEBIAN", "bsd"] {
             assert_eq!(unzip::flavour_from(Some(bad.into())), Err(bad.into()));
         }
     }
@@ -353,7 +359,7 @@ mod tests {
         let (code, out, _) = run("unzip", unzip::Flavour::Apple);
         assert_eq!(code, 0);
         assert!(out.contains("Please report bugs to Apple."), "{out}");
-        let (_, out, _) = run("unzip", unzip::Flavour::Ubuntu);
+        let (_, out, _) = run("unzip", unzip::Flavour::Debian);
         assert!(!out.contains("Apple"), "{out}");
         let (code, out, _) = run("zipinfo", U);
         assert_eq!(code, 0);

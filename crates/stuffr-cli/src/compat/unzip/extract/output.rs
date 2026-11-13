@@ -657,7 +657,7 @@ impl EntrySrc {
 
 impl EntrySrc {
     // port: fileio.c:fillinbuf
-    /// `fillinbuf()` (ubuntu: -DUSE_BZIP2): the next block read into the
+    /// `fillinbuf()` (debian: -DUSE_BZIP2): the next block read into the
     /// buffer, the bytes past the entry hidden, the rest decrypted; the
     /// count left in it, 0 at the end of the file or after a failed
     /// `read()` (which stays in `G.incnt`, unreported: `UZbunzip2()` takes
@@ -723,7 +723,7 @@ pub(crate) fn defer_leftover_input(zin: &mut ZipIn, csize: &mut i64) {
 // port: fileio.c:undefer_input
 /// `undefer_input()`: give the hidden bytes back (and what the decoder left
 /// of the entry).
-/// ubuntu: 22-cve-2019-13232-fix-bug-in-undefer-input.patch clamps a
+/// debian: 22-cve-2019-13232-fix-bug-in-undefer-input.patch clamps a
 /// negative `G.csize` to 0 first (`flavour::cve_2019_13232_undefer_input`,
 /// Task 14).
 pub(crate) fn undefer_input(uz: &mut Uz, zin: &mut ZipIn, csize: &mut i64) {

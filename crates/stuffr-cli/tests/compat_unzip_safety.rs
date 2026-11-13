@@ -18,7 +18,7 @@ mod unix {
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::Path;
 
-    const FLAVOURS: [&str; 2] = ["apple", "ubuntu"];
+    const FLAVOURS: [&str; 2] = ["apple", "debian"];
 
     /// stuffr as `flavour`, `unzip args` over `files` after `setup`.
     fn run(
@@ -153,7 +153,7 @@ mod unix {
 
     /// A symlink the archive makes and a file meant to go through it, in one
     /// archive: symlinks are made last (deferred), so the file meets a
-    /// placeholder, not a door. The Ubuntu flavour then makes each symlink,
+    /// placeholder, not a door. The Debian flavour then makes each symlink,
     /// and it is only a link; the Apple flavour (macOS 27.2's build) refuses
     /// both, as they leave the root.
     #[test]
@@ -183,7 +183,7 @@ mod unix {
                 let what = format!("{f} {args:?}: exit {} stderr {:?}", r.code, r.stderr);
                 assert!(under(&r.tree, "outside").is_empty(), "{what}");
                 // Apple (macOS 27.2's build) refuses both escaping links;
-                // Ubuntu makes them, as links only
+                // Debian makes them, as links only
                 if f == "apple" {
                     assert!(!r.tree.contains_key(&b"dst/s"[..]), "{what}");
                     assert!(!r.tree.contains_key(&b"dst/t"[..]), "{what}");
@@ -234,7 +234,7 @@ mod unix {
     /// symlink whose target leaves the extraction root, `symlink error:
     /// Permission denied` each, exit 2, the rest made; with and without
     /// `-d`, under `-:`, `-o` and `-q`; a pre-existing `pre -> ..` on the
-    /// way counts. The Ubuntu flavour makes every link as stored.
+    /// way counts. The Debian flavour makes every link as stored.
     #[test]
     fn escaping_symlinks_by_flavour() {
         fn pre(w: &Path) {
@@ -494,7 +494,7 @@ mod unix {
     /// A real full disk (fix round 1): `RLIMIT_FSIZE` with `SIGXFSZ`
     /// ignored, so a write past the limit fails (`EFBIG`) mid-entry, the
     /// decoder holding the window. Against this platform's reference when
-    /// it has one (Apple on macOS, Ubuntu on Linux), stuffr in its flavour:
+    /// it has one (Apple on macOS, Debian on Linux), stuffr in its flavour:
     /// the same streams, exit code and file sizes, with no answer and with
     /// `y`. Without a reference: the question and exit 50.
     #[test]
@@ -660,7 +660,7 @@ mod unix {
     /// ruling: T10-2. Apple's `close_outfile()` falls off its end without a
     /// `return` on a regular file (undefined behaviour); its binary answers
     /// as 0, so the decoder's error is replaced and the CRC check follows
-    /// (` bad CRC 00000000`). The Ubuntu flavour (upstream) keeps the error
+    /// (` bad CRC 00000000`). The Debian flavour (upstream) keeps the error
     /// and prints no CRC line. Both keep the file, exit 2.
     #[test]
     fn a_failed_inflate_then_the_crc_is_each_trees_own() {
@@ -698,7 +698,7 @@ mod unix {
     /// ruling: T10-3. A name given at "new name: " that is absolute: Apple's
     /// tree reads its relative part past the built path (stale memory: its
     /// binary said "No such file or directory"), stuffr says so for every
-    /// operation; upstream (Ubuntu) drops the leading `/` and extracts it
+    /// operation; upstream (Debian) drops the leading `/` and extracts it
     /// under the current directory.
     #[test]
     fn an_absolute_new_name() {
@@ -728,15 +728,15 @@ mod unix {
             "{}",
             apple.stderr
         );
-        let ubuntu = run(
-            "ubuntu",
+        let debian = run(
+            "debian",
             &["a.zip"],
             &[("a.zip", z)],
             Some(existing),
             Some(b"r\n/abs/dir/renamed.txt\n"),
         );
-        assert_eq!(ubuntu.code, 0, "{}", ubuntu.stderr);
-        assert!(ubuntu.tree.contains_key(&b"abs/dir/renamed.txt"[..]));
+        assert_eq!(debian.code, 0, "{}", debian.stderr);
+        assert!(debian.tree.contains_key(&b"abs/dir/renamed.txt"[..]));
     }
 
     /// ruling: T10-11. When the output cannot be made after an earlier entry

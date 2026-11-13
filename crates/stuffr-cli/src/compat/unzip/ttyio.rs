@@ -1,7 +1,7 @@
 //! `ttyio.c`: the password prompt (`getp()`, the `ATH_BEO_UNX` one that
 //! reads `/dev/tty`), the pager's key (`zgetch()`, `FGETCH(0)`) and the
 //! screen size (`screensize()`). Apple's tree has upstream's file
-//! unchanged, and no Ubuntu patch touches it.
+//! unchanged, and no Debian patch touches it.
 //!
 //! The terminal's mode is changed through [`TtyMode`], which puts it back
 //! on every path (ruling T11-1); a typed password lives in a [`Password`],

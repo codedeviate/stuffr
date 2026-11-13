@@ -3,7 +3,7 @@
 //! the flavour's codes, and writes nothing outside its directory.
 
 use super::*;
-use crate::compat::unzip::{EXIT_CODES_APPLE, EXIT_CODES_UBUNTU, Flavour, run_in_counted};
+use crate::compat::unzip::{EXIT_CODES_APPLE, EXIT_CODES_DEBIAN, Flavour, run_in_counted};
 use std::ffi::OsString;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -185,7 +185,7 @@ fn bases() -> Vec<Vec<u8>> {
                 method: 9,
                 ..deflated(b"d64.txt", &text)
             },
-            // Ubuntu's build options (Task 13): bzip2, a Unicode Path, a
+            // Debian's build options (Task 13): bzip2, a Unicode Path, a
             // SparkFS filetype
             bzipped(b"bz.txt", &text, bzip2(&text)),
             E {
@@ -253,7 +253,7 @@ fn hostile_archives_never_panic_or_leave_the_root() {
                     z.truncate(cut);
                 }
             }
-            for f in [Flavour::Apple, Flavour::Ubuntu] {
+            for f in [Flavour::Apple, Flavour::Debian] {
                 for args in runs {
                     let d = Dir::new("hostile");
                     let root = d.0.join("root");
@@ -264,7 +264,7 @@ fn hostile_archives_never_panic_or_leave_the_root() {
                         run_in_counted(f, &root, "unzip", &argv, b"y\nr\nnew.txt\nA\n", &|_| None);
                     let codes = match f {
                         Flavour::Apple => EXIT_CODES_APPLE,
-                        Flavour::Ubuntu => EXIT_CODES_UBUNTU,
+                        Flavour::Debian => EXIT_CODES_DEBIAN,
                     };
                     assert!(
                         codes.contains(&code),
@@ -376,7 +376,7 @@ fn a_spent_budget_is_a_full_disk() {
         deflated(b"big.bin", &big),
         stored(b"small.txt", b"small\n", 0o100644 << 16),
     ]);
-    for f in [Flavour::Apple, Flavour::Ubuntu] {
+    for f in [Flavour::Apple, Flavour::Debian] {
         for args in [
             &["-o", "a.zip"][..],
             &["-c", "a.zip"],
@@ -402,7 +402,7 @@ fn a_spent_budget_is_a_full_disk() {
                     // Apple's extraction reaches the warning (its
                     // `close_outfile()` replaces the code: T10-2), its `-c`,
                     // `-p`, `-t` return first; upstream always warns
-                    let warned = f == Flavour::Ubuntu || args[0] == "-o";
+                    let warned = f == Flavour::Debian || args[0] == "-o";
                     assert_eq!(
                         err.contains("big.bin is probably truncated\n"),
                         warned,
@@ -449,7 +449,7 @@ fn a_comment_pause_reads_the_run_input() {
     z[n - 2..].copy_from_slice(&(comment.len() as u16).to_le_bytes());
     z.extend_from_slice(comment);
     let h = hide();
-    for f in [Flavour::Apple, Flavour::Ubuntu] {
+    for f in [Flavour::Apple, Flavour::Debian] {
         let d = Dir::new("pause");
         std::fs::write(d.0.join("root/cs.zip"), &z).unwrap();
         let (code, out, err) = run_piped(&d, f, &["-o", "cs.zip"], b"q");
@@ -487,7 +487,7 @@ fn a_comment_pause_reads_the_run_input() {
 #[test]
 fn the_pager_pages_the_usage_to_a_pipe() {
     let d = Dir::new("pager");
-    for f in [Flavour::Apple, Flavour::Ubuntu] {
+    for f in [Flavour::Apple, Flavour::Debian] {
         let (_, plain, _) = run_piped(&d, f, &["-h"], b"");
         let lines = plain.lines().count();
         assert!(lines >= 22, "{lines}");
@@ -510,7 +510,7 @@ fn the_pager_pages_the_usage_to_a_pipe() {
     }
 }
 
-// ---- Ubuntu's build options (Task 13): the rulings, stuffr-only ----
+// ---- Debian's build options (Task 13): the rulings, stuffr-only ----
 
 /// `data` compressed by stuffr's bzip2 encoder.
 fn bzip2(data: &[u8]) -> Vec<u8> {
@@ -564,7 +564,7 @@ fn sandboxed(f: Flavour, z: &[u8], args: &[&str]) -> (i32, String, String, Dir) 
     )
 }
 
-/// T13-2: where Ubuntu's `UZbunzip2()` calls libbzip2 for ever (a stream
+/// T13-2: where Debian's `UZbunzip2()` calls libbzip2 for ever (a stream
 /// cut short; a stream followed by more bytes in an entry of several
 /// buffers), stuffr ends as running out of data does: "invalid compressed
 /// data to bunzip", exit 2. A whole stream tests OK, and Apple's build has
@@ -583,13 +583,13 @@ fn bzip2_rulings() {
         ([large.as_slice(), &[0u8; 20000]].concat(), &big),
     ] {
         let z = zip(&[bzipped(b"s.txt", plain, body)]);
-        let (code, out, err, _d) = sandboxed(Flavour::Ubuntu, &z, &["-t", "a.zip"]);
+        let (code, out, err, _d) = sandboxed(Flavour::Debian, &z, &["-t", "a.zip"]);
         assert_eq!(code, 2, "{out}{err}");
         assert!(out.contains(error), "{out}");
         assert_eq!(err, "");
     }
     let z = zip(&[bzipped(b"s.txt", &line, small.clone())]);
-    let (code, out, _, _d) = sandboxed(Flavour::Ubuntu, &z, &["-t", "a.zip"]);
+    let (code, out, _, _d) = sandboxed(Flavour::Debian, &z, &["-t", "a.zip"]);
     assert_eq!(code, 0, "{out}");
     // `"%8sing: %-22s  %s%s"` then `" OK"`
     let ok = format!("{:>8}ing: {:<23}  OK\n", "test", "s.txt");
@@ -622,13 +622,13 @@ fn acorn_filetype_is_bit_31_of_the_load_address() {
             ..stored(b"y", b"y", 0o100644 << 16)
         },
     ]);
-    let (code, out, err, d) = sandboxed(Flavour::Ubuntu, &z, &["-F", "a.zip"]);
+    let (code, out, err, d) = sandboxed(Flavour::Debian, &z, &["-F", "a.zip"]);
     assert_eq!(code, 0, "{out}{err}");
     let root = d.0.join("root");
     assert!(root.join("x,000").is_file(), "{out}");
     assert!(root.join("y,ffd").is_file(), "{out}");
     for (f, args) in [
-        (Flavour::Ubuntu, &["a.zip"][..]),
+        (Flavour::Debian, &["a.zip"][..]),
         (Flavour::Apple, &["a.zip"]),
     ] {
         let (code, out, err, d) = sandboxed(f, &z, args);
@@ -642,7 +642,7 @@ fn acorn_filetype_is_bit_31_of_the_load_address() {
 /// T13-5 and T13-6, the Unicode Path rulings (the sandbox's locale is C):
 /// a block shorter than its five fixed bytes reads zeros past the field
 /// (version 0, so "checksum invalid", here for both blocks); `-U` keeps a
-/// 10-byte `#L` escape whole (where Ubuntu's `strcat` overflows); without
+/// 10-byte `#L` escape whole (where Debian's `strcat` overflows); without
 /// `-U` the patched path cuts it to the buffer, with its warning.
 #[test]
 fn unicode_rulings() {
@@ -662,7 +662,7 @@ fn unicode_rulings() {
             ..stored(b"s3.txt", b"x", 0o100644 << 16)
         },
     ]);
-    let (code, out, err, _d) = sandboxed(Flavour::Ubuntu, &z, &["-l", "a.zip"]);
+    let (code, out, err, _d) = sandboxed(Flavour::Debian, &z, &["-l", "a.zip"]);
     assert_eq!(code, 0, "{out}{err}");
     // the listing's name column: three blanks, then the name
     let named = |n: &str| format!("{:3}{n}\n", "");
@@ -683,16 +683,16 @@ fn unicode_rulings() {
         extra: unipath(&five),
         ..stored(b"f.txt", b"x", 0o100644 << 16)
     }]);
-    let (code, out, err, _d) = sandboxed(Flavour::Ubuntu, &z, &["-U", "-l", "a.zip"]);
+    let (code, out, err, _d) = sandboxed(Flavour::Debian, &z, &["-U", "-l", "a.zip"]);
     assert_eq!((code, err.as_str()), (0, ""), "{out}");
     assert!(out.contains(&named("#L03ffffff")), "{out}");
-    let (code, out, err, _d) = sandboxed(Flavour::Ubuntu, &z, &["-l", "a.zip"]);
+    let (code, out, err, _d) = sandboxed(Flavour::Debian, &z, &["-l", "a.zip"]);
     assert_eq!(code, 0, "{out}{err}");
     assert!(out.contains(&named("#L03ffff")), "{out}");
     assert_eq!(err, "warning:  filename too long (P1) -- truncating.\n");
 }
 
-/// ruling: T14-2 (ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-
+/// ruling: T14-2 (debian: 23-cve-2019-13232-zip-bomb-with-overlapped-
 /// entries.patch). `G.zip64` is set by a Unicode Path block that
 /// getUnicodeData() takes, so after a bit-3 entry with one the descriptor
 /// skip reads 8 more bytes: here into the next local header, which then
@@ -722,10 +722,10 @@ fn a_taken_unicode_path_makes_the_descriptor_skip_zip64() {
         stored(b"b.txt", b"bye\n", 0o100644 << 16),
     ]);
     let overlapped = "error: invalid zip file with overlapped components (possible zip bomb)\n";
-    let (code, out, err, _d) = sandboxed(Flavour::Ubuntu, &with, &["-t", "a.zip"]);
+    let (code, out, err, _d) = sandboxed(Flavour::Debian, &with, &["-t", "a.zip"]);
     assert_eq!(code, 12, "{out}{err}");
     assert!(out.ends_with(overlapped), "{out}");
-    for (f, z) in [(Flavour::Ubuntu, &without), (Flavour::Apple, &with)] {
+    for (f, z) in [(Flavour::Debian, &without), (Flavour::Apple, &with)] {
         let (code, out, err, _d) = sandboxed(f, z, &["-t", "a.zip"]);
         assert_eq!(code, 0, "{f:?}: {out}{err}");
     }
@@ -760,4 +760,73 @@ fn apple_overwrite_checks_see_the_existing_file_in_a_sandbox() {
         b"from the archive\n"
     );
     assert!(!err.contains("directory attributes"), "{err}");
+}
+
+/// An Info-ZIP VMS block (`IM`, "VFAB", `EB_IZVMS_BCDEFL`, size 32) whose
+/// memextract() payload is `method` with `crc` over `data`.
+fn izvms_block(method: u16, crc_of: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut d = b"VFAB".to_vec();
+    d.extend_from_slice(&2u16.to_le_bytes());
+    d.extend_from_slice(&32u16.to_le_bytes());
+    d.extend_from_slice(&[0; 4]);
+    d.extend_from_slice(&method.to_le_bytes());
+    d.extend_from_slice(&crc(crc_of).to_le_bytes());
+    d.extend_from_slice(data);
+    let mut b = 0x4d49u16.to_le_bytes().to_vec();
+    b.extend_from_slice(&(d.len() as u16).to_le_bytes());
+    b.extend_from_slice(&d);
+    b
+}
+
+/// ruling: T2-1. A deflated VMS block read when `-a` starts an entry's
+/// output inflates while the entry's decoder holds the window: it gets a
+/// window of its own (this panicked before 0.27.0, "window of 0 bytes"),
+/// and the entry is read as VMS records when the block says so. With a
+/// bad CRC the block still counts in Apple's flavour (extract_izvms_block()
+/// uses the buffer anyway) and not in Debian's (can-2026-2034442.patch).
+#[test]
+fn a_deflated_vms_block_read_while_flushing() {
+    let mut fab = vec![0u8; 32];
+    fab[31] = 2; // VMSREC_C_VAR
+    let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(&fab).unwrap();
+    let body = enc.finish().unwrap();
+    let records = b"\x05\x00hello\x00\x03\x00abc\x00";
+    for (crc_of, flavour, vms) in [
+        (&fab[..], Flavour::Apple, true),
+        (&fab[..], Flavour::Debian, true),
+        (&b"other"[..], Flavour::Apple, true),
+        (&b"other"[..], Flavour::Debian, false),
+    ] {
+        let d = Dir::new("vmsdefl");
+        let mut e = stored(b"v.txt", records, 0o100644 << 16);
+        e.host = 2;
+        e.extra = izvms_block(8, crc_of, &body);
+        std::fs::write(d.0.join("root/v.zip"), zip(&[e])).unwrap();
+        let (code, _, err) = run_piped(&d, flavour, &["-aa", "v.zip"], b"");
+        let got = std::fs::read(d.0.join("root/v.txt")).unwrap();
+        let what = format!("{flavour:?} {}", crc_of == &fab[..]);
+        assert_eq!(code, 0, "{what}: {err}");
+        assert_eq!(got == b"hello\nabc\n", vms, "{what}: {got:?}");
+    }
+}
+
+/// can-2026-2034442.patch: a stored VMS block longer than its size is
+/// refused in Debian's flavour (the entry is plain text); Apple's copies it
+/// whole and reads the records.
+#[test]
+fn a_stored_vms_block_longer_than_its_size() {
+    let mut fab = vec![0u8; 40];
+    fab[31] = 2;
+    for (flavour, vms) in [(Flavour::Apple, true), (Flavour::Debian, false)] {
+        let d = Dir::new("vmsover");
+        let mut e = stored(b"v.txt", b"\x05\x00hello\x00", 0o100644 << 16);
+        e.host = 2;
+        e.extra = izvms_block(0, &fab, &fab);
+        std::fs::write(d.0.join("root/v.zip"), zip(&[e])).unwrap();
+        let (code, _, err) = run_piped(&d, flavour, &["-aa", "v.zip"], b"");
+        let got = std::fs::read(d.0.join("root/v.txt")).unwrap();
+        assert_eq!(code, 0, "{flavour:?}: {err}");
+        assert_eq!(got == b"hello\n", vms, "{flavour:?}: {got:?}");
+    }
 }

@@ -6,7 +6,7 @@
 //! each group while nothing else runs.
 //!
 //! This platform's flavour against its reference: Apple's on macOS,
-//! Ubuntu's on Linux (`make compat-ubuntu`).
+//! Debian's on Linux (`make compat-debian`).
 
 #[cfg(unix)]
 mod compat_harness;

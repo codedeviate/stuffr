@@ -219,7 +219,7 @@ fn test_compr_eb(uz: &mut Uz, eb: &[u8], eb_size: usize, compr_offset: usize) ->
     // For STORE method, compressed and uncompressed sizes must agree.
     let eb_compr_method = fileio::makeword(&eb[EB_HEADSIZE + compr_offset..]);
     // apple: extract.c:2307 counts the 6-byte compression header as data;
-    // ubuntu: 12-cve-2014-9636-test-compr-eb.patch does not.
+    // debian: 12-cve-2014-9636-test-compr-eb.patch does not.
     let stored_len = if flavour::cve_2014_9636_stored_size(uz.flavour) {
         (eb_size - compr_offset - EB_CMPRHEADLEN) as u64
     } else {
@@ -239,7 +239,9 @@ fn test_compr_eb(uz: &mut Uz, eb: &[u8], eb_size: usize, compr_offset: usize) ->
 // port: extract.c:memextract
 /// `memextract(tgt, tgtsize, src, srcsize)`: `src` (method word, CRC, data)
 /// stored or inflated into at most `tgtsize` bytes (`memflush()`: more is
-/// `PK_DISK`), then its CRC checked. Returns the code and the bytes (kept
+/// `PK_DISK`; a stored block longer than that is `PK_ERR` in Debian 13,
+/// can-2026-2034442.patch, and copied whole by Apple's, past its buffer),
+/// then its CRC checked. Returns the code and the bytes (kept
 /// only up to `keep`, for the VMS block's record attributes).
 fn memextract_keep(uz: &mut Uz, tgtsize: u64, src: &[u8], keep: usize) -> (i32, Vec<u8>) {
     let method = fileio::makeword(src);
@@ -249,13 +251,29 @@ fn memextract_keep(uz: &mut Uz, tgtsize: u64, src: &[u8], keep: usize) -> (i32, 
     let mut crc = flate2::Crc::new();
     let mut kept = Vec::new();
     match method {
+        // debian: can-2026-2034442.patch
+        STORED if flavour::memextract_checks_room(uz.flavour) && data.len() as u64 > tgtsize => {
+            error = PK_ERR;
+        }
         STORED => {
             crc.update(data);
             kept.extend_from_slice(&data[..data.len().min(keep)]);
         }
         DEFLATED | ENHDEFLATED => {
             let mut outsize = tgtsize;
-            let mut slide = std::mem::take(&mut uz.slide);
+            // ruling: T2-1 (0.27.0). Called from `flush()` (a VMS block
+            // read when `-a` starts an entry's output), the C inflates
+            // into `G.slide`, the very buffer being flushed, and the
+            // entry's output becomes what the block inflated to. Here the
+            // outer decoder holds the window (`uz.slide` empty), so the
+            // block inflates into a window of its own and the entry's
+            // output is left as it was.
+            let held = uz.slide.is_empty();
+            let mut slide = if held {
+                vec![0u8; stuffr::infozip::WSIZE].into_boxed_slice()
+            } else {
+                std::mem::take(&mut uz.slide)
+            };
             let r = {
                 let cell = RefCell::new(&mut *uz);
                 let mut src = data.iter();
@@ -284,8 +302,10 @@ fn memextract_keep(uz: &mut Uz, tgtsize: u64, src: &[u8], keep: usize) -> (i32, 
                     &mut message,
                 )
             };
-            uz.slide = slide;
-            uz.restore_slide();
+            if !held {
+                uz.slide = slide;
+                uz.restore_slide();
+            }
             if let Err(stop) = r {
                 let r = match stop {
                     Stop::Code(c) => c,
@@ -427,7 +447,11 @@ fn extract_izvms_block(uz: &mut Uz, ebdata: &[u8], keep: usize) -> Option<Vec<u8
     match cmptype {
         EB_IZVMS_BCSTOR => Some(body[..usiz.min(keep)].to_vec()),
         EB_IZVMS_BC00 => Some(decompress_bits(usiz.min(keep), body)),
-        EB_IZVMS_BCDEFL => Some(memextract_keep(uz, usiz as u64, &pad6(body), keep).1),
+        EB_IZVMS_BCDEFL => {
+            let (r, kept) = memextract_keep(uz, usiz as u64, &pad6(body), keep);
+            // debian: can-2026-2034442.patch
+            (r == PK_OK || !flavour::memextract_checks_room(uz.flavour)).then_some(kept)
+        }
         _ => None,
     }
 }

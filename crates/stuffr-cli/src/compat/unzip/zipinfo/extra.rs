@@ -374,6 +374,9 @@ fn field_specific(uz: &mut Uz, eb_id: u16, data: &[u8], p_endprev: &mut u64) -> 
                 return false;
             }
             show_mac_type_creator(uz, &data[4..12]);
+            // debian: can-2026-2034443.patch cuts the length byte to 31,
+            // which is this ruling's answer, so Debian 13's is defined
+            // and the same; Apple's build is still the unpatched C.
             // ruling: the C copies 31 bytes into `filenameBuf[32]` and
             // writes its NUL at `filenameBuf[ef_ptr[32]]`, which a length
             // byte above 31 puts outside the array (undefined behaviour;

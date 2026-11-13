@@ -1268,7 +1268,7 @@ pub struct Case<'a> {
     /// `TZ` for both sides; `None` is `UTC`, so no run depends on the
     /// machine's zone (unzip's times are local).
     pub tz: Option<&'a str>,
-    /// The unzip family's flavour (`apple`, `ubuntu`), given to stuffr's
+    /// The unzip family's flavour (`apple`, `debian`), given to stuffr's
     /// side only, as `STUFFR_UNZIP_FLAVOR`: a suite compares stuffr in the
     /// reference's flavour whatever the platform's default is, and the
     /// reference never sees the variable.

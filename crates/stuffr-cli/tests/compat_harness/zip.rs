@@ -50,7 +50,11 @@ pub const ZIP_HELP_HEADERS: [&str; 4] = [
 /// The flavour whose reference this platform has: `apple` on macOS and
 /// the BSDs, `ubuntu` elsewhere (the family's own default).
 pub fn platform_zip_flavour() -> &'static str {
-    platform_unzip_flavour()
+    if platform_unzip_flavour() == "apple" {
+        "apple"
+    } else {
+        "ubuntu"
+    }
 }
 
 /// The installed apt `zip` package's version, `None` without `dpkg-query`

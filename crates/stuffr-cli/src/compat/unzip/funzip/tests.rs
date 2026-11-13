@@ -99,7 +99,7 @@ fn a_two_byte_field_cut_short_reads_high_ones() {
 
 /// ruling: T12-3. An encrypted gzip member's check byte is a header byte
 /// a gzip header never fills (`h[9]` with bit 3 of MTIME's third byte,
-/// else `h[15]`): it is 0, as Ubuntu's binary gives every time (Apple's
+/// else `h[15]`): it is 0, as Debian's binary gives every time (Apple's
 /// gives 0 for `h[9]` and stack garbage for `h[15]`).
 #[test]
 fn an_encrypted_gzip_member_checks_against_zero() {

@@ -471,43 +471,17 @@ fn funzip_takes_a_password_then_a_file() {
     assert_eq!((got.password.as_deref(), got.input), (Some(&b""[..]), None));
 }
 
-/// ubuntu: 20-unzip60-alt-iconv-utf8.patch's `-I`/`-O`, attached or as the
-/// next argument, kept to 25 bytes, the rest of the argument used up.
-/// ruling: T14-7. `-I ''` is an empty `ISO_CP` and the next argument is an
-/// option again (the C's `while(*(++s));` past the empty string's NUL is
-/// not reproduced). Apple has no such options.
+/// Debian 13 has no `-I`/`-O` (Ubuntu's 20-unzip60-alt-iconv-utf8.patch,
+/// until 0.26.0): in either flavour they are bad options, the usage and
+/// exit 10.
 #[test]
-fn charsets_are_taken_as_ubuntu_takes_them() {
-    let ubuntu = |zipinfo: bool, args: &[&str]| parse_as(Flavour::Ubuntu, zipinfo, args, &[]);
-    let r = ubuntu(false, &["-I", "", "-l", "a.zip"]);
-    assert_eq!(ok(&r).archive, "a.zip");
-    assert_eq!((r.o.iso_cp.as_slice(), r.o.vflag), (&b""[..], 1));
-    let r = ubuntu(false, &["-OCP866q", "-I", "ISO-8859-5", "-l", "a.zip"]);
-    assert_eq!(ok(&r).archive, "a.zip");
-    assert_eq!(r.o.oem_cp, b"CP866q");
-    assert_eq!(r.o.iso_cp, b"ISO-8859-5");
-    let long = "x".repeat(30);
-    let r = ubuntu(true, &["-1O", &long, "a.zip"]);
-    assert_eq!(ok(&r).archive, "a.zip");
-    assert_eq!(r.o.oem_cp, vec![b'x'; 25]);
-    for (args, msg) in [
-        (
-            &["-O"][..],
-            "error:  a valid character encoding should follow the -O argument",
-        ),
-        (
-            &["-O-l", "a.zip"],
-            "error:  a valid character encoding should follow the -I argument",
-        ),
-        (&["--I", "x", "a.zip"], "error:  encodings can't be negated"),
-    ] {
-        let r = ubuntu(false, args);
-        assert_eq!(
-            (&r.parsed.as_ref().err(), r.err.as_str()),
-            (&Some(&10), msg),
-            "{args:?}"
-        );
+fn charset_options_are_bad_options() {
+    for f in [Flavour::Apple, Flavour::Debian] {
+        for zipinfo in [false, true] {
+            for args in [&["-I", "x", "a.zip"][..], &["-OCP866", "a.zip"]] {
+                let r = parse_as(f, zipinfo, args, &[]);
+                assert_eq!(r.parsed.as_ref().err(), Some(&10), "{f:?} {args:?}");
+            }
+        }
     }
-    let r = unzip(&["-I", "x", "a.zip"]);
-    assert_eq!(r.parsed.as_ref().err(), Some(&10));
 }

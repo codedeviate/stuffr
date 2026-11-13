@@ -4,14 +4,14 @@
 //!
 //! Each row is tagged with the flavour whose reference it was recorded on
 //! ([`Which`]); a row runs on its own platform's reference only (Apple on
-//! macOS, Ubuntu on Linux: CI and `make compat-ubuntu`). Two uses:
+//! macOS, Debian on Linux: CI and `make compat-debian`). Two uses:
 //! - `recorded_rows_hold_on_the_reference` (always on) runs every row of
 //!   this platform's flavour on the reference and checks the recording, so
 //!   the table cannot rot;
 //! - `taskN_rows_match_stuffr` runs the rows Task N implemented against
 //!   stuffr in that flavour (`assert_same_unzip`); every task's runs now,
-//!   none is ignored. R13: on Ubuntu a row whose answer needs a patch of its
-//!   series runs under Task 14 ([`Row::needs_patch`]); Ubuntu's build
+//!   none is ignored. R13: on Debian a row whose answer needs a patch of its
+//!   series runs under Task 14 ([`Row::needs_patch`]); Debian's build
 //!   options are Task 13's.
 //!
 //! Every row runs under `LANG=C` and `TZ=UTC` (the harness's defaults);
@@ -30,7 +30,7 @@ mod unix {
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Which {
         Apple,
-        Ubuntu,
+        Debian,
         /// Both gave exactly this answer.
         Both,
     }
@@ -40,19 +40,19 @@ mod unix {
         if platform_unzip_flavour() == "apple" {
             Which::Apple
         } else {
-            Which::Ubuntu
+            Which::Debian
         }
     }
 
     /// One probed command and what the reference did (2026-10-20).
     struct Row {
         flavour: Which,
-        /// The task whose differential runs the row (on Ubuntu, a `Both`
+        /// The task whose differential runs the row (on Debian, a `Both`
         /// row that needs a patch runs under Task 14: [`Row::task_here`]).
         task: u8,
-        /// The Ubuntu patch a `Both` row's answer needs there (R13: Task
+        /// The Debian patch a `Both` row's answer needs there (R13: Task
         /// 14's), named for the record.
-        ubuntu_patch: Option<&'static str>,
+        debian_patch: Option<&'static str>,
         label: &'static str,
         name: &'static str,
         args: Vec<&'static str>,
@@ -81,14 +81,14 @@ mod unix {
 
         fn task_here(&self) -> u8 {
             match (self.flavour, own()) {
-                (Which::Both, Which::Ubuntu) if self.ubuntu_patch.is_some() => 14,
+                (Which::Both, Which::Debian) if self.debian_patch.is_some() => 14,
                 _ => self.task,
             }
         }
 
-        /// The row's Ubuntu side needs `patch` (Task 14, R13).
+        /// The row's Debian side needs `patch` (Task 14, R13).
         fn needs_patch(mut self, patch: &'static str) -> Row {
-            self.ubuntu_patch = Some(patch);
+            self.debian_patch = Some(patch);
             self
         }
 
@@ -142,7 +142,7 @@ mod unix {
         Row {
             flavour,
             task,
-            ubuntu_patch: None,
+            debian_patch: None,
             label,
             name,
             args: args.to_vec(),
@@ -388,8 +388,8 @@ mod unix {
         "  unzip -fo foo ReadMe => quietly replace existing ReadMe if archive file newer\n",
     );
 
-    /// Ubuntu's `unzip` usage after its banner line.
-    const UBUNTU_USAGE: &str = concat!(
+    /// Debian's `unzip` usage after its banner line.
+    const DEBIAN_USAGE: &str = concat!(
         "\n",
         "Usage: unzip [-Z] [-opts[modifiers]] file[.zip] [list] [-x xlist] [-d exdir]\n",
         "  Default action is to extract files in list, except those in xlist, to exdir;\n",
@@ -408,9 +408,6 @@ mod unix {
         "  -C  match filenames case-insensitively     -L  make (some) names lowercase\n",
         "  -X  restore UID/GID info                   -V  retain VMS version numbers\n",
         "  -K  keep setuid/setgid/tacky permissions   -M  pipe through \"more\" pager\n",
-        "  -O CHARSET  specify a character encoding for DOS, Windows and OS/2 archives\n",
-        "  -I CHARSET  specify a character encoding for UNIX and other archives\n",
-        "\n",
         "See \"unzip -hh\" or unzip.txt for more help.  Examples:\n",
         "  unzip data1 -x joe   => extract all files except joe from zipfile data1.zip\n",
         "  unzip -p foo | more  => send contents of foo.zip via pipe into program more\n",
@@ -438,8 +435,9 @@ mod unix {
         "  -x  exclude filenames that follow from listing\n",
     );
 
-    /// Ubuntu's zipinfo usage after its banner line (adds `-O`/`-I`).
-    const UBUNTU_ZIPINFO_USAGE: &str = concat!(
+    /// Debian's zipinfo usage after its banner line (Apple's: Debian 13 has no
+    /// `-O`/`-I`).
+    const DEBIAN_ZIPINFO_USAGE: &str = concat!(
         "\n",
         "List name, date/time, attribute, size, compression method, etc., about files\n",
         "in list (excluding those in xlist) contained in the specified .zip archive(s).\n",
@@ -457,8 +455,6 @@ mod unix {
         "  -z  print zipfile comment   -T  print file times in sortable decimal format\n",
         "  -C  be case-insensitive     -M  page output through built-in \"more\"\n",
         "  -x  exclude filenames that follow from listing\n",
-        "  -O CHARSET  specify a character encoding for DOS, Windows and OS/2 archives\n",
-        "  -I CHARSET  specify a character encoding for UNIX and other archives\n",
     );
 
     /// The end of Apple's `unzip -v`: compile options and environment (the
@@ -485,9 +481,9 @@ mod unix {
         "      ZIPINFOOPT:  [none]\n",
     );
 
-    /// The end of Ubuntu's `unzip -v` under `LANG=C` (`char coding: other`;
-    /// the UTF-8 locales are `compat_unzip_ubuntu::ubuntu_build_rows`').
-    const UBUNTU_OPTIONS: &str = concat!(
+    /// The end of Debian's `unzip -v` under `LANG=C` (`char coding: other`;
+    /// the UTF-8 locales are `compat_unzip_debian::debian_build_rows`').
+    const DEBIAN_OPTIONS: &str = concat!(
         "UnZip special compilation options:\n",
         "        ACORN_FTYPE_NFS\n",
         "        COPYRIGHT_CLEAN (PKZIP 0.9x unreducing method not supported)\n",
@@ -544,9 +540,10 @@ mod unix {
         use Which::*;
         let a = || vec![("a.zip", a_zip())];
         let mut v = Vec::new();
-        // Usage, help, version, a bad option (Task 7). On Ubuntu `-v` is its
-        // build options' (Task 13); the usage texts carry the `-O`/`-I`
-        // lines of 20-unzip60-alt-iconv-utf8.patch (Task 14).
+        // Usage, help, version, a bad option (Task 7). On Debian `-v` is its
+        // build options' (Task 13); the usage texts are Apple's bar the `-U`
+        // line (Debian 13 has no 20-unzip60-alt-iconv-utf8.patch, so no
+        // `-O`/`-I` lines).
         for (who, task, version_task, usage, zipinfo, options, banner) in [
             (
                 Apple,
@@ -558,13 +555,13 @@ mod unix {
                 APPLE_UNZIP_BANNER,
             ),
             (
-                Ubuntu,
+                Debian,
                 14,
                 13,
-                UBUNTU_USAGE,
-                UBUNTU_ZIPINFO_USAGE,
-                UBUNTU_OPTIONS,
-                UBUNTU_UNZIP_BANNER,
+                DEBIAN_USAGE,
+                DEBIAN_ZIPINFO_USAGE,
+                DEBIAN_OPTIONS,
+                DEBIAN_UNZIP_BANNER,
             ),
         ] {
             v.extend([
@@ -737,7 +734,6 @@ mod unix {
         // Task 7's probes both references answer alike (2026-10-20).
         let long: &'static str = Box::leak("a".repeat(16225).into_boxed_str());
         v.extend([
-            // Ubuntu's extended help gains the patch's `-I`/`-O` lines.
             row(
                 Both,
                 7,
@@ -748,8 +744,7 @@ mod unix {
                 0,
                 "\nExtended Help for UnZip\n",
                 "",
-            )
-            .needs_patch("20-unzip60-alt-iconv-utf8.patch"),
+            ),
             row(
                 Both,
                 7,
@@ -806,7 +801,7 @@ mod unix {
                 "error:  must give decryption password with -P option\n",
             ),
             // Under -t the message and the usage go to standard output
-            // (Ubuntu's usage has the patch's `-O`/`-I` lines).
+            // (Debian's usage opens with 02-this-is-debian-unzip's banner).
             row(
                 Both,
                 7,
@@ -818,7 +813,7 @@ mod unix {
                 INVALID_OPTIONS,
                 "",
             )
-            .needs_patch("20-unzip60-alt-iconv-utf8.patch"),
+            .needs_patch("02-this-is-debian-unzip.patch"),
             row(
                 Both,
                 7,
@@ -831,7 +826,7 @@ mod unix {
                 "",
             )
             .env(&[("UNZIP", "-t")])
-            .needs_patch("20-unzip60-alt-iconv-utf8.patch"),
+            .needs_patch("02-this-is-debian-unzip.patch"),
             row(
                 Both,
                 7,
@@ -970,7 +965,7 @@ mod unix {
             ),
         ]);
         // Listing (Task 8): what does not print a date is the same in both
-        // builds (Ubuntu's dates are year first: `DF_YMD`).
+        // builds (Debian's dates are year first: `DF_YMD`).
         v.extend([
             row(
                 Both,
@@ -1877,7 +1872,7 @@ mod unix {
                 "",
             ),
         ]);
-        // The overlapped archive: Apple tests both entries; Ubuntu's
+        // The overlapped archive: Apple tests both entries; Debian's
         // bomb-detection patch (Task 14) stops at the second, exit 12.
         v.extend([
             row(
@@ -1897,7 +1892,7 @@ mod unix {
                 "",
             ),
             row(
-                Ubuntu,
+                Debian,
                 14,
                 "overlapped",
                 "unzip",
@@ -2563,8 +2558,8 @@ mod unix {
     }
 
     /// Task 7's rows (options, usage, banners, the environment): this
-    /// platform's and the `Both` ones (on Ubuntu, its usage texts are Task
-    /// 14's: the iconv patch's `-O`/`-I` lines).
+    /// platform's and the `Both` ones (on Debian, its usage texts are Task
+    /// 14's: 02-this-is-debian-unzip's banner).
     #[test]
     fn task7_rows_match_stuffr() {
         differential(7);
@@ -2601,14 +2596,14 @@ mod unix {
         differential(12);
     }
 
-    /// Task 13's rows: Ubuntu's `-v` (its build options); the rest of
-    /// Task 13's differential is `compat_unzip_ubuntu::ubuntu_build_rows`.
+    /// Task 13's rows: Debian's `-v` (its build options); the rest of
+    /// Task 13's differential is `compat_unzip_debian::debian_build_rows`.
     #[test]
     fn task13_rows_match_stuffr() {
         differential(13);
     }
 
-    /// Task 14's rows: Ubuntu's answers that need its patch series (each
+    /// Task 14's rows: Debian's answers that need its patch series (each
     /// `Both` row names its patch: [`Row::needs_patch`]).
     #[test]
     fn task14_rows_match_stuffr() {
@@ -2722,17 +2717,17 @@ mod unix {
     /// nothing here touches a macOS-only facility, so Linux CI runs it too.
     #[test]
     fn rulings_on_undefined_behaviour() {
-        for flavour in ["apple", "ubuntu"] {
+        for flavour in ["apple", "debian"] {
             eprintln!("flavour {flavour}");
             // The only text the flavours print differently here: -v's date
-            // column (Apple mm-dd-yyyy, Ubuntu yyyy-mm-dd).
+            // column (Apple mm-dd-yyyy, Debian yyyy-mm-dd).
             let (d2020, d1980) = if flavour == "apple" {
                 ("01-02-2020", "00-01-1980")
             } else {
                 ("2020-01-02", "1980-00-01")
             };
             // ruling: list.c's `methbuf` overflow (Apple dies with SIGTRAP, exit
-            // 133): a method above 999 prints as Ubuntu's CVE-2014-9913 patch
+            // 133): a method above 999 prints as Debian's CVE-2014-9913 patch
             // prints it.
             let m = zip_with(
                 &[
@@ -2907,14 +2902,14 @@ mod unix {
 
     /// The rulings on zipinfo.c's undefined behaviour, pinned on stuffr
     /// alone. On the `attribs[16]` and `methbuf[5]` overflows Apple's
-    /// build dies by `__sprintf_chk` (SIGTRAP, exit 133) and Ubuntu's by
-    /// FORTIFY (`*** buffer overflow detected ***`), except where Ubuntu's
+    /// build dies by `__sprintf_chk` (SIGTRAP, exit 133) and Debian's by
+    /// FORTIFY (`*** buffer overflow detected ***`), except where Debian's
     /// CVE-2016-9844 patch prints `03E8`; the SmartZip and INT_MIN answers
     /// are what both references happened to print (probe: `zipinfo -s`,
     /// `-v`, `-t` of each archive here, both references).
     #[test]
     fn zipinfo_rulings() {
-        for flavour in ["apple", "ubuntu"] {
+        for flavour in ["apple", "debian"] {
             eprintln!("flavour {flavour}");
             let one = |spec: CentralSpec, args: &[&'static str]| {
                 let z = central_only(&[spec], None, b"");
@@ -2952,7 +2947,7 @@ mod unix {
                 line(&one(host(b"t", 0x1264, 0x8000 << 16), &["-m"])),
                 "SHMWREXWR   10.0 ths        1 b-  0% stor 20-Jan-02 03:04 t"
             );
-            // ruling: `methbuf[5]` overflowed by a method above 999: Ubuntu's
+            // ruling: `methbuf[5]` overflowed by a method above 999: Debian's
             // CVE-2016-9844 form, four hex digits.
             let m = |method: u16| CentralSpec {
                 method,

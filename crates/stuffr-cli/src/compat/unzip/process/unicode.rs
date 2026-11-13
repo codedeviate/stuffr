@@ -1,4 +1,4 @@
-//! ubuntu: -DUNICODE_SUPPORT -DUNICODE_WCHAR. process.c's Unicode part:
+//! debian: -DUNICODE_SUPPORT -DUNICODE_WCHAR. process.c's Unicode part:
 //! `getUnicodeData()`, which finds an entry's UTF-8 name in its Unicode
 //! Path extra block (`0x7075`), and the conversions `do_string()` runs a
 //! UTF-8 name through when the locale is not UTF-8 (or `-U` asks for
@@ -6,14 +6,16 @@
 //! `wctomb()`, or as an escape (`#U00e9`, `#L01f600`) where the locale has
 //! no encoding for it.
 //!
-//! ruling: T13-1. This code exists only in Ubuntu's build (Apple's has no
-//! `UNICODE_SUPPORT`), so it has one form in any reference, Ubuntu's
-//! patched one: CVE-2021-4217.patch (a Unicode block with no name read is
-//! `PK_ERR`) and 28-cve-2022-0529-and-cve-2022-0530.patch (a name that is
-//! not UTF-8 is "Unicode filename corrupt"; an escape that would overflow
-//! the buffer is cut short with a warning) are ported as they apply, under
-//! `// ubuntu:` comments, without a Task 14 hook: no flavour runs this
-//! code without them.
+//! ruling: T13-1. This code exists only in Debian's build (Apple's has no
+//! `UNICODE_SUPPORT`), so it has one form, the patched one:
+//! 28-cve-2022-0529-and-cve-2022-0530.patch (a name that is not UTF-8 is
+//! "Unicode filename corrupt"; an escape that would overflow the buffer is
+//! cut short with a warning) is ported as it applies, under `// debian:`
+//! comments, without a Task 14 hook. So is CVE-2021-4217.patch (a Unicode
+//! block with no name read is `PK_ERR`), which Ubuntu 24.04 carried and
+//! Debian 13 does not: its build dereferences a NULL name there and dies
+//! ("zipfile probably corrupt (segmentation violation)", exit 3), and stuffr
+//! keeps the patched answer (deviation 11).
 
 use super::super::fileio;
 use super::super::messages as m;
@@ -90,7 +92,8 @@ pub(crate) fn get_unicode_data(uz: &mut Uz, ef: &[u8], full: Option<&[u8]>) -> (
                 at(ef, offset + 3),
             ]);
             offset += 4;
-            // ubuntu: CVE-2021-4217.patch
+            // deviation 11: Ubuntu's CVE-2021-4217.patch, kept (Debian 13
+            // has no such patch and dereferences NULL here)
             let Some(full) = full else {
                 // Check if we have a unicode extra section but no filename
                 // set
@@ -121,7 +124,7 @@ pub(crate) fn get_unicode_data(uz: &mut Uz, ef: &[u8], full: Option<&[u8]>) -> (
                     UniPath::Name(name)
                 }
             };
-            // ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-
+            // debian: 23-cve-2019-13232-zip-bomb-with-overlapped-
             // entries.patch (its `G.zip64 = TRUE` hunk landed here, in
             // getUnicodeData(), not in getZip64Data())
             uz.zip64 = true;
@@ -240,7 +243,7 @@ fn wide_to_local_string(uz: &mut Uz, wide: &[u32], escape_all: bool) -> Vec<u8> 
             buffer.extend_from_slice(&mb);
         } else {
             // no MB for this wide: use escape for wide character
-            // ubuntu: 28-cve-2022-0529-and-cve-2022-0530.patch
+            // debian: 28-cve-2022-0529-and-cve-2022-0530.patch
             let escape = wide_to_escape_string(w);
             let room = buffer_size.saturating_sub(buffer.len() + 1);
             let n = if escape.len() > room {
@@ -259,7 +262,7 @@ fn wide_to_local_string(uz: &mut Uz, wide: &[u32], escape_all: bool) -> Vec<u8> 
 // port: process.c:utf8_to_local_string
 /// `utf8_to_local_string(utf8, escape_all)`: the C string `utf8` in the
 /// locale's encoding; `None` when it is not UTF-8.
-/// ubuntu: 28-cve-2022-0529-and-cve-2022-0530.patch (`NULL` for a name
+/// debian: 28-cve-2022-0529-and-cve-2022-0530.patch (`NULL` for a name
 /// that does not convert, where upstream went on with a null pointer).
 pub(crate) fn utf8_to_local_string(uz: &mut Uz, utf8: &[u8], escape_all: bool) -> Option<Vec<u8>> {
     let wide = utf8_to_wide_string(utf8)?;

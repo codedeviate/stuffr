@@ -235,18 +235,19 @@ fn oem_names_are_code_page_850() {
     });
 }
 
-/// ruling: T14-4. The Ubuntu flavour has no OEM table (20-unzip60-alt-
-/// iconv-utf8.patch): a sandbox converts nothing, a Windows NT name of any
-/// version included.
+/// The Debian flavour converts OEM names through the same OEM 850 table as
+/// Apple's (Debian 13 has no 20-unzip60-alt-iconv-utf8.patch): MS-DOS
+/// names and Windows NT 5.0 ones, never an NT 2.0 one.
 #[test]
-fn ubuntu_names_stay_as_stored_in_a_sandbox() {
+fn debian_names_go_through_the_oem_table() {
     let env = |_: &str| None;
     let mut err: Vec<u8> = Vec::new();
-    let mut uz = Uz::new(sandbox(), Flavour::Ubuntu, &env, &mut err);
-    crate::compat::unzip::unix::charset::init_conversion_charsets(&mut uz);
-    assert!(uz.o.oem_cp.is_empty());
-    uz.o.oem_cp = b"CP866".to_vec();
-    for (hostnum, hostver) in [(FS_FAT_, 20), (FS_NTFS_, 20), (FS_NTFS_, 50)] {
+    let uz = Uz::new(sandbox(), Flavour::Debian, &env, &mut err);
+    for (hostnum, hostver, want) in [
+        (FS_FAT_, 20, &b"caf\xe9\0\x82"[..]),
+        (FS_NTFS_, 20, b"caf\x82\0\x82"),
+        (FS_NTFS_, 50, b"caf\xe9\0\x82"),
+    ] {
         let p = PInfo {
             hostnum,
             hostver,
@@ -254,19 +255,19 @@ fn ubuntu_names_stay_as_stored_in_a_sandbox() {
         };
         let mut s = *b"caf\x82\0\x82";
         ext_ascii_to_native(&uz, &mut s, &p, false);
-        assert_eq!(&s, b"caf\x82\0\x82");
+        assert_eq!(&s[..], want, "{hostnum} {hostver}");
     }
 }
 
 /// ruling: T11-5. The first password prompt names the archive and the
-/// entry while both, filtered, fit `2*FILNAMSIZ` bytes (Apple 2048, Ubuntu
-/// 8192), else it is "Enter password: " (ubuntu:
+/// entry while both, filtered, fit `2*FILNAMSIZ` bytes (Apple 2048, Debian
+/// 8192), else it is "Enter password: " (debian:
 /// 20-cve-2018-1000035-unzip-buffer-overflow.patch; Apple's build dies one
 /// byte past its buffer).
 #[test]
 fn the_password_prompt_fits_its_buffer() {
     let env = |_: &str| None;
-    for (f, room) in [(Flavour::Apple, 2048), (Flavour::Ubuntu, 8192)] {
+    for (f, room) in [(Flavour::Apple, 2048), (Flavour::Debian, 8192)] {
         let mut err: Vec<u8> = Vec::new();
         let mut uz = Uz::new(sandbox(), f, &env, &mut err);
         let zfn = b"lon3.zip";

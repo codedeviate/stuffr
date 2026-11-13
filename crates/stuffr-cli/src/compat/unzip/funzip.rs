@@ -1,9 +1,9 @@
 //! `funzip.c` (fUnZip 3.95, Mark Adler): the first entry of a zip archive,
 //! or a gzip member, from standard input or a file, to standard output.
 //!
-//! Apple's `funzip.c` is upstream's byte for byte and no Ubuntu patch
+//! Apple's `funzip.c` is upstream's byte for byte and no Debian patch
 //! touches it (only the manual page and the Makefile), so both flavours
-//! run this one port; no build option of Ubuntu's reaches it (probed: the
+//! run this one port; no build option of Debian's reaches it (probed: the
 //! same answers for every input of the Task 12 table on both references).
 //! The banner of its usage is the one flavour difference (deviation 2).
 //!
@@ -365,7 +365,7 @@ fn filter(uz: &mut Uz, src: &mut Src, password: Option<&[u8]>) -> i32 {
     // first local header (GZPHDR < LOCHDR)
     // ruling: T12-3. The bytes a gzip header never fills are 0.
     // probe: an encrypted gzip member under `funzip -pw`, every check byte
-    // 0..=255 (gzenc.py): Ubuntu passes 0 only, every run; Apple passes 0
+    // 0..=255 (gzenc.py): Debian passes 0 only, every run; Apple passes 0
     // for `h[9]` and changing values for `h[15]`.
     let mut h = [0u8; LOCHDR];
     let g: bool; // true if gzip format

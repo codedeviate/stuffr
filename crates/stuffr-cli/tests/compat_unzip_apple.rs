@@ -905,7 +905,7 @@ mod macos {
     }
 
     /// Stays on macOS: the expected text needs Apple's `FILNAMSIZ` (1024) and
-    /// `PATH_MAX` (1024); Ubuntu's are 4096, so it prints another message.
+    /// `PATH_MAX` (1024); Debian's are 4096, so it prints another message.
     #[test]
     fn ruling_t8_7_wildcard_past_filnamsiz() {
         // ruling (T8-7): a wildcard whose directory part names a real

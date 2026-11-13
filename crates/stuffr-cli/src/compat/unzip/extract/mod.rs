@@ -10,7 +10,7 @@
 //! `stuffr::infozip`, the CRC); after the last block it makes the deferred
 //! symlinks and sets the made directories' attributes, deepest first.
 //! `crypt.rs` is crypt.c's `decrypt()`; `extra.rs` is `TestExtraField()`,
-//! `test_compr_eb()` and `memextract()`; `cover.rs` is Ubuntu's bomb
+//! `test_compr_eb()` and `memextract()`; `cover.rs` is Debian's bomb
 //! detection (23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch).
 //!
 //! Every count from the archive drives a loop, never an allocation beyond a
@@ -39,7 +39,7 @@ pub(crate) const PK_MEM3: i32 = 6;
 pub(crate) const PK_DISK: i32 = 50;
 pub(crate) const IZ_UNSUP: i32 = 81;
 pub(crate) const IZ_BADPWD: i32 = 82;
-/// unzip.h's `PK_BOMB` (ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-
+/// unzip.h's `PK_BOMB` (debian: 23-cve-2019-13232-zip-bomb-with-overlapped-
 /// entries.patch): likely zip bomb.
 pub(crate) const PK_BOMB: i32 = 12;
 
@@ -127,7 +127,7 @@ pub(crate) struct Ex {
     pub(crate) reported_backslash: bool,
     /// The keys decrypting the entry (`G.keys`), set by `decrypt()`.
     pub(crate) keys: Option<stuffr::infozip::crypt::Keys>,
-    /// `G.cover` (ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-
+    /// `G.cover` (debian: 23-cve-2019-13232-zip-bomb-with-overlapped-
     /// entries.patch): the spans tested or extracted so far.
     pub(crate) cover: cover::Cover,
 }
@@ -206,7 +206,7 @@ pub(crate) fn extract_or_test_files(uz: &mut Uz) -> i32 {
 
     let mut ex = Ex::new();
 
-    // ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch,
+    // debian: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch,
     // 24-cve-2019-13232-do-not-raise-alert-for-misplaced-central-
     // directory.patch: one more: initialize cover structure for bomb
     // detection. Start with spans that cover any extra bytes at the start,
@@ -374,7 +374,7 @@ pub(crate) fn extract_or_test_files(uz: &mut Uz) -> i32 {
                 error_in_archive = error;
             }
             // ...and keep going (unless disk full or user break)
-            // ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch
+            // debian: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch
             // (or a bomb)
             if ex.disk_full > 1 || uz.abort.is_some() || error == PK_BOMB {
                 // clear reached_end to signal premature stop ...
@@ -552,6 +552,8 @@ fn read_extra(uz: &mut Uz, ex: &mut Ex, e: &mut CentralEntry, length: usize, loc
         ex.extra_field = Some(field);
         return PK_EOF;
     }
+    // apple: CVE-2021-4217 (in Apple's tree); deviation 11 for Debian 13,
+    // whose build reads the uninitialised rest of the field
     if bytes_read != length {
         ex.extra_field = Some(field);
         return PK_ERR;
@@ -567,7 +569,7 @@ fn read_extra(uz: &mut Uz, ex: &mut Ex, e: &mut CentralEntry, length: usize, loc
         );
         error = PK_WARN;
     }
-    // ubuntu: -DUNICODE_SUPPORT (`G.pInfo`: the central header's bit 11,
+    // debian: -DUNICODE_SUPPORT (`G.pInfo`: the central header's bit 11,
     // also for a local field)
     if flavour::unicode_support(uz.flavour) {
         let pinfo = if local { ex.pinfo.pinfo } else { e.pinfo };
@@ -583,7 +585,7 @@ fn read_extra(uz: &mut Uz, ex: &mut Ex, e: &mut CentralEntry, length: usize, loc
     error
 }
 
-/// ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch and
+/// debian: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch and
 /// 24-cve-2019-13232-do-not-raise-alert-for-misplaced-central-
 /// directory.patch: the cover list started as `extract_or_test_files()`
 /// starts it: the central directory (a span that cannot be added is "not
@@ -765,7 +767,7 @@ fn extract_or_test_entrylist(
         // backward), skip to the target position and reset readbuf().
         let inbufsiz = fileio::INBUFSIZ as i64;
         let mut request = ex.pinfo.offset.wrapping_add(uz.zin.extra_bytes);
-        // ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch
+        // debian: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch
         if bombs && ex.cover.within(request) {
             uz.info(0x401, m::OVERLAPPED_COMPONENTS.as_bytes());
             return PK_BOMB;
@@ -877,7 +879,7 @@ fn extract_or_test_entrylist(
             error_in_archive = error; // only PK_EOF defined
             continue; // can still try next one
         }
-        // ubuntu: -DUNICODE_SUPPORT
+        // debian: -DUNICODE_SUPPORT
         if flavour::unicode_support(uz.flavour)
             && (uz.lrec.general_purpose_bit_flag & (1 << 11) == 1 << 11)
                 != ex.pinfo.pinfo.gpf_is_utf8
@@ -954,7 +956,7 @@ fn extract_or_test_entrylist(
         if uz.lrec.compression_method == 0 {
             let mut csiz_decrypted = uz.lrec.csize;
             if ex.pinfo.encrypted {
-                // ubuntu: 16-fix-integer-underflow-csiz-decrypted.patch:
+                // debian: 16-fix-integer-underflow-csiz-decrypted.patch:
                 // handle the error now to prevent unsigned overflow (the
                 // rest of this block of entries is dropped with it)
                 if flavour::csize_below_header_refused(uz.flavour) && csiz_decrypted < 12 {
@@ -1201,7 +1203,7 @@ fn extract_or_test_entrylist(
                 return error_in_archive; // (unless disk full)
             }
         }
-        // ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch
+        // debian: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch
         if bombs {
             let end = uz
                 .zin

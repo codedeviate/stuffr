@@ -18,7 +18,6 @@ use std::ffi::OsString;
 
 use super::flavour;
 use super::messages::{self as m, printf};
-use super::unix::charset;
 use super::{MSG_STDERR, PK_COOL, PK_OK, PK_PARAM, Uz};
 
 /// What the command line asks for once it has parsed: the archive operand,
@@ -37,10 +36,9 @@ pub(crate) struct Parsed {
     pub exdir: Option<OsString>,
 }
 
-/// The options: `unzip.h`'s `UzpOpts` (`uO`) as Apple's and Ubuntu's Unix
-/// builds have it, one field per member, plus the two option flags kept in
-/// `G` (`M_flag`) or in globals of Ubuntu's iconv patch (`ISO_CP`,
-/// `OEM_CP`). Counting flags are `i32`, as C's `int`; the defaults are
+/// The options: `unzip.h`'s `UzpOpts` (`uO`) as Apple's and Debian's Unix
+/// builds have it, one field per member, plus the option flag kept in `G`
+/// (`M_flag`). Counting flags are `i32`, as C's `int`; the defaults are
 /// `globalsCtor()`'s (zero, except `lflag`, see [`Options::new`]).
 ///
 /// This task only sets them; the archive tasks (8–14) read them.
@@ -67,7 +65,7 @@ pub(crate) struct Options {
     pub d_flag: i32,
     /// `-f`: `uO.fflag`, freshen existing files only (sets `uflag` too).
     pub fflag: bool,
-    /// `-F` (`ACORN_FTYPE_NFS`, Ubuntu): `uO.acorn_nfs_ext`, NFS filetype
+    /// `-F` (`ACORN_FTYPE_NFS`, Debian): `uO.acorn_nfs_ext`, NFS filetype
     /// extensions.
     pub acorn_nfs_ext: bool,
     /// zipinfo `-h`: `uO.hflag`, the header line.
@@ -96,7 +94,7 @@ pub(crate) struct Options {
     pub t_flag: bool,
     /// `-u` (and `-f`): `uO.uflag`, update.
     pub uflag: bool,
-    /// `-U` (counted, `UNICODE_SUPPORT`, Ubuntu): `uO.U_flag`, escape
+    /// `-U` (counted, `UNICODE_SUPPORT`, Debian): `uO.U_flag`, escape
     /// non-ASCII (`-UU`: ignore Unicode fields).
     pub u_flag: i32,
     /// `-l`/`-v` (counted; a first `-v` is 2): `uO.vflag`, list (verbosely);
@@ -104,7 +102,7 @@ pub(crate) struct Options {
     pub vflag: i32,
     /// `-V`: `uO.V_flag`, keep VMS version numbers.
     pub v_flag: bool,
-    /// `-W` (`WILD_STOP_AT_DIR`, Ubuntu): `uO.W_flag`, wildcards stop at
+    /// `-W` (`WILD_STOP_AT_DIR`, Debian): `uO.W_flag`, wildcards stop at
     /// `/`.
     pub w_flag: bool,
     /// `-X` (counted, `RESTORE_UIDGID`): `uO.X_flag`, restore owner and
@@ -119,14 +117,6 @@ pub(crate) struct Options {
     /// `-M`: `G.M_flag`, page output through the built-in "more" (cleared
     /// when standard output is not a terminal).
     pub m_flag: bool,
-    /// `-I CHARSET` (Ubuntu's `20-unzip60-alt-iconv-utf8.patch`): `ISO_CP`,
-    /// the encoding of names from Unix and other archives, as a C string
-    /// of at most `MAX_CP_NAME` bytes (empty: no conversion).
-    pub iso_cp: Vec<u8>,
-    /// `-O CHARSET` (the same patch): `OEM_CP`, the encoding of names from
-    /// DOS, Windows and OS/2 archives (its default guessed from the locale:
-    /// `unix::charset::init_conversion_charsets`).
-    pub oem_cp: Vec<u8>,
 }
 
 impl Options {
@@ -400,7 +390,7 @@ fn operands(uz: &mut Uz, argv: &[Vec<u8>]) -> Result<Parsed, i32> {
         // -d ignored
         uz.info(0x401, m::NOT_EXTRACTING.as_bytes());
     }
-    // ubuntu: -DUNICODE_SUPPORT (`UNICODE_WCHAR`): `-U` once escapes all
+    // debian: -DUNICODE_SUPPORT (`UNICODE_WCHAR`): `-U` once escapes all
     // non-ASCII.
     if flavour::unicode_support(uz.flavour) && uz.o.u_flag == 1 {
         uz.unicode_escape_all = true;
@@ -551,7 +541,7 @@ fn uz_opts(uz: &mut Uz, argv: &[Vec<u8>]) -> Result<usize, i32> {
                         uz.o.uflag = true;
                     }
                 }
-                // ubuntu: -DACORN_FTYPE_NFS
+                // debian: -DACORN_FTYPE_NFS
                 b'F' if flavour::acorn_ftype_nfs(f) => {
                     if negative != 0 {
                         uz.o.acorn_nfs_ext = false;
@@ -565,13 +555,6 @@ fn uz_opts(uz: &mut Uz, argv: &[Vec<u8>]) -> Result<usize, i32> {
                     if showhelp == 0 {
                         showhelp = if arg.get(s) == Some(&b'h') { 2 } else { 1 };
                     }
-                }
-                // ubuntu: 20-unzip60-alt-iconv-utf8.patch
-                b'I' | b'O' if flavour::iconv_charsets(f) => {
-                    let rest = &arg[s..];
-                    charset_option(uz, c == b'O', negative, rest, argv, &mut p, &mut argc)?;
-                    // No params straight after charset name
-                    s = arg.len();
                 }
                 b'j' => {
                     // junk pathnames/directory structure
@@ -716,7 +699,7 @@ fn uz_opts(uz: &mut Uz, argv: &[Vec<u8>]) -> Result<usize, i32> {
                 }
                 b'U' => {
                     if flavour::unicode_support(f) {
-                        // ubuntu: -DUNICODE_SUPPORT: escape UTF-8, or
+                        // debian: -DUNICODE_SUPPORT: escape UTF-8, or
                         // disable UTF-8 support
                         if negative != 0 {
                             uz.o.u_flag = (uz.o.u_flag - negative).max(0);
@@ -752,7 +735,7 @@ fn uz_opts(uz: &mut Uz, argv: &[Vec<u8>]) -> Result<usize, i32> {
                         uz.o.v_flag = true;
                     }
                 }
-                // ubuntu: -DWILD_STOP_AT_DIR
+                // debian: -DWILD_STOP_AT_DIR
                 b'W' if flavour::wild_stop_at_dir(f) => {
                     // Wildcard interpretation (stop at '/'?)
                     if negative != 0 {
@@ -983,13 +966,6 @@ fn zi_opts(uz: &mut Uz, argv: &[Vec<u8>]) -> Result<usize, i32> {
                         }
                     }
                 }
-                // ubuntu: 20-unzip60-alt-iconv-utf8.patch
-                b'I' | b'O' if flavour::iconv_charsets(f) => {
-                    let rest = &arg[s..];
-                    charset_option(uz, c == b'O', negative, rest, argv, &mut p, &mut argc)?;
-                    // No params straight after charset name
-                    s = arg.len();
-                }
                 b'T' => {
                     // use (sortable) decimal time format
                     if negative != 0 {
@@ -999,7 +975,7 @@ fn zi_opts(uz: &mut Uz, argv: &[Vec<u8>]) -> Result<usize, i32> {
                         uz.o.t_flag = true;
                     }
                 }
-                // ubuntu: -DUNICODE_SUPPORT
+                // debian: -DUNICODE_SUPPORT
                 b'U' if flavour::unicode_support(f) => {
                     // escape UTF-8, or disable UTF-8 support
                     if negative != 0 {
@@ -1018,7 +994,7 @@ fn zi_opts(uz: &mut Uz, argv: &[Vec<u8>]) -> Result<usize, i32> {
                         uz.o.lflag = 10;
                     }
                 }
-                // ubuntu: -DWILD_STOP_AT_DIR
+                // debian: -DWILD_STOP_AT_DIR
                 b'W' if flavour::wild_stop_at_dir(f) => {
                     // Wildcard interpretation (stop at '/'?)
                     if negative != 0 {
@@ -1106,12 +1082,7 @@ pub(crate) fn usage(uz: &mut Uz, error: bool) -> i32 {
         uz.info_fmt(flag, flavour::zipinfo_banner(f), &[version]);
         uz.info(flag, m::ZIPINFO_USAGE_LINE1.as_bytes());
         uz.info(flag, m::ZIPINFO_USAGE_LINE2.as_bytes());
-        let mut line3 = m::ZIPINFO_USAGE_LINE3.to_owned();
-        // ubuntu: 20-unzip60-alt-iconv-utf8.patch
-        if flavour::iconv_charsets(f) {
-            line3.push_str(m::ZIPINFO_USAGE_ICONV);
-        }
-        uz.info(flag, line3.as_bytes());
+        uz.info(flag, m::ZIPINFO_USAGE_LINE3.as_bytes());
     } else {
         // UnZip mode
         let mut line1 = Vec::new();
@@ -1121,15 +1092,11 @@ pub(crate) fn usage(uz: &mut Uz, error: bool) -> i32 {
         uz.info(flag, m::UNZIP_USAGE_LINE2.as_bytes());
         uz.info(flag, m::UNZIP_USAGE_LINE3.as_bytes());
         let mut line4 = m::UNZIP_USAGE_LINE4_HEAD.to_owned();
-        // ubuntu: -DUNICODE_SUPPORT
+        // debian: -DUNICODE_SUPPORT
         if flavour::unicode_support(f) {
             line4.push_str(m::UNZIP_USAGE_LINE4_UNICODE);
         }
         line4.push_str(m::UNZIP_USAGE_LINE4_TAIL);
-        // ubuntu: 20-unzip60-alt-iconv-utf8.patch
-        if flavour::iconv_charsets(f) {
-            line4.push_str(m::UNZIP_USAGE_LINE4_ICONV);
-        }
         uz.info(flag, line4.as_bytes());
         uz.info(flag, m::UNZIP_USAGE_LINE5.as_bytes());
     }
@@ -1140,75 +1107,11 @@ pub(crate) fn usage(uz: &mut Uz, error: bool) -> i32 {
 /// `unzip -hh`: the extended help, to standard output. Each line is printed
 /// with `"%s\n"`, so its text is not a format (`%%` stays two bytes).
 fn help_extended(uz: &mut Uz) {
-    let iconv = flavour::iconv_charsets(uz.flavour);
     for line in m::HELP_EXTENDED {
         let mut l = line.as_bytes().to_vec();
         l.push(b'\n');
         uz.info(0, &l);
-        // ubuntu: 20-unzip60-alt-iconv-utf8.patch
-        if iconv && let Some((_, more)) = m::HELP_EXTENDED_ICONV.iter().find(|(a, _)| a == line) {
-            for extra in *more {
-                let mut l = extra.as_bytes().to_vec();
-                l.push(b'\n');
-                uz.info(0, &l);
-            }
-        }
     }
-}
-
-// port: unzip.c:uz_opts, zipinfo.c:zi_opts (ubuntu: 20-unzip60-alt-iconv-
-// utf8.patch's `case ('I')` and `case ('O')`)
-/// `-I CHARSET` / `-O CHARSET` (`oem`): the name is the rest of the
-/// argument (`-Icharset`; none may start with `-`) or the next argument
-/// (which must not start with `-`), kept as `strncpy()` keeps it
-/// (`charset::cp_name`); either way the rest of the argument is used up.
-/// `Err(PK_PARAM)`, after the patch's message, when negated or missing.
-/// ruling: T14-7. `-I ''` makes the C's `while(*(++s));` step past the
-/// empty string's NUL (undefined behaviour); its defined effect, an empty
-/// `ISO_CP` (no conversion) and nothing more of that argument, is kept.
-fn charset_option(
-    uz: &mut Uz,
-    oem: bool,
-    negative: i32,
-    rest: &[u8],
-    argv: &[Vec<u8>],
-    p: &mut usize,
-    argc: &mut i64,
-) -> Result<(), i32> {
-    if negative != 0 {
-        uz.info(0x401, m::ENCODINGS_NEGATED.as_bytes());
-        return Err(PK_PARAM);
-    }
-    let name = if !rest.is_empty() {
-        // Handle the -Icharset case. Assume that charsets can't start with
-        // a dash to spot arguments misuse.
-        if rest[0] == b'-' {
-            uz.info(0x401, m::ENCODING_SHOULD_FOLLOW_I.as_bytes());
-            return Err(PK_PARAM);
-        }
-        rest.to_vec()
-    } else {
-        // -I charset
-        *p += 1;
-        *argc -= 1;
-        if !(*argc > 0 && argv.get(*p).is_some_and(|a| a.first() != Some(&b'-'))) {
-            let msg = if oem {
-                m::ENCODING_SHOULD_FOLLOW_O
-            } else {
-                m::ENCODING_SHOULD_FOLLOW_I
-            };
-            uz.info(0x401, msg.as_bytes());
-            return Err(PK_PARAM);
-        }
-        argv[*p].clone()
-    };
-    let cp = charset::cp_name(&name);
-    if oem {
-        uz.o.oem_cp = cp;
-    } else {
-        uz.o.iso_cp = cp;
-    }
-    Ok(())
 }
 
 // port: unzip.c:show_version_info
@@ -1233,7 +1136,7 @@ fn show_version_info(uz: &mut Uz) {
     version(uz);
     uz.info(0, m::COMPILE_OPTIONS.as_bytes());
     let mut opts: Vec<String> = Vec::new();
-    // ubuntu: -DACORN_FTYPE_NFS
+    // debian: -DACORN_FTYPE_NFS
     if flavour::acorn_ftype_nfs(f) {
         opts.push(m::OPT_ACORN_FTYPE_NFS.into());
     }
@@ -1250,7 +1153,7 @@ fn show_version_info(uz: &mut Uz) {
         ]
         .map(String::from),
     );
-    // ubuntu: -DUNICODE_SUPPORT (`UTF8_MAYBE_NATIVE`: the codeset
+    // debian: -DUNICODE_SUPPORT (`UTF8_MAYBE_NATIVE`: the codeset
     // `nl_langinfo(CODESET)` names, `UTF-8` or `other`; `fileio::init_locale`).
     if flavour::unicode_support(f) {
         let coding = if uz.native_is_utf8 {
@@ -1263,12 +1166,12 @@ fn show_version_info(uz: &mut Uz) {
         opts.push(String::from_utf8_lossy(&line).into_owned());
     }
     opts.extend([m::OPT_USE_LFS, m::OPT_USE_ZIP64].map(String::from));
-    // ubuntu: -DUSE_BZIP2
+    // debian: -DUSE_BZIP2
     if flavour::use_bzip2(f) {
         opts.push(m::OPT_USE_BZIP2.into());
     }
     opts.push(m::OPT_VMS_TEXT_CONV.into());
-    // ubuntu: -DWILD_STOP_AT_DIR
+    // debian: -DWILD_STOP_AT_DIR
     if flavour::wild_stop_at_dir(f) {
         opts.push(m::OPT_WILD_STOP_AT_DIR.into());
     }

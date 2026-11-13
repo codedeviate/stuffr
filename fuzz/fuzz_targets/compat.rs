@@ -5,7 +5,7 @@
 //! `lzma`, `unlzma`, `lzcat`) and the zstd family (0.14.0 Task 10: `zstd`,
 //! `unzstd`, `zstdcat`, `zstdmt`) and the lz4 family (0.15.0 Task 8:
 //! `lz4`, `unlz4`, `lz4cat`, `lz4c`) and the unzip family (0.16.0 Tasks 7
-//! and 15: `unzip`, `zipinfo`, `funzip`, each as Apple's and as Ubuntu's)
+//! and 15: `unzip`, `zipinfo`, `funzip`, each as Apple's and as Debian's)
 //! and the compress family (0.18.0: `compress`, `uncompress`, each as
 //! Apple's and as ncompress), through `stuffr_cli::compat::run_in_counted`
 //! and `bzip2recover::recover`.
@@ -32,7 +32,8 @@
 //! `stuffr_core::testing::decode_compat_case` (whose tables are the wire
 //! format of the seeds `crates/stuffr/tests/fuzz_corpus.rs` writes). The
 //! tool byte also picks the gzip and unzip flavours, `(byte / names) & 1`
-//! (R7: 0 GNU or Ubuntu, 1 BSD or Apple), and the compress family's: 0
+//! (R7: 0 GNU, Debian (unzip) or Ubuntu (zip), 1 BSD or Apple), and the
+//! compress family's: 0
 //! ncompress, 1 Apple (absolute, not relative to the platform's default, so
 //! a crash artifact replays the same personality everywhere). Each
 //! file the mask names is created holding the payload; with the mask's stdin
@@ -118,7 +119,7 @@
 //!   `a.br`, the twenty-first `COMPAT_FILES` entry (third mask byte, bit 21),
 //!   and the `-q`/`-w`/`-K`/`-C` forms.
 //! - the unzip family exits with one of its flavour's reference codes
-//!   (`unzip::EXIT_CODES_APPLE`, `unzip::EXIT_CODES_UBUNTU`), reads each
+//!   (`unzip::EXIT_CODES_APPLE`, `unzip::EXIT_CODES_DEBIAN`), reads each
 //!   archive within `check_unzip_reads`' bound (not linear: Apple's build
 //!   reads an entry once per central record naming it), keeps the output
 //!   budget over the whole extracted tree, writes nothing through the
@@ -1979,12 +1980,12 @@ fn check_unzip_cwd(dir: &Path, name: &str, args: &[&str]) {
 }
 
 /// The unzip family (0.16.0) through `compat::run_in_counted`, as the
-/// flavour the name byte gives (R7: 0 Ubuntu, 1 Apple, the same side as
+/// flavour the name byte gives (R7: 0 Debian, 1 Apple, the same side as
 /// gzip's GNU and BSD). Asserted:
 ///
 /// - the exit is one the flavour's reference gives
-///   (`unzip::EXIT_CODES_APPLE`, `unzip::EXIT_CODES_UBUNTU`: 12, `PK_BOMB`,
-///   is Ubuntu's alone); stuffr's own 3-7 never appear with their meanings,
+///   (`unzip::EXIT_CODES_APPLE`, `unzip::EXIT_CODES_DEBIAN`: 12, `PK_BOMB`,
+///   is Debian's alone); stuffr's own 3-7 never appear with their meanings,
 ///   and a panic is a crash;
 /// - the read bound (`check_unzip_reads`);
 /// - standard output plus every new or changed file anywhere under the
@@ -2001,7 +2002,7 @@ fn check_unzip_cwd(dir: &Path, name: &str, args: &[&str]) {
 ///   (`check_unzip_cwd`).
 fn run_unzip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]) {
     let flavour = if flavour == 0 {
-        unzip::Flavour::Ubuntu
+        unzip::Flavour::Debian
     } else {
         unzip::Flavour::Apple
     };
@@ -2028,7 +2029,7 @@ fn run_unzip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]) {
     }
     let codes = match flavour {
         unzip::Flavour::Apple => unzip::EXIT_CODES_APPLE,
-        unzip::Flavour::Ubuntu => unzip::EXIT_CODES_UBUNTU,
+        unzip::Flavour::Debian => unzip::EXIT_CODES_DEBIAN,
     };
     assert!(
         codes.contains(&code),
@@ -2181,7 +2182,7 @@ fn check_unzip_links(
 ///   locator and directory, the central directory, and its re-read after a
 ///   "missing bytes" correction. **Not linear, and no linear bound
 ///   applies:** Apple's build reads an entry's data once for every central
-///   record naming it (it has no overlap check; Ubuntu's patch 23 refuses
+///   record naming it (it has no overlap check; Debian's patch 23 refuses
 ///   the second, exit 12), and data that decodes to nothing (deflate's
 ///   empty stored blocks) costs no output budget, so one 60 KiB entry named
 ///   by a thousand records reads 60 MB, as Apple's `unzip -t` itself does.
@@ -2199,7 +2200,7 @@ fn check_unzip_links(
 /// it): 3 passes for `-t`, `-p`, extraction and `-l`/`-v`/zipinfo
 /// alike (`test-stored` 9,344 of 3,108 bytes, `test-implode` 7,259 of
 /// 2,413, `extract-deflate` 1,994 of 658; zipinfo and `-l` 1,336 of 658,
-/// 2 passes, no entry data). Ubuntu's overlapped refusal stops at 512 of
+/// 2 passes, no entry data). Debian's overlapped refusal stops at 512 of
 /// 246. funzip reads its file operand once (658 of 658).
 fn check_unzip_reads(
     dir: &Path,

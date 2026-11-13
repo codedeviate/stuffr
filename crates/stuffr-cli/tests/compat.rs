@@ -624,18 +624,21 @@ mod unix {
             "UnZip 6.00 of 20 April 2009, by stuffr {v} (altered; original by Info-ZIP, \
              with modifications by Apple Inc.).\n"
         )));
-        let o = run("zipinfo", &["-h"], "ubuntu");
-        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-        assert!(stdout(&o).starts_with(&format!(
-            "ZipInfo 3.00 of 20 April 2009, by stuffr {v} (altered; Debian's build, \
-             original by Greg Roelofs and the Info-ZIP group).\n"
-        )));
+        // `ubuntu` is an alias of `debian` (0.27.0)
+        for flavour in ["debian", "ubuntu"] {
+            let o = run("zipinfo", &["-h"], flavour);
+            assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+            assert!(stdout(&o).starts_with(&format!(
+                "ZipInfo 3.00 of 20 April 2009, by stuffr {v} (altered; Debian's build, \
+                 original by Greg Roelofs and the Info-ZIP group).\n"
+            )));
+        }
         for n in ["unzip", "zipinfo", "funzip"] {
-            let o = run(n, &["-h"], "debian");
+            let o = run(n, &["-h"], "Debian");
             assert_eq!(o.status.code(), Some(1), "{n}");
             assert_eq!(
                 stderr(&o),
-                format!("{n}: STUFFR_UNZIP_FLAVOR must be apple or ubuntu, not 'debian'\n")
+                format!("{n}: STUFFR_UNZIP_FLAVOR must be apple or debian, not 'Debian'\n")
             );
             assert!(o.stdout.is_empty(), "{n}");
         }

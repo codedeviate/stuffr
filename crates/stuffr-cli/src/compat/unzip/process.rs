@@ -9,7 +9,7 @@
 //! the listings; [`selected`] is the include/exclude test every loop makes.
 //! `check_ecrec_zip64()` is `#if 0` in the C and has no port. Apple's
 //! build has no `UNICODE_SUPPORT`: `getUnicodeData()` and its conversions
-//! are Ubuntu's, in [`unicode`].
+//! are Debian's, in [`unicode`].
 //!
 //! Every count and offset from the archive drives a loop or a seek, never
 //! an allocation: a name, an extra field or a comment is at most 64 KiB.
@@ -97,7 +97,7 @@ pub(crate) struct Ecrec {
     pub have_ecr64: bool,
     /// Some field needed the Zip64 record's value.
     pub is_zip64_archive: bool,
-    /// `ec_start`, `ec_end` (ubuntu: 24-cve-2019-13232-do-not-raise-alert-
+    /// `ec_start`, `ec_end` (debian: 24-cve-2019-13232-do-not-raise-alert-
     /// for-misplaced-central-directory.patch): the end record's span, the
     /// Zip64 locator before it included.
     pub ec_start: u64,
@@ -672,7 +672,7 @@ pub(crate) fn process_cdir_file_hdr(uz: &mut Uz) -> Result<CentralEntry, i32> {
     // strings (see do_string() function in fileio.c)
     e.pinfo.has_ux_att = e.external_file_attributes & 0xffff_0000 != 0;
 
-    // ubuntu: -DUNICODE_SUPPORT: remember the state of GPB11 (General
+    // debian: -DUNICODE_SUPPORT: remember the state of GPB11 (General
     // Purpuse Bit 11) which indicates that the standard path and comment
     // are UTF-8.
     e.pinfo.gpf_is_utf8 = e.general_purpose_bit_flag & (1 << 11) == 1 << 11;
@@ -758,7 +758,7 @@ pub(crate) fn get_zip64_data(uz: &mut Uz, e: &mut CentralEntry, ef: &[u8]) -> i3
     const Z64FLGS: u64 = 0xffff;
     const Z64FLGL: u64 = 0xffff_ffff;
     let f = uz.flavour;
-    // ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch
+    // debian: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch
     uz.zip64 = false;
     let mut ef = ef;
     while ef.len() >= EB_HEADSIZE {
@@ -826,6 +826,8 @@ pub(crate) fn read_extra_field(uz: &mut Uz, e: &mut CentralEntry) -> i32 {
         e.extra = Some(field);
         return PK_EOF;
     }
+    // apple: CVE-2021-4217 (in Apple's tree); deviation 11 for Debian 13,
+    // whose build reads the uninitialised rest of the field
     if bytes_read != length {
         e.extra = Some(field);
         return PK_ERR;
@@ -840,7 +842,7 @@ pub(crate) fn read_extra_field(uz: &mut Uz, e: &mut CentralEntry) -> i32 {
         );
         error = PK_WARN;
     }
-    // ubuntu: -DUNICODE_SUPPORT
+    // debian: -DUNICODE_SUPPORT
     if flavour::unicode_support(uz.flavour) {
         let pinfo = e.pinfo;
         let r = fileio::unicode_name(uz, &field, &pinfo);
@@ -944,9 +946,9 @@ pub(crate) fn walk(
                 return error;
             }
         }
-        // ubuntu: -DUNICODE_SUPPORT: the extra field's UTF-8 name, if any,
+        // debian: -DUNICODE_SUPPORT: the extra field's UTF-8 name, if any,
         // is the one matched and shown
-        if uz.flavour == super::Flavour::Ubuntu {
+        if uz.flavour == super::Flavour::Debian {
             e.filename = fileio::c_str(&uz.filename).to_vec();
         }
 
@@ -966,7 +968,7 @@ pub(crate) fn walk(
 /// Whether the entry named `name` is one the command line asks for:
 /// matching an include pattern (or there are none) and no exclude pattern
 /// (list.c, zipinfo.c and extract.c's `do_this_file` test). `-C` folds
-/// case; Ubuntu's `-W` stops wildcards at `/`. `fn_matched` and
+/// case; Debian's `-W` stops wildcards at `/`. `fn_matched` and
 /// `xn_matched`, when given, note which patterns matched (zipinfo's and
 /// the extraction's "not matched" cautions); each must have one flag per
 /// pattern (`uz.pfnames`, `uz.pxnames`).
@@ -986,7 +988,7 @@ pub(crate) fn selected(
         return true;
     }
     let ic = uz.o.c_flag;
-    // ubuntu: -DWILD_STOP_AT_DIR (`WISEP`: '/' under -W)
+    // debian: -DWILD_STOP_AT_DIR (`WISEP`: '/' under -W)
     let stop = flavour::wild_stop_at_dir(uz.flavour) && uz.o.w_flag;
     let mut do_this_file = if uz.pfnames.is_empty() {
         true
@@ -1026,7 +1028,7 @@ pub(crate) fn selected(
 /// `ef_is_c` is a central directory's field (an `EF_TIME` block there holds
 /// the modification time only). A 32-bit time with its top bit set is kept
 /// only when the DOS time says 2038 or later (`time_t` is 64-bit).
-/// ubuntu: -DIZ_HAVE_UXUIDGID adds the owner fields, and
+/// debian: -DIZ_HAVE_UXUIDGID adds the owner fields, and
 /// 17-restore-unix-timestamps-accurately.patch changes which earlier flags
 /// an `EF_IZUNIX2`/`EF_IZUNIX3` block clears
 /// (`flavour::izunix_keeps_times`). A listing asks for no owner, so only
@@ -1061,12 +1063,14 @@ fn read_ux3_value(f: flavour::Flavour, b: &[u8], size: usize) -> Option<u64> {
 /// UID and GID of a `Ux` block of exactly 4 bytes, a `ux` block of version 1
 /// (which, without 17-restore-unix-timestamps-accurately.patch, also drops
 /// earlier times), or a full `UX` block, and the flags gain
-/// [`EB_UX2_VALID`]. Ubuntu builds with the patched
+/// [`EB_UX2_VALID`]. Debian builds with the patched
 /// (05-fix-uid-gid-handling.patch) form of the `ux` reading, which is what
 /// is ported. `f` is the flavour (`makeint64()`'s and patch 17's).
+/// Debian 13 takes it only when the sizes fill the block exactly
+/// (can-2026-2034440.patch: [`flavour::ux3_sizes_checked`]).
 /// ruling: T10-12. A `ux` block whose UID/GID sizes run past the block makes
-/// the C read past it; here the owner is then not taken. A size other than
-/// 2, 4 or 8 leaves the C's (uninitialised) value: 0 here.
+/// the unpatched C read past it; here the owner is then not taken. A size
+/// other than 2, 4 or 8 leaves the C's (uninitialised) value: 0 here.
 pub(crate) fn ef_scan_for_izux_owner(
     f: flavour::Flavour,
     ef: &[u8],
@@ -1075,7 +1079,7 @@ pub(crate) fn ef_scan_for_izux_owner(
     z_utim: Option<&mut IzTimes>,
     mut owner: Option<&mut [u64; 2]>,
 ) -> u32 {
-    // ubuntu: 17-restore-unix-timestamps-accurately.patch
+    // debian: 17-restore-unix-timestamps-accurately.patch
     let keeps_times = flavour::izunix_keeps_times(f);
     let mut flags: u32 = 0;
     let mut have_new_type_eb = 0;
@@ -1162,7 +1166,7 @@ pub(crate) fn ef_scan_for_izux_owner(
             }
             EF_IZUNIX2 => {
                 if keeps_times {
-                    // ubuntu: 17-restore-unix-timestamps-accurately.patch
+                    // debian: 17-restore-unix-timestamps-accurately.patch
                     if have_new_type_eb == 0 {
                         have_new_type_eb = 1;
                     }
@@ -1188,7 +1192,7 @@ pub(crate) fn ef_scan_for_izux_owner(
                 // new 3rd generation Unix ef
                 have_new_type_eb = 2;
                 if keeps_times {
-                    // ubuntu: 17-restore-unix-timestamps-accurately.patch:
+                    // debian: 17-restore-unix-timestamps-accurately.patch:
                     // ignore any prior EF_IZUNIX/EF_PKUNIX/EF_IZUNIX2
                     // UID/GID.
                     flags &= 0x0ff;
@@ -1203,7 +1207,13 @@ pub(crate) fn ef_scan_for_izux_owner(
                         flags &= !0x0ff; // ignore any previous UNIX field
                     }
                     let gid_at = uid_size + 2;
-                    if let Some(&gid_size) = data.get(gid_at) {
+                    // debian: can-2026-2034440.patch: valid: 1 (Version) +
+                    // 1 (UIDSize) + UIDSize + 1 (GIDSize) + 2 (min GIDSize)
+                    // <= eb_len, and the claimed xID sizes fill eb_len.
+                    let sizes_fit = !flavour::ux3_sizes_checked(f)
+                        || (5 + uid_size <= eb_len
+                            && 3 + uid_size + usize::from(data[gid_at]) == eb_len);
+                    if sizes_fit && let Some(&gid_size) = data.get(gid_at) {
                         let gid_size = usize::from(gid_size);
                         let uid = data.get(2..2 + uid_size);
                         let gid = data.get(gid_at + 1..gid_at + 1 + gid_size);

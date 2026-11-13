@@ -1615,9 +1615,9 @@ COMPATIBILITY LINKS (INSTALL-LINKS)
       names stuffr. The benchmark options (-b, -e, -i) are refused.
 
       The unzip, zipinfo and funzip names behave as Info-ZIP UnZip 6.00:
-      Apple's build on macOS and the BSDs, Ubuntu 24.04's elsewhere;
-      STUFFR_UNZIP_FLAVOR=apple or ubuntu overrides that (any other value is
-      refused, exit 1). UNZIP and UNZIPOPT (ZIPINFO and ZIPINFOOPT for
+      Apple's build on macOS and the BSDs, Debian 13's elsewhere;
+      STUFFR_UNZIP_FLAVOR=apple or debian overrides that (ubuntu is an alias
+      of debian; any other value is refused, exit 1). UNZIP and UNZIPOPT (ZIPINFO and ZIPINFOOPT for
       zipinfo) are read before the command line, as unzip reads them. The
       first line of the usage and -v screens names stuffr.
 

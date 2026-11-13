@@ -14,7 +14,6 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use super::messages as m;
-use super::unix::charset;
 use super::{PK_COOL, PK_EOF, PK_ERR, PK_OK, PK_WARN, Uz, flavour};
 use crate::compat::host::{Host, InFile};
 
@@ -61,7 +60,7 @@ pub(crate) struct PInfo {
     pub vollabel: bool,
     /// `HasUxAtt`: the external attributes' high 16 bits are set.
     pub has_ux_att: bool,
-    /// `GPFIsUTF8` (ubuntu: -DUNICODE_SUPPORT): the central header's
+    /// `GPFIsUTF8` (debian: -DUNICODE_SUPPORT): the central header's
     /// general-purpose bit 11, "the name and comment are UTF-8".
     pub gpf_is_utf8: bool,
 }
@@ -186,7 +185,7 @@ pub(crate) fn makelong(b: &[u8]) -> u32 {
 /// A little-endian 64-bit field, as `LARGE_FILE_SUPPORT`'s `makeint64()`
 /// assembles it: upstream's leaves out byte 5 (bits 40..47), so Apple's
 /// unzip reads `0x0000_ff00_0000_0000` as 0.
-/// ubuntu: 21-fix-warning-messages-on-big-files.patch adds byte 5
+/// debian: 21-fix-warning-messages-on-big-files.patch adds byte 5
 /// (`flavour::makeint64_reads_byte_5`).
 pub(crate) fn makeint64(f: flavour::Flavour, b: &[u8]) -> u64 {
     let mut v = (u64::from(b[7]) << 56)
@@ -292,33 +291,15 @@ fn here_plus(uz: &Uz, length: usize) -> i64 {
 /// code page 850 (`_OEM_INTERN`, `oem2iso_850`); everything else is ISO
 /// 8859-1 already (`_ISO_INTERN` is `A_TO_N`, nothing on ASCII). In
 /// place, up to the string's NUL.
-/// ubuntu: 20-unzip60-alt-iconv-utf8.patch makes `_OEM_INTERN` and
-/// `_ISO_INTERN` `oem_intern()` and `iso_intern()`: the string converted
-/// from `OEM_CP` or `ISO_CP` to the locale's character set through
-/// `iconv(3)` (`unix::charset`), or left as it is (no table); and every
-/// Windows NT archive is OEM, whatever its version. On success the
-/// string's buffer is rewritten as `strncpy(string, buf, FILNAMSIZ)` does:
-/// the converted text, then zeros up to `FILNAMSIZ` bytes.
-pub(crate) fn ext_ascii_to_native(uz: &Uz, s: &mut [u8], p: &PInfo, islochdr: bool) {
-    let ubuntu = flavour::iconv_charsets(uz.flavour);
+/// debian: as Apple's. Ubuntu's 20-unzip60-alt-iconv-utf8.patch (`-O`/`-I`
+/// and `iconv(3)` in place of this table, until 0.26.0) is not in Debian
+/// 13's series.
+pub(crate) fn ext_ascii_to_native(_uz: &Uz, s: &mut [u8], p: &PInfo, islochdr: bool) {
     let oem = (p.hostnum == FS_FAT_
         && !((islochdr || p.has_ux_att)
             && (p.hostver == 25 || p.hostver == 26 || p.hostver == 40)))
         || p.hostnum == FS_HPFS_
-        // ubuntu: 20-unzip60-alt-iconv-utf8.patch (`/* && (hostver) == 50 */`)
-        || (p.hostnum == FS_NTFS_ && (ubuntu || p.hostver == 50));
-    if ubuntu {
-        // ubuntu: 20-unzip60-alt-iconv-utf8.patch
-        let from = if oem { &uz.o.oem_cp } else { &uz.o.iso_cp };
-        let buflen = flavour::filnamsiz(uz.flavour);
-        if let Some(out) = charset::charset_to_intern(&uz.host, s, from, buflen) {
-            let n = s.len().min(buflen);
-            s[..n].fill(0);
-            let k = out.len().min(n);
-            s[..k].copy_from_slice(&out[..k]);
-        }
-        return;
-    }
+        || (p.hostnum == FS_NTFS_ && p.hostver == 50);
     if oem {
         for b in s.iter_mut() {
             if *b == 0 {
@@ -549,7 +530,7 @@ fn native_name(uz: &Uz, name: &mut [u8], length: usize, pinfo: &PInfo, islochdr:
 }
 
 // port: fileio.c:do_string
-/// ubuntu: -DUNICODE_SUPPORT. `do_string(DS_FN)`'s Unicode build: the whole
+/// debian: -DUNICODE_SUPPORT. `do_string(DS_FN)`'s Unicode build: the whole
 /// name read into `G.filename_full` (grown to `length + 1` bytes when it is
 /// too small, `FILNAMSIZ` at least), for the Unicode Path checksum, then
 /// its first `FILNAMSIZ - 1` bytes into `G.filename` (`strncpy()`: to the
@@ -598,7 +579,7 @@ fn strncpy(dst: &mut [u8], src: &[u8], n: usize) {
 }
 
 // port: fileio.c:do_string
-/// ubuntu: -DUNICODE_SUPPORT. `do_string(EXTRA_FIELD)`'s tail, once the
+/// debian: -DUNICODE_SUPPORT. `do_string(EXTRA_FIELD)`'s tail, once the
 /// field `ef` is read (and unless `-UU`): the entry's UTF-8 name, the
 /// stored one when its general-purpose bit 11 is set (`pinfo`, the central
 /// header's), else a Unicode Path block's, replaces `G.filename`: as it
@@ -632,7 +613,7 @@ pub(crate) fn unicode_name(uz: &mut Uz, ef: &[u8], pinfo: &PInfo) -> i32 {
     };
     let filnamsiz = uz.filename.len();
     let mut error = PK_COOL;
-    // ubuntu: -DUTF8_MAYBE_NATIVE
+    // debian: -DUTF8_MAYBE_NATIVE
     if uz.native_is_utf8 && !uz.unicode_escape_all {
         let mut name = std::mem::take(&mut uz.filename);
         strncpy(&mut name, &unipath, filnamsiz - 1);
@@ -644,10 +625,10 @@ pub(crate) fn unicode_name(uz: &mut Uz, ef: &[u8], pinfo: &PInfo) -> i32 {
             error = PK_WARN;
         }
     } else {
-        // ubuntu: -DUNICODE_WCHAR: convert UTF-8 to local character set
+        // debian: -DUNICODE_WCHAR: convert UTF-8 to local character set
         let escape_all = uz.unicode_escape_all;
         match unicode::utf8_to_local_string(uz, &unipath, escape_all) {
-            // ubuntu: 28-cve-2022-0529-and-cve-2022-0530.patch: detect
+            // debian: 28-cve-2022-0529-and-cve-2022-0530.patch: detect
             // conversion failure, emit message, continue with unconverted
             // name
             None => {
@@ -736,7 +717,7 @@ fn libc_isprint(c: u8) -> bool {
 /// returned. A control byte becomes `^` and its letter; another byte
 /// `isprint()` refuses becomes `?`; past `size - 4` bytes the text ends in
 /// `...`.
-/// ubuntu: -DNO_WORKING_ISPRINT escapes control bytes only and leaves
+/// debian: -DNO_WORKING_ISPRINT escapes control bytes only and leaves
 /// every other byte (DEL and 0x80..0xff too) as it is
 /// (`flavour::no_working_isprint`).
 pub(crate) fn fnfilter_at(uz: &mut Uz, raw: &[u8], at: usize, size: usize) -> Vec<u8> {
@@ -948,12 +929,12 @@ const YDAYS: [u32; 13] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334,
 /// extra days and month 15 a date in 2090); here month 0 counts no days
 /// before it and months 14 and 15 the whole year (`ydays[12]`, which month
 /// 13 reads).
-/// ubuntu: the Linux build (no `BSD4_4`: `flavour::dos_time_bsd4_4`)
+/// debian: the Linux build (no `BSD4_4`: `flavour::dos_time_bsd4_4`)
 /// adds `timezone` (the zone's standard offset, seconds west) and takes a
 /// whole hour off when the result is in summer time; the two agree in UTC
 /// and in whole-hour zones away from the changes. probe: extraction mtimes
 /// under `TZ=EST5EDT,M3.2.0,M11.1.0` (a DOS time in the spring-forward
-/// gap) and `TZ=LHST-10:30LHDT-11,M10.1.0,M4.1.0` (half-hour DST): Ubuntu's
+/// gap) and `TZ=LHST-10:30LHDT-11,M10.1.0,M4.1.0` (half-hour DST): Debian's
 /// 1583649000 and 1579048200, `BSD4_4`'s 1583652600 and 1579050000.
 pub(crate) fn dos_to_unix_time(uz: &Uz, dosdatetime: u32) -> i64 {
     const YRBASE: i64 = 1970;
@@ -998,7 +979,7 @@ pub(crate) fn dos_to_unix_time(uz: &Uz, dosdatetime: u32) -> i64 {
             m_time -= tm.gmtoff; // sec. EAST of GMT: subtr.
         }
     } else {
-        // ubuntu: !BSD4_4. tzset was already called at start of
+        // debian: !BSD4_4. tzset was already called at start of
         // process_zipfiles()
         m_time += timezone(uz); // seconds WEST of GMT:  add
         // Adjust for local daylight savings (summer) time.
@@ -1035,7 +1016,7 @@ fn timezone_real() -> i64 {
     }
 }
 
-/// Off Linux (the Ubuntu flavour elsewhere; nothing is promised there,
+/// Off Linux (the Debian flavour elsewhere; nothing is promised there,
 /// deviation 6) the standard offset is read from `localtime()`: the
 /// offset of January 1st or July 1st of 2020 that is not summer time.
 #[cfg(not(target_os = "linux"))]
@@ -1112,7 +1093,7 @@ pub(crate) enum Pw {
 
 /// `UzpPassword()`'s first prompt: `[zipfile] entry password: ` with both
 /// names filtered, or "Enter password: " when they exceed `2*FILNAMSIZ`
-/// bytes together (ubuntu: 20-cve-2018-1000035; ruling T11-5 for Apple).
+/// bytes together (debian: 20-cve-2018-1000035; ruling T11-5 for Apple).
 pub(crate) fn passw_prompt(uz: &mut Uz, zfn: &[u8], efn: &[u8]) -> Vec<u8> {
     let zfnf = fnfilter1(uz, zfn);
     let efnf = fnfilter2(uz, efn);
@@ -1132,13 +1113,13 @@ pub(crate) fn passw_prompt(uz: &mut Uz, zfn: &[u8], efn: &[u8]) -> Vec<u8> {
 /// sets two retries; each later call asks "password incorrect--reenter"
 /// and spends one. The names are `G.zipfn` and `G.filename`.
 ///
-/// ubuntu: 20-cve-2018-1000035-unzip-buffer-overflow.patch: when the two
+/// debian: 20-cve-2018-1000035-unzip-buffer-overflow.patch: when the two
 /// filtered names exceed `2*FILNAMSIZ` bytes the prompt is "Enter
 /// password: ". ruling: T11-5. Apple's build `sprintf()`s them into its
 /// `2*FILNAMSIZ + 15`-byte buffer unchecked, and `__sprintf_chk` kills it
 /// (SIGTRAP, exit 133) one byte past that (probe: `lon3.zip` with an entry
 /// of 1020 `^A` bytes, 2048 filtered bytes, prompts; `lon4.zip` with one
-/// more byte traps); Apple's flavour gives Ubuntu's answer with its own
+/// more byte traps); Apple's flavour gives Debian's answer with its own
 /// `FILNAMSIZ`, as the earlier buffer rulings (T8-1, T9) do.
 pub(crate) fn uzp_password(uz: &mut Uz, rcnt: &mut i32) -> Pw {
     let prompt: Vec<u8> = if *rcnt == 0 {

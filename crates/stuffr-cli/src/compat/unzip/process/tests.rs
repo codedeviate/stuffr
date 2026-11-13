@@ -291,9 +291,9 @@ fn unix_times_from_the_extra_field() {
     );
 
     // 17-restore-unix-timestamps-accurately.patch: a `Ux` block after an
-    // old `UX` one drops its times on Apple (upstream), not on Ubuntu; a
+    // old `UX` one drops its times on Apple (upstream), not on Debian; a
     // `ux` block after a `UT` one drops the times only where the owner is
-    // read (Ubuntu's IZ_HAVE_UXUIDGID without the patch).
+    // read (Debian's IZ_HAVE_UXUIDGID without the patch).
     let ux2 = b"Ux\x04\x00\xe8\x03\xe8\x03";
     let old_then_ux2 = [&ux(200, 300)[..], ux2].concat();
     let mut z = IzTimes::default();
@@ -303,7 +303,7 @@ fn unix_times_from_the_extra_field() {
     );
     let mut z = IzTimes::default();
     assert_eq!(
-        ef_scan_for_izux(Flavour::Ubuntu, &old_then_ux2, true, 0, Some(&mut z)),
+        ef_scan_for_izux(Flavour::Debian, &old_then_ux2, true, 0, Some(&mut z)),
         3
     );
     assert_eq!((z.mtime, z.atime), (200, 300));
@@ -312,7 +312,7 @@ fn unix_times_from_the_extra_field() {
     let mut ug = [0u64; 2];
     let mut z = IzTimes::default();
     let f = ef_scan_for_izux_owner(
-        Flavour::Ubuntu,
+        Flavour::Debian,
         &ut_then_ux3,
         false,
         0,
@@ -462,7 +462,7 @@ fn a_one_block_archive_is_read_in_passes_not_per_entry() {
         len <= crate::compat::unzip::fileio::INBUFSIZ as u64,
         "{len}"
     );
-    for flavour in [Flavour::Apple, Flavour::Ubuntu] {
+    for flavour in [Flavour::Apple, Flavour::Debian] {
         for (name, args) in [
             ("unzip", &["-t", "a.zip"][..]),
             ("unzip", &["-l", "a.zip"]),
@@ -499,5 +499,36 @@ fn a_one_block_archive_is_read_in_passes_not_per_entry() {
                 r.bytes
             );
         }
+    }
+}
+
+/// can-2026-2034440.patch: Debian takes a `ux` owner only when its sizes
+/// fill the block exactly; Apple's form (the unpatched check, reached only
+/// through this function) takes any that fit.
+#[test]
+fn debian_takes_a_ux_owner_only_when_its_sizes_fill_the_block() {
+    let block = |data: &[u8]| {
+        let mut v = 0x7875u16.to_le_bytes().to_vec();
+        v.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        v.extend_from_slice(data);
+        v
+    };
+    let scan = |f: Flavour, ef: &[u8]| {
+        let mut z = IzTimes::default();
+        let mut ug = [7u64, 7];
+        let flags = ef_scan_for_izux_owner(f, ef, false, 0, Some(&mut z), Some(&mut ug));
+        flags & EB_UX2_VALID != 0
+    };
+    for (data, apple, debian) in [
+        (&[1, 4, 0xe8, 3, 0, 0, 4, 0xf4, 1, 0, 0][..], true, true),
+        (&[1, 4, 0xe8, 3, 0, 0, 4, 0xf4, 1, 0, 0, 0], true, false),
+        (&[1, 4, 0xe8, 3, 0, 0, 0], true, false),
+        (&[1, 4, 0xe8, 3, 0, 0, 1, 0], true, false),
+        (&[1, 2, 0xe8, 3, 2, 0xf4, 1], true, true),
+        (&[1, 2, 0xe8, 3, 2, 0xf4, 1, 0, 0], true, false),
+        (&[1, 4, 0xe8, 3, 0, 0, 8, 1, 2, 3, 4], false, false),
+    ] {
+        assert_eq!(scan(Flavour::Apple, &block(data)), apple, "{data:?}");
+        assert_eq!(scan(Flavour::Debian, &block(data)), debian, "{data:?}");
     }
 }

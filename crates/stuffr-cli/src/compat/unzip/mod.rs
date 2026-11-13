@@ -5,18 +5,19 @@
 //! licence version 2009-Jan-02, `LICENSE-infozip`; this is an altered
 //! version, marked as such by every banner). Each ported function carries
 //! `// port: <file>.c:<function>`, each Apple change `// apple:
-//! <file>.c:<line>`, each Ubuntu difference `// ubuntu: <patch>` or `//
-//! ubuntu: -D<DEFINE>`, and each rule taken from the binary rather than the
+//! <file>.c:<line>`, each Debian difference `// debian: <patch>` or `//
+//! debian: -D<DEFINE>`, and each rule taken from the binary rather than the
 //! source `// probe: <command>`; where the two disagree, the binary wins.
 //! Every string is in `messages.rs`.
 //!
 //! **Flavours** ([`Flavour`], `flavour.rs`): Apple's `/usr/bin/unzip` on
-//! macOS and the BSDs, Ubuntu 24.04's `6.0-28ubuntu4.1` elsewhere
-//! ([`default_flavour`]), or as `STUFFR_UNZIP_FLAVOR` (`apple`, `ubuntu`)
+//! macOS and the BSDs, Debian 13's `6.0-29+deb13u1` elsewhere
+//! ([`default_flavour`]; Ubuntu 24.04's `6.0-28ubuntu4.1` until 0.26.0), or
+//! as `STUFFR_UNZIP_FLAVOR` (`apple`, `debian`, or its alias `ubuntu`)
 //! says; [`run`] reads it once, and anything else in it is refused, exit 1,
-//! in stuffr's own words. Ubuntu's build options (its `-D` DEFINES) and
+//! in stuffr's own words. Debian's build options (its `-D` DEFINES) and
 //! its patch series are flavour checks at the points they change
-//! behaviour (R13), each marked `// ubuntu:`.
+//! behaviour (R13), each marked `// debian:`.
 //!
 //! **G becomes `Uz`** (R5): Info-ZIP's global `G` (and its `uO`
 //! options) is one value per run, holding the host, the flavour, the
@@ -39,8 +40,9 @@
 //! `screensize()`; `fileio.rs`: `UzpPassword()`, `UzpMorePause()`; `-M`'s
 //! line counting in `Uz::print_raw`; crypt.c's retries; the interrupt
 //! handler, exit 80: Task 11); funzip (`funzip.rs`: funzip.c, Task 12);
-//! Ubuntu's build options and patch series as flavour checks throughout
-//! (Tasks 13 and 14; `process/unicode.rs` is Ubuntu's alone).
+//! Debian's build options and patch series as flavour checks throughout
+//! (Tasks 13 and 14; `process/unicode.rs` is Debian's alone; moved from
+//! Ubuntu 24.04 to Debian 13 in 0.27.0).
 
 //! Known deviations (the source of truth; the README and the spec mirror
 //! this list):
@@ -52,25 +54,23 @@
 //! 2. The first banner line of each program's usage and `-v` names stuffr
 //!    and says it is altered (Info-ZIP licence clause 3):
 //!    `UnZip 6.00 of 20 April 2009, by stuffr X.Y.Z (altered; original by
-//!    Info-ZIP, with modifications by Apple Inc.).` (Ubuntu: `(altered;
+//!    Info-ZIP, with modifications by Apple Inc.).` (Debian: `(altered;
 //!    Debian's build, original by Info-ZIP).`), and likewise for zipinfo
 //!    and funzip. That line is wider than the pager's 80 columns, so under
 //!    `-M` it counts as two screen lines and `-Mh` pauses one text line
 //!    earlier than the reference (P26). `-v`'s `Compiled with` line is the
 //!    recorded reference build's (Apple: this release's macOS build), so
 //!    other macOS builds print a different one.
-//! 3. Pre-existing symlinks: the Ubuntu flavour also stays beneath the
+//! 3. Pre-existing symlinks: the Debian flavour also stays beneath the
 //!    extraction root, as Apple's does. On unix only: off unix (Windows)
 //!    the walk (`unix/beneath.rs`'s `imp_std`) follows symlinks, so
 //!    neither flavour is contained there.
 //! 4. The archive being read is never overwritten.
-//! 5. `-O`/`-I` (Ubuntu) convert names through `iconv(3)`; they are
-//!    unavailable on Windows, where they are parsed as Ubuntu parses them
-//!    and convert nothing, as a conversion Ubuntu's `iconv_open()` refuses
-//!    (silently: the names stay as stored; ruling T14-5).
+//! 5. (Withdrawn in 0.27.0: it concerned Ubuntu's `-O`/`-I`, which Debian
+//!    13 does not have; the number is kept so the others keep theirs.)
 //! 6. Locale-dependent output is identical under `C`, `C.UTF-8` and
 //!    `en_US.UTF-8` only.
-//! 7. On macOS the Ubuntu flavour also propagates the archive's quarantine
+//! 7. On macOS the Debian flavour also propagates the archive's quarantine
 //!    attribute (R9), as Apple's does.
 //! 8. The terminal (T11-1, P28): after a prompt, a pager key or an
 //!    interrupt, the terminal's mode is put back exactly as it was, where
@@ -86,7 +86,7 @@
 //!    its final `fflush()`, so it loses the data and exits 0.
 //! 10. Undefined behaviour and endless loops are not reproduced. Where a
 //!     reference's behaviour is undefined, or never ends, stuffr gives a
-//!     defined answer instead. Ubuntu's bzip2 decoding loops for ever on a
+//!     defined answer instead. Debian's bzip2 decoding loops for ever on a
 //!     truncated entry; stuffr answers as for bad bzip2 data, exit 2
 //!     (T13-2). Apple's `-:` on a `../` directory entry changes the
 //!     directory above the extraction root; stuffr refuses (T10-10). After
@@ -95,10 +95,19 @@
 //!     of input the C asks for a new name for ever at the rename prompt,
 //!     and waits for ever at the `-M` pager's; stuffr takes `[N]one` and
 //!     stops pausing (T10-9, T11-4). Buffer overflows are answered in both
-//!     flavours with the forms of Ubuntu's CVE fixes: a method above 999
+//!     flavours with the forms of Debian's CVE fixes: a method above 999
 //!     is `Unk` and four hex digits (`Unk03E8`), and a password prompt
 //!     whose names are too long is "Enter password: " (T11-5). The full
 //!     set is in the code's `// ruling:` comments.
+//! 11. CVE-2021-4217 (0.27.0): Debian 13 has no fix for it (Ubuntu 24.04
+//!     had). A first entry with no name whose extra field holds a Unicode
+//!     Path block makes Debian's unzip and zipinfo dereference a NULL name
+//!     and die ("error:  zipfile probably corrupt (segmentation
+//!     violation)", exit 3); stuffr reads the archive as the fix does (the
+//!     block is ignored). An extra field cut short by the end of the
+//!     archive is read by Debian with its missing bytes uninitialised;
+//!     stuffr refuses it as the fix does (and as Apple's tree does): "bad
+//!     extra field length", exit 2 where the listing needs it.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -170,14 +179,14 @@ pub(crate) const MSG_TNEWLN: u32 = 0x0040;
 /// them), 9–11, 50, 51, 80–82. For the `compat` fuzz target (Task 15).
 #[doc(hidden)]
 pub const EXIT_CODES_APPLE: &[i32] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 50, 51, 80, 81, 82];
-/// [`EXIT_CODES_APPLE`] plus 12 (`PK_BOMB`, ubuntu:
+/// [`EXIT_CODES_APPLE`] plus 12 (`PK_BOMB`, debian:
 /// 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch).
 #[doc(hidden)]
-pub const EXIT_CODES_UBUNTU: &[i32] =
+pub const EXIT_CODES_DEBIAN: &[i32] =
     &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 50, 51, 80, 81, 82];
 
 /// The flavour a build uses when `STUFFR_UNZIP_FLAVOR` is unset or empty:
-/// Apple on macOS and the BSDs, Ubuntu everywhere else, Windows included.
+/// Apple on macOS and the BSDs, Debian everywhere else, Windows included.
 pub fn default_flavour() -> Flavour {
     if cfg!(any(
         target_os = "macos",
@@ -188,18 +197,20 @@ pub fn default_flavour() -> Flavour {
     )) {
         Flavour::Apple
     } else {
-        Flavour::Ubuntu
+        Flavour::Debian
     }
 }
 
-/// The flavour `STUFFR_UNZIP_FLAVOR`'s value selects: `apple` or `ubuntu`,
-/// the default when unset or empty, and `Err(value)` for anything else.
+/// The flavour `STUFFR_UNZIP_FLAVOR`'s value selects: `apple` or `debian`
+/// (`ubuntu`, the Linux flavour's name until 0.27.0, is an alias of
+/// `debian`), the default when unset or empty, and `Err(value)` for
+/// anything else.
 pub(crate) fn flavour_from(value: Option<OsString>) -> Result<Flavour, OsString> {
     match value {
         None => Ok(default_flavour()),
         Some(v) if v.is_empty() => Ok(default_flavour()),
         Some(v) if v == "apple" => Ok(Flavour::Apple),
-        Some(v) if v == "ubuntu" => Ok(Flavour::Ubuntu),
+        Some(v) if v == "debian" || v == "ubuntu" => Ok(Flavour::Debian),
         Some(v) => Err(v),
     }
 }
@@ -230,12 +241,12 @@ pub(crate) struct Uz<'a> {
     pub(crate) extract_flag: bool,
     /// `G.process_all_files`: no names were given after the archive.
     pub(crate) process_all_files: bool,
-    /// `G.native_is_utf8` (ubuntu: -DUTF8_MAYBE_NATIVE): the locale's
+    /// `G.native_is_utf8` (debian: -DUTF8_MAYBE_NATIVE): the locale's
     /// codeset is UTF-8 (`fileio::init_locale`; `false` under `LANG=C` and
     /// in a sandbox).
     /// Apple's `fnfilter()` reads the same fact through `isprint()`.
     pub(crate) native_is_utf8: bool,
-    /// `G.unicode_escape_all` (ubuntu: -DUNICODE_WCHAR): `-U` given once.
+    /// `G.unicode_escape_all` (debian: -DUNICODE_WCHAR): `-U` given once.
     pub(crate) unicode_escape_all: bool,
     /// `checkdir()`'s state: the extraction root (`G.rootpath`,
     /// `G.rootlen`, Apple's `G.rootdir`: apple: globals.c:164, `-1` at
@@ -290,7 +301,7 @@ pub(crate) struct Uz<'a> {
     pub(crate) lrec: process::Lrec,
     /// `G.csize`: the entry's compressed bytes left (a C `zoff_t`).
     pub(crate) csize: i64,
-    /// `G.zip64` (ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-
+    /// `G.zip64` (debian: 23-cve-2019-13232-zip-bomb-with-overlapped-
     /// entries.patch): cleared by each `getZip64Data()` and set by a Unicode
     /// Path block that `getUnicodeData()` takes (where the patch's hunk
     /// landed), never by a Zip64 block; `extract_or_test_member()`'s data
@@ -306,7 +317,7 @@ pub(crate) struct Uz<'a> {
     /// `G.filename`, `FILNAMSIZ` bytes (`flavour::filnamsiz`): the entry's
     /// name as a C string, the bytes past its NUL left from earlier names.
     pub(crate) filename: Vec<u8>,
-    /// `G.filename_full` (ubuntu: -DUNICODE_SUPPORT): the last name read,
+    /// `G.filename_full` (debian: -DUNICODE_SUPPORT): the last name read,
     /// whole, as a C string, for the Unicode Path checksum; `None` (`NULL`)
     /// until a name is read. Its length is `G.fnfull_bufsize`.
     pub(crate) filename_full: Option<Vec<u8>>,
@@ -714,17 +725,12 @@ fn main(
     // siblings): for the whole run, an interrupt puts the terminal's echo
     // back and exits with IZ_CTRLC, leaving a partial output in place.
     // probe: `kill -INT`/`-TERM`/`-ABRT` during `unzip big.zip` (Apple's and
-    // Ubuntu's): exit 80, nothing printed, `big.bin` kept, also under an
+    // Debian's): exit 80, nothing printed, `big.bin` kept, also under an
     // inherited `SIG_IGN`; SIGHUP and SIGQUIT kill it.
     let _interrupt =
         host::arm_interrupt_exit(&host, host::UNZIP_SIGNALS, IZ_CTRLC, m::HANDLER_TEXT);
     let mut uz = Uz::new(host, flavour, env, err);
     uz.native_is_utf8 = fileio::init_locale(&uz.host);
-    // ubuntu: 20-unzip60-alt-iconv-utf8.patch (unzip.c: `#ifdef UNIX
-    // init_conversion_charsets()`, before the options are read)
-    if flavour::iconv_charsets(flavour) {
-        unix::charset::init_conversion_charsets(&mut uz);
-    }
     let code = unzip(&mut uz, argv0, args);
     let _ = uz.out.flush();
     code
@@ -794,7 +800,7 @@ mod tests {
         let want = if apple {
             Flavour::Apple
         } else {
-            Flavour::Ubuntu
+            Flavour::Debian
         };
         assert_eq!(default_flavour(), want);
     }
@@ -811,7 +817,7 @@ mod tests {
              with modifications by Apple Inc.).\nPlease report bugs to Apple.\n\nUsage: "
         );
         assert!(out.starts_with(&want), "{out}");
-        let (_, out, _) = run(Flavour::Ubuntu, "unzip", &["-h"]);
+        let (_, out, _) = run(Flavour::Debian, "unzip", &["-h"]);
         let want = format!(
             "UnZip 6.00 of 20 April 2009, by stuffr {v} (altered; Debian's build, original \
              by Info-ZIP).\n\nUsage: "
@@ -826,7 +832,7 @@ mod tests {
             )),
             "{out}"
         );
-        let (_, out, _) = run(Flavour::Ubuntu, "unzip", &["-Z"]);
+        let (_, out, _) = run(Flavour::Debian, "unzip", &["-Z"]);
         assert!(
             out.starts_with(&format!(
                 "ZipInfo 3.00 of 20 April 2009, by stuffr {v} (altered; Debian's build, \
@@ -843,9 +849,9 @@ mod tests {
             ),
             "{out}"
         );
-        let (_, out, _) = run(Flavour::Ubuntu, "unzip", &["-v"]);
+        let (_, out, _) = run(Flavour::Debian, "unzip", &["-v"]);
         assert!(
-            out.contains("\nCompiled with gcc 13.2.0 for Unix (Linux ELF).\n\n"),
+            out.contains("\nCompiled with gcc 14.2.0 for Unix (Linux ELF).\n\n"),
             "{out}"
         );
     }
@@ -855,10 +861,10 @@ mod tests {
     /// flavour's codes. What it answers is the archive tasks' to pin.
     #[test]
     fn past_the_parser_a_run_never_panics() {
-        for f in [Flavour::Apple, Flavour::Ubuntu] {
+        for f in [Flavour::Apple, Flavour::Debian] {
             let codes = match f {
                 Flavour::Apple => EXIT_CODES_APPLE,
-                Flavour::Ubuntu => EXIT_CODES_UBUNTU,
+                Flavour::Debian => EXIT_CODES_DEBIAN,
             };
             for (name, args) in [
                 ("funzip", &[][..]),
@@ -873,8 +879,8 @@ mod tests {
 
     /// The exit-code tables differ by `PK_BOMB` only.
     #[test]
-    fn ubuntu_adds_only_pk_bomb() {
-        let extra: Vec<i32> = EXIT_CODES_UBUNTU
+    fn debian_adds_only_pk_bomb() {
+        let extra: Vec<i32> = EXIT_CODES_DEBIAN
             .iter()
             .copied()
             .filter(|c| !EXIT_CODES_APPLE.contains(c))
@@ -883,7 +889,7 @@ mod tests {
         assert!(
             EXIT_CODES_APPLE
                 .iter()
-                .all(|c| EXIT_CODES_UBUNTU.contains(c))
+                .all(|c| EXIT_CODES_DEBIAN.contains(c))
         );
     }
 }

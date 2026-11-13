@@ -549,7 +549,7 @@ compat-debian:
 	$(COMPAT_DEBIAN_RUN) \
 	  $(COMPAT_DEBIAN_CARGO) -p stuffr-cli --lib compat::unzip -- $(COMPAT_DEBIAN_ALL_ARGS)
 	$(COMPAT_DEBIAN_RUN) \
-	  $(COMPAT_DEBIAN_CARGO) -p stuffr-cli --test compat_unzip_ubuntu --test compat_unzip_common --test compat_unzip_safety \
+	  $(COMPAT_DEBIAN_CARGO) -p stuffr-cli --test compat_unzip_debian --test compat_unzip_common --test compat_unzip_safety \
 	    --test compat_unzip_tty --test compat_unzip_umask --test compat_unzip_harness_selftest -- $(COMPAT_DEBIAN_ALL_ARGS)
 	$(COMPAT_DEBIAN_RUN) \
 	  $(COMPAT_DEBIAN_CARGO) -p stuffr-cli --lib compat::compress -- $(COMPAT_DEBIAN_ALL_ARGS)

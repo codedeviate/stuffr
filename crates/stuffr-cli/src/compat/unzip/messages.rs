@@ -3,8 +3,8 @@
 //!
 //! Ported from Apple's `zip-33` tree (`unzip60/`, the Info-ZIP licence,
 //! `LICENSE-infozip`). Each literal names its C array (`unzip.c:Zfirst`),
-//! an Apple change (`// apple: <file>.c:<line>`), an Ubuntu patch
-//! (`// ubuntu: <patch>`) or the binary it was recorded from
+//! an Apple change (`// apple: <file>.c:<line>`), a Debian patch
+//! (`// debian: <patch>`) or the binary it was recorded from
 //! (`// probe: <command>`). Formats follow C's `printf` as [`printf`]
 //! renders them: `%s` and `%d` take the next argument (an integer is
 //! formatted by the caller); a width or precision is applied by the caller
@@ -26,9 +26,9 @@ pub(super) const APPLE_UNZIP_BANNER: &str = "UnZip 6.00 of 20 April 2009, by stu
      (altered; original by Info-ZIP, with modifications by Apple Inc.).\n";
 /// apple: unzip.c:575, the rest of Apple's `UnzipUsageLine1`.
 pub(super) const APPLE_REPORT_BUGS: &str = "Please report bugs to Apple.\n\n";
-/// ubuntu: 02-this-is-debian-unzip.patch (`UnZip 6.00 of 20 April 2009, by
+/// debian: 02-this-is-debian-unzip.patch (`UnZip 6.00 of 20 April 2009, by
 /// Debian. Original by Info-ZIP.`), as R2 words it.
-pub(super) const UBUNTU_UNZIP_BANNER: &str = "UnZip 6.00 of 20 April 2009, by stuffr %s \
+pub(super) const DEBIAN_UNZIP_BANNER: &str = "UnZip 6.00 of 20 April 2009, by stuffr %s \
      (altered; Debian's build, original by Info-ZIP).\n";
 /// unzip.c:ZipInfoUsageLine1's first line (`ZipInfo 3.00 of 20 April 2009,
 /// by Greg Roelofs and the Info-ZIP group.`, both builds), after R2's
@@ -36,16 +36,16 @@ pub(super) const UBUNTU_UNZIP_BANNER: &str = "UnZip 6.00 of 20 April 2009, by st
 pub(super) const APPLE_ZIPINFO_BANNER: &str = "ZipInfo 3.00 of 20 April 2009, by stuffr %s \
      (altered; original by Greg Roelofs and the Info-ZIP group, with modifications by \
      Apple Inc.).\n";
-/// The same line after R2's pattern for Ubuntu's build.
-pub(super) const UBUNTU_ZIPINFO_BANNER: &str = "ZipInfo 3.00 of 20 April 2009, by stuffr %s \
+/// The same line after R2's pattern for Debian's build.
+pub(super) const DEBIAN_ZIPINFO_BANNER: &str = "ZipInfo 3.00 of 20 April 2009, by stuffr %s \
      (altered; Debian's build, original by Greg Roelofs and the Info-ZIP group).\n";
 /// funzip.c:main's first usage line (`fUnZip (filter UnZip), version 3.95 of
 /// 20 January 2009`, both builds), after R2's pattern for Apple's build.
 pub(super) const APPLE_FUNZIP_BANNER: &str = "fUnZip (filter UnZip), version 3.95 of \
      20 January 2009, by stuffr %s (altered; original by Info-ZIP, with modifications by \
      Apple Inc.).\n";
-/// The same line after R2's pattern for Ubuntu's build.
-pub(super) const UBUNTU_FUNZIP_BANNER: &str = "fUnZip (filter UnZip), version 3.95 of \
+/// The same line after R2's pattern for Debian's build.
+pub(super) const DEBIAN_FUNZIP_BANNER: &str = "fUnZip (filter UnZip), version 3.95 of \
      20 January 2009, by stuffr %s (altered; Debian's build, original by Info-ZIP).\n";
 
 // ---- unzip.c: unzip() and uz_opts() ----
@@ -100,7 +100,7 @@ pub(super) const UNZIP_USAGE_LINE4_HEAD: &str = concat!(
     "  -j  junk paths (do not make directories)   -aa treat ALL files as text\n",
 );
 /// unzip.c:UnzipUsageLine4's `-U` line, in the `UNICODE_SUPPORT` build only
-/// (ubuntu: -DUNICODE_SUPPORT).
+/// (debian: -DUNICODE_SUPPORT).
 pub(super) const UNZIP_USAGE_LINE4_UNICODE: &str =
     "  -U  use escapes for all non-ASCII Unicode  -UU ignore any Unicode fields\n";
 /// unzip.c:UnzipUsageLine4's last lines, ` %-42s` filled with `local2`
@@ -110,13 +110,6 @@ pub(super) const UNZIP_USAGE_LINE4_TAIL: &str = concat!(
     "  -C  match filenames case-insensitively     -L  make (some) names lowercase\n",
     "  -X  restore UID/GID info                   -V  retain VMS version numbers\n",
     "  -K  keep setuid/setgid/tacky permissions   -M  pipe through \"more\" pager\n",
-);
-/// ubuntu: 20-unzip60-alt-iconv-utf8.patch, the end of its Unix
-/// `UnzipUsageLine4`.
-pub(super) const UNZIP_USAGE_LINE4_ICONV: &str = concat!(
-    "  -O CHARSET  specify a character encoding for DOS, Windows and OS/2 archives\n",
-    "  -I CHARSET  specify a character encoding for UNIX and other archives\n",
-    "\n",
 );
 /// unzip.c:UnzipUsageLine5 with `Example2` and `Example3` (`ReadMe`, which
 /// fills `%-6s` exactly).
@@ -157,21 +150,6 @@ pub(super) const ZIPINFO_USAGE_LINE3: &str = concat!(
     "  -C  be case-insensitive     -M  page output through built-in \"more\"\n",
     "  -x  exclude filenames that follow from listing\n",
 );
-/// ubuntu: 20-unzip60-alt-iconv-utf8.patch, uz_opts()'s and zi_opts()'s
-/// `-I`/`-O` refusals (no newline: `Info(slide, 0x401, ...)`). A `-O`
-/// whose attached name starts with `-` prints the `-I` text too (the
-/// patch's copy).
-pub(super) const ENCODINGS_NEGATED: &str = "error:  encodings can't be negated";
-pub(super) const ENCODING_SHOULD_FOLLOW_I: &str =
-    "error:  a valid character encoding should follow the -I argument";
-pub(super) const ENCODING_SHOULD_FOLLOW_O: &str =
-    "error:  a valid character encoding should follow the -O argument";
-/// ubuntu: 20-unzip60-alt-iconv-utf8.patch, the end of its Unix
-/// `ZipInfoUsageLine3`.
-pub(super) const ZIPINFO_USAGE_ICONV: &str = concat!(
-    "  -O CHARSET  specify a character encoding for DOS, Windows and OS/2 archives\n",
-    "  -I CHARSET  specify a character encoding for UNIX and other archives\n",
-);
 
 // ---- unzip.c: show_version_info() ----
 
@@ -187,14 +165,14 @@ pub(super) const UNZIP_USAGE_LINE2V: &str = concat!(
 /// (macOS, 2026-10-20).
 pub(super) const APPLE_COMPILED_WITH: &str = "Compiled with gcc Apple LLVM 21.0.0 \
      (clang-2100.4.1.1) [+internal-os] for Unix Mac OS X on Oct  3 2026.\n\n";
-/// unix/unix.c:version()'s line of Ubuntu's build (13-remove-build-date.patch
-/// drops the date). probe: `unzip -v` (ubuntu:24.04, unzip 6.0-28ubuntu4.1).
-pub(super) const UBUNTU_COMPILED_WITH: &str = "Compiled with gcc 13.2.0 for Unix (Linux ELF).\n\n";
+/// unix/unix.c:version()'s line of Debian's build (13-remove-build-date.patch
+/// drops the date). probe: `unzip -v` (debian:trixie, unzip 6.0-29+deb13u1).
+pub(super) const DEBIAN_COMPILED_WITH: &str = "Compiled with gcc 14.2.0 for Unix (Linux ELF).\n\n";
 /// unzip.c:CompileOptions.
 pub(super) const COMPILE_OPTIONS: &str = "UnZip special compilation options:\n";
 /// unzip.c:CompileOptFormat.
 pub(super) const COMPILE_OPT_FORMAT: &str = "        %s\n";
-/// unzip.c:AcornFtypeNFS (ubuntu: -DACORN_FTYPE_NFS).
+/// unzip.c:AcornFtypeNFS (debian: -DACORN_FTYPE_NFS).
 pub(super) const OPT_ACORN_FTYPE_NFS: &str = "ACORN_FTYPE_NFS";
 /// unzip.c:Copyright_Clean.
 pub(super) const OPT_COPYRIGHT_CLEAN: &str =
@@ -215,7 +193,7 @@ pub(super) const OPT_USE_UNSHRINK: &str =
     "USE_UNSHRINK (PKZIP/Zip 1.x unshrinking method supported)";
 /// unzip.c:Use_Deflate64.
 pub(super) const OPT_USE_DEFLATE64: &str = "USE_DEFLATE64 (PKZIP 4.x Deflate64(tm) supported)";
-/// unzip.c:Use_Unicode (`UTF8_MAYBE_NATIVE` and `UNICODE_WCHAR`; ubuntu:
+/// unzip.c:Use_Unicode (`UTF8_MAYBE_NATIVE` and `UNICODE_WCHAR`; debian:
 /// -DUNICODE_SUPPORT). `%s` is `SysChUTF8` or `SysChOther`.
 pub(super) const OPT_USE_UNICODE: &str =
     "UNICODE_SUPPORT [wide-chars, char coding: %s] (handle UTF-8 paths)";
@@ -228,13 +206,13 @@ pub(super) const OPT_USE_LFS: &str = "LARGE_FILE_SUPPORT (large files over 2 GiB
 /// unzip.c:Use_Zip64.
 pub(super) const OPT_USE_ZIP64: &str =
     "ZIP64_SUPPORT (archives using Zip64 for large files supported)";
-/// unzip.c:UseBZip2 with `BZ2_bzlibVersion()` (ubuntu: -DUSE_BZIP2). probe:
-/// `unzip -v` (ubuntu:24.04): the library is `1.0.8, 13-Jul-2019`.
+/// unzip.c:UseBZip2 with `BZ2_bzlibVersion()` (debian: -DUSE_BZIP2). probe:
+/// `unzip -v` (debian:trixie): the library is `1.0.8, 13-Jul-2019`.
 pub(super) const OPT_USE_BZIP2: &str =
     "USE_BZIP2 (PKZIP 4.6+, using bzip2 lib version 1.0.8, 13-Jul-2019)";
 /// unzip.c:VmsTextConv.
 pub(super) const OPT_VMS_TEXT_CONV: &str = "VMS_TEXT_CONV";
-/// unzip.c:WildStopAtDir (ubuntu: -DWILD_STOP_AT_DIR).
+/// unzip.c:WildStopAtDir (debian: -DWILD_STOP_AT_DIR).
 pub(super) const OPT_WILD_STOP_AT_DIR: &str = "WILD_STOP_AT_DIR";
 /// unzip.c:Decryption with `CR_MAJORVER`, `CR_MINORVER`, `CR_BETA_VER` and
 /// `CryptDate` (crypt.h: 2, 11, `""`, `05 Jan 2007`).
@@ -245,30 +223,6 @@ pub(super) const ENV_OPTIONS: &str = "\nUnZip and ZipInfo environment options:\n
 pub(super) const NONE: &str = "[none]";
 
 // ---- unzip.c: help_extended() ----
-
-/// ubuntu: 20-unzip60-alt-iconv-utf8.patch's `-hh` entries: each group is
-/// printed after the line of [`HELP_EXTENDED`] it names.
-pub(super) const HELP_EXTENDED_ICONV: &[(&str, &[&str])] = &[
-    (
-        "         standard header.",
-        &["  -I CHARSET  [UNIX] Specify a character encoding for UNIX and other archives."],
-    ),
-    (
-        "         care.",
-        &[
-            "  -O CHARSET  [UNIX] Specify a character encoding for DOS, Windows",
-            "                and OS/2 archives.",
-        ],
-    ),
-    (
-        "  -z  Include archive comment if any in listing.",
-        &[
-            "  -O CHARSET  [UNIX] Specify a character encoding for DOS, Windows",
-            "                and OS/2 archives.",
-            "  -I CHARSET  [UNIX] Specify a character encoding for UNIX and other archives.",
-        ],
-    ),
-];
 
 /// unzip.c:help_extended()'s `text[]`, each element printed with `%s\n`.
 pub(super) const HELP_EXTENDED: &[&str] = &[
@@ -667,18 +621,18 @@ pub(super) const CANNOT_OPEN_ZIPFILE: &str = "error:  cannot open zipfile [ %s ]
 pub(super) const READ_ERROR: &str = "error:  zipfile read error\n";
 /// fileio.c:FilenameTooLongTrunc.
 pub(super) const FILENAME_TOO_LONG_TRUNC: &str = "warning:  filename too long--truncating.\n";
-/// fileio.c:UFilenameTooLongTrunc (ubuntu: -DUNICODE_SUPPORT, its text as
+/// fileio.c:UFilenameTooLongTrunc (debian: -DUNICODE_SUPPORT, its text as
 /// 28-cve-2022-0529-and-cve-2022-0530.patch has it).
 pub(super) const UFILENAME_TOO_LONG_TRUNC: &str =
     "warning:  Converted Unicode filename too long--truncating.\n";
-/// fileio.c:UFilenameCorrupt (ubuntu: -DUNICODE_SUPPORT,
+/// fileio.c:UFilenameCorrupt (debian: -DUNICODE_SUPPORT,
 /// 28-cve-2022-0529-and-cve-2022-0530.patch).
 pub(super) const UFILENAME_CORRUPT: &str = "error: Unicode filename corrupt.\n";
-/// process.c:UnicodeVersionError (ubuntu: -DUNICODE_SUPPORT).
+/// process.c:UnicodeVersionError (debian: -DUNICODE_SUPPORT).
 pub(super) const UNICODE_VERSION_ERROR: &str = "\nwarning:  Unicode Path version > 1\n";
-/// process.c:UnicodeMismatchError (ubuntu: -DUNICODE_SUPPORT).
+/// process.c:UnicodeMismatchError (debian: -DUNICODE_SUPPORT).
 pub(super) const UNICODE_MISMATCH_ERROR: &str = "\nwarning:  Unicode Path checksum invalid\n";
-/// process.c:UFilenameTooLongTrunc (ubuntu: -DUNICODE_SUPPORT,
+/// process.c:UFilenameTooLongTrunc (debian: -DUNICODE_SUPPORT,
 /// 28-cve-2022-0529-and-cve-2022-0530.patch): `wide_to_local_string()`'s
 /// escape cut short.
 pub(super) const UFILENAME_TOO_LONG_P1: &str = "warning:  filename too long (P1) -- truncating.\n";
@@ -1329,7 +1283,7 @@ pub(super) const COMPR_NAMES: [(u16, &str); 17] = [
 pub(super) const FIL_NAM_MSG: &str = "%s:  bad filename length (%s)\n";
 /// extract.c:LvsCFNamMsg.
 pub(super) const LVS_CF_NAM_MSG: &str = "%s:  mismatching \"local\" filename (%s),\n         continuing with \"central\" filename version\n";
-/// extract.c:GP11FlagsDiffer (ubuntu: -DUNICODE_SUPPORT; `%lu`, `%s`, `%d`
+/// extract.c:GP11FlagsDiffer (debian: -DUNICODE_SUPPORT; `%lu`, `%s`, `%d`
 /// formatted by the caller).
 pub(super) const GP11_FLAGS_DIFFER: &str = "file #%s (%s):\n         mismatch between local and central GPF bit 11 (\"UTF-8\"),\n         continuing with central flag (IsUTF8 = %s)\n";
 /// extract.c:WrnStorUCSizCSizDiff.
@@ -1418,7 +1372,7 @@ pub(super) const INFLATE: &str = "inflate";
 pub(super) const EXPLODE: &str = "explode";
 /// extract.c:Unshrink.
 pub(super) const UNSHRINK: &str = "unshrink";
-/// extract.c:BUnzip (ubuntu: -DUSE_BZIP2).
+/// extract.c:BUnzip (debian: -DUSE_BZIP2).
 pub(super) const BUNZIP: &str = "bunzip";
 /// extract.c:FileTruncated.
 pub(super) const FILE_TRUNCATED: &str = "warning:  %s is probably truncated\n";
@@ -1426,7 +1380,7 @@ pub(super) const FILE_TRUNCATED: &str = "warning:  %s is probably truncated\n";
 pub(super) const FILE_UNKNOWN_COMP_METHOD: &str = "%s:  unknown compression method\n";
 /// extract.c:BadCRC (`%08lx` twice, formatted by the caller).
 pub(super) const BAD_CRC: &str = " bad CRC %s  (should be %s)\n";
-/// extract.c:NotEnoughMemCover (ubuntu: 23-cve-2019-13232-zip-bomb-with-
+/// extract.c:NotEnoughMemCover (debian: 23-cve-2019-13232-zip-bomb-with-
 /// overlapped-entries.patch).
 pub(super) const NOT_ENOUGH_MEM_COVER: &str = "error: not enough memory for bomb detection\n";
 /// extract.c:OverlappedComponents (the same patch).
@@ -1443,7 +1397,7 @@ pub(super) const VERB_EXTRACT: &[u8] = b"extract";
 pub(super) const VERB_UNSHRINK: &[u8] = b"unshrink";
 pub(super) const VERB_EXPLOD: &[u8] = b"explod";
 pub(super) const VERB_INFLAT: &[u8] = b"inflat";
-/// extract_or_test_member's BZIPPED verb (ubuntu: -DUSE_BZIP2).
+/// extract_or_test_member's BZIPPED verb (debian: -DUSE_BZIP2).
 pub(super) const VERB_BUNZIPP: &[u8] = b"bunzipp";
 /// extract_or_test_member's `nul`, `txt`, `bin`.
 pub(super) const KIND_EMPTY: &[u8] = b"[empty] ";
@@ -1587,4 +1541,4 @@ pub(super) const HANDLER_TEXT: &[u8] = b"";
 /// stuffr's own: the flavour variable holds neither name (exit 1). `%s` is
 /// the program name, then the value.
 pub(super) const FLAVOR_REFUSED: &str =
-    "%s: STUFFR_UNZIP_FLAVOR must be apple or ubuntu, not '%s'\n";
+    "%s: STUFFR_UNZIP_FLAVOR must be apple or debian, not '%s'\n";

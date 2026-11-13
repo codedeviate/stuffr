@@ -59,7 +59,7 @@ pub(crate) fn decrypt_entry(uz: &mut Uz, ex: &mut Ex, passwrd: Option<&[u8]>) ->
         // `b = NEXTBYTE; h[n] = (uch)b`: EOF is 0xff
         *b = match src.next_byte() {
             Some(c) => c,
-            // ubuntu: 14-cve-2015-7696.patch: quit early if compressed size
+            // debian: 14-cve-2015-7696.patch: quit early if compressed size
             // < HEAD_LEN, before `undefer_input()`: the input is left
             // deferred (`G.incnt` 0, the leftover hidden), as the C leaves
             // it for the next entry.

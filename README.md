@@ -1766,11 +1766,12 @@ input is copied through, as lz4 does.
 Info-ZIP: the `-Z` must be the first argument, and the rest is zipinfo's
 command line. They behave as **Info-ZIP UnZip 6.00**, in two flavours, chosen
 as the gzip family chooses its own: Apple's build on macOS and the BSDs (the
-reference is `/usr/bin/unzip`, from Apple's `zip-33` tree), Ubuntu's build
-everywhere else, Windows included (Ubuntu 24.04's `6.0-28ubuntu4.1`, Debian's
-patch series and build options). `STUFFR_UNZIP_FLAVOR=apple` or `ubuntu`
-overrides that; any other value is refused at exit 1 with
-`unzip: STUFFR_UNZIP_FLAVOR must be apple or ubuntu, not 'VALUE'` (the invoked
+reference is `/usr/bin/unzip`, from Apple's `zip-33` tree), Debian's build
+everywhere else, Windows included (Debian 13's `6.0-29+deb13u1`, its patch
+series and build options; Ubuntu 24.04's `6.0-28ubuntu4.1` until `0.26.0`).
+`STUFFR_UNZIP_FLAVOR=apple` or `debian` overrides that (`ubuntu`, the old
+name, is an alias of `debian`); any other value is refused at exit 1 with
+`unzip: STUFFR_UNZIP_FLAVOR must be apple or debian, not 'VALUE'` (the invoked
 name leads the line). `unzip` reads `UNZIP` and `UNZIPOPT`, and `zipinfo` reads `ZIPINFO` and
 `ZIPINFOOPT`, before the command line, as the reference does.
 
@@ -1781,7 +1782,7 @@ name leads the line). `unzip` reads `UNZIP` and `UNZIPOPT`, and `zipinfo` reads 
   the listings (`-l`, `-v`, `-z`, `-T`, zipinfo's formats and totals), testing,
   extraction with its overwrite questions and passwords, the usage screens,
   `-v`, and the exit codes Info-ZIP defines (0 to 3, 4 to 8, 9 to 11, 50, 51,
-  80 to 82, and 12 under Ubuntu).
+  80 to 82, and 12 under Debian).
 - **Extracted trees are identical wherever the reference's behaviour is
   defined** (deviation 10): names, modes, times, symlinks, and on macOS the
   archive's quarantine attribute. A differential suite runs each
@@ -1798,24 +1799,22 @@ name leads the line). `unzip` reads `UNZIP` and `UNZIPOPT`, and `zipinfo` reads 
 2. **The first banner line** of each program's usage and `-v` names stuffr
    and says it is altered (Info-ZIP licence, clause 3): `UnZip 6.00 of 20
    April 2009, by stuffr X.Y.Z (altered; original by Info-ZIP, with
-   modifications by Apple Inc.).` (Ubuntu: `(altered; Debian's build,
+   modifications by Apple Inc.).` (Debian: `(altered; Debian's build,
    original by Info-ZIP).`), and likewise for zipinfo and funzip. That line is
    wider than the pager's 80 columns, so under `-M` it counts as two screen
    lines and `-Mh` pauses one text line earlier than the reference. `-v`'s
    `Compiled with` line is the recorded reference build's (Apple: this
    release's macOS build), so other macOS builds print a different one.
-3. **Pre-existing symlinks.** The Ubuntu flavour also stays beneath the
+3. **Pre-existing symlinks.** The Debian flavour also stays beneath the
    extraction root, as Apple's does. On unix only: off unix (Windows) the
    walk (`unix/beneath.rs`'s `imp_std`) follows symlinks, so neither flavour
    is contained there.
 4. **The archive being read is never overwritten.**
-5. **`-O` and `-I` (Ubuntu)** convert names through `iconv(3)`. They are
-   unavailable on Windows, where they are parsed as Ubuntu parses them and
-   convert nothing, as a conversion Ubuntu's `iconv_open()` refuses (silently:
-   the names stay as stored).
+5. (Withdrawn in `0.27.0`: it concerned Ubuntu's `-O`/`-I`, which Debian 13
+   does not have. The number is kept so the others keep theirs.)
 6. **Locale-dependent output** is identical under `C`, `C.UTF-8` and
    `en_US.UTF-8` only.
-7. **Quarantine on macOS.** The Ubuntu flavour also propagates the archive's
+7. **Quarantine on macOS.** The Debian flavour also propagates the archive's
    quarantine attribute there, as Apple's does.
 8. **The terminal.** After a prompt, a pager key or an interrupt, the
    terminal's mode is put back exactly as it was, where unzip only sets echo
@@ -1830,7 +1829,7 @@ name leads the line). `unzip` reads `UNZIP` and `UNZIPOPT`, and `zipinfo` reads 
    it loses the data and exits 0.
 10. **Undefined behaviour and endless loops are not reproduced.** Where a
     reference's behaviour is undefined, or never ends, stuffr gives a defined
-    answer instead. Ubuntu's bzip2 decoding loops for ever on a truncated
+    answer instead. Debian's bzip2 decoding loops for ever on a truncated
     entry; stuffr answers as for bad bzip2 data, exit 2 (T13-2). Apple's `-:`
     on a `../` directory entry changes the directory above the extraction
     root; stuffr refuses (T10-10). After a failed create Apple writes through
@@ -1838,10 +1837,18 @@ name leads the line). `unzip` reads `UNZIP` and `UNZIPOPT`, and `zipinfo` reads 
     on (T10-11). At the end of input the C asks for a new name for ever at the
     rename prompt, and waits for ever at the `-M` pager's; stuffr takes
     `[N]one` and stops pausing (T10-9, T11-4). Buffer overflows are answered
-    in both flavours with the forms of Ubuntu's CVE fixes: a method above 999
+    in both flavours with the forms of Debian's CVE fixes: a method above 999
     is `Unk` and four hex digits (`Unk03E8`), and a password prompt whose
     names are too long is "Enter password: " (T11-5). The full set is in the
     code's `// ruling:` comments.
+11. **CVE-2021-4217** (`0.27.0`). Debian 13 carries no fix for it (Ubuntu
+    24.04 did). A first entry with no name whose extra field holds a Unicode
+    Path block makes Debian's unzip and zipinfo dereference a NULL name and
+    die (`error:  zipfile probably corrupt (segmentation violation)`, exit
+    3); stuffr reads the archive as the fix does (the block is ignored). An
+    extra field cut short by the end of the archive is read by Debian with
+    its missing bytes uninitialised; stuffr refuses it as the fix does, and
+    as Apple's tree does (`bad extra field length`).
 
 ### The compress family
 

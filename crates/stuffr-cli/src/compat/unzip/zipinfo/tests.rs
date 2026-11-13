@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use super::short::{Attribs, unix_letters, version};
 use super::*;
 use crate::compat::host::{Host, SANDBOX_OUTPUT_CAP, Sandbox};
-use crate::compat::unzip::{EXIT_CODES_APPLE, EXIT_CODES_UBUNTU, Flavour, run_in_counted};
+use crate::compat::unzip::{EXIT_CODES_APPLE, EXIT_CODES_DEBIAN, Flavour, run_in_counted};
 
 /// A run's `G` in a sandbox (UTC), for the pieces that read `uO`.
 fn with_uz<R>(f: impl FnOnce(&mut Uz) -> R) -> R {
@@ -274,10 +274,10 @@ fn hostile_directories_never_panic() {
             z[at] = 0xff;
         }
         std::fs::write(dir.join("h.zip"), &z).unwrap();
-        for f in [Flavour::Apple, Flavour::Ubuntu] {
+        for f in [Flavour::Apple, Flavour::Debian] {
             let codes = match f {
                 Flavour::Apple => EXIT_CODES_APPLE,
-                Flavour::Ubuntu => EXIT_CODES_UBUNTU,
+                Flavour::Debian => EXIT_CODES_DEBIAN,
             };
             for args in formats {
                 let mut a: Vec<OsString> = args.iter().map(OsString::from).collect();

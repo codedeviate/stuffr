@@ -13,7 +13,7 @@ pub const DEBIAN_UNZIP_VERSION: &str = "6.0-29+deb13u1";
 /// own first line names stuffr instead; [`unzip_differences`] masks both).
 pub const APPLE_UNZIP_BANNER: &str =
     "UnZip 6.00 of 20 April 2009, by Info-ZIP, with modifications by Apple Inc.";
-pub const UBUNTU_UNZIP_BANNER: &str =
+pub const DEBIAN_UNZIP_BANNER: &str =
     "UnZip 6.00 of 20 April 2009, by Debian. Original by Info-ZIP.";
 /// zipinfo's, the same in both builds.
 pub const ZIPINFO_BANNER: &str =
@@ -56,7 +56,7 @@ pub const APPLE_UNZIP_IDENTITY: &str = concat!(
 );
 
 /// The flavour whose reference this platform has: `apple` on macOS and
-/// the BSDs, `ubuntu` elsewhere (the family's own default, plan
+/// the BSDs, `debian` elsewhere (the family's own default, plan
 /// "Flavour selection").
 pub fn platform_unzip_flavour() -> &'static str {
     if cfg!(any(
@@ -68,13 +68,13 @@ pub fn platform_unzip_flavour() -> &'static str {
     )) {
         "apple"
     } else {
-        "ubuntu"
+        "debian"
     }
 }
 
 /// The installed apt `unzip` package's version, `None` without `dpkg-query`
 /// or the package.
-pub fn ubuntu_unzip_version() -> Option<String> {
+pub fn debian_unzip_version() -> Option<String> {
     let out = output(
         Command::new("dpkg-query")
             .args(["-W", "-f", "${Version}", "unzip"])
@@ -104,7 +104,7 @@ pub fn unzip_dir() -> Option<&'static str> {
         if cfg!(target_os = "macos") {
             Ok("/usr/bin")
         } else if cfg!(target_os = "linux") {
-            match ubuntu_unzip_version() {
+            match debian_unzip_version() {
                 Some(v) if v == DEBIAN_UNZIP_VERSION => Ok("/usr/bin"),
                 Some(v) => Err(format!(
                     "the apt unzip is {v}, not {DEBIAN_UNZIP_VERSION} (`make compat-debian` has it)"
@@ -426,12 +426,12 @@ fn mask_unzip_banners(text: &[u8], ours: Option<&str>) -> Vec<u8> {
     let stuffr = format!(", by stuffr {} (altered; ", env!("CARGO_PKG_VERSION"));
     let marker = match ours {
         Some("apple") => Some("Apple Inc."),
-        Some("ubuntu") => Some("Debian"),
+        Some("debian") => Some("Debian"),
         _ => None,
     };
     let banners = [
         APPLE_UNZIP_BANNER,
-        UBUNTU_UNZIP_BANNER,
+        DEBIAN_UNZIP_BANNER,
         ZIPINFO_BANNER,
         FUNZIP_BANNER,
     ];

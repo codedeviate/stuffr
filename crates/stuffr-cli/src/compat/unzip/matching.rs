@@ -39,7 +39,7 @@ fn c_str(s: &[u8]) -> &[u8] {
 /// `match(string, pattern, ignore_case, sepc)`: whether `name` matches the
 /// wildcard `pattern`. `ignore_case` is `-C` (and zipinfo's `-C`);
 /// `stop_at_dir` is `WILD_STOP_AT_DIR` with `uO.W_flag` set (`sepc` `/`;
-/// Ubuntu's `-W`, `flavour::wild_stop_at_dir`), else `sepc` is 0, which is
+/// Debian's `-W`, `flavour::wild_stop_at_dir`), else `sepc` is 0, which is
 /// the code a build without `WILD_STOP_AT_DIR` runs.
 ///
 /// `*` matches any run of bytes, `?` one byte, `[...]` a set (`[!...]` or
@@ -82,7 +82,7 @@ fn recmatch(pat: &[u8], s: &[u8], ic: bool, sepc: u8) -> i32 {
 
             // '?' matches any character (but not an empty string)
             if c == b'?' {
-                // ubuntu: -DWILD_STOP_AT_DIR (with -W it won't match '/')
+                // debian: -DWILD_STOP_AT_DIR (with -W it won't match '/')
                 if at(s, si) != 0 && (sepc == 0 || at(s, si) != sepc) {
                     si += 1;
                     continue 'eval;
@@ -92,7 +92,7 @@ fn recmatch(pat: &[u8], s: &[u8], ic: bool, sepc: u8) -> i32 {
 
             // '*' matches any number of characters, including zero
             if c == b'*' {
-                // ubuntu: -DWILD_STOP_AT_DIR
+                // debian: -DWILD_STOP_AT_DIR
                 if sepc != 0 {
                     // check for single "*" or double "**"
                     if at(pat, pi) != b'*' {

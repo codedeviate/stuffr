@@ -1,10 +1,10 @@
-//! The unzip family's Ubuntu flavour against its reference, apt's `unzip`
-//! 6.0-28ubuntu4.1 on ubuntu 24.04 (0.16.0). Linux only: CI's ubuntu-latest
-//! has the package, and `make compat-ubuntu` runs this suite in a Docker
-//! image that has it (ruling R10). The shared rows are in
-//! `compat_unzip_common.rs`; this suite holds the differentials of Ubuntu's
-//! own build options (Task 13: `ubuntu_build_rows`) and, from Task 14, of
-//! its patches.
+//! The unzip family's Debian flavour against its reference, apt's `unzip`
+//! 6.0-29+deb13u1 on Debian 13 (trixie) (0.27.0; Ubuntu 24.04's
+//! 6.0-28ubuntu4.1 from 0.16.0 to 0.26.0). Linux only: `make compat-debian`
+//! runs this suite in a Docker image that has the package (ruling R10). The
+//! shared rows are in `compat_unzip_common.rs`; this suite holds the
+//! differentials of Debian's own build options (Task 13:
+//! `debian_build_rows`) and of its patch series (`debian_patch_rows`).
 
 #[cfg(target_os = "linux")]
 mod compat_harness;
@@ -16,18 +16,18 @@ mod linux {
     /// The oracle is the pinned release: the package version, and the
     /// banner its usage opens with.
     #[test]
-    fn the_reference_is_ubuntus_unzip_6_0_28ubuntu4_1() {
+    fn the_reference_is_debians_unzip_6_0_29_deb13u1() {
         if unzip_dir().is_none() {
             return;
         }
         assert_eq!(
-            ubuntu_unzip_version().as_deref(),
+            debian_unzip_version().as_deref(),
             Some(DEBIAN_UNZIP_VERSION)
         );
         let r = unzip_reference(&unzip_case("unzip", vec![], vec![])).unwrap();
         let out = String::from_utf8_lossy(&r.stdout);
-        assert_eq!(out.lines().next(), Some(UBUNTU_UNZIP_BANNER), "{out}");
-        assert_eq!(platform_unzip_flavour(), "ubuntu");
+        assert_eq!(out.lines().next(), Some(DEBIAN_UNZIP_BANNER), "{out}");
+        assert_eq!(platform_unzip_flavour(), "debian");
     }
 
     // ---- archives ----
@@ -404,7 +404,7 @@ mod linux {
             ("enc.zip", enc),
             ("bigenc.zip", big_enc),
         ];
-        // The fixture whose README records Ubuntu's `-t` answer.
+        // The fixture whose README records Debian's `-t` answer.
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../stuffr-formats/tests/data/infozip/bzip2.zip");
         if let Ok(b) = std::fs::read(&fixture) {
@@ -570,7 +570,7 @@ mod linux {
         run_group(group, cases, Skipped::none(), &assert_same_unzip);
     }
 
-    /// Ubuntu's build options (Task 13), against its binary: the `-v`
+    /// Debian's build options (Task 13), against its binary: the `-v`
     /// screen's "char coding" per locale; names (`NO_WORKING_ISPRINT`,
     /// `UNICODE_SUPPORT` with `UTF8_MAYBE_NATIVE` and `UNICODE_WCHAR`) in
     /// listings, zipinfo, tests and extraction per locale; bzip2 entries
@@ -579,7 +579,7 @@ mod linux {
     /// and symlinks (`NO_LCHMOD`). The probes behind each are in
     /// `.claude/rules/compat.md`, "Task 13 probes".
     #[test]
-    fn ubuntu_build_rows() {
+    fn debian_build_rows() {
         // -v per locale
         let cases: Vec<Case> = LOCALES
             .iter()
@@ -1232,11 +1232,11 @@ mod linux {
         }
     }
 
-    /// 20-unzip60-alt-iconv-utf8.patch's inputs: names with high bytes from
-    /// MS-DOS (2.0, and PKZIP 2.5, whose local name is ISO), Windows NT (2.0
-    /// and 5.0: the patch makes every NT version OEM), OS/2 and Unix; a name
-    /// whose conversion overflows `FILNAMSIZ` (left as stored) and one that
-    /// just fits; a name that is not UTF-8; a directory; comments.
+    /// The inputs of Ubuntu's 20-unzip60-alt-iconv-utf8.patch, which Debian
+    /// 13 does not carry: names with high bytes from MS-DOS (2.0, and PKZIP
+    /// 2.5, whose local name is ISO), Windows NT (2.0, which stays as stored,
+    /// and 5.0, OEM), OS/2 and Unix; long names; a name that is not UTF-8; a
+    /// directory; comments.
     fn iconv_zips() -> Vec<(&'static str, Vec<u8>)> {
         let long = vec![0x82u8; 3000];
         let mid = vec![0x82u8; 2000];
@@ -1281,6 +1281,104 @@ mod linux {
                 "dir.zip",
                 zip_with(&[dir, dos_entry(b"d\x82r/f\x82.txt", 0, 20)], b"", b""),
             ),
+        ]
+    }
+
+    /// Debian 13's security fixes' inputs. `ux.zip` (can-2026-2034440):
+    /// `ux` blocks naming root, whose owner `-X` cannot set (a warning when
+    /// taken): sizes that fill the block exactly (taken), one byte left over,
+    /// a GID of 0 and of 1 byte, a GID running past the block (none taken).
+    /// `smart.zip` (can-2026-2034443): SmartZip blocks whose name length is
+    /// 5, 31, 40, 200 and 255. `vms.zip` (can-2026-2034442): entries made
+    /// on VMS whose Info-ZIP VMS block is "deflated" but holds a stored FAB
+    /// copy saying "variable-length records": as long as its size says
+    /// (`-a` reads the entry as VMS records), and 8 bytes longer (refused:
+    /// plain text).
+    fn can_2026_zips() -> Vec<(&'static str, Vec<u8>)> {
+        let ux = |uid: &[u8], gid: &[u8], tail: &[u8]| {
+            let mut d = vec![1, uid.len() as u8];
+            d.extend_from_slice(uid);
+            d.push(gid.len() as u8);
+            d.extend_from_slice(gid);
+            d.extend_from_slice(tail);
+            block(0x7875, &d)
+        };
+        let r4 = [0u8; 4];
+        let mut over = vec![1, 4, 0, 0, 0, 0, 8];
+        over.extend_from_slice(&[0; 4]);
+        let ux_blocks = [
+            ux(&r4, &r4, b""),
+            ux(&r4, &r4, b"\0"),
+            ux(&r4, b"", b""),
+            ux(&r4, b"\0", b""),
+            block(0x7875, &over),
+            ux(&[0; 2], &[0; 2], b""),
+            ux(&[0; 2], &[0; 2], b"\0\0"),
+        ];
+        let ux_names: [&[u8]; 7] = [
+            b"exact.txt",
+            b"trail.txt",
+            b"gid0.txt",
+            b"gid1.txt",
+            b"over.txt",
+            b"two.txt",
+            b"two_trail.txt",
+        ];
+        let ux_entries: Vec<ZipEntrySpec> = ux_names
+            .iter()
+            .zip(&ux_blocks)
+            .map(|(n, b)| with_extra(n, b"x", b))
+            .collect();
+        let smart = |len: u8, name: &[u8]| {
+            let mut d = b"dZipTEXTttxt".to_vec();
+            d.extend_from_slice(&[0; 20]);
+            d.push(len);
+            let mut n = name.to_vec();
+            n.resize(31, 0);
+            d.extend_from_slice(&n);
+            block(0x4d63, &d)
+        };
+        let smart_blocks = [
+            smart(5, b"DDDDDDDDDD"),
+            smart(31, &[b'A'; 31]),
+            smart(40, &[b'B'; 31]),
+            smart(200, b"short\0rest"),
+            smart(255, &[b'C'; 31]),
+        ];
+        let smart_names: [&[u8]; 5] = [b"s5", b"s31", b"s40", b"s200", b"s255"];
+        let smart_entries: Vec<ZipEntrySpec> = smart_names
+            .iter()
+            .zip(&smart_blocks)
+            .map(|(n, b)| with_extra(n, b"x", b))
+            .collect();
+        // An Info-ZIP VMS block (`IM`, "VFAB"): `EB_IZVMS_BCDEFL`, its
+        // size 32, and memextract()'s method word (STORED), CRC and data.
+        let vms = |fab_len: usize| {
+            let mut fab = vec![0u8; fab_len];
+            fab[31] = 2; // VMSFAB_B_RFM: VMSREC_C_VAR
+            let mut d = b"VFAB".to_vec();
+            d.extend_from_slice(&2u16.to_le_bytes());
+            d.extend_from_slice(&32u16.to_le_bytes());
+            d.extend_from_slice(&[0; 4]);
+            d.extend_from_slice(&0u16.to_le_bytes());
+            d.extend_from_slice(&crc32(&fab).to_le_bytes());
+            d.extend_from_slice(&fab);
+            block(0x4d49, &d)
+        };
+        let (fits, over) = (vms(32), vms(40));
+        let records = b"\x05\x00hello\x00\x03\x00abc\x00";
+        let vms_entries: Vec<ZipEntrySpec> = [(&b"fits.txt"[..], &fits), (b"over.txt", &over)]
+            .into_iter()
+            .map(|(name, extra)| ZipEntrySpec {
+                version_made_by: 0x0214,
+                extra,
+                ..ZipEntrySpec::new(name, records)
+            })
+            .collect();
+        vec![
+            ("ux.zip", zip_with(&ux_entries, b"", b"")),
+            ("smart.zip", zip_with(&smart_entries, b"", b"")),
+            ("vms.zip", zip_with(&vms_entries, b"", b"")),
         ]
     }
 
@@ -1422,11 +1520,71 @@ mod linux {
         check("zip64_flags_outlive_their_archive", &cases);
     }
 
-    /// Ubuntu's patch series (Task 14), against its binary, one group per
+    /// Debian's patch series (Task 14), against its binary, one group per
     /// patch or set of patches. The probes behind each are in
     /// `.claude/rules/compat.md`, "Task 14 probes".
+    /// Deviation 11: Debian 13 has no fix for CVE-2021-4217. A first entry
+    /// with no name and a Unicode Path block: the reference dereferences a
+    /// NULL name and dies by its SIGSEGV handler (exit 3), stuffr lists and
+    /// extracts as the fix does. An extra field cut short by the end of the
+    /// archive: the reference reads uninitialised bytes (its answer is not
+    /// asserted beyond not being the fix's), stuffr refuses it as the fix
+    /// does ("bad extra field length", exit 2).
     #[test]
-    fn ubuntu_patch_rows() {
+    fn cve_2021_4217_is_deviation_11() {
+        if unzip_dir().is_none() {
+            return;
+        }
+        let noname = zip_with(
+            &[
+                with_extra(b"", b"x", &unipath(b"", b"u.txt", 1)),
+                ZipEntrySpec::new(b"b.txt", b"b"),
+            ],
+            b"",
+            b"",
+        );
+        let mut short = zip_with(&[with_extra(b"a.txt", b"x", &ut())], b"", b"");
+        let cd = short.windows(4).rposition(|w| w == b"PK\x01\x02").unwrap();
+        short[cd + 30..cd + 32].copy_from_slice(&200u16.to_le_bytes());
+        let files = vec![("noname.zip", noname), ("short.zip", short)];
+        for (name, args) in [
+            ("unzip", &["-l", "noname.zip"][..]),
+            ("unzip", &["-t", "noname.zip"]),
+            ("zipinfo", &["noname.zip"]),
+        ] {
+            let c = case(name, args, &files, &[]);
+            let r = unzip_reference(&c).unwrap();
+            assert_eq!(r.code, 3, "{args:?}: {}", r.stderr);
+            let said = [r.stderr.as_bytes(), &r.stdout].concat();
+            assert!(
+                String::from_utf8_lossy(&said).contains("(segmentation violation)"),
+                "{args:?}"
+            );
+            // the fix's answer: the block ignored, the archive read on
+            // (`-t` warns of the empty local name: exit 1)
+            let s = stuffr_unzip(&c);
+            let want = if args[0] == "-t" { 1 } else { 0 };
+            assert_eq!(s.code, want, "{args:?}: {}", s.stderr);
+            assert!(
+                String::from_utf8_lossy(&s.stdout).contains("b.txt"),
+                "{args:?}"
+            );
+        }
+        for args in [&["-l", "short.zip"][..], &["short.zip"]] {
+            let c = case("unzip", args, &files, &[]);
+            let r = unzip_reference(&c).unwrap();
+            let s = stuffr_unzip(&c);
+            assert_eq!(s.code, 2, "{args:?}: {}", s.stderr);
+            assert_ne!(r.code, 2, "{args:?}: the reference has the fix?");
+            if args.len() == 1 {
+                assert_eq!(s.stderr, "a.txt:  bad extra field length (central)\n");
+                assert!(!r.stderr.contains("bad extra field length"), "{}", r.stderr);
+            }
+        }
+    }
+
+    #[test]
+    fn debian_patch_rows() {
         // 09, 10, 11, 12, 14, 16, 18, 19: the CVE fixes' triggers
         let files = cve_zips();
         let mut cases = Vec::new();
@@ -1473,14 +1631,16 @@ mod linux {
             cases.push(case("unzip", args, &files, &[]));
         }
         check("CVE-2019-13232", &cases);
-        // T14-2 is exercised: Ubuntu's own answers
+        // T14-2 is exercised: Debian's own answers
         for (z, code) in [("dd_unipath.zip", 12), ("dd_unipath_bad.zip", 0)] {
             if let Some(r) = unzip_reference(&case("unzip", &["-t", z], &files, &[])) {
                 assert_eq!(r.code, code, "{z}: {}", String::from_utf8_lossy(&r.stdout));
             }
         }
 
-        // 20-unzip60-alt-iconv-utf8: -O/-I, the default OEM_CP per locale
+        // 20-unzip60-alt-iconv-utf8 is Ubuntu's alone: Debian 13 has no
+        // `-O`/`-I` (a bad option: the usage, exit 10), and its names go
+        // through the OEM 850 table, as Apple's, in every locale.
         let files = iconv_zips();
         let mut cases = Vec::new();
         for env in PROMISED.iter().chain(&LOCALES[6..]) {
@@ -1549,7 +1709,33 @@ mod linux {
         ] {
             cases.push(case("zipinfo", args, &files, &[]));
         }
-        check("20-unzip60-alt-iconv-utf8", &cases);
+        check("no 20-unzip60-alt-iconv-utf8", &cases);
+
+        // can-2026-2034440, can-2026-2034443, can-2026-2034442: Debian 13's
+        // security fixes
+        let files = can_2026_zips();
+        let mut cases = Vec::new();
+        for z in ["ux.zip", "smart.zip", "vms.zip"] {
+            for op in [&["-l"][..], &["-v"], &["-t"], &[], &["-X"]] {
+                let mut args = op.to_vec();
+                args.push(z);
+                cases.push(case("unzip", &args, &files, &[]));
+            }
+            for op in [&["-v"][..], &["-l"]] {
+                let mut args = op.to_vec();
+                args.push(z);
+                cases.push(case("zipinfo", &args, &files, &[]));
+            }
+        }
+        for args in [
+            &["-a", "vms.zip"][..],
+            &["-aa", "vms.zip"],
+            &["-aa", "-p", "vms.zip"],
+            &["-Zv", "smart.zip"],
+        ] {
+            cases.push(case("unzip", args, &files, &[]));
+        }
+        check("can-2026", &cases);
 
         // the rest: 17 (times), 21 (byte 5), handle_windows_zip64 (a Zip64
         // locator counting 0 disks), and 04 and 08 (in Apple's tree too)

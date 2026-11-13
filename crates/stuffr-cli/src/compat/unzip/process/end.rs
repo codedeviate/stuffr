@@ -128,7 +128,7 @@ fn find_ecrec64(uz: &mut Uz) -> i32 {
 
     // Check for consistency: the disk numbers in ecrec and ecloc64 must
     // match (the locator counts disks from 1).
-    // ubuntu: handle_windows_zip64.patch (a zero disk count is no
+    // debian: handle_windows_zip64.patch (a zero disk count is no
     // contradiction; `flavour::handle_windows_zip64`)
     if uz.ecrec.number_this_disk != 0xffff
         && (!flavour::handle_windows_zip64(f) || ecloc64_total_disks != 0)
@@ -200,7 +200,7 @@ fn find_ecrec64(uz: &mut Uz) -> i32 {
 
     // Now, we are (almost) sure that we have a Zip64 archive.
     uz.ecrec.have_ecr64 = true;
-    // ubuntu: 24-cve-2019-13232-do-not-raise-alert-for-misplaced-central-
+    // debian: 24-cve-2019-13232-do-not-raise-alert-for-misplaced-central-
     // directory.patch
     uz.ecrec.ec_start = uz.ecrec.ec_start.wrapping_sub((ECLOC64_SIZE + 4) as u64);
     uz.ecrec.ec64_start = ecrec64_start_offset;
@@ -315,15 +315,15 @@ pub(super) fn find_ecrec(uz: &mut Uz, searchlen: i64) -> i32 {
         // ruling: T14-3. find_ecrec() never clears `have_ecr64` or
         // `is_zip64_archive` (only find_ecrec64() sets them): after a Zip64
         // archive they stay set for every later archive of the run, as do
-        // the Zip64 record's spans. probe: Ubuntu's `unzip -qt '*.zip'`
+        // the Zip64 record's spans. probe: Debian's `unzip -qt '*.zip'`
         // over a Zip64 archive, then a plain one: "overlapped components"
         // for the plain one (its cover starts with the stale span).
         have_ecr64: uz.ecrec.have_ecr64,
         is_zip64_archive: uz.ecrec.is_zip64_archive,
         ec64_start: uz.ecrec.ec64_start,
         ec64_end: uz.ecrec.ec64_end,
-        // ubuntu: 24-cve-2019-13232-do-not-raise-alert-for-misplaced-
-        // central-directory.patch (in both flavours: only the Ubuntu
+        // debian: 24-cve-2019-13232-do-not-raise-alert-for-misplaced-
+        // central-directory.patch (in both flavours: only the Debian
         // flavour's bomb detection reads them)
         ec_start: uz.real_ecrec_offset as u64,
         ec_end: (uz.real_ecrec_offset as u64)

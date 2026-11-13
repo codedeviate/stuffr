@@ -256,10 +256,10 @@ pub(super) fn zi_short(uz: &mut Uz, e: &CentralEntry) -> i32 {
         // unknown
         // ruling: `sprintf(&methbuf[1], "%03u")` of a method above 999
         // overflows `methbuf[5]` (undefined behaviour; Apple's build has
-        // no fix). Both flavours print what Ubuntu's
+        // no fix). Both flavours print what Debian's
         // 19-cve-2016-9844-zipinfo-buffer-overflow.patch prints: four
         // upper-case hex digits in place of `u###` (`03E8`).
-        // ubuntu: 19-cve-2016-9844-zipinfo-buffer-overflow.patch
+        // debian: 19-cve-2016-9844-zipinfo-buffer-overflow.patch
         methbuf = if e.compression_method <= 999 {
             format!("u{:03}", e.compression_method).into_bytes()
         } else {
@@ -355,7 +355,7 @@ pub(super) fn zi_short(uz: &mut Uz, e: &CentralEntry) -> i32 {
             // (attribs[6]: `l` in real 4.3BSD, `S` as SunOS 4.1.x)
             unix_letters(&mut attribs, xattr, b'S');
             // apple: zipinfo.c:2117 (`sprintf(&attribs[11], "%2u.%u", ...)`)
-            // ubuntu: 08-allow-greater-hostver-values.patch (the same line)
+            // debian: 08-allow-greater-hostver-values.patch (the same line)
             let v = format!("{:>2}.{}", hostver / 10, hostver % 10).into_bytes();
             attribs.sprintf_at(11, &v);
         }

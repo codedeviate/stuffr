@@ -137,7 +137,7 @@ fn recursive(mut p: &[u8], mut s: &[u8], ic: bool, sepc: u8) -> i32 {
 
         // '?' matches any character (but not an empty string)
         if c == b'?' {
-            // ubuntu: -DWILD_STOP_AT_DIR (with -W it won't match '/')
+            // debian: -DWILD_STOP_AT_DIR (with -W it won't match '/')
             if at(s, 0) != 0 && (sepc == 0 || at(s, 0) != sepc) {
                 s = &s[1..];
                 continue;
@@ -147,7 +147,7 @@ fn recursive(mut p: &[u8], mut s: &[u8], ic: bool, sepc: u8) -> i32 {
 
         // '*' matches any number of characters, including zero
         if c == b'*' {
-            // ubuntu: -DWILD_STOP_AT_DIR
+            // debian: -DWILD_STOP_AT_DIR
             if sepc != 0 {
                 // check for single "*" or double "**"
                 if at(p, 0) != b'*' {

@@ -1,6 +1,6 @@
 //! The unzip family at a terminal (0.16.0 Task 11), on every unix, against
-//! this platform's reference (Apple's `/usr/bin/unzip` on macOS, Ubuntu's
-//! on Linux: `make compat-ubuntu`) with stuffr in that flavour: the
+//! this platform's reference (Apple's `/usr/bin/unzip` on macOS, Debian's
+//! on Linux: `make compat-debian`) with stuffr in that flavour: the
 //! password prompt on the controlling terminal (R12, `Case::tty_ctl`) and
 //! its retries, Review Focus 4's password mixes, the overwrite question
 //! and `[r]ename` at a terminal, `-M`'s pager, the `^S` pause in a comment,
@@ -401,7 +401,7 @@ mod unix {
 
     /// ruling: T11-5. An entry whose filtered name with the archive's
     /// exceeds `2*FILNAMSIZ` bytes: Apple's build dies in `__sprintf_chk`;
-    /// both flavours ask "Enter password: " as Ubuntu's patch does. 1020
+    /// both flavours ask "Enter password: " as Debian's patch does. 1020
     /// `^A` bytes (2040 shown) and `lon3.zip` fit Apple's 2048 exactly; one
     /// more byte does not.
     #[test]

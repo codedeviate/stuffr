@@ -103,7 +103,7 @@ impl std::fmt::Display for Escaped {
 impl std::error::Error for Escaped {}
 
 /// `EACCES`, which Apple's `open_outfile()` makes of `ENOTCAPABLE` (and the
-/// Ubuntu flavour of every escape: deviation 3).
+/// Debian flavour of every escape: deviation 3).
 pub(crate) fn eacces() -> io::Error {
     #[cfg(unix)]
     {

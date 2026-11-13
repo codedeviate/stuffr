@@ -11,7 +11,6 @@ use super::{Uz, flavour};
 
 pub(crate) mod attrs;
 pub(crate) mod beneath;
-pub(crate) mod charset;
 pub(crate) mod mapname;
 
 /// `do_wild()`'s state (`SYSTEM_SPECIFIC_GLOBALS`: `wild_dir`, `wildname`,
@@ -61,7 +60,7 @@ impl Wild {
     /// one), or, when there is none, `wildspec` itself once. `None` when
     /// there are no more.
     pub(crate) fn do_wild(&mut self, uz: &Uz, wildspec: &[u8]) -> Option<Vec<u8>> {
-        // ubuntu: -DWILD_STOP_AT_DIR (`WISEP`)
+        // debian: -DWILD_STOP_AT_DIR (`WISEP`)
         let stop = flavour::wild_stop_at_dir(uz.flavour) && uz.o.w_flag;
         if !self.notfirstcall {
             // first call:  must initialize everything

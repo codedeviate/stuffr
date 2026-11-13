@@ -5,6 +5,8 @@
 # The harness checks the unzip, zip and ncompress versions itself
 # (`unzip_dir()`, `zip_dir()`, `ncompress_dir()` require them under `CI`), so a
 # newer apt package fails the run loudly instead of being used as the oracle.
+# `procps` gives the harness `ps` (the unzip harness selftest reads a case's
+# session leader through it).
 #
 # Used by `make compat-debian`, which builds this image and runs the unzip,
 # compress, zip, bzip2 and gzip suites in it with `CI=1`. The repository is
@@ -22,6 +24,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       unzip zip ncompress bzip2 gzip build-essential curl ca-certificates locales \
+      procps \
  && sed -i 's/^# *\(en_US.UTF-8 UTF-8\)/\1/' /etc/locale.gen \
  && locale-gen \
  && rm -rf /var/lib/apt/lists/*

@@ -68,7 +68,7 @@ pub(crate) fn ratio(uc: u64, c: u64) -> i32 {
 /// (`-214748365%` for INT_MIN, ` 214748365%` for INT_MAX), and so it is
 /// here.
 /// probe: unzip -v of 1000 bytes stored in 2^31 + 1000 + k, k in -6..=6,
-/// on both references (Apple and Ubuntu print the same figures)
+/// on both references (Apple and Debian print the same figures)
 fn cfactor(uc: u64, c: u64) -> (u8, i32) {
     let r = ratio(uc, c);
     let sgn = if r < 0 { b'-' } else { b' ' };
@@ -95,7 +95,7 @@ fn cfactorstr(sgn: u8, cfactor: i32) -> Vec<u8> {
 /// ruling: the C writes `Unk:` and `%03u` into an 8-byte `methbuf`, which a
 /// method above 999 overflows (Apple's unzip dies by `__sprintf_chk`, exit
 /// 133: probe `unzip -l` of an entry of method 1000). Both flavours print
-/// what Ubuntu's 18-cve-2014-9913-unzip-buffer-overflow.patch prints:
+/// what Debian's 18-cve-2014-9913-unzip-buffer-overflow.patch prints:
 /// `Unk` and four upper-case hex digits (`Unk03E8`).
 fn methbuf(e: &CentralEntry) -> Vec<u8> {
     let methnum = find_compr_idx(e.compression_method);
@@ -390,7 +390,7 @@ mod tests {
         assert_eq!(methbuf(&e(12, 0)), b"BZip2");
         assert_eq!(methbuf(&e(99, 0)), b"Unk:099");
         assert_eq!(methbuf(&e(999, 0)), b"Unk:999");
-        // ruling: past 999, Ubuntu's CVE-2014-9913 format for both flavours.
+        // ruling: past 999, Debian's CVE-2014-9913 format for both flavours.
         assert_eq!(methbuf(&e(1000, 0)), b"Unk03E8");
         assert_eq!(methbuf(&e(65535, 0)), b"UnkFFFF");
     }

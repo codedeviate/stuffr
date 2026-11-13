@@ -27,7 +27,7 @@ const SHRUNK: u16 = 1;
 const IMPLODED: u16 = 6;
 const DEFLATED: u16 = 8;
 const ENHDEFLATED: u16 = 9;
-/// ubuntu: -DUSE_BZIP2
+/// debian: -DUSE_BZIP2
 const BZIPPED: u16 = 12;
 
 /// `ExtractMsg`'s `%8s`: the verb right-aligned in eight columns.
@@ -192,14 +192,14 @@ pub(crate) fn extract_or_test_member(uz: &mut Uz, ex: &mut Ex) -> i32 {
         uz.info(0, b"\n");
     }
 
-    // ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch
+    // debian: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch
     if flavour::skips_data_descriptor(uz.flavour) && uz.lrec.general_purpose_bit_flag & 8 != 0 {
         error = skip_data_descriptor(uz, error);
     }
     error
 }
 
-/// ubuntu: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch: skip
+/// debian: 23-cve-2019-13232-zip-bomb-with-overlapped-entries.patch: skip
 /// over data descriptor (harder than it sounds, due to signature
 /// ambiguity). `PK_ERR` when the archive ends first, else `error`.
 fn skip_data_descriptor(uz: &mut Uz, error: i32) -> i32 {
@@ -333,7 +333,7 @@ fn unstore(
 const BZ_EXIT_PK_MEM3: i32 = -PK_MEM3;
 
 // port: extract.c:UZbunzip2
-/// ubuntu: -DUSE_BZIP2. The entry's bzip2 stream decoded as the C drives
+/// debian: -DUSE_BZIP2. The entry's bzip2 stream decoded as the C drives
 /// libbzip2 (`stuffr::bzip2_stream::RawStream`, one `BZ2_bzDecompress` a
 /// call, R1): straight from the archive's buffer (`G.inptr`, `G.incnt`,
 /// refilled by `fillinbuf()`) into `slide`, flushed each time the window
@@ -368,7 +368,7 @@ fn bunzip2(
     flush: &mut dyn FnMut(&[u8]) -> Result<(), i32>,
 ) -> Result<(), Stop<i32>> {
     use stuffr::bzip2_stream::{RawStream, StreamError};
-    // ubuntu: 15-cve-2015-7697.patch
+    // debian: 15-cve-2015-7697.patch
     if src.zin.incnt <= 0 && src.csize <= 0 {
         // avoid an infinite loop
         return Err(Stop::Code(2));
@@ -467,7 +467,7 @@ fn bunzip2(
     }
 
     src.zin.inptr = next_in;
-    // ubuntu: 25-cve-2019-13232-fix-bug-in-uzbunzip2.patch
+    // debian: 25-cve-2019-13232-fix-bug-in-uzbunzip2.patch
     src.zin.incnt -= next_in as i64; // reset for other routines
     Ok(())
 }
@@ -475,7 +475,7 @@ fn bunzip2(
 // port: extract.c:extract_or_test_member
 /// The entry's data decoded by its method (`G.lrec.compression_method`):
 /// stored, shrunk (1), imploded (6), deflated (8), deflate64 (9) or, in
-/// the Ubuntu flavour, bzip2 (12), each announced by its
+/// the Debian flavour, bzip2 (12), each announced by its
 /// "extracting:"/"inflating:"/... line, each failure by the C's message.
 /// Any other method is "unknown compression method", `PK_WARN`
 /// (`store_info()` has already refused them). Returns the PK code.
@@ -592,7 +592,7 @@ pub(crate) fn decode_entry(uz: &mut Uz, ex: &mut Ex) -> i32 {
                 Ended::Code(r) => r,
             }
         }
-        // ubuntu: -DUSE_BZIP2
+        // debian: -DUSE_BZIP2
         BZIPPED if flavour::use_bzip2(uz.flavour) => {
             if announce {
                 extract_msg(uz, ex, m::VERB_BUNZIPP, false);
