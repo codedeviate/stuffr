@@ -386,3 +386,14 @@ fn an_interrupt_after_a_failed_replace_keeps_the_temporary() {
         "zip's answer"
     );
 }
+
+/// Ruling T3-1: Debian's symlink size (16-fix-symlink-update-detection) is
+/// taken on unix only. Off unix (Windows uses the Debian flavour too) a
+/// symlink's `symlink_metadata` length is the reparse point's, not its
+/// target's length, so the size stays -1 as before 0.27.0; Apple never
+/// counts it.
+#[test]
+fn symlink_sizes_count_for_debian_on_unix_only() {
+    assert!(!flavour::symlink_has_size(Flavour::Apple));
+    assert_eq!(flavour::symlink_has_size(Flavour::Debian), cfg!(unix));
+}

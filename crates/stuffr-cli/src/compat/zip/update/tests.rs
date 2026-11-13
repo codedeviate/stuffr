@@ -309,6 +309,12 @@ fn tt_command_is_whole_at_every_length() {
     }
     assert_eq!(super::tt_command(b"t {} x", b"zi1"), b"t  \"zi1\"  x");
     assert_eq!(super::tt_command(b"{}{}", b"z"), b" \"z\" {}");
+    // an escaped byte, appended and in place of `{}`
+    assert_eq!(super::tt_command(b"t", b"a$b"), b"t \"a\\$b\"");
+    assert_eq!(
+        super::tt_command(b"t {} x", b"a'b!"),
+        b"t  \"a'b\"'!'\"\"  x"
+    );
 }
 
 /// fix-command-injection: `quote_arg()`'s Unix rules. The name is put in

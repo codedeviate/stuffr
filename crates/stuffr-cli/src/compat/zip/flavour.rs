@@ -49,8 +49,8 @@
 //! | 11 typo "ambiguities" | `man/zip.1`, `zip.txt` only | none |
 //! | 12 fix build with gcc 14 | `unix/configure` no longer adds `-DNO_RMDIR`, `-DNO_STRCHR`, `-DNO_STRRCHR`, `-DNO_RENAME`, `-DNO_MKTEMP`, `-DNO_MKTIME`, `-DNO_MKSTEMP`, `-DZMEM`, `-DNO_ERRNO`, `-DNO_DIR` or `-DNO_VALLOC` when its undeclared-function probe fails (gcc 14 makes an implicit declaration an error, so every probe would fail). On glibc those probes succeeded under gcc 13, so the DEFINES are Ubuntu's: none of these is set, as before | none: no behaviour (measured: `zip -v`'s options are Ubuntu's) |
 //! | 13 typo "OS/2" | `man/zip.1`, `zip.txt` only | none |
-//! | 14 buffer overflow, Unicode file name (Ubuntu's 12) | `mbstowcs(..., wsize + 1)`: without it glibc's fortify aborts on any non-ASCII name | none: the defined, patched behaviour is the only one (`unicode::local_to_wide`; deviation 28, `ub_rulings`) |
-//! | 15 buffer overflow, CVE-2018-13410 (Ubuntu's 13) | `-TT` buffer `+ 4`: without it one byte is written past the command | none: stuffr builds the command as a string (`update::tt_command`; deviation 28, `ub_rulings`) |
+//! | 14 buffer overflow, Unicode file name (Ubuntu's 12) | `mbstowcs(..., wsize + 1)`: without it glibc's fortify aborts on any non-ASCII name | none: the defined, patched behaviour is the only one (`unicode::local_to_wide`; deviation 28, `debian_patch_rulings`) |
+//! | 15 buffer overflow, CVE-2018-13410 (Ubuntu's 13) | `-TT` buffer `+ 4`: without it one byte is written past the command | none: stuffr builds the command as a string (`update::tt_command`; deviation 28, `debian_patch_rulings`) |
 //! | 16 fix symlink update detection | `unix.c:filetime` gives a symlink its `st_size` (under `-y`, its target's length): `-sf`/`-du` figures, a stored link's sizes (`zip -y - l` streams it; before, exit 16 "zip -0 not supported for I/O on pipes or devices"), `-FS`/`-u`/`-f` freshness (an unchanged link is current) | [`symlink_has_size`] (`scan.rs`, `zipup.rs`, `readzip::disk_time`) |
 //! | fix-command-injection | `zip.c:quote_arg`: the name `-T` gives `unzip -t` or a `-TT` command is in double quotes, `"`, `$`, `` ` ``, `\` escaped and `!` as `"'!'"` (Ubuntu's put it in single quotes, so a name holding one broke the command: `test of a'b.zip FAILED`) | [`test_through_shell`] (`update::quote_arg`, `update::tt_command`) |
 //!
@@ -82,8 +82,12 @@ pub enum Flavour {
 /// a stored link's sizes (so `zip -y - l` can stream it: a size of -1 on
 /// a pipe is "zip -0 not supported for I/O on pipes or devices"), and
 /// what `-FS`/`-u`/`-f` compare: an unchanged link is current.
+///
+/// Unix only (ruling T3-1): Windows takes the Debian flavour too, but its
+/// `symlink_metadata` length is the reparse point's (0), not the target's
+/// length, so off unix a symlink keeps the size -1 it had before 0.27.0.
 pub(crate) fn symlink_has_size(f: Flavour) -> bool {
-    f == Flavour::Debian
+    cfg!(unix) && f == Flavour::Debian
 }
 
 /// `-DBZIP2_SUPPORT`, Debian only: `-Z bzip2` (`-Z b`) is accepted and
