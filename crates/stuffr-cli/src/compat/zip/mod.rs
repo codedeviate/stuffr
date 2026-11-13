@@ -163,8 +163,10 @@
 //!     temporary removed). And the `zip I/O error:` line of "unexpected
 //!     error on zip file" shows whatever `errno` glibc's later calls left
 //!     (`No such file or directory` from the time zone lookup in a
-//!     container without tzdata); stuffr shows the write's own error, as
-//!     Apple does.
+//!     container without tzdata, measured on Ubuntu 24.04's build; Debian
+//!     13's image shows the write's own `File too large`); stuffr shows the
+//!     write's own error, as Apple does. The double free holds on Debian 13
+//!     (re-probed 0.27.0: exit 5, `free(): double free detected`).
 //! 13. Reading an archive, undefined behaviour of the C is not reproduced:
 //!     an end record or Zip64 record cut short is read as zeros (the C reads
 //!     its uninitialised stack buffer: Apple, for an archive that is only
@@ -258,10 +260,12 @@
 //!     the current directory: `zip -s 64k -sp t.zip big` answered `o/`
 //!     writes `t.z01` here, then `o/t.z02`, ..., `o/t.zip`.
 //! 23. Ruling Z25: `-z` whose first comment line is empty copies `\r\n`
-//!     into a one-byte block (`strcpy(p, "\r\n")`): Debian's build dies in
-//!     glibc's buffer-overflow check (exit 9 through zip's SIGABRT
-//!     handler); Apple's writes the comment. stuffr writes it in both
-//!     flavours, as Apple's build does.
+//!     into a one-byte block (`strcpy(p, "\r\n")`): Ubuntu 24.04's build
+//!     died in glibc's buffer-overflow check (exit 9 through zip's SIGABRT
+//!     handler); Apple's writes the comment, and so does Debian 13's (gcc
+//!     14 build, re-probed 0.27.0: the same comment bytes, exit 0). stuffr
+//!     writes it in both flavours, so for Debian 13 this is no longer a
+//!     difference (`compat_zip_debian::debian_patch_rows` compares it).
 //! 24. `zipcloak` (crypt.c's `zipcloak()` and `zipbare()`) ignores
 //!     `readlocal()`'s failure (a local header that cannot be found or
 //!     read) and goes on with an uninitialised local header; stuffr ends the
@@ -270,15 +274,16 @@
 //!     removed and the archive untouched. A split archive under `-O` meets
 //!     it at its first entry: zipcloak's `readlocal()` (the UTIL build's)
 //!     looks for every entry in the last part only, warns `Did not find
-//!     entry for <name>`, and Debian's build then dies of SIGSEGV
+//!     entry for <name>`, and Ubuntu 24.04's build then died of SIGSEGV
 //!     (`Interrupted (aborting)`, exit 9, or killed by the signal from its
-//!     handler; measured with a terminal in Docker); stuffr warns the same
-//!     and ends with `Zip file structure invalid`, exit 3. (Without `-O` both
-//!     refuse a split archive: `cannot update a split archive`, exit 16.)
-//!     A central name longer than the local one makes `readlocal()` write
-//!     past the local name's buffer;
-//!     stuffr keeps the local name as it is (a shorter central name cuts it
-//!     with a NUL, as the C does).
+//!     handler; measured with a terminal in Docker); Debian 13's zip still
+//!     fails there (exit not 0, nothing written: `compat_zip_tty`); stuffr
+//!     warns the same and ends with `Zip file structure invalid`, exit 3.
+//!     (Without `-O` both refuse a split archive: `cannot update a split
+//!     archive`, exit 16.) A central name longer than the local one makes
+//!     `readlocal()` write past the local name's buffer; stuffr keeps the
+//!     local name as it is (a shorter central name cuts it with a NUL, as
+//!     the C does).
 //! 25. `zipnote` and `zipsplit` never set `out_path`, so `readzipfile()`'s
 //!     `strcmp(in_path, out_path)` over a NULL ends in SIGSEGV for an
 //!     archive that does not exist (or is named ``) and for a split archive
@@ -320,7 +325,7 @@
 //!     on, for every name that is not ASCII) and patch 15 (`-TT`'s command
 //!     buffer one byte short) are Debian's own fixes: both flavours take the
 //!     patched, defined behaviour (Apple has neither code path). Pinned,
-//!     stuffr-only, by `compat_zip_common::ub_rulings`; the crash answers
+//!     stuffr-only, by `compat_zip_common::debian_patch_rulings`; the crash answers
 //!     are also compared with the reference (`compat_zip_debian`).
 //! 29. `-Z bzip2` (Debian): zipup.c tests whether an entry is text over the
 //!     whole 16 KiB input buffer, past the bytes read, and the buffer is
@@ -329,7 +334,7 @@
 //!     longer text file is text). The block's first contents are
 //!     uninitialised in the C; stuffr takes them as zeros (a short first
 //!     text file is binary, `iattr` 0, as measured). Pinned by
-//!     `compat_zip_common::ub_rulings`.
+//!     `compat_zip_common::debian_patch_rulings`.
 //! 30. Ruling Z32: an interrupt (SIGINT, SIGTERM) while the new archive
 //!     replaces the old one (`fileio.c:replace`: the archive unlinked, then
 //!     the temporary renamed; or, for a linked archive or a temporary on

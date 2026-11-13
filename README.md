@@ -2053,7 +2053,8 @@ before the command line, as the reference does.
     `ziperr` closes the stream twice and glibc aborts (exit 5, the temporary
     left); stuffr answers as Apple does (`Temporary file failure`, exit 10,
     the temporary removed). And the `zip I/O error:` line shows the write's
-    own error, as Apple does, not whatever `errno` glibc's later calls left.
+    own error, as Apple does, not whatever `errno` glibc's later calls left
+    (measured on Ubuntu 24.04's build in a container without tzdata).
 13. **Reading an archive**, undefined behaviour not reproduced: an end record
     or Zip64 record cut short is read as zeros (an archive that is only
     `PK\5\6` is empty to stuffr; Apple says "cannot update a split archive");
@@ -2125,17 +2126,19 @@ before the command line, as the reference does.
     takes the name part as empty and indexes before its buffer; stuffr takes
     such a name as one in the current directory.
 23. **`-z` whose first comment line is empty** (ruling Z25) copies `\r\n` into
-    a one-byte block: Debian's build dies in glibc's overflow check (exit 9);
-    Apple's writes the comment. stuffr writes it in both flavours.
+    a one-byte block: Ubuntu 24.04's build died in glibc's overflow check
+    (exit 9); Apple's and Debian 13's write the comment. stuffr writes it in
+    both flavours (no longer a difference from Debian 13).
 24. **`zipcloak` ignores `readlocal()`'s failure** and goes on with an
     uninitialised local header; stuffr ends the run with that failure's code
     (`zipcloak error: ... (was encrypting an entry)` or `(was decrypting an
     entry)`), the temporary removed and the archive untouched. A split
     archive under `-O` meets it at the first entry: the UTIL build's
     `readlocal()` looks in the last part only and warns `Did not find entry
-    for <name>`; Debian then dies of SIGSEGV (`Interrupted (aborting)`, exit
-    9, or killed by the signal from its handler; measured with a terminal in
-    Docker); stuffr warns the same and ends `Zip file structure invalid`, exit
+    for <name>`; Ubuntu 24.04's build then died of SIGSEGV (`Interrupted
+    (aborting)`, exit 9, or killed by the signal from its handler; measured
+    with a terminal in Docker), and Debian 13's still fails there (exit not
+    0); stuffr warns the same and ends `Zip file structure invalid`, exit
     3. (Without `-O` both refuse a split archive: `cannot update a split
     archive`, exit 16.) A central name longer than the local one makes the C
     write past the local name's buffer; stuffr keeps the local name as it is

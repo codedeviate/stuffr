@@ -337,6 +337,8 @@ mod linux {
     ///   figures, a stored entry's sizes (so `zip -y - l` streams it), and
     ///   `-FS`/`-u`/`-f` freshness (an unchanged link is current, one
     ///   re-pointed at a target of another length is not);
+    /// - deviation 23's input, an empty first `-z` line: Debian 13's gcc 14
+    ///   build writes it as the comment, where Ubuntu 24.04's died;
     /// - `fix-command-injection`: the name `-T` hands to `unzip` or to the
     ///   `-TT` command is quoted by `quote_arg()` (`"..."`, with `\` before
     ///   `"`, `$`, `` ` `` and `\`, and `!` as `"'!'"`), so an archive named
@@ -433,6 +435,18 @@ mod linux {
             &["zip", "-T", "-TT", "fb/show {}", "d$x/n.zip", "a.txt"],
         ] {
             push(args, dir_tree());
+        }
+        // deviation 23 (ruling Z25): Ubuntu 24.04's build died of an empty
+        // first `-z` line; Debian 13's writes the comment, as stuffr does
+        for stdin in [&b"\nsecond\n"[..], b"\n", b"\n\nthird\n.\n"] {
+            let mut c = zip_case(
+                "zip",
+                &["-z", "t.zip"],
+                ZipTree::standard().file("t.zip", &archive),
+            );
+            c.zip_flavour = Some("debian");
+            c.stdin = Some(stdin.to_vec());
+            cases.push(c);
         }
         assert!(cases.len() >= 100, "{} cases", cases.len());
         run_group(

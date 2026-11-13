@@ -383,8 +383,8 @@ fn sp_with_a_bare_archive_name_keeps_the_name() {
 }
 
 /// Ruling Z25 (deviation 23): an empty first `-z` line is the comment
-/// `\r\n` in both flavours (Apple's build; Debian's dies of glibc's
-/// buffer-overflow check).
+/// `\r\n` in both flavours (Apple's and Debian 13's builds; Ubuntu 24.04's
+/// died of glibc's buffer-overflow check).
 #[test]
 fn an_empty_first_comment_line_is_apples_answer() {
     for flavour in [Flavour::Apple, Flavour::Debian] {

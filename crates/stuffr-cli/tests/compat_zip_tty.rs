@@ -255,9 +255,9 @@ mod unix {
 
     /// Deviation 24 on a split archive under `-O`, recorded: zipcloak's
     /// `readlocal()` does not find the first entry in the last part, and
-    /// the reference goes on with an uninitialised local header (Debian's
-    /// dies of SIGSEGV in Docker, its warning lost in its stdio buffer when
-    /// standard output is a pipe). Only the line before the undefined
+    /// the reference goes on with an uninitialised local header (Ubuntu
+    /// 24.04's died of SIGSEGV in Docker; Debian 13's exits non-zero), its
+    /// warning lost in its stdio buffer when standard output is a pipe. Only the line before the undefined
     /// behaviour is compared; stuffr's end is pinned in
     /// `zipcloak::tests::a_split_archive_under_o_ends_at_its_first_entry`.
     #[test]

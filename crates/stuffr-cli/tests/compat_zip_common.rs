@@ -718,14 +718,14 @@ mod unix {
         }
     }
 
-    /// stuffr-only pins of the undefined behaviour Debian's patches 12 and
-    /// 13 remove and of Task 11's rulings (deviations 28 and 29), in both
+    /// stuffr-only pins of the undefined behaviour Debian's patches 14 and
+    /// 15 remove and of Task 11's rulings (deviations 28 and 29), in both
     /// flavours:
-    /// - patch 12 (`mbstowcs` told the buffer is `strlen + 1` wide
+    /// - patch 14 (`mbstowcs` told the buffer is `strlen + 1` wide
     ///   characters; glibc's fortify aborts on any non-ASCII name): a
     ///   non-ASCII name is archived (Debian: bit 11; Apple, which has no
     ///   Unicode code: no flag);
-    /// - patch 13 (`-TT`'s command one byte short): the test command runs
+    /// - patch 15 (`-TT`'s command one byte short): the test command runs
     ///   whatever the archive name's length;
     /// - deviation 28: where Debian's C reads through a NULL from a
     ///   conversion that failed (a bit-11 name that is not UTF-8, a Unicode
@@ -734,10 +734,10 @@ mod unix {
     /// - deviation 29: `-Z bzip2`'s text test of a first entry sees zeros
     ///   past the bytes read (a short text file is binary).
     #[test]
-    fn ub_rulings() {
+    fn debian_patch_rulings() {
         for flavour in ["apple", "debian"] {
             let debian = flavour == "debian";
-            // patch 12
+            // patch 14
             let mut c = zip_case(
                 "zip",
                 &["t.zip", "caf\u{e9}.txt"],
@@ -748,7 +748,7 @@ mod unix {
             assert_eq!(r.code, 0, "{flavour}");
             let (flags, _) = central_flags(&archive_of(&r, b"t.zip"));
             assert_eq!(flags, if debian { 0x800 } else { 0 }, "{flavour}");
-            // patch 13: end to end at three name lengths (the boundary
+            // patch 15: end to end at three name lengths (the boundary
             // itself is `update::tests::tt_command_is_whole_at_every_length`)
             for name in [
                 "q.zip",
