@@ -106,8 +106,16 @@
 //!     violation)", exit 3); stuffr reads the archive as the fix does (the
 //!     block is ignored). An extra field cut short by the end of the
 //!     archive is read by Debian with its missing bytes uninitialised;
-//!     stuffr refuses it as the fix does (and as Apple's tree does): "bad
-//!     extra field length", exit 2 where the listing needs it.
+//!     stuffr refuses it as the fix does (and as Apple's tree does): `-l`
+//!     ends with exit 2 before listing the entry, and extraction says
+//!     "NAME:  bad extra field length (central)", exit 2.
+//! 12. A VMS block read while an entry is written (`-a`/`-aa`, an entry made
+//!     on VMS with an Info-ZIP VMS extra block): the reference works in the
+//!     buffer it is writing out, so the entry's output becomes the bytes
+//!     the block inflates to, or the text of the message the block's check
+//!     prints ("bad extra-field CRC"). stuffr writes the entry's own data
+//!     (the message is printed as the reference prints it). Before 0.27.0
+//!     stuffr panicked on a deflated block here, in both flavours (T2-1).
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
