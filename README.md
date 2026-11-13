@@ -612,6 +612,23 @@ read list.
 > under `--all-features`, **3720** on the default tier — measured from
 > this bump's own `make check FULL=1`, `GATE_EXIT=0`, nothing skipped.
 >
+> `0.27.0`: **Debian 13 (trixie) is the Linux personality.** The `unzip`,
+> `zipinfo`, `funzip`, `zip`, `zipcloak`, `zipnote` and `zipsplit` links
+> follow Debian's unzip `6.0-29+deb13u1` and zip `3.0-15+deb13u1` instead
+> of Ubuntu 24.04's packages; `STUFFR_UNZIP_FLAVOR` and `STUFFR_ZIP_FLAVOR`
+> take `apple` or `debian`, and the old `ubuntu` value still works as a
+> name for `debian`. Ubuntu's own additions are gone: unzip's `-O`/`-I`
+> character-set options are refused as Debian's unzip refuses them, and
+> Debian's newer security patches are followed (unzip's three 2026 fixes,
+> zip's command quoting for `-T`/`-TT`). On Linux, zip `-y` records a
+> symlink's size as Debian's zip does. The compress, bzip2 and GNU gzip
+> links are measured against Debian 13's ncompress 5.0-3, bzip2 1.0.8-6
+> and gzip 1.13. CI's reference jobs run in a `debian:trixie` container,
+> and `make compat-ubuntu` is now `make compat-debian`. macOS and Windows
+> behaviour is unchanged. A MINOR. **3880** tests under `--all-features`,
+> **3725** on the default tier — measured from this bump's own
+> `make check`, `GATE_EXIT=0`, nothing skipped.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
