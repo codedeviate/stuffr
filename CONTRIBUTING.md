@@ -98,7 +98,7 @@ busy machine that is also running Docker and an IDE (a precaution, not a
 measured gain). `make check FULL=1` (any value but empty or 0) is the
 overnight mode: every core, as before. `make fuzz` adds
 `-rss_limit_mb=1024` in daytime (libFuzzer's default of 2048 under
-`FULL=1`), and `make compat-ubuntu` passes the same `--test-threads` into the
+`FULL=1`), and `make compat-debian` passes the same `--test-threads` into the
 container (it does not see the host's environment). Both modes run exactly
 the same tests: only concurrency (and the fuzz memory cap, which also sets
 libFuzzer's malloc limit to the same figure) differs. Daytime's
@@ -1240,9 +1240,9 @@ emulates is two programs:
   starts from GNU's source is wrong by construction.
 - **Reference tools.** GNU gzip is the Homebrew `gzip` keg on macOS, addressed
   by path (`/opt/homebrew/opt/gzip/bin/gzip`, 1.15 here) and never linked, so
-  it cannot shadow Apple's; on Linux it is the platform's, and CI's ubuntu has
-  1.12. The suites probe the version (`gnu_gzip_version()`) and adjust where
-  1.12 differs. Apple's is `/usr/bin/gzip` (487.0.1). `ncompress` supplies the
+  it cannot shadow Apple's; on Linux it is the platform's, and CI's Debian 13
+  container has 1.13. The suites probe the version (`gnu_gzip_version()`) and
+  adjust where another release differs. Apple's is `/usr/bin/gzip` (487.0.1). `ncompress` supplies the
   `.Z` inputs of the GNU foreign-format group (the keg path again; Apple's
   `/usr/bin/compress` is a different program). A Mac that wants the gzip suites to
   run rather than skip (they panic under `CI`) needs `brew install gzip
@@ -1279,7 +1279,7 @@ emulates is two programs:
   `xz --robot --version` says `50080042` counts. CI builds the release
   tarball (SHA-256 pinned) in the composite action
   `.github/actions/xz-reference`, cached, in every job that runs the
-  `compat_xz*` tests, because ubuntu's xz is 5.4.x and Homebrew's drifts.
+  `compat_xz*` tests, because the distribution's xz is not the pinned one and Homebrew's drifts.
 - **R3, the hardware.** `Host::Real` reads the machine's processors and
   memory (they set xz's default thread count and memory limits);
   `Host::Sandbox` (the fuzz target) sees a fixed two threads and 4 GiB, and
@@ -1379,25 +1379,25 @@ and is the second family, after GNU gzip, written **clean room**:
   README mirrors it.
 
 **The unzip family** (`compat/unzip/`) is a port of Info-ZIP UnZip 6.00 in
-two flavours, like gzip: Apple's `zip-33` tree is the base and Ubuntu's
-`6.0-28ubuntu4.1` is a set of flavour checks (`flavour.rs`, one function per
+two flavours, like gzip: Apple's `zip-33` tree is the base and Debian 13's
+`6.0-29+deb13u1` (Ubuntu 24.04's `6.0-28ubuntu4.1` until 0.26.0) is a set of flavour checks (`flavour.rs`, one function per
 Debian define or patch). Info-ZIP's licence is permissive but asks that an
 altered version be marked, which is why the banner lines name stuffr.
 Each ported function carries a `// port:` comment, each Apple change `//
-apple:`, each Ubuntu difference `// ubuntu:`, and each rule taken from the
+apple:`, each Debian difference `// debian:`, and each rule taken from the
 binary `// probe:`. The module doc of `compat/unzip/mod.rs` is the source of
 truth for the ten deviations; the README mirrors it. The shared decoders and
 the crypt keys live in the doc-hidden `stuffr::infozip`. `make
-compat-ubuntu` runs the unzip suites against Ubuntu's unzip in Docker.
+compat-debian` runs the unzip suites against Debian 13's unzip in Docker.
 
 **The zip family** (`compat/zip/`) is a port of Info-ZIP Zip 3.0 in two
-flavours, built like unzip's: Apple's `zip-33` tree is the base and Ubuntu's
-`3.0-13ubuntu0.2` is a set of flavour checks (`flavour.rs`, one function per
+flavours, built like unzip's: Apple's `zip-33` tree is the base and Debian 13's
+`3.0-15+deb13u1` (Ubuntu 24.04's `3.0-13ubuntu0.2` until 0.26.0) is a set of flavour checks (`flavour.rs`, one function per
 Debian define or patch). Comment conventions are unzip's (`// port:`, `//
-apple:`, `// ubuntu:`, `// probe:`, plus `// ruling:` for each undefined
+apple:`, `// debian:`, `// probe:`, plus `// ruling:` for each undefined
 behaviour decision). The module doc of `compat/zip/mod.rs` is the source of
 truth for the thirty deviations; the README mirrors it. `make
-compat-ubuntu` runs the zip suites against Ubuntu's zip in Docker.
+compat-debian` runs the zip suites against Debian 13's zip in Docker.
 
 **Reference tools.** The bzip2 family is tested against the system
 `/usr/bin/bzip2` and `/usr/bin/bzip2recover`, which are not the same program
@@ -1405,7 +1405,7 @@ on both CI platforms:
 
 - **macOS ships upstream bzip2 1.0.8.** That is the oracle the family was
   built against, and every case runs there.
-- **ubuntu-latest ships Debian's 1.0.8-6**, and two of its patches change
+- **Debian 13 (CI's container) ships Debian's 1.0.8-6**, and two of its patches change
   observable behaviour. `20-legacy.patch` makes `-V`/`-L` exit after the
   licence, where upstream carries on and compresses stdin.
   `bzip2recover-race-open-output.diff` opens each `rec*` output with

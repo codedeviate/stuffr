@@ -71,10 +71,10 @@ const ZIP: FormatId = FormatId::new("zip");
 /// not the binary's owner, so the path is derived the way Cargo's own runtime
 /// environment allows instead: this test binary's `current_exe()` lives under
 /// `<target-dir>/<profile>/deps/` (or `build/` since cargo 1.100), and
-/// `stuffr` — built for the SAME profile — lives one directory up. If it is not there yet (a clean checkout that has
-/// never built the CLI crate), this builds it explicitly via the `CARGO`
-/// environment variable Cargo sets at runtime for exactly this kind of
-/// self-reference.
+/// `stuffr` — built for the SAME profile — lives one directory up. If it is
+/// not there yet (a clean checkout that has never built the CLI crate), this
+/// builds it explicitly via the `CARGO` environment variable Cargo sets at
+/// runtime for exactly this kind of self-reference.
 static STUFFR: LazyLock<PathBuf> = LazyLock::new(stuffr_bin_path);
 
 fn stuffr_bin_path() -> PathBuf {

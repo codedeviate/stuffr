@@ -254,8 +254,9 @@ pub(super) const IO_FAILED: &str = "%s: %s: %s\n";
 /// The system's refusal to create the output name when one exists and the
 /// refusal is not EEXIST. Observed on Debian 13's 1.13: `gzip -dN s/in.gz`
 /// storing `/` (any name ending in `/`) says `\ngzip: s/: Is a directory`
-/// (exit 1), also under `-f` and `-v` (`-f`: Linux only, see `may_write`); Ubuntu's 1.12 printed it without the newline. NEWS 1.13 does not
-/// mention it, so whether upstream or Debian added it is not known.
+/// (exit 1), also under `-f` and `-v` (`-f`: Linux only, see `may_write`);
+/// Ubuntu's 1.12 printed it without the newline. NEWS 1.13 does not mention
+/// it, so whether upstream or Debian added it is not known.
 pub(super) const OUTPUT_REFUSED: &str = "\n%s: %s: %s\n";
 
 // ---- decompression, -t and -l ----

@@ -984,47 +984,47 @@ const COMPAT_SHAPES: &[&str] = &[
     // 0.16.0 Task 7: the unzip family's names, one seed each, for its
     // command line (usage, the version screen, funzip's password). The
     // unzip family names its flavour second (`unzip-apple-…`,
-    // `unzip-ubuntu-…`; R7's 1 and 0), as the gzip family does.
+    // `unzip-debian-…`; R7's 1 and 0), as the gzip family does.
     "unzip-apple-help",
-    "unzip-ubuntu-version",
+    "unzip-debian-version",
     "zipinfo-apple-help",
-    "funzip-ubuntu-stdin-password",
+    "funzip-debian-stdin-password",
     // 0.16.0 Task 15: one archive per method (stored, deflate, implode,
     // shrink, bzip2, traditional encryption), a damaged one, the
     // overlapped-components bomb, a symlink leaving the root, the replace
     // question, `-d`, two archives, the listings, and funzip's inputs.
     "unzip-apple-test-stored",
-    "unzip-ubuntu-test-stored",
+    "unzip-debian-test-stored",
     "unzip-apple-extract-deflate",
-    "unzip-ubuntu-extract-deflate",
-    "unzip-ubuntu-pipe-deflate",
+    "unzip-debian-extract-deflate",
+    "unzip-debian-pipe-deflate",
     "unzip-apple-list-deflate",
     "unzip-apple-test-implode",
-    "unzip-ubuntu-test-implode",
-    "unzip-ubuntu-extract-implode",
+    "unzip-debian-test-implode",
+    "unzip-debian-extract-implode",
     "unzip-apple-test-shrink",
-    "unzip-ubuntu-test-shrink",
+    "unzip-debian-test-shrink",
     "unzip-apple-test-bzip2",
-    "unzip-ubuntu-test-bzip2",
+    "unzip-debian-test-bzip2",
     "unzip-apple-test-encrypted",
-    "unzip-ubuntu-test-encrypted",
+    "unzip-debian-test-encrypted",
     "unzip-apple-test-damaged",
-    "unzip-ubuntu-test-damaged",
+    "unzip-debian-test-damaged",
     "unzip-apple-test-overlapped",
-    "unzip-ubuntu-test-overlapped",
+    "unzip-debian-test-overlapped",
     "unzip-apple-extract-symlink",
-    "unzip-ubuntu-extract-symlink",
+    "unzip-debian-extract-symlink",
     "unzip-apple-replace-prompt",
-    "unzip-ubuntu-replace-prompt",
-    "unzip-ubuntu-exdir",
+    "unzip-debian-replace-prompt",
+    "unzip-debian-exdir",
     "unzip-apple-two-archives",
-    "unzip-ubuntu-list-zipinfo-mode",
+    "unzip-debian-list-zipinfo-mode",
     "zipinfo-apple-list",
-    "zipinfo-ubuntu-list",
+    "zipinfo-debian-list",
     "funzip-apple-stdin-gzip",
-    "funzip-ubuntu-stdin-gzip",
+    "funzip-debian-stdin-gzip",
     "funzip-apple-file-zip",
-    "funzip-ubuntu-stdin-encrypted-cut",
+    "funzip-debian-stdin-encrypted-cut",
     // The compress family (0.18.0): one seed per name as ncompress
     // (flavour byte 0, on every platform), then `compress-<apple|ncompress>-<case>`
     // and `uncompress-<apple|ncompress>-<case>`: a seed per major flag and
@@ -1113,96 +1113,96 @@ const COMPAT_SHAPES: &[&str] = &[
     "uncompress-ncompress-force-uppercase",
     "uncompress-ncompress-force-not-compressed",
     // The zip family (0.19.0 Tasks 4 and 12): every case in both flavours
-    // (`<tool>-<apple|ubuntu>-<case>`, the byte absolute: 0 Ubuntu, 1 Apple):
+    // (`<tool>-<apple|debian>-<case>`, the byte absolute: 0 Debian, 1 Apple):
     // the front-end screens, adding (stored, best, names from stdin and from
     // a pattern file, junked, recursive, excluded, moved, logged, with
     // attributes, encrypted, Unicode), updating, freshening, deleting,
     // growing, commenting, the two repairs, `-T`, a difference archive, the
     // three helpers (zipcloak, zipnote, zipsplit with each of its options).
     "zip-apple-help",
-    "zip-ubuntu-help",
+    "zip-debian-help",
     "zip-apple-help2",
-    "zip-ubuntu-help2",
+    "zip-debian-help2",
     "zip-apple-version",
-    "zip-ubuntu-version",
+    "zip-debian-version",
     "zip-apple-add",
-    "zip-ubuntu-add",
+    "zip-debian-add",
     "zip-apple-add-store",
-    "zip-ubuntu-add-store",
+    "zip-debian-add-store",
     "zip-apple-add-best",
-    "zip-ubuntu-add-best",
+    "zip-debian-add-best",
     "zip-apple-add-stdin-names",
-    "zip-ubuntu-add-stdin-names",
+    "zip-debian-add-stdin-names",
     "zip-apple-add-pattern-file",
-    "zip-ubuntu-add-pattern-file",
+    "zip-debian-add-pattern-file",
     "zip-apple-add-junk",
-    "zip-ubuntu-add-junk",
+    "zip-debian-add-junk",
     "zip-apple-add-recurse",
-    "zip-ubuntu-add-recurse",
+    "zip-debian-add-recurse",
     "zip-apple-add-exclude",
-    "zip-ubuntu-add-exclude",
+    "zip-debian-add-exclude",
     "zip-apple-add-move",
-    "zip-ubuntu-add-move",
+    "zip-debian-add-move",
     "zip-apple-add-log",
-    "zip-ubuntu-add-log",
+    "zip-debian-add-log",
     "zip-apple-add-attrs",
-    "zip-ubuntu-add-attrs",
+    "zip-debian-add-attrs",
     "zip-apple-add-encrypt",
-    "zip-ubuntu-add-encrypt",
+    "zip-debian-add-encrypt",
     "zip-apple-add-show",
-    "zip-ubuntu-add-show",
+    "zip-debian-add-show",
     "zip-apple-add-unicode",
-    "zip-ubuntu-add-unicode",
+    "zip-debian-add-unicode",
     "zip-apple-update",
     "zip-apple-update-fake-end-record",
-    "zip-ubuntu-update-fake-end-record",
-    "zip-ubuntu-update",
+    "zip-debian-update-fake-end-record",
+    "zip-debian-update",
     "zip-apple-freshen",
-    "zip-ubuntu-freshen",
+    "zip-debian-freshen",
     "zip-apple-delete",
-    "zip-ubuntu-delete",
+    "zip-debian-delete",
     "zip-apple-grow",
-    "zip-ubuntu-grow",
+    "zip-debian-grow",
     "zip-apple-comment",
-    "zip-ubuntu-comment",
+    "zip-debian-comment",
     "zip-apple-fix",
-    "zip-ubuntu-fix",
+    "zip-debian-fix",
     "zip-apple-fix-fix",
-    "zip-ubuntu-fix-fix",
+    "zip-debian-fix-fix",
     "zip-apple-fix-fix-cut",
-    "zip-ubuntu-fix-fix-cut",
+    "zip-debian-fix-fix-cut",
     "zip-apple-test",
-    "zip-ubuntu-test",
+    "zip-debian-test",
     "zip-apple-difference",
-    "zip-ubuntu-difference",
+    "zip-debian-difference",
     "zipcloak-apple-help",
-    "zipcloak-ubuntu-help",
+    "zipcloak-debian-help",
     "zipcloak-apple-encrypt",
-    "zipcloak-ubuntu-encrypt",
+    "zipcloak-debian-encrypt",
     "zipcloak-apple-decrypt",
-    "zipcloak-ubuntu-decrypt",
+    "zipcloak-debian-decrypt",
     "zipcloak-apple-out",
-    "zipcloak-ubuntu-out",
+    "zipcloak-debian-out",
     "zipnote-apple-help",
-    "zipnote-ubuntu-help",
+    "zipnote-debian-help",
     "zipnote-apple-list",
-    "zipnote-ubuntu-list",
+    "zipnote-debian-list",
     "zipnote-apple-write",
-    "zipnote-ubuntu-write",
+    "zipnote-debian-write",
     "zipnote-apple-write-out",
-    "zipnote-ubuntu-write-out",
+    "zipnote-debian-write-out",
     "zipsplit-apple-help",
-    "zipsplit-ubuntu-help",
+    "zipsplit-debian-help",
     "zipsplit-apple-split",
-    "zipsplit-ubuntu-split",
+    "zipsplit-debian-split",
     "zipsplit-apple-split-pause",
-    "zipsplit-ubuntu-split-pause",
+    "zipsplit-debian-split-pause",
     "zipsplit-apple-split-time",
-    "zipsplit-ubuntu-split-time",
+    "zipsplit-debian-split-time",
     "zipsplit-apple-split-dir",
-    "zipsplit-ubuntu-split-dir",
+    "zipsplit-debian-split-dir",
     "zipsplit-apple-index",
-    "zipsplit-ubuntu-index",
+    "zipsplit-debian-index",
     "compress-apple-stdin-dash",
     "compress-apple-cluster-force",
 ];
@@ -1355,7 +1355,7 @@ fn zipcrypto(password: &[u8], check: u8, plain: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// An unzip-family case as `flavour` (0 Ubuntu, 1 Apple: R7's second
+/// An unzip-family case as `flavour` (0 Debian, 1 Apple: R7's second
 /// half, the same side as gzip's GNU and BSD).
 fn uz(
     name: &str,
@@ -1368,7 +1368,7 @@ fn uz(
     encode_compat_case(name, flavour, args, files, stdin, payload)
 }
 
-/// The `compat` seed for an unzip-family `shape` (`<tool>-<apple|ubuntu>-
+/// The `compat` seed for an unzip-family `shape` (`<tool>-<apple|debian>-
 /// <case>`), or `None` for another family's.
 fn unzip_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> {
     let mut parts = shape.splitn(3, '-');
@@ -1376,7 +1376,7 @@ fn unzip_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> 
         return Ok(None);
     };
     let flavour = match (tool, flavour) {
-        ("unzip" | "zipinfo" | "funzip", "ubuntu") => 0,
+        ("unzip" | "zipinfo" | "funzip", "debian") => 0,
         ("unzip" | "zipinfo" | "funzip", "apple") => 1,
         _ => return Ok(None),
     };
@@ -1452,7 +1452,7 @@ fn unzip_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> 
             e.data[mid] ^= 0x55;
             uz(tool, flavour, &["-t", "a.zip"], a, false, &unzip_zip(&[e]))
         }
-        // Two central records naming one local header: Ubuntu's
+        // Two central records naming one local header: Debian's
         // overlapped-components refusal (exit 12), Apple tests it twice.
         "test-overlapped" => {
             let mut second = ZipSeed::stored("a.txt", short);
@@ -2599,9 +2599,9 @@ fn compress_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>
     }))
 }
 
-/// The `compat` seed for a zip-family `shape` (`<tool>-<apple|ubuntu>-
+/// The `compat` seed for a zip-family `shape` (`<tool>-<apple|debian>-
 /// <case>`), or `None` for another family's. The flavour byte is absolute:
-/// 0 Ubuntu, 1 Apple. An archive-consuming case holds a small archive
+/// 0 Debian, 1 Apple. An archive-consuming case holds a small archive
 /// (`src`: a deflated `a.txt` and a stored `b.txt`, made by `unzip_zip`),
 /// an adding case holds text in `a` (and, for the names cases, `a` is the
 /// one name its own bytes list: the payload is every file and standard
@@ -2615,7 +2615,7 @@ fn zip_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> {
         return Ok(None);
     }
     let flavour = match flavour {
-        "ubuntu" => 0,
+        "debian" => 0,
         "apple" => 1,
         _ => return Ok(None),
     };
@@ -4927,15 +4927,15 @@ fn every_compat_seed_decodes_fits_and_carries_its_shape() {
             Some("bsd") if gzip_family => 1,
             Some("gnu") if gzip_family => 0,
             Some("apple") if unzip_family => 1,
-            Some("ubuntu") if unzip_family => 0,
+            Some("debian") if unzip_family => 0,
             // The compress family's byte is absolute too: 0 ncompress,
             // 1 Apple, whatever the platform (a crash artifact replays the
             // same personality everywhere).
             Some("apple") if compress_family => 1,
             Some("ncompress") if compress_family => 0,
-            // Also absolute: 0 Ubuntu, 1 Apple.
+            // Also absolute: 0 Debian, 1 Apple.
             Some("apple") if zip_family => 1,
-            Some("ubuntu") if zip_family => 0,
+            Some("debian") if zip_family => 0,
             _ => {
                 assert!(
                     !gzip_family && !unzip_family && !zip_family,
@@ -5005,7 +5005,7 @@ fn compress_seeds_name_their_personality_on_every_platform() {
 }
 
 /// The zip-family seeds (0.19.0 Task 12) name their tool and carry the byte
-/// they say: every case in both flavours (0 Ubuntu, 1 Apple, on the wire and
+/// they say: every case in both flavours (0 Debian, 1 Apple, on the wire and
 /// in the first byte), the archive-consuming ones hold a whole archive (the
 /// repairs a damaged or cut one), the names cases hold the one name their
 /// payload lists, the split cases three entries, and every argument is a
@@ -5013,7 +5013,7 @@ fn compress_seeds_name_their_personality_on_every_platform() {
 #[test]
 fn the_zip_seeds_carry_their_shape() {
     let work = tempfile::tempdir().unwrap();
-    let (mut apple, mut ubuntu) = (0, 0);
+    let (mut apple, mut debian) = (0, 0);
     let mut healthy: Option<Vec<u8>> = None;
     for shape in COMPAT_SHAPES {
         let mut parts = shape.splitn(3, '-');
@@ -5030,8 +5030,8 @@ fn the_zip_seeds_carry_their_shape() {
                 apple += 1;
                 1
             }
-            "ubuntu" => {
-                ubuntu += 1;
+            "debian" => {
+                debian += 1;
                 0
             }
             other => panic!("{shape}: flavour {other:?}"),
@@ -5077,8 +5077,8 @@ fn the_zip_seeds_carry_their_shape() {
         }
     }
     assert!(
-        apple >= 40 && apple == ubuntu,
-        "{apple} apple, {ubuntu} ubuntu"
+        apple >= 40 && apple == debian,
+        "{apple} apple, {debian} debian"
     );
 }
 

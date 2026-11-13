@@ -7,8 +7,9 @@
 //! Unlicense, whose text ships with stuffr-cli as `LICENSE-ncompress`. Of
 //! Debian 13's six patches (`remove-zcat`, `uncompress-real`, `fix-softlinks`,
 //! `manpage-cleanup`, `gcc-15`, `old-style-functions`), `uncompress-real.patch`
-//! and `fix-softlinks.patch` change behaviour: the first is deviation N2 below, the second drops
-//! `-DLSTAT`, so `lstat` is `stat` and symbolic links are followed. The
+//! and `fix-softlinks.patch` change behaviour: the first is deviation N2
+//! below, the second drops `-DLSTAT`, so `lstat` is `stat` and symbolic links
+//! are followed. The
 //! build's `-DUSERMEM=800000` makes the `FAST` hash, and glibc's `BUFSIZ`
 //! makes `IBUFSIZ` and `OBUFSIZ` 8192, which shows in `-V` and in the
 //! corrupt-input debug line. The measurement record of 0.18.0 Task 1

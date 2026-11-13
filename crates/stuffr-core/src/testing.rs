@@ -140,10 +140,10 @@ pub const SALVAGE_FUZZ_MAX_ENTRY: u64 = 256 * 1024;
 /// The `compat` fuzz target's tool selector: byte `n % COMPAT_NAMES.len()`
 /// names the compatibility tool a case runs as, and `(n / len) & 1` the
 /// flavour: the gzip family's (0 GNU, 1 BSD; R7 of 0.12.0) and, since
-/// 0.16.0, the unzip family's (0 Ubuntu, 1 Apple: the same side as gzip's)
+/// 0.16.0, the unzip family's (0 Debian, 1 Apple: the same side as gzip's)
 /// and, since 0.18.0, the compress family's (0 ncompress, 1 Apple: absolute
 /// like the others, so an artifact replays the same personality on every
-/// platform) and, since 0.19.0, the zip family's (0 Ubuntu, 1 Apple, absolute
+/// platform) and, since 0.19.0, the zip family's (0 Debian, 1 Apple, absolute
 /// too). Only those four families read it. Every seed the
 /// 0.11.0 generator wrote has a name byte below 4,
 /// so it decodes to the same tool, as GNU (`old_seeds_decode_unchanged`).
@@ -589,7 +589,7 @@ const FIRST_WIDER_FILE: usize = 15;
 pub struct CompatCase<'a> {
     /// The tool, from [`COMPAT_NAMES`].
     pub name: &'static str,
-    /// The flavour (R7): gzip's 0 GNU or 1 BSD, unzip's 0 Ubuntu or 1
+    /// The flavour (R7): gzip's 0 GNU or 1 BSD, unzip's 0 Debian or 1
     /// Apple; the other families ignore it.
     pub flavour: u8,
     /// The arguments after `argv[0]`, from [`COMPAT_TOKENS`].
@@ -1976,7 +1976,7 @@ mod tests {
     /// `Host::path` keeps those inside; this is the other half, for every
     /// operand a token spells. Also: every token is reachable by the one
     /// byte that selects it, and the zip family's flavour byte is the same
-    /// 0 Ubuntu / 1 Apple the unzip family's is.
+    /// 0 Debian / 1 Apple the unzip family's is.
     #[test]
     fn no_compat_token_escapes_the_run_directory() {
         for t in COMPAT_TOKENS {

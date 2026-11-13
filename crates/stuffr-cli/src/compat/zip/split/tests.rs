@@ -386,7 +386,7 @@ fn sp_with_a_bare_archive_name_keeps_the_name() {
 /// is the comment `\r\n` in both flavours, as Apple's and Debian 13's builds
 /// write it (Ubuntu 24.04's died of glibc's buffer-overflow check).
 #[test]
-fn an_empty_first_comment_line_is_apples_answer() {
+fn an_empty_first_comment_line_is_crlf_in_both_flavours() {
     for flavour in [Flavour::Apple, Flavour::Debian] {
         let s = Scratch::new("zcomment");
         std::fs::write(s.0.join("a.txt"), b"hello\n").unwrap();

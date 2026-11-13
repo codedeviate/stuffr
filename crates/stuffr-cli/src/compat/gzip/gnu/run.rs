@@ -444,9 +444,9 @@ impl Gz<'_> {
         // The two differ for a name ending in `/` over a directory: macOS
         // says EEXIST, Linux EISDIR (Debian 13's 1.13: `gzip -dN s/in.gz`
         // storing `/` says `\ngzip: s/: Is a directory`, the leading newline
-        // of a failure to create the output; Ubuntu's 1.12 had none). So ask the system: an
-        // exclusive create of a name that exists creates nothing, and one
-        // that vanished meanwhile is removed again.
+        // of a failure to create the output; Ubuntu's 1.12 had none). So ask
+        // the system: an exclusive create of a name that exists creates
+        // nothing, and one that vanished meanwhile is removed again.
         match File::options().write(true).create_new(true).open(out_path) {
             Ok(_) => {
                 let _ = fs::remove_file(out_path);

@@ -23,7 +23,12 @@ jobs:
     # 3.0-15+deb13u1, ncompress 5.0-3, bzip2, GNU gzip 1.13), and the harness
     # requires those versions under `CI`. The image is the digest
     # `tests/docker/debian-13/Dockerfile` (`make compat-debian`) builds on;
-    # refresh both together.
+    # refresh both together. The digest pins the base image only: `apt-get`
+    # below installs trixie's CURRENT archive packages, not the digest's, so
+    # a Debian point release that moves unzip, zip, gzip, ncompress or bzip2
+    # fails the harness's CI version pins. Update the `DEBIAN_*_VERSION`
+    # consts in `crates/stuffr-cli/tests/compat_harness/` when that happens.
+    # LANG is deliberately left unset (POSIX), as `make compat-debian` does.
     runs-on: ubuntu-26.04
     container: &debian-container
       image: &debian-image debian:trixie@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6
@@ -89,6 +94,10 @@ jobs:
       # carry the toolchain in their name; pinned to a SHA that name is gone,
       # so every use pins `master` and names the toolchain as an input. One
       # SHA for all of them is what Dependabot proposes (PR #1).
+      #
+      # This step runs as root, so rustup warns that `$HOME` differs from the
+      # owner of CARGO_HOME/RUSTUP_HOME (oracle's). The warning is harmless:
+      # both homes are set explicitly and chowned to oracle afterwards.
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
@@ -96,7 +105,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           # Never a cache built on a runner's own OS: its build scripts were
-          # linked against another libc.
+          # linked against another libc. The key is NOT bound to the image
+          # digest: glibc is fixed within a Debian stable release, so a digest
+          # refresh does not invalidate objects built against it.
           key: debian-13
           # `make check`'s lint and fmt steps now reach `fuzz/` as well as the
           # workspace, and `fuzz/` is `exclude`d from the workspace so it has

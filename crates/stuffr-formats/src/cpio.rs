@@ -2024,7 +2024,7 @@ mod tests {
 
     /// Cross-implementation arbiter: what stuffr writes must read back
     /// through a real `cpio`. CI installs it explicitly (unlike `tar`/`ar`,
-    /// `ubuntu-latest` does not ship it — see the CI workflow); a
+    /// the CI image does not ship it — see the CI workflow); a
     /// contributor's machine lacking it fails this test loudly rather than
     /// passing having verified nothing (Phase 1e, Finding 8, repeating) —
     /// see `require_bin`.

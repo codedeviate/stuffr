@@ -1549,9 +1549,10 @@ mod linux {
         check("zip64_flags_outlive_their_archive", &cases);
     }
 
-    /// Debian's patch series (Task 14), against its binary, one group per
-    /// patch or set of patches. The probes behind each are in
-    /// `.claude/rules/compat.md`, "Task 14 probes".
+    // Debian's patch series (Task 14), against its binary, one group per
+    // patch or set of patches. The probes behind each are in
+    // `.claude/rules/compat.md`, "Task 14 probes".
+
     /// Deviation 12: a VMS block read while `-aa` writes the entry. The
     /// reference works in the buffer it is writing out: a deflated block
     /// leaves the bytes it inflates to as the entry's data (six newlines,

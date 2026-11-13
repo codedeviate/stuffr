@@ -1800,7 +1800,7 @@ mod tests {
 
     /// Locates `bin` on `PATH`, panicking rather than silently skipping if
     /// it is absent. CI always installs it (`ar` ships via `binutils` on
-    /// `ubuntu-latest` unconditionally), so an absence here means only a
+    /// the CI image unconditionally), so an absence here means only a
     /// contributor's own machine lacks it — and a silent `return` in that
     /// case would report every cross-implementation test in this file as
     /// PASSING having verified nothing at all, exactly the shape Finding 8
@@ -2081,7 +2081,7 @@ mod tests {
 
     /// Cross-implementation arbiter: what stuffr writes must read back
     /// through a real `ar`. CI has it unconditionally (`binutils` ships it
-    /// on `ubuntu-latest`); a contributor's machine lacking it fails this
+    /// in the CI image); a contributor's machine lacking it fails this
     /// test loudly rather than passing having verified nothing (Phase 1e,
     /// Finding 8) — see `require_bin`.
     #[test]

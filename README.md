@@ -1866,7 +1866,8 @@ carries both and picks one:
 
 - **Apple compress** (a port of `file_cmds-487.0.1`'s `compress.c` and
   `zopen.c`) on macOS and the BSDs.
-- **ncompress** (a port of ncompress 5.0, built as Ubuntu's `5.0-1` builds it)
+- **ncompress** (a port of ncompress 5.0, built as Debian 13's `5.0-3` builds it;
+  Ubuntu's `5.0-1` until `0.26.0`)
   everywhere else, Windows included.
 - **`STUFFR_COMPRESS_FLAVOR=apple|ncompress`** overrides the choice, whatever
   the platform; unset or empty means the platform's own. Any other value is
@@ -1875,7 +1876,7 @@ carries both and picks one:
   reference has the variable.
 
 `uncompress` decompresses, and so does `compress -d`; on Linux it behaves as
-ncompress's own `uncompress` (Ubuntu installs that as `uncompress.real`), never
+ncompress's own `uncompress` (Debian installs that as `uncompress.real`), never
 as gzip's script. `zcat` stays in the gzip family.
 
 **The promise:** stdout, stderr and exit codes are the chosen reference's, and
@@ -1936,7 +1937,7 @@ the output.
   table fills, the ratio checks see the 10-bit sizes, so the CLEAR codes fall
   where ncompress's would not.
 - **N2.** `uncompress` decompresses under that name on every platform.
-  Ubuntu's binary does so only as `uncompress.real`; where its usage says
+  Debian 13's binary does so only as `uncompress.real`; where its usage says
   `uncompress.real`, stuffr's says `uncompress`.
 - **N4.** `uncompress -f` on a file refused at its header (not in compressed
   format, or more than 16 bits): ncompress prints the refusal and its exit
@@ -1946,7 +1947,7 @@ the output.
   format` and then ` -- replaced with g` on the next line, which is false;
   stuffr leaves that line out. An empty `.Z` with `-f` still becomes an empty
   output, as ncompress makes it.
-- **Ubuntu's build everywhere.** On macOS this personality is still Ubuntu's
+- **Debian 13's build everywhere.** On macOS this personality is still Debian 13's
   build, not Homebrew's: symbolic-link operands are followed, `-V` lists
   `FAST, ` and `IBUFSIZ=8192, OBUFSIZ=8192`, and the corrupt-input debug line
   follows 8192-byte buffers.
