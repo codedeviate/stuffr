@@ -128,7 +128,7 @@ fn find_ecrec64(uz: &mut Uz) -> i32 {
 
     // Check for consistency: the disk numbers in ecrec and ecloc64 must
     // match (the locator counts disks from 1).
-    // debian: handle_windows_zip64.patch (a zero disk count is no
+    // debian: 29-handle-windows-zip64-files.patch (a zero disk count is no
     // contradiction; `flavour::handle_windows_zip64`)
     if uz.ecrec.number_this_disk != 0xffff
         && (!flavour::handle_windows_zip64(f) || ecloc64_total_disks != 0)

@@ -242,8 +242,17 @@ fn test_compr_eb(uz: &mut Uz, eb: &[u8], eb_size: usize, compr_offset: usize) ->
 /// `PK_DISK`; a stored block longer than that is `PK_ERR` in Debian 13,
 /// can-2026-2034442.patch, and copied whole by Apple's, past its buffer),
 /// then its CRC checked. Returns the code and the bytes (kept
-/// only up to `keep`, for the VMS block's record attributes).
-fn memextract_keep(uz: &mut Uz, tgtsize: u64, src: &[u8], keep: usize) -> (i32, Vec<u8>) {
+/// only up to `keep`, for the VMS block's record attributes). `srcsize` is
+/// the C's (`src` may be padded past it: `pad6`): under 6, `G.incnt` is
+/// negative and, cast to `extent`, larger than any `tgtsize`, so Debian's
+/// stored arm refuses it too.
+fn memextract_keep(
+    uz: &mut Uz,
+    tgtsize: u64,
+    src: &[u8],
+    srcsize: usize,
+    keep: usize,
+) -> (i32, Vec<u8>) {
     let method = fileio::makeword(src);
     let extra_field_crc = fileio::makelong(&src[2..]);
     let data = &src[6..];
@@ -252,7 +261,10 @@ fn memextract_keep(uz: &mut Uz, tgtsize: u64, src: &[u8], keep: usize) -> (i32, 
     let mut kept = Vec::new();
     match method {
         // debian: can-2026-2034442.patch
-        STORED if flavour::memextract_checks_room(uz.flavour) && data.len() as u64 > tgtsize => {
+        STORED
+            if flavour::memextract_checks_room(uz.flavour)
+                && (srcsize < 6 || (srcsize - 6) as u64 > tgtsize) =>
+        {
             error = PK_ERR;
         }
         STORED => {
@@ -261,7 +273,7 @@ fn memextract_keep(uz: &mut Uz, tgtsize: u64, src: &[u8], keep: usize) -> (i32, 
         }
         DEFLATED | ENHDEFLATED => {
             let mut outsize = tgtsize;
-            // ruling: T2-1 (0.27.0). Called from `flush()` (a VMS block
+            // ruling: T2-1 (0.27.0), deviation 12. Called from `flush()` (a VMS block
             // read when `-a` starts an entry's output), the C inflates
             // into `G.slide`, the very buffer being flushed, and the
             // entry's output becomes what the block inflated to. Here the
@@ -359,7 +371,7 @@ fn memextract_keep(uz: &mut Uz, tgtsize: u64, src: &[u8], keep: usize) -> (i32, 
 
 /// [`memextract_keep`] keeping nothing.
 fn memextract(uz: &mut Uz, tgtsize: u64, src: &[u8]) -> (i32, Vec<u8>) {
-    memextract_keep(uz, tgtsize, src, 0)
+    memextract_keep(uz, tgtsize, src, src.len(), 0)
 }
 
 /// `VMSFAB_B_RFM`: the FAB's record format byte.
@@ -448,7 +460,7 @@ fn extract_izvms_block(uz: &mut Uz, ebdata: &[u8], keep: usize) -> Option<Vec<u8
         EB_IZVMS_BCSTOR => Some(body[..usiz.min(keep)].to_vec()),
         EB_IZVMS_BC00 => Some(decompress_bits(usiz.min(keep), body)),
         EB_IZVMS_BCDEFL => {
-            let (r, kept) = memextract_keep(uz, usiz as u64, &pad6(body), keep);
+            let (r, kept) = memextract_keep(uz, usiz as u64, &pad6(body), body.len(), keep);
             // debian: can-2026-2034442.patch
             (r == PK_OK || !flavour::memextract_checks_room(uz.flavour)).then_some(kept)
         }

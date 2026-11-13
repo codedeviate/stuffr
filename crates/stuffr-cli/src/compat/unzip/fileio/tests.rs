@@ -206,14 +206,14 @@ fn makeint64_leaves_out_byte_5_as_upstream_does() {
 
 #[test]
 fn oem_names_are_code_page_850() {
-    with_uz(|uz| {
+    with_uz(|_| {
         let dos = PInfo {
             hostnum: FS_FAT_,
             hostver: 20,
             ..PInfo::default()
         };
         let mut s = *b"caf\x82\0\x82";
-        ext_ascii_to_native(uz, &mut s, &dos, false);
+        ext_ascii_to_native(&mut s, &dos, false);
         // Converted up to the NUL only.
         assert_eq!(&s, b"caf\xe9\0\x82");
         // PKZIP 2.5 with Unix attributes: already ISO 8859-1.
@@ -223,26 +223,24 @@ fn oem_names_are_code_page_850() {
             ..dos
         };
         let mut s = *b"\x82";
-        ext_ascii_to_native(uz, &mut s, &pk25, false);
+        ext_ascii_to_native(&mut s, &pk25, false);
         assert_eq!(&s, b"\x82");
         let unix = PInfo {
             hostnum: 3,
             ..PInfo::default()
         };
         let mut s = *b"\x82";
-        ext_ascii_to_native(uz, &mut s, &unix, false);
+        ext_ascii_to_native(&mut s, &unix, false);
         assert_eq!(&s, b"\x82");
     });
 }
 
-/// The Debian flavour converts OEM names through the same OEM 850 table as
-/// Apple's (Debian 13 has no 20-unzip60-alt-iconv-utf8.patch): MS-DOS
+/// Both flavours convert OEM names through the OEM 850 table (Debian 13 has
+/// no 20-unzip60-alt-iconv-utf8.patch, so the table no longer depends on
+/// the flavour): MS-DOS
 /// names and Windows NT 5.0 ones, never an NT 2.0 one.
 #[test]
 fn debian_names_go_through_the_oem_table() {
-    let env = |_: &str| None;
-    let mut err: Vec<u8> = Vec::new();
-    let uz = Uz::new(sandbox(), Flavour::Debian, &env, &mut err);
     for (hostnum, hostver, want) in [
         (FS_FAT_, 20, &b"caf\xe9\0\x82"[..]),
         (FS_NTFS_, 20, b"caf\x82\0\x82"),
@@ -254,7 +252,7 @@ fn debian_names_go_through_the_oem_table() {
             ..PInfo::default()
         };
         let mut s = *b"caf\x82\0\x82";
-        ext_ascii_to_native(&uz, &mut s, &p, false);
+        ext_ascii_to_native(&mut s, &p, false);
         assert_eq!(&s[..], want, "{hostnum} {hostver}");
     }
 }

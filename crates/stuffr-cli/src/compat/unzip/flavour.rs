@@ -239,7 +239,7 @@ pub(crate) fn makeint64_reads_byte_5(f: Flavour) -> bool {
     f == Flavour::Debian
 }
 
-/// `handle_windows_zip64.patch`, Debian only: `find_ecrec64()` takes a
+/// `29-handle-windows-zip64-files.patch`, Debian only: `find_ecrec64()` takes a
 /// Zip64 locator whose disk count is 0 (as Windows writes it) as no
 /// contradiction of the classic record's disk number.
 pub(crate) fn handle_windows_zip64(f: Flavour) -> bool {

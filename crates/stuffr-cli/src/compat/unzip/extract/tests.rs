@@ -830,3 +830,33 @@ fn a_stored_vms_block_longer_than_its_size() {
         assert_eq!(got == b"hello\n", vms, "{flavour:?}: {got:?}");
     }
 }
+
+/// can-2026-2034442.patch with a payload under memextract()'s 6-byte head:
+/// `G.incnt` is negative, so Debian's stored arm refuses it silently;
+/// Apple's (read as zeros past the block, T10-8) checks a CRC and says so.
+#[test]
+fn a_vms_payload_shorter_than_its_head() {
+    for (flavour, message) in [(Flavour::Apple, true), (Flavour::Debian, false)] {
+        let d = Dir::new("vmsshort");
+        let mut e = stored(b"v.txt", b"\x05\x00hello\x00", 0o100644 << 16);
+        e.host = 2;
+        let mut b = izvms_block(0, b"", b"");
+        // keep the method word and two CRC bytes: a 4-byte payload
+        b.truncate(b.len() - 2);
+        let len = (b.len() - 4) as u16;
+        b[2..4].copy_from_slice(&len.to_le_bytes());
+        let n = b.len();
+        b[n - 2..].copy_from_slice(&[0x12, 0x34]);
+        e.extra = b;
+        std::fs::write(d.0.join("root/v.zip"), zip(&[e])).unwrap();
+        let (code, _, err) = run_piped(&d, flavour, &["-aa", "v.zip"], b"");
+        assert_eq!(code, 0, "{flavour:?}: {err}");
+        assert_eq!(
+            err.contains("bad extra-field CRC"),
+            message,
+            "{flavour:?}: {err}"
+        );
+        let got = std::fs::read(d.0.join("root/v.txt")).unwrap();
+        assert_eq!(got, b"\x05\x00hello\x00", "{flavour:?}");
+    }
+}

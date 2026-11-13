@@ -1284,6 +1284,44 @@ mod linux {
         ]
     }
 
+    /// A VMS FAB copy of `len` bytes saying "variable-length records".
+    fn vms_fab(len: usize) -> Vec<u8> {
+        let mut fab = vec![0u8; len];
+        fab[31] = 2; // VMSFAB_B_RFM: VMSREC_C_VAR
+        fab
+    }
+
+    /// An Info-ZIP VMS block (`IM`, "VFAB", `EB_IZVMS_BCDEFL`, size 32)
+    /// holding memextract()'s `payload` (method word, CRC, data).
+    fn izvms_payload(payload: &[u8]) -> Vec<u8> {
+        let mut d = b"VFAB".to_vec();
+        d.extend_from_slice(&2u16.to_le_bytes());
+        d.extend_from_slice(&32u16.to_le_bytes());
+        d.extend_from_slice(&[0; 4]);
+        d.extend_from_slice(payload);
+        block(0x4d49, &d)
+    }
+
+    /// [`izvms_payload`] of `method`, the CRC of `crc_of`, and `data`.
+    fn izvms_block(method: u16, crc_of: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut p = method.to_le_bytes().to_vec();
+        p.extend_from_slice(&crc32(crc_of).to_le_bytes());
+        p.extend_from_slice(data);
+        izvms_payload(&p)
+    }
+
+    /// The records every VMS entry here holds.
+    const VMS_RECORDS: &[u8] = b"\x05\x00hello\x00\x03\x00abc\x00";
+
+    /// An entry made on VMS holding [`VMS_RECORDS`], with `extra`.
+    fn on_vms<'a>(name: &'a [u8], extra: &'a [u8]) -> ZipEntrySpec<'a> {
+        ZipEntrySpec {
+            version_made_by: 0x0214,
+            extra,
+            ..ZipEntrySpec::new(name, VMS_RECORDS)
+        }
+    }
+
     /// Debian 13's security fixes' inputs. `ux.zip` (can-2026-2034440):
     /// `ux` blocks naming root, whose owner `-X` cannot set (a warning when
     /// taken): sizes that fill the block exactly (taken), one byte left over,
@@ -1292,8 +1330,8 @@ mod linux {
     /// 5, 31, 40, 200 and 255. `vms.zip` (can-2026-2034442): entries made
     /// on VMS whose Info-ZIP VMS block is "deflated" but holds a stored FAB
     /// copy saying "variable-length records": as long as its size says
-    /// (`-a` reads the entry as VMS records), and 8 bytes longer (refused:
-    /// plain text).
+    /// (`-a` reads the entry as VMS records), 8 bytes longer (refused:
+    /// plain text), and a 4-byte payload (refused, silently).
     fn can_2026_zips() -> Vec<(&'static str, Vec<u8>)> {
         let ux = |uid: &[u8], gid: &[u8], tail: &[u8]| {
             let mut d = vec![1, uid.len() as u8];
@@ -1353,28 +1391,19 @@ mod linux {
             .collect();
         // An Info-ZIP VMS block (`IM`, "VFAB"): `EB_IZVMS_BCDEFL`, its
         // size 32, and memextract()'s method word (STORED), CRC and data.
-        let vms = |fab_len: usize| {
-            let mut fab = vec![0u8; fab_len];
-            fab[31] = 2; // VMSFAB_B_RFM: VMSREC_C_VAR
-            let mut d = b"VFAB".to_vec();
-            d.extend_from_slice(&2u16.to_le_bytes());
-            d.extend_from_slice(&32u16.to_le_bytes());
-            d.extend_from_slice(&[0; 4]);
-            d.extend_from_slice(&0u16.to_le_bytes());
-            d.extend_from_slice(&crc32(&fab).to_le_bytes());
-            d.extend_from_slice(&fab);
-            block(0x4d49, &d)
-        };
-        let (fits, over) = (vms(32), vms(40));
-        let records = b"\x05\x00hello\x00\x03\x00abc\x00";
-        let vms_entries: Vec<ZipEntrySpec> = [(&b"fits.txt"[..], &fits), (b"over.txt", &over)]
-            .into_iter()
-            .map(|(name, extra)| ZipEntrySpec {
-                version_made_by: 0x0214,
-                extra,
-                ..ZipEntrySpec::new(name, records)
-            })
-            .collect();
+        let fits = izvms_block(0, &vms_fab(32), &vms_fab(32));
+        let over = izvms_block(0, &vms_fab(40), &vms_fab(40));
+        // a payload of 4 bytes: STORED and half a CRC (Debian refuses it
+        // silently: `G.incnt` is negative)
+        let short = izvms_payload(&[0, 0, 0x12, 0x34]);
+        let vms_entries: Vec<ZipEntrySpec> = [
+            (&b"fits.txt"[..], &fits),
+            (b"over.txt", &over),
+            (b"short.txt", &short),
+        ]
+        .into_iter()
+        .map(|(name, extra)| on_vms(name, extra))
+        .collect();
         vec![
             ("ux.zip", zip_with(&ux_entries, b"", b"")),
             ("smart.zip", zip_with(&smart_entries, b"", b"")),
@@ -1523,6 +1552,53 @@ mod linux {
     /// Debian's patch series (Task 14), against its binary, one group per
     /// patch or set of patches. The probes behind each are in
     /// `.claude/rules/compat.md`, "Task 14 probes".
+    /// Deviation 12: a VMS block read while `-aa` writes the entry. The
+    /// reference works in the buffer it is writing out: a deflated block
+    /// leaves the bytes it inflates to as the entry's data (six newlines,
+    /// read as VMS records), and a stored block whose CRC fails leaves the
+    /// CRC message's text there (its first record). stuffr writes the
+    /// entry's own data and prints the message as the reference does.
+    /// can-2026-2034442's second hunk shows in the stored case: the failed
+    /// block is dropped, so the entry is not read as VMS records.
+    #[test]
+    fn vms_block_while_writing_is_deviation_12() {
+        if unzip_dir().is_none() {
+            return;
+        }
+        let fab = vms_fab(32);
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+        std::io::Write::write_all(&mut enc, &fab).unwrap();
+        let defl = izvms_block(8, &fab, &enc.finish().unwrap());
+        let badcrc = izvms_block(0, b"not the fab", &fab);
+        let files = vec![
+            ("defl.zip", zip_with(&[on_vms(b"v.txt", &defl)], b"", b"")),
+            ("bad.zip", zip_with(&[on_vms(b"v.txt", &badcrc)], b"", b"")),
+        ];
+        let file = |run: &UnzipRun| -> Vec<u8> {
+            match run.tree.get(&b"v.txt"[..]) {
+                Some(UnzipNode::File { bytes, .. }) => bytes.clone(),
+                other => panic!("v.txt: {other:?}"),
+            }
+        };
+        let has = |hay: &[u8], needle: &str| String::from_utf8_lossy(hay).contains(needle);
+        // deflated: the block's bytes (32 bytes read as VMS records)
+        let c = case("unzip", &["-aa", "defl.zip"], &files, &[]);
+        let (r, s) = (unzip_reference(&c).unwrap(), stuffr_unzip(&c));
+        assert_eq!((r.code, s.code), (0, 0), "{} / {}", r.stderr, s.stderr);
+        assert_eq!((r.stderr.as_str(), s.stderr.as_str()), ("", ""));
+        assert_eq!(file(&r), b"\n\n\n\n\n\n");
+        assert_eq!(file(&s), b"hello\nabc\n");
+        // stored, bad CRC: the message, then the message's text as data
+        let c = case("unzip", &["-aa", "bad.zip"], &files, &[]);
+        let (r, s) = (unzip_reference(&c).unwrap(), stuffr_unzip(&c));
+        assert_eq!((r.code, s.code), (0, 0));
+        assert!(r.stderr.contains("bad extra-field CRC"), "{}", r.stderr);
+        assert_eq!(r.stderr, s.stderr);
+        assert!(has(&file(&r), "error ["), "{:?}", file(&r));
+        // the entry's own bytes, not read as VMS records
+        assert_eq!(file(&s), VMS_RECORDS);
+    }
+
     /// Deviation 11: Debian 13 has no fix for CVE-2021-4217. A first entry
     /// with no name and a Unicode Path block: the reference dereferences a
     /// NULL name and dies by its SIGSEGV handler (exit 3), stuffr lists and

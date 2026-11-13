@@ -294,7 +294,7 @@ fn here_plus(uz: &Uz, length: usize) -> i64 {
 /// debian: as Apple's. Ubuntu's 20-unzip60-alt-iconv-utf8.patch (`-O`/`-I`
 /// and `iconv(3)` in place of this table, until 0.26.0) is not in Debian
 /// 13's series.
-pub(crate) fn ext_ascii_to_native(_uz: &Uz, s: &mut [u8], p: &PInfo, islochdr: bool) {
+pub(crate) fn ext_ascii_to_native(s: &mut [u8], p: &PInfo, islochdr: bool) {
     let oem = (p.hostnum == FS_FAT_
         && !((islochdr || p.has_ux_att)
             && (p.hostver == 25 || p.hostver == 26 || p.hostver == 40)))
@@ -381,7 +381,7 @@ pub(crate) fn do_string(
                     // text is a C string in it
                     let mut buf = text.clone();
                     buf.resize((text.len() + 1).max(flavour::filnamsiz(uz.flavour)), 0);
-                    ext_ascii_to_native(uz, &mut buf, p, false);
+                    ext_ascii_to_native(&mut buf, p, false);
                     text = c_str(&buf).to_vec();
                 }
                 // ASCII, filter out ANSI escape sequences and handle ^S
@@ -486,7 +486,7 @@ pub(crate) fn read_filename(uz: &mut Uz, length: usize, pinfo: &PInfo, islochdr:
     // A short read keeps the bytes past it from the earlier name.
     name[length] = 0; // terminate w/zero:  ASCIIZ
 
-    native_name(uz, &mut name, length, pinfo, islochdr);
+    native_name(&mut name, length, pinfo, islochdr);
     uz.filename = name;
 
     if block_len == 0 {
@@ -509,10 +509,10 @@ pub(crate) fn read_filename(uz: &mut Uz, length: usize, pinfo: &PInfo, islochdr:
 /// What `do_string(DS_FN)` does to a name once read: the host's code page
 /// converted, lowercased under `lcflag`, a volume label's dot after 8
 /// characters removed.
-fn native_name(uz: &Uz, name: &mut [u8], length: usize, pinfo: &PInfo, islochdr: bool) {
+fn native_name(name: &mut [u8], length: usize, pinfo: &PInfo, islochdr: bool) {
     // translate the Zip entry filename coded in host-dependent "extended
     // ASCII" into the compiler's (system's) internal text code page
-    ext_ascii_to_native(uz, name, pinfo, islochdr);
+    ext_ascii_to_native(name, pinfo, islochdr);
 
     if pinfo.lcflag {
         // replace with lowercase filename
@@ -564,7 +564,7 @@ fn read_filename_full(uz: &mut Uz, length: usize, pinfo: &PInfo, islochdr: bool)
     strncpy(&mut name, &full, length);
     name[length] = 0; // terminate w/zero:  ASCIIZ
     uz.filename_full = Some(full);
-    native_name(uz, &mut name, length, pinfo, islochdr);
+    native_name(&mut name, length, pinfo, islochdr);
     uz.filename = name;
     error
 }
