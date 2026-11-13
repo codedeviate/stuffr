@@ -1227,7 +1227,7 @@ fn run_zstd(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
     let mut operands = z.operands.clone();
     operands.extend(&listed);
     check_zstd_reads(dir, name, args, &z, &operands, &reads);
-    check_zstd_leftovers(dir, name, args, &listed);
+    check_zstd_leftovers(dir, name, args, &listed, zstd_trains_to_stdout(&z, args));
     check_budget(dir, name, args, &out, &before);
 }
 
@@ -1302,7 +1302,13 @@ fn check_zstd_reads(
 /// `--filelist` gave as bases too. A listed name may differ from a table
 /// name only by ASCII case on a case-folding filesystem (it opens the
 /// table's file; the output is spelled as listed), as under xz.
-fn check_zstd_leftovers(dir: &Path, name: &str, args: &[&str], listed: &[&str]) {
+fn check_zstd_leftovers(
+    dir: &Path,
+    name: &str,
+    args: &[&str],
+    listed: &[&str],
+    train_to_stdout: bool,
+) {
     let Ok(listing) = std::fs::read_dir(dir) else {
         return;
     };
@@ -1312,12 +1318,31 @@ fn check_zstd_leftovers(dir: &Path, name: &str, args: &[&str], listed: &[&str]) 
             !n.starts_with(".stuffr-zstd-"),
             "{name} {args:?}: left its temporary {n:?}"
         );
+        // zstd 1.5.7: `-c`/`--stdout` sets `outFileName = stdoutmark`
+        // (`"/*stdout*\\"`, fileio.h) and `--train*` passes it on as the
+        // dictionary's name, which `DiB_saveDict` `fopen`s. Outside the
+        // sandbox that is a file at the filesystem root; the sandbox's
+        // `Host::path` drops the leading `/`, so it lands in the run directory.
+        let stdout_named_dict = train_to_stdout && n == "*stdout*\\";
         assert!(
-            could_be_written_with(&n, false, listed)
+            stdout_named_dict
+                || could_be_written_with(&n, false, listed)
                 || (case_insensitive_fs() && could_be_written_with(&n, true, listed)),
             "{name} {args:?}: left a stray {n:?}"
         );
     }
+}
+
+/// Whether a zstd run trains a dictionary and was told to send its output to
+/// stdout (`-c`, `--stdout`, or the mark itself as an `-o` value), judged
+/// loosely: any short cluster holding `c` counts, which only loosens the check.
+fn zstd_trains_to_stdout(z: &ZstdArgs, args: &[&str]) -> bool {
+    matches!(z.mode, ZstdMode::Train)
+        && args.iter().any(|a| {
+            *a == "--stdout"
+                || *a == "/*stdout*\\"
+                || (a.starts_with('-') && !a.starts_with("--") && a.contains('c'))
+        })
 }
 
 /// Whether an lz4 run's operation is `--list`: the last token that sets a

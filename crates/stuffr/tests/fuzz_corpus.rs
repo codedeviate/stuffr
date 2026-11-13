@@ -850,6 +850,8 @@ const COMPAT_SHAPES: &[&str] = &[
     "zstd-train-maxdict",
     "zstd-train-cover",
     "zstd-train-fastcover",
+    // `--train -c`: the dictionary is named after zstd's stdout mark.
+    "zstd-train-stdout",
     // Decompression: each name, `.tzst`, a dictionary, a prefix, window
     // limits, pass-through, the foreign formats, frames with skippable
     // frames between them.
@@ -2182,6 +2184,16 @@ fn zstd_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> {
         "train-fastcover" => z(
             &[&["--train-fastcover"][..], &samples].concat(),
             &samples,
+            false,
+            &text,
+        ),
+        "train-stdout" => z(
+            &[
+                &["--train-cover=k=16,d=6", "-B1K", "--stdout"][..],
+                &samples[..3],
+            ]
+            .concat(),
+            &samples[..3],
             false,
             &text,
         ),
