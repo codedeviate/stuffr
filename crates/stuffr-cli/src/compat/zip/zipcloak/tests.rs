@@ -576,13 +576,13 @@ fn hostile_encrypted_archives_end_cleanly() {
     }
 }
 
-/// Deviation 24: a split archive under `-O`. zipcloak's `readlocal()` (the
-/// UTIL build's) looks for each entry in the archive file it has open, the
-/// last part; it does not find the first entry there. Ubuntu 24.04's build
-/// then used its uninitialised local header and died of SIGSEGV (measured
-/// at a terminal in Docker; Debian 13's still fails there); stuffr warns as it does and ends with that
-/// failure: `Zip file structure invalid`, exit 3, nothing written. Without
-/// `-O` both refuse the split archive (exit 16, recorded in
+/// Deviation 24: a split archive under `-O`. zipcloak's `readlocal()` (the UTIL
+/// build's) looks for each entry in the archive file it has open, the last
+/// part; it does not find the first entry there. Ubuntu 24.04's build then used
+/// its uninitialised local header and died of SIGSEGV (measured at a terminal
+/// in Docker; Debian 13's still fails there); stuffr warns as it does and ends
+/// with that failure: `Zip file structure invalid`, exit 3, nothing written.
+/// Without `-O` both refuse the split archive (exit 16, recorded in
 /// `compat_zip_common`'s probe, pinned here too).
 #[test]
 fn a_split_archive_under_o_ends_at_its_first_entry() {

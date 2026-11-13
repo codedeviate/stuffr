@@ -337,8 +337,9 @@ mod linux {
     ///   figures, a stored entry's sizes (so `zip -y - l` streams it), and
     ///   `-FS`/`-u`/`-f` freshness (an unchanged link is current, one
     ///   re-pointed at a target of another length is not);
-    /// - deviation 23's input, an empty first `-z` line: Debian 13's gcc 14
-    ///   build writes it as the comment, where Ubuntu 24.04's died;
+    /// - withdrawn deviation 23's input, an empty first `-z` line: Debian
+    ///   13's gcc 14 build writes it as the comment, where Ubuntu 24.04's
+    ///   died;
     /// - `fix-command-injection`: the name `-T` hands to `unzip` or to the
     ///   `-TT` command is quoted by `quote_arg()` (`"..."`, with `\` before
     ///   `"`, `$`, `` ` `` and `\`, and `!` as `"'!'"`), so an archive named
@@ -436,8 +437,9 @@ mod linux {
         ] {
             push(args, dir_tree());
         }
-        // deviation 23 (ruling Z25): Ubuntu 24.04's build died of an empty
-        // first `-z` line; Debian 13's writes the comment, as stuffr does
+        // ruling Z25 (deviation 23, withdrawn in 0.27.0): Ubuntu 24.04's
+        // build died of an empty first `-z` line; Debian 13's writes the
+        // comment, the same bytes as stuffr
         for stdin in [&b"\nsecond\n"[..], b"\n", b"\n\nthird\n.\n"] {
             let mut c = zip_case(
                 "zip",

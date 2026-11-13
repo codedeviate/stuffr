@@ -2054,7 +2054,9 @@ before the command line, as the reference does.
     left); stuffr answers as Apple does (`Temporary file failure`, exit 10,
     the temporary removed). And the `zip I/O error:` line shows the write's
     own error, as Apple does, not whatever `errno` glibc's later calls left
-    (measured on Ubuntu 24.04's build in a container without tzdata).
+    (measured on Ubuntu 24.04's build in a container without tzdata). Debian
+    13 shows the write's own error (`File too large`), so that half is no
+    longer a difference.
 13. **Reading an archive**, undefined behaviour not reproduced: an end record
     or Zip64 record cut short is read as zeros (an archive that is only
     `PK\5\6` is empty to stuffr; Apple says "cannot update a split archive");
@@ -2125,10 +2127,10 @@ before the command line, as the reference does.
 22. **`-sp` with an archive name that has no directory** (ruling Z24): zip
     takes the name part as empty and indexes before its buffer; stuffr takes
     such a name as one in the current directory.
-23. **`-z` whose first comment line is empty** (ruling Z25) copies `\r\n` into
-    a one-byte block: Ubuntu 24.04's build died in glibc's overflow check
-    (exit 9); Apple's and Debian 13's write the comment. stuffr writes it in
-    both flavours (no longer a difference from Debian 13).
+23. (Withdrawn in `0.27.0`: an empty first `-z` comment line, ruling Z25.
+    Ubuntu 24.04's build died there in glibc's overflow check, exit 9; Debian
+    13's writes the comment, the same bytes as stuffr and Apple's build. The
+    number is kept so the others keep theirs.)
 24. **`zipcloak` ignores `readlocal()`'s failure** and goes on with an
     uninitialised local header; stuffr ends the run with that failure's code
     (`zipcloak error: ... (was encrypting an entry)` or `(was decrypting an

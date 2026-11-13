@@ -259,13 +259,13 @@
 //!     and indexes before its buffer. stuffr takes such a name as one in
 //!     the current directory: `zip -s 64k -sp t.zip big` answered `o/`
 //!     writes `t.z01` here, then `o/t.z02`, ..., `o/t.zip`.
-//! 23. Ruling Z25: `-z` whose first comment line is empty copies `\r\n`
-//!     into a one-byte block (`strcpy(p, "\r\n")`): Ubuntu 24.04's build
-//!     died in glibc's buffer-overflow check (exit 9 through zip's SIGABRT
-//!     handler); Apple's writes the comment, and so does Debian 13's (gcc
-//!     14 build, re-probed 0.27.0: the same comment bytes, exit 0). stuffr
-//!     writes it in both flavours, so for Debian 13 this is no longer a
-//!     difference (`compat_zip_debian::debian_patch_rows` compares it).
+//! 23. (Withdrawn in 0.27.0; the number is kept so the others keep theirs.)
+//!     It was ruling Z25: `-z` whose first comment line is empty copies
+//!     `\r\n` into a one-byte block (`strcpy(p, "\r\n")`), and Ubuntu
+//!     24.04's build died there in glibc's buffer-overflow check (exit 9
+//!     through zip's SIGABRT handler). Debian 13's gcc 14 build writes the
+//!     comment, the same bytes as stuffr and Apple's build, exit 0
+//!     (`compat_zip_debian::debian_patch_rows` compares them).
 //! 24. `zipcloak` (crypt.c's `zipcloak()` and `zipbare()`) ignores
 //!     `readlocal()`'s failure (a local header that cannot be found or
 //!     read) and goes on with an uninitialised local header; stuffr ends the
@@ -325,8 +325,8 @@
 //!     on, for every name that is not ASCII) and patch 15 (`-TT`'s command
 //!     buffer one byte short) are Debian's own fixes: both flavours take the
 //!     patched, defined behaviour (Apple has neither code path). Pinned,
-//!     stuffr-only, by `compat_zip_common::debian_patch_rulings`; the crash answers
-//!     are also compared with the reference (`compat_zip_debian`).
+//!     stuffr-only, by `compat_zip_common::debian_patch_rulings`; the crash
+//!     answers are also compared with the reference (`compat_zip_debian`).
 //! 29. `-Z bzip2` (Debian): zipup.c tests whether an entry is text over the
 //!     whole 16 KiB input buffer, past the bytes read, and the buffer is
 //!     allocated once per run and never cleared, so the test sees what an

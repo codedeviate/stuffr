@@ -3,9 +3,9 @@
 //! extra fields, data descriptors, Zip64 records, comments, the deflate
 //! data at every level), both streams and the exit code, over
 //! [`zip_bytes_matrix`] (new archives), [`zip_update_matrix`] (archives
-//! already at the path) and [`zip_encrypted_matrix`] (`-P`, compared
-//! outside the encryption headers). Apple's `/usr/bin/zip` on macOS, Debian's apt
-//! `zip` under `make compat-debian` and CI's Linux jobs.
+//! already at the path) and [`zip_encrypted_matrix`] (`-P`, compared outside
+//! the encryption headers). Apple's `/usr/bin/zip` on macOS, Debian's apt `zip`
+//! under `make compat-debian` and CI's Linux jobs.
 
 #[cfg(unix)]
 mod compat_harness;

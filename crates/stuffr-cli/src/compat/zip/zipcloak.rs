@@ -21,15 +21,16 @@
 //! exit 5).
 //!
 //! Undefined behaviour of the C, not reproduced (deviation 24): crypt.c's
-//! `zipcloak()` and `zipbare()` ignore `readlocal()`'s result and go on
-//! with an uninitialised local header when it fails (a local header that
-//! cannot be found or read); stuffr ends the run with that failure's code
-//! (`was encrypting an entry`, `was decrypting an entry`), the temporary
-//! removed. That is also the answer for a split archive with `-O` (the
-//! UTIL build's `readlocal()` looks for every entry in the last part, as
-//! stuffr does, and does not find it: Ubuntu 24.04's build then died of
-//! SIGSEGV in its handler; Debian 13's still fails there). A central name longer than the local one makes `readlocal()`
-//! write past the local name's buffer; stuffr keeps the local name.
+//! `zipcloak()` and `zipbare()` ignore `readlocal()`'s result and go on with an
+//! uninitialised local header when it fails (a local header that cannot be
+//! found or read); stuffr ends the run with that failure's code (`was
+//! encrypting an entry`, `was decrypting an entry`), the temporary removed.
+//! That is also the answer for a split archive with `-O` (the UTIL build's
+//! `readlocal()` looks for every entry in the last part, as stuffr does, and
+//! does not find it: Ubuntu 24.04's build then died of SIGSEGV in its handler;
+//! Debian 13's still fails there). A central name longer than the local one
+//! makes `readlocal()` write past the local name's buffer; stuffr keeps the
+//! local name.
 
 use stuffr::infozip::crypt::{Keys, RAND_HEAD_LEN, crypt_header};
 
