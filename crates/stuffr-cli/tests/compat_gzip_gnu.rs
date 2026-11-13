@@ -1864,7 +1864,13 @@ mod differential {
         // macOS), never writing anywhere.
         for (stored, args, op) in [
             (&b"/"[..], &["-dN"][..], "s/in.gz"),
+            // `-dNf` and `-dNfv` on Linux take the OUTPUT_REFUSED path (the
+            // leading "\n" of a failed create, `Is a directory`, exit 1),
+            // measured on gzip 1.13 (Debian 13) only: macOS's 1.15 unlinks
+            // first and says `Operation not permitted`, and Ubuntu's 1.12
+            // printed no newline. The Debian 13 container is the judge.
             (b"/", &["-dNf"], "s/in.gz"),
+            (b"/", &["-dNfv"], "s/in.gz"),
             (b"//", &["-dN"], "s/in.gz"),
             (b"", &["-dNf"], "s/in.gz"),
             (b"", &["-dNfv"], "s/in.gz"),
