@@ -1871,6 +1871,14 @@ mod differential {
             // printed no newline. The Debian 13 container is the judge.
             (b"/", &["-dNf"], "s/in.gz"),
             (b"/", &["-dNfv"], "s/in.gz"),
+            // A trailing `/` on a name that needs quoting: the refusal is
+            // judged on the raw name (Debian 13's 1.13 prints it unquoted).
+            (b"a b/", &["-dNf"], "s/in.gz"),
+            (b"a b/", &["-dNfv"], "s/in.gz"),
+            (b"a'b/", &["-dNf"], "s/in.gz"),
+            (b"a'b/", &["-dNfv"], "s/in.gz"),
+            (b"a b/", &["-dN"], "s/in.gz"),
+            (b"a'b/", &["-dN"], "s/in.gz"),
             (b"//", &["-dN"], "s/in.gz"),
             (b"", &["-dNf"], "s/in.gz"),
             (b"", &["-dNfv"], "s/in.gz"),

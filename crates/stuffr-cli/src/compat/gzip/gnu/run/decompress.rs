@@ -414,7 +414,7 @@ impl Gz<'_> {
         let out_name = self.output_name(name, Some(suffix), opened.header.as_ref());
         let qout = quote(&out_name);
         let out_path = self.host.path(&out_name);
-        let Some(replace) = self.may_write(&out_path, &qout, path, meta) else {
+        let Some(replace) = self.may_write(&out_path, &out_name, &qout, path, meta) else {
             return Ok(());
         };
         // A stored name that is empty or ends in `/` cannot be a file: GNU
@@ -429,7 +429,13 @@ impl Gz<'_> {
                 }
                 Err(e) => e,
             };
-            self.error(m::CREATE_FAILED, &[PROGRAM, &qout, &strerror(&e)]);
+            // Debian's 1.13 prints a name ending in `/` as it is, unquoted.
+            let shown = if cfg!(target_os = "linux") && out_name.ends_with(b"/") {
+                &out_name
+            } else {
+                &qout
+            };
+            self.error(m::CREATE_FAILED, &[PROGRAM, shown, &strerror(&e)]);
             return Ok(());
         }
         let (tmp, tmp_file, _guard) = match host::create_temp_armed(

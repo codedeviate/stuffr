@@ -361,7 +361,7 @@ impl Gz<'_> {
         let out_name = [name, &self.s.suffix].concat();
         let qout = quote(&out_name);
         let out_path = self.host.path(&out_name);
-        let Some(replace) = self.may_write(&out_path, &qout, &path, meta) else {
+        let Some(replace) = self.may_write(&out_path, &out_name, &qout, &path, meta) else {
             return;
         };
         let (tmp, tmp_file, _guard) = match host::create_temp_armed(
@@ -415,6 +415,7 @@ impl Gz<'_> {
     fn may_write(
         &mut self,
         out_path: &Path,
+        out_name: &[u8],
         qout: &[u8],
         input: &Path,
         input_meta: &Metadata,
@@ -429,12 +430,15 @@ impl Gz<'_> {
                 // A name ending in `/` fails as a create, not an unlink: Debian
                 // 13's 1.13 prefixes the newline (see `OUTPUT_REFUSED`); macOS
                 // 1.15 does not (its unlink says "Operation not permitted").
-                let fmt = if cfg!(target_os = "linux") && qout.ends_with(b"/") {
-                    m::OUTPUT_REFUSED
+                // Debian's 1.13 also prints the name as it is, unquoted, on
+                // that path (`s/a b/`), so the raw name is what is shown.
+                let refused = cfg!(target_os = "linux") && out_name.ends_with(b"/");
+                let (fmt, shown) = if refused {
+                    (m::OUTPUT_REFUSED, out_name)
                 } else {
-                    m::IO_FAILED
+                    (m::IO_FAILED, qout)
                 };
-                self.error(fmt, &[PROGRAM, qout, &strerror(&e)]);
+                self.error(fmt, &[PROGRAM, shown, &strerror(&e)]);
                 return None;
             }
             return Some(true);
@@ -454,7 +458,13 @@ impl Gz<'_> {
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => {
-                self.error(m::OUTPUT_REFUSED, &[PROGRAM, qout, &strerror(&e)]);
+                // Debian's 1.13 prints the raw name here too.
+                let shown = if cfg!(target_os = "linux") {
+                    out_name
+                } else {
+                    qout
+                };
+                self.error(m::OUTPUT_REFUSED, &[PROGRAM, shown, &strerror(&e)]);
                 return None;
             }
         }
