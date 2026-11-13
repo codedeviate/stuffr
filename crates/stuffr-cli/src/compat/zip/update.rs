@@ -13,7 +13,7 @@
 //!
 //! Deviations (`mod.rs`, 13-16): `-g` grows a copy (zip writes into the
 //! archive itself), the output is not truncated before it is replaced,
-//! `-T` never sees Ubuntu's double free (ruling Z3), and a sandboxed `-T`
+//! `-T` never sees Debian's double free (ruling Z3), and a sandboxed `-T`
 //! spawns nothing.
 
 use std::ffi::OsStr;
@@ -416,7 +416,7 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
                                 if z.o.bad_open_is_error {
                                     let mut h = Vec::new();
                                     printf(&mut h, m::WAS_ZIPPING, &[&zf.e.name]);
-                                    // ubuntu: the stale errno, as for a new file
+                                    // debian: the stale errno, as for a new file
                                     let shown = if flavour::stale_errno_after_warning(z.flavour) {
                                         io::Error::from_raw_os_error(22)
                                     } else {
@@ -584,7 +584,7 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
                 if z.o.bad_open_is_error {
                     let mut h = Vec::new();
                     printf(&mut h, m::WAS_ZIPPING, &[&f.name]);
-                    // ubuntu: glibc's stdio leaves EINVAL in errno by the
+                    // debian: glibc's stdio leaves EINVAL in errno by the
                     // time ziperr prints it (measured)
                     let shown = if flavour::stale_errno_after_warning(z.flavour) {
                         io::Error::from_raw_os_error(22)
@@ -921,37 +921,59 @@ pub(crate) fn check_zipfile(z: &mut Zr, name: &[u8]) -> Result<(), Exit> {
     check_zipfile_64(z, name, false)
 }
 
-/// Ubuntu's `-TT` command (zip.c:check_zipfile): the first `{}` replaced
-/// by the quoted temporary name, or the quoted name appended. Built as a
-/// string: patch 13's buffer (`strlen(cmd) + strlen(name) + 3`, one byte
-/// short of the appended form and its NUL) has no counterpart, so the
-/// command is whole at every length (deviation 28).
+/// zip.c:quote_arg (Debian's fix-command-injection), its Unix rules: `s`
+/// in double quotes, a backslash before `"`, `$`, `` ` `` and `\`, and a
+/// `!` as `"'!'"` (the quotes closed, the `!` single-quoted, the quotes
+/// reopened). Every other byte is as it is.
+// port: zip.c:quote_arg
+// debian: fix-command-injection
+pub(crate) fn quote_arg(s: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 * s.len() + 2);
+    out.push(b'"');
+    for &c in s {
+        match c {
+            b'!' => out.extend_from_slice(b"\"'!'\""),
+            b'"' | b'$' | b'`' | b'\\' => out.extend_from_slice(&[b'\\', c]),
+            _ => out.push(c),
+        }
+    }
+    out.push(b'"');
+    out
+}
+
+/// Debian's `-TT` command (zip.c:check_zipfile): the first `{}` replaced
+/// by the temporary name, or the name appended, the name quoted by
+/// [`quote_arg`] (fix-command-injection; Ubuntu 24.04's build put it in
+/// single quotes, so a name holding one broke the command). Built as a
+/// string: patch 15's buffer (`strlen(cmd) + strlen(qname) + 4`) has no
+/// counterpart, so the command is whole at every length (deviation 28).
 // port: zip.c:check_zipfile (-TT)
 pub(crate) fn tt_command(up: &[u8], name: &[u8]) -> Vec<u8> {
-    let mut cmd = Vec::with_capacity(up.len() + name.len() + 4);
+    // debian: fix-command-injection
+    let q = quote_arg(name);
+    let mut cmd = Vec::with_capacity(up.len() + q.len() + 4);
     match up.windows(2).position(|w| w == b"{}") {
         Some(i) => {
             cmd.extend_from_slice(&up[..i]);
-            cmd.extend_from_slice(b" '");
-            cmd.extend_from_slice(name);
-            cmd.extend_from_slice(b"' ");
+            cmd.push(b' ');
+            cmd.extend_from_slice(&q);
+            cmd.push(b' ');
             cmd.extend_from_slice(&up[i + 2..]);
         }
         None => {
             cmd.extend_from_slice(up);
-            cmd.extend_from_slice(b" '");
-            cmd.extend_from_slice(name);
-            cmd.push(b'\'');
+            cmd.push(b' ');
+            cmd.extend_from_slice(&q);
         }
     }
     cmd
 }
 
 /// zip.c:check_zipfile: test `name` with `unzip -t` (or `-TT`'s command):
-/// Apple through `posix_spawnp` (no shell; `{}` refused), Ubuntu through
-/// `system()` (`/bin/sh -c`, the name quoted). A failure is
+/// Apple through `posix_spawnp` (no shell; `{}` refused), Debian through
+/// `system()` (`/bin/sh -c`, the name quoted by [`quote_arg`]). A failure is
 /// `ZE_TEST`, "original files unmodified": ruling Z3 (deviation 15), as
-/// Apple answers in both flavours, where Ubuntu's build frees the
+/// Apple answers in both flavours, where Debian's build frees the
 /// temporary's stream twice and aborts.
 // port: zip.c:check_zipfile
 fn check_zipfile_64(z: &mut Zr, name: &[u8], zip64_archive: bool) -> Result<(), Exit> {
@@ -979,9 +1001,8 @@ fn check_zipfile_64(z: &mut Zr, name: &[u8], zip64_archive: bool) -> Result<(), 
                 if !verbose {
                     cmd.extend_from_slice(m::QQ_CMD.as_bytes());
                 }
-                cmd.push(b'\'');
-                cmd.extend_from_slice(name);
-                cmd.push(b'\'');
+                // debian: fix-command-injection
+                cmd.extend_from_slice(&quote_arg(name));
                 system(z, &cmd)
             } else {
                 let mut argv = vec![m::UNZIP.as_bytes().to_vec(), m::UNZIP_T.as_bytes().to_vec()];
@@ -997,7 +1018,7 @@ fn check_zipfile_64(z: &mut Zr, name: &[u8], zip64_archive: bool) -> Result<(), 
         let mut l = Vec::new();
         printf(&mut l, m::TEST_FAILED, &[&zipfile]);
         z.mesg_write(&l);
-        // ruling Z3: Ubuntu's double free (exit 5) is not reproduced
+        // ruling Z3: Debian's double free (exit 5) is not reproduced
         return Err(z.ziperr(ZE_TEST, m::ORIGINAL_UNMODIFIED.as_bytes()));
     }
     let mut l = Vec::new();

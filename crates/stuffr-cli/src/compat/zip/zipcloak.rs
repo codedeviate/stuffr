@@ -27,7 +27,7 @@
 //! (`was encrypting an entry`, `was decrypting an entry`), the temporary
 //! removed. That is also the answer for a split archive with `-O` (the
 //! UTIL build's `readlocal()` looks for every entry in the last part, as
-//! stuffr does, and does not find it: Ubuntu's then dies of SIGSEGV in its
+//! stuffr does, and does not find it: Debian's then dies of SIGSEGV in its
 //! handler). A central name longer than the local one makes `readlocal()`
 //! write past the local name's buffer; stuffr keeps the local name.
 

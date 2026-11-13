@@ -11,7 +11,7 @@
 //! whole: no input is ever lost. Messages go to standard error (`mesg`;
 //! standard output is the listing).
 //!
-//! `-w` is Ubuntu's (patch 07): Apple's `zipnote -w` closes the input
+//! `-w` is Debian's (patch 07): Apple's `zipnote -w` closes the input
 //! stream `x` twice, the second time closing the temporary's stream, and
 //! always ends in exit 10 (`Bad file descriptor`, `Temporary file failure`)
 //! with the archive untouched. That is undefined behaviour in the C and is
@@ -45,7 +45,7 @@ const ZE_CREAT: i32 = 15;
 const MARK: u8 = b'@';
 
 /// The size of zipnote.c's line buffer: `WRBUFSIZ` (2047, `FNMAX` being
-/// 1024 in both builds; measured on Ubuntu's) plus one.
+/// 1024 in both builds; measured on Debian's) plus one.
 const LINE_SIZE: usize = 2048;
 
 /// zipnote.c:putclean: `s` to standard output, without control characters

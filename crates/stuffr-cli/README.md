@@ -74,6 +74,9 @@ Apple's on macOS and the BSDs); `STUFFR_GZIP_FLAVOR=gnu|bsd` overrides that.
 The unzip names are Info-ZIP UnZip 6.00 in Apple's or Debian 13's build, the
 same way; `STUFFR_UNZIP_FLAVOR=apple|debian` overrides that (`ubuntu` is an
 alias of `debian`).
+The zip names are Info-ZIP Zip 3.0 in Apple's or Debian 13's build, the same
+way; `STUFFR_ZIP_FLAVOR=apple|debian` overrides that (`ubuntu` is an alias of
+`debian`).
 The compress names are Apple's `compress` (487.0.1) on macOS and the BSDs and
 ncompress 5.0 elsewhere; `STUFFR_COMPRESS_FLAVOR=apple|ncompress` overrides that.
 

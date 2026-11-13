@@ -14,7 +14,7 @@ mod compat_harness;
 mod unix {
     use super::compat_harness::*;
 
-    /// This suite is Apple's: other platforms' reference is Ubuntu's.
+    /// This suite is Apple's: other platforms' reference is Debian's.
     fn apple_here() -> bool {
         if platform_zip_flavour() != "apple" {
             eprintln!("skipped: this platform's zip reference is not Apple's");
@@ -39,7 +39,7 @@ mod unix {
         );
     }
 
-    /// A newline in a name is shown raw (Ubuntu shows `^J`).
+    /// A newline in a name is shown raw (Debian shows `^J`).
     #[test]
     fn a_newline_in_a_name_is_shown_as_it_is() {
         if !apple_here() {

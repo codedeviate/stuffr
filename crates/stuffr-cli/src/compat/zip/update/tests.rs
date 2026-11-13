@@ -171,10 +171,10 @@ fn growing_writes_a_copy() {
 }
 
 /// Deviation 16: a sandboxed run spawns nothing, so `-T` fails as without
-/// `unzip` (and `-TT`'s command is not run); ruling Z3 for Ubuntu too.
+/// `unzip` (and `-TT`'s command is not run); ruling Z3 for Debian too.
 #[test]
 fn a_sandboxed_test_fails_in_both_flavours() {
-    for f in [Flavour::Apple, Flavour::Ubuntu] {
+    for f in [Flavour::Apple, Flavour::Debian] {
         let s = with_archive("test");
         let (code, out, err, _) = run(&s.0, f, &["-T", "t.zip", "big"]);
         assert_eq!(code, 8, "{f:?} {out}");
@@ -290,10 +290,10 @@ fn show_files_with_move_deletes_nothing() {
     assert_eq!(names(&s.0), ["a.txt", "big", "t.zip"]);
 }
 
-/// Patch 13 (deviation 28): the appended form needs `strlen(cmd) +
-/// strlen(name) + 3` bytes and a NUL, one more than the unpatched C's
-/// buffer; around that edge (and for buffers malloc rounds to 8 or 16)
-/// the command is whole: the name quoted after a space, nothing lost.
+/// Patch 15 (deviation 28): the appended form needs `strlen(cmd) +
+/// strlen(qname) + 1` bytes and a NUL, within the patched C's `+ 4`;
+/// around that edge (and for buffers malloc rounds to 8 or 16) the command
+/// is whole: the quoted name after a space, nothing lost.
 #[test]
 fn tt_command_is_whole_at_every_length() {
     for ul in [1usize, 4, 5, 6, 7, 8, 13, 16, 29] {
@@ -302,13 +302,32 @@ fn tt_command_is_whole_at_every_length() {
             let cmd = super::tt_command(&up, &name);
             assert_eq!(cmd.len(), ul + nl + 3, "{ul} {nl}");
             assert_eq!(&cmd[..ul], &up[..]);
-            assert_eq!(&cmd[ul..ul + 2], b" '");
+            assert_eq!(&cmd[ul..ul + 2], b" \"");
             assert_eq!(&cmd[ul + 2..ul + 2 + nl], &name[..]);
-            assert_eq!(cmd.last(), Some(&b'\''));
+            assert_eq!(cmd.last(), Some(&b'"'));
         }
     }
-    assert_eq!(super::tt_command(b"t {} x", b"zi1"), b"t  'zi1'  x");
-    assert_eq!(super::tt_command(b"{}{}", b"z"), b" 'z' {}");
+    assert_eq!(super::tt_command(b"t {} x", b"zi1"), b"t  \"zi1\"  x");
+    assert_eq!(super::tt_command(b"{}{}", b"z"), b" \"z\" {}");
+}
+
+/// fix-command-injection: `quote_arg()`'s Unix rules. The name is put in
+/// double quotes; `"`, `$`, `` ` `` and `\` get a backslash, `!` closes
+/// the quotes, is single-quoted and reopens them; every other byte (a
+/// single quote, a space, a newline, a high byte) is as it is.
+#[test]
+fn quote_arg_follows_debians_unix_rules() {
+    let q = |s: &[u8]| super::quote_arg(s);
+    assert_eq!(q(b""), b"\"\"");
+    assert_eq!(q(b"a b.zip"), b"\"a b.zip\"");
+    assert_eq!(q(b"a'b.zip"), b"\"a'b.zip\"");
+    assert_eq!(q(b"a\"b"), b"\"a\\\"b\"");
+    assert_eq!(q(b"a$b"), b"\"a\\$b\"");
+    assert_eq!(q(b"a`b"), b"\"a\\`b\"");
+    assert_eq!(q(b"a\\b"), b"\"a\\\\b\"");
+    assert_eq!(q(b"a!b"), b"\"a\"'!'\"b\"");
+    assert_eq!(q(b"!!"), b"\"\"'!'\"\"'!'\"\"");
+    assert_eq!(q(b"n\n\xe9"), b"\"n\n\xe9\"");
 }
 
 /// Deviation 13 (ruling Z33): `-g --out` leaves the input archive untouched

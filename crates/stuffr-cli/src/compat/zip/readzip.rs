@@ -14,7 +14,7 @@
 //! directory from as many parts as it spans, `zipcopy`, `readlocal` and
 //! `bfcopy` open the part an entry is on and go on to the next at a part's
 //! end, asking where a part is when it cannot be opened (`split.rs`).
-//! `-F` is `scanzipf_regnew`'s fix mode; `-FF` is `fix.rs`. Ubuntu's
+//! `-F` is `scanzipf_regnew`'s fix mode; `-FF` is `fix.rs`. Debian's
 //! `UNICODE_SUPPORT` reading of bit-11 and Unicode Path names is Task 11's.
 //!
 //! Undefined behaviour in the C, not reproduced (deviation 13 in
@@ -71,10 +71,10 @@ pub(crate) struct ZFile {
     pub(crate) current: bool,
     /// `-k` given when it was matched.
     pub(crate) dosflag: bool,
-    /// Ubuntu's `zuname`: the UTF-8 name in the local character set, the
+    /// Debian's `zuname`: the UTF-8 name in the local character set, the
     /// other name the entry is matched by.
     pub(crate) zuname: Option<Vec<u8>>,
-    /// Ubuntu's `ouname`: `zuname` as `-su`/`-sU` show it (escaped under
+    /// Debian's `ouname`: `zuname` as `-su`/`-sU` show it (escaped under
     /// `-UN escape`).
     pub(crate) ouname: Option<Vec<u8>>,
 }
@@ -89,7 +89,7 @@ pub(crate) struct Archive {
     /// `zsort`: indices of `zfiles` sorted by stored name (the flavour's
     /// `qsort`), for `zsearch`.
     pub(crate) zsort: Vec<usize>,
-    /// `zusort` (Ubuntu): indices sorted by `zuname`, else the stored
+    /// `zusort` (Debian): indices sorted by `zuname`, else the stored
     /// name, for `zsearch`'s second search.
     pub(crate) zusort: Vec<usize>,
     /// `zipbeg`: where the first entry starts (what is before it is copied).
@@ -491,7 +491,7 @@ pub(crate) fn zsearch(ar: &Archive, n: &[u8]) -> Option<usize> {
     if let Some(i) = search(&ar.zsort, n, &|i| cstr(&ar.zfiles[i].zname)) {
         return Some(i);
     }
-    // ubuntu: the Unicode names (zusort is empty for Apple, under -UN no
+    // debian: the Unicode names (zusort is empty for Apple, under -UN no
     // and under -FF)
     search(&ar.zusort, n, &|i| {
         let f = &ar.zfiles[i];
@@ -1018,7 +1018,7 @@ fn scanzipf_regnew(
                 }
                 return Err(read_fail(f));
             }
-            // ubuntu: UNICODE_SUPPORT's bit-11 and Unicode Path names
+            // debian: UNICODE_SUPPORT's bit-11 and Unicode Path names
             if flavour::unicode_support(z.flavour) && z.o.unicode_mismatch != 3 {
                 if e.flg & UTF8_BIT != 0 {
                     // the path is UTF-8; a local name made from it (the
@@ -1056,7 +1056,7 @@ fn scanzipf_regnew(
             let zname = cstr(&e.iname).to_vec();
             e.name = zname.clone();
             e.oname = super::scan::display(z, &zname);
-            // ubuntu: the converted Unicode name, the alternate one to match
+            // debian: the converted Unicode name, the alternate one to match
             let (mut zuname, mut ouname) = (None, None);
             if z.program == "zip"
                 && z.o.unicode_mismatch != 3
@@ -1364,7 +1364,7 @@ pub(crate) fn readlocal(z: &mut Zr, ia: &mut InArchive, zf: &ZFile) -> Result<Lo
         ia.f = None;
         return Err(LocalFail::Code(if err { ZE_READ } else { ZE_EOF }));
     }
-    // ubuntu: the Unicode Path field's warnings (its name is not kept)
+    // debian: the Unicode Path field's warnings (its name is not kept)
     if flavour::unicode_support(z.flavour) && z.o.unicode_mismatch != 3 {
         // `locz->iname[z->nam] = '\0'`: cut where the central name ends
         let cut = &name[..name.len().min(e.nam.unwrap_or(e.iname.len()))];
@@ -1576,7 +1576,7 @@ pub(crate) fn zipcopy(
     // zip64_entry = adjust_zip_local_entry(localz)
     out.zip64_entry = get_extra_field(0x0001, &lz.extra).is_some();
     lz.vem = zf.e.vem;
-    // ubuntu: UNICODE_SUPPORT's local names
+    // debian: UNICODE_SUPPORT's local names
     if flavour::unicode_support(z.flavour) && z.o.unicode_mismatch != 3 {
         if zf.e.flg & UTF8_BIT != 0 {
             // the path is UTF-8 (a name that does not convert crashes the
@@ -1767,8 +1767,8 @@ pub(crate) fn ut_mtime(e: &ZEntry) -> Option<i64> {
 }
 
 /// unix.c's filetime for an archive entry's name: its MS-DOS time (0 when
-/// it is not on disk), size (-1 for anything but a regular file) and
-/// modification time.
+/// it is not on disk), size (-1 for anything but a regular file, or a
+/// symlink: [`super::flavour::symlink_has_size`]) and modification time.
 pub(crate) fn disk_time(z: &Zr, name: &[u8]) -> (u64, i64, i64) {
     let stripped = name.strip_suffix(b"/").unwrap_or(name);
     if stripped.is_empty() {
@@ -1784,7 +1784,11 @@ pub(crate) fn disk_time(z: &Zr, name: &[u8]) -> (u64, i64, i64) {
         return (0, -1, 0);
     };
     let meta = super::unix::meta_of(&md);
-    let usize = if meta.file_type() == super::unix::S_IFREG {
+    let ty = meta.file_type();
+    // debian: 16-fix-symlink-update-detection
+    let usize = if ty == super::unix::S_IFREG
+        || (ty == super::unix::S_IFLNK && super::flavour::symlink_has_size(z.flavour))
+    {
         meta.size as i64
     } else {
         -1

@@ -16,7 +16,7 @@
 //! zip reads its answers with `fgets` and does not look at what it
 //! returns: at the end of standard input the buffer keeps whatever it held
 //! (uninitialised at the first question), and `-FF` asks again for ever
-//! (both references; gigabytes of prompts), as does Ubuntu's `-sp`. stuffr
+//! (both references; gigabytes of prompts), as does Debian's `-sp`. stuffr
 //! never loops: the end of standard input at a question about a part to
 //! read answers `q` (abort, as an explicit `q` does: measured on both
 //! references), and at `-sp`'s question about where to write it answers

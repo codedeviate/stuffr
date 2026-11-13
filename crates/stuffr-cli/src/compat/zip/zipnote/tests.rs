@@ -50,7 +50,7 @@ fn run(
     (c, o, e)
 }
 
-const FLAVOURS: [Flavour; 2] = [Flavour::Apple, Flavour::Ubuntu];
+const FLAVOURS: [Flavour; 2] = [Flavour::Apple, Flavour::Debian];
 
 /// A directory with `t.zip` of `a.txt`, `b.txt`, `c` (stored and deflated).
 fn with_archive(tag: &str, f: Flavour) -> Scratch {
@@ -232,7 +232,7 @@ fn a_percent_in_the_archive_name_is_a_character() {
     }
     let (c, ..) = run(
         &s,
-        Flavour::Ubuntu,
+        Flavour::Debian,
         "zip",
         &["-q", "-0", "a%d.zip", "r1", "r2"],
         b"",
@@ -240,7 +240,7 @@ fn a_percent_in_the_archive_name_is_a_character() {
     assert_eq!(c, 0);
     let (code, out, _) = run(
         &s,
-        Flavour::Ubuntu,
+        Flavour::Debian,
         "zipsplit",
         &["-n", "12000", "a%d.zip"],
         b"",

@@ -1273,7 +1273,7 @@ pub struct Case<'a> {
     /// reference's flavour whatever the platform's default is, and the
     /// reference never sees the variable.
     pub unzip_flavour: Option<&'a str>,
-    /// The zip family's flavour (`apple`, `ubuntu`), given to stuffr's side
+    /// The zip family's flavour (`apple`, `debian`), given to stuffr's side
     /// only, as `STUFFR_ZIP_FLAVOR` (0.19.0), as [`Case::unzip_flavour`].
     pub zip_flavour: Option<&'a str>,
     /// The zip family's input tree ([`ZipTree`]: bytes, modes, mtimes and

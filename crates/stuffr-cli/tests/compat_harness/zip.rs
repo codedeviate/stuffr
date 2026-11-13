@@ -30,8 +30,8 @@ pub const APPLE_ZIP_BANNERS: [&str; 4] = [
     "This is ZipSplit 3.0 (July 5th 2008), by Info-ZIP, with modifications by Apple Inc.",
 ];
 
-/// The Ubuntu programs' `-v` banners (upstream's text).
-pub const UBUNTU_ZIP_BANNERS: [&str; 4] = [
+/// The Debian programs' `-v` banners (upstream's text).
+pub const DEBIAN_ZIP_BANNERS: [&str; 4] = [
     "This is Zip 3.0 (July 5th 2008), by Info-ZIP.",
     "This is ZipCloak 3.0 (July 5th 2008), by Info-ZIP.",
     "This is ZipNote 3.0 (July 5th 2008), by Info-ZIP.",
@@ -48,18 +48,15 @@ pub const ZIP_HELP_HEADERS: [&str; 4] = [
 ];
 
 /// The flavour whose reference this platform has: `apple` on macOS and
-/// the BSDs, `ubuntu` elsewhere (the family's own default).
+/// the BSDs, `debian` elsewhere (the family's own default; the unzip
+/// family's answer).
 pub fn platform_zip_flavour() -> &'static str {
-    if platform_unzip_flavour() == "apple" {
-        "apple"
-    } else {
-        "ubuntu"
-    }
+    platform_unzip_flavour()
 }
 
 /// The installed apt `zip` package's version, `None` without `dpkg-query`
 /// or the package.
-pub fn ubuntu_zip_version() -> Option<String> {
+pub fn debian_zip_version() -> Option<String> {
     let out = output(
         Command::new("dpkg-query")
             .args(["-W", "-f", "${Version}", "zip"])
@@ -89,7 +86,7 @@ pub fn zip_dir() -> Option<&'static str> {
         if cfg!(target_os = "macos") {
             Ok("/usr/bin")
         } else if cfg!(target_os = "linux") {
-            match ubuntu_zip_version() {
+            match debian_zip_version() {
                 Some(v) if v == DEBIAN_ZIP_VERSION => Ok("/usr/bin"),
                 Some(v) => Err(format!(
                     "the apt zip is {v}, not {DEBIAN_ZIP_VERSION} (`make compat-debian` has it)"
@@ -365,24 +362,24 @@ pub fn zip_case(name: &'static str, args: &[&'static str], tree: ZipTree) -> Cas
 
 /// Every program-naming line becomes `<banner>` (a `-v` banner) or
 /// `<usage-banner>` (a help header). On the reference side (`ours` None) a
-/// line that is exactly one of [`APPLE_ZIP_BANNERS`], [`UBUNTU_ZIP_BANNERS`]
+/// line that is exactly one of [`APPLE_ZIP_BANNERS`], [`DEBIAN_ZIP_BANNERS`]
 /// or [`ZIP_HELP_HEADERS`]. On stuffr's side (`ours` the forced flavour) a
 /// line `HEAD, by stuffr X.Y.Z (altered; TEXT)REST` where `HEAD` and `REST`
 /// are a reference line's (the text before its `, by ` and after it: `.`
 /// for a banner, `. Usage:` for zip's help header, nothing for the
 /// helpers'), and `TEXT` names the flavour's origin (`Apple Inc.`;
-/// `Debian` or `Ubuntu`). Text around such a line, another flavour's
+/// `Debian`). Text around such a line, another flavour's
 /// origin or another version still differs.
 pub fn mask_zip_banners(text: &[u8], ours: Option<&str>) -> Vec<u8> {
     let marker: &[&str] = match ours {
         Some("apple") => &["Apple Inc."],
-        Some("ubuntu") => &["Debian", "Ubuntu"],
+        Some("debian") => &["Debian"],
         _ => &[],
     };
     let stuffr = format!(", by stuffr {} (altered; ", env!("CARGO_PKG_VERSION"));
     // (head, rest, label) of every reference line
     let mut shapes: Vec<(&str, &str, &str)> = Vec::new();
-    for b in APPLE_ZIP_BANNERS.iter().chain(UBUNTU_ZIP_BANNERS.iter()) {
+    for b in APPLE_ZIP_BANNERS.iter().chain(DEBIAN_ZIP_BANNERS.iter()) {
         let head = b.split_once(", by ").map_or(*b, |(h, _)| h);
         shapes.push((head, ".", "<banner>"));
     }
@@ -400,7 +397,7 @@ pub fn mask_zip_banners(text: &[u8], ours: Option<&str>) -> Vec<u8> {
         };
         let s = String::from_utf8_lossy(body);
         let label = if ours.is_none() {
-            if APPLE_ZIP_BANNERS.contains(&s.as_ref()) || UBUNTU_ZIP_BANNERS.contains(&s.as_ref()) {
+            if APPLE_ZIP_BANNERS.contains(&s.as_ref()) || DEBIAN_ZIP_BANNERS.contains(&s.as_ref()) {
                 Some("<banner>")
             } else if ZIP_HELP_HEADERS.contains(&s.as_ref()) {
                 Some("<usage-banner>")
@@ -1252,7 +1249,7 @@ pub fn zip_encrypted_matrix(flavour: &'static str) -> Vec<Case<'static>> {
 
 // ---- The scanning matrix (0.19.0 Task 5) ----
 
-/// The cases of `compat_zip_apple` and `compat_zip_ubuntu`'s scanning
+/// The cases of `compat_zip_apple` and `compat_zip_debian`'s scanning
 /// matrix: which names zip would operate on (`-sf` lists them without
 /// writing), over every shape of operand, pattern, directory, link and date
 /// filter, in `flavour`. Nothing in them writes an archive, so the exit
@@ -1883,7 +1880,7 @@ fn patched(mut b: Vec<u8>, at: usize, with: &[u8]) -> Vec<u8> {
 /// deleted from, copied, grown, tested, commented, adjusted, damaged, in
 /// `flavour`, compared byte for byte with the reference (both streams, the
 /// exit code, every archive and the rest of the tree). `failing_tests`:
-/// whether to include the `-T` runs whose test fails (Ubuntu's reference
+/// whether to include the `-T` runs whose test fails (Debian's reference
 /// double-frees there: ruling Z3, pinned stuffr-only).
 pub fn zip_update_matrix(flavour: &'static str, failing_tests: bool) -> Vec<Case<'static>> {
     let mut out: Vec<Case<'static>> = Vec::new();
@@ -2193,7 +2190,7 @@ pub fn zip_update_matrix(flavour: &'static str, failing_tests: bool) -> Vec<Case
         (&["-TT", "false", "t.zip", "d/c.txt"], a()),
         (&["-T", "-TT", "true {}", "t.zip", "d/c.txt"], a()),
         (&["-T", "-b", "d", "t.zip", "a.txt"], fake("", 0)),
-        // Apple spawns with an empty environment, Ubuntu's system() keeps it
+        // Apple spawns with an empty environment, Debian's system() keeps it
         (&["-T", "-TT", "probe", "t.zip", "a.txt"], env_probe(a())),
     ] {
         add(args, tree, None, &[FAKE_UNZIP_PATH]);
@@ -2470,7 +2467,7 @@ pub fn zip_fix_matrix(flavour: &'static str) -> Vec<Case<'static>> {
         add(&["-FF", "-q", "in.zip", "--out", "f.zip"], with(name), b"");
     }
     // Apple's -FF copies the local extra field as zeros after its first NUL
-    // (ruling Z19: Ubuntu's are heap garbage)
+    // (ruling Z19: Debian's are heap garbage)
     if flavour == "apple" {
         add(
             &["-FF", "in.zip", "--out", "f.zip"],
@@ -2623,7 +2620,7 @@ pub fn zip_split_matrix(flavour: &'static str) -> Vec<Case<'static>> {
     ] {
         add(args, big().dir("tmp"), enter);
     }
-    // a comment after the splits (an empty first line would be Ubuntu's
+    // a comment after the splits (an empty first line would be Debian's
     // heap overflow, `strcpy(p, "\r\n")` into one byte: not split-related)
     add(
         &["-s", "64k", "-z", "t.zip", "big"],

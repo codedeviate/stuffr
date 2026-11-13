@@ -4,11 +4,12 @@
 //! **A port** of Info-ZIP Zip 3.0 (July 5th 2008; the Info-ZIP licence,
 //! `LICENSE-infozip`: this is an altered version, marked as such by every
 //! banner) in two builds, Apple's (`zip-33`, `zip30/`, default on macOS and
-//! the BSDs) and Ubuntu's (`3.0-13ubuntu0.2`, default elsewhere), chosen by
-//! [`default_flavour`] or `STUFFR_ZIP_FLAVOR=apple|ubuntu` ([`run`] reads
+//! the BSDs) and Debian 13's (`3.0-15+deb13u1`, default elsewhere), chosen by
+//! [`default_flavour`] or `STUFFR_ZIP_FLAVOR=apple|debian` (`ubuntu`, the
+//! Linux flavour's name until 0.27.0, is an alias of `debian`; [`run`] reads
 //! it once; anything else in it is refused, exit 1, in stuffr's own
 //! words). Each ported function carries `// port: <file>.c:<function>`;
-//! Ubuntu's differences are checks in `flavour.rs`, one function per
+//! Debian's differences are checks in `flavour.rs`, one function per
 //! behaviour. Every string is in `messages.rs`.
 //!
 //! **What is here (Task 4 of 0.19.0):** the names, the flavour, the
@@ -70,7 +71,7 @@
 //! split, the parts and the index written directly under their names), over
 //! the shared reader and writer.
 //!
-//! **Task 11 (`unicode.rs`, `zipup.rs`, `flavour.rs`):** Ubuntu's deltas:
+//! **Task 11 (`unicode.rs`, `zipup.rs`, `flavour.rs`):** Debian's deltas:
 //! `UNICODE_SUPPORT` (bit 11 and the Unicode Path field written and read,
 //! `-UN`, `-su`/`-sU`, matching by the Unicode name, the helpers and `-FF`
 //! over such entries), `BZIP2_SUPPORT` (`-Z bzip2` through stuffr's bzip2
@@ -91,7 +92,7 @@
 //! 2. The banner line of `-v` and the header line of each program's help
 //!    name stuffr and say it is altered (Info-ZIP licence clause 3):
 //!    `This is Zip 3.0 (July 5th 2008), by stuffr X.Y.Z (altered; original
-//!    by Info-ZIP, with modifications by Apple Inc.).` (Ubuntu: `(altered;
+//!    by Info-ZIP, with modifications by Apple Inc.).` (Debian: `(altered;
 //!    Debian's build, original by Info-ZIP)`), likewise `Zip 3.0 (July 5th
 //!    2008), by stuffr ... Usage:` and the helpers' `ZipCloak 3.0 (July
 //!    5th 2008), by stuffr ...`. `-v`'s `Compiled with` line is the
@@ -113,7 +114,7 @@
 //!    option whose `'name' (description)` needs 50 bytes or more (`-lf`,
 //!    `--output-file`, `--junk-paths=x`, `--recurse-patterns-`: 59 forms in
 //!    all, listed by `cli/tests.rs`) aborts both references (Apple: SIGTRAP
-//!    from `__sprintf_chk`, Ubuntu: glibc's "buffer overflow detected" and
+//!    from `__sprintf_chk`, Debian: glibc's "buffer overflow detected" and
 //!    zip's SIGABRT handler, exit 9). stuffr prints the whole message,
 //!    exit 16, as the C would with room.
 //! 6. `-O` (`--output-file`) with no archive name at all: the C compares a
@@ -130,7 +131,7 @@
 //!    handler answers with a blank line and `Interrupted (aborting)`, exit
 //!    9. stuffr gives that answer without the dereference (as for 6), also
 //!    for an `-i`/`-x`/`-R` pattern of that shape. The order of two equal
-//!    names in the found list follows each libc's `qsort` (Ubuntu's stable
+//!    names in the found list follows each libc's `qsort` (Debian's stable
 //!    merge sort; Apple's, on macOS, the platform's own `qsort_r`, and off
 //!    macOS a BSD quicksort ported in `scan.rs`). Off macOS the port orders
 //!    6 of 4000 random arrays with many equal keys differently from macOS
@@ -154,8 +155,8 @@
 //!     text (0 bytes, CRC 0), exit 0.
 //! 12. A write to the archive that fails is answered where and as zip's
 //!     stdio stream answers it (`zipup.rs`, `sink.rs`; measured under
-//!     `ulimit -f` on both references). Two Ubuntu answers are not
-//!     reproduced: when only `fclose` meets the failure, Ubuntu's `ziperr`
+//!     `ulimit -f` on both references). Two Debian answers are not
+//!     reproduced: when only `fclose` meets the failure, Debian's `ziperr`
 //!     closes the stream a second time and glibc aborts on the double free
 //!     (exit 5, the temporary left; undefined behaviour, as ruling Z3's);
 //!     stuffr answers as Apple does ("Temporary file failure", exit 10, the
@@ -201,7 +202,7 @@
 //!     file into its place (the link's target left empty); stuffr writes
 //!     through the link, as `replace` does for any linked archive. Pinned by
 //!     `update::tests::a_failed_run_leaves_the_output_as_it_was`.
-//! 15. Ruling Z3: a failing `-T` in Ubuntu's build closes the temporary's
+//! 15. Ruling Z3: a failing `-T` in Debian's build closes the temporary's
 //!     stream twice (`ziperr` after `fclose(y)`) and glibc aborts on the
 //!     double free (exit 5, a blank line, glibc's message); stuffr answers
 //!     as Apple's build does in both flavours: `test of t.zip FAILED`, `zip
@@ -220,7 +221,7 @@
 //!     standard input its buffer keeps what it held (uninitialised at the
 //!     first question), and `-FF` (both builds; also `-F` and a copy of a
 //!     split archive whose part is missing) asks again for ever, gigabytes
-//!     of prompts; so does Ubuntu's `-sp`. stuffr never loops: the end of
+//!     of prompts; so does Debian's `-sp`. stuffr never loops: the end of
 //!     standard input at a question about a part to READ answers `q`
 //!     (abort: as an explicit `q`, measured on both references: `-FF` goes
 //!     on and writes what it has, `could not find split` and exit 0 when
@@ -233,7 +234,7 @@
 //!     one copied with `strcpy`, which stops at the first NUL (almost always
 //!     the second byte of the first block's size) and leaves the rest of
 //!     the `malloc`ed field as it was: zeros on Apple, heap garbage that
-//!     changes from run to run on Ubuntu. stuffr copies up to and with the
+//!     changes from run to run on Debian. stuffr copies up to and with the
 //!     first NUL and writes zeros after it (Apple's bytes). The entry's
 //!     `lflg`, never set, is read as 0 (it only sizes `tempzn`); a data
 //!     descriptor signature split across two 16 KiB reads (the C then
@@ -257,7 +258,7 @@
 //!     the current directory: `zip -s 64k -sp t.zip big` answered `o/`
 //!     writes `t.z01` here, then `o/t.z02`, ..., `o/t.zip`.
 //! 23. Ruling Z25: `-z` whose first comment line is empty copies `\r\n`
-//!     into a one-byte block (`strcpy(p, "\r\n")`): Ubuntu's build dies in
+//!     into a one-byte block (`strcpy(p, "\r\n")`): Debian's build dies in
 //!     glibc's buffer-overflow check (exit 9 through zip's SIGABRT
 //!     handler); Apple's writes the comment. stuffr writes it in both
 //!     flavours, as Apple's build does.
@@ -269,7 +270,7 @@
 //!     removed and the archive untouched. A split archive under `-O` meets
 //!     it at its first entry: zipcloak's `readlocal()` (the UTIL build's)
 //!     looks for every entry in the last part only, warns `Did not find
-//!     entry for <name>`, and Ubuntu's build then dies of SIGSEGV
+//!     entry for <name>`, and Debian's build then dies of SIGSEGV
 //!     (`Interrupted (aborting)`, exit 9, or killed by the signal from its
 //!     handler; measured with a terminal in Docker); stuffr warns the same
 //!     and ends with `Zip file structure invalid`, exit 3. (Without `-O` both
@@ -287,10 +288,10 @@
 //! 26. Ruling Z4: Apple's `zipnote -w` closes the input stream twice (the
 //!     second `fclose` closes the temporary's) and always fails, exit 10,
 //!     `Bad file descriptor` then `Temporary file failure`, with the
-//!     archive untouched. That is undefined behaviour; stuffr takes Ubuntu's
+//!     archive untouched. That is undefined behaviour; stuffr takes Debian's
 //!     patched answer (patch 07) in both flavours: `-w` works. Pinned by
 //!     `compat_zip_helpers::zipnote_w_is_the_same_in_both_flavours`
-//!     (stuffr's two flavours agree and exit 0) and, on Ubuntu, against the
+//!     (stuffr's two flavours agree and exit 0) and, on Debian, against the
 //!     reference. A comment's length wraps at 65536 as the C's `ush` does.
 //! 27. `zipsplit`: a `%` in the archive's name is a conversion in the C's
 //!     name template (`sprintf(name, template, n)`, undefined behaviour);
@@ -301,7 +302,7 @@
 //!     interrupt removes the parts only when `-b`'s directory is shorter
 //!     than half of `PATH_MAX` (the handler's static holds that much;
 //!     longer arms nothing and the parts stay).
-//! 28. Ubuntu's `UNICODE_SUPPORT` (`unicode.rs`), undefined behaviour of the
+//! 28. Debian's `UNICODE_SUPPORT` (`unicode.rs`), undefined behaviour of the
 //!     C not reproduced. Where a conversion fails and the C reads through
 //!     the NULL it got (a bit-11 name zip's UTF-8 decoder refuses; a
 //!     Unicode Path field whose UTF-8 name it refuses; `-UN escape` over a
@@ -314,14 +315,14 @@
 //!     read as zeros past its end (the C reads past it); an old field of
 //!     another length than the new one is taken out and the new one
 //!     appended (the C's copy of what follows it runs four bytes long).
-//!     Patch 12 (`mbstowcs` told the buffer holds `strlen + 1` wide
+//!     Patch 14 (`mbstowcs` told the buffer holds `strlen + 1` wide
 //!     characters, which glibc's fortify takes for an overflow and aborts
-//!     on, for every name that is not ASCII) and patch 13 (`-TT`'s command
-//!     buffer one byte short) are Ubuntu's own fixes: both flavours take the
+//!     on, for every name that is not ASCII) and patch 15 (`-TT`'s command
+//!     buffer one byte short) are Debian's own fixes: both flavours take the
 //!     patched, defined behaviour (Apple has neither code path). Pinned,
 //!     stuffr-only, by `compat_zip_common::ub_rulings`; the crash answers
-//!     are also compared with the reference (`compat_zip_ubuntu`).
-//! 29. `-Z bzip2` (Ubuntu): zipup.c tests whether an entry is text over the
+//!     are also compared with the reference (`compat_zip_debian`).
+//! 29. `-Z bzip2` (Debian): zipup.c tests whether an entry is text over the
 //!     whole 16 KiB input buffer, past the bytes read, and the buffer is
 //!     allocated once per run and never cleared, so the test sees what an
 //!     earlier entry left there (reproduced: a short text file after a
@@ -450,7 +451,7 @@ pub struct Exit {
 }
 
 /// The flavour a build uses when `STUFFR_ZIP_FLAVOR` is unset or empty:
-/// Apple on macOS and the BSDs, Ubuntu everywhere else, Windows included.
+/// Apple on macOS and the BSDs, Debian 13 everywhere else, Windows included.
 pub fn default_flavour() -> Flavour {
     if cfg!(any(
         target_os = "macos",
@@ -461,18 +462,21 @@ pub fn default_flavour() -> Flavour {
     )) {
         Flavour::Apple
     } else {
-        Flavour::Ubuntu
+        Flavour::Debian
     }
 }
 
-/// The flavour `STUFFR_ZIP_FLAVOR`'s value selects: `apple` or `ubuntu`,
+/// The flavour `STUFFR_ZIP_FLAVOR`'s value selects: `apple` or `debian`
+/// (`ubuntu`, the Linux flavour's name until 0.27.0, is an alias of it),
 /// the default when unset or empty, and `Err(value)` for anything else.
 pub(crate) fn flavour_from(value: Option<OsString>) -> Result<Flavour, OsString> {
     match value {
         None => Ok(default_flavour()),
         Some(v) if v.is_empty() => Ok(default_flavour()),
         Some(v) if v == "apple" => Ok(Flavour::Apple),
-        Some(v) if v == "ubuntu" => Ok(Flavour::Ubuntu),
+        Some(v) if v == "debian" => Ok(Flavour::Debian),
+        // the Linux flavour's name until 0.27.0
+        Some(v) if v == "ubuntu" => Ok(Flavour::Debian),
         Some(v) => Err(v),
     }
 }
@@ -520,7 +524,7 @@ pub(crate) struct Zr<'a> {
     /// `mesg_line_started`, shared with the split writer, which writes its
     /// questions itself.
     pub(crate) line_cell: std::rc::Rc<std::cell::Cell<bool>>,
-    /// zip's `using_utf8` (Ubuntu's `UNICODE_SUPPORT`): `en_US.UTF-8`
+    /// zip's `using_utf8` (Debian's `UNICODE_SUPPORT`): `en_US.UTF-8`
     /// loads, so names convert as UTF-8 and new ones get bit 11
     /// (`unicode::utf8_locale`); always false for Apple.
     pub(crate) using_utf8: bool,
@@ -559,7 +563,7 @@ impl<'a> Zr<'a> {
         }
     }
 
-    /// What putlocal/putcentral need of `UNICODE_SUPPORT` (Ubuntu only):
+    /// What putlocal/putcentral need of `UNICODE_SUPPORT` (Debian only):
     /// `using_utf8` and `-UN UTF8`.
     pub(crate) fn unicode_out(&self) -> Option<(bool, bool)> {
         flavour::unicode_support(self.flavour).then_some((self.using_utf8, self.o.utf8_force))

@@ -201,7 +201,7 @@ mod tests {
         .iter()
         .flat_map(|h| unhex(h))
         .collect();
-        for f in [Flavour::Apple, Flavour::Ubuntu] {
+        for f in [Flavour::Apple, Flavour::Debian] {
             assert_eq!(extra_fields(f, &meta(501, 20), true), want, "{f:?}");
         }
     }
@@ -215,7 +215,7 @@ mod tests {
         .iter()
         .flat_map(|h| unhex(h))
         .collect();
-        for f in [Flavour::Apple, Flavour::Ubuntu] {
+        for f in [Flavour::Apple, Flavour::Debian] {
             assert_eq!(extra_fields(f, &meta(0x1092, 0x1092), false), want, "{f:?}");
         }
     }
@@ -224,7 +224,7 @@ mod tests {
     /// tag anywhere in either, whatever the owner.
     #[test]
     fn no_flavour_writes_the_16_bit_block() {
-        for f in [Flavour::Apple, Flavour::Ubuntu] {
+        for f in [Flavour::Apple, Flavour::Debian] {
             for local in [true, false] {
                 let b = extra_fields(f, &meta(4242, 4242), local);
                 assert!(!b.windows(2).any(|w| w == b"Ux"), "{f:?} {b:?}");

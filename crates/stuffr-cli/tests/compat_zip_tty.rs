@@ -1,6 +1,6 @@
 //! The zip family at a terminal (0.19.0 Task 9), on every unix, against
 //! this platform's reference (Apple's `/usr/bin/{zip,zipcloak}` on macOS,
-//! Ubuntu's under `make compat-ubuntu`) with stuffr in that flavour: the
+//! Debian's under `make compat-debian`) with stuffr in that flavour: the
 //! password prompts on the controlling terminal (`Case::tty_ctl`: the
 //! answers typed there, the prompts on standard error) for `zip -e` and
 //! `zipcloak` (encrypt, `-d`, `-O`, a wrong password, entries already
@@ -255,7 +255,7 @@ mod unix {
 
     /// Deviation 24 on a split archive under `-O`, recorded: zipcloak's
     /// `readlocal()` does not find the first entry in the last part, and
-    /// the reference goes on with an uninitialised local header (Ubuntu's
+    /// the reference goes on with an uninitialised local header (Debian's
     /// dies of SIGSEGV in Docker, its warning lost in its stdio buffer when
     /// standard output is a pipe). Only the line before the undefined
     /// behaviour is compared; stuffr's end is pinned in

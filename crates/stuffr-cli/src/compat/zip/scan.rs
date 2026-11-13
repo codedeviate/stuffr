@@ -450,7 +450,7 @@ fn filter(patterns: &[Filter], cx: Cx, name: &[u8]) -> bool {
 }
 
 /// What a name looks like in zip's messages (`local_to_display_string`):
-/// Ubuntu shows a byte below a space as `^` and the letter, Apple as is.
+/// Debian shows a byte below a space as `^` and the letter, Apple as is.
 pub(crate) fn display(z: &Zr, iname: &[u8]) -> Vec<u8> {
     if !flavour::shows_newline_escaped(z.flavour) {
         return iname.to_vec();
@@ -652,7 +652,7 @@ impl Scan {
                 matched = true;
             }
         }
-        // ubuntu: proc_archive_name also checks the escaped Unicode names
+        // debian: proc_archive_name also checks the escaped Unicode names
         if show_oname {
             for i in 0..self.ar.zfiles.len() {
                 let zf = &mut self.ar.zfiles[i];
@@ -763,7 +763,9 @@ fn filetime(z: &Zr, name: &[u8]) -> Option<(UnixMeta, u64, Option<u64>, FoundKin
         meta_of(&r.ok()?)
     };
     let ty = meta.file_type();
-    let usize = (ty == S_IFREG).then_some(meta.size);
+    // debian: 16-fix-symlink-update-detection
+    let usize = (ty == S_IFREG || (ty == S_IFLNK && flavour::symlink_has_size(z.flavour)))
+        .then_some(meta.size);
     let kind = if name == b"-" {
         FoundKind::Stdin
     } else if ty == S_IFLNK {
@@ -781,7 +783,7 @@ fn filetime(z: &Zr, name: &[u8]) -> Option<(UnixMeta, u64, Option<u64>, FoundKin
 /// `qsort` as the flavour's C library has it. The two sorts of
 /// [`check_dup`] put equal keys next to each other in an order the C leaves
 /// open, and which of two equal names is dropped, and which of two equal
-/// internal names is reported first, follows from it: Ubuntu's glibc sorts
+/// internal names is reported first, follows from it: Debian's glibc sorts
 /// with a stable merge sort; Apple's libc with the BSD quicksort
 /// (Bentley and McIlroy: median of three or nine, equal keys swapped to the
 /// ends, an insertion sort below eight elements), ported here and checked
@@ -797,7 +799,7 @@ pub(crate) fn qsort(
     cmp: &dyn Fn(usize, usize) -> std::cmp::Ordering,
 ) {
     match f {
-        flavour::Flavour::Ubuntu => v.sort_by(|&a, &b| cmp(a, b)),
+        flavour::Flavour::Debian => v.sort_by(|&a, &b| cmp(a, b)),
         #[cfg(target_os = "macos")]
         flavour::Flavour::Apple => macos_qsort(v, cmp),
         #[cfg(not(target_os = "macos"))]
@@ -1310,7 +1312,7 @@ pub(crate) fn show_files(z: &mut Zr, c: &mut Collected) -> Exit {
             // not -sU: the log shows the normal name
             z.log_write(&line);
         }
-        // ubuntu: -su shows the escaped Unicode name under the name, -sU
+        // debian: -su shows the escaped Unicode name under the name, -sU
         // shows it instead of the name
         if matches!(sf, 3 | 4)
             && let Some(u) = &ouname
@@ -1341,7 +1343,7 @@ pub(crate) fn show_files(z: &mut Zr, c: &mut Collected) -> Exit {
         if (len as i64) > 0 {
             bytes = bytes.wrapping_add(len);
         }
-        // ubuntu: -UN escape shows the names escaped (a name the locale
+        // debian: -UN escape shows the names escaped (a name the locale
         // cannot convert crashes the C: deviation 28)
         let shown = if z.o.unicode_escape_all {
             match unicode::local_to_escape(z.using_utf8, &f.zname) {

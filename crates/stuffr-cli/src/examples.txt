@@ -1622,9 +1622,9 @@ COMPATIBILITY LINKS (INSTALL-LINKS)
       first line of the usage and -v screens names stuffr.
 
       The zip, zipcloak, zipnote and zipsplit names behave as Info-ZIP Zip
-      3.0: Apple's build on macOS and the BSDs, Ubuntu 24.04's elsewhere;
-      STUFFR_ZIP_FLAVOR=apple or ubuntu overrides that (any other value is
-      refused, exit 1). ZIPOPT and ZIP are read before the command line, as
+      3.0: Apple's build on macOS and the BSDs, Debian 13's elsewhere;
+      STUFFR_ZIP_FLAVOR=apple or debian overrides that (ubuntu is an alias
+      of debian; any other value is refused, exit 1). ZIPOPT and ZIP are read before the command line, as
       zip reads them. The banner line of -v and the first line of each help
       screen name stuffr.
 

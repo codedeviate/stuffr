@@ -1,11 +1,11 @@
-//! The zip family's Ubuntu flavour against its reference, apt's `zip`
-//! 3.0-13ubuntu0.2 on ubuntu 24.04. Linux only: CI's ubuntu-24.04 has the
-//! package and `make compat-ubuntu` runs this suite in a Docker image that
-//! has it. The rows shared by both flavours are in `compat_zip_common.rs`;
-//! this suite holds the matrices and the cases only Ubuntu's build has.
+//! The zip family's Debian flavour against its reference, apt's `zip`
+//! 3.0-15+deb13u1 on Debian 13 (trixie). Linux only: `make compat-debian`
+//! runs this suite in a Docker image that has the package. The rows shared
+//! by both flavours are in `compat_zip_common.rs`; this suite holds the
+//! matrices and the cases only Debian's build has.
 //!
 //! Task 5 (0.19.0): which names zip would operate on ([`zip_scan_matrix`],
-//! the same cases as Apple's suite), and what Ubuntu's `UNICODE_SUPPORT`
+//! the same cases as Apple's suite), and what Debian's `UNICODE_SUPPORT`
 //! build does with names in messages.
 
 #[cfg(target_os = "linux")]
@@ -17,21 +17,21 @@ mod linux {
 
     /// The oracle is the pinned release.
     #[test]
-    fn the_reference_is_ubuntus_zip_3_0_13ubuntu0_2() {
+    fn the_reference_is_debians_zip_3_0_15_deb13u1() {
         if zip_dir().is_none() {
             return;
         }
-        assert_eq!(ubuntu_zip_version().as_deref(), Some(DEBIAN_ZIP_VERSION));
-        assert_eq!(platform_zip_flavour(), "ubuntu");
+        assert_eq!(debian_zip_version().as_deref(), Some(DEBIAN_ZIP_VERSION));
+        assert_eq!(platform_zip_flavour(), "debian");
     }
 
     /// Task 5: the scanning matrix, exit code, both streams and the tree.
     #[test]
-    fn the_scan_matrix_matches_ubuntus_zip() {
-        let cases = zip_scan_matrix("ubuntu");
+    fn the_scan_matrix_matches_debians_zip() {
+        let cases = zip_scan_matrix("debian");
         assert!(cases.len() >= 150, "{} cases", cases.len());
         run_group(
-            "zip scan (ubuntu)",
+            "zip scan (debian)",
             &cases,
             Skipped::none(),
             &assert_same_zip,
@@ -46,7 +46,7 @@ mod linux {
             .file_at(b"new\nline", b"x", 0o644)
             .file_at(b"tab\there", b"x", 0o644);
         let mut c = zip_case("zip", &["-sf", "t.zip", "new\nline", "tab\there"], tree);
-        c.zip_flavour = Some("ubuntu");
+        c.zip_flavour = Some("debian");
         if !assert_same_zip(&c) {
             return;
         }
@@ -123,14 +123,14 @@ mod linux {
         ]
     }
 
-    /// Task 11: Ubuntu's `UNICODE_SUPPORT` and `BZIP2_SUPPORT` builds and
+    /// Task 11: Debian's `UNICODE_SUPPORT` and `BZIP2_SUPPORT` builds and
     /// its patch series, against the reference (Docker). Names that are not
     /// ASCII under `C`, `C.UTF-8` and `en_US.UTF-8` and with no
     /// `en_US.UTF-8` at all (`LOCPATH` pointing nowhere), the `-UN` modes,
     /// `-su`/`-sU`, archives holding UTF-8 names (bit 11) and Unicode Path
     /// fields, and the helpers over them (Review Focus 5 included).
     #[test]
-    fn ubuntu_build_rows() {
+    fn debian_build_rows() {
         let caf = "café.txt";
         let names_tree = || {
             ZipTree::standard()
@@ -156,7 +156,7 @@ mod linux {
                     stdin: Option<&[u8]>,
                     env: &[(&'static str, &'static str)]| {
             let mut c = zip_case(args[0], &args[1..], tree);
-            c.zip_flavour = Some("ubuntu");
+            c.zip_flavour = Some("debian");
             c.stdin = stdin.map(<[u8]>::to_vec);
             c.env = env.to_vec();
             cases.push(c);
@@ -322,7 +322,121 @@ mod linux {
         );
         assert!(cases.len() >= 200, "{} cases", cases.len());
         run_group(
-            "zip ubuntu build",
+            "zip debian build",
+            &cases,
+            Skipped::none(),
+            &assert_same_zip,
+        );
+    }
+
+    /// The two patches Debian 13 carries that Ubuntu 24.04's build did not
+    /// (0.27.0), against the reference:
+    ///
+    /// - `16-fix-symlink-update-detection`: under `-y` a symlink's own size
+    ///   (its target's length) is its size on disk, for `-sf`'s and `-du`'s
+    ///   figures, a stored entry's sizes (so `zip -y - l` streams it), and
+    ///   `-FS`/`-u`/`-f` freshness (an unchanged link is current, one
+    ///   re-pointed at a target of another length is not);
+    /// - `fix-command-injection`: the name `-T` hands to `unzip` or to the
+    ///   `-TT` command is quoted by `quote_arg()` (`"..."`, with `\` before
+    ///   `"`, `$`, `` ` `` and `\`, and `!` as `"'!'"`), so an archive named
+    ///   with a quote, a space, `$` or a backtick is tested whole and never
+    ///   runs anything. `fb/show` prints each argument it gets.
+    #[test]
+    fn debian_patch_rows() {
+        let mut cases: Vec<Case<'static>> = Vec::new();
+        let mut push = |args: &[&'static str], tree: ZipTree| {
+            let mut c = zip_case(args[0], &args[1..], tree);
+            c.zip_flavour = Some("debian");
+            cases.push(c);
+        };
+        // ---- 16-fix-symlink-update-detection ----
+        let linked = || ZipTree::standard().symlink("l", "abcde");
+        let made = zip_made("debian", &linked(), &["-y", "t.zip", "l"], "t.zip");
+        let with = |target: &str, mtime: i64| {
+            ZipTree::standard()
+                .file("t.zip", &made)
+                .symlink("l", target)
+                .times("l", mtime, INPUT_ATIME)
+        };
+        let same = INPUT_MTIME as i64;
+        let later = same + 86_400;
+        for args in [
+            &["zip", "-sf", "-y", "t.zip", "l"][..],
+            &["zip", "-sf", "-y", "t.zip", "l", "a.txt"],
+            &["zip", "-y", "t.zip", "l"],
+            &["zip", "-y", "-", "l"],
+            &["zip", "-du", "-y", "t.zip", "l"],
+            &["zip", "-v", "-y", "t.zip", "l"],
+            &["zip", "-y", "-0", "t.zip", "l", "a.txt"],
+            &["zip", "-y", "-Z", "bzip2", "t.zip", "l"],
+            &["zip", "-y", "-r", "t.zip", "."],
+        ] {
+            push(args, linked());
+        }
+        for (target, mtime) in [
+            ("abcde", same),
+            ("xy", same),
+            ("vwxyz", same),
+            ("xy", later),
+            ("abcde", later),
+        ] {
+            for args in [
+                &["zip", "-FS", "-y", "t.zip", "l"][..],
+                &["zip", "-u", "-y", "t.zip", "l"],
+                &["zip", "-f", "-y", "t.zip", "l"],
+                &["zip", "-u", "-y", "-v", "t.zip", "l"],
+                &["zip", "-sf", "-u", "-y", "t.zip", "l"],
+                &["zip", "-FS", "-y", "t.zip", "l", "a.txt"],
+            ] {
+                push(args, with(target, mtime));
+            }
+        }
+        // ---- fix-command-injection ----
+        let show = |t: ZipTree| {
+            t.file_mode(
+                "fb/show",
+                "#!/bin/sh\nfor a; do printf '[%s]\\n' \"$a\"; done\n",
+                0o755,
+            )
+        };
+        let archive = zip_made("debian", &ZipTree::standard(), &["t.zip", "a.txt"], "t.zip");
+        for name in [
+            "a b.zip",
+            "a'b.zip",
+            "a\"b.zip",
+            "a$b.zip",
+            "a!b.zip",
+            "a\\b.zip",
+            "a`b.zip",
+            "a$(id)b.zip",
+            "a'$(id)'b.zip",
+        ] {
+            let tree = || show(ZipTree::standard().file_at(name.as_bytes(), &archive, 0o644));
+            for args in [
+                &["zip", "-T", name][..],
+                &["zip", "-T", "-TT", "unzip -tqq", name],
+                &["zip", "-T", "-TT", "fb/show", name],
+                &["zip", "-T", "-TT", "fb/show {} x", name],
+                &["zip", "-T", "-TT", "fb/show {}", name],
+                &["zip", "-T", "-TT", "fb/show {}{}", name],
+                &["zip", "-T", name, "b.txt"],
+            ] {
+                push(args, tree());
+            }
+        }
+        // the temporary's name carries the archive's directory
+        let dir_tree = || show(ZipTree::standard().dir("d'x").dir("d$x"));
+        for args in [
+            &["zip", "-T", "d'x/n.zip", "a.txt"][..],
+            &["zip", "-T", "-TT", "fb/show", "d'x/n.zip", "a.txt"],
+            &["zip", "-T", "-TT", "fb/show {}", "d$x/n.zip", "a.txt"],
+        ] {
+            push(args, dir_tree());
+        }
+        assert!(cases.len() >= 100, "{} cases", cases.len());
+        run_group(
+            "zip debian patches",
             &cases,
             Skipped::none(),
             &assert_same_zip,
@@ -336,6 +450,6 @@ mod linux {
         if zip_dir().is_none() {
             return;
         }
-        zip_interrupts_match("ubuntu");
+        zip_interrupts_match("debian");
     }
 }

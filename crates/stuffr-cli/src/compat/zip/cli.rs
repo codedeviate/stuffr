@@ -146,7 +146,7 @@ const fn ch(c: char) -> u32 {
 
 /// zip.c:options[] as the unix build compiles it, in the table's order
 /// (`-so` lists it so, and a long name's abbreviation is looked up in it).
-/// Ubuntu's `UNICODE_SUPPORT` adds `-su`, `-sU` and `-UN`.
+/// Debian's `UNICODE_SUPPORT` adds `-su`, `-sU` and `-UN`.
 // port: zip.c:options
 pub(crate) fn table(f: Flavour) -> Vec<OptionSpec> {
     let mut t = vec![
@@ -653,7 +653,7 @@ pub(crate) fn table(f: Flavour) -> Vec<OptionSpec> {
             "get file names from stdin, one per line",
         ),
     ];
-    // ubuntu: -DUNICODE_SUPPORT (the options after `-so` and `-U`)
+    // debian: -DUNICODE_SUPPORT (the options after `-so` and `-U`)
     if flavour::unicode_support(f) {
         let at = t
             .iter()
@@ -1548,7 +1548,7 @@ pub(crate) enum Method {
     Store,
     /// DEFLATE
     Deflate,
-    /// BZIP2 (ubuntu)
+    /// BZIP2 (debian)
     Bzip2,
 }
 
@@ -1765,9 +1765,9 @@ pub(crate) fn help(z: &mut Zr) {
 /// zip.c:help_extended.
 fn help_extended(z: &mut Zr) {
     let mut text = String::from(m::ZIP_HELP2_HEAD);
-    // ubuntu: the `{}` line Apple comments out
+    // debian: the `{}` line Apple comments out
     if flavour::help2_brace_line(z.flavour) {
-        text.push_str(m::ZIP_HELP2_UBUNTU_LINE);
+        text.push_str(m::ZIP_HELP2_DEBIAN_LINE);
     }
     text.push_str(m::ZIP_HELP2_TAIL);
     z.stdout_write(text.as_bytes());
@@ -2158,7 +2158,7 @@ pub(crate) fn parse_zip(z: &mut Zr, argv0: &[u8], rest: &[Vec<u8>]) -> Result<()
             (_, o::SD) => z.o.show_what_doing = true,
             (_, o::SF) => z.o.show_files = if negated { 2 } else { 1 },
             (_, o::SO) => z.o.show_options = true,
-            // ubuntu: -DUNICODE_SUPPORT
+            // debian: -DUNICODE_SUPPORT
             (_, o::SU) => z.o.show_files = if negated { 4 } else { 3 },
             (_, o::SU_CAP) => z.o.show_files = if negated { 6 } else { 5 },
             // -s
@@ -2223,7 +2223,7 @@ pub(crate) fn parse_zip(z: &mut Zr, argv0: &[u8], rest: &[Vec<u8>]) -> Result<()
                 }
                 z.o.action = Action::Archive;
             }
-            // ubuntu: -DUNICODE_SUPPORT, -UN
+            // debian: -DUNICODE_SUPPORT, -UN
             (_, o::UN) => {
                 let v = val(value);
                 if abbrevmatch(b"quit", &v, false, 1) {
@@ -2280,7 +2280,7 @@ pub(crate) fn parse_zip(z: &mut Zr, argv0: &[u8], rest: &[Vec<u8>]) -> Result<()
                 } else if abbrevmatch(b"store", &v, false, 1) {
                     z.o.method = Method::Store;
                 } else if abbrevmatch(b"bzip2", &v, false, 1) {
-                    // ubuntu: -DBZIP2_SUPPORT
+                    // debian: -DBZIP2_SUPPORT
                     if flavour::bzip2_support(z.flavour) {
                         z.o.method = Method::Bzip2;
                     } else {

@@ -18,21 +18,23 @@ fn the_default_flavour_follows_the_platform() {
     let want = if apple {
         Flavour::Apple
     } else {
-        Flavour::Ubuntu
+        Flavour::Debian
     };
     assert_eq!(default_flavour(), want);
 }
 
-/// `STUFFR_ZIP_FLAVOR` selects `apple` or `ubuntu`, unset or empty is the
-/// default, and anything else (another case, a blank) is refused.
+/// `STUFFR_ZIP_FLAVOR` selects `apple` or `debian` (`ubuntu`, the Linux
+/// flavour's name until 0.27.0, is an alias of `debian`), unset or empty is
+/// the default, and anything else (another case, a blank) is refused.
 #[test]
 fn the_flavour_variable_rejects_other_values() {
     let d = default_flavour();
     assert_eq!(flavour_from(None), Ok(d));
     assert_eq!(flavour_from(Some("".into())), Ok(d));
     assert_eq!(flavour_from(Some("apple".into())), Ok(Flavour::Apple));
-    assert_eq!(flavour_from(Some("ubuntu".into())), Ok(Flavour::Ubuntu));
-    for bad in ["Apple", "UBUNTU", " apple", "debian", "gnu"] {
+    assert_eq!(flavour_from(Some("debian".into())), Ok(Flavour::Debian));
+    assert_eq!(flavour_from(Some("ubuntu".into())), Ok(Flavour::Debian));
+    for bad in ["Apple", "UBUNTU", " apple", "Debian", "DEBIAN", "gnu"] {
         assert_eq!(flavour_from(Some(bad.into())), Err(bad.into()));
     }
 }

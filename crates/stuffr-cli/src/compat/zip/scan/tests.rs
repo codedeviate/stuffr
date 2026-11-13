@@ -201,7 +201,7 @@ fn an_r_pattern_is_tested_against_the_last_components_of_the_name() {
 }
 
 #[test]
-fn the_display_name_of_ubuntu_escapes_control_bytes_apple_shows_them() {
+fn the_display_name_of_debian_escapes_control_bytes_apple_shows_them() {
     // `display` needs a run; the rule is the bytes below a space
     let esc = |b: &[u8]| {
         let mut out = Vec::new();
@@ -252,15 +252,15 @@ fn the_bsd_qsort_sorts() {
     }
 }
 
-/// Below eight elements the BSD sort is an insertion sort: stable. Ubuntu's
+/// Below eight elements the BSD sort is an insertion sort: stable. Debian's
 /// is stable at every size.
 #[test]
-fn small_arrays_keep_equal_keys_in_order_and_ubuntu_always_does() {
+fn small_arrays_keep_equal_keys_in_order_and_debian_always_does() {
     let keys = [0u8, 0, 1, 0, 0, 0, 0];
     assert_eq!(sorted_by_key(&keys), [0, 1, 3, 4, 5, 6, 2]);
     let many: Vec<u8> = (0..200u32).map(|i| (i * 7 % 5) as u8).collect();
     let mut v: Vec<usize> = (0..many.len()).collect();
-    qsort(flavour::Flavour::Ubuntu, &mut v, &|a, b| {
+    qsort(flavour::Flavour::Debian, &mut v, &|a, b| {
         many[a].cmp(&many[b])
     });
     let mut want: Vec<usize> = (0..many.len()).collect();
@@ -320,7 +320,7 @@ fn a_very_deep_tree_does_not_overflow_the_stack() {
             let args = ["-sf", "-r", "t.zip", "d"]
                 .map(std::ffi::OsString::from)
                 .to_vec();
-            super::super::run_in(&dir, "zip", args, b"", flavour::Flavour::Ubuntu)
+            super::super::run_in(&dir, "zip", args, b"", flavour::Flavour::Debian)
         })
         .unwrap();
     let (code, out, _) = h.join().expect("the walk overflowed or panicked");

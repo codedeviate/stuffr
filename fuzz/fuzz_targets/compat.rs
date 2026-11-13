@@ -32,7 +32,7 @@
 //! `stuffr_core::testing::decode_compat_case` (whose tables are the wire
 //! format of the seeds `crates/stuffr/tests/fuzz_corpus.rs` writes). The
 //! tool byte also picks the gzip and unzip flavours, `(byte / names) & 1`
-//! (R7: 0 GNU, Debian (unzip) or Ubuntu (zip), 1 BSD or Apple), and the
+//! (R7: 0 GNU or Debian (unzip, zip), 1 BSD or Apple), and the
 //! compress family's: 0
 //! ncompress, 1 Apple (absolute, not relative to the platform's default, so
 //! a crash artifact replays the same personality everywhere). Each
@@ -136,7 +136,7 @@
 //!   `COMPAT_FILES` entries, on the third mask byte (bits 19 and 20), and
 //!   the `-b` forms.
 //! - the zip family (`zip`, `zipcloak`, `zipnote`, `zipsplit`; flavour byte
-//!   absolute, 0 Ubuntu and 1 Apple) exits with a ziperr code
+//!   absolute, 0 Debian and 1 Apple) exits with a ziperr code
 //!   (`zip::EXIT_CODES`, never 1), opens only files an operand names within
 //!   `check_zip_reads`' bound (`-FF` at `2 × len + 1 MiB`), makes only names
 //!   a token spells (`zip_name_ok`), leaves no `zi??????` temporary, makes at
@@ -2839,7 +2839,7 @@ const ZIP_READ_PASSES: u64 = 3;
 const ZIP_READ_BLOCK: u64 = 8192;
 
 /// The zip family (0.19.0) through `compat::run_in_counted`, as the
-/// flavour byte says (0 Ubuntu, 1 Apple, absolute: the rule of the unzip and
+/// flavour byte says (0 Debian, 1 Apple, absolute: the rule of the unzip and
 /// compress families). Asserted:
 ///
 /// - the exit is one of `zip::EXIT_CODES` (the ziperr set: never 1, which
@@ -2860,9 +2860,9 @@ const ZIP_READ_BLOCK: u64 = 8192;
 ///   payload supplies (`-@`, `@file`, an archive's own entries) are kept
 ///   inside by the sandbox's `Host::path`.
 fn run_zip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8], payload: &[u8]) {
-    let flavour_name = if flavour == 0 { "ubuntu" } else { "apple" };
+    let flavour_name = if flavour == 0 { "debian" } else { "apple" };
     let flavour = if flavour == 0 {
-        zip::Flavour::Ubuntu
+        zip::Flavour::Debian
     } else {
         zip::Flavour::Apple
     };

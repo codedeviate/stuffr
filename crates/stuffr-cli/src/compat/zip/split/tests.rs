@@ -91,7 +91,7 @@ fn split_set(tag: &str, flavour: Flavour) -> Scratch {
 /// through `Host::track`, and read about once.
 #[test]
 fn split_parts_are_read_through_track() {
-    for flavour in [Flavour::Apple, Flavour::Ubuntu] {
+    for flavour in [Flavour::Apple, Flavour::Debian] {
         for args in [
             &["-F", "s.zip", "--out", "f.zip"][..],
             &["-FF", "s.zip", "--out", "f.zip"],
@@ -122,7 +122,7 @@ fn split_parts_are_read_through_track() {
 /// `q` (ruling Z5); `-FF`'s single-disk question at the end is "no".
 #[test]
 fn questions_end_with_standard_input() {
-    for flavour in [Flavour::Apple, Flavour::Ubuntu] {
+    for flavour in [Flavour::Apple, Flavour::Debian] {
         let s = split_set("eof", flavour);
         std::fs::remove_file(s.0.join("s.z02")).unwrap();
         let r = run(
@@ -162,7 +162,7 @@ fn questions_end_with_standard_input() {
 /// directory, no panic, an exit code of the family's.
 #[test]
 fn splits_are_written_in_a_sandbox() {
-    for flavour in [Flavour::Apple, Flavour::Ubuntu] {
+    for flavour in [Flavour::Apple, Flavour::Debian] {
         let s = Scratch::new("write");
         std::fs::write(s.0.join("big"), noise(200_000, 3)).unwrap();
         let r = run(
@@ -194,7 +194,7 @@ fn splits_are_written_in_a_sandbox() {
 /// length times a read).
 #[test]
 fn ff_over_hostile_bytes_ends() {
-    for flavour in [Flavour::Apple, Flavour::Ubuntu] {
+    for flavour in [Flavour::Apple, Flavour::Debian] {
         let s = Scratch::new("hostile");
         let mut sigs = Vec::new();
         for i in 0..20_000u32 {
@@ -293,7 +293,7 @@ fn ff_work_is_linear_in_the_archive() {
 /// way is refused before anything is written, the archive untouched.
 #[test]
 fn fix_never_replaces_its_input() {
-    for flavour in [Flavour::Apple, Flavour::Ubuntu] {
+    for flavour in [Flavour::Apple, Flavour::Debian] {
         let s = Scratch::new("same");
         let damaged = b"PK\x03\x04 not much of an archive".to_vec();
         std::fs::write(s.0.join("a.zip"), &damaged).unwrap();
@@ -328,7 +328,7 @@ fn fix_never_replaces_its_input() {
 /// exit 14 (`-sp` warns first, and asks no more).
 #[test]
 fn a_split_that_cannot_take_the_rest_ends_the_run() {
-    for flavour in [Flavour::Apple, Flavour::Ubuntu] {
+    for flavour in [Flavour::Apple, Flavour::Debian] {
         for sp in [false, true] {
             let s = Scratch::new("room");
             std::fs::write(s.0.join("big"), noise(200_000, 3)).unwrap();
@@ -362,7 +362,7 @@ fn a_split_that_cannot_take_the_rest_ends_the_run() {
 /// directory takes it as a name in the current directory.
 #[test]
 fn sp_with_a_bare_archive_name_keeps_the_name() {
-    for flavour in [Flavour::Apple, Flavour::Ubuntu] {
+    for flavour in [Flavour::Apple, Flavour::Debian] {
         let s = Scratch::new("bare");
         std::fs::write(s.0.join("big"), noise(200_000, 3)).unwrap();
         std::fs::create_dir(s.0.join("o")).unwrap();
@@ -383,11 +383,11 @@ fn sp_with_a_bare_archive_name_keeps_the_name() {
 }
 
 /// Ruling Z25 (deviation 23): an empty first `-z` line is the comment
-/// `\r\n` in both flavours (Apple's build; Ubuntu's dies of glibc's
+/// `\r\n` in both flavours (Apple's build; Debian's dies of glibc's
 /// buffer-overflow check).
 #[test]
 fn an_empty_first_comment_line_is_apples_answer() {
-    for flavour in [Flavour::Apple, Flavour::Ubuntu] {
+    for flavour in [Flavour::Apple, Flavour::Debian] {
         let s = Scratch::new("zcomment");
         std::fs::write(s.0.join("a.txt"), b"hello\n").unwrap();
         let r = run(&s.0, flavour, &["-z", "t.zip", "a.txt"], b"\n.\n", u64::MAX);

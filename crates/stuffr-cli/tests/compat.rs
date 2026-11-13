@@ -644,6 +644,51 @@ mod unix {
         }
     }
 
+    /// The zip names run in the flavour `STUFFR_ZIP_FLAVOR` picks: `debian`,
+    /// and `ubuntu` as its alias (0.27.0); any other value, another case
+    /// included, is refused, exit 1, in stuffr's words.
+    #[test]
+    fn the_zip_names_take_debian_and_its_alias() {
+        let s = Scratch::new("zipnames");
+        let o = il(&s.0, &["--names", "zip,zipcloak,zipnote,zipsplit"]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        let dir = s.0.canonicalize().unwrap();
+        let run = |n: &str, flavor: &str| {
+            Command::new(dir.join(n))
+                .arg("-v")
+                .env("STUFFR_ZIP_FLAVOR", flavor)
+                .env_remove("ZIP")
+                .env_remove("ZIPOPT")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap()
+        };
+        for n in ["zip", "zipcloak", "zipnote", "zipsplit"] {
+            for flavour in ["debian", "ubuntu"] {
+                let o = run(n, flavour);
+                assert_eq!(o.status.code(), Some(0), "{n} {flavour}: {}", stderr(&o));
+                let out = stdout(&o);
+                assert!(
+                    out.contains("(altered; Debian's build, original by Info-ZIP).\n"),
+                    "{n} {flavour}: {out}"
+                );
+                assert!(
+                    out.contains("Compiled with gcc 14.2.0 for Unix (Linux ELF).\n"),
+                    "{n} {flavour}: {out}"
+                );
+            }
+            for bad in ["Debian", "DEBIAN"] {
+                let o = run(n, bad);
+                assert_eq!(o.status.code(), Some(1), "{n}");
+                assert_eq!(
+                    stderr(&o),
+                    format!("{n}: STUFFR_ZIP_FLAVOR must be apple or debian, not '{bad}'\n")
+                );
+                assert!(o.stdout.is_empty(), "{n}");
+            }
+        }
+    }
+
     /// The two compress names (0.18.0) are among the 34 links. Each runs as
     /// its name in the flavour `STUFFR_COMPRESS_FLAVOR` picks (Apple's
     /// usage line names the program), and any other value of it is refused,

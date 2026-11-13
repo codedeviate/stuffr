@@ -433,7 +433,7 @@ mod tests {
         for name in ["zip", "zipcloak", "zipnote", "zipsplit"] {
             for (f, origin) in [
                 (zip::Flavour::Apple, "with modifications by Apple Inc."),
-                (zip::Flavour::Ubuntu, "Debian's build"),
+                (zip::Flavour::Debian, "Debian's build"),
             ] {
                 let (code, out, err, reads) =
                     run_in_counted(&dir, name, vec!["-h".into()], b"", G, U, C, f).unwrap();

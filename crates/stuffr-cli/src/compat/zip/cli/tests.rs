@@ -265,17 +265,17 @@ fn short_option_errors_name_the_byte() {
 #[test]
 fn the_flavours_have_their_own_tables() {
     let a = table(Flavour::Apple);
-    let u = table(Flavour::Ubuntu);
+    let u = table(Flavour::Debian);
     assert_eq!(u.len(), a.len() + 3);
     let shorts = |t: &[OptionSpec]| t.iter().map(|s| s.short).collect::<Vec<_>>();
     for extra in ["su", "sU", "UN"] {
         assert!(!shorts(&a).contains(&extra));
         assert!(shorts(&u).contains(&extra));
     }
-    // -su is `-s u` for Apple (a bad size), the show option for Ubuntu
+    // -su is `-s u` for Apple (a bad size), the show option for Debian
     let (seen, _) = walk(Flavour::Apple, &["-su", "x"]).unwrap();
     assert_eq!(seen[0], (c('s'), val("u"), false));
-    let (seen, _) = walk(Flavour::Ubuntu, &["-su"]).unwrap();
+    let (seen, _) = walk(Flavour::Debian, &["-su"]).unwrap();
     assert_eq!(seen[0], (o::SU, None, false));
     assert_eq!(
         walk(Flavour::Apple, &["--show-unicode"]).unwrap_err(),
@@ -558,10 +558,10 @@ fn compression_methods_follow_the_build() {
         out,
         "\nzip error: Not supported (Compression method bzip2 not enabled)\n"
     );
-    // Ubuntu accepts it and goes on (to the scan: `a` is not there)
-    let (code, out, _) = go(Flavour::Ubuntu, "zip", &["-Z", "b", "t.zip", "a"]);
+    // Debian accepts it and goes on (to the scan: `a` is not there)
+    let (code, out, _) = go(Flavour::Debian, "zip", &["-Z", "b", "t.zip", "a"]);
     assert_eq!((code, out.as_str()), (12, NOT_MATCHED_A));
-    let (code, out, _) = go(Flavour::Ubuntu, "zip", &["-Z", "foo", "t.zip", "a"]);
+    let (code, out, _) = go(Flavour::Debian, "zip", &["-Z", "foo", "t.zip", "a"]);
     assert_eq!(code, 16);
     assert_eq!(
         out,
@@ -586,10 +586,10 @@ fn the_unicode_option_takes_its_words() {
     for w in [
         "q", "quit", "w", "Warn", "i", "n", "no", "e", "escape", "u", "UTF8",
     ] {
-        let (code, out, err) = go(Flavour::Ubuntu, "zip", &["-UN", w, "t.zip", "a"]);
+        let (code, out, err) = go(Flavour::Debian, "zip", &["-UN", w, "t.zip", "a"]);
         assert_eq!((code, out.as_str()), (12, NOT_MATCHED_A), "{w}: {err}");
     }
-    let (code, out, _) = go(Flavour::Ubuntu, "zip", &["-UN", "x", "t.zip", "a"]);
+    let (code, out, _) = go(Flavour::Debian, "zip", &["-UN", "x", "t.zip", "a"]);
     assert_eq!(code, 16);
     assert_eq!(
         out,
@@ -610,7 +610,7 @@ fn the_screens_name_stuffr_and_the_build() {
          zip [-options] [-b path] [-t mmddyyyy] [-n suffixes] [zipfile list] [-xi list]\n"
     );
     assert!(out.starts_with(&want), "{out}");
-    let (_, out, _) = go(Flavour::Ubuntu, "zip", &["--version"]);
+    let (_, out, _) = go(Flavour::Debian, "zip", &["--version"]);
     assert!(
         out.contains(&format!(
             "This is Zip 3.0 (July 5th 2008), by stuffr {v} (altered; Debian's build, \
@@ -631,7 +631,7 @@ fn the_screens_name_stuffr_and_the_build() {
         ("zipnote", "\nZipNote 3.0 (July 5th 2008), by stuffr "),
         ("zipsplit", "\nZipSplit 3.0 (July 5th 2008), by stuffr "),
     ] {
-        let (code, out, _) = go(Flavour::Ubuntu, name, &["-h"]);
+        let (code, out, _) = go(Flavour::Debian, name, &["-h"]);
         assert_eq!(code, 0, "{name}");
         assert!(
             out.contains(&format!(
@@ -645,7 +645,7 @@ fn the_screens_name_stuffr_and_the_build() {
 #[test]
 fn the_extended_help_differs_by_one_line() {
     let (_, a, _) = go(Flavour::Apple, "zip", &["-h2"]);
-    let (_, u, _) = go(Flavour::Ubuntu, "zip", &["-h2"]);
+    let (_, u, _) = go(Flavour::Debian, "zip", &["-h2"]);
     let brace = " \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20In cmd, {} replaced by temp archive path, else temp appended.\n";
     assert!(!a.contains(brace));
     assert!(u.contains(brace));
@@ -682,7 +682,7 @@ fn show_options_lists_the_table_with_its_columns() {
         lines.contains(&" i \x20\x20include \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20list \x20\x20\x20\x20include only files matching patterns"),
         "{out}"
     );
-    let (_, out, _) = go(Flavour::Ubuntu, "zip", &["-so"]);
+    let (_, out, _) = go(Flavour::Debian, "zip", &["-so"]);
     assert!(
         out.contains(" UN \x20unicode \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20req \x20\x20\x20\x20\x20UN=quit, warn, ignore, no, escape\n"),
         "{out}"
@@ -915,7 +915,7 @@ fn options_are_recorded_for_the_later_tasks() {
         budget: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1 << 20)),
         reads: Default::default(),
     });
-    let mut z = Zr::new(host, Flavour::Ubuntu, "zip", &env, &mut err);
+    let mut z = Zr::new(host, Flavour::Debian, "zip", &env, &mut err);
     parse_zip(
         &mut z,
         b"zip",
@@ -993,13 +993,13 @@ fn optname_len(s: &OptionSpec, islong: bool) -> usize {
 /// form, the message), for the options whose name text needs 50 bytes or
 /// more: the C formats it into `char optname[50]` with `sprintf`, so
 /// both references abort there (Apple: SIGTRAP from `__sprintf_chk`;
-/// Ubuntu: glibc's "buffer overflow detected", then zip's SIGABRT handler,
+/// Debian: glibc's "buffer overflow detected", then zip's SIGABRT handler,
 /// exit 9). Deviation 5: stuffr prints the whole message, exit 16. This
 /// stuffr-only test pins which commands that is, and what they print.
 #[test]
 fn an_option_name_too_long_for_the_c_buffer_is_still_answered_whole() {
     let mut found: Vec<(Flavour, String)> = Vec::new();
-    for f in [Flavour::Apple, Flavour::Ubuntu] {
+    for f in [Flavour::Apple, Flavour::Debian] {
         for s in table(f) {
             let nolist = |t: ValueType| matches!(t, ValueType::Required | ValueType::List);
             // short forms: `-r-`, and a value option at the end
@@ -1033,12 +1033,12 @@ fn an_option_name_too_long_for_the_c_buffer_is_still_answered_whole() {
             .collect()
     };
     assert_eq!(of(Flavour::Apple), PINNED_OVERFLOWS);
-    let mut ubuntu = of(Flavour::Ubuntu);
-    ubuntu.retain(|a| !PINNED_OVERFLOWS_UBUNTU.contains(a));
-    assert_eq!(ubuntu, PINNED_OVERFLOWS);
+    let mut debian = of(Flavour::Debian);
+    debian.retain(|a| !PINNED_OVERFLOWS_DEBIAN.contains(a));
+    assert_eq!(debian, PINNED_OVERFLOWS);
     assert_eq!(
-        of(Flavour::Ubuntu).len(),
-        PINNED_OVERFLOWS.len() + PINNED_OVERFLOWS_UBUNTU.len()
+        of(Flavour::Debian).len(),
+        PINNED_OVERFLOWS.len() + PINNED_OVERFLOWS_DEBIAN.len()
     );
     // each of them answers the whole message with exit 16, as the C
     // would have had the buffer been large enough
@@ -1071,7 +1071,7 @@ fn an_option_name_too_long_for_the_c_buffer_is_still_answered_whole() {
 /// 5: stuffr gives that answer without the dereference.
 #[test]
 fn an_out_name_without_an_archive_name_answers_as_the_references_crash_does() {
-    for f in [Flavour::Apple, Flavour::Ubuntu] {
+    for f in [Flavour::Apple, Flavour::Debian] {
         for argv in [&["-O", "o.zip"][..], &["-s-", "--output-file", "1k"][..]] {
             let (code, out, err) = go(f, "zip", argv);
             assert_eq!((code, err.as_str()), (9, ""), "{argv:?}");
@@ -1088,7 +1088,7 @@ fn an_out_name_without_an_archive_name_answers_as_the_references_crash_does() {
 }
 
 /// The forms that overflow, in Apple's table order (the same under
-/// Ubuntu's, which adds the two of [`PINNED_OVERFLOWS_UBUNTU`]; measured
+/// Debian's, which adds the two of [`PINNED_OVERFLOWS_DEBIAN`]; measured
 /// on Apple's reference for every form of every option: it dies exactly
 /// when the formatted name needs 50 bytes or more).
 const PINNED_OVERFLOWS: &[&str] = &[
@@ -1153,14 +1153,14 @@ const PINNED_OVERFLOWS: &[&str] = &[
     "--names-stdin=v",
 ];
 
-/// What Ubuntu's table adds (its `-su` and `-sU`).
-const PINNED_OVERFLOWS_UBUNTU: &[&str] = &["--show-unicode=v", "--show-just-unicode=v"];
+/// What Debian's table adds (its `-su` and `-sU`).
+const PINNED_OVERFLOWS_DEBIAN: &[&str] = &["--show-unicode=v", "--show-just-unicode=v"];
 
 /// Every row of both tables has an arm in `main()`'s loop: no option ever
 /// reaches the "no such option ID" answer.
 #[test]
 fn every_table_row_has_an_arm() {
-    for f in [Flavour::Apple, Flavour::Ubuntu] {
+    for f in [Flavour::Apple, Flavour::Debian] {
         for s in table(f) {
             let arg = if !s.long.is_empty() {
                 match s.value {
@@ -1217,7 +1217,7 @@ fn the_logged_command_line_hides_the_password() {
         // -i's value list ends where -P starts; nothing else changes
         (&["t.zip", "a", "-i", "*.c", "*.h", "-P", "hunter2"], &[]),
     ];
-    for f in [Flavour::Apple, Flavour::Ubuntu] {
+    for f in [Flavour::Apple, Flavour::Debian] {
         let table = table(f);
         for (argv, want) in cases {
             let args = args_of(&[&["zip"], *argv].concat());

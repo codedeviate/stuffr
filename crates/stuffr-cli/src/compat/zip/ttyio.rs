@@ -1,7 +1,7 @@
 //! zip's `ttyio.c`: the password prompt (`getp()`, the `ATH_BEO_UNX` one
 //! that reads `/dev/tty` with echo off), and the random bytes of an
 //! encryption header. zip's `ttyio.c` is unzip's (Apple's tree and
-//! upstream's are the same file, and no Ubuntu patch touches it), so the
+//! upstream's are the same file, and no Debian patch touches it), so the
 //! prompt's loop is unzip's port (`unzip::ttyio::getp_on`): the prompt on
 //! standard error, a line read a byte at a time keeping `IZ_PWLEN + 1`
 //! bytes, `(line too long--try again)` and the prompt again for a longer

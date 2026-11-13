@@ -1968,12 +1968,13 @@ reopens it before `main`. The full set is in the code's module docs
 `zip`, `zipcloak`, `zipnote` and `zipsplit`, from `0.19.0`. They behave as
 **Info-ZIP Zip 3.0** (July 5th 2008), in two flavours, chosen as the unzip
 family chooses its own: Apple's build on macOS and the BSDs (the reference is
-`/usr/bin/zip`, from Apple's `zip-33` tree), Ubuntu's build everywhere else,
-Windows included (Ubuntu 24.04's `3.0-13ubuntu0.2`, Debian's patch series and
-build options, Unicode and bzip2 support among them).
-`STUFFR_ZIP_FLAVOR=apple` or `ubuntu` overrides that; any other value is
-refused at exit 1 with `zip: STUFFR_ZIP_FLAVOR must be apple or ubuntu, not
-'VALUE'` (the invoked name leads the line). `zip` reads `ZIPOPT` and `ZIP`
+`/usr/bin/zip`, from Apple's `zip-33` tree), Debian 13's build everywhere
+else, Windows included (`3.0-15+deb13u1`, Debian's patch series and build
+options, Unicode and bzip2 support among them; Ubuntu 24.04's build until
+`0.27.0`). `STUFFR_ZIP_FLAVOR=apple` or `debian` overrides that (`ubuntu` is
+an alias of `debian`); any other value is refused at exit 1 with `zip:
+STUFFR_ZIP_FLAVOR must be apple or debian, not 'VALUE'` (the invoked name
+leads the line). `zip` reads `ZIPOPT` and `ZIP`
 before the command line, as the reference does.
 
 **The promise:**
@@ -2000,7 +2001,7 @@ before the command line, as the reference does.
 2. **The banner.** The `-v` banner line and each program's help header name
    stuffr and say it is altered (Info-ZIP licence, clause 3): `This is Zip 3.0
    (July 5th 2008), by stuffr X.Y.Z (altered; original by Info-ZIP, with
-   modifications by Apple Inc.).` (Ubuntu: `(altered; Debian's build,
+   modifications by Apple Inc.).` (Debian: `(altered; Debian's build,
    original by Info-ZIP)`), likewise `Zip 3.0 (July 5th 2008), by stuffr ...
    Usage:` and the helpers' `ZipCloak 3.0 ...`. `-v`'s `Compiled with` line is
    the recorded reference build's, so another macOS build prints a different
@@ -2018,7 +2019,7 @@ before the command line, as the reference does.
    buffer; an error about an option whose `'name' (description)` needs 50
    bytes or more (`-lf`, `--output-file`, `--junk-paths=x`,
    `--recurse-patterns-`: 59 forms in all, listed by `cli/tests.rs`) aborts
-   both references (Apple: SIGTRAP from `__sprintf_chk`; Ubuntu: glibc's
+   both references (Apple: SIGTRAP from `__sprintf_chk`; Debian: glibc's
    "buffer overflow detected" and zip's SIGABRT handler, exit 9). stuffr
    prints the whole message, exit 16, as the C would with room.
 6. **`-O` with no archive name** dereferences NULL in the C (SIGSEGV, answered
@@ -2030,7 +2031,7 @@ before the command line, as the reference does.
 8. **`//host` and `//host/share`** alone as a name (or an `-i`/`-x`/`-R`
    pattern) make `ex2in` dereference NULL in both references; stuffr gives
    the same SIGSEGV answer as 6 without the crash. The order of two equal
-   names in the found list follows each libc's `qsort`: Ubuntu's stable merge
+   names in the found list follows each libc's `qsort`: Debian's stable merge
    sort, Apple's own `qsort_r` on macOS, and off macOS a BSD quicksort ported
    in `scan.rs`, which orders 6 of 4000 random arrays with many equal keys
    differently from macOS (which of two equal names is dropped, when one
@@ -2048,7 +2049,7 @@ before the command line, as the reference does.
     text (0 bytes, CRC 0), exit 0.
 12. **A failing write to the archive** is answered where and as zip's stdio
     stream answers it (measured under `ulimit -f` on both references), except
-    two Ubuntu answers: when only `fclose` meets the failure, Ubuntu's
+    two Debian answers: when only `fclose` meets the failure, Debian's
     `ziperr` closes the stream twice and glibc aborts (exit 5, the temporary
     left); stuffr answers as Apple does (`Temporary file failure`, exit 10,
     the temporary removed). And the `zip I/O error:` line shows the write's
@@ -2084,7 +2085,7 @@ before the command line, as the reference does.
     the link, renames a new file into its place (the link's target left
     empty); stuffr writes through the link, as `replace` does for any linked
     archive.
-15. **A failing `-T` in Ubuntu's build** closes the temporary's stream twice
+15. **A failing `-T` in Debian's build** closes the temporary's stream twice
     and glibc aborts (ruling Z3); stuffr answers as Apple does in both
     flavours: `test of t.zip FAILED`, `zip error: Zip file invalid, could not
     spawn unzip, or wrong unzip (original files unmodified)`, exit 8, the
@@ -2097,7 +2098,7 @@ before the command line, as the reference does.
 18. **Split-part questions at the end of input** (ruling Z5). zip reads the
     answers with `fgets` and ignores the result, so at end of input `-FF`
     (also `-F`, and a copy of a split archive with a missing part, and
-    Ubuntu's `-sp`) asks for ever. stuffr never loops: a question about a part
+    Debian's `-sp`) asks for ever. stuffr never loops: a question about a part
     to read answers `q` (as an explicit `q`, measured: `could not find split`
     and exit 0, or `Interrupted (Could not find split)`, exit 9, when an entry
     was being copied), and `-sp`'s question about where to write the next
@@ -2105,7 +2106,7 @@ before the command line, as the reference does.
 19. **`-FF`, undefined behaviour not reproduced.** The central extra field of
     an entry found by its local header is copied with `strcpy`, which stops at
     the first NUL and leaves the rest of a `malloc`ed field as it was (zeros on
-    Apple, heap garbage that changes from run to run on Ubuntu); stuffr
+    Apple, heap garbage that changes from run to run on Debian); stuffr
     copies up to and with the first NUL and writes zeros after (Apple's
     bytes). The entry's `lflg`, never set, is read as 0 (it only sizes
     `tempzn`); a data descriptor signature split across two 16 KiB reads (the
@@ -2124,7 +2125,7 @@ before the command line, as the reference does.
     takes the name part as empty and indexes before its buffer; stuffr takes
     such a name as one in the current directory.
 23. **`-z` whose first comment line is empty** (ruling Z25) copies `\r\n` into
-    a one-byte block: Ubuntu's build dies in glibc's overflow check (exit 9);
+    a one-byte block: Debian's build dies in glibc's overflow check (exit 9);
     Apple's writes the comment. stuffr writes it in both flavours.
 24. **`zipcloak` ignores `readlocal()`'s failure** and goes on with an
     uninitialised local header; stuffr ends the run with that failure's code
@@ -2132,7 +2133,7 @@ before the command line, as the reference does.
     entry)`), the temporary removed and the archive untouched. A split
     archive under `-O` meets it at the first entry: the UTIL build's
     `readlocal()` looks in the last part only and warns `Did not find entry
-    for <name>`; Ubuntu then dies of SIGSEGV (`Interrupted (aborting)`, exit
+    for <name>`; Debian then dies of SIGSEGV (`Interrupted (aborting)`, exit
     9, or killed by the signal from its handler; measured with a terminal in
     Docker); stuffr warns the same and ends `Zip file structure invalid`, exit
     3. (Without `-O` both refuse a split archive: `cannot update a split
@@ -2146,7 +2147,7 @@ before the command line, as the reference does.
     is not raised.
 26. **`zipnote -w` on Apple** (ruling Z4) closes the input stream twice and
     always fails, exit 10, `Bad file descriptor`, the archive untouched
-    (undefined behaviour). stuffr takes Ubuntu's patched answer (patch 07) in
+    (undefined behaviour). stuffr takes Debian's patched answer (patch 07) in
     both flavours: `-w` works. A comment's length wraps at 65536 as the C's
     `ush` does.
 27. **`zipsplit`.** A `%` in the archive's name is a conversion in the C's name
@@ -2155,18 +2156,18 @@ before the command line, as the reference does.
     back to the wrong disk; stuffr redoes disk 1. An interrupt removes the
     parts only when `-b`'s directory is shorter than half of `PATH_MAX` (the
     handler's static holds that much).
-28. **Ubuntu's `UNICODE_SUPPORT`.** Where a conversion fails and the C reads
+28. **Debian's `UNICODE_SUPPORT`.** Where a conversion fails and the C reads
     through the NULL it got (a bit-11 name zip's UTF-8 decoder refuses; a
     Unicode Path field whose name it refuses; `-UN escape` over a name the
     locale cannot convert) or copies a not-yet-set name, the reference dies
     of SIGSEGV and answers `Interrupted (aborting)`, exit 9; stuffr gives that
     answer without the crash. A Unicode Path field shorter than its header
     says is read as zeros past its end; an old field of another length than
-    the new one is taken out and the new one appended. Patches 12 (`mbstowcs`
+    the new one is taken out and the new one appended. Patches 14 (`mbstowcs`
     told the buffer holds `strlen + 1` wide characters, which glibc aborts on
-    for every non-ASCII name) and 13 (`-TT`'s command buffer one byte short)
-    are Ubuntu's own fixes: both flavours take the defined behaviour.
-29. **`-Z bzip2` (Ubuntu).** zipup.c tests whether an entry is text over the
+    for every non-ASCII name) and 15 (`-TT`'s command buffer one byte short)
+    are Debian's own fixes: both flavours take the defined behaviour.
+29. **`-Z bzip2` (Debian).** zipup.c tests whether an entry is text over the
     whole 16 KiB input buffer, past the bytes read, and the buffer is never
     cleared, so the test sees what an earlier entry left there (reproduced: a
     short text file after a longer text file is text). The buffer's first
@@ -2901,14 +2902,14 @@ and 1.11.0 binaries, and is MIT. On the `lz4-c` tier liblz4 1.11.0 is linked, un
 BSD-2-Clause licence (`crates/stuffr-cli/LICENSE-lz4`), already in the
 expression below.
 Since `0.16.0` the unzip family is ported from Info-ZIP UnZip 6.0 (Apple's
-`zip-33` tree, and Debian's patch series for the Ubuntu flavour, both under
+`zip-33` tree, and Debian's patch series for the Debian flavour, both under
 the same licence) and stays under the **Info-ZIP licence**, version
 2009-Jan-02 ([`crates/stuffr-cli/LICENSE-infozip`](crates/stuffr-cli/LICENSE-infozip)).
 Its clause 3 asks that an altered version be plainly marked and never
 presented as an Info-ZIP release, which is why the family's banner lines
 name stuffr and say "altered".
 Since `0.19.0` the zip family is ported from Info-ZIP Zip 3.0 (Apple's
-`zip-33` tree, and Debian's patch series for the Ubuntu flavour) and is under
+`zip-33` tree, and Debian's patch series for the Debian flavour) and is under
 the same **Info-ZIP licence**; the banner lines name stuffr and say "altered"
 as for unzip.
 Since `0.20.0` the brotli family is ported from brotli 1.2.1's

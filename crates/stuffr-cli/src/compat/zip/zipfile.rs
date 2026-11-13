@@ -81,7 +81,7 @@ pub(crate) struct ZEntry {
     pub(crate) atx: u32,
     /// Offset of the local header.
     pub(crate) off: u64,
-    /// Ubuntu's `z->uname`: the UTF-8 name a non-ASCII name stores (bit
+    /// Debian's `z->uname`: the UTF-8 name a non-ASCII name stores (bit
     /// 11) or puts in a Unicode Path field; `None` for Apple.
     pub(crate) uname: Option<Vec<u8>>,
     /// The C's `z->nam` where it is not the name's length: the stored
@@ -200,7 +200,7 @@ pub(crate) struct ZOut {
     /// `split_size`, also when not splitting (`-s 64k -s-`: what does not
     /// fit is not written, as in the C).
     pub(crate) split_size: u64,
-    /// Ubuntu's `UNICODE_SUPPORT` in putlocal/putcentral: `using_utf8` and
+    /// Debian's `UNICODE_SUPPORT` in putlocal/putcentral: `using_utf8` and
     /// `utf8_force` (`-UN UTF8`); `None` for Apple's build.
     pub(crate) unicode: Option<(bool, bool)>,
 }
@@ -564,7 +564,7 @@ fn local_header(z: &mut ZEntry, out: &mut ZOut, rewrite: bool) -> Result<Vec<u8>
     if out.zip64_entry || was_zip64 {
         add_local_zip64_extra_field(z);
     }
-    // ubuntu: UNICODE_SUPPORT, the UTF-8 name or the Unicode Path field
+    // debian: UNICODE_SUPPORT, the UTF-8 name or the Unicode Path field
     let mut name = z.iname.clone();
     if let Some((using_utf8, utf8_force)) = out.unicode {
         if let Some(u) = z.uname.clone() {
@@ -645,7 +645,7 @@ pub(crate) fn putextended(z: &ZEntry, out: &mut ZOut) -> io::Result<()> {
 /// first when a field does not fit or `-fz` asks).
 // port: zipfile.c:putcentral
 pub(crate) fn putcentral(z: &mut ZEntry, out: &mut ZOut) -> Result<(), PutError> {
-    // ubuntu: UNICODE_SUPPORT, the UTF-8 name or the Unicode Path field
+    // debian: UNICODE_SUPPORT, the UTF-8 name or the Unicode Path field
     let mut name = z.iname.clone();
     if let Some((_, utf8_force)) = out.unicode {
         if let Some(u) = z.uname.clone() {

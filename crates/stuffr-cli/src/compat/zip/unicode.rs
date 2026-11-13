@@ -1,4 +1,4 @@
-//! Ubuntu's `UNICODE_SUPPORT` (fileio.c's Unicode functions and
+//! Debian's `UNICODE_SUPPORT` (fileio.c's Unicode functions and
 //! zipfile.c's Unicode Path extra field): what zip does with a name that is
 //! not ASCII. Apple's build has none of it; every caller asks
 //! [`flavour::unicode_support`](super::flavour::unicode_support) first.

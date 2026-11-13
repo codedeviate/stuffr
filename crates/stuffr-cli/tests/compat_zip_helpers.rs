@@ -5,8 +5,8 @@
 //! Apple's `zipnote -w` always fails (exit 10, a double `fclose`: ruling
 //! Z4), so on macOS its working runs are not compared with the reference:
 //! `zipnote_w_is_the_same_in_both_flavours` runs them in stuffr's two
-//! flavours and requires the same bytes, and the Ubuntu leg
-//! (`make compat-ubuntu`) compares them with Ubuntu's own, whose patch 07
+//! flavours and requires the same bytes, and the Debian leg
+//! (`make compat-debian`) compares them with Debian's own, whose patch 07
 //! made `-w` work.
 
 #[cfg(unix)]
@@ -406,7 +406,7 @@ mod unix {
         assert!(total >= 50, "{total} cases in all");
     }
 
-    /// Ruling Z4 (deviation 26): `zipnote -w` works as Ubuntu's (patch 07)
+    /// Ruling Z4 (deviation 26): `zipnote -w` works as Debian's (patch 07)
     /// in both flavours: the runs of the matrix that write the archive end
     /// in exit 0 in each, with the same tree, and a second listing gives
     /// back what was written.
@@ -417,7 +417,7 @@ mod unix {
             let mut a = c.case.clone();
             a.zip_flavour = Some("apple");
             let mut u = c.case.clone();
-            u.zip_flavour = Some("ubuntu");
+            u.zip_flavour = Some("debian");
             let (ra, ru) = (stuffr_zip(&a), stuffr_zip(&u));
             assert_eq!(ra.code, ru.code, "{:?}", c.case.args);
             if ra.code == 0 {
@@ -839,7 +839,7 @@ mod unix {
             let mut a = c.clone();
             a.zip_flavour = Some("apple");
             let mut u = c.clone();
-            u.zip_flavour = Some("ubuntu");
+            u.zip_flavour = Some("debian");
             let (ra, ru) = (stuffr_zip(&a), stuffr_zip(&u));
             let d = zip_differences(&c, &ra, &ru);
             assert!(d.is_empty(), "{:?}: {}", c.args, d.join("\n"));
@@ -1014,7 +1014,7 @@ mod unix {
         // sh's `ulimit -f` counts 512-byte blocks in dash, 1024-byte ones in
         // macOS's sh: the limits are the same bytes, those a whole number of
         // units holds (so no limit is tried twice). Linux's sh is taken to be
-        // dash: true on ubuntu-24.04 and in the compat-ubuntu image.
+        // dash: true on Debian 13 and in the compat-debian image.
         let unit: u64 = if cfg!(target_os = "linux") { 512 } else { 1024 };
         let mut compared = 0;
         for (limit, pause, index, input, answers) in (96..=120u64)

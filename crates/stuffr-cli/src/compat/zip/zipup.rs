@@ -43,7 +43,7 @@ const ZE_WRITE: i32 = 14;
 /// zip.h's methods.
 const STORE: u16 = 0;
 const DEFLATE: u16 = 8;
-/// zip.h:BZIP2 (Ubuntu's `BZIP2_SUPPORT`).
+/// zip.h:BZIP2 (Debian's `BZIP2_SUPPORT`).
 const BZIP2: u16 = 12;
 /// zipup.c:OBUF_SZ (tailor.h:ZBSZ), bzfilecompress's output buffer.
 const OBUF_SZ: usize = 16384;
@@ -404,7 +404,8 @@ pub(crate) fn perror(z: &mut Zr, fmt: &str, e: &io::Error) {
 
 /// unix.c:filetime for zipup: the attributes (`st_mode << 16`, the
 /// MS-DOS read-only and directory bits), the size (-1 for anything but a
-/// regular file), the stat and its MS-DOS time.
+/// regular file, or a symlink: [`flavour::symlink_has_size`]), the stat and
+/// its MS-DOS time.
 pub(crate) struct FileTime {
     a: u32,
     q: i64,
@@ -432,7 +433,9 @@ pub(crate) fn filetime(z: &Zr, name: &[u8]) -> Result<FileTime, io::Error> {
     if meta.mode & S_IFMT == S_IFDIR {
         a |= MSDOS_DIR_ATTR;
     }
-    let q = if meta.mode & S_IFMT == S_IFREG {
+    let ty = meta.mode & S_IFMT;
+    // debian: 16-fix-symlink-update-detection
+    let q = if ty == S_IFREG || (ty == S_IFLNK && flavour::symlink_has_size(z.flavour)) {
         meta.size as i64
     } else {
         -1
@@ -482,7 +485,7 @@ thread_local! {
 /// message line was begun by the caller.
 // port: zipup.c:zipup
 pub(crate) fn add(z: &mut Zr, w: &mut Wr, f: &Found) -> Result<Zipped, Exit> {
-    // ubuntu: UNICODE_SUPPORT, the UTF-8 name only for a name that is not
+    // debian: UNICODE_SUPPORT, the UTF-8 name only for a name that is not
     // ASCII (fileio.c:newname's local_to_utf8_string, zip.c's is_ascii test)
     let uname = if flavour::unicode_support(z.flavour) {
         unicode::local_to_utf8(z.using_utf8, &f.zname).filter(|u| !unicode::is_ascii(Some(u)))
@@ -551,7 +554,7 @@ pub(crate) fn add_entry(
     // Select the method by the suffix and the global method.
     let method = match z.o.method {
         Method::Store => STORE,
-        // ubuntu: -DBZIP2_SUPPORT (Apple refuses -Z bzip2 in the options)
+        // debian: -DBZIP2_SUPPORT (Apple refuses -Z bzip2 in the options)
         Method::Bzip2 => BZIP2,
         _ => DEFLATE,
     };
@@ -977,7 +980,7 @@ impl BzOut {
     }
 }
 
-/// zipup.c:bzfilecompress (Ubuntu's `BZIP2_SUPPORT`): the entry through
+/// zipup.c:bzfilecompress (Debian's `BZIP2_SUPPORT`): the entry through
 /// libbzip2 at block size `level` (stuffr's encoder, byte-identical to
 /// libbzip2 1.0.8, as `compat::bzip2` uses), written in `OBUF_SZ` pieces.
 /// An input that ends within the first two reads and does not get smaller

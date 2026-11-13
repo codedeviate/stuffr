@@ -4,8 +4,8 @@
 //! data at every level), both streams and the exit code, over
 //! [`zip_bytes_matrix`] (new archives), [`zip_update_matrix`] (archives
 //! already at the path) and [`zip_encrypted_matrix`] (`-P`, compared
-//! outside the encryption headers). Apple's `/usr/bin/zip` on macOS, Ubuntu's apt
-//! `zip` under `make compat-ubuntu` and CI's Linux jobs.
+//! outside the encryption headers). Apple's `/usr/bin/zip` on macOS, Debian's apt
+//! `zip` under `make compat-debian` and CI's Linux jobs.
 
 #[cfg(unix)]
 mod compat_harness;
@@ -29,7 +29,7 @@ mod unix {
         );
     }
 
-    /// Task 7: updates. Ubuntu's failing `-T` runs are left out: its
+    /// Task 7: updates. Debian's failing `-T` runs are left out: its
     /// reference double-frees there (ruling Z3, pinned in
     /// `compat_zip_common`).
     #[test]
@@ -85,7 +85,7 @@ mod unix {
         let mut cases = zip_split_matrix(f);
         if f == "apple" {
             // `-sp` at the end of standard input: Apple's build goes on as
-            // with ENTER, which is ruling Z5's answer (Ubuntu's asks again
+            // with ENTER, which is ruling Z5's answer (Debian's asks again
             // for ever: pinned stuffr-only below)
             let mut c = zip_case(
                 "zip",
@@ -194,7 +194,7 @@ mod unix {
     /// up to its first NUL, zeros after.
     #[test]
     fn fix_and_split_rulings_hold_in_both_flavours() {
-        for flavour in ["apple", "ubuntu"] {
+        for flavour in ["apple", "debian"] {
             let run = |args: &[&'static str], tree: ZipTree, stdin: &[u8]| {
                 let mut c = zip_case("zip", args, tree);
                 c.zip_flavour = Some(flavour);

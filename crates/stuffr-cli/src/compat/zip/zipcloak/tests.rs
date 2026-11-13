@@ -35,7 +35,7 @@ impl Scratch {
     }
 
     /// Sets `a.txt` and `b.txt`'s access and modification times to one
-    /// fixed instant. The Ubuntu flavour's UT field records the atime, and
+    /// fixed instant. The Debian flavour's UT field records the atime, and
     /// the read by one `zip` run moves it whenever that read lands in a
     /// later second, so a test that zips the same files twice and compares
     /// the archives pins the times before each run.
@@ -118,7 +118,7 @@ fn copying(name: &str) -> String {
     String::from_utf8(l).unwrap()
 }
 
-const FLAVOURS: [Flavour; 2] = [Flavour::Apple, Flavour::Ubuntu];
+const FLAVOURS: [Flavour; 2] = [Flavour::Apple, Flavour::Debian];
 
 /// `a.txt` (stored) and `b.txt` (deflated) and a plain `t.zip` of them.
 fn with_plain(tag: &str, flavour: Flavour) -> Scratch {
@@ -578,7 +578,7 @@ fn hostile_encrypted_archives_end_cleanly() {
 
 /// Deviation 24: a split archive under `-O`. zipcloak's `readlocal()` (the
 /// UTIL build's) looks for each entry in the archive file it has open, the
-/// last part; it does not find the first entry there. Ubuntu's build then
+/// last part; it does not find the first entry there. Debian's build then
 /// uses its uninitialised local header and dies of SIGSEGV (measured at a
 /// terminal in Docker); stuffr warns as it does and ends with that
 /// failure: `Zip file structure invalid`, exit 3, nothing written. Without

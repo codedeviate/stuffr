@@ -161,7 +161,7 @@ mod unix {
         );
         // the other flavour's origin is not this flavour's banner
         assert_ne!(
-            mask_zip_banners(apple_ours.as_bytes(), Some("ubuntu")),
+            mask_zip_banners(apple_ours.as_bytes(), Some("debian")),
             masked
         );
         // another version, or text around the line, is not a banner
@@ -175,15 +175,15 @@ mod unix {
             ref_around.as_bytes()
         );
 
-        // Ubuntu's banner and the help headers, both sides
-        let ubuntu_ref = "This is ZipCloak 3.0 (July 5th 2008), by Info-ZIP.\n";
-        let ubuntu_ours = format!(
+        // Debian's banner and the help headers, both sides
+        let debian_ref = "This is ZipCloak 3.0 (July 5th 2008), by Info-ZIP.\n";
+        let debian_ours = format!(
             "This is ZipCloak 3.0 (July 5th 2008), by stuffr {v} (altered; Debian's build, \
              original by Info-ZIP).\n"
         );
-        assert_eq!(mask_zip_banners(ubuntu_ref.as_bytes(), None), b"<banner>\n");
+        assert_eq!(mask_zip_banners(debian_ref.as_bytes(), None), b"<banner>\n");
         assert_eq!(
-            mask_zip_banners(ubuntu_ours.as_bytes(), Some("ubuntu")),
+            mask_zip_banners(debian_ours.as_bytes(), Some("debian")),
             b"<banner>\n"
         );
         let help_ref = "Zip 3.0 (July 5th 2008). Usage:\n";
@@ -209,7 +209,7 @@ mod unix {
             "ZipNote 3.0 (July 5th 2008), by stuffr {v} (altered; Debian's build, original by Info-ZIP)\n"
         );
         assert_eq!(
-            mask_zip_banners(helper.as_bytes(), Some("ubuntu")),
+            mask_zip_banners(helper.as_bytes(), Some("debian")),
             b"<usage-banner>\n"
         );
         assert_eq!(

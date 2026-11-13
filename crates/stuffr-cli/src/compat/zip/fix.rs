@@ -32,7 +32,7 @@
 //! - zipcopy copies the local extra field into the central one with
 //!   `strcpy`, which stops at the first NUL (the second byte of a block's
 //!   size, nearly always) and leaves the rest of the `malloc`ed field as it
-//!   was (zeros on Apple; heap garbage that changes run to run on Ubuntu).
+//!   was (zeros on Apple; heap garbage that changes run to run on Debian).
 //!   stuffr copies up to and with the first NUL and fills the rest with
 //!   zeros: Apple's bytes.
 //! - an entry's `lflg` is never set before zipcopy reads it for the size of
@@ -564,7 +564,7 @@ fn scanzipf_fixnew(
                         zf.e.att = att;
                         zf.e.atx = atx;
                         zf.dosflag = (vem & 0xff00) == 0;
-                        // ubuntu: UNICODE_SUPPORT, the UTF-8 name from the
+                        // debian: UNICODE_SUPPORT, the UTF-8 name from the
                         // flags (as the local header had them, now) or the
                         // central Unicode Path field; the local header is
                         // rewritten with it below, as long as it now is

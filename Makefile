@@ -558,7 +558,7 @@ compat-debian:
 	$(COMPAT_DEBIAN_RUN) \
 	  $(COMPAT_DEBIAN_CARGO) -p stuffr-cli --lib compat::zip -- $(COMPAT_DEBIAN_ALL_ARGS)
 	$(COMPAT_DEBIAN_RUN) \
-	  $(COMPAT_DEBIAN_CARGO) -p stuffr-cli --test compat_zip_common --test compat_zip_ubuntu --test compat_zip_bytes --test compat_zip_tty --test compat_zip_helpers --test compat_zip_harness_selftest -- $(COMPAT_DEBIAN_ALL_ARGS)
+	  $(COMPAT_DEBIAN_CARGO) -p stuffr-cli --test compat_zip_common --test compat_zip_debian --test compat_zip_bytes --test compat_zip_tty --test compat_zip_helpers --test compat_zip_harness_selftest -- $(COMPAT_DEBIAN_ALL_ARGS)
 	$(COMPAT_DEBIAN_RUN) \
 	  $(COMPAT_DEBIAN_CARGO) -p stuffr-cli --test compat_bzip2 --test compat_bzip2recover -- $(COMPAT_DEBIAN_ALL_ARGS)
 	$(COMPAT_DEBIAN_RUN) env -u STUFFR_GZIP_FLAVOR \

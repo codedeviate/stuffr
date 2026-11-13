@@ -5,7 +5,7 @@
 //!
 //! Each row is tagged with the flavour whose reference it was recorded on
 //! ([`Which`]); a row runs on its own platform's reference only (Apple on
-//! macOS, Ubuntu on Linux: CI and `make compat-ubuntu`).
+//! macOS, Debian on Linux: CI and `make compat-debian`).
 //! `zip_recorded_rows_hold_on_the_reference` runs every row of this
 //! platform's flavour on the reference and checks the recording, so the
 //! table cannot rot. Each row names the task whose differential will run
@@ -30,7 +30,7 @@ mod unix {
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Which {
         Apple,
-        Ubuntu,
+        Debian,
         /// Both gave exactly this answer.
         Both,
     }
@@ -40,7 +40,7 @@ mod unix {
         if platform_zip_flavour() == "apple" {
             Which::Apple
         } else {
-            Which::Ubuntu
+            Which::Debian
         }
     }
 
@@ -193,11 +193,11 @@ mod unix {
                  \x20            On Unix, to use unzip in current directory, could use:\n\
                  \x20              zip archive file1 file2 -T -TT \"./unzip -tqq\"\n\
                  \x20            The return code is checked for success (0 on Unix)\n", ""),
-            row(Ubuntu, 4, "-h2 has the {} line", "zip", &["-h2"], 0,
+            row(Debian, 4, "-h2 has the {} line", "zip", &["-h2"], 0,
                 "             In cmd, {} replaced by temp archive path, else temp appended.\n", ""),
             row(Both, 4, "show options", "zip", &["-so"], 0,
                 "available options:\n sh  long               val  neg description", ""),
-            row(Ubuntu, 4, "show options lists -UN", "zip", &["-so"], 0,
+            row(Debian, 4, "show options lists -UN", "zip", &["-so"], 0,
                 " UN  unicode            req      UN=quit, warn, ignore, no, escape\n", ""),
             row(Both, 4, "licence", "zip", &["-L"], 0,
                 "Copyright (c) 1990-2008 Info-ZIP.  All rights reserved.\n", ""),
@@ -208,11 +208,11 @@ mod unix {
                 "\tSTORE_UNIX_UIDs_GIDs (store UID/GID sizes/values using new extra field)\n\
                  \tUIDGID_16BIT         (old Unix 16-bit UID/GID extra field also used)\n\
                  \t[encryption, version 2.91 of 05 Jan 2007] (modified for Zip 3)\n", ""),
-            row(Ubuntu, 4, "version", "zip", &["--version"], 0,
+            row(Debian, 4, "version", "zip", &["--version"], 0,
                 "This is Zip 3.0 (July 5th 2008), by Info-ZIP.\n\
                  Currently maintained by E. Gordon.  Please send bug reports to\n", ""),
-            row(Ubuntu, 4, "version options", "zip", &["-v"], 0,
-                "Compiled with gcc 13.3.0 for Unix (Linux ELF).\n\n\
+            row(Debian, 4, "version options", "zip", &["-v"], 0,
+                "Compiled with gcc 14.2.0 for Unix (Linux ELF).\n\n\
                  Zip special compilation options:\n\
                  \tUSE_EF_UT_TIME       (store Universal Time)\n\
                  \tBZIP2_SUPPORT        (bzip2 library version 1.0.8, 13-Jul-2019)\n", ""),
@@ -232,7 +232,7 @@ mod unix {
                 "\tzip warning: valid compression methods are:  store, deflate)\n\
                  \tzip warning: unknown compression method found:  foo\n\n\
                  zip error: Invalid command arguments (Option -Z (--compression-method):  unknown method)\n", ""),
-            row(Ubuntu, 4, "-Z unknown", "zip", &["-Z", "foo", "t.zip", "a.txt"], 16,
+            row(Debian, 4, "-Z unknown", "zip", &["-Z", "foo", "t.zip", "a.txt"], 16,
                 "\tzip warning: valid compression methods are:  store, deflate, bzip2\n\
                  \tzip warning: unknown compression method found:  foo\n\n\
                  zip error: Invalid command arguments (Option -Z (--compression-method):  unknown method)\n", ""),
@@ -261,12 +261,12 @@ mod unix {
             row(Apple, 4, "-su is -s u", "zip", &["-su", "t.zip", "a.txt"], 16,
                 "\tzip warning: Unable to read number (must start with digit): u\n\n\
                  zip error: Invalid command arguments (bad split size:  'u')\n", ""),
-            row(Ubuntu, 4, "-su", "zip", &["-su", "t.zip", "a.txt"], 0,
+            row(Debian, 4, "-su", "zip", &["-su", "t.zip", "a.txt"], 0,
                 "Would Add/Update:\n  a.txt\nTotal 1 entries (6 bytes)\n", "")
                 .needs(5),
             row(Apple, 4, "-UN", "zip", &["t.zip", "a.txt", "-UN", "warn"], 16,
                 "\nzip error: Invalid command arguments (short option 'N' not supported)\n", ""),
-            row(Ubuntu, 4, "-UN", "zip", &["t.zip", "a.txt", "-UN", "warn"], 0,
+            row(Debian, 4, "-UN", "zip", &["t.zip", "a.txt", "-UN", "warn"], 0,
                 "  adding: a.txt (stored 0%)\n", "")
                 .needs(6),
             row(Both, 4, "ZIP quiet", "zip", &["t.zip", "a.txt"], 0, "", "")
@@ -346,7 +346,7 @@ mod unix {
                 "  adding: new\nline (stored 0%)\n", "")
                 .tree(ZipTree::standard().file("new\nline", b"x"))
                 .needs(6),
-            row(Ubuntu, 5, "newline in a name", "zip", &["t.zip", "new\nline"], 0,
+            row(Debian, 5, "newline in a name", "zip", &["t.zip", "new\nline"], 0,
                 "  adding: new^Jline (stored 0%)\n", "")
                 .tree(ZipTree::standard().file("new\nline", b"x"))
                 .needs(6),
@@ -395,14 +395,14 @@ mod unix {
                 "\tzip warning: can't use -T on stdout, -T ignored\n  adding: a.txt (deflated -32%)\n"),
             row(Apple, 7, "-TT test fails", "zip", &["-T", "-TT", "false", "t.zip", "a.txt"], 8,
                 "test of t.zip FAILED\n\nzip error: Zip file invalid, could not spawn unzip, or wrong unzip (original files unmodified)\n", ""),
-            row(Ubuntu, 7, "-TT test fails (double free)", "zip", &["-T", "-TT", "false", "t.zip", "a.txt"], 5,
+            row(Debian, 7, "-TT test fails (double free)", "zip", &["-T", "-TT", "false", "t.zip", "a.txt"], 5,
                 "test of t.zip FAILED\n\nzip error: Zip file invalid, could not spawn unzip, or wrong unzip (original files unmodified)\n\n",
                 // glibc's wording may differ on CI's x86_64
                 "double free"
             ).stderr_contains().reference_only(),
             row(Apple, 7, "-TT with {}", "zip", &["-T", "-TT", "true {}", "t.zip", "a.txt"], 16,
                 "\nzip error: Invalid command arguments ({} in -TT not supported)\n", ""),
-            row(Ubuntu, 7, "-TT through a shell", "zip", &["-T", "-TT", "true {}", "t.zip", "a.txt"], 0,
+            row(Debian, 7, "-TT through a shell", "zip", &["-T", "-TT", "true {}", "t.zip", "a.txt"], 0,
                 "test of t.zip OK\n", ""),
             row(Both, 7, "adjust a plain archive", "zip", &["-A", "t.zip"], 3,
                 "\tzip warning: reading archive fseek: Invalid argument\n\nzip error: Zip file structure invalid (t.zip)\n", "")
@@ -484,7 +484,7 @@ mod unix {
                 .tree(with_archive(&[(b"a.txt", b"hello\n")]))
                 .piped(b"@ a.txt\nnew comment\n@ (comment above this line)\n@ (zip file comment below this line)\n")
                 .reference_only(),
-            row(Ubuntu, 10, "zipnote -w", "zipnote", &["-w", "t.zip"], 0, "", "")
+            row(Debian, 10, "zipnote -w", "zipnote", &["-w", "t.zip"], 0, "", "")
                 .tree(with_archive(&[(b"a.txt", b"hello\n")]))
                 .piped(b"@ a.txt\nnew comment\n@ (comment above this line)\n@ (zip file comment below this line)\n"),
             row(Both, 10, "zipnote a missing archive", "zipnote", &["nosuch.zip"], 9, "",
@@ -507,10 +507,10 @@ mod unix {
                  zipsplit error: Could not create output file (nodir/t1.zip)\n",
                 "zipsplit error: No such file or directory\n")
                 .tree(with_archive(&[(b"a.txt", b"hello\n")])),
-            // ---- Task 11: Ubuntu's build ----
-            row(Ubuntu, 11, "-Z bzip2", "zip", &["-Z", "bzip2", "t.zip", "b.txt"], 0,
+            // ---- Task 11: Debian's build ----
+            row(Debian, 11, "-Z bzip2", "zip", &["-Z", "bzip2", "t.zip", "b.txt"], 0,
                 "  adding: b.txt (bzipped 91%)\n", ""),
-            row(Ubuntu, 11, "Unicode support in -v", "zip", &["-v"], 0,
+            row(Debian, 11, "Unicode support in -v", "zip", &["-v"], 0,
                 "\tUNICODE_SUPPORT      (store and read UTF-8 Unicode paths)\n\
                  \tSTORE_UNIX_UIDs_GIDs (store UID/GID sizes/values using new extra field)\n\
                  \tUIDGID_NOT_16BIT     (old Unix 16-bit UID/GID extra field not used)\n", ""),
@@ -554,7 +554,7 @@ mod unix {
 
     /// Task 4's rows: options, help and version screens, the environment,
     /// the checks of `main()` and the helpers' usage. The rows whose answer
-    /// needs the archive code (the `ZIP` and `ZIPOPT` that archive, Ubuntu's
+    /// needs the archive code (the `ZIP` and `ZIPOPT` that archive, Debian's
     /// `-su` and `-UN`) run with the task that builds it.
     #[test]
     fn task4_rows_match_the_reference() {
@@ -568,7 +568,7 @@ mod unix {
     /// added, `-k`, `-j`, `-x`, names from standard input, an unreadable
     /// file among readable ones, Review Focus 2) run with Task 6, which
     /// writes the archive; the scanning matrices are in
-    /// `compat_zip_apple` and `compat_zip_ubuntu`.
+    /// `compat_zip_apple` and `compat_zip_debian`.
     #[test]
     fn task5_rows_match_the_reference() {
         differential(5);
@@ -578,7 +578,7 @@ mod unix {
     /// `-v` and the progress counters, an archive or standard input on a
     /// pipe, descriptors, an archive that cannot be created), and the rows
     /// of Tasks 4 and 5 whose answer is written (`ZIP`/`ZIPOPT` that
-    /// archive, Ubuntu's `-UN`, a FIFO or a dangling link beside a file,
+    /// archive, Debian's `-UN`, a FIFO or a dangling link beside a file,
     /// `-k`, `-j`, `-x`, `-@`, names with a newline, and Review Focus 2's
     /// unreadable file among readable ones).
     #[test]
@@ -587,7 +587,7 @@ mod unix {
     }
 
     /// Task 7's rows: updating, deleting, the temporary, `-T`/`-TT`, `-A`
-    /// (Ubuntu's `-T` double free is recorded only: ruling Z3).
+    /// (Debian's `-T` double free is recorded only: ruling Z3).
     #[test]
     fn task7_rows_match_the_reference() {
         differential(7);
@@ -618,7 +618,7 @@ mod unix {
         differential(10);
     }
 
-    /// Task 11's rows: Ubuntu's `-Z bzip2` and Unicode names, Apple's
+    /// Task 11's rows: Debian's `-Z bzip2` and Unicode names, Apple's
     /// answers to the same (its build has neither).
     #[test]
     fn task11_rows_match_the_reference() {
@@ -718,16 +718,16 @@ mod unix {
         }
     }
 
-    /// stuffr-only pins of the undefined behaviour Ubuntu's patches 12 and
+    /// stuffr-only pins of the undefined behaviour Debian's patches 12 and
     /// 13 remove and of Task 11's rulings (deviations 28 and 29), in both
     /// flavours:
     /// - patch 12 (`mbstowcs` told the buffer is `strlen + 1` wide
     ///   characters; glibc's fortify aborts on any non-ASCII name): a
-    ///   non-ASCII name is archived (Ubuntu: bit 11; Apple, which has no
+    ///   non-ASCII name is archived (Debian: bit 11; Apple, which has no
     ///   Unicode code: no flag);
     /// - patch 13 (`-TT`'s command one byte short): the test command runs
     ///   whatever the archive name's length;
-    /// - deviation 28: where Ubuntu's C reads through a NULL from a
+    /// - deviation 28: where Debian's C reads through a NULL from a
     ///   conversion that failed (a bit-11 name that is not UTF-8, a Unicode
     ///   Path field with no name), the answer is its crash's, without the
     ///   crash; Apple reads such archives as any other;
@@ -735,8 +735,8 @@ mod unix {
     ///   past the bytes read (a short text file is binary).
     #[test]
     fn ub_rulings() {
-        for flavour in ["apple", "ubuntu"] {
-            let ubuntu = flavour == "ubuntu";
+        for flavour in ["apple", "debian"] {
+            let debian = flavour == "debian";
             // patch 12
             let mut c = zip_case(
                 "zip",
@@ -747,7 +747,7 @@ mod unix {
             let r = stuffr_zip(&c);
             assert_eq!(r.code, 0, "{flavour}");
             let (flags, _) = central_flags(&archive_of(&r, b"t.zip"));
-            assert_eq!(flags, if ubuntu { 0x800 } else { 0 }, "{flavour}");
+            assert_eq!(flags, if debian { 0x800 } else { 0 }, "{flavour}");
             // patch 13: end to end at three name lengths (the boundary
             // itself is `update::tests::tt_command_is_whole_at_every_length`)
             for name in [
@@ -795,7 +795,7 @@ mod unix {
                     let mut c = zip_case(prog, args, tree.clone());
                     c.zip_flavour = Some(flavour);
                     let r = stuffr_zip(&c);
-                    if !ubuntu {
+                    if !debian {
                         assert_eq!(r.code, 0, "{flavour} {prog} {args:?}");
                         continue;
                     }
@@ -813,8 +813,8 @@ mod unix {
                     );
                 }
             }
-            // deviation 29 (Ubuntu only: Apple refuses -Z bzip2)
-            if ubuntu {
+            // deviation 29 (Debian only: Apple refuses -Z bzip2)
+            if debian {
                 let mut c = zip_case(
                     "zip",
                     &["-Z", "bzip2", "t.zip", "b.txt"],
@@ -830,12 +830,12 @@ mod unix {
     }
 
     /// Ruling Z3 (deviation 15): a failing `-T` answers as Apple's zip in
-    /// both flavours, where Ubuntu's frees the temporary's stream twice and
+    /// both flavours, where Debian's frees the temporary's stream twice and
     /// aborts (exit 5): `test of t.zip FAILED`, `ZE_TEST` (exit 8), nothing
     /// on standard error, no temporary left and no archive made.
     #[test]
     fn a_failing_test_is_apples_answer_in_both_flavours() {
-        for flavour in ["apple", "ubuntu"] {
+        for flavour in ["apple", "debian"] {
             for args in [
                 &["-T", "-TT", "false", "t.zip", "a.txt"][..],
                 &["-T", "t.zip", "a.txt"],
@@ -871,7 +871,7 @@ mod unix {
     /// archive's), and the grown archive is in place after the test.
     #[test]
     fn a_grown_archive_is_tested_under_the_temporarys_name() {
-        for flavour in ["apple", "ubuntu"] {
+        for flavour in ["apple", "debian"] {
             let old = zip_made(flavour, &ZipTree::standard(), &["t.zip", "a.txt"], "t.zip");
             let tree = env_probe(ZipTree::standard().file("t.zip", old));
             let mut c = zip_case("zip", &["-T", "-TT", "probe", "-g", "t.zip", "b.txt"], tree);

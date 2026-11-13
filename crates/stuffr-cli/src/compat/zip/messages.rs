@@ -2,9 +2,9 @@
 //! prints it (C locale).
 //!
 //! Ported from Info-ZIP Zip 3.0 (`zip30`, the Info-ZIP licence,
-//! `LICENSE-infozip`), with Apple's `zip-33` changes and Ubuntu's
-//! `3.0-13ubuntu0.2` differences where they show. Each literal names its C
-//! function (`zip.c:help`), an Apple change (`apple.diff`), an Ubuntu patch
+//! `LICENSE-infozip`), with Apple's `zip-33` changes and Debian 13's
+//! `3.0-15+deb13u1` differences where they show. Each literal names its C
+//! function (`zip.c:help`), an Apple change (`apple.diff`), a Debian patch
 //! or the binary it was recorded from. Formats follow C's `printf` as
 //! [`printf`] renders them: `%s` takes the next argument.
 //!
@@ -24,8 +24,8 @@ pub(super) use crate::compat::host::printf;
 /// revision.h's `by Info-ZIP, with modifications by Apple Inc.`, in the
 /// words of stuffr's banner: whose build it alters.
 pub(super) const APPLE_ORIGIN: &str = "original by Info-ZIP, with modifications by Apple Inc.";
-/// Ubuntu's package of upstream's `by Info-ZIP.` banner.
-pub(super) const UBUNTU_ORIGIN: &str = "Debian's build, original by Info-ZIP";
+/// Debian's package of upstream's `by Info-ZIP.` banner.
+pub(super) const DEBIAN_ORIGIN: &str = "Debian's build, original by Info-ZIP";
 /// revision.h:versinfolines[0], `-v`'s banner line. `%s` is the program
 /// (`Zip`, `ZipCloak`, `ZipNote`, `ZipSplit`), stuffr's version, the origin.
 pub(super) const VERSION_BANNER: &str =
@@ -151,11 +151,11 @@ pub(super) const BAD_T_DATE: &str =
 /// zip.c:main, `-tt`.
 pub(super) const BAD_TT_DATE: &str =
     "invalid date entered for -tt option - use mmddyyyy or yyyy-mm-dd";
-/// zip.c:main, `-UN` (ubuntu: UNICODE_SUPPORT), a warning.
+/// zip.c:main, `-UN` (debian: UNICODE_SUPPORT), a warning.
 pub(super) const UN_MUST_BE: &str = "-UN must be Quit, Warn, Ignore, No, Escape, or UTF8: ";
 /// zip.c:main, `-UN`.
 pub(super) const UN_BAD_VALUE: &str = "-UN (unicode) bad value";
-/// zip.c:main, `-Z` with BZIP2_SUPPORT (ubuntu), a warning.
+/// zip.c:main, `-Z` with BZIP2_SUPPORT (debian), a warning.
 pub(super) const Z_METHODS_BZIP2: &str = "valid compression methods are:  store, deflate, bzip2";
 /// zip.c:main, `-Z` without BZIP2_SUPPORT (apple; the stray `)` is the
 /// source's), a warning.
@@ -307,7 +307,7 @@ pub(super) const INVALID_SIZE: &str = "invalid size given. Use option -h for hel
 
 /// stuffr's own: the flavour variable holds neither name (exit 1). `%s` is
 /// the program name, then the value.
-pub(super) const FLAVOR_REFUSED: &str = "%s: STUFFR_ZIP_FLAVOR must be apple or ubuntu, not '%s'\n";
+pub(super) const FLAVOR_REFUSED: &str = "%s: STUFFR_ZIP_FLAVOR must be apple or debian, not '%s'\n";
 
 // ---- scanning names (Task 5: fileio.c, unix.c, zip.c:main) ----
 
@@ -631,8 +631,8 @@ pub(super) const ZIP_HELP2_HEAD: &str = concat!(
     "               zip archive file1 file2 -T -TT \"./unzip -tqq\"\n",
 );
 
-/// ubuntu: the `{}` line Apple comments out (apple.diff, zip.c:925).
-pub(super) const ZIP_HELP2_UBUNTU_LINE: &str =
+/// debian: the `{}` line Apple comments out (apple.diff, zip.c:925).
+pub(super) const ZIP_HELP2_DEBIAN_LINE: &str =
     "             In cmd, {} replaced by temp archive path, else temp appended.\n";
 
 /// zip.c:help_extended after that line.
@@ -899,19 +899,19 @@ pub(super) const ZIP_V_APPLE_POST: &str = concat!(
     "\n",
 );
 
-/// zip.c:version_info, what precedes the banner line (recorded `zip -v`, ubuntu).
-pub(super) const ZIP_V_UBUNTU_PRE: &str =
+/// zip.c:version_info, what precedes the banner line (recorded `zip -v`, debian).
+pub(super) const ZIP_V_DEBIAN_PRE: &str =
     "Copyright (c) 1990-2008 Info-ZIP - Type 'zip \"-L\"' for software license.\n";
 
-/// zip.c:version_info, what follows the banner line (recorded `zip -v`, ubuntu), up to the environment section.
-pub(super) const ZIP_V_UBUNTU_POST: &str = concat!(
+/// zip.c:version_info, what follows the banner line (recorded `zip -v`, debian), up to the environment section.
+pub(super) const ZIP_V_DEBIAN_POST: &str = concat!(
     "Currently maintained by E. Gordon.  Please send bug reports to\n",
     "the authors using the web page at www.info-zip.org; see README for details.\n",
     "\n",
     "Latest sources and executables are at ftp://ftp.info-zip.org/pub/infozip,\n",
     "as of above date; see http://www.info-zip.org/ for other sites.\n",
     "\n",
-    "Compiled with gcc 13.3.0 for Unix (Linux ELF).\n",
+    "Compiled with gcc 14.2.0 for Unix (Linux ELF).\n",
     "\n",
     "Zip special compilation options:\n",
     "\tUSE_EF_UT_TIME       (store Universal Time)\n",
@@ -952,21 +952,21 @@ pub(super) const ZIPCLOAK_V_APPLE_POST: &str = concat!(
     "\t[encryption, version 2.91 of 05 Jan 2007]\n",
 );
 
-/// zipcloak.c:version_info, what precedes the banner line (recorded `zipcloak -v`, ubuntu).
-pub(super) const ZIPCLOAK_V_UBUNTU_PRE: &str = concat!(
+/// zipcloak.c:version_info, what precedes the banner line (recorded `zipcloak -v`, debian).
+pub(super) const ZIPCLOAK_V_DEBIAN_PRE: &str = concat!(
     "Copyright (c) 1990-2008 Info-ZIP - Type 'zipcloak \"-L\"' for software license.\n",
     "\n",
 );
 
-/// zipcloak.c:version_info, what follows the banner line (recorded `zipcloak -v`, ubuntu).
-pub(super) const ZIPCLOAK_V_UBUNTU_POST: &str = concat!(
+/// zipcloak.c:version_info, what follows the banner line (recorded `zipcloak -v`, debian).
+pub(super) const ZIPCLOAK_V_DEBIAN_POST: &str = concat!(
     "Currently maintained by E. Gordon.  Please send bug reports to\n",
     "the authors using the web page at www.info-zip.org; see README for details.\n",
     "\n",
     "Latest sources and executables are at ftp://ftp.info-zip.org/pub/infozip,\n",
     "as of above date; see http://www.info-zip.org/ for other sites.\n",
     "\n",
-    "Compiled with gcc 13.3.0 for Unix (Linux ELF).\n",
+    "Compiled with gcc 14.2.0 for Unix (Linux ELF).\n",
     "\n",
     "ZipCloak special compilation options:\n",
     "\t[encryption, version 2.91 of 05 Jan 2007]\n",
@@ -986,19 +986,19 @@ pub(super) const ZIPNOTE_V_APPLE_POST: &str = concat!(
     "\t[none]\n",
 );
 
-/// zipnote.c:version_info, what precedes the banner line (recorded `zipnote -v`, ubuntu).
-pub(super) const ZIPNOTE_V_UBUNTU_PRE: &str =
+/// zipnote.c:version_info, what precedes the banner line (recorded `zipnote -v`, debian).
+pub(super) const ZIPNOTE_V_DEBIAN_PRE: &str =
     "Copyright (c) 1990-2008 Info-ZIP - Type 'zipnote \"-L\"' for software license.\n";
 
-/// zipnote.c:version_info, what follows the banner line (recorded `zipnote -v`, ubuntu).
-pub(super) const ZIPNOTE_V_UBUNTU_POST: &str = concat!(
+/// zipnote.c:version_info, what follows the banner line (recorded `zipnote -v`, debian).
+pub(super) const ZIPNOTE_V_DEBIAN_POST: &str = concat!(
     "Currently maintained by E. Gordon.  Please send bug reports to\n",
     "the authors using the web page at www.info-zip.org; see README for details.\n",
     "\n",
     "Latest sources and executables are at ftp://ftp.info-zip.org/pub/infozip,\n",
     "as of above date; see http://www.info-zip.org/ for other sites.\n",
     "\n",
-    "Compiled with gcc 13.3.0 for Unix (Linux ELF).\n",
+    "Compiled with gcc 14.2.0 for Unix (Linux ELF).\n",
     "\n",
     "ZipNote special compilation options:\n",
     "\t[none]\n",
@@ -1017,18 +1017,18 @@ pub(super) const ZIPSPLIT_V_APPLE_POST: &str = concat!(
     "\t[none]\n",
 );
 
-/// zipsplit.c:version_info, what precedes the banner line (recorded `zipsplit -v`, ubuntu).
-pub(super) const ZIPSPLIT_V_UBUNTU_PRE: &str = "";
+/// zipsplit.c:version_info, what precedes the banner line (recorded `zipsplit -v`, debian).
+pub(super) const ZIPSPLIT_V_DEBIAN_PRE: &str = "";
 
-/// zipsplit.c:version_info, what follows the banner line (recorded `zipsplit -v`, ubuntu).
-pub(super) const ZIPSPLIT_V_UBUNTU_POST: &str = concat!(
+/// zipsplit.c:version_info, what follows the banner line (recorded `zipsplit -v`, debian).
+pub(super) const ZIPSPLIT_V_DEBIAN_POST: &str = concat!(
     "Currently maintained by E. Gordon.  Please send bug reports to\n",
     "the authors using the web page at www.info-zip.org; see README for details.\n",
     "\n",
     "Latest sources and executables are at ftp://ftp.info-zip.org/pub/infozip,\n",
     "as of above date; see http://www.info-zip.org/ for other sites.\n",
     "\n",
-    "Compiled with gcc 13.3.0 for Unix (Linux ELF).\n",
+    "Compiled with gcc 14.2.0 for Unix (Linux ELF).\n",
     "\n",
     "ZipSplit special compilation options:\n",
     "\t[none]\n",
@@ -1320,7 +1320,7 @@ pub(super) const UNZIP_T: &str = "-t";
 pub(super) const UNZIP_QQ: &str = "-qq";
 /// zip.c:check_unzip_version, the version probe's command.
 pub(super) const UNZIP_V_CMD: &str = " -v";
-/// zip.c:check_zipfile (Ubuntu): `system()`'s command and its quoting.
+/// zip.c:check_zipfile (Debian): `system()`'s command and its quoting.
 pub(super) const UNZIP_T_CMD: &str = "unzip -t ";
 pub(super) const QQ_CMD: &str = "-qq ";
 /// zip.c:check_unzip_version's `sscanf(buf, "UnZip %f ", ...)` prefix.
@@ -1567,7 +1567,7 @@ pub(super) const INDEX_LINE: &str = "%s %s\n";
 /// C library prints `(null)`.
 pub(super) const NULL_TEXT: &str = "(null)";
 
-// ---- Ubuntu's UNICODE_SUPPORT (Task 11) ----
+// ---- Debian's UNICODE_SUPPORT (Task 11) ----
 
 /// zipfile.c:read_Unicode_Path_entry: a leftover debugging `printf` to
 /// standard output on a checksum mismatch (central directory only; `%d` is
@@ -1584,7 +1584,7 @@ pub(super) const UNICODE_MISMATCH_QUIT: &str = "Unicode does not match path:  %s
 pub(super) const UNICODE_PATH_ERROR: &str = "Unicode path error";
 /// zip.c:main (`-su`, and fileio.c:proc_archive_name under `-v`).
 pub(super) const ESCAPED_UNICODE: &str = "     Escaped Unicode:  %s\n";
-/// zipup.c (zip_stats): a bzip2 entry's line, `-Z bzip2` (Ubuntu).
+/// zipup.c (zip_stats): a bzip2 entry's line, `-Z bzip2` (Debian).
 pub(super) const BZIPPED: &str = " (bzipped %s%%)\n";
 /// zipup.c:bz_compress_init, `BZ2_bzCompressInit`'s BZ_PARAM_ERROR (-2): a
 /// block size out of 1..9 (`-0 -Z bzip2`).
