@@ -1013,7 +1013,9 @@ fn back_to_back_truncated_arc_entries_write_linear_bytes() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(4), "{stderr}");
     assert!(
-        stderr.contains("truncated header(s) starting inside an earlier truncated entry"),
+        stderr.contains(
+            "truncated header(s) lying inside an earlier truncated entry's surviving bytes"
+        ),
         "{stderr}"
     );
 

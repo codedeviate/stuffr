@@ -1027,22 +1027,30 @@ pub fn salvage_zip(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
         candidates.sort_by_key(|c| c.offset);
     }
 
+    // Every offset the engine is handed is accounted for by the engine:
+    // listed as an entry, or (bug hunt 2026-11-14, H8) refused for the
+    // run-wide truncated budget and reported as its own sighting.
+    let offered: HashSet<u64> = candidates.iter().map(|c| c.offset).collect();
     let mut outcome = annotate_candidates(&scanner, src, candidates, policy)?;
     // 0.10.3 Task 4b: every header the scan's budget left unjudged — never
     // an entry, and printed by the caller like any other sighting. Unless
     // the central directory recovered it after all (fix round 1): a header
     // the scan refused for its budget is exactly the kind the directory
     // pass above reaches by its own route, and a sighting there would say
-    // "not listed or recovered" of an entry this very outcome lists.
-    let recovered: HashSet<u64> = outcome.entries.iter().map(|e| e.offset).collect();
+    // "not listed or recovered" of an entry this very outcome lists. Nor
+    // when the engine refused that recovered candidate for its truncated
+    // budget: it already reported the offset, and a second sighting would
+    // count one header twice under two reasons.
     outcome
         .sightings
-        .extend(budget_sightings(scanner, &recovered));
+        .extend(budget_sightings(scanner, &offered));
     Ok(outcome)
 }
 
 /// The scan's budget sightings, less every header the directory pass
-/// recovered — filtered BEFORE the cap, so the count stays exact (0.10.4).
+/// recovered (`offered`: every offset handed to the engine, which lists it
+/// or reports it itself) — filtered BEFORE the cap, so the count stays
+/// exact (0.10.4).
 ///
 /// A refused header at an offset no directory record names cannot be
 /// recovered, and went straight into the capped [`ZipSalvage::over_budget`]
@@ -1052,11 +1060,11 @@ pub fn salvage_zip(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
 /// and the held ones: re-pushed in ascending order into a fresh log, with
 /// the capped log's uncounted remainder carried on the last, the result is
 /// what one log of every unrecovered refusal would have held.
-fn budget_sightings(scanner: ZipSalvage, recovered: &HashSet<u64>) -> Vec<Sighting> {
+fn budget_sightings(scanner: ZipSalvage, offered: &HashSet<u64>) -> Vec<Sighting> {
     let held: Vec<u64> = scanner
         .held_for_directory
         .into_iter()
-        .filter(|offset| !recovered.contains(offset))
+        .filter(|offset| !offered.contains(offset))
         .collect();
     let direct = scanner.over_budget.into_sightings();
     if held.is_empty() {
