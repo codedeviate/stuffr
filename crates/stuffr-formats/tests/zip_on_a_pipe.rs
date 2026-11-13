@@ -70,7 +70,7 @@ const ZIP: FormatId = FormatId::new("zip");
 /// crates/stuffr-formats/Cargo.toml` and under `--workspace`). This crate is
 /// not the binary's owner, so the path is derived the way Cargo's own runtime
 /// environment allows instead: this test binary's `current_exe()` lives under
-/// `<target-dir>/<profile>/deps/`, and `stuffr` — built for the SAME profile —
+/// `<target-dir>/<profile>/deps/` (or `build/` since cargo 1.100), and `stuffr` — built for the SAME profile —
 /// lives one directory up. If it is not there yet (a clean checkout that has
 /// never built the CLI crate), this builds it explicitly via the `CARGO`
 /// environment variable Cargo sets at runtime for exactly this kind of
@@ -79,11 +79,22 @@ static STUFFR: LazyLock<PathBuf> = LazyLock::new(stuffr_bin_path);
 
 fn stuffr_bin_path() -> PathBuf {
     let exe = std::env::current_exe().expect("current_exe");
-    // `.../target/<profile>/deps/zip_on_a_pipe-<hash>` -> `.../target/<profile>/`
+    // The test binary lives at `.../target/<profile>/deps/zip_on_a_pipe-<hash>`
+    // (cargo before 1.100) or at
+    // `.../target/<profile>/build/<pkg>/<hash>/out/zip_on_a_pipe-<hash>`
+    // (build-dir layout v2). Either way the profile directory is the parent of
+    // the nearest `deps` or `build` ancestor.
     let profile_dir = exe
-        .parent()
+        .ancestors()
+        .skip(1)
+        .find(|a| {
+            matches!(
+                a.file_name().and_then(|n| n.to_str()),
+                Some("deps" | "build")
+            )
+        })
         .and_then(Path::parent)
-        .expect("test binary has a target/<profile>/deps parent")
+        .expect("test binary sits under a target/<profile>/{deps,build} directory")
         .to_path_buf();
     let bin = profile_dir.join(format!("stuffr{}", std::env::consts::EXE_SUFFIX));
     if bin.is_file() {
