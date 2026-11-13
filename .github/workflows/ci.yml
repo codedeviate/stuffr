@@ -52,16 +52,16 @@ jobs:
       # `lzip.rs`'s reference-tool tests go through `require_lzip`, which
       # PANICS rather than skipping if the binary is absent — `ar.rs`,
       # `cpio.rs` and `zip.rs`'s `require_bin` use the same convention.
-      # `ubuntu-latest` doesn't ship `lzip` (unlike `xz`, which is already on
+      # `ubuntu-24.04` doesn't ship `lzip` (unlike `xz`, which is already on
       # the image), so without this install every one of those tests turns
       # this job red rather than silently no-op'ing — which is deliberate
       # (Finding 8 of the Phase 1e final review: a silent skip here once let
       # the trailing-data rule that took two review rounds to get right go
       # unexercised in CI). `cpio` is the same story for `cpio.rs`'s own
-      # reference-tool test: `ubuntu-latest` ships `unzip`, GNU `tar` and
+      # reference-tool test: `ubuntu-24.04` ships `unzip`, GNU `tar` and
       # `ar` (binutils) but not `cpio` (Phase 1e's Finding 8, repeating —
       # Phase 2's Task 10 brief calls this out by name).
-      # `zip` and `unzip` are named too, though `ubuntu-latest` already
+      # `zip` and `unzip` are named too, though `ubuntu-24.04` already
       # ships both: `zip.rs`'s cross-implementation tests go through
       # `require_bin` as well, so an image change that dropped either would
       # turn this job red with a confusing "reference tool missing" failure
@@ -238,7 +238,7 @@ jobs:
 
   miri:
     name: miri (the two unsafe regions)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -270,7 +270,7 @@ jobs:
 
   fuzz-smoke:
     name: fuzz smoke (codec, container, chain, roundtrip, salvage, compat, infozip — pure tier)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -437,7 +437,7 @@ jobs:
 
   purity:
     name: purity (pure pulls in no C-compiling crate)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master

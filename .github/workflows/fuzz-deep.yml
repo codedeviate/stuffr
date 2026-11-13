@@ -75,7 +75,11 @@ permissions:
 jobs:
   fuzz-deep:
     name: fuzz deep (${{ matrix.target }}${{ matrix.features && format(', {0}', matrix.features) || '' }})
-    runs-on: ubuntu-latest
+    # Pinned, not `ubuntu-latest`: the label moved to 26.04 in November 2026
+    # (actions/runner-images#14748), and a silent image change is how a C
+    # leg meets a new compiler. This job uses no apt reference tools, so it
+    # runs on the newest image; ci.yml's reference-bound jobs stay on 24.04.
+    runs-on: ubuntu-26.04
     # Ruling J: a scheduled workflow must not run in a fork of this
     # repository. `schedule` events aren't delivered to forks by GitHub in
     # the first place unless a fork owner has separately enabled Actions and
@@ -194,7 +198,9 @@ jobs:
             exit 1
           fi
           if [ "$TIER" = c ]; then
-            # GCC 13 (this runner's `cc`) under ASan miscompiles zstd-sys's
+            # Kept from the 24.04 image (GCC 13; 26.04 has GCC 15, where the
+            # reduced case is clean, and the flag is harmless there):
+            # GCC 13 under ASan miscompiles zstd-sys's
             # `-fmerge-all-constants`: a function-local const table (zstd_opt.c's
             # `getAllMatchesFns`) becomes a global, but its scope-end
             # use-after-scope poisoning is still emitted on that global, so the
