@@ -1056,7 +1056,14 @@ struct ZstdArgs<'a> {
     /// Each `--filelist` value: a list of names, read whole once.
     filelists: Vec<&'a str>,
     mode: ZstdMode,
+    /// zstdcli.c's `outFileName` as the arguments leave it: the last of
+    /// `-c`/`--stdout` (the stdout mark) and `-o NAME` (`--train*` only
+    /// supplies a default when none was given).
+    out: Option<&'a str>,
 }
+
+/// zstd's `stdoutmark` (fileio.h).
+const ZSTD_STDOUTMARK: &str = "/*stdout*\\";
 
 /// zstdcli.c's long options that take a value with `=` or, without one,
 /// from the next argument (`NEXT_FIELD`, `NEXT_UINT32`, `NEXT_TSIZE`),
@@ -1089,6 +1096,7 @@ fn zstd_parse<'a>(name: &str, args: &[&'a str]) -> ZstdArgs<'a> {
         operands: Vec::new(),
         dicts: Vec::new(),
         filelists: Vec::new(),
+        out: None,
         mode: match name {
             "unzstd" | "zstdcat" => ZstdMode::Decompress,
             _ => ZstdMode::Compress,
@@ -1119,6 +1127,7 @@ fn zstd_parse<'a>(name: &str, args: &[&'a str]) -> ZstdArgs<'a> {
                 "compress" => z.mode = ZstdMode::Compress,
                 "decompress" | "uncompress" => z.mode = ZstdMode::Decompress,
                 "test" => z.mode = ZstdMode::Test,
+                "stdout" => z.out = Some(ZSTD_STDOUTMARK),
                 l if l.starts_with("train") => z.mode = ZstdMode::Train,
                 _ => {
                     let found = ZSTD_LONG_WITH_VALUE
@@ -1143,20 +1152,23 @@ fn zstd_parse<'a>(name: &str, args: &[&'a str]) -> ZstdArgs<'a> {
                     'd' => z.mode = ZstdMode::Decompress,
                     't' => z.mode = ZstdMode::Test,
                     'l' => z.mode = ZstdMode::List,
+                    'c' => z.out = Some(ZSTD_STDOUTMARK),
                     'o' | 'D' => {
                         // `-D=x` takes the rest; `-D x` the next argument,
                         // and the cluster goes on after `D`.
                         let rest = &cluster[k + 1..];
                         if let Some(v) = rest.strip_prefix('=') {
-                            if c == 'D' {
-                                z.dicts.push(v);
+                            match c {
+                                'D' => z.dicts.push(v),
+                                _ => z.out = Some(v),
                             }
                             break;
                         }
-                        if let Some(v) = value(&mut i, "")
-                            && c == 'D'
-                        {
-                            z.dicts.push(v);
+                        if let Some(v) = value(&mut i, "") {
+                            match c {
+                                'D' => z.dicts.push(v),
+                                _ => z.out = Some(v),
+                            }
                         }
                     }
                     _ => {}
@@ -1181,6 +1193,7 @@ fn zstd_list_names(bytes: &[u8]) -> impl Iterator<Item = &str> {
 /// The zstd family through `run_in_counted`.
 fn run_zstd(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
     let before = contents(dir);
+    check_zstd_stdout_rule_once();
     let z = zstd_parse(name, args);
     // `--filelist` names come from a case file, which holds the payload: a
     // name holding a `/` could leave the run's directory, and `.`/`..`
@@ -1227,7 +1240,7 @@ fn run_zstd(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
     let mut operands = z.operands.clone();
     operands.extend(&listed);
     check_zstd_reads(dir, name, args, &z, &operands, &reads);
-    check_zstd_leftovers(dir, name, args, &listed, zstd_trains_to_stdout(&z, args));
+    check_zstd_leftovers(dir, name, args, &listed, zstd_trains_to_stdout(&z));
     check_budget(dir, name, args, &out, &before);
 }
 
@@ -1333,16 +1346,37 @@ fn check_zstd_leftovers(
     }
 }
 
-/// Whether a zstd run trains a dictionary and was told to send its output to
-/// stdout (`-c`, `--stdout`, or the mark itself as an `-o` value), judged
-/// loosely: any short cluster holding `c` counts, which only loosens the check.
-fn zstd_trains_to_stdout(z: &ZstdArgs, args: &[&str]) -> bool {
-    matches!(z.mode, ZstdMode::Train)
-        && args.iter().any(|a| {
-            *a == "--stdout"
-                || *a == "/*stdout*\\"
-                || (a.starts_with('-') && !a.starts_with("--") && a.contains('c'))
-        })
+/// Whether a zstd run trains a dictionary whose name is the stdout mark: the
+/// parsed `outFileName` is the mark (`-c`/`--stdout` after the last `-o`,
+/// before any `--`).
+fn zstd_trains_to_stdout(z: &ZstdArgs) -> bool {
+    matches!(z.mode, ZstdMode::Train) && z.out == Some(ZSTD_STDOUTMARK)
+}
+
+/// The stdout-dictionary allowance must hold only where zstd's own rules leave
+/// `outFileName` the stdout mark. A fuzz binary cannot run `cargo test`
+/// (libFuzzer owns `main`), so `run_zstd` runs this once per process.
+fn check_zstd_stdout_rule_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let t = |args: &[&str]| zstd_trains_to_stdout(&zstd_parse("zstd", args));
+        assert!(t(&["--train", "-c", "a"]));
+        assert!(t(&["--train", "--stdout", "a"]));
+        assert!(t(&["--train", "-o", "x", "-c", "a"]));
+        // a later -o overrides -c
+        assert!(!t(&["--train", "-c", "-o", "x", "a"]));
+        assert!(!t(&["--train", "--stdout", "-ox", "a"]));
+        // after `--` the flag is an operand
+        assert!(!t(&["--train", "--", "--stdout", "a"]));
+        assert!(!t(&["--train", "--", "-c", "a"]));
+        // `c` inside an `=` value is not -c
+        assert!(!t(&["--train", "-o=c", "a"]));
+        assert!(!t(&["--train", "-D=abc", "a"]));
+        // zstd keeps scanning the cluster after `-o NAME`, so `-oc` is -o, -c
+        assert!(t(&["--train", "-oc", "x", "a"]));
+        // not a training run
+        assert!(!t(&["-c", "a"]));
+    });
 }
 
 /// Whether an lz4 run's operation is `--list`: the last token that sets a
