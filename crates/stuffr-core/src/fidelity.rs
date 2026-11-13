@@ -51,7 +51,7 @@ impl fmt::Display for Rung {
 }
 
 /// Which metadata fields are **missing**. `true` means absent, not present.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct MetaFields {
     pub mtime: bool,
@@ -88,7 +88,7 @@ impl MetaFields {
 }
 
 /// One specific, structured thing that was lost or approximated.
-#[derive(Clone, PartialEq, Eq, Debug, thiserror::Error)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, thiserror::Error)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(tag = "kind", rename_all = "kebab-case"))]
 #[non_exhaustive]
@@ -375,8 +375,11 @@ impl FidelitySink {
     /// Moves every recorded warning into `report` (de-duplicated as
     /// [`FidelityReport::merge`] does), leaving the sink empty.
     pub fn drain_into(&self, report: &mut FidelityReport) {
-        for w in std::mem::take(&mut *self.lock()) {
-            if !report.warnings.contains(&w) {
+        let taken = std::mem::take(&mut *self.lock());
+        let mut seen: std::collections::HashSet<Fidelity> =
+            report.warnings.iter().cloned().collect();
+        for w in taken {
+            if seen.insert(w.clone()) {
                 report.warn(w);
             }
         }
@@ -460,8 +463,11 @@ impl FidelityReport {
         if other.rung.severity() > self.rung.severity() {
             self.rung = other.rung;
         }
+        // A hash set keeps this linear: a convert can fold one warning per
+        // archive entry in here, all distinct.
+        let mut seen: std::collections::HashSet<Fidelity> = self.warnings.iter().cloned().collect();
         for w in &other.warnings {
-            if !self.warnings.contains(w) {
+            if seen.insert(w.clone()) {
                 self.warnings.push(w.clone());
             }
         }
@@ -615,6 +621,41 @@ mod tests {
         let mut a = FidelityReport::new(Rung::Degraded);
         a.merge(&FidelityReport::exact());
         assert_eq!(a.rung, Rung::Degraded);
+    }
+
+    #[test]
+    fn merge_and_drain_of_many_distinct_warnings_keep_order() {
+        const N: usize = 200_000;
+        let skipped = |i: usize| Fidelity::EntrySkipped {
+            entry: i.to_string(),
+            reason: "dup".to_string(),
+        };
+        let mut other = FidelityReport::exact();
+        for i in 0..N {
+            other.warn(skipped(i));
+        }
+        // a repeat of every tenth warning must not be folded in twice
+        for i in (0..N).step_by(10) {
+            other.warn(skipped(i));
+        }
+        let mut merged = FidelityReport::exact();
+        merged.merge(&other);
+        assert_eq!(merged.warnings.len(), N);
+        assert!(
+            merged
+                .warnings
+                .iter()
+                .enumerate()
+                .all(|(i, w)| *w == skipped(i))
+        );
+
+        let sink = FidelitySink::new();
+        for i in 0..N {
+            sink.warn(skipped(i));
+        }
+        let mut drained = FidelityReport::exact();
+        sink.drain_into(&mut drained);
+        assert_eq!(drained.warnings, merged.warnings);
     }
 
     #[test]
