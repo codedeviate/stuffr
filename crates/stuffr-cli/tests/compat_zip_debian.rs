@@ -418,6 +418,9 @@ mod linux {
             let tree = || show(ZipTree::standard().file_at(name.as_bytes(), &archive, 0o644));
             for args in [
                 &["zip", "-T", name][..],
+                // the default test command (no `-TT`) at its non-quiet
+                // spelling: `-v` drops the `qq` from the built-in `unzip -t`
+                &["zip", "-v", "-T", name],
                 &["zip", "-T", "-TT", "unzip -tqq", name],
                 &["zip", "-T", "-TT", "fb/show", name],
                 &["zip", "-T", "-TT", "fb/show {} x", name],

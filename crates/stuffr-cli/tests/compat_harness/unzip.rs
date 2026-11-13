@@ -90,7 +90,7 @@ pub fn debian_unzip_version() -> Option<String> {
 /// The directory of the platform's unzip reference (`unzip`, `zipinfo`,
 /// `funzip`), R3: `/usr/bin` on macOS (Apple's build), and `/usr/bin` on
 /// Linux only when the apt package is [`DEBIAN_UNZIP_VERSION`]: another
-/// release is no reference (CI's ubuntu-latest and `make compat-debian`
+/// release is no reference (CI's Debian 13 jobs and `make compat-debian`
 /// have it). Elsewhere there is none.
 ///
 /// `None`: a skip with a note locally, a panic under `CI` (the rule of

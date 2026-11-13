@@ -1242,9 +1242,10 @@ emulates is two programs:
   by path (`/opt/homebrew/opt/gzip/bin/gzip`, 1.15 here) and never linked, so
   it cannot shadow Apple's; on Linux it is the platform's, and CI's Debian 13
   container has 1.13. The suites probe the version (`gnu_gzip_version()`) and
-  adjust where another release differs. Apple's is `/usr/bin/gzip` (487.0.1). `ncompress` supplies the
-  `.Z` inputs of the GNU foreign-format group (the keg path again; Apple's
-  `/usr/bin/compress` is a different program). A Mac that wants the gzip suites to
+  adjust where another release differs. Apple's is `/usr/bin/gzip`
+  (487.0.1). `ncompress` supplies the `.Z` inputs of the GNU foreign-format
+  group (the keg path again; Apple's `/usr/bin/compress` is a different
+  program). A Mac that wants the gzip suites to
   run rather than skip (they panic under `CI`) needs `brew install gzip
   ncompress`.
 - **CI.** The `compat-macos` job is the only one that runs on macOS: it
@@ -1380,9 +1381,10 @@ and is the second family, after GNU gzip, written **clean room**:
 
 **The unzip family** (`compat/unzip/`) is a port of Info-ZIP UnZip 6.00 in
 two flavours, like gzip: Apple's `zip-33` tree is the base and Debian 13's
-`6.0-29+deb13u1` (Ubuntu 24.04's `6.0-28ubuntu4.1` until 0.26.0) is a set of flavour checks (`flavour.rs`, one function per
-Debian define or patch). Info-ZIP's licence is permissive but asks that an
-altered version be marked, which is why the banner lines name stuffr.
+`6.0-29+deb13u1` (Ubuntu 24.04's `6.0-28ubuntu4.1` until 0.26.0) is a set
+of flavour checks (`flavour.rs`, one function per Debian define or patch).
+Info-ZIP's licence is permissive but asks that an altered version be
+marked, which is why the banner lines name stuffr.
 Each ported function carries a `// port:` comment, each Apple change `//
 apple:`, each Debian difference `// debian:`, and each rule taken from the
 binary `// probe:`. The module doc of `compat/unzip/mod.rs` is the source of
@@ -1392,8 +1394,9 @@ compat-debian` runs the unzip suites against Debian 13's unzip in Docker.
 
 **The zip family** (`compat/zip/`) is a port of Info-ZIP Zip 3.0 in two
 flavours, built like unzip's: Apple's `zip-33` tree is the base and Debian 13's
-`3.0-15+deb13u1` (Ubuntu 24.04's `3.0-13ubuntu0.2` until 0.26.0) is a set of flavour checks (`flavour.rs`, one function per
-Debian define or patch). Comment conventions are unzip's (`// port:`, `//
+`3.0-15+deb13u1` (Ubuntu 24.04's `3.0-13ubuntu0.2` until 0.26.0) is a set
+of flavour checks (`flavour.rs`, one function per Debian define or patch).
+Comment conventions are unzip's (`// port:`, `//
 apple:`, `// debian:`, `// probe:`, plus `// ruling:` for each undefined
 behaviour decision). The module doc of `compat/zip/mod.rs` is the source of
 truth for the thirty deviations; the README mirrors it. `make
