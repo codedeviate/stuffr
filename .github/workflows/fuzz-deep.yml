@@ -78,7 +78,7 @@ jobs:
     # Pinned, not `ubuntu-latest`: the label moved to 26.04 in November 2026
     # (actions/runner-images#14748), and a silent image change is how a C
     # leg meets a new compiler. This job uses no apt reference tools, so it
-    # runs on the newest image; ci.yml's reference-bound jobs stay on 24.04.
+    # runs on the newest image; ci.yml's reference-bound jobs run in Debian 13.
     runs-on: ubuntu-26.04
     # Ruling J: a scheduled workflow must not run in a fork of this
     # repository. `schedule` events aren't delivered to forks by GitHub in

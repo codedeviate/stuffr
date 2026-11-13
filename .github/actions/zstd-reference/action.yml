@@ -6,9 +6,10 @@ description: >-
   harness panics if the reference is missing or is not exactly 1.5.7 with
   gzip, lz4, lzma and xz support.
 
-# liblz4 is the one library NOT taken from the distro: ubuntu's liblz4-dev is
-# 1.9.4, whose level 2 is the "fast" mode, while lz4 1.10.0 added a mid-way
-# level 2, and 1.11.0 changed the bytes of levels 1, 2 and 10-12 again, so
+# liblz4 is the one library NOT taken from the distro: Debian 13's liblz4-dev
+# is 1.10.0 (Ubuntu 24.04's was 1.9.4, whose level 2 is the "fast" mode; 1.10.0
+# added a mid-way level 2), and 1.11.0 changed the bytes of levels 1, 2 and
+# 10-12 again, so
 # `--format=lz4` bytes differ by liblz4 release. The reference therefore links
 # a liblz4.a built from the lz4 1.11.0 release tarball (lib/ only),
 # statically: the release stuffr's lz4-c tier vendors.
@@ -19,18 +20,35 @@ description: >-
 # (cheap: the runners have most of them), and a verification step after the
 # cache restore runs the binary and says so if the cache is broken.
 
+inputs:
+  image:
+    description: >-
+      The container image the job runs in, or empty on the runner's own OS.
+      It is part of the cache key, so an install built on the host is never
+      restored into a container (or one built in another image).
+    required: false
+    default: ''
+
 runs:
   using: composite
   steps:
-    # Keyed on the version, the OS and the CPU: the install is a native build.
+    # Read from `$RUNNER_TEMP` by a step, so the path is the one the step's
+    # own system sees: the runner's, or the container's mount of it.
+    - name: where the install lives
+      id: dir
+      shell: bash
+      run: echo "path=$RUNNER_TEMP/zstd-1.5.7" >> "$GITHUB_OUTPUT"
+
+    # Keyed on the version, the OS, the CPU and the container image: the
+    # install is a native build, linked against that system's libraries.
     - name: cache the zstd 1.5.7 install
       id: cache
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
-        path: ${{ runner.temp }}/zstd-1.5.7
-        key: zstd-1.5.7-lz4-1.11.0-${{ runner.os }}-${{ runner.arch }}
+        path: ${{ steps.dir.outputs.path }}
+        key: zstd-1.5.7-lz4-1.11.0-${{ runner.os }}-${{ runner.arch }}${{ inputs.image && format('-{0}', inputs.image) || '' }}
 
-    # The tarball, not a distro package: ubuntu and Homebrew ship other
+    # The tarball, not a distro package: Debian and Homebrew ship other
     # builds, and the promise is byte identity with 1.5.7. The SHA-256 is the
     # one in the release's own zstd-1.5.7.tar.gz.sha256, and matches a local
     # `shasum -a 256` of the download.
@@ -39,7 +57,10 @@ runs:
       run: |
         set -euo pipefail
         if [ "$RUNNER_OS" = Linux ]; then
-          sudo apt-get update && sudo apt-get install -y zlib1g-dev liblzma-dev
+          # Root in CI's debian:trixie container, which has no sudo to lean
+          # on; a runner's own user still needs it.
+          sudo=; [ "$(id -u)" -eq 0 ] || sudo=sudo
+          $sudo apt-get update && $sudo apt-get install -y --no-install-recommends zlib1g-dev liblzma-dev
         elif [ "$RUNNER_OS" = macOS ]; then
           brew list xz >/dev/null 2>&1 || brew install xz
         fi

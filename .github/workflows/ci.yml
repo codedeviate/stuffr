@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # By hand, on any branch (`gh workflow run ci.yml --ref <branch>`): how a
+  # CI change is proven before it reaches `main`.
+  workflow_dispatch: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,9 +17,73 @@ permissions:
 jobs:
   gate:
     name: gate (stable)
-    # 24.04, not -latest: the Ubuntu unzip suites need unzip 6.0-28ubuntu4.1.
-    runs-on: ubuntu-24.04
+    # The reference-bound jobs (gate, msrv, c-backed) run in Debian 13, the
+    # Linux personality of the unzip, zip, compress, bzip2 and gzip families:
+    # their oracles are apt's packages there (unzip 6.0-29+deb13u1, zip
+    # 3.0-15+deb13u1, ncompress 5.0-3, bzip2, GNU gzip 1.13), and the harness
+    # requires those versions under `CI`. The image is the digest
+    # `tests/docker/debian-13/Dockerfile` (`make compat-debian`) builds on;
+    # refresh both together.
+    runs-on: ubuntu-26.04
+    container: &debian-container
+      image: &debian-image debian:trixie@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6
+      # The runner's own open-file limit (65536). Docker's default soft limit
+      # is 1024, and one test binary running every test at once outgrows it:
+      # the first container gate failed three lib tests with EMFILE.
+      options: --ulimit nofile=65536:65536
+    # Steps run as root in the container, and root ignores permission bits:
+    # every mode-dependent row would answer differently. So the toolchain
+    # lives in homes the user `oracle` owns, and every cargo/make step runs
+    # as `oracle` (`as-oracle`, made by the first step).
+    env: &debian-env
+      CARGO_HOME: /home/oracle/.cargo
+      RUSTUP_HOME: /home/oracle/.rustup
+    defaults: &debian-defaults
+      run:
+        # The runner's own default (the container's would be `sh -e`):
+        # no pipefail, so `unzip -v | head -n 1` cannot fail on SIGPIPE.
+        shell: bash -e {0}
     steps:
+      # What the image lacks, then `oracle`: the uid that owns the checkout
+      # (the runner's own user), so the workspace stays the runner's to
+      # clean. Nothing here ships a `-dev` library or `pkg-config`, which
+      # keeps `c-backed`'s no-system-library build honest (see there).
+      #
+      # `lzip`, `cpio`, `zip`, `unzip`, `lhasa`, `python3`: reference tools
+      # the tests require by name (`require_lzip`, `require_bin`,
+      # `require_lhasa`), and they PANIC when one is absent rather than
+      # skip (Finding 8 of the Phase 1e final review: a silent skip once let
+      # a trailing-data rule go unexercised in CI). `lhasa` installs
+      # `/usr/bin/lhasa` and no `lha`; Homebrew's formula installs the same
+      # program as `lha`, so `require_lhasa` tries both. `ncompress`,
+      # `bzip2`, `gzip`, `zip`, `unzip`: the compat families' Debian
+      # oracles. GNU tar is the image's own `tar` (`require_gnu_tar`).
+      # `perl` gives the reference actions `shasum`, `cmake` builds the
+      # brotli reference, `procps` gives the harness `ps` and `kill`,
+      # `locales` the `en_US.UTF-8` some compat rows switch to.
+      - &debian-setup
+        name: prepare the container (packages, the user oracle)
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git curl ca-certificates build-essential sudo lzip cpio zip unzip \
+            ncompress lhasa bzip2 gzip xz-utils locales python3 perl cmake procps
+          sed -i 's/^# *\(en_US.UTF-8 UTF-8\)/\1/' /etc/locale.gen
+          locale-gen
+          uid=$(stat -c %u "$GITHUB_WORKSPACE")
+          useradd --create-home --uid "$uid" --shell /bin/bash oracle
+          mkdir -p "$CARGO_HOME" "$RUSTUP_HOME"
+          chown oracle:oracle "$CARGO_HOME" "$RUSTUP_HOME"
+          # `setpriv`, not `runuser`: runuser opens a PAM session whose
+          # pam_limits put the soft open-file limit back to 1024 (measured:
+          # EMFILE in three jobs). setpriv only changes the ids, so the
+          # limits and the environment (CI, STUFFR_*_REFERENCE, CARGO_HOME,
+          # ...) carry over; HOME is restated for oracle.
+          printf '%s\n' '#!/bin/sh' \
+            'exec setpriv --reuid=oracle --regid=oracle --init-groups env HOME=/home/oracle "$@"' \
+            > /usr/local/bin/as-oracle
+          chmod 755 /usr/local/bin/as-oracle
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # rust-toolchain's channel branches (`@stable`, `@nightly`, `@1.88`)
       # carry the toolchain in their name; pinned to a SHA that name is gone,
@@ -28,6 +95,9 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
+          # Never a cache built on a runner's own OS: its build scripts were
+          # linked against another libc.
+          key: debian-13
           # `make check`'s lint and fmt steps now reach `fuzz/` as well as the
           # workspace, and `fuzz/` is `exclude`d from the workspace so it has
           # its OWN `target/`. The default config caches only the workspace's,
@@ -49,73 +119,48 @@ jobs:
       # `toolchain: stable` step is inert and "gate (stable)"
       # silently runs on 1.95 instead of stable.
       - run: rm rust-toolchain.toml
-      # `lzip.rs`'s reference-tool tests go through `require_lzip`, which
-      # PANICS rather than skipping if the binary is absent — `ar.rs`,
-      # `cpio.rs` and `zip.rs`'s `require_bin` use the same convention.
-      # `ubuntu-24.04` doesn't ship `lzip` (unlike `xz`, which is already on
-      # the image), so without this install every one of those tests turns
-      # this job red rather than silently no-op'ing — which is deliberate
-      # (Finding 8 of the Phase 1e final review: a silent skip here once let
-      # the trailing-data rule that took two review rounds to get right go
-      # unexercised in CI). `cpio` is the same story for `cpio.rs`'s own
-      # reference-tool test: `ubuntu-24.04` ships `unzip`, GNU `tar` and
-      # `ar` (binutils) but not `cpio` (Phase 1e's Finding 8, repeating —
-      # Phase 2's Task 10 brief calls this out by name).
-      # `zip` and `unzip` are named too, though `ubuntu-24.04` already
-      # ships both: `zip.rs`'s cross-implementation tests go through
-      # `require_bin` as well, so an image change that dropped either would
-      # turn this job red with a confusing "reference tool missing" failure
-      # instead of installing it. Naming them here makes the dependency
-      # explicit and costs nothing when they are already present.
-      # `lhasa` joined the list in Phase 3c Task 6, when LHA gained an
-      # encoder and `lha.rs` gained the only test that can prove what it
-      # writes is genuinely LHA rather than something `oxiarc-lzhuf` and
-      # `delharc` merely agree about. Two things about it are easy to get
-      # wrong and both are load-bearing:
-      #   * The PACKAGE is `lhasa`, and so is the BINARY it installs here —
-      #     `/usr/bin/lhasa`, per the Debian bookworm and Ubuntu noble file
-      #     lists, with no `lha` at all. Homebrew's formula of the same name
-      #     installs the same program as `lha`. `require_lhasa` (in
-      #     `legacy/lha.rs` and again in `cli/common.rs`) tries both names for
-      #     exactly that reason.
-      #   * It belongs on ALL THREE of these lines, the `c-backed` one
-      #     included. That is measured, not assumed: `cargo test --workspace
-      #     --no-default-features --features c-backed -p stuffr-formats --lib
-      #     -- --list` lists `legacy::lha::tests::lhasa_reads_what_we_write`,
-      #     so that job runs the test and panics without the tool.
-      # `tar.rs`'s multi-writer cross-implementation test is the one
-      # holdout: it counts how many of `tar`, `gtar` and `python3` are on
-      # PATH and only asserts that at least one was tried, rather than
-      # requiring a named binary — deliberate, because it is a multi-writer
-      # fallback test, not a single-reference-tool one, and every candidate
-      # it lists is already part of this image or the base image. (`python3`
-      # is not named here: it is part of the base image and cannot be
-      # absent.) Since 0.8.1 some CLI tests also REQUIRE GNU tar, through
-      # `require_gnu_tar` (defined in `cli/common.rs`; called from
-      # `cli/convert.rs`, `cli/entries.rs`, `cli/fidelity.rs`,
-      # `cli/hard_links.rs` and `cli/salvage_checksumless.rs`;
-      # `--sparse --hole-detection=raw`, `--format=pax`):
-      # `gtar`, or a `tar` whose `--version` says GNU. The runner's own
-      # `tar` is GNU's, so nothing is installed for them here; on macOS
-      # they need `brew install gnu-tar` and panic naming it otherwise.
+      # `tar.rs`'s multi-writer cross-implementation test counts how many of
+      # `tar`, `gtar` and `python3` are on PATH and only asserts that at least
+      # one was tried, rather than requiring a named binary. Since 0.8.1 some
+      # CLI tests also REQUIRE GNU tar, through `require_gnu_tar` (defined in
+      # `cli/common.rs`; `--sparse --hole-detection=raw`, `--format=pax`):
+      # `gtar`, or a `tar` whose `--version` says GNU. Debian's `tar` is GNU's,
+      # so nothing is installed for them; on macOS they need
+      # `brew install gnu-tar` and panic naming it otherwise.
       # xz 5.8.4 from the release tarball: the compat_xz* oracle (see the action).
       - uses: ./.github/actions/xz-reference
+        with: &debian-reference
+          image: *debian-image
       # zstd 1.5.7 from the release tarball: the compat_zstd* oracle (see the action).
       - uses: ./.github/actions/zstd-reference
+        with: *debian-reference
       # lz4 1.11.0 from the release tarball: the compat_lz4* oracle (see the action).
       - uses: ./.github/actions/lz4-reference
+        with: *debian-reference
       - uses: ./.github/actions/brotli-reference
-      - run: sudo apt-get update && sudo apt-get install -y lzip cpio zip unzip ncompress lhasa
-      # The unzip family's Ubuntu oracle is this exact package (`unzip_dir()`
-      # requires 6.0-28ubuntu4.1 and panics under CI otherwise): print it.
-      # The compress family's ncompress oracle is this exact package too
-      # (`ncompress_dir()` requires 5.0-1 and panics under CI otherwise).
-      # So is the zip family's: apt's zip 3.0-13ubuntu0.2 (`zip -v` prints it).
-      - run: |
-          dpkg-query -W unzip zip ncompress
+        with: *debian-reference
+      # Everything above ran as root; from here on `oracle` builds and tests,
+      # so it must own the toolchain, the checkout and the restored target/.
+      - &debian-own
+        name: hand the toolchain and the checkout to oracle
+        run: chown -R oracle:oracle "$CARGO_HOME" "$RUSTUP_HOME" "$GITHUB_WORKSPACE"
+      # Not root (a root run passes permission-dependent rows wrongly), and
+      # which releases this run compares against: the unzip, zip and
+      # ncompress oracles are these exact packages (`unzip_dir()`,
+      # `zip_dir()`, `ncompress_dir()` require them and panic under CI
+      # otherwise), as are bzip2's and GNU gzip's.
+      - &debian-versions
+        name: the user and the Debian references
+        run: |
+          test "$(id -u oracle)" != 0
+          as-oracle id
+          echo "open files (root): $(ulimit -Sn) soft, $(ulimit -Hn) hard"
+          as-oracle sh -c 'echo "open files (oracle): $(ulimit -Sn) soft, $(ulimit -Hn) hard"'
+          dpkg-query -W unzip zip ncompress bzip2 gzip
           unzip -v | head -n 1
           zip -v | head -n 2
           compress -V | head -n 1
+          gzip --version | head -n 1
       # The same command CONTRIBUTING.md tells a human to run — but NOT the
       # same toolchain, and not the same platform. The `rm` above puts this
       # job on current stable while `rust-toolchain.toml` keeps local runs on
@@ -129,112 +174,110 @@ jobs:
       #     --target x86_64-unknown-linux-gnu -- -D warnings
       # FULL=1: the overnight mode, every core. Without it `make check` runs
       # the gentler daytime mode (fewer test threads) meant for a laptop.
-      - run: make check FULL=1
+      - run: as-oracle make check FULL=1
 
   msrv:
     name: msrv (1.88)
-    # 24.04, not -latest: the Ubuntu unzip suites need unzip 6.0-28ubuntu4.1.
-    runs-on: ubuntu-24.04
+    # In Debian 13 as `oracle`, like "gate" (see there).
+    runs-on: ubuntu-26.04
+    container: *debian-container
+    env: *debian-env
+    defaults: *debian-defaults
     steps:
+      - *debian-setup
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.88"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: debian-13
       # rust-toolchain.toml pins 1.95 for local development and must not
       # constrain the MSRV check. Remove it so the toolchain action's choice
       # takes effect.
       - run: rm rust-toolchain.toml
-      # See "gate"'s identical step: without this, lzip's, cpio's and zip's
-      # reference-tool tests (all `require_*`/`require_bin`, all PANIC on
-      # absence) turn this job red rather than silently no-op'ing.
       # xz 5.8.4 from the release tarball: the compat_xz* oracle (see the action).
       - uses: ./.github/actions/xz-reference
+        with: *debian-reference
       # zstd 1.5.7 from the release tarball: the compat_zstd* oracle (see the action).
       - uses: ./.github/actions/zstd-reference
+        with: *debian-reference
       # lz4 1.11.0 from the release tarball: the compat_lz4* oracle (see the action).
       - uses: ./.github/actions/lz4-reference
+        with: *debian-reference
       - uses: ./.github/actions/brotli-reference
-      - run: sudo apt-get update && sudo apt-get install -y lzip cpio zip unzip ncompress lhasa
-      # The unzip family's Ubuntu oracle is this exact package (`unzip_dir()`
-      # requires 6.0-28ubuntu4.1 and panics under CI otherwise): print it.
-      # The compress family's ncompress oracle is this exact package too
-      # (`ncompress_dir()` requires 5.0-1 and panics under CI otherwise).
-      # So is the zip family's: apt's zip 3.0-13ubuntu0.2 (`zip -v` prints it).
-      - run: |
-          dpkg-query -W unzip zip ncompress
-          unzip -v | head -n 1
-          zip -v | head -n 2
-          compress -V | head -n 1
+        with: *debian-reference
+      - *debian-own
+      - *debian-versions
       # rust-version claims 1.88 and this job is the only thing that checks it.
       # The floor was 1.85 through Phase 1d; it moved because holding it forced an
       # exact pin on a dependency, which blocked patch-level security fixes, and
       # because let-chains (stable in 1.88) were being routed around in every task.
-      - run: cargo build --workspace --all-features
-      - run: cargo test --workspace --all-features
+      - run: as-oracle cargo build --workspace --all-features
+      - run: as-oracle cargo test --workspace --all-features
       # The pure tier is a different test set, not a subset — see the
       # `test-pure` target in the Makefile for why.
-      - run: cargo test --workspace
+      - run: as-oracle cargo test --workspace
 
   c-backed:
     name: c-backed
-    # 24.04, not -latest: the Ubuntu unzip suites need unzip 6.0-28ubuntu4.1.
-    runs-on: ubuntu-24.04
+    # In Debian 13 as `oracle`, like "gate" (see there).
+    runs-on: ubuntu-26.04
+    container: *debian-container
+    env: *debian-env
+    defaults: *debian-defaults
     steps:
+      - *debian-setup
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: debian-13
       # rust-toolchain.toml pins 1.95 for local development, which would
       # otherwise make the toolchain selection above inert (see "gate"'s
       # identical step).
       - run: rm rust-toolchain.toml
-      # The first job in this project's history that needs a C compiler on
-      # the runner — and it needs nothing else. `zstd` vendors its own C
-      # source and builds it statically by default, and `liblzma` is pinned
-      # to `{ version = "0.4", default-features = false, features =
+      # The build needs a C compiler and nothing else. `zstd` vendors its
+      # own C source and builds it statically by default, and `liblzma` is
+      # pinned to `{ version = "0.4", default-features = false, features =
       # ["static"] }` specifically so it never reaches for `libclang` (for
-      # bindgen) or a system liblzma via pkg-config. Do NOT add an
-      # `apt-get install` step "to be safe" — that would mask a regression
-      # back to the pkg-config path, which is the failure this job's minimal
-      # setup exists to catch. If this job ever fails for a missing system
-      # library, that is the bug, not the runner.
-      - run: cargo build --workspace --no-default-features --features c-backed
-      # Reference TOOLS, installed deliberately after the build above and
-      # never before it. The build is what proves the no-system-library
-      # property — linking happens there — so the guard the comment above
-      # describes is fully intact at the moment it matters. What follows is
-      # `cargo test`, and `lzip.rs`, `cpio.rs` and `zip.rs` each require a
-      # named reference binary through a panicking `require_bin`/
-      # `require_lzip`: absent, they fail loudly rather than proving nothing.
-      # None of these packages ships a `liblzma` pkg-config file, so none can
-      # mask the pkg-config regression this job exists to catch.
+      # bindgen) or a system liblzma via pkg-config. The container's first
+      # step installs `build-essential` and reference tools but no `-dev`
+      # library and no `pkg-config`; do NOT add one before this build "to be
+      # safe" — that would mask a regression back to the pkg-config path,
+      # which is the failure this job's minimal setup exists to catch. If
+      # this job ever fails for a missing system library, that is the bug,
+      # not the image. The toolchain is handed to `oracle` first, for the
+      # build too.
+      - *debian-own
+      - run: as-oracle cargo build --workspace --no-default-features --features c-backed
+      # The reference actions, deliberately after the build above and never
+      # before it: the zstd one installs zlib1g-dev and liblzma-dev (its
+      # binary links them). The build is what proves the no-system-library
+      # property — linking happens there — so the guard above is fully
+      # intact at the moment it matters. What follows is `cargo test`, whose
+      # reference-tool tests panic when their tool is absent.
       #
-      # This job went red on the v0.2.0 push for exactly this: Phase 2 turned
+      # This job went red on the v0.2.0 push for exactly that: Phase 2 turned
       # lzip's silent skip into a hard requirement on the stated grounds that
       # "CI already installs lzip unconditionally" — which was checked against
       # `gate` and `msrv`, both of which do, and not against this job, which
       # did not. 11 lzip tests panicked.
       # xz 5.8.4 from the release tarball: the compat_xz* oracle (see the action).
       - uses: ./.github/actions/xz-reference
+        with: *debian-reference
       # zstd 1.5.7 from the release tarball: the compat_zstd* oracle (see the action).
       - uses: ./.github/actions/zstd-reference
+        with: *debian-reference
       # lz4 1.11.0 from the release tarball: the compat_lz4* oracle (see the action).
       - uses: ./.github/actions/lz4-reference
+        with: *debian-reference
       - uses: ./.github/actions/brotli-reference
-      - run: sudo apt-get update && sudo apt-get install -y lzip cpio zip unzip ncompress lhasa
-      # The unzip family's Ubuntu oracle is this exact package (`unzip_dir()`
-      # requires 6.0-28ubuntu4.1 and panics under CI otherwise): print it.
-      # The compress family's ncompress oracle is this exact package too
-      # (`ncompress_dir()` requires 5.0-1 and panics under CI otherwise).
-      # So is the zip family's: apt's zip 3.0-13ubuntu0.2 (`zip -v` prints it).
-      - run: |
-          dpkg-query -W unzip zip ncompress
-          unzip -v | head -n 1
-          zip -v | head -n 2
-          compress -V | head -n 1
-      - run: cargo test --workspace --no-default-features --features c-backed
+        with: *debian-reference
+      - *debian-versions
+      - run: as-oracle cargo test --workspace --no-default-features --features c-backed
 
   miri:
     name: miri (the two unsafe regions)
@@ -465,7 +508,7 @@ jobs:
 
   supply-chain:
     name: supply chain (cargo-deny)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
