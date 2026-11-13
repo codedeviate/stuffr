@@ -1,17 +1,18 @@
 //! The ncompress personality: stuffr behaving as ncompress 5.0, built as
-//! Ubuntu's `5.0-1` builds it, on every platform (ruling E6 of 0.18.0).
+//! Debian 13's `5.0-3` builds it, on every platform (ruling E6 of 0.18.0).
 //!
 //! **Ported from source.** ncompress 5.0's `compress.c` (github
 //! `vapier/ncompress` tag `v5.0`, identical to Debian's
 //! `ncompress_5.0.orig.tar.gz`), released into the public domain under the
 //! Unlicense, whose text ships with stuffr-cli as `LICENSE-ncompress`. Of
-//! Ubuntu's three patches, `uncompress-real.patch` and `fix-softlinks.patch`
-//! change behaviour: the first is deviation N2 below, the second drops
+//! Debian 13's six patches (`remove-zcat`, `uncompress-real`, `fix-softlinks`,
+//! `manpage-cleanup`, `gcc-15`, `old-style-functions`), `uncompress-real.patch`
+//! and `fix-softlinks.patch` change behaviour: the first is deviation N2 below, the second drops
 //! `-DLSTAT`, so `lstat` is `stat` and symbolic links are followed. The
 //! build's `-DUSERMEM=800000` makes the `FAST` hash, and glibc's `BUFSIZ`
 //! makes `IBUFSIZ` and `OBUFSIZ` 8192, which shows in `-V` and in the
 //! corrupt-input debug line. The measurement record of 0.18.0 Task 1
-//! checked every behaviour against Ubuntu's and Homebrew's 5.0.
+//! checked every behaviour against Debian 13's and Homebrew's 5.0.
 //!
 //! **Names.** `uncompress` decompresses, and so does `compress -d`. The
 //! usage names the invoked program (`progname`).
@@ -95,7 +96,7 @@
 //!   after it the ratio checks see the 10-bit sizes, so the CLEAR codes
 //!   fall where ncompress's would not.
 //! - **N2.** `uncompress` decompresses under that name on every platform
-//!   (ruling E5). Ubuntu's binary decompresses only as `uncompress.real`
+//!   (ruling E5). Debian 13's binary decompresses only as `uncompress.real`
 //!   (Debian's `uncompress-real.patch`; as `uncompress` it compresses), so
 //!   where its usage says `uncompress.real`, stuffr's says `uncompress`.
 //! - **N4.** `uncompress -f` on a file refused at its header (not in
@@ -108,8 +109,8 @@
 //!   which is false (the input was refused, nothing replaced `g`): stuffr
 //!   leaves that line out. An empty `.Z` with `-f` still becomes an empty
 //!   output, as ncompress makes it (nothing is lost).
-//! - **Ubuntu's build everywhere (ruling E6).** On macOS this personality
-//!   is still Ubuntu's build, not Homebrew's: symbolic-link operands are
+//! - **Debian 13's build everywhere (ruling E6).** On macOS this personality
+//!   is still Debian 13's build, not Homebrew's: symbolic-link operands are
 //!   followed (Homebrew's `-DLSTAT` refuses them, `NAME is not a directory
 //!   or a regular file - ignored`), `-V` lists `FAST, ` and `IBUFSIZ=8192,
 //!   OBUFSIZ=8192`, and the corrupt-input debug line and the output written

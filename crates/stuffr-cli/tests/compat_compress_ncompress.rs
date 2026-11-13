@@ -1,7 +1,7 @@
 //! Differential tests: stuffr invoked as `compress` and `uncompress` with
 //! `STUFFR_COMPRESS_FLAVOR=ncompress`, against ncompress 5.0
-//! ([`ncompress_dir`](compat_harness::ncompress_dir)): Ubuntu's `5.0-1` on
-//! Linux (`make compat-ubuntu`; `uncompress` is `/usr/bin/uncompress.real`
+//! ([`ncompress_dir`](compat_harness::ncompress_dir)): Debian 13's `5.0-3` on
+//! Linux (`make compat-debian`; `uncompress` is `/usr/bin/uncompress.real`
 //! there), Homebrew's 5.0 on macOS.
 //!
 //! Every row comes from the measurement record of 0.18.0 Task 1
@@ -13,9 +13,9 @@
 //! round-tripped; the one invalid stream (deviation N1) is asserted in
 //! `deviations`.
 //!
-//! **Platforms (ruling E6).** The personality is Ubuntu's build on every
+//! **Platforms (ruling E6).** The personality is Debian 13's build on every
 //! platform. On Linux the suite compares against that build and masks
-//! nothing. On macOS Homebrew's build differs from Ubuntu's in exactly
+//! nothing. On macOS Homebrew's build differs from Debian 13's in exactly
 //! three measured ways, and each is masked where it shows, with a comment:
 //! symbolic-link operands (`symlink_operands`), the `-V` text
 //! (`mask_homebrew`), and the corrupt-input debug line with the output
@@ -86,14 +86,14 @@ mod common {
     }
 
     /// The reference on `c`: `compress`, or `uncompress` under the name that
-    /// decompresses (`uncompress.real` on Ubuntu). `None` without one.
+    /// decompresses (`uncompress.real` on Debian 13). `None` without one.
     pub fn reference_run(c: &Case) -> Option<Run> {
         let dir = ncompress_dir()?;
         Some(run_program(&ncompress_exe(dir, c.name), c, false))
     }
 
     /// Whether the reference is Homebrew's build (macOS), which differs
-    /// from Ubuntu's in the three ways the module doc lists.
+    /// from Debian 13's in the three ways the module doc lists.
     pub fn homebrew() -> bool {
         cfg!(target_os = "macos")
     }
@@ -107,7 +107,7 @@ mod common {
         // Mask 1 of 3, the `-V` text: Homebrew's build is compiled with
         // `-DLSTAT` and stdio's 1024-byte `BUFSIZ`, so its compile-option
         // lines read `FAST, LSTAT, ` and `IBUFSIZ=1024, OBUFSIZ=1024`;
-        // Ubuntu's (stuffr's) read `FAST, ` and `IBUFSIZ=8192,
+        // Debian 13's (stuffr's) read `FAST, ` and `IBUFSIZ=8192,
         // OBUFSIZ=8192`. The two lines after `Compile options:` are masked
         // on both sides; every other line is compared.
         for run in [&mut *r, &mut *s] {
@@ -125,9 +125,9 @@ mod common {
         }
         // Mask 2 of 3, the corrupt-input debug line: `insize:N posbits:N
         // inbuf:...` reports the input buffer's state, which depends on
-        // IBUFSIZ (1024 on Homebrew, 8192 on Ubuntu), and the output that
+        // IBUFSIZ (1024 on Homebrew, 8192 on Debian 13), and the output that
         // reached standard output before the abort is whole OBUFSIZ pieces
-        // (29 696 bytes on Homebrew, 24 576 on Ubuntu for the record's
+        // (29 696 bytes on Homebrew, 24 576 on Debian 13 for the record's
         // concatenated stream). The line is masked on both sides. Both
         // detect the bad code at the same place, so stuffr's output must be
         // whole 8192-byte pieces, a prefix of Homebrew's whole 1024-byte
@@ -335,7 +335,7 @@ mod differential {
     /// `-V` print to standard output and exit 0 at once; an unknown flag is
     /// `Unknown flag: 'x'; ` and the usage, exit 1; `-n`, `-s`, `-q`, `-r`,
     /// `-k`, `-F` are accepted. (`uncompress`'s usage rows are
-    /// `deviations::n2_*` on Linux, where Ubuntu's names `uncompress.real`.)
+    /// `deviations::n2_*` on Linux, where Debian 13's names `uncompress.real`.)
     #[test]
     fn flags_and_usage_match_ncompress() {
         let Some(x) = fixtures() else { return };
@@ -1050,13 +1050,13 @@ mod differential {
         group("every bit count", &cases);
     }
 
-    /// Mask 3 of 3 (ruling E6), symbolic links as operands. Ubuntu builds
+    /// Mask 3 of 3 (ruling E6), symbolic links as operands. Debian 13 builds
     /// ncompress without `-DLSTAT` (Debian's `fix-softlinks.patch`), so a
     /// link operand is followed: `compress l` writes `l.Z` and removes the
     /// link, exit 0. Homebrew's build has `-DLSTAT` and refuses it (`l is
     /// not a directory or a regular file - ignored`, exit 1). On Linux these
     /// rows are compared like any other; on macOS the reference's refusal is
-    /// asserted as measured, and stuffr's answer as Ubuntu's.
+    /// asserted as measured, and stuffr's answer as Debian 13's.
     #[test]
     fn symlink_operands() {
         let Some(x) = fixtures() else { return };
@@ -1120,7 +1120,7 @@ mod differential {
                 }
                 ("uncompress", ["-c", "l.Z"]) => assert!(s.stdout == x.f, "{why}"),
                 ("compress", ["-r", "ld"]) => {
-                    // Ubuntu's `stat` walks the linked directory.
+                    // Debian 13's `stat` walks the linked directory.
                     assert_eq!(names, ["dir/", "dir/a.Z", "ld"], "{why}");
                     assert!(s.tree["dir/a.Z"].0 == x.az, "{why}");
                 }
@@ -1222,7 +1222,7 @@ mod deviations {
     }
 
     /// N2: `uncompress` decompresses under that name on every platform
-    /// (ruling E5). Ubuntu's binary decompresses only as
+    /// (ruling E5). Debian 13's binary decompresses only as
     /// `uncompress.real` (Debian's `uncompress-real.patch`), so its
     /// messages that name the program say `uncompress.real` where stuffr's
     /// say `uncompress`; everything else is the same. Homebrew's build is
@@ -1340,7 +1340,7 @@ mod interrupts {
 
     /// The program and the `argv[0]` it runs as: stuffr as `name`, or the
     /// reference program that answers to `name` (`uncompress.real` on
-    /// Ubuntu, which only decompresses under that name).
+    /// Debian 13, which only decompresses under that name).
     fn exe(mine: bool, name: &str) -> (PathBuf, String) {
         if mine {
             return (

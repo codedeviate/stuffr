@@ -224,8 +224,10 @@ mod differential {
     // ---- the reference's version: the one table ----
 
     /// Every place this suite's reference behaves differently by release.
-    /// stuffr models GNU gzip 1.15; CI's references are older (ubuntu's
-    /// 1.12, the macOS runner's Homebrew 1.14). Each row names the release
+    /// stuffr models GNU gzip 1.15; CI's references are older (Debian 13's
+    /// 1.13, the macOS runner's Homebrew 1.14; the 1.13 leading-newline
+    /// difference is in stuffr, not here, see `OUTPUT_REFUSED`; the 1.12 rows
+    /// below were measured on Ubuntu 24.04 before it was dropped). Each row names the release
     /// a behaviour arrived in and the evidence: GNU's NEWS, and what CI's
     /// 1.12 and 1.14 printed (run 38132192489). A case that depends on a
     /// row is added through [`Gated::since`], and on an older reference it
@@ -1904,7 +1906,8 @@ mod differential {
     /// A stored `/` names the output `s/`, the operand's own directory.
     /// GNU says the system's refusal to create it exclusively: macOS's
     /// EEXIST is "already exists" (exit 2), Linux's EISDIR for a name
-    /// ending in `/` is `Is a directory` (exit 1, CI's ubuntu). stuffr
+    /// ending in `/` is `Is a directory` (exit 1) after the blank line of a
+    /// failed create (Debian 13's 1.13; Ubuntu's 1.12 printed none). stuffr
     /// once said "already exists" everywhere. Asserted on stuffr's side,
     /// so it holds without a reference; nothing is written either way.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1916,7 +1919,7 @@ mod differential {
         });
         let s = stuffr_as(&dz("gzip", &["-dN", "s/in.gz"], vec![("s/in.gz", m)]));
         let want = if cfg!(target_os = "linux") {
-            (1, "gzip: s/: Is a directory\n")
+            (1, "\ngzip: s/: Is a directory\n")
         } else {
             (2, "gzip: s/ already exists;\tnot overwritten\n")
         };

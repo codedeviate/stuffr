@@ -1,6 +1,6 @@
 //! Every message the ncompress personality prints, copied from ncompress
-//! 5.0's `compress.c` (the Unlicense, `LICENSE-ncompress`) as Ubuntu's
-//! `5.0-1` builds it, and checked against Ubuntu's `/usr/bin/compress` and
+//! 5.0's `compress.c` (the Unlicense, `LICENSE-ncompress`) as Debian 13's
+//! `5.0-3` builds it, and checked against Debian 13's `/usr/bin/compress` and
 //! Homebrew's 5.0. Formats keep C's `fprintf` layout and print through
 //! [`printf`]: each conversion (`%s`, `%d`, `%i`, `%c`, `%jd`, `%02X`)
 //! takes the next argument, which the caller has already formatted as C
@@ -12,7 +12,7 @@
 //! and `strerror(errno)`.
 //!
 //! One deliberate choice, ruling E6 of 0.18.0: [`ABOUT`]'s compile-option
-//! lines are Ubuntu's build's (`FAST, ` and `IBUFSIZ=8192, OBUFSIZ=8192`)
+//! lines are Debian 13's build's (`FAST, ` and `IBUFSIZ=8192, OBUFSIZ=8192`)
 //! on every platform, where Homebrew's read `FAST, LSTAT, ` and
 //! `IBUFSIZ=1024, OBUFSIZ=1024`.
 
@@ -184,7 +184,7 @@ pub(super) const FIRST_CODE: &str = "oldcode:-1 code:%i\n";
 pub(super) const BAD_CODE: &str = "insize:%d posbits:%d inbuf:%02X %02X %02X %02X %02X (%d)\n";
 
 /// `decompress`, after either of the two above (the name is fixed, even
-/// as `compress -d` or Ubuntu's `uncompress.real`).
+/// as `compress -d` or Debian 13's `uncompress.real`).
 pub(super) const CORRUPT_INPUT: &str = "uncompress: corrupt input\n";
 
 // ---- read_error, write_error ----
@@ -197,7 +197,7 @@ pub(super) const WRITE_ERROR: &str = "\nwrite error on";
 
 // ---- about ----
 
-/// `about()`, `-V`, to standard output: `version_id` and Ubuntu's build's
+/// `about()`, `-V`, to standard output: `version_id` and Debian 13's build's
 /// compile options (ruling E6; see the module doc).
 pub(super) const ABOUT: &str = concat!(
     "Compress version: (N)compress 5.0\n",
@@ -241,10 +241,10 @@ mod tests {
         assert_eq!(out, b"x%");
     }
 
-    /// The `-V` text is Ubuntu's, byte for byte (the record's
-    /// "ncompress `-V` stdout, Ubuntu 5.0-1").
+    /// The `-V` text is Debian 13's, byte for byte (the record's
+    /// "ncompress `-V` stdout, Ubuntu 5.0-1"; Debian 13's 5.0-3 prints the same).
     #[test]
-    fn about_is_ubuntus() {
+    fn about_is_debians() {
         assert_eq!(ABOUT.len(), 556);
         assert!(
             ABOUT.contains("\n        FAST, \n        IBUFSIZ=8192, OBUFSIZ=8192, BITS=16\n\n")

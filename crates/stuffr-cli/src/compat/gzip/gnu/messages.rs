@@ -247,11 +247,16 @@ pub(super) const STDIN_NAME: &[u8] = b"stdin";
 /// `gzip: stdin: …` or `gzip: NAME: …`. Observed for the unlink `-f`
 /// does first: `gzip -df a.gz` with a directory `a` says `gzip: a:
 /// Operation not permitted`, no leading newline; and for an existing
-/// output the system refuses other than with EEXIST (observed on ubuntu's
-/// 1.12: `gzip -dN s/in.gz` storing `/` says `gzip: s/: Is a directory`,
-/// exit 1). A full disk was not
-/// reproduced; read and write errors take the same shape.
+/// output the system refuses other than with EEXIST, see [`OUTPUT_REFUSED`]. A
+/// full disk was not reproduced; read and write errors take the same shape.
 pub(super) const IO_FAILED: &str = "%s: %s: %s\n";
+
+/// The system's refusal to create the output name when one exists and the
+/// refusal is not EEXIST. Observed on Debian 13's 1.13: `gzip -dN s/in.gz`
+/// storing `/` (any name ending in `/`) says `\ngzip: s/: Is a directory`
+/// (exit 1), also under `-f` and `-v` (`-f`: Linux only, see `may_write`); Ubuntu's 1.12 printed it without the newline. NEWS 1.13 does not
+/// mention it, so whether upstream or Debian added it is not known.
+pub(super) const OUTPUT_REFUSED: &str = "\n%s: %s: %s\n";
 
 // ---- decompression, -t and -l ----
 //

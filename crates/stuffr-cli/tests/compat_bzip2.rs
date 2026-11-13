@@ -674,7 +674,7 @@ mod differential {
 
     /// Whether the reference exits straight after printing the licence, as
     /// Debian's bzip2 does (its `20-legacy.patch` adds `exit(0)` after
-    /// `license()`; ubuntu-latest inherits it). Upstream 1.0.8 carries on and
+    /// `license()`; Debian 13 has it too). Upstream 1.0.8 carries on and
     /// compresses stdin, so `bzip2 -V </dev/null` writes an empty stream.
     fn reference_exits_after_license() -> Option<bool> {
         let exe = Path::new(REFERENCE_DIR).join("bzip2");

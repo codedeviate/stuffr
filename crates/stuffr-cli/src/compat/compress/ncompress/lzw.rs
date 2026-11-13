@@ -1,5 +1,5 @@
 //! ncompress 5.0's coder, `compress()` and `decompress()` of `compress.c`
-//! (the Unlicense, `LICENSE-ncompress`), as Ubuntu's 5.0-1 builds it:
+//! (the Unlicense, `LICENSE-ncompress`), as Debian 13's 5.0-3 builds it:
 //! `-DUSERMEM=800000`, so `FAST` (a 2^17-entry hash with `primetab`'s
 //! secondary probe), and glibc's `BUFSIZ` for `IBUFSIZ` and `OBUFSIZ`
 //! (8192).

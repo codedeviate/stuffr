@@ -7,7 +7,7 @@
 //!   ported from its `compress.c` and `zopen.c` (BSD-3-Clause,
 //!   `LICENSE-compress-bsd`). The module doc of `apple/mod.rs` lists the
 //!   behaviours reproduced and the deviations.
-//! - **ncompress** (`ncompress/`): ncompress 5.0 as Ubuntu's `5.0-1`
+//! - **ncompress** (`ncompress/`): ncompress 5.0 as Debian 13's `5.0-3`
 //!   builds it, on every platform, ported from its `compress.c` (the
 //!   Unlicense, `LICENSE-ncompress`). The module doc of `ncompress/mod.rs`
 //!   lists the behaviours reproduced and the deviations.
@@ -16,8 +16,9 @@
 //! `apple` or `ncompress`; [`run`] reads the variable once, before any
 //! argument. Anything else in it is refused, exit 1, in stuffr's own words
 //! (neither reference has the variable). `uncompress` decompresses in both
-//! flavours, on every platform (Ubuntu's own `uncompress` is gzip's script,
-//! and its ncompress binary decompresses only as `uncompress.real`).
+//! flavours, on every platform (on Debian 13 `/usr/bin/uncompress` is a symlink to
+//! gzip's `gunzip`, `dpkg -S` says package gzip, and the ncompress binary
+//! decompresses only as `uncompress.real`, a symlink to `compress`).
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;

@@ -763,7 +763,7 @@ const NCOMPRESS_VERSION_LINE: &str = "Compress version: (N)compress 5.0";
 
 /// `dpkg-query -W -f '${Version}' ncompress`, `None` when there is no such
 /// package (or no dpkg).
-pub fn ubuntu_ncompress_version() -> Option<String> {
+pub fn debian_ncompress_version() -> Option<String> {
     let out = output(
         Command::new("dpkg-query")
             .args(["-W", "-f", "${Version}", "ncompress"])
@@ -777,8 +777,9 @@ pub fn ubuntu_ncompress_version() -> Option<String> {
 }
 
 /// The directory of an ncompress 5.0 reference: `compress`, and beside it
-/// `uncompress` (Homebrew, upstream) or `uncompress.real` (Debian and
-/// Debian 13, whose `uncompress` is gzip's script; [`ncompress_exe`] picks).
+/// `uncompress` (Homebrew, upstream) or `uncompress.real` (Debian 13: its
+/// `uncompress` is a symlink to gzip's `gunzip`, `uncompress.real` one to
+/// `compress`; [`ncompress_exe`] picks).
 ///
 /// Looked up in this order, the first whose `compress -V` reports 5.0
 /// winning:
@@ -795,7 +796,7 @@ pub fn ncompress_dir() -> Option<&'static str> {
     static DIR: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
     let found = DIR.get_or_init(|| {
         if cfg!(target_os = "linux") && std::env::var_os("CI").is_some() {
-            match ubuntu_ncompress_version() {
+            match debian_ncompress_version() {
                 Some(v) if v == DEBIAN_NCOMPRESS_VERSION => {}
                 Some(v) => {
                     panic!("CI is set but the apt ncompress is {v}, not {DEBIAN_NCOMPRESS_VERSION}")

@@ -8,7 +8,7 @@ pub enum Flavour {
     /// Apple's `/usr/bin/compress` (`file_cmds-487.0.1`): the default on
     /// macOS and the BSDs.
     Apple,
-    /// ncompress 5.0 as Ubuntu 24.04 ships it (`5.0-1`): the default
+    /// ncompress 5.0 as Debian 13 ships it (`5.0-3`): the default
     /// elsewhere.
     Ncompress,
 }

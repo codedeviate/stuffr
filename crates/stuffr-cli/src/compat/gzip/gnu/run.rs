@@ -426,7 +426,15 @@ impl Gz<'_> {
             let is_input = fs::metadata(out_path)
                 .is_ok_and(|o| same_file(&o, input_meta).unwrap_or(out_path == input));
             if !is_input && let Err(e) = fs::remove_file(out_path) {
-                self.error(m::IO_FAILED, &[PROGRAM, qout, &strerror(&e)]);
+                // A name ending in `/` fails as a create, not an unlink: Debian
+                // 13's 1.13 prefixes the newline (see `OUTPUT_REFUSED`); macOS
+                // 1.15 does not (its unlink says "Operation not permitted").
+                let fmt = if cfg!(target_os = "linux") && qout.ends_with(b"/") {
+                    m::OUTPUT_REFUSED
+                } else {
+                    m::IO_FAILED
+                };
+                self.error(fmt, &[PROGRAM, qout, &strerror(&e)]);
                 return None;
             }
             return Some(true);
@@ -434,8 +442,9 @@ impl Gz<'_> {
         // "Already exists" is the system's refusal to create a name that
         // exists; any other refusal is said in the system's words (exit 1).
         // The two differ for a name ending in `/` over a directory: macOS
-        // says EEXIST, Linux EISDIR (CI's 1.12: `gzip -dN s/in.gz` storing
-        // `/` says `gzip: s/: Is a directory`). So ask the system: an
+        // says EEXIST, Linux EISDIR (Debian 13's 1.13: `gzip -dN s/in.gz`
+        // storing `/` says `\ngzip: s/: Is a directory`, the leading newline
+        // of a failure to create the output; Ubuntu's 1.12 had none). So ask the system: an
         // exclusive create of a name that exists creates nothing, and one
         // that vanished meanwhile is removed again.
         match File::options().write(true).create_new(true).open(out_path) {
@@ -445,7 +454,7 @@ impl Gz<'_> {
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => {
-                self.error(m::IO_FAILED, &[PROGRAM, qout, &strerror(&e)]);
+                self.error(m::OUTPUT_REFUSED, &[PROGRAM, qout, &strerror(&e)]);
                 return None;
             }
         }

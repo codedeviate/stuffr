@@ -1,6 +1,6 @@
 //! `main` after its option loop, `comprexx`, `compdir`, `prratio`,
 //! `read_error`, `write_error` and `abort_compress`, from ncompress 5.0's
-//! `compress.c` (the Unlicense, `LICENSE-ncompress`) with Ubuntu's 5.0-1
+//! `compress.c` (the Unlicense, `LICENSE-ncompress`) with Debian 13's 5.0-3
 //! build: `stat` where upstream's `-DLSTAT` build calls `lstat`
 //! (`fix-softlinks.patch`), so symbolic links are followed. Each in the
 //! order the C makes its calls, since the order decides which message a
@@ -295,7 +295,7 @@ impl Run<'_, '_> {
     fn comprexx_inner(&mut self, fileptr: &[u8]) -> Result<Option<()>, Abort> {
         let mut tempname = fileptr.to_vec();
         let mut has_z = has_z_suffix(&tempname);
-        // Ubuntu's build: `lstat` is `stat`.
+        // Debian 13's build: `lstat` is `stat`.
         let infstat = match fs::metadata(self.path(&tempname)) {
             Ok(st) => st,
             Err(e) => {

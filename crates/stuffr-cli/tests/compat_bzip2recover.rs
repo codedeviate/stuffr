@@ -2,7 +2,7 @@
 //! bzip2recover 1.0.8. Every case compares the `rec*` file names, bytes and
 //! modes, stderr and the exit code.
 //!
-//! **Debian's reference.** Debian and Ubuntu patch bzip2recover with
+//! **Debian's reference.** Debian (1.0.8-6 on Debian 13) patches bzip2recover with
 //! `bzip2recover-race-open-output.diff`, which opens each output with
 //! `open(O_WRONLY|O_CREAT|O_EXCL, 0600)` instead of `fopen(.., "wb")`. That
 //! makes the outputs mode 0600 whatever the umask, and refuses (`can't
@@ -15,17 +15,18 @@
 //! `0o666 & !umask` output modes are checked and then set to stuffr's 0600
 //! before comparing.
 //!
-//! **A reference that caps one magic early.** Debian's 1.0.8-6 build stops
-//! at the 50000th magic with "appears to contain more than 50000 blocks"
-//! (exit 1, no outputs), where upstream 1.0.8 (macOS) lists block 50000 and
-//! stops only at the 50001st. No Debian patch touches this: its
-//! `bzip2recover.c` has upstream's check, and upstream writes `bStart[50000]`
-//! one past the array at that magic, so this is the same undefined
-//! behaviour compiled differently (most likely gcc's optimiser using the
-//! out-of-bounds store to fire the check a magic early). stuffr keeps
-//! upstream's observable behaviour. [`early_cap_reference`] probes for it;
-//! on such a reference the cases with 50000 or more magics are skipped,
-//! counted as known oracle skips. A deviation of the test oracle again.
+//! **No early cap on Debian 13.** Ubuntu 24.04's bzip2 stopped at the 50000th
+//! magic ("appears to contain more than 50000 blocks", exit 1, no outputs: its
+//! `CVE-2026-42250` patch, `BZ_MAX_HANDLED_BLOCKS - 1`), one before upstream
+//! 1.0.8, which lists block 50000 and stops only at the 50001st. Debian 13's
+//! 1.0.8-6 does not carry that patch: its `bzip2recover.c` is upstream's
+//! (`currBlock >= BZ_MAX_HANDLED_BLOCKS`), and measured in the image 49999 and
+//! 50000 back-to-back magics succeed (exit 0, block 50000 listed) while 50001
+//! exits 1 with the cap message, as on macOS. So [`early_cap_reference`] now
+//! finds `false` on every reference this suite uses, the "block cap" cases
+//! all run and the skip branch is dead; the probe stays as a guard that
+//! panics on a reference that is neither shape, and prints a note if one ever
+//! caps early again (an Ubuntu build in `/usr/bin`).
 
 #[cfg(unix)]
 mod compat_harness;
@@ -223,7 +224,8 @@ mod differential {
     }
 
     /// Whether the reference stops at the 50000th magic instead of the
-    /// 50001st (see the file's doc). Probed once with exactly 50000
+    /// 50001st (Ubuntu 24.04's patched build; false on Debian 13, see the
+    /// file's doc). Probed once with exactly 50000
     /// back-to-back magics: exit 1 with "more than 50000 blocks" is the
     /// early cap, success is upstream, anything else panics. `None` when the
     /// reference is missing.
@@ -567,7 +569,7 @@ mod differential {
     }
 
     const EARLY_CAP_SKIP: &str = "50000+ magics: the reference stops at the 50000th \
-                                  magic, one before upstream 1.0.8";
+                                  magic, one before upstream 1.0.8 (an Ubuntu build; not Debian 13)";
 
     /// Whether a block magic starts at bit `i` of `data`.
     fn bit_magic_at(data: &[u8], i: usize) -> bool {
