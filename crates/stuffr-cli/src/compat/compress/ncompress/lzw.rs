@@ -478,8 +478,8 @@ pub(super) fn decompress(
     let mut posbits: i64 = 3 << 3;
     let mut free_ent = if block_mode { FIRST } else { 256 };
     t.prefix[..256].fill(0);
-    for code in 0..256 {
-        t.suffix[code] = code as u8;
+    for (code, slot) in t.suffix.iter_mut().enumerate().take(256) {
+        *slot = code as u8;
     }
     let mut outbuf = vec![0u8; OUTBUF];
     // `de_stack`, filled backwards in the C; here in push order, read

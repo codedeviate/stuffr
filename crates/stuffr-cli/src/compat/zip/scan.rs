@@ -1292,8 +1292,7 @@ pub(crate) fn show_files(z: &mut Zr, c: &mut Collected) -> Exit {
         z.log_write(heading(z).as_bytes());
     }
     let listing_names = matches!(sf, 1 | 3);
-    for i in 0..c.ar.zfiles.len() {
-        let zf = &c.ar.zfiles[i];
+    for zf in &c.ar.zfiles {
         if !(zf.mark != 0 || z.o.kk == 3) {
             continue;
         }
