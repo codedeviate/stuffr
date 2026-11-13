@@ -16,9 +16,9 @@ use super::*;
 /// stores the access time; two runs reading a second apart would differ).
 pub const INPUT_ATIME: i64 = 2_000_000_000;
 
-/// The Ubuntu reference: apt's `zip` on ubuntu 24.04 (`dpkg-query -W -f
+/// The Debian reference: apt's `zip` on Debian 13 (trixie) (`dpkg-query -W -f
 /// '${Version}' zip`).
-pub const UBUNTU_ZIP_VERSION: &str = "3.0-13ubuntu0.2";
+pub const DEBIAN_ZIP_VERSION: &str = "3.0-15+deb13u1";
 
 /// The `-v` banner of each Apple program (`zip`, `zipcloak`, `zipnote`,
 /// `zipsplit`): the line that names it. stuffr's own names stuffr instead
@@ -70,8 +70,8 @@ pub fn ubuntu_zip_version() -> Option<String> {
 
 /// The directory of the platform's zip reference (`zip`, `zipcloak`,
 /// `zipnote`, `zipsplit`): `/usr/bin` on macOS (Apple's build), and
-/// `/usr/bin` on Linux only when the apt package is [`UBUNTU_ZIP_VERSION`]
-/// (`make compat-ubuntu` and CI's ubuntu-24.04 have it). Elsewhere there
+/// `/usr/bin` on Linux only when the apt package is [`DEBIAN_ZIP_VERSION`]
+/// (`make compat-debian` and CI's Debian 13 jobs have it). Elsewhere there
 /// is none.
 ///
 /// `None`: a skip with a note locally, a panic under `CI` (the rule of
@@ -86,9 +86,9 @@ pub fn zip_dir() -> Option<&'static str> {
             Ok("/usr/bin")
         } else if cfg!(target_os = "linux") {
             match ubuntu_zip_version() {
-                Some(v) if v == UBUNTU_ZIP_VERSION => Ok("/usr/bin"),
+                Some(v) if v == DEBIAN_ZIP_VERSION => Ok("/usr/bin"),
                 Some(v) => Err(format!(
-                    "the apt zip is {v}, not {UBUNTU_ZIP_VERSION} (`make compat-ubuntu` has it)"
+                    "the apt zip is {v}, not {DEBIAN_ZIP_VERSION} (`make compat-debian` has it)"
                 )),
                 None => Err("/usr/bin/zip is not apt's zip package".to_owned()),
             }

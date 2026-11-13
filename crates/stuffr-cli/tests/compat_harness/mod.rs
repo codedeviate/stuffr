@@ -753,10 +753,10 @@ pub fn brotli_dir() -> Option<&'static str> {
 
 // ---- ncompress 5.0 (the compress family's ncompress personality) ----
 
-/// The apt package `make compat-ubuntu` and CI's ubuntu-24.04 runners have:
+/// The apt package `make compat-debian` and CI's Debian 13 jobs have:
 /// the build the ncompress personality follows on every platform (ruling E6
 /// of 0.18.0).
-pub const UBUNTU_NCOMPRESS_VERSION: &str = "5.0-1";
+pub const DEBIAN_NCOMPRESS_VERSION: &str = "5.0-3";
 
 /// What ncompress 5.0's `-V` prints first, on every build.
 const NCOMPRESS_VERSION_LINE: &str = "Compress version: (N)compress 5.0";
@@ -778,7 +778,7 @@ pub fn ubuntu_ncompress_version() -> Option<String> {
 
 /// The directory of an ncompress 5.0 reference: `compress`, and beside it
 /// `uncompress` (Homebrew, upstream) or `uncompress.real` (Debian and
-/// Ubuntu, whose `uncompress` is gzip's script; [`ncompress_exe`] picks).
+/// Debian 13, whose `uncompress` is gzip's script; [`ncompress_exe`] picks).
 ///
 /// Looked up in this order, the first whose `compress -V` reports 5.0
 /// winning:
@@ -787,7 +787,7 @@ pub fn ubuntu_ncompress_version() -> Option<String> {
 /// 3. on Linux, `/usr/bin` (`apt-get install ncompress`).
 ///
 /// Under `CI` on Linux the apt package must also be
-/// [`UBUNTU_NCOMPRESS_VERSION`] (`dpkg-query -W ncompress`), as
+/// [`DEBIAN_NCOMPRESS_VERSION`] (`dpkg-query -W ncompress`), as
 /// [`unzip_dir`] pins unzip's: another build is no oracle. `None` when there
 /// is none: a skip with a note locally, a panic under `CI` (the rule of
 /// [`require_reference`]).
@@ -796,9 +796,9 @@ pub fn ncompress_dir() -> Option<&'static str> {
     let found = DIR.get_or_init(|| {
         if cfg!(target_os = "linux") && std::env::var_os("CI").is_some() {
             match ubuntu_ncompress_version() {
-                Some(v) if v == UBUNTU_NCOMPRESS_VERSION => {}
+                Some(v) if v == DEBIAN_NCOMPRESS_VERSION => {}
                 Some(v) => {
-                    panic!("CI is set but the apt ncompress is {v}, not {UBUNTU_NCOMPRESS_VERSION}")
+                    panic!("CI is set but the apt ncompress is {v}, not {DEBIAN_NCOMPRESS_VERSION}")
                 }
                 None => panic!("CI is set but the apt package ncompress is not installed"),
             }

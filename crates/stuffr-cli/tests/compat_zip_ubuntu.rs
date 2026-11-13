@@ -21,7 +21,7 @@ mod linux {
         if zip_dir().is_none() {
             return;
         }
-        assert_eq!(ubuntu_zip_version().as_deref(), Some(UBUNTU_ZIP_VERSION));
+        assert_eq!(ubuntu_zip_version().as_deref(), Some(DEBIAN_ZIP_VERSION));
         assert_eq!(platform_zip_flavour(), "ubuntu");
     }
 

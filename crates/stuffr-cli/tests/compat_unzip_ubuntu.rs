@@ -22,7 +22,7 @@ mod linux {
         }
         assert_eq!(
             ubuntu_unzip_version().as_deref(),
-            Some(UBUNTU_UNZIP_VERSION)
+            Some(DEBIAN_UNZIP_VERSION)
         );
         let r = unzip_reference(&unzip_case("unzip", vec![], vec![])).unwrap();
         let out = String::from_utf8_lossy(&r.stdout);

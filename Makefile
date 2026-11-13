@@ -25,16 +25,16 @@ TEST_THREAD_ARGS =
 FUZZ_RSS_ARGS =
 endif
 
-.PHONY: help check check-legs lint-latest deps-guard fmt fmt-check lint doc test test-pure release miri hooks clean fuzz-corpus fuzz compat-ubuntu deny sweep-tmp leak-snapshot leak-check tmp-leaks-selftest
+.PHONY: help check check-legs lint-latest deps-guard fmt fmt-check lint doc test test-pure release miri hooks clean fuzz-corpus fuzz compat-debian deny sweep-tmp leak-snapshot leak-check tmp-leaks-selftest
 
 help:
 	@echo 'stuffr development targets:'
 	@echo '  make check    fmt, lint, test, release build — the full gate'
 	@echo '                (always ends by sweeping stale stuffr-* temp folders)'
 	@echo '                Modes: daytime by default ($(TEST_THREADS) test threads, fuzz -rss_limit_mb=1024,'
-	@echo '                the same thread limit in compat-ubuntu); FULL=1 (any value but'
+	@echo '                the same thread limit in compat-debian); FULL=1 (any value but'
 	@echo '                empty or 0) lifts the limits: every core, libFuzzer default ceiling'
-	@echo '  make check FULL=1  overnight mode (also works with test, test-pure, fuzz, compat-ubuntu)'
+	@echo '  make check FULL=1  overnight mode (also works with test, test-pure, fuzz, compat-debian)'
 	@echo '  make sweep-tmp  remove stuffr-* temp folders older than a day (live pids kept)'
 	@echo '  make leak-check  fail on stuffr-* temp folders made since the last leak-snapshot'
 	@echo '  make tmp-leaks-selftest  self-test of scripts/tmp-leaks.sh'
@@ -51,8 +51,8 @@ help:
 	@echo '  make fuzz-corpus  (re)generate fuzz/corpus/{codec,container,chain,roundtrip,salvage,compat,infozip}'
 	@echo '  make fuzz     short, seeded smoke pass over the seven targets (mirrors CI)'
 	@echo '  make deny     cargo-deny (advisories, licences, bans, sources) and the vendored-C check'
-	@echo '  make compat-ubuntu  the unzip, compress and zip suites against Ubuntu 24.04, in Docker'
-	@echo '                (not in check; COMPAT_UBUNTU_ARGS=... is passed to the tests)'
+	@echo '  make compat-debian  the unzip, compress, zip, bzip2 and gzip suites against Debian 13, in Docker'
+	@echo '                (not in check; COMPAT_DEBIAN_ARGS=... is passed to the tests)'
 
 # Ordered so the cheapest gate fails first.
 #
@@ -505,55 +505,64 @@ fuzz-corpus:
 	done; \
 	echo "✓ corpus regenerated ($$ran generator test(s) ran; all seven target corpora non-empty)"
 
-# The unzip family's Ubuntu oracle (0.16.0, ruling R10): apt's unzip
-# 6.0-28ubuntu4.1 on ubuntu:24.04, which only CI's ubuntu-latest otherwise has.
-# Builds tests/docker/ubuntu-24.04 (the toolchain rust-toolchain.toml names)
-# and runs the Ubuntu and shared unzip suites in it with `CI=1`, so a missing
+# The Linux oracle (0.27.0; the unzip family's since 0.16.0, ruling R10): apt's
+# unzip 6.0-29+deb13u1, zip 3.0-15+deb13u1, ncompress 5.0-3, bzip2 and GNU gzip
+# 1.13 on debian:trixie, which only CI otherwise has.
+# Builds tests/docker/debian-13 (the toolchain rust-toolchain.toml names)
+# and runs the Debian and shared unzip suites in it with `CI=1`, so a missing
 # or wrong reference fails instead of skipping. The repository is mounted
 # read-only; cargo's registry and the target directory are named Docker
 # volumes, so runs are incremental and the host's `target/` is never written.
 # Runs as the image's unprivileged user (root ignores modes). Not part of
-# `check`: Docker is not a gate dependency. `COMPAT_UBUNTU_ARGS` goes after
+# `check`: Docker is not a gate dependency. `COMPAT_DEBIAN_ARGS` goes after
 # `--` (a test name filter, `--nocapture`). The lib unit tests of
 # `compat::unzip` run first (P42): the Linux-only ones run nowhere else.
 # The compress family's ncompress personality (0.18.0) has its oracle here
-# too, apt's ncompress 5.0-1 (`uncompress.real`): the `compat::compress` lib
+# too, apt's ncompress 5.0-3 (`uncompress.real`): the `compat::compress` lib
 # tests, then `compat_compress_ncompress`, one container for both.
 # `docker volume rm
-# stuffr-ubuntu-target stuffr-ubuntu-cargo-registry` starts clean.
-COMPAT_UBUNTU_IMAGE ?= stuffr-ubuntu-24.04
-COMPAT_UBUNTU_ARGS ?=
+# stuffr-debian-target stuffr-debian-cargo-registry` starts clean.
+COMPAT_DEBIAN_IMAGE ?= stuffr-debian-13
+COMPAT_DEBIAN_ARGS ?=
 # Daytime mode also limits the container's test threads (it ignores the
-# host's environment); FULL=1 lifts it. If COMPAT_UBUNTU_ARGS already carries
+# host's environment); FULL=1 lifts it. If COMPAT_DEBIAN_ARGS already carries
 # its own --test-threads, the daytime one is omitted (libtest rejects or
 # ignores a repeated option), so the user's value is the only one.
 ifeq ($(filter-out 0,$(strip $(FULL))),)
-COMPAT_UBUNTU_THREADS = --test-threads=$(TEST_THREADS)
+COMPAT_DEBIAN_THREADS = --test-threads=$(TEST_THREADS)
 else
-COMPAT_UBUNTU_THREADS =
+COMPAT_DEBIAN_THREADS =
 endif
-COMPAT_UBUNTU_ALL_ARGS = $(if $(findstring --test-threads,$(COMPAT_UBUNTU_ARGS)),,$(COMPAT_UBUNTU_THREADS)) $(COMPAT_UBUNTU_ARGS)
-COMPAT_UBUNTU_RUN = docker run --rm -e CI=1 \
+COMPAT_DEBIAN_ALL_ARGS = $(if $(findstring --test-threads,$(COMPAT_DEBIAN_ARGS)),,$(COMPAT_DEBIAN_THREADS)) $(COMPAT_DEBIAN_ARGS)
+COMPAT_DEBIAN_RUN = docker run --rm -e CI=1 \
 	  -v "$(CURDIR)":/src:ro \
-	  -v stuffr-ubuntu-cargo-registry:/home/oracle/.cargo/registry \
-	  -v stuffr-ubuntu-target:/target \
-	  $(COMPAT_UBUNTU_IMAGE)
+	  -v stuffr-debian-cargo-registry:/home/oracle/.cargo/registry \
+	  -v stuffr-debian-target:/target \
+	  $(COMPAT_DEBIAN_IMAGE)
 
-compat-ubuntu:
+COMPAT_DEBIAN_CARGO ?= cargo test --locked
+
+compat-debian:
 	docker build --quiet \
 	  --build-arg RUST_TOOLCHAIN=$$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml) \
-	  -t $(COMPAT_UBUNTU_IMAGE) tests/docker/ubuntu-24.04
-	$(COMPAT_UBUNTU_RUN) \
-	  cargo test --locked -p stuffr-cli --lib compat::unzip -- $(COMPAT_UBUNTU_ALL_ARGS)
-	$(COMPAT_UBUNTU_RUN) \
-	  cargo test --locked -p stuffr-cli --test compat_unzip_ubuntu --test compat_unzip_common --test compat_unzip_safety \
-	    --test compat_unzip_tty --test compat_unzip_umask --test compat_unzip_harness_selftest -- $(COMPAT_UBUNTU_ALL_ARGS)
-	$(COMPAT_UBUNTU_RUN) sh -c \
-	  'cargo test --locked -p stuffr-cli --lib compat::compress -- $(COMPAT_UBUNTU_ALL_ARGS) \
-	   && cargo test --locked -p stuffr-cli --test compat_compress_ncompress -- $(COMPAT_UBUNTU_ALL_ARGS)'
-	$(COMPAT_UBUNTU_RUN) sh -c \
-	  'cargo test --locked -p stuffr-cli --lib compat::zip -- $(COMPAT_UBUNTU_ALL_ARGS) \
-	   && cargo test --locked -p stuffr-cli --test compat_zip_common --test compat_zip_ubuntu --test compat_zip_bytes --test compat_zip_tty --test compat_zip_helpers --test compat_zip_harness_selftest -- $(COMPAT_UBUNTU_ALL_ARGS)'
+	  -t $(COMPAT_DEBIAN_IMAGE) tests/docker/debian-13
+	$(COMPAT_DEBIAN_RUN) \
+	  $(COMPAT_DEBIAN_CARGO) -p stuffr-cli --lib compat::unzip -- $(COMPAT_DEBIAN_ALL_ARGS)
+	$(COMPAT_DEBIAN_RUN) \
+	  $(COMPAT_DEBIAN_CARGO) -p stuffr-cli --test compat_unzip_ubuntu --test compat_unzip_common --test compat_unzip_safety \
+	    --test compat_unzip_tty --test compat_unzip_umask --test compat_unzip_harness_selftest -- $(COMPAT_DEBIAN_ALL_ARGS)
+	$(COMPAT_DEBIAN_RUN) \
+	  $(COMPAT_DEBIAN_CARGO) -p stuffr-cli --lib compat::compress -- $(COMPAT_DEBIAN_ALL_ARGS)
+	$(COMPAT_DEBIAN_RUN) \
+	  $(COMPAT_DEBIAN_CARGO) -p stuffr-cli --test compat_compress_ncompress -- $(COMPAT_DEBIAN_ALL_ARGS)
+	$(COMPAT_DEBIAN_RUN) \
+	  $(COMPAT_DEBIAN_CARGO) -p stuffr-cli --lib compat::zip -- $(COMPAT_DEBIAN_ALL_ARGS)
+	$(COMPAT_DEBIAN_RUN) \
+	  $(COMPAT_DEBIAN_CARGO) -p stuffr-cli --test compat_zip_common --test compat_zip_ubuntu --test compat_zip_bytes --test compat_zip_tty --test compat_zip_helpers --test compat_zip_harness_selftest -- $(COMPAT_DEBIAN_ALL_ARGS)
+	$(COMPAT_DEBIAN_RUN) \
+	  $(COMPAT_DEBIAN_CARGO) -p stuffr-cli --test compat_bzip2 --test compat_bzip2recover -- $(COMPAT_DEBIAN_ALL_ARGS)
+	$(COMPAT_DEBIAN_RUN) env -u STUFFR_GZIP_FLAVOR \
+	  $(COMPAT_DEBIAN_CARGO) -p stuffr-cli --test compat_gzip_gnu -- $(COMPAT_DEBIAN_ALL_ARGS)
 
 clean:
 	$(CARGO) clean

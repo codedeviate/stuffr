@@ -5,9 +5,9 @@
 
 use super::*;
 
-/// The Ubuntu reference: apt's `unzip` on ubuntu 24.04 (`dpkg-query -W -f
+/// The Debian reference: apt's `unzip` on Debian 13 (trixie) (`dpkg-query -W -f
 /// '${Version}' unzip`).
-pub const UBUNTU_UNZIP_VERSION: &str = "6.0-28ubuntu4.1";
+pub const DEBIAN_UNZIP_VERSION: &str = "6.0-29+deb13u1";
 
 /// The first line of each reference program's usage and `-v` (R2: stuffr's
 /// own first line names stuffr instead; [`unzip_differences`] masks both).
@@ -89,8 +89,8 @@ pub fn ubuntu_unzip_version() -> Option<String> {
 
 /// The directory of the platform's unzip reference (`unzip`, `zipinfo`,
 /// `funzip`), R3: `/usr/bin` on macOS (Apple's build), and `/usr/bin` on
-/// Linux only when the apt package is [`UBUNTU_UNZIP_VERSION`]: another
-/// release is no reference (CI's ubuntu-latest and `make compat-ubuntu`
+/// Linux only when the apt package is [`DEBIAN_UNZIP_VERSION`]: another
+/// release is no reference (CI's ubuntu-latest and `make compat-debian`
 /// have it). Elsewhere there is none.
 ///
 /// `None`: a skip with a note locally, a panic under `CI` (the rule of
@@ -105,9 +105,9 @@ pub fn unzip_dir() -> Option<&'static str> {
             Ok("/usr/bin")
         } else if cfg!(target_os = "linux") {
             match ubuntu_unzip_version() {
-                Some(v) if v == UBUNTU_UNZIP_VERSION => Ok("/usr/bin"),
+                Some(v) if v == DEBIAN_UNZIP_VERSION => Ok("/usr/bin"),
                 Some(v) => Err(format!(
-                    "the apt unzip is {v}, not {UBUNTU_UNZIP_VERSION} (`make compat-ubuntu` has it)"
+                    "the apt unzip is {v}, not {DEBIAN_UNZIP_VERSION} (`make compat-debian` has it)"
                 )),
                 None => Err("/usr/bin/unzip is not apt's unzip package".to_owned()),
             }
