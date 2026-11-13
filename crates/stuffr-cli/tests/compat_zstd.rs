@@ -3294,7 +3294,41 @@ mod unix {
         let mut f = vec![0x50, 0x2a, 0x4d, 0x18, 0xfd, 0xff, 0xff, 0xff];
         f.extend_from_slice(&[0x50, 0x2a, 0x4d, 0x18, 0, 0, 0, 0]);
         add(f, &mut cases);
-        check("list_skippable_frames", &cases);
+        check_with("list_skippable_frames", &cases, uninitialised_size_bytes);
+    }
+
+    /// A file of 5 to 7 bytes that is a skippable frame cut inside its size
+    /// field: zstd takes the field's missing high bytes from a buffer it
+    /// never wrote, so the position in `seeked to position N` is
+    /// uninitialised memory past the file (zeros on Ubuntu 24.04 and macOS;
+    /// on Debian 13's CI runs, sometimes stale bytes such as `0x7373000b`).
+    /// stuffr reads them as zeros. Only the size bytes the file holds are
+    /// compared; the reference's number then becomes stuffr's. A larger
+    /// file (the frame after another) keeps its full comparison: there the
+    /// buffer holds the earlier header, which both sides read.
+    fn uninitialised_size_bytes(_: &Case, r: &mut Run, s: &mut Run) {
+        fn seek(t: &str) -> Option<(u64, u64, &str)> {
+            let at = t.find("seeked to position ")?;
+            let rest = &t[at + "seeked to position ".len()..];
+            let comma = rest.find(", which is beyond file size of ")?;
+            let pos = rest[..comma].parse().ok()?;
+            let tail = &rest[comma + ", which is beyond file size of ".len()..];
+            let end = tail.find(|c: char| !c.is_ascii_digit())?;
+            Some((pos, tail[..end].parse().ok()?, &rest[..comma]))
+        }
+        let (Some((rp, rlen, rnum)), Some((sp, slen, snum))) = (seek(&r.stderr), seek(&s.stderr))
+        else {
+            return;
+        };
+        if rlen != slen || !(5..8).contains(&rlen) || rp < 8 || sp < 8 {
+            return;
+        }
+        let known = (1u64 << (8 * (rlen - 4))) - 1;
+        if (rp - 8) & known == (sp - 8) & known {
+            let from = format!("seeked to position {rnum},");
+            let to = format!("seeked to position {snum},");
+            r.stderr = r.stderr.replacen(&from, &to, 1);
+        }
     }
 
     /// Every prefix of a file of two frames and a skippable frame, with
