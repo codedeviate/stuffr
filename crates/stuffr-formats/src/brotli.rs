@@ -117,9 +117,12 @@ impl Codec for Brotli {
     fn decoder<'a>(
         &self,
         src: Box<dyn Source + 'a>,
-        _o: &DecodeOpts,
+        o: &DecodeOpts,
     ) -> Result<Box<dyn Source + 'a>> {
-        Ok(Box::new(StreamOnly::new(BrotliStreamDecoder::new(src))))
+        Ok(Box::new(StreamOnly::new(BrotliStreamDecoder::new(
+            src,
+            o.memory_limit,
+        ))))
     }
 
     fn check_encode_opts(&self, o: &EncodeOpts) -> Result<()> {
@@ -171,11 +174,47 @@ struct BrotliStreamDecoder<'a> {
     /// further call to `read` must return `Ok(0)` without touching `src` or
     /// `dec` again.
     done: bool,
+    /// `--memory-limit`: a declared window above it is refused (exit 6).
+    memory_limit: Option<u64>,
+    /// The stream header's window has been checked against `memory_limit`.
+    window_checked: bool,
+}
+
+/// The window size (`1 << WBITS`) a brotli stream header declares, read from
+/// its first bytes: RFC 7932 §9.1 plus the large-window extension (a first
+/// byte of `0x11` with bit 7 clear, then a 6-bit exponent in 10..=30, as
+/// brotli's `decode.c`). `None` when the prefix is too short or the header
+/// is not one the decoder accepts: the decoder then reports its own error.
+fn declared_window(head: &[u8]) -> Option<u64> {
+    let b0 = *head.first()?;
+    let wbits = if b0 & 1 == 0 {
+        16
+    } else if (b0 >> 1) & 7 != 0 {
+        17 + u32::from((b0 >> 1) & 7)
+    } else {
+        match (b0 >> 4) & 7 {
+            0 => 17,
+            1 => {
+                if b0 & 0x80 != 0 {
+                    return None;
+                }
+                let w = u32::from(*head.get(1)? & 0x3f);
+                if !(10..=30).contains(&w) {
+                    return None;
+                }
+                w
+            }
+            n => 8 + u32::from(n),
+        }
+    };
+    Some(1u64 << wbits)
 }
 
 impl<'a> BrotliStreamDecoder<'a> {
-    fn new(src: Box<dyn Source + 'a>) -> Self {
+    fn new(src: Box<dyn Source + 'a>, memory_limit: Option<u64>) -> Self {
         Self {
+            memory_limit,
+            window_checked: false,
             src,
             dec: BrotliState::new(
                 HeapAlloc::<u8>::default(),
@@ -204,6 +243,38 @@ impl<'a> BrotliStreamDecoder<'a> {
         self.in_len = n;
         if n == 0 {
             self.src_eof = true;
+        }
+        Ok(())
+    }
+
+    /// Refuses a stream whose declared window exceeds `memory_limit`, before
+    /// the decoder grows a ring buffer toward it. Needs at most the first two
+    /// bytes (the large-window form), so it tops `in_buf` up to two bytes
+    /// first; a header too short or invalid is left to the decoder (exit 5).
+    fn check_window(&mut self) -> std::io::Result<()> {
+        while self.in_len - self.in_pos < 2 && !self.src_eof && self.in_pos == 0 {
+            let n = self.src.read(&mut self.in_buf[self.in_len..])?;
+            if n == 0 {
+                self.src_eof = true;
+            }
+            self.in_len += n;
+        }
+        self.window_checked = true;
+        let Some(limit) = self.memory_limit else {
+            return Ok(());
+        };
+        if let Some(window) = declared_window(&self.in_buf[self.in_pos..self.in_len])
+            && window > limit
+        {
+            self.done = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                format!(
+                    "brotli: stream header declares a window of {window} bytes, but \
+                     --memory-limit allows only {limit} — raise --memory-limit to decode \
+                     this file"
+                ),
+            ));
         }
         Ok(())
     }
@@ -256,6 +327,9 @@ impl Read for BrotliStreamDecoder<'_> {
         loop {
             if self.in_pos >= self.in_len {
                 self.refill()?;
+            }
+            if !self.window_checked {
+                self.check_window()?;
             }
 
             let mut available_in = self.in_len - self.in_pos;
@@ -353,6 +427,65 @@ mod tests {
         let mut out = Vec::new();
         dec.read_to_end(&mut out).unwrap();
         out
+    }
+
+    #[test]
+    fn declared_window_parses_headers() {
+        // Normal WBITS 10..=24 as the encoder's lgwin writes them.
+        for lg in 10u32..=24 {
+            let mut e = Vec::new();
+            {
+                let mut w = brotli::CompressorWriter::new(&mut e, 4096, 5, lg);
+                w.write_all(b"x").unwrap();
+            }
+            assert_eq!(declared_window(&e), Some(1u64 << lg), "lgwin {lg}");
+        }
+        // Large window: 0x11, then a 6-bit exponent.
+        assert_eq!(declared_window(&[0x11, 30]), Some(1 << 30));
+        assert_eq!(declared_window(&[0x11, 0x40 | 25]), Some(1 << 25));
+        assert_eq!(declared_window(&[0x11, 9]), None);
+        assert_eq!(declared_window(&[0x11, 31]), None);
+        assert_eq!(declared_window(&[0x91, 30]), None);
+        // Too short.
+        assert_eq!(declared_window(&[]), None);
+        assert_eq!(declared_window(&[0x11]), None);
+        assert_eq!(declared_window(&[0x00]), Some(1 << 16));
+    }
+
+    fn read_all(bytes: Vec<u8>, limit: Option<u64>) -> std::io::Result<Vec<u8>> {
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(bytes)));
+        let o = DecodeOpts {
+            memory_limit: limit,
+            ..DecodeOpts::default()
+        };
+        let mut dec = Brotli.decoder(src, &o).unwrap();
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out)?;
+        Ok(out)
+    }
+
+    #[test]
+    fn large_window_over_the_limit_is_refused() {
+        // A large-window header declaring 1 GiB, then an empty last metablock.
+        // Header bits: 0x11 | 30 << 8 (14 bits), ISLAST=1, ISLASTEMPTY=1.
+        let bits: u32 = 0x11 | (30 << 8) | (1 << 14) | (1 << 15);
+        let bytes = vec![bits as u8, (bits >> 8) as u8];
+        let e = read_all(bytes.clone(), Some(1 << 20)).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::OutOfMemory);
+        // Without a limit the same stream decodes (to nothing).
+        assert_eq!(read_all(bytes, None).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn window_within_the_limit_decodes_and_short_header_is_corrupt() {
+        let plain = b"hello hello hello".repeat(50);
+        let packed = compress(&plain);
+        assert_eq!(read_all(packed.clone(), Some(64 << 20)).unwrap(), plain);
+        // A 4 MiB window (lgwin 22) is refused under a 1 MiB limit.
+        let e = read_all(packed, Some(1 << 20)).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::OutOfMemory);
+        let e = read_all(vec![0x11], Some(1 << 20)).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
