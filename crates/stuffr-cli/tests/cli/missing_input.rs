@@ -182,7 +182,7 @@ fn ls_of_an_unreadable_file_matches_list() {
     let dir = tmp_dir();
     let f = dir.join("f.gz");
     std::fs::write(&f, b"x").unwrap();
-    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
     if std::fs::File::open(&f).is_ok() {
         return; // root: mode 000 is readable
     }
