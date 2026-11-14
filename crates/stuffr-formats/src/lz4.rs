@@ -214,6 +214,9 @@ fn skippable_frame_len(err: &std::io::Error) -> Option<u32> {
 struct SkipSkippableFrames<'a> {
     dec: Option<FrameDecoder<TrackedRead<'a>>>,
     served_since_probe: Arc<AtomicBool>,
+    /// Set when a skippable frame was just discarded: a clean end of input
+    /// right after it is a legitimate end (H4), as after a real EndMark.
+    after_skip: Arc<AtomicBool>,
 }
 
 impl std::io::Read for SkipSkippableFrames<'_> {
@@ -238,6 +241,7 @@ impl std::io::Read for SkipSkippableFrames<'_> {
                         remaining -= want;
                     }
                     self.served_since_probe.store(false, Ordering::Relaxed);
+                    self.after_skip.store(true, Ordering::Relaxed);
                     self.dec = Some(FrameDecoder::new(tracked));
                 }
             }
@@ -259,6 +263,8 @@ struct EnforceEndMark<R> {
     /// is judged by the same rule again, never waved through just because
     /// an earlier frame completed cleanly.
     awaiting_concat_probe: bool,
+    /// Shared with `SkipSkippableFrames`; see its field.
+    after_skip: Arc<AtomicBool>,
     /// Latches truncation so every further call keeps reporting the same
     /// error, the same idempotence `conformance::framed_mock`'s reference
     /// double uses for its own truncated-or-corrupted state.
@@ -290,12 +296,15 @@ impl<R: std::io::Read> std::io::Read for EnforceEndMark<R> {
             let n = self.inner.read(buf)?;
             if n > 0 {
                 self.awaiting_concat_probe = false;
+                self.after_skip.store(false, Ordering::Relaxed);
                 return Ok(n);
             }
             // n == 0: did the wrapped source genuinely run dry reaching this
             // result, or did FrameDecoder read a real EndMark in full?
             if self.hit_eof.load(Ordering::Relaxed) {
-                if self.awaiting_concat_probe && !self.served_since_probe.load(Ordering::Relaxed) {
+                if (self.awaiting_concat_probe || self.after_skip.load(Ordering::Relaxed))
+                    && !self.served_since_probe.load(Ordering::Relaxed)
+                {
                     // This Ok(0) came from FrameDecoder checking for a
                     // concatenated next frame (its own frame-header parse),
                     // not from mid-frame block processing, AND not one byte
@@ -530,9 +539,11 @@ impl Codec for Lz4 {
             hit_eof: Arc::clone(&hit_eof),
             served_since_probe: Arc::clone(&served_since_probe),
         };
+        let after_skip = Arc::new(AtomicBool::new(false));
         let skip_skippable = SkipSkippableFrames {
             dec: Some(FrameDecoder::new(tracked)),
             served_since_probe: Arc::clone(&served_since_probe),
+            after_skip: Arc::clone(&after_skip),
         };
         let normalized = NormalizeDecodeErrors::new(skip_skippable, LZ4_MALFORMED_AS_OTHER_EOF);
         Ok(Box::new(StreamOnly::new(EnforceEndMark {
@@ -540,6 +551,7 @@ impl Codec for Lz4 {
             hit_eof,
             served_since_probe,
             awaiting_concat_probe: false,
+            after_skip,
             truncated: false,
         })))
     }
@@ -672,6 +684,27 @@ mod tests {
         let mut want = a;
         want.extend(b);
         assert_eq!(decompress(bytes), want);
+    }
+
+    /// H4: a stream of nothing but complete skippable frames is empty, as
+    /// `lz4 -d` reads it; one cut short is still truncation.
+    #[test]
+    fn skippable_only_stream_is_empty() {
+        for bytes in [
+            skippable_frame(b"abcd"),
+            skippable_frame(&[]),
+            [skippable_frame(&[1; 9]), skippable_frame(&[2; 3])].concat(),
+        ] {
+            assert_eq!(decompress(bytes), b"");
+        }
+        let cut = skippable_frame(b"abcd");
+        for n in 1..cut.len() {
+            let src: Box<dyn Source> =
+                Box::new(ReaderSource::new(std::io::Cursor::new(cut[..n].to_vec())));
+            let mut dec = Lz4.decoder(src, &DecodeOpts::default()).unwrap();
+            let mut out = Vec::new();
+            assert!(dec.read_to_end(&mut out).is_err(), "cut at {n} must fail");
+        }
     }
 
     #[test]
