@@ -1,12 +1,14 @@
-//! `--list`: what lz4 1.11.0 prints about the frames in each file, without
+//! `--list`: what lz4 1.11.1 prints about the frames in each file, without
 //! decoding any of them.
 //!
 //! **Clean room.** Every rule below was recovered by probing the 1.10.0
-//! binary and then the 1.11.0 one with hand-made files (the 1.10.0 cases
-//! are in `.claude/rules/compat.md`, "lz4 1.10.0 probes"; the 1.11.0 ones
-//! in the probe document's section 1.16, the `--list` rows of
-//! `tests/compat_lz4.rs` and a random differential of 4000 runs, recorded
-//! in the 0.26.0 Task 6 report); lz4's `programs/` was never read.
+//! binary, then the 1.11.0 one and then the 1.11.1 one with hand-made files
+//! (the 1.10.0 cases are in `.claude/rules/compat.md`, "lz4 1.10.0 probes";
+//! the 1.11.0 ones in the probe document's section 1.16, the `--list` rows
+//! of `tests/compat_lz4.rs` and a random differential of 4000 runs,
+//! recorded in the 0.26.0 Task 6 report; the 1.11.1 ones, standard input
+//! and legacy frames, in the lz4 1.11.1 session report); lz4's `programs/` was
+//! never read.
 //! Messages are in `messages.rs`.
 //!
 //! **What it does** (all probed):
@@ -14,11 +16,12 @@
 //!   a name that is none (missing, a directory, `/dev/null`) is `lz4: NAME
 //!   is not a regular file` and ends the run with exit 1, as does the first
 //!   file that fails any other way: **the files after it are not read**.
-//!   Standard input given as no operand, or as `-`, lists nothing: only the
-//!   table header is printed. The operand `stdin` is standard input as a
-//!   file: listed (as `stdin`, from its current offset) when it is
-//!   redirected from a regular file, "not a regular file" when it is a pipe
-//!   or a device (a file of that name is never read). `-r` expands directories as
+//!   Standard input is listed as a file (1.11.1; 1.11.0 printed only the
+//!   header): with no list operand (none, `-`, or operands only before
+//!   `--list`) or as the operand `stdin`, it is listed (as `stdin`, from its
+//!   current offset) when it is redirected from a regular file, "not a
+//!   regular file" when it is a pipe or a device (a file of that name is
+//!   never read). A `-` among other list operands is still skipped. `-r` expands directories as
 //!   it does for compression ([`Run::expand`]); display names are the base
 //!   name (after the last `/`), error messages carry the name as given.
 //! - A **walker** reads frame after frame and never decodes: a modern frame
@@ -40,12 +43,10 @@
 //!   size, the content size is not compared with anything, and no block
 //!   or checksum is read (probe: a corrupt block, a wrong content checksum,
 //!   a content size of 5 over 3 stored bytes all list). A skippable frame
-//!   whose area runs past the end of the file is `Error 43`. A legacy
-//!   block that does is not checked: the next read finds nothing and the
-//!   frame ends.
-//! - A frame's **size** is the distance the walker moved (for a legacy
-//!   frame not clamped to the file: a block cut short still counts as long
-//!   as it said); a skippable frame's is `size + 8` in 32 bits (probe: size
+//!   whose area runs past the end of the file is `Error 43`; a legacy
+//!   block that does is `Corrupted legacy frame` (1.11.1; 1.11.0 let the
+//!   next read find nothing and end the frame).
+//! - A frame's **size** is the distance the walker moved; a skippable frame's is `size + 8` in 32 bits (probe: size
 //!   `0xFFFFFFFF` says 7, when the file holds it). The content size in a
 //!   header counts only when it is not 0 (probe: a header saying 0 lists
 //!   as `-`).
@@ -60,10 +61,11 @@
 //!     refuses are not recognized (1.10.0's `Error 71` and `Error 72` are
 //!     gone; a header carrying a dictionary ID but no content size, which
 //!     1.10.0 refused, is listed);
-//!   - a legacy frame with no block (its magic number then the end of the
-//!     file or another magic number), is not recognized, and one with a
-//!     word cut short or too large is too, with `Corrupted legacy frame`
-//!     first; a skippable magic number with its size cut is `Error 42`,
+//!   - a legacy frame with a word cut short or too large, or a block past
+//!     the end of the file, is not recognized, with `Corrupted legacy
+//!     frame` first (one with no block, its magic number then the end of
+//!     the file or another magic number, is listed since 1.11.1, 4 bytes
+//!     long); a skippable magic number with its size cut is `Error 42`,
 //!     one whose area runs past the end `Error 43`.
 //! - The table: without `-v` one row per file after a header printed once
 //!   (compressed = the file's size, not the frames'); with display level 3
@@ -336,16 +338,18 @@ impl<R: Read + Seek> Walker<R> {
     }
 
     /// A legacy frame whose magic number is at `start`.
+    ///
+    /// lz4 1.11.1 (probe, 2026-11-14, against 1.11.0): a frame with no block
+    /// (its magic number, then the end of the file or another magic number)
+    /// is listed, a frame of 4 bytes; a block that runs past the end of the
+    /// file is `Corrupted legacy frame` (1.11.0 listed both the other way
+    /// round). A word cut short or over 8 MiB is corrupt as before.
     fn legacy(&mut self, start: u64) -> Result<FrameInfo, Stop> {
         let mut p = start + 4;
-        let mut first = true;
         loop {
             let mut w = [0u8; 4];
             let n = self.win.read_at(p, &mut w);
             if n == 0 {
-                if first {
-                    return Err(Stop::NotRecognized);
-                }
                 break;
             }
             if n < 4 {
@@ -360,16 +364,16 @@ impl<R: Read + Seek> Walker<R> {
                 break;
             }
             if v == MAGIC || v == LEGACY_MAGIC || is_skippable_magic(v) {
-                if first {
-                    return Err(Stop::NotRecognized);
-                }
                 break;
             }
             if v as usize > LEGACY_BLOCK_SIZE {
                 return Err(Stop::CorruptLegacy);
             }
-            p += 4 + u64::from(v);
-            first = false;
+            let end = p + 4 + u64::from(v);
+            if end > self.win.len() {
+                return Err(Stop::CorruptLegacy);
+            }
+            p = end;
         }
         self.pos = p;
         Ok(FrameInfo {
@@ -694,13 +698,22 @@ pub(crate) fn list_files(
     }
     let mut result = Ok(());
     // `from_list` holds only when operands followed `--list` (which, like
-    // `-m` and `-r`, makes every later operand a list entry); without them
-    // the one input is standard input, which lists nothing. The names go through `expand` first so that `-r`
-    // lists a directory's files, as the operand path would compress them,
-    // and every file is then listed in turn, numbered `i` of `total`,
-    // stopping at the first failure.
-    if cmd.from_list {
-        let names = run.expand(&cmd.inputs);
+    // `-m` and `-r`, makes every later operand a list entry). The names go
+    // through `expand` first so that `-r` lists a directory's files, as the
+    // operand path would compress them, and every file is then listed in
+    // turn, numbered `i` of `total`, stopping at the first failure.
+    // Without list entries the one input is standard input, listed as the
+    // operand `stdin` is (lz4 1.11.1, NEWS: "`--list` reads standard input
+    // again"; probe: `lz4 --list < a.lz4` lists `stdin`, a pipe is `lz4:
+    // stdin is not a regular file`, exit 1; 1.11.0 printed the header only).
+    let names = if cmd.from_list {
+        run.expand(&cmd.inputs)
+    } else {
+        Vec::new()
+    };
+    if names.is_empty() {
+        result = list_one(&mut run, STDINMARK, 1, 1);
+    } else {
         let total = names.len();
         for (i, name) in names.iter().enumerate() {
             result = list_one(&mut run, name, i + 1, total);

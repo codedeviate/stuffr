@@ -19,13 +19,13 @@ pub(super) use crate::compat::host::printf;
 
 // ---- the banner and the help texts ----
 
-/// probe: `lz4 -V` (1.11.0) prints `*** lz4 v1.11.0 64-bit multithread, by
+/// probe: `lz4 -V` (1.11.0) prints `*** lz4 v1.11.1 64-bit multithread, by
 /// Yann Collet ***`; spec deviation 1 adds `(stuffr X.Y.Z)` (the argument)
-/// after `multithread`, so the prefix `*** lz4 v1.11.0 ` a script reads is
+/// after `multithread`, so the prefix `*** lz4 v1.11.1 ` a script reads is
 /// unchanged. Printed by `-V` (standard output), first by `-h`/`-H`
 /// (standard error), and at `-v`.
 pub(super) const BANNER: &str =
-    "*** lz4 v1.11.0 64-bit multithread (stuffr %s), by Yann Collet ***\n";
+    "*** lz4 v1.11.1 64-bit multithread (stuffr %s), by Yann Collet ***\n";
 
 /// probe: `lz4 --bogus`: the line before the short usage on a usage error.
 pub(super) const INCORRECT_PARAMETERS: &str = "Incorrect parameters\n";
@@ -271,6 +271,11 @@ pub(super) const CANNOT_DETERMINE: &str = "Cannot determine an output filename \
 
 /// probe: `script -q /dev/null lz4` (standard input a terminal).
 pub(super) const STDIN_CONSOLE: &str = "refusing to read from a console\n";
+
+/// lz4 1.11.1, after [`STDIN_CONSOLE`] only (probe, a pty standard input:
+/// `lz4`, `unlz4`, `lz4c`, `-d`, `-m -`, `-v`; not `-qq`; the stdout
+/// refusal has no such line). `%s` is the invoked name.
+pub(super) const STDIN_CONSOLE_HELP: &str = "For help, type: %s -h\n";
 
 /// probe: `lz4 a -` with standard output a terminal.
 pub(super) const STDOUT_CONSOLE: &str = "refusing to write to console without -c \n";

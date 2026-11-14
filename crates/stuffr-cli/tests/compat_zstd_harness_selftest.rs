@@ -96,10 +96,10 @@ mod unix {
         }
     }
 
-    /// `zstd_lz4_is_1_11` tells a zstd linked to liblz4 1.11.0 from one
+    /// `zstd_lz4_is_1_11` tells a zstd linked to liblz4 1.11.x from one
     /// linked to 1.10.0: the recorded digests differ, and each reference
     /// found on this machine hashes to its own. The reference in use (the
-    /// one `zstd_dir` found) must be the 1.11.0 one under `CI`; the old
+    /// one `zstd_dir` found) must be the 1.11.x one under `CI`; the old
     /// 1.10-linked build is checked when it is here
     /// (`~/Library/Caches/stuffr-references/zstd-1.5.7/bin/zstd`, or
     /// `$STUFFR_ZSTD_LZ4_1_10_REFERENCE`).

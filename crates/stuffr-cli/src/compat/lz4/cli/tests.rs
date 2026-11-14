@@ -393,8 +393,8 @@ fn lz4c_reads_the_legacy_arguments_from_the_rest_of_an_argument() {
         let (r, out, err) = run("lz4c", args, &[]);
         assert_eq!(r.unwrap_err().code, 0, "{args:?}");
         assert!(
-            out.is_empty() && err.contains("Legacy arguments : \n"),
-            "{err}"
+            err.is_empty() && out.contains("Legacy arguments : \n"),
+            "{out}"
         );
     }
     let (r, _, _) = run("lz4c", &["-yf"], &[]);
@@ -825,7 +825,7 @@ fn usage_errors_print_at_display_level_1() {
 #[test]
 fn help_and_version_print_at_once_whatever_the_level() {
     let banner = format!(
-        "*** lz4 v1.11.0 64-bit multithread (stuffr {}), by Yann Collet ***\n",
+        "*** lz4 v1.11.1 64-bit multithread (stuffr {}), by Yann Collet ***\n",
         env!("CARGO_PKG_VERSION")
     );
     for args in [
@@ -849,8 +849,9 @@ fn help_and_version_print_at_once_whatever_the_level() {
             "{args:?}"
         );
     }
-    let (r, out, short) = run("lz4", &["-qq", "-h"], &[]);
-    assert_eq!((r.unwrap_err().code, out.as_str()), (0, ""));
+    // lz4 1.11.1: the help, banner and all, goes to standard output.
+    let (r, short, err) = run("lz4", &["-qq", "-h"], &[]);
+    assert_eq!((r.unwrap_err().code, err.as_str()), (0, ""));
     assert!(short.starts_with(&banner));
     // (The help's columns are built with `repeat`: a literal run of blanks
     // trips `no_message_literal_in_the_workspace_carries_a_run_of_collapsed_indentation`.)
@@ -859,12 +860,12 @@ fn help_and_version_print_at_once_whatever_the_level() {
         " -i#{}: minimum evaluation time in seconds (default : 3s) \n",
         blanks(4)
     )));
-    assert_eq!(run("lz4", &["--help"], &[]).2, short);
-    assert_eq!(run("lz4", &["-hV"], &[]).2, short);
-    let long = run("lz4", &["-H"], &[]).2;
+    assert_eq!(run("lz4", &["--help"], &[]).1, short);
+    assert_eq!(run("lz4", &["-hV"], &[]).1, short);
+    let long = run("lz4", &["-H"], &[]).1;
     assert!(long.starts_with(&short));
     assert!(long.ends_with(&format!("{}generator | lz4 | consumer \n", blanks(10))));
-    let long_c = run("lz4c", &["-H"], &[]).2;
+    let long_c = run("lz4c", &["-H"], &[]).1;
     assert!(long_c.contains(&format!(
         " -y{}: overwrite output without prompting \n\n****",
         blanks(5)
@@ -1102,7 +1103,10 @@ fn refusals_print_their_line_and_exit_1() {
     };
     assert_eq!(
         r(&[], Refusal::StdinConsole),
-        (1, "refusing to read from a console\n".into())
+        (
+            1,
+            "refusing to read from a console\nFor help, type: lz4 -h\n".into()
+        )
     );
     assert_eq!(
         r(&[], Refusal::StdoutConsole),

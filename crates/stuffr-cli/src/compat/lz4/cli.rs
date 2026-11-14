@@ -525,21 +525,22 @@ pub(crate) fn print_banner(w: &mut dyn Write) {
     printf(w, m::BANNER, &[env!("CARGO_PKG_VERSION").as_bytes()]);
 }
 
-/// lz4 -h (`long` false) or -H (`long` true), to standard error (probe:
-/// `lz4 -h 2>/dev/null` prints nothing). `--help` is `-h` (probe: both are
-/// 2117 bytes).
-fn print_help(err: &mut dyn Write, program: &[u8], legacy: bool, long: bool) {
-    print_banner(err);
-    printf(err, m::USAGE, &[program]);
+/// lz4 -h (`long` false) or -H (`long` true), banner included, to standard
+/// output since lz4 1.11.1 (NEWS: "help (`-h`, `-H`, `--help`) outputs to
+/// stdout"; probe: `lz4 -h 2>/dev/null` prints it all, the text is 1.11.0's
+/// byte for byte). `--help` is `-h`.
+fn print_help(out: &mut dyn Write, program: &[u8], legacy: bool, long: bool) {
+    print_banner(out);
+    printf(out, m::USAGE, &[program]);
     let budget = (MEMORY_DEFAULT >> 20).to_string();
-    printf(err, m::HELP_REST, &[budget.as_bytes()]);
+    printf(out, m::HELP_REST, &[budget.as_bytes()]);
     if legacy {
-        printf(err, m::HELP_LEGACY, &[]);
+        printf(out, m::HELP_LEGACY, &[]);
     }
     if long {
-        printf(err, m::LONG_HELP, &[program; 6]);
+        printf(out, m::LONG_HELP, &[program; 6]);
         if legacy {
-            printf(err, m::LONG_HELP_LEGACY, &[program; 2]);
+            printf(out, m::LONG_HELP_LEGACY, &[program; 2]);
         }
     }
 }
@@ -725,7 +726,7 @@ fn long_option(
         b"--verbose" => st.display_level += 1,
         b"--quiet" => st.display_level -= 1,
         b"--help" => {
-            print_help(err, st.program, st.legacy_cli, false);
+            print_help(out, st.program, st.legacy_cli, false);
             return Err(Stop {
                 code: 0,
                 pause: st.pause,
@@ -871,11 +872,11 @@ fn short_options(
                 return Err(clean(st));
             }
             b'h' => {
-                print_help(err, st.program, st.legacy_cli, false);
+                print_help(out, st.program, st.legacy_cli, false);
                 return Err(clean(st));
             }
             b'H' => {
-                print_help(err, st.program, st.legacy_cli, true);
+                print_help(out, st.program, st.legacy_cli, true);
                 return Err(clean(st));
             }
             b'z' => st.mode = Mode::Compress,
@@ -1257,7 +1258,10 @@ pub(crate) fn list_target(cmd: &Command, op: Op, name: &[u8]) -> Option<Target> 
 pub(crate) fn refuse(err: &mut dyn Write, cmd: &Command, refusal: Refusal) -> i32 {
     if cmd.display_level >= 1 {
         match refusal {
-            Refusal::StdinConsole => printf(err, m::STDIN_CONSOLE, &[]),
+            Refusal::StdinConsole => {
+                printf(err, m::STDIN_CONSOLE, &[]);
+                printf(err, m::STDIN_CONSOLE_HELP, &[&cmd.program]);
+            }
             Refusal::StdoutConsole => printf(err, m::STDOUT_CONSOLE, &[]),
             Refusal::NoOutputName => {
                 printf(err, m::CANNOT_DETERMINE, &[]);

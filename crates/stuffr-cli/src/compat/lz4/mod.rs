@@ -1,10 +1,12 @@
 //! The lz4 family (`lz4`, `unlz4`, `lz4cat`, `lz4c`): stuffr behaving as
-//! the LZ4 command line interface v1.11.0 (0.26.0; v1.10.0 before).
+//! the LZ4 command line interface v1.11.1 (v1.11.0 from 0.26.0, v1.10.0
+//! before).
 //!
 //! **A clean-room implementation** (spec decision 3): lz4's `programs/` is
 //! GPL-2.0-or-later and was never read. Every rule comes from the man page
 //! (`lz4.1`), `NEWS`, `README.md`, `lz4 -h`/`-H` and probes of the 1.10.0
-//! binary and then the 1.11.0 one, and carries its source in a comment; every string is in
+//! binary, then the 1.11.0 one and then the 1.11.1 one (black box, side by
+//! side with 1.11.0), and carries its source in a comment; every string is in
 //! `messages.rs`. liblz4 itself (BSD-2-Clause, `LICENSE-lz4`) is reached
 //! through `stuffr::lz4_opts`. `cli.rs` holds the command line and the
 //! decision table for where output goes.
@@ -39,8 +41,8 @@
 //! this list):
 //!
 //! 1. The banner names stuffr wherever lz4 prints it (`-V`, the first line
-//!    of `-h`/`-H`, `-v`): `*** lz4 v1.11.0 64-bit multithread (stuffr
-//!    X.Y.Z), by Yann Collet ***`. The prefix `*** lz4 v1.11.0 ` is
+//!    of `-h`/`-H`, `-v`): `*** lz4 v1.11.1 64-bit multithread (stuffr
+//!    X.Y.Z), by Yann Collet ***`. The prefix `*** lz4 v1.11.1 ` is
 //!    unchanged.
 //! 2. Timing and host fields vary, as between two runs of lz4: the `Done
 //!    in` line's seconds, speed and cpu load, the progress refreshes, and
@@ -385,7 +387,7 @@ mod tests {
     #[test]
     fn a_sandboxed_run_parses_and_plans() {
         let banner = format!(
-            "*** lz4 v1.11.0 64-bit multithread (stuffr {}), by Yann Collet ***\n",
+            "*** lz4 v1.11.1 64-bit multithread (stuffr {}), by Yann Collet ***\n",
             env!("CARGO_PKG_VERSION")
         );
         assert_eq!(run("lz4", &["-V"], b""), (0, banner.clone(), String::new()));

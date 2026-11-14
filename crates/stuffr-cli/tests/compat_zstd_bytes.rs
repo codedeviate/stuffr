@@ -24,7 +24,7 @@
 //! 0 and `--fast=1`: gzip is compared byte for byte with C zlib (`zlib-c`;
 //! spike S2 measured zlib's deflate and header identical to the
 //! reference's, the OS byte included), xz and lzma with liblzma (`xz-c`,
-//! 5.8.4 on both sides) and lz4 with liblz4 (`lz4-c`, 1.11.0 via
+//! 5.8.4 on both sides) and lz4 with liblz4 (`lz4-c`, 1.11.1 via
 //! `stuffr::lz4_opts`); elsewhere the reference decodes stuffr's output to
 //! the input.
 

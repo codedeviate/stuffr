@@ -145,7 +145,7 @@ jobs:
       # zstd 1.5.7 from the release tarball: the compat_zstd* oracle (see the action).
       - uses: ./.github/actions/zstd-reference
         with: *debian-reference
-      # lz4 1.11.0 from the release tarball: the compat_lz4* oracle (see the action).
+      # lz4 1.11.1 from the release tarball: the compat_lz4* oracle (see the action).
       - uses: ./.github/actions/lz4-reference
         with: *debian-reference
       - uses: ./.github/actions/brotli-reference
@@ -213,7 +213,7 @@ jobs:
       # zstd 1.5.7 from the release tarball: the compat_zstd* oracle (see the action).
       - uses: ./.github/actions/zstd-reference
         with: *debian-reference
-      # lz4 1.11.0 from the release tarball: the compat_lz4* oracle (see the action).
+      # lz4 1.11.1 from the release tarball: the compat_lz4* oracle (see the action).
       - uses: ./.github/actions/lz4-reference
         with: *debian-reference
       - uses: ./.github/actions/brotli-reference
@@ -282,7 +282,7 @@ jobs:
       # zstd 1.5.7 from the release tarball: the compat_zstd* oracle (see the action).
       - uses: ./.github/actions/zstd-reference
         with: *debian-reference
-      # lz4 1.11.0 from the release tarball: the compat_lz4* oracle (see the action).
+      # lz4 1.11.1 from the release tarball: the compat_lz4* oracle (see the action).
       - uses: ./.github/actions/lz4-reference
         with: *debian-reference
       - uses: ./.github/actions/brotli-reference
@@ -577,7 +577,7 @@ jobs:
       - uses: ./.github/actions/xz-reference
       # zstd 1.5.7 from the release tarball: the compat_zstd* oracle (see the action).
       - uses: ./.github/actions/zstd-reference
-      # lz4 1.11.0 from the release tarball: the compat_lz4* oracle (see the action).
+      # lz4 1.11.1 from the release tarball: the compat_lz4* oracle (see the action).
       - uses: ./.github/actions/lz4-reference
       - uses: ./.github/actions/brotli-reference
       # Which releases this run compares against: the logs said neither.

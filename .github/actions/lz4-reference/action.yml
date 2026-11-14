@@ -1,12 +1,12 @@
 name: lz4 reference
 description: >-
-  Builds lz4 1.11.0 from the release tarball and exports
+  Builds lz4 1.11.1 from the release tarball and exports
   STUFFR_LZ4_REFERENCE, the oracle of the lz4 compatibility suites
   (compat_lz4*). Every job that runs those tests needs it; with CI set, the
-  harness panics if the reference is missing or is not exactly 1.11.0.
+  harness panics if the reference is missing or is not exactly 1.11.1.
 
 # The binary is built from the tarball, not taken from a distro: Debian and
-# Homebrew ship other releases, and the promise is byte identity with 1.11.0.
+# Homebrew ship other releases, and the promise is byte identity with 1.11.1.
 # lz4 links nothing but libc and pthreads (multithreading is the default on
 # POSIX since 1.10), so the cached install needs no runtime libraries.
 # The whole tarball is extracted: since 1.11.0 the Makefiles include
@@ -33,40 +33,40 @@ runs:
     - name: where the install lives
       id: dir
       shell: bash
-      run: echo "path=$RUNNER_TEMP/lz4-1.11.0" >> "$GITHUB_OUTPUT"
+      run: echo "path=$RUNNER_TEMP/lz4-1.11.1" >> "$GITHUB_OUTPUT"
 
     # Keyed on the version, the OS, the CPU and the container image: the
     # install is a native build, linked against that system's libraries.
-    - name: cache the lz4 1.11.0 install
+    - name: cache the lz4 1.11.1 install
       id: cache
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.dir.outputs.path }}
-        key: lz4-1.11.0-${{ runner.os }}-${{ runner.arch }}${{ inputs.image && format('-{0}', inputs.image) || '' }}
+        key: lz4-1.11.1-${{ runner.os }}-${{ runner.arch }}${{ inputs.image && format('-{0}', inputs.image) || '' }}
 
-    # The SHA-256 is the one in the release's own lz4-1.11.0.tar.gz.sha256,
+    # The SHA-256 is the one in the release's own lz4-1.11.1.tar.gz.sha256,
     # and matches a local `shasum -a 256` of two independent downloads.
-    - name: build lz4 1.11.0
+    - name: build lz4 1.11.1
       if: steps.cache.outputs.cache-hit != 'true'
       shell: bash
       run: |
         set -euo pipefail
-        url=https://github.com/lz4/lz4/releases/download/v1.11.0/lz4-1.11.0.tar.gz
-        sha256=247e5fa64da5f7b75ee3dd3bed484076396c9ebe8254d9ccf693eb62800c5e26
+        url=https://github.com/lz4/lz4/releases/download/v1.11.1/lz4-1.11.1.tar.gz
+        sha256=683fed08a844ad012196381e40badf80c0bbe4962959761416d41c9e67d77ec7
         src="$RUNNER_TEMP/lz4-src"
         mkdir -p "$src"
-        curl -fsSL --retry 3 -o "$src/lz4-1.11.0.tar.gz" "$url"
-        echo "$sha256  $src/lz4-1.11.0.tar.gz" | shasum -a 256 -c -
-        tar -xzf "$src/lz4-1.11.0.tar.gz" -C "$src"
-        make -C "$src/lz4-1.11.0/programs" lz4 -j"$(getconf _NPROCESSORS_ONLN)"
-        mkdir -p "$RUNNER_TEMP/lz4-1.11.0/bin"
-        cp "$src/lz4-1.11.0/programs/lz4" "$RUNNER_TEMP/lz4-1.11.0/bin/lz4"
+        curl -fsSL --retry 3 -o "$src/lz4-1.11.1.tar.gz" "$url"
+        echo "$sha256  $src/lz4-1.11.1.tar.gz" | shasum -a 256 -c -
+        tar -xzf "$src/lz4-1.11.1.tar.gz" -C "$src"
+        make -C "$src/lz4-1.11.1/programs" lz4 -j"$(getconf _NPROCESSORS_ONLN)"
+        mkdir -p "$RUNNER_TEMP/lz4-1.11.1/bin"
+        cp "$src/lz4-1.11.1/programs/lz4" "$RUNNER_TEMP/lz4-1.11.1/bin/lz4"
 
     - name: use it as the reference
       shell: bash
       run: |
         set -euo pipefail
-        bin="$RUNNER_TEMP/lz4-1.11.0/bin"
+        bin="$RUNNER_TEMP/lz4-1.11.1/bin"
         for l in unlz4 lz4cat lz4c; do ln -sf lz4 "$bin/$l"; done
         echo "STUFFR_LZ4_REFERENCE=$bin/lz4" >> "$GITHUB_ENV"
         if ! "$bin/lz4" -V; then

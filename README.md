@@ -1231,7 +1231,7 @@ cargo install --locked stuffr-cli --features c-backed    # needs a C compiler, n
 
 `--locked` keeps the vendored C libraries at the versions the compatibility
 links promise (libzstd 1.5.7 through `zstd-sys`); without it, cargo may resolve
-newer `-sys` crates. liblz4 1.11.0 is vendored in `stuffr-formats` itself.
+newer `-sys` crates. liblz4 1.11.1 is vendored in `stuffr-formats` itself.
 
 The five legacy formats (Unix `compress` `.Z`, LHA/LZH and ARJ — all three
 read AND write, as of Phase 3c Tasks 5, 6 and 7 — plus the read-only ARC/PAK and ZOO) are in the default
@@ -1272,7 +1272,7 @@ behaves as **bzip2 1.0.8**; invoked as `gzip`, `gunzip`, `zcat` or `gzcat`
 `unlzma` or `lzcat` (from `0.13.0`), as **xz** (XZ Utils 5.8.4); invoked as
 `zstd`, `unzstd`, `zstdcat` or `zstdmt` (from `0.14.0`), as **zstd** (zstd
 1.5.7); invoked as `lz4`, `unlz4`, `lz4cat` or `lz4c` (from `0.15.0`), as
-**lz4** (lz4 1.11.0); invoked as `unzip`, `zipinfo` or `funzip` (from
+**lz4** (lz4 1.11.1); invoked as `unzip`, `zipinfo` or `funzip` (from
 `0.16.0`), as **Info-ZIP UnZip 6.00**; invoked as `compress` or `uncompress`
 (from `0.18.0`), as **compress**, Apple's 487.0.1 or ncompress 5.0; invoked as
 `zip`, `zipcloak`, `zipnote` or `zipsplit` (from `0.19.0`), as **Info-ZIP Zip
@@ -1579,7 +1579,7 @@ input through, at display level 1) and `zstdmt` compresses with `-T0`.
 - **Compressed output.** On the `c-backed` tier (`--features c-backed`, which
   builds libzstd 1.5.7) zstd frames and dictionaries are **byte-identical to
   zstd 1.5.7** for every level, `--ultra`, `--long`, `-T`, `--rsyncable`,
-  `--format=gzip|xz|lzma|lz4` (liblz4 1.11.0 through `lz4-c`, in
+  `--format=gzip|xz|lzma|lz4` (liblz4 1.11.1 through `lz4-c`, in
   `c-backed`), dictionaries and `--patch-from`. The exceptions:
   `--train-cover` (see below) and `--adapt` (its level moves by timing, so its
   frames are compatible, not identical). On the default pure tier every option is
@@ -1692,7 +1692,7 @@ bounds never apply to a real run.
 ### The lz4 family
 
 `lz4`, `unlz4`, `lz4cat` and `lz4c`, from `0.15.0`. They behave as the
-**lz4 command line tool, version 1.11.0** (from `0.26.0`; 1.10.0 before),
+**lz4 command line tool, version 1.11.1** (1.11.0 from `0.26.0`, 1.10.0 before),
 and only that version: one personality, one reference. The preset comes from the invoked name as lz4
 derives it, probed on the binary: the name itself or the name followed by `.`
 and anything (`unlz4.exe`), case-sensitively; `unlz4-1`, `xunlz4` and `UNLZ4`
@@ -1704,23 +1704,23 @@ benchmark lines included.
 
 **The promise:**
 
-- **Stdout, stderr and exit codes are those of lz4 1.11.0** (under
+- **Stdout, stderr and exit codes are those of lz4 1.11.1** (under
   `LC_ALL=C`), on both build tiers: every documented option, `--list` (compact
   and `-v`), `-v`/`-vv`/`-vvv`, `-m`, `-r`, `--rm`, `-D` dictionaries,
   legacy frames (`-l`), concatenated and skippable frames, sparse output, the
   overwrite question and the display level rules. The exit codes are lz4's:
   0, 1 (usage and file errors) and `Error N` exiting N; stuffr's own 3 to 7
   never apply under these names. A differential suite runs each case through
-  a real lz4 1.11.0 and a stuffr link and compares those streams, the file
+  a real lz4 1.11.1 and a stuffr link and compares those streams, the file
   tree, modes and mtimes.
 - **Compressed output.** With `--features lz4-c` (also in `c-backed`), which
-  builds the vendored liblz4 1.11.0, `.lz4` bytes are **byte-identical to lz4
-  1.11.0** for every option. On the default pure tier (`lz4_flex`) every option
-  is accepted and the output is **compatible**: lz4 1.11.0 decodes it to the
+  builds the vendored liblz4 1.11.1, `.lz4` bytes are **byte-identical to lz4
+  1.11.1** for every option. On the default pure tier (`lz4_flex`) every option
+  is accepted and the output is **compatible**: lz4 1.11.1 decodes it to the
   input.
 - **The intended difference:** the banner. `-V`, the first lines of `-h`/`-H`
-  and `-v` print `*** lz4 v1.11.0 64-bit multithread (stuffr X.Y.Z), by Yann
-  Collet ***`; the prefix `*** lz4 v1.11.0 ` is unchanged.
+  and `-v` print `*** lz4 v1.11.1 64-bit multithread (stuffr X.Y.Z), by Yann
+  Collet ***`; the prefix `*** lz4 v1.11.1 ` is unchanged.
 
 **Known differences, both tiers:**
 
@@ -1736,9 +1736,9 @@ benchmark lines included.
   or a block when larger) with independent blocks, which both compress on the
   calling thread. Where liblz4's workers take the frame (more than one job,
   or linked blocks over a block or more) the figure is what they had handed
-  back when it was drawn, which varies from run to run in lz4 1.11.0 itself,
+  back when it was drawn, which varies from run to run in lz4 1.11.1 itself,
   so it is timing too. While decoding, the refreshes are drawn at other
-  moments: lz4 1.11.0 draws one after each piece it has decoded without
+  moments: lz4 1.11.1 draws one after each piece it has decoded without
   error (3 to 4 MiB of output), so a decode that fails inside its first
   piece shows none and one that fails at the end of the input shows what was
   decoded by then; a frame followed by bytes that are no frame draws it
@@ -1751,7 +1751,7 @@ benchmark lines included.
   gone. stuffr refuses with lz4's own same-file message (`a: input and output are the same file; not
   overwritten`) and counts that input as failed (exit 1), whatever `-f`
   says. Every other same-file case (`lz4 -f a a`, a hard or symbolic link,
-  `-m`) lz4 1.11.0 refuses itself, with that message, and stuffr does the
+  `-m`) lz4 1.11.1 refuses itself, with that message, and stuffr does the
   same. A pipe from the file, or standard output redirected onto it, loses
   the data alike in both: the pipe or the shell has done it before either
   program can see it.
@@ -1769,7 +1769,7 @@ benchmark lines included.
   and have no effect without it, as in lz4. `-h` and `-H` still list all
   three. The hidden `-S` is accepted and has no effect, as in lz4.
 - **A decode that fails keeps everything decoded before the fault** in its
-  output (a file or standard output). lz4 1.11.0 hands its output on in 4 MiB
+  output (a file or standard output). lz4 1.11.1 hands its output on in 4 MiB
   pieces and writes the rest only at the end of a frame or of the input, so a
   fault inside a frame loses what follows the last whole piece, and a frame
   followed by bytes that are no frame leaves nothing or the whole frame, run
@@ -2385,7 +2385,7 @@ tiers:
   liblzma, against XZ Utils 5.8.4 (done); zstd on the `c-backed` tier,
   via libzstd, against zstd 1.5.7 (done; `--train-cover` and `--adapt`
   excepted, as stated above); lz4 on the `lz4-c` tier (in `c-backed`), via
-  liblz4, against lz4 1.11.0 (done; 1.10.0 from `0.15.0`), which also makes zstd's `--format=lz4`
+  liblz4, against lz4 1.11.1 (done; 1.11.0 from `0.26.0`, 1.10.0 from `0.15.0`), which also makes zstd's `--format=lz4`
   byte-identical there; brotli on the `brotli-c` tier (in `c-backed`), via
   the vendored libbrotli 1.2.1, against brotli 1.2.1 (done).
 - **Compatible behaviour only** (the same flags, files, exit codes and
@@ -2417,7 +2417,7 @@ copies `UTIL_makeHumanReadableSize` from `programs/util.c` (BSD, covered by
 The lz4 family ports nothing: lz4's command line tool is GPL-2.0-or-later and
 its source was never read, so the front end is a clean-room implementation
 from lz4's documentation (man pages, `NEWS`, `-h`/`-H`) and the behaviour of
-the 1.10.0 and 1.11.0 binaries. On the `lz4-c` tier liblz4 1.11.0 (Yann Collet,
+the 1.10.0, 1.11.0 and 1.11.1 binaries. On the `lz4-c` tier liblz4 1.11.1 (Yann Collet,
 BSD-2-Clause) is linked; its notice is in
 [`crates/stuffr-cli/LICENSE-lz4`](crates/stuffr-cli/LICENSE-lz4).
 The unzip family is ported from Info-ZIP UnZip 6.0 (Apple's `zip-33` tree
@@ -2969,8 +2969,8 @@ verbatim zstd source (`UTIL_makeHumanReadableSize` from `programs/util.c`),
 also BSD and covered by `LICENSE-zstd`.
 The lz4 family (`0.15.0`) is not a port: lz4's CLI is GPL-2.0-or-later and was
 **not read**, so `crates/stuffr-cli/src/compat/lz4/` is a clean-room
-implementation from lz4's documentation and the behaviour of the 1.10.0
-and 1.11.0 binaries, and is MIT. On the `lz4-c` tier liblz4 1.11.0 is linked, under its
+implementation from lz4's documentation and the behaviour of the 1.10.0,
+1.11.0 and 1.11.1 binaries, and is MIT. On the `lz4-c` tier liblz4 1.11.1 is linked, under its
 BSD-2-Clause licence (`crates/stuffr-cli/LICENSE-lz4`), already in the
 expression below.
 Since `0.16.0` the unzip family is ported from Info-ZIP UnZip 6.0 (Apple's

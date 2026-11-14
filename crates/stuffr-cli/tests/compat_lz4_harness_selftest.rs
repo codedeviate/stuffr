@@ -2,7 +2,7 @@
 //! must notice each single kind of difference and name it, the progress
 //! normaliser must hide deviation 2's fields (timing, refreshes, thread
 //! count) and nothing else, and the reference lookup must accept only
-//! lz4 1.11.0.
+//! lz4 1.11.1.
 //!
 //! Every run here is REFERENCE-shaped: stuffr is not run as `lz4` (the
 //! binary answers to that name from Task 3 on), so the sensitivity tests
@@ -77,7 +77,7 @@ Done in 0.00 s ==> 20.94 MiB/s  (cpu load : 67%)\n";
     }
 
     #[test]
-    fn reference_is_1_11_0() {
+    fn reference_is_1_11_1() {
         let Some(dir) = lz4() else {
             assert!(
                 std::env::var_os("CI").is_none(),
@@ -91,7 +91,7 @@ Done in 0.00 s ==> 20.94 MiB/s  (cpu load : 67%)\n";
             .output()
             .unwrap();
         let v = String::from_utf8_lossy(&o.stdout).into_owned();
-        assert!(v.contains("v1.11.0"), "{v:?}");
+        assert!(v.contains("v1.11.1"), "{v:?}");
         for link in ["unlz4", "lz4cat", "lz4c"] {
             assert!(Path::new(dir).join(link).exists(), "{dir}/{link}");
         }

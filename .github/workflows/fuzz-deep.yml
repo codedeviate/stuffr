@@ -19,7 +19,7 @@ name: fuzz (deep, scheduled)
 # Ruling I's "pure tier only" reasoning does NOT apply here on principle —
 # this is exactly the workflow a `--features c-backed` pass belongs in — and
 # since 0.26.0 there is one: stuffr compiles two vendored C libraries itself
-# (libbrotli 1.2.1 and liblz4 1.11.0, every symbol prefixed `stuffr_`), so
+# (libbrotli 1.2.1 and liblz4 1.11.1, every symbol prefixed `stuffr_`), so
 # `compat` (whose brotli and lz4 families, and every other, then run on the
 # C tier) and `roundtrip` (the registry's C zstd/xz/lzma/zlib codecs) also
 # run built with the fuzz crate's `c-backed` feature, 20 minutes each like

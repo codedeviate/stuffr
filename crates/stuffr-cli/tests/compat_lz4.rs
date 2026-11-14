@@ -45,12 +45,12 @@ mod unix {
     /// judged by the reference decoding them (spec deviation 6).
     const EXACT: bool = cfg!(feature = "lz4-c");
 
-    const REFERENCE_BANNER: &str = "*** lz4 v1.11.0 64-bit multithread, by Yann Collet ***\n";
+    const REFERENCE_BANNER: &str = "*** lz4 v1.11.1 64-bit multithread, by Yann Collet ***\n";
 
     /// Spec deviation 1: stuffr's banner.
     fn our_banner() -> String {
         format!(
-            "*** lz4 v1.11.0 64-bit multithread (stuffr {}), by Yann Collet ***\n",
+            "*** lz4 v1.11.1 64-bit multithread (stuffr {}), by Yann Collet ***\n",
             env!("CARGO_PKG_VERSION")
         )
     }
@@ -286,6 +286,14 @@ mod unix {
             "frame_zero4.lz4" => cat(&[&good(), &[0u8; 4]]),
             "leg_magic_only.lz4" => LEGACY.to_vec(),
             "leg_magics.lz4" => cat(&[&LEGACY, &LEGACY]),
+            // lz4 1.11.1's legacy `--list` (probe 2026-11-14, against 1.11.0):
+            // a frame with no block is listed, a block past the end is not.
+            "leg_8m_cut.lz4" => cat(&[&LEGACY, &le32(0x80_0000), b"abc"]),
+            "leg_magic_then_leg.lz4" => cat(&[&LEGACY, &legacy()]),
+            "leg_then_magic.lz4" => cat(&[&legacy(), &LEGACY]),
+            "leg_block_exact.lz4" => cat(&[&LEGACY, &le32(5), b"abcde"]),
+            "leg_block_one_short.lz4" => cat(&[&LEGACY, &le32(6), b"abcde"]),
+            "leg_then_frame_magic.lz4" => cat(&[&LEGACY, &[0x04, 0x22, 0x4d, 0x18]]),
             "leg_zero_blocks.lz4" => cat(&[&LEGACY, &le32(0), &le32(0), &le32(0)]),
             // `--list` (0.26.0 Task 6, lz4 1.11.0's checks): the classes
             // the random differential found.
@@ -373,8 +381,10 @@ mod unix {
         setup: Option<fn(&Path)>,
         /// The reference's exit code.
         code: i32,
-        /// Text its standard error holds (`""`: nothing is checked).
+        /// Text its standard error holds (`""`: nothing is checked), or its
+        /// standard output when `on_stdout` (the help, since lz4 1.11.1).
         msg: &'static str,
+        on_stdout: bool,
     }
 
     /// The start of every short usage: `Incorrect parameters`, then the
@@ -402,6 +412,7 @@ mod unix {
             setup: None,
             code,
             msg,
+            on_stdout: false,
         }
     }
 
@@ -421,6 +432,11 @@ mod unix {
         }
         fn setup(mut self, f: fn(&Path)) -> Row {
             self.setup = Some(f);
+            self
+        }
+        /// The message is on standard output (lz4 1.11.1's help).
+        fn on_stdout(mut self) -> Row {
+            self.on_stdout = true;
             self
         }
     }
@@ -1050,7 +1066,8 @@ mod unix {
                 &[],
                 0,
                 "Usage : \n      lz4 [arg] [input] [output] \n",
-            ),
+            )
+            .on_stdout(),
             row(
                 T3,
                 "-H",
@@ -1059,7 +1076,8 @@ mod unix {
                 &[],
                 0,
                 "***** Advanced comment *****",
-            ),
+            )
+            .on_stdout(),
             row(
                 T3,
                 "--help is -h",
@@ -1068,7 +1086,8 @@ mod unix {
                 &[],
                 0,
                 "--best  : same as -12\n",
-            ),
+            )
+            .on_stdout(),
             row(T3, "--version", "lz4", &["--version"], &[], 0, ""),
             row(
                 T3,
@@ -1078,7 +1097,8 @@ mod unix {
                 &[],
                 0,
                 "Usage : \n",
-            ),
+            )
+            .on_stdout(),
             row(
                 T3,
                 "an unknown option before -h",
@@ -1088,7 +1108,7 @@ mod unix {
                 1,
                 usage,
             ),
-            row(T3, "-hV", "lz4", &["-hV"], &[], 0, "Usage : \n"),
+            row(T3, "-hV", "lz4", &["-hV"], &[], 0, "Usage : \n").on_stdout(),
             row(T3, "-Vh", "lz4", &["-Vh"], &[], 0, ""),
             row(
                 T3,
@@ -1108,9 +1128,10 @@ mod unix {
                 &[],
                 0,
                 "Usage : \n",
-            ),
+            )
+            .on_stdout(),
             row(T3, "-qq -V still prints", "lz4", &["-qq", "-V"], &[], 0, ""),
-            row(T3, "-dh", "lz4", &["-dh"], &[], 0, "Usage : \n"),
+            row(T3, "-dh", "lz4", &["-dh"], &[], 0, "Usage : \n").on_stdout(),
             row(
                 T3,
                 "-b before -h",
@@ -1119,7 +1140,8 @@ mod unix {
                 &[],
                 0,
                 "Usage : \n",
-            ),
+            )
+            .on_stdout(),
             row(T3, "-e before -V", "lz4", &["-e", "-V"], &[], 0, ""),
             row(
                 T3,
@@ -1129,7 +1151,8 @@ mod unix {
                 &[],
                 0,
                 "      unlz4 [arg] [input] [output] \n",
-            ),
+            )
+            .on_stdout(),
             row(
                 T3,
                 "unlz4 -H",
@@ -1138,7 +1161,8 @@ mod unix {
                 &[],
                 0,
                 "unlz4 will refuse to read from console",
-            ),
+            )
+            .on_stdout(),
             row(
                 T3,
                 "lz4cat -h",
@@ -1147,7 +1171,8 @@ mod unix {
                 &[],
                 0,
                 "      lz4cat [arg] [input] [output] \n",
-            ),
+            )
+            .on_stdout(),
             row(
                 T3,
                 "lz4cat -H",
@@ -1156,7 +1181,8 @@ mod unix {
                 &[],
                 0,
                 "generator | lz4cat | consumer",
-            ),
+            )
+            .on_stdout(),
             row(T3, "lz4cat -V", "lz4cat", &["-V"], &[], 0, ""),
             row(
                 T3,
@@ -1175,7 +1201,8 @@ mod unix {
                 &[],
                 0,
                 "Legacy arguments : \n -c0    : fast compression \n",
-            ),
+            )
+            .on_stdout(),
             row(
                 T3,
                 "lz4c -H warns",
@@ -1184,7 +1211,8 @@ mod unix {
                 &[],
                 0,
                 "***** Warning  ***** \n",
-            ),
+            )
+            .on_stdout(),
             row(
                 T3,
                 "lz4c usage error has no legacy block",
@@ -1202,7 +1230,8 @@ mod unix {
                 &["a"],
                 0,
                 "Legacy arguments : \n",
-            ),
+            )
+            .on_stdout(),
             row(
                 T3,
                 "lz4c -hcd is -h",
@@ -1211,7 +1240,8 @@ mod unix {
                 &["a"],
                 0,
                 "Legacy arguments : \n",
-            ),
+            )
+            .on_stdout(),
             row(T3, "lz4c -yf", "lz4c", &["-yf", "a"], &["a"], 1, usage),
             row(
                 T3,
@@ -1348,7 +1378,9 @@ mod unix {
                 &["-p", "-h"],
                 &[],
                 0,
-                "(default : 3s) \nPress enter to continue...\n",
+                // lz4 1.11.1: the help on standard output, the pause on
+                // standard error.
+                "Press enter to continue...\n",
             ),
             row(
                 T3,
@@ -2366,8 +2398,8 @@ mod unix {
                 .tty(false, true),
             row(T4, "stdout a pipe, file in: writes FILE.lz4", "lz4", &["a"], &["a"], 0, "Compressed filename will be : a.lz4 "),
             // ---- Task 5: --list ----
-            row(T5, "--list on stdin", "lz4", &["--list"], &[], 0, "").stdin_fx("b.lz4"),
-            row(T5, "--list on empty stdin", "lz4", &["--list"], &[], 0, "").stdin(b""),
+            row(T5, "--list on a piped stdin (1.11.1)", "lz4", &["--list"], &[], 1, "lz4: stdin is not a regular file \n").stdin_fx("b.lz4"),
+            row(T5, "--list on an empty piped stdin (1.11.1)", "lz4", &["--list"], &[], 1, "lz4: stdin is not a regular file \n").stdin(b""),
             row(T5, "--list a frame", "lz4", &["--list", "b.lz4"], &["b.lz4"], 0, ""),
             row(T5, "--list a legacy frame", "lz4", &["--list", "leg.lz4"], &["leg.lz4"], 0, ""),
             row(T5, "--list a legacy magic only", "lz4", &["--list", "legzero.lz4"], &["legzero.lz4"], 0, ""),
@@ -2430,13 +2462,25 @@ mod unix {
             row(T5, "--list a cut header, -v", "lz4", &["--list", "-v", "t_hdr.lz4"], &["t_hdr.lz4"], 1, "File format not recognized"),
             row(T5, "--list a cut block of block checksums, -v", "lz4", &["--list", "-v", "t_bblk.lz4"], &["t_bblk.lz4"], 1, "lz4: t_bblk.lz4: File format not recognized \n"),
             row(T5, "--list a cut magic number", "lz4", &["--list", "t_magic.lz4"], &["t_magic.lz4"], 40, "Magic Number unreadable"),
-            row(T5, "--list a legacy magic number alone", "lz4", &["--list", "leg_magic_only.lz4"], &["leg_magic_only.lz4"], 1, "File format not recognized"),
-            row(T5, "--list two legacy magic numbers", "lz4", &["--list", "leg_magics.lz4"], &["leg_magics.lz4"], 1, "File format not recognized"),
+            row(T5, "--list a legacy magic number alone (1.11.1: listed)", "lz4", &["--list", "leg_magic_only.lz4"], &["leg_magic_only.lz4"], 0, ""),
+            row(T5, "--list two legacy magic numbers (1.11.1: listed)", "lz4", &["--list", "leg_magics.lz4"], &["leg_magics.lz4"], 0, ""),
             row(T5, "--list zero-size legacy blocks", "lz4", &["--list", "-v", "leg_zero_blocks.lz4"], &["leg_zero_blocks.lz4"], 1, "Stream followed by undecodable data at position 12 \nlz4: leg_zero_blocks.lz4: File format not recognized \n"),
             row(T5, "--list a legacy size above 4 GiB - 16", "lz4", &["--list", "leg_huge.lz4"], &["leg_huge.lz4"], 1, "Corrupted legacy frame \nlz4: leg_huge.lz4: File format not recognized"),
             row(T5, "--list a legacy size just above 8 MiB", "lz4", &["--list", "leg_8m.lz4"], &["leg_8m.lz4"], 1, "Corrupted legacy frame \nlz4: leg_8m.lz4: File format not recognized"),
             row(T5, "--list a legacy size cut short", "lz4", &["--list", "leg_bsz_trunc.lz4"], &["leg_bsz_trunc.lz4"], 1, "Corrupted legacy frame"),
-            row(T5, "--list a legacy block cut short, -v", "lz4", &["--list", "-v", "leg_blk_trunc.lz4"], &["leg_blk_trunc.lz4"], 0, ""),
+            row(T5, "--list leg_8m_cut.lz4 (1.11.1)", "lz4", &["--list", "leg_8m_cut.lz4"], &["leg_8m_cut.lz4"], 1, "Corrupted legacy frame \nlz4: leg_8m_cut.lz4: File format not recognized \n"),
+            row(T5, "--list leg_8m_cut.lz4, -v (1.11.1)", "lz4", &["--list", "-v", "leg_8m_cut.lz4"], &["leg_8m_cut.lz4"], 1, "Corrupted legacy frame \nlz4: leg_8m_cut.lz4: File format not recognized \n"),
+            row(T5, "--list leg_magic_then_leg.lz4 (1.11.1)", "lz4", &["--list", "leg_magic_then_leg.lz4"], &["leg_magic_then_leg.lz4"], 0, ""),
+            row(T5, "--list leg_magic_then_leg.lz4, -v (1.11.1)", "lz4", &["--list", "-v", "leg_magic_then_leg.lz4"], &["leg_magic_then_leg.lz4"], 0, ""),
+            row(T5, "--list leg_then_magic.lz4 (1.11.1)", "lz4", &["--list", "leg_then_magic.lz4"], &["leg_then_magic.lz4"], 0, ""),
+            row(T5, "--list leg_then_magic.lz4, -v (1.11.1)", "lz4", &["--list", "-v", "leg_then_magic.lz4"], &["leg_then_magic.lz4"], 0, ""),
+            row(T5, "--list leg_block_exact.lz4 (1.11.1)", "lz4", &["--list", "leg_block_exact.lz4"], &["leg_block_exact.lz4"], 0, ""),
+            row(T5, "--list leg_block_exact.lz4, -v (1.11.1)", "lz4", &["--list", "-v", "leg_block_exact.lz4"], &["leg_block_exact.lz4"], 0, ""),
+            row(T5, "--list leg_block_one_short.lz4 (1.11.1)", "lz4", &["--list", "leg_block_one_short.lz4"], &["leg_block_one_short.lz4"], 1, "Corrupted legacy frame \nlz4: leg_block_one_short.lz4: File format not recognized \n"),
+            row(T5, "--list leg_block_one_short.lz4, -v (1.11.1)", "lz4", &["--list", "-v", "leg_block_one_short.lz4"], &["leg_block_one_short.lz4"], 1, "Corrupted legacy frame \nlz4: leg_block_one_short.lz4: File format not recognized \n"),
+            row(T5, "--list leg_then_frame_magic.lz4 (1.11.1)", "lz4", &["--list", "leg_then_frame_magic.lz4"], &["leg_then_frame_magic.lz4"], 1, "lz4: leg_then_frame_magic.lz4: File format not recognized \n"),
+            row(T5, "--list leg_then_frame_magic.lz4, -v (1.11.1)", "lz4", &["--list", "-v", "leg_then_frame_magic.lz4"], &["leg_then_frame_magic.lz4"], 1, "lz4: leg_then_frame_magic.lz4: File format not recognized \n"),
+            row(T5, "--list a legacy block cut short, -v (1.11.1: corrupt)", "lz4", &["--list", "-v", "leg_blk_trunc.lz4"], &["leg_blk_trunc.lz4"], 1, "Corrupted legacy frame \nlz4: leg_blk_trunc.lz4: File format not recognized \n"),
             row(T5, "--list a legacy frame then 3 bytes", "lz4", &["--list", "leg_garbage.lz4"], &["leg_garbage.lz4"], 1, "Corrupted legacy frame"),
             row(T5, "--list a legacy frame then 8 zeros", "lz4", &["--list", "-v", "leg_zeros.lz4"], &["leg_zeros.lz4"], 1, "Stream followed by undecodable data at position 107 \nlz4: leg_zeros.lz4: File format not recognized \n"),
             row(T5, "--list a frame then 1 byte", "lz4", &["--list", "-v", "frame_tail1.lz4"], &["frame_tail1.lz4"], 40, "Magic Number unreadable"),
@@ -2475,10 +2519,10 @@ mod unix {
             row(T5, "--list a missing file between two", "lz4", &["--list", "b.lz4", "nosuch", "cs.lz4"], &["b.lz4", "cs.lz4"], 1, "lz4: nosuch is not a regular file"),
             row(T5, "--list an Error N ends the run", "lz4", &["--list", "t_magic.lz4", "b.lz4"], &["t_magic.lz4", "b.lz4"], 40, "Magic Number unreadable"),
             row(T5, "--list - between files", "lz4", &["--list", "b.lz4", "-", "cs.lz4"], &["b.lz4", "cs.lz4"], 0, ""),
-            row(T5, "--list - alone", "lz4", &["--list", "-"], &[], 0, "").stdin_fx("b.lz4"),
-            row(T5, "--list -v on stdin", "lz4", &["--list", "-v"], &[], 0, "").stdin_fx("b.lz4"),
+            row(T5, "--list - alone, piped (1.11.1)", "lz4", &["--list", "-"], &[], 1, "lz4: stdin is not a regular file \n").stdin_fx("b.lz4"),
+            row(T5, "--list -v on a piped stdin (1.11.1)", "lz4", &["--list", "-v"], &[], 1, "lz4: stdin is not a regular file \n").stdin_fx("b.lz4"),
             row(T5, "--list the operand stdin, a pipe (a file of that name is not read)", "lz4", &["--list", "stdin"], &["stdin"], 1, "lz4: stdin is not a regular file"),
-            row(T5, "--list after the operand", "lz4", &["b.lz4", "--list"], &["b.lz4"], 0, ""),
+            row(T5, "--list after the operand: stdin, piped (1.11.1)", "lz4", &["b.lz4", "--list"], &["b.lz4"], 1, "lz4: stdin is not a regular file \n"),
             row(T5, "--list -d: the last mode wins", "lz4", &["--list", "-d", "b.lz4"], &["b.lz4"], 0, ""),
             row(T5, "-d --list: the last mode wins", "lz4", &["-d", "--list", "b.lz4"], &["b.lz4"], 0, ""),
             row(T5, "--list -t: the last mode wins", "lz4", &["--list", "-t", "b.lz4"], &["b.lz4"], 0, ""),
@@ -2942,6 +2986,8 @@ mod unix {
             "skip_ok.lz4",
             "notlz4",
             "t_magic.lz4",
+            "leg_magics.lz4",
+            "leg_blk_trunc.lz4",
         ] {
             fs::write(dir.join(name), fx(name)).unwrap();
         }
@@ -2976,6 +3022,11 @@ mod unix {
             &["--list", "b.lz4", "stdin", "cs.lz4"],
             &["--list", "-"],
             &["--list"],
+            // lz4 1.11.1 lists standard input with no list operand.
+            &["--list", "-v"],
+            &["--list", "-v", "-"],
+            &["--list", "b.lz4", "-"],
+            &["b.lz4", "--list"],
         ] {
             for input in [
                 "b.lz4",
@@ -2984,6 +3035,8 @@ mod unix {
                 "skip_ok.lz4",
                 "notlz4",
                 "t_magic.lz4",
+                "leg_magics.lz4",
+                "leg_blk_trunc.lz4",
                 "",
             ] {
                 assert_eq!(
@@ -3230,7 +3283,11 @@ mod unix {
             };
             // The refresh of a failing decode lands anywhere in the message
             // (the reference's own race): judge the normalised text.
-            let raw = run.stderr.replace(REFERENCE_BANNER, "");
+            let raw = if r.on_stdout {
+                String::from_utf8_lossy(&run.stdout).replace(REFERENCE_BANNER, "")
+            } else {
+                run.stderr.replace(REFERENCE_BANNER, "")
+            };
             let stderr = normalise_lz4_progress(&raw);
             if run.code != r.code || !(raw.contains(r.msg) || stderr.contains(r.msg)) {
                 bad.push(format!(

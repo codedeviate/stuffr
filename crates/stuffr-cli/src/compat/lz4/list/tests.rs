@@ -515,10 +515,11 @@ fn a_huge_skippable_frame_wraps_its_size() {
 }
 
 /// probe: legacy frames: magic, then 4-byte sizes and blocks, to the end of
-/// the file or a word that is a magic number; more than 8 MiB, or a word
-/// cut short, is corrupted; a frame with no block is not recognized,
-/// whatever follows. lz4 1.11.0: a word of 0 ends the frame and is part of
-/// it (1.10.0 took it for an empty block), even as the first word.
+/// the file or a word that is a magic number; more than 8 MiB, a word cut
+/// short, or (lz4 1.11.1) a block past the end of the file is corrupted; a
+/// frame with no block is a frame of 4 bytes (1.11.1; 1.11.0: not
+/// recognized). lz4 1.11.0: a word of 0 ends the frame and is part of it
+/// (1.10.0 took it for an empty block), even as the first word.
 #[test]
 fn legacy_frames() {
     assert_eq!(sizes(&legacy(&[10])), [18]);
@@ -549,16 +550,27 @@ fn legacy_frames() {
     let mut then = legacy(&[3]);
     then.extend_from_slice(&skippable(2));
     assert_eq!(walk(&then).0[1].kind, Kind::Skippable);
-    // Cut inside a block: still what it said.
-    assert_eq!(sizes(&legacy(&[5])[..11]), [13]);
+    // Cut inside a block (lz4 1.11.1; 1.11.0 listed what it said).
+    assert_eq!(stop_of(&legacy(&[5])[..11]), Some(Stop::CorruptLegacy));
+    assert_eq!(stop_of(&legacy(&[5])[..12]), Some(Stop::CorruptLegacy));
 
     let magic = LEGACY_MAGIC.to_le_bytes();
-    assert_eq!(stop_of(&magic), Some(Stop::NotRecognized));
+    assert_eq!(sizes(&magic), [4]);
     let mut f = magic.to_vec();
     f.extend_from_slice(&magic);
-    assert_eq!(stop_of(&f), Some(Stop::NotRecognized));
+    assert_eq!(sizes(&f), [4, 4]);
+    let mut f = magic.to_vec();
+    f.extend_from_slice(&legacy(&[3]));
+    assert_eq!(sizes(&f), [4, 11]);
     let mut f = magic.to_vec();
     f.extend_from_slice(&Shape::new().bytes());
+    assert_eq!(
+        walk(&f).0.iter().map(|f| f.kind).collect::<Vec<_>>(),
+        [Kind::Legacy, Kind::Frame]
+    );
+    // A legacy frame then a magic number with nothing after it.
+    let mut f = magic.to_vec();
+    f.extend_from_slice(&MAGIC.to_le_bytes());
     assert_eq!(stop_of(&f), Some(Stop::NotRecognized));
     for n in 1..=3 {
         let mut f = legacy(&[3]);
@@ -568,9 +580,12 @@ fn legacy_frames() {
         g.resize(4 + n, 1);
         assert_eq!(stop_of(&g), Some(Stop::CorruptLegacy), "{n}");
     }
-    // 8 MiB is a block, one more is not (probe: 8388608 / 8388609).
+    // 8 MiB is a block, one more is not (probe: 8388608 / 8388609); a
+    // block of 8 MiB needs its 8 MiB (1.11.1).
     let mut f = magic.to_vec();
     f.extend_from_slice(&(8u32 << 20).to_le_bytes());
+    assert_eq!(stop_of(&f), Some(Stop::CorruptLegacy));
+    f.resize(8 + (8 << 20), 0);
     assert_eq!(sizes(&f), [8 + (8 << 20)]);
     let mut f = magic.to_vec();
     f.extend_from_slice(&((8u32 << 20) + 1).to_le_bytes());
@@ -842,7 +857,7 @@ fn the_verbose_table() {
     let (code, out, err) = d.run(&["--list", "-v", "two.lz4", "sub/two.lz4"]);
     assert_eq!(code, 0);
     assert!(
-        err.starts_with("*** lz4 v1.11.0 64-bit multithread (stuffr "),
+        err.starts_with("*** lz4 v1.11.1 64-bit multithread (stuffr "),
         "{err:?}"
     );
     assert_eq!(err.lines().count(), 1, "{err:?}");
@@ -888,8 +903,8 @@ fn the_levels() {
     );
 }
 
-/// probe: standard input lists nothing (the header, exit 0); a file named
-/// `stdin` is a file; the first failure ends the run, its predecessors'
+/// probe: standard input is listed as a file (lz4 1.11.1; a sandbox's is a
+/// pipe, so "not a regular file", exit 1); a file named `stdin` is a file; the first failure ends the run, its predecessors'
 /// rows stay, its successors are never read; `Error N` exits N.
 #[test]
 fn failures_end_the_run() {
@@ -906,10 +921,11 @@ fn failures_end_the_run() {
         ("cut.lz4", &cut),
         ("past.lz4", &past),
     ]);
+    let piped = "lz4: stdin is not a regular file \n";
     let (code, out, err) = d.run(&["--list"]);
-    assert_eq!((code, out.as_str(), err.as_str()), (0, HEADER, ""));
-    let (code, out, _) = d.run(&["--list", "-"]);
-    assert_eq!((code, out.as_str()), (0, HEADER));
+    assert_eq!((code, out.as_str(), err.as_str()), (1, HEADER, piped));
+    let (code, out, err) = d.run(&["--list", "-"]);
+    assert_eq!((code, out.as_str(), err.as_str()), (1, HEADER, piped));
     let (code, out, err) = d.run(&["--list", "a.lz4", "-", "a.lz4"]);
     assert_eq!((code, err.as_str()), (0, ""));
     assert_eq!(out.matches("a.lz4").count(), 2);

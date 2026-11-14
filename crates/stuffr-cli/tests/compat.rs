@@ -549,7 +549,7 @@ mod unix {
 
     /// The four lz4 names are links like the rest (thirty-four in all now), and
     /// a link runs as its name: `-h` prints its own name in the usage line
-    /// (to standard error, as lz4 does), `lz4c`'s lists the legacy
+    /// (to standard output, as lz4 1.11.1 does), `lz4c`'s lists the legacy
     /// arguments, and `-V` prints stuffr's banner (spec deviation 1).
     #[test]
     fn install_links_creates_the_lz4_names() {
@@ -559,7 +559,7 @@ mod unix {
         assert_eq!(std::fs::read_dir(&s.0).unwrap().count(), 34);
         let dir = s.0.canonicalize().unwrap();
         let banner = format!(
-            "*** lz4 v1.11.0 64-bit multithread (stuffr {}), by Yann Collet ***\n",
+            "*** lz4 v1.11.1 64-bit multithread (stuffr {}), by Yann Collet ***\n",
             env!("CARGO_PKG_VERSION")
         );
         for n in ["lz4", "unlz4", "lz4cat", "lz4c"] {
@@ -567,15 +567,15 @@ mod unix {
             assert_eq!(std::fs::read_link(&link).unwrap(), canon_stuffr(), "{n}");
             let o = Command::new(&link).arg("-h").output().unwrap();
             assert_eq!(o.status.code(), Some(0), "{n}: {}", stderr(&o));
-            assert_eq!(stdout(&o), "", "{n}");
+            assert_eq!(stderr(&o), "", "{n}");
             let usage = format!("Usage : \n      {n} [arg] [input] [output] \n");
             assert!(
-                stderr(&o).starts_with(&format!("{banner}{usage}")),
+                stdout(&o).starts_with(&format!("{banner}{usage}")),
                 "{n}: {}",
-                stderr(&o)
+                stdout(&o)
             );
             assert_eq!(
-                stderr(&o).contains("Legacy arguments : \n"),
+                stdout(&o).contains("Legacy arguments : \n"),
                 n == "lz4c",
                 "{n}"
             );

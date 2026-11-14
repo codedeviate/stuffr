@@ -409,10 +409,11 @@ fn zstd_lz4_probe_input() -> Vec<u8> {
 }
 
 /// SHA-256 of `zstd -c -q --format=lz4 -1` over [`zstd_lz4_probe_input`]
-/// with liblz4 1.11.0 linked (recorded 2026-11-08 with zstd 1.5.7 built
-/// against the lz4 1.11.0 tarball's static liblz4, as the zstd-reference
-/// action builds it). The same zstd linked to liblz4 1.10.0 writes
-/// [`ZSTD_LZ4_1_10_SHA256`] instead.
+/// with liblz4 1.11.x linked (recorded 2026-11-08 with zstd 1.5.7 built
+/// against the lz4 1.11.0 tarball's static liblz4; liblz4 1.11.1, which the
+/// zstd-reference action builds since 2026-11-14, writes the same bytes).
+/// The same zstd linked to liblz4 1.10.0 writes [`ZSTD_LZ4_1_10_SHA256`]
+/// instead.
 pub const ZSTD_LZ4_1_11_SHA256: &str =
     "669da1e65b951c279fd09fb9d57086f8baeca9c962f84b8739a8fe641e6c0d9d";
 /// What liblz4 1.10.0 gives for the same command (recorded alongside, for
@@ -440,22 +441,22 @@ pub fn zstd_lz4_bytes(dir: &Path, level: &str, data: &[u8]) -> Option<Vec<u8>> {
     out.status.success().then_some(out.stdout)
 }
 
-/// Whether `<dir>/zstd`'s liblz4 is 1.11.0's: its `--format=lz4 -1` bytes
+/// Whether `<dir>/zstd`'s liblz4 is 1.11.x's: its `--format=lz4 -1` bytes
 /// over [`zstd_lz4_probe_input`] hash to [`ZSTD_LZ4_1_11_SHA256`].
 pub fn zstd_lz4_is_1_11_at(dir: &Path) -> bool {
     zstd_lz4_bytes(dir, "-1", &zstd_lz4_probe_input())
         .is_some_and(|b| sha256(&b) == ZSTD_LZ4_1_11_SHA256)
 }
 
-/// Whether the reference zstd's liblz4 is 1.11.0, so its `--format=lz4` bytes
+/// Whether the reference zstd's liblz4 is 1.11.x, so its `--format=lz4` bytes
 /// are the ones stuffr promises. `zstd -vV` does not print liblz4's version,
 /// so this compares the bytes it writes on a fixed input with liblz4
-/// 1.11.0's, recorded ([`zstd_lz4_is_1_11_at`]): 1.10.0 (and 1.9.x,
+/// 1.11.x's, recorded ([`zstd_lz4_is_1_11_at`]): 1.10.0 (and 1.9.x,
 /// ubuntu's `liblz4-dev`) write other bytes at level 1.
 ///
 /// `false` locally is a skip of the `--format=lz4` byte rows with a note;
 /// under `CI` it panics (the rule of [`require_reference`]): the
-/// `zstd-reference` action builds liblz4 1.11.0 statically for this. `false`
+/// `zstd-reference` action builds liblz4 1.11.1 statically for this. `false`
 /// without a reference at all (nothing to compare against).
 pub fn zstd_lz4_is_1_11() -> bool {
     static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -465,12 +466,12 @@ pub fn zstd_lz4_is_1_11() -> bool {
         if !ok {
             assert!(
                 std::env::var_os("CI").is_none(),
-                "CI is set but the reference zstd's liblz4 is not 1.11.0 (`--format=lz4 -1` \
-                 bytes differ from liblz4 1.11.0's): zstd must be linked against liblz4 \
-                 1.11.0, as the zstd-reference action builds it"
+                "CI is set but the reference zstd's liblz4 is not 1.11.x (`--format=lz4 -1` \
+                 bytes differ from liblz4 1.11.x's): zstd must be linked against liblz4 \
+                 1.11.1, as the zstd-reference action builds it"
             );
             eprintln!(
-                "skipped: the reference zstd's liblz4 is not 1.11.0 (--format=lz4 byte rows)"
+                "skipped: the reference zstd's liblz4 is not 1.11.x (--format=lz4 byte rows)"
             );
         }
         ok
@@ -608,16 +609,16 @@ pub fn strip_bench_help(stdout: &str) -> String {
 
 const LZ4_LINKS: [&str; 3] = ["unlz4", "lz4cat", "lz4c"];
 
-/// Whether `<dir>/lz4`'s `-V` says release 1.11.0 (`*** lz4 v1.11.0 64-bit
+/// Whether `<dir>/lz4`'s `-V` says release 1.11.1 (`*** lz4 v1.11.1 64-bit
 /// multithread, by Yann Collet ***`).
-fn is_lz4_1_11_0(dir: &Path) -> bool {
+fn is_lz4_1_11_1(dir: &Path) -> bool {
     output(
         Command::new(dir.join("lz4"))
             .arg("-V")
             .env_clear()
             .stdin(Stdio::null()),
     )
-    .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("v1.11.0"))
+    .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("v1.11.1"))
 }
 
 /// `lz4` on `PATH`, like a shell's lookup.
@@ -627,10 +628,10 @@ fn lz4_on_path() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// The directory holding lz4 1.11.0's `lz4` and its links `unlz4`, `lz4cat`
+/// The directory holding lz4 1.11.1's `lz4` and its links `unlz4`, `lz4cat`
 /// and `lz4c`.
 ///
-/// Looked up in this order, the first one that [`is_lz4_1_11_0`] accepts
+/// Looked up in this order, the first one that [`is_lz4_1_11_1`] accepts
 /// winning:
 /// 1. `$STUFFR_LZ4_REFERENCE`, the path of an `lz4` (CI builds the release
 ///    tarball there; if the three links are not beside it they are made in a
@@ -641,7 +642,7 @@ fn lz4_on_path() -> Option<PathBuf> {
 /// `None` when there is none: a skip with a note locally, a panic under `CI`
 /// (the rule of [`require_reference`]), so every test that skips on it would
 /// otherwise pass vacuously. Another release is no reference: stuffr
-/// promises 1.11.0's behaviour.
+/// promises 1.11.1's behaviour.
 pub fn lz4_dir() -> Option<&'static str> {
     static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let found = DIR.get_or_init(|| {
@@ -659,7 +660,7 @@ pub fn lz4_dir() -> Option<&'static str> {
             let Some(dir) = dir_with_links_for(&exe, "lz4", &LZ4_LINKS) else {
                 continue;
             };
-            if is_lz4_1_11_0(&dir) {
+            if is_lz4_1_11_1(&dir) {
                 return dir.to_str().map(str::to_owned);
             }
         }
@@ -670,10 +671,10 @@ pub fn lz4_dir() -> Option<&'static str> {
         None => {
             assert!(
                 std::env::var_os("CI").is_none(),
-                "CI is set but there is no lz4 1.11.0 reference \
+                "CI is set but there is no lz4 1.11.1 reference \
                  (looked at $STUFFR_LZ4_REFERENCE, /opt/homebrew/opt/lz4/bin, PATH)"
             );
-            eprintln!("skipped: lz4 1.11.0 not installed");
+            eprintln!("skipped: lz4 1.11.1 not installed");
             None
         }
     }
