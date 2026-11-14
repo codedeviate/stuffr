@@ -912,8 +912,12 @@ impl Bz<'_> {
                     self.say(m::DELETION_FAILED, &[p]);
                 }
             } else {
-                // bzip2 keeps the partial output when the input has gone.
-                let _ = fs::rename(&tmp, self.host.path(&out));
+                // bzip2 keeps the partial output when the input has gone: the
+                // file it created `O_EXCL` at the start. A name that appeared
+                // since is someone else's and is never replaced (bzip2 would
+                // leave it too, its own output being unlinked), so the
+                // temporary goes there only exclusively, `-f` or not.
+                let _ = publish(&tmp, &self.host.path(&out), false);
                 self.say(m::DELETION_SUPPRESSED, &[p]);
                 self.say(m::SINCE_INPUT_GONE, &[p]);
                 self.say(m::MAY_BE_INCOMPLETE, &[p, &out]);
@@ -1006,6 +1010,53 @@ mod tests {
                     format!("bzip2: Output file {} already exists.\n", out.display())
                 );
             }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// When the input has gone, a failed run keeps its partial output, as
+    /// bzip2 keeps the file it created `O_EXCL`; but a name that appeared at
+    /// the output meanwhile is never replaced, `-f` or not.
+    #[test]
+    fn a_kept_partial_output_never_replaces_a_name_that_appeared() {
+        let dir = std::env::temp_dir().join(format!("stuffr-bz-keep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (tmp, out) = (dir.join(".tmp"), dir.join("big"));
+        let gone = dir.join("big.bz2");
+        for (force, appeared) in [(false, true), (true, true), (false, false)] {
+            fs::write(&tmp, b"partial").unwrap();
+            let _ = fs::remove_file(&out);
+            if appeared {
+                fs::write(&out, b"precious").unwrap();
+            }
+            let mut err = Vec::new();
+            let mut host = Host::Real;
+            let mut s = settings(force);
+            s.op = OpMode::Decompress;
+            let mut bz = Bz {
+                prog: "bunzip2",
+                s,
+                num_files: 1,
+                exit: 0,
+                processed: 1,
+                in_name: gone.as_os_str().as_encoded_bytes().to_vec(),
+                out_name: out.as_os_str().as_encoded_bytes().to_vec(),
+                pending: Some(tmp.clone()),
+                unz_fails: false,
+                test_fails: false,
+                host: &mut host,
+                err: &mut err,
+            };
+            let _ = bz.clean_up_and_fail(1);
+            let exit = bz.exit;
+            let msg = String::from_utf8(err).unwrap();
+            let what = format!("force={force} appeared={appeared}");
+            assert_eq!(exit, 1, "{what}");
+            assert!(msg.contains("may be incomplete"), "{what}: {msg}");
+            assert!(!tmp.exists(), "{what}: the temporary is left");
+            let want: &[u8] = if appeared { b"precious" } else { b"partial" };
+            assert_eq!(fs::read(&out).unwrap(), want, "{what}");
         }
         let _ = fs::remove_dir_all(&dir);
     }
