@@ -46,8 +46,22 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     if cli.examples {
-        print!("{EXAMPLES}");
-        return ExitCode::SUCCESS;
+        // `print!` panics on EPIPE (SIGPIPE is ignored by the runtime), and
+        // the page is ~2x a pipe buffer: `| head` must end quietly, as
+        // `formats`/`list` do.
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        return match out
+            .write_all(EXAMPLES.as_bytes())
+            .and_then(|()| out.flush())
+        {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("stuffr: i/o error: {e}");
+                ExitCode::from(1)
+            }
+        };
     }
 
     let command = match cli.command {
@@ -58,7 +72,7 @@ fn main() -> ExitCode {
         // a missing required subcommand by hand: the full help, on exit 2.
         None => {
             let _ = Cli::command().print_help();
-            println!();
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\n");
             return ExitCode::from(2);
         }
     };
@@ -131,21 +145,25 @@ fn refuse_unopenable_inputs(cmd: &Command) -> stuffr::Result<()> {
         // Only a regular file is opened: opening a FIFO for reading blocks
         // until a writer appears, and a directory or device has its own
         // verb-level handling.
-        let opened = std::fs::metadata(p).and_then(|md| {
-            if md.is_file() && !is_pack {
-                std::fs::File::open(p).map(drop)
-            } else {
-                Ok(())
-            }
-        });
-        if let Err(e) = opened {
-            return Err(stuffr::Error::Usage(format!(
-                "cannot read {}: {e}",
-                stuffr::fmt_name(p)
-            )));
-        }
+        refuse_unopenable_path(p, is_pack)?;
     }
     Ok(())
+}
+
+/// One path's share of [`refuse_unopenable_inputs`], shared with `ls FILE`
+/// so both spellings of the operation classify (and word) it identically.
+fn refuse_unopenable_path(p: &str, is_pack: bool) -> stuffr::Result<()> {
+    // Only a regular file is opened: opening a FIFO for reading blocks
+    // until a writer appears, and a directory or device has its own
+    // verb-level handling.
+    let opened = std::fs::metadata(p).and_then(|md| {
+        if md.is_file() && !is_pack {
+            std::fs::File::open(p).map(drop)
+        } else {
+            Ok(())
+        }
+    });
+    opened.map_err(|e| stuffr::Error::Usage(format!("cannot read {}: {e}", stuffr::fmt_name(p))))
 }
 
 /// Prints `e` as `stuffr: …`. A foreign file (an Apple disk image) is a
@@ -168,6 +186,14 @@ fn report_error(e: &stuffr::Error, input: Option<&str>) {
 fn run_ls(args: stuffr_cli::cli::LsArgs, invoked_as: &str) -> ExitCode {
     // A file argument is `list`'s, and so are its errors' paths.
     let input = args.path.clone().filter(|p| p != "-");
+    // As `list` does (0.25.2): an unopenable file is a usage error, exit 2.
+    // A directory (or a missing path, which `ls::run` words itself) passes.
+    if let Some(p) = input.as_deref()
+        && let Err(e) = refuse_unopenable_path(p, false)
+    {
+        report_error(&e, None);
+        return ExitCode::from(e.exit_code() as u8);
+    }
     match ls::run(args, invoked_as) {
         Ok(ls::LsStatus::Complete) => ExitCode::SUCCESS,
         Ok(ls::LsStatus::Degraded) => ExitCode::from(4),

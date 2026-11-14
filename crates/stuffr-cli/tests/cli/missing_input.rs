@@ -174,3 +174,50 @@ fn pack_keeps_skipping_an_unreadable_named_file() {
     assert!(err.contains("skipped entry"), "{err}");
     assert!(err.contains("could not be opened"), "{err}");
 }
+
+#[cfg(unix)]
+#[test]
+fn ls_of_an_unreadable_file_matches_list() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp_dir();
+    let f = dir.join("f.gz");
+    std::fs::write(&f, b"x").unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0)).unwrap();
+    if std::fs::File::open(&f).is_ok() {
+        return; // root: mode 000 is readable
+    }
+    let f = f.to_str().unwrap();
+    let l = run_output(&["list", f]);
+    let s = run_output(&["ls", f]);
+    assert_eq!(l.status.code(), Some(2));
+    assert_eq!(s.status.code(), Some(2));
+    assert_eq!(l.stderr, s.stderr);
+    assert!(text(&s.stderr).starts_with("stuffr: usage error: cannot read"));
+    let missing = dir.join("gone.gz");
+    let m = run_output(&["ls", missing.to_str().unwrap()]);
+    assert_eq!(m.status.code(), Some(2));
+}
+
+#[cfg(unix)]
+#[test]
+fn examples_into_a_closed_pipe_is_quiet() {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut c = Command::new(env!("CARGO_BIN_EXE_stuffr"))
+        .arg("--examples")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut buf = [0u8; 10];
+    c.stdout.take().unwrap().read_exact(&mut buf).unwrap();
+    let out = c.wait_with_output().unwrap();
+    assert_ne!(out.status.code(), Some(101));
+    assert!(out.status.success(), "{:?}", out.status);
+    assert!(
+        !text(&out.stderr).contains("panicked"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(out.stderr.is_empty(), "{}", text(&out.stderr));
+}
