@@ -1559,24 +1559,17 @@ impl ArchiveWrite for ArWrite {
         // so an entry of unknown size is buffered. Stated rather than
         // hidden: this is the one container here that cannot stream its
         // input on the write side (`cpio.rs` shares the constraint).
+        let identifier = write_safe_identifier(meta.name.clone().into_bytes());
+        // The size field holds ten decimal digits. There is no honest clamp
+        // for a length, so a member that cannot fit is refused. A declared
+        // size is checked before buffering anything; the read length is
+        // checked again for an entry of unknown size.
+        if let Some(size) = meta.size {
+            check_size_field(&meta.name, size, &identifier)?;
+        }
         let mut buf = Vec::new();
         data.read_to_end(&mut buf)?;
-
-        let identifier = write_safe_identifier(meta.name.clone().into_bytes());
-        // The size field holds ten decimal digits, and a BSD `#1/N` member
-        // counts its N name bytes (NUL-padded to a multiple of 4) inside it.
-        // There is no honest clamp for a length, so it is refused.
-        let name_in_size = if identifier.len() > 16 || identifier.contains(&b' ') {
-            (identifier.len() as u64).div_ceil(4) * 4
-        } else {
-            0
-        };
-        if (buf.len() as u64).saturating_add(name_in_size) > MAX_FIELD_SIZE {
-            return Err(Error::ResourceLimit(format!(
-                "ar cannot store `{}`: its size field holds ten decimal digits                  (at most {MAX_FIELD_SIZE} bytes, including a long name)",
-                meta.name
-            )));
-        }
+        check_size_field(&meta.name, buf.len() as u64, &identifier)?;
         // Every other number is clamped to what its fixed-width field holds
         // rather than written wider, which would shift the rest of the header
         // and the payload and corrupt the whole archive. The loss is reported
@@ -1710,6 +1703,29 @@ const MODE_KEEP: u32 = 0o177_777;
 /// Largest size the 10-digit decimal field holds.
 const MAX_FIELD_SIZE: u64 = 9_999_999_999;
 
+/// Whether a payload of `payload` bytes fits the 10-digit size field. A BSD
+/// `#1/N` member (name over 16 bytes or containing a space, judged on the
+/// identifier after `write_safe_identifier`) counts its name, padded as the
+/// `ar` crate pads it (`len + (4 - len % 4) % 4`), inside that size.
+fn size_field_fits(payload: u64, identifier: &[u8]) -> bool {
+    let len = identifier.len() as u64;
+    let name = if identifier.len() > 16 || identifier.contains(&b' ') {
+        len + (4 - len % 4) % 4
+    } else {
+        0
+    };
+    payload.saturating_add(name) <= MAX_FIELD_SIZE
+}
+
+fn check_size_field(name: &str, size: u64, identifier: &[u8]) -> Result<()> {
+    if size_field_fits(size, identifier) {
+        return Ok(());
+    }
+    Err(Error::Unsupported(format!(
+        "ar cannot store `{name}`: {size} bytes exceeds the format's 10-digit size field"
+    )))
+}
+
 /// Which of `meta`'s header numbers an `ar` member header cannot hold, and
 /// so [`ArWrite::add`] clamps (uid/gid and mtime to 0, mode to its low 16
 /// bits). `uid_gid` covers either id. Doc-hidden: the facade turns it into a
@@ -1802,6 +1818,64 @@ mod tests {
         assert_eq!((seen[0].2, seen[0].3), (Some(0), Some(0)));
         assert_eq!(seen[1].0, "next");
         assert_eq!(seen[1].1, b"world");
+    }
+
+    #[test]
+    fn size_field_fits_counts_a_bsd_name_inside_the_size() {
+        // Short inline name: the payload alone.
+        assert!(size_field_fits(9_999_999_999, b"a.txt"));
+        assert!(!size_field_fits(10_000_000_000, b"a.txt"));
+        // 20-byte name: padded length 20 counts.
+        let long = [b'n'; 20];
+        assert!(size_field_fits(9_999_999_979, &long));
+        assert!(!size_field_fits(9_999_999_980, &long));
+        // 17-byte name pads to 20.
+        let odd = [b'n'; 17];
+        assert!(size_field_fits(9_999_999_979, &odd));
+        assert!(!size_field_fits(9_999_999_980, &odd));
+        // A short name with a space is BSD form too.
+        assert!(size_field_fits(9_999_999_995, b"a b"));
+        assert!(!size_field_fits(9_999_999_996, b"a b"));
+        let e = check_size_field("a b", 10_000_000_000, b"a b").expect_err("refuse");
+        assert!(matches!(e, Error::Unsupported(_)));
+    }
+
+    #[test]
+    fn clamped_fields_on_a_bsd_long_name_member_keep_the_framing() {
+        let buf = SharedBuf::new();
+        let mut w = Ar
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
+            .expect("create");
+        let mut m = EntryMeta::file("a/long/member/name.txt");
+        m.uid = Some(3_000_000);
+        m.gid = Some(3_000_000);
+        w.add(&m, &mut std::io::Cursor::new(&b"payload"[..]))
+            .expect("add");
+        w.add(
+            &EntryMeta::file("z"),
+            &mut std::io::Cursor::new(&b"last"[..]),
+        )
+        .expect("add");
+        w.finish().expect("finish").finish().expect("finish sink");
+        let bytes = buf.contents();
+        assert_eq!(&bytes[8 + 58..8 + 60], b"`\n");
+        let mut r = open_forward_only(&Ar, &bytes);
+        let mut seen = Vec::new();
+        while let Some(mut e) = r.next_entry().expect("next") {
+            let mut d = Vec::new();
+            e.reader().read_to_end(&mut d).expect("read");
+            seen.push((e.meta().name.clone(), d));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                ("a/long/member/name.txt".to_string(), b"payload".to_vec()),
+                ("z".to_string(), b"last".to_vec())
+            ]
+        );
     }
 
     #[test]
