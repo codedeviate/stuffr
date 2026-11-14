@@ -167,7 +167,12 @@ pub(crate) fn write_archive(
         .create(PlainSink::new(Box::new(buf.clone())), opts)
         .ok()?;
     for (meta, data) in entries {
-        w.add(meta, &mut std::io::Cursor::new(data)).ok()?;
+        // A known size keeps zip on its plain header path.
+        let mut meta = meta.clone();
+        if meta.size.is_none() {
+            meta.size = Some(data.len() as u64);
+        }
+        w.add(&meta, &mut std::io::Cursor::new(data)).ok()?;
     }
     w.finish().ok()?.finish().ok()?;
     Some(buf.contents())

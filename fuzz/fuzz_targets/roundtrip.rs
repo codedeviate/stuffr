@@ -206,11 +206,14 @@ fn container_round_trip(container: &dyn Container, content: &[u8]) {
             return;
         }
     };
-    // `EntryMeta::file` leaves `size` as `None`, which is what
-    // `container_conformance.rs`'s own `build` does — a container that needs
-    // the length up front derives it rather than being handed a claim it
-    // would then have to police.
-    let meta = EntryMeta::file(ENTRY_NAME);
+    // Both shapes are fuzzed: a declared size (zip's plain header path) for
+    // most inputs, and `None` (zip64, the length derived rather than a claim
+    // the container would have to police) when the content length is a
+    // multiple of four.
+    let mut meta = EntryMeta::file(ENTRY_NAME);
+    if content.len() % 4 != 0 {
+        meta.size = Some(content.len() as u64);
+    }
     if let Err(e) = w.add(&meta, &mut std::io::Cursor::new(content)) {
         check_error_is_classified(&e).expect("container add error classification");
         return;

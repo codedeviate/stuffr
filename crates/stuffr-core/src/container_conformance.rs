@@ -283,7 +283,10 @@ fn build(container: &dyn Container, entries: &[(&str, &[u8])]) -> Vec<u8> {
         )
         .unwrap_or_else(|e| panic!("conformance[{id}] create: {e}"));
     for (name, data) in entries {
-        let meta = EntryMeta::file(*name);
+        // A known size: an unknown one forces zip64 and would leave the
+        // plain header path unexercised.
+        let mut meta = EntryMeta::file(*name);
+        meta.size = Some(data.len() as u64);
         w.add(&meta, &mut io::Cursor::new(*data))
             .unwrap_or_else(|e| panic!("conformance[{id}] add({name}): {e}"));
     }

@@ -3980,7 +3980,13 @@ mod tests {
             .create(PlainSink::new(Box::new(buf.clone())), opts)
             .expect("create");
         for (meta, data) in entries {
-            w.add(meta, &mut io::Cursor::new(*data)).expect("add");
+            // A known size keeps the plain (non-zip64) header path; an
+            // unknown one would force zip64 for every entry.
+            let mut meta = meta.clone();
+            if meta.size.is_none() {
+                meta.size = Some(data.len() as u64);
+            }
+            w.add(&meta, &mut io::Cursor::new(*data)).expect("add");
         }
         w.finish().expect("finish").finish().expect("finish sink");
         buf.contents()
