@@ -1402,8 +1402,8 @@ carries both and picks one:
   decoding, so a failure loses it (GNU loses both files). stuffr prints and
   exits the same, keeps the input on failure and replaces it only with a
   finished output. That includes GNU's two later-failure cases: a later
-  member refused at its header (GNU would keep the part decoded) leaves the
-  input untouched, and under `-k` an operand after it whose header ends the
+  member refused at its header (GNU keeps the part decoded for another
+  output name, but here loses both) leaves the input untouched, and under `-k` an operand after it whose header ends the
   run (GNU removes the last `-k` output) leaves the decoded file in place.
 - **A mid-input read error keeps the input** and removes the partial output.
   Apple's gzip keeps the cut-short output and removes the input. Streams and
