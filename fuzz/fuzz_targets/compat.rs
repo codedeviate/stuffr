@@ -314,6 +314,7 @@ fn could_be_written_with(name: &str, fold: bool, extra: &[&str]) -> bool {
         || name.starts_with(".stuffr-xz-")
         || name.starts_with(".stuffr-zstd-")
         || name.starts_with(".stuffr-lz4-")
+        || name.starts_with(".stuffr-compress-")
         || ZSTD_NAMES.iter().any(|n| key(n) == name)
         || bases.iter().any(|b| {
             name == b

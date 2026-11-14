@@ -120,7 +120,8 @@
 //!   (`.stuffr-compress-*.tmp`, armed for the signal handler like any
 //!   output; SIGQUIT, which ncompress leaves at its default, leaves the
 //!   temporary behind, mode 0600, with the input intact), renamed over the
-//!   name only on success (ruling E4: an input is never lost). Messages and exit codes are ncompress's; a success leaves
+//!   name only on success (ruling E4: an input is never lost). Messages and
+//!   exit codes are ncompress's; a success leaves
 //!   the same files (the link removed unless `-k`); a failure leaves the
 //!   input and its link as they were. A second hard link keeps the data in
 //!   ncompress too: no deviation there.

@@ -187,7 +187,8 @@ fn run_ls(args: stuffr_cli::cli::LsArgs, invoked_as: &str) -> ExitCode {
     // A file argument is `list`'s, and so are its errors' paths.
     let input = args.path.clone().filter(|p| p != "-");
     // As `list` does (0.25.2): an unopenable file is a usage error, exit 2.
-    // A directory (or a missing path, which `ls::run` words itself) passes.
+    // A directory passes; a missing path is refused here, worded as
+    // `ls::run` words it.
     if let Some(p) = input.as_deref()
         && let Err(e) = refuse_unopenable_path(p, false)
     {

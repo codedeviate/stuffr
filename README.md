@@ -1330,7 +1330,9 @@ and mtimes.
   `l` -> `l.bz2` (`bzip2 -f l`) or `x.bz2` -> `x` (`bunzip2 -f x.bz2`),
   bzip2 removes the output name, which holds the input's only copy, then
   fails: "I/O or other error ... No such file or directory", exit 1.
-  stuffr prints the same and exits the same, but removes nothing.
+  stuffr prints the same and exits the same, but removes nothing. Unix
+  only: elsewhere there is no identity comparison and bzip2's behaviour
+  remains.
 - **bzip2recover at exactly 50000 blocks.** At 50000 magics with at least 40
   bits after the last, bzip2recover 1.0.8 writes past its arrays and, on
   macOS, silently drops block 1. stuffr writes it. Upstream's undefined
@@ -1408,7 +1410,8 @@ carries both and picks one:
   exits the same, keeps the input on failure and replaces it only with a
   finished output. That includes GNU's two later-failure cases: a later
   member refused at its header (GNU keeps the part decoded for another
-  output name, but here loses both) leaves the input untouched, and under `-k` an operand after it whose header ends the
+  output name, but here loses both) leaves the input untouched, and under `-k` an operand after it whose
+  header ends the
   run (GNU removes the last `-k` output) leaves the decoded file in place.
 - **A mid-input read error keeps the input** and removes the partial output.
   Apple's gzip keeps the cut-short output and removes the input. Streams and

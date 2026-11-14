@@ -1255,7 +1255,9 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
 
   stuffr salvage broken.zip -C out/ --index 6
       --index selects by SCAN POSITION — 0-based, counting every record the
-      raw scan found, shadowed ones included — and this is a DIFFERENT
+      raw scan found, shadowed ones included (overlapping truncated headers
+      a hostile file repeats beyond the work budget take no scan position;
+      they are counted on stderr) — and this is a DIFFERENT
       numbering from `list`'s own index (see "LISTING AND TESTING AN
       ARCHIVE" above), which never counts a shadowed record at all. On an
       archive where a name is duplicated, `list --index 6` and

@@ -937,12 +937,24 @@ fn describe(sightings: &[Sighting], list_clause: bool) -> Option<String> {
             sighting_groups(&bounded)
         ));
     }
+    let (overlapping, verdicts): (Vec<&Sighting>, Vec<&Sighting>) = verdicts
+        .into_iter()
+        .partition(|s| s.shape == OVERLAPPING_TRUNCATED_SHAPE);
     if !verdicts.is_empty() {
         sentences.push(format!(
             "this build's salvage scanner bounds the work it spends judging candidate headers \
              across the whole scan, and did not judge {} — so whatever those headers \
              describe is not listed or recovered there, though the scan went on past them{tail}",
             sighting_groups(&verdicts)
+        ));
+    }
+    if !overlapping.is_empty() {
+        sentences.push(format!(
+            "this build's salvage scanner bounds the work it spends judging candidate headers \
+             across the whole scan, and did not judge {} — they are not listed separately; \
+             their bytes are part of the earlier truncated entry, and the scan went on past \
+             them{tail}",
+            sighting_groups(&overlapping)
         ));
     }
     (!sentences.is_empty()).then(|| sentences.join("; and separately, "))
@@ -1583,7 +1595,8 @@ pub trait SalvageScan {
 }
 
 /// Walk `scan` over `src`, collecting every candidate it reports into a
-/// [`SalvageOutcome`].
+/// [`SalvageOutcome`]. (Overlapping truncated headers a hostile file repeats
+/// beyond the work budget take no scan position and are counted on stderr.)
 ///
 /// **Requires a seekable source.** Scanning searches back and forth over the
 /// archive rather than reading it once in order, so this takes

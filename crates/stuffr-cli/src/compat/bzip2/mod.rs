@@ -32,7 +32,8 @@
 //!   the file's only link, bzip2 removes the output, which deletes the
 //!   input's only copy, then fails to stat the input: "I/O or other error",
 //!   `No such file or directory`, exit 1. stuffr prints the same and exits
-//!   the same, but removes nothing: the data stays where it was.
+//!   the same, but removes nothing: the data stays where it was. Unix only:
+//!   elsewhere there is no identity comparison, so bzip2's behaviour remains.
 
 use std::ffi::OsString;
 use std::io::{self, Write};

@@ -5418,9 +5418,11 @@ fn plan_entry_write(
         }
         plan => plan,
     };
+    let mut ownership_at = None;
     if caps.stores_ownership
         && let Some(w) = ownership_warning(meta)
     {
+        ownership_at = Some(warnings.len());
         warnings.push(w);
     }
     // `ar`'s fixed-width header fields clamp what does not fit; say so.
@@ -5428,10 +5430,23 @@ fn plan_entry_write(
     if matches!(plan, WritePlan::Write) && container == stuffr_formats::ar::AR {
         let lost = stuffr_formats::ar::unrepresentable_fields(meta);
         if lost != MetaFields::default() {
-            warnings.push(Fidelity::MetadataIncomplete {
-                entry: meta.name.clone(),
-                fields: lost,
-            });
+            // One warning per entry: fold into the ownership warning when
+            // that one was already pushed.
+            if let Some(Fidelity::MetadataIncomplete { fields, .. }) =
+                ownership_at.and_then(|i| warnings.get_mut(i))
+            {
+                fields.mtime |= lost.mtime;
+                fields.mode |= lost.mode;
+                fields.uid_gid |= lost.uid_gid;
+                fields.comment |= lost.comment;
+                fields.extra |= lost.extra;
+                fields.crc |= lost.crc;
+            } else {
+                warnings.push(Fidelity::MetadataIncomplete {
+                    entry: meta.name.clone(),
+                    fields: lost,
+                });
+            }
         }
     }
     plan
@@ -7538,6 +7553,32 @@ mod tests {
         assert!(matches!(
             &w[..],
             [Fidelity::MetadataIncomplete { fields, .. }] if fields.uid_gid && !fields.mode
+        ));
+    }
+
+    /// An `ar` entry with no ids AND a clamped mode earns ONE warning
+    /// naming the union of both fields.
+    #[cfg(feature = "ar")]
+    #[test]
+    fn an_ar_entry_missing_ids_and_clamping_warns_once() {
+        let mut m = meta_with(None, None);
+        m.mode = Some(0o7_777_777_777);
+        let owns = ContainerCaps {
+            stores_ownership: true,
+            ..Default::default()
+        };
+        let mut w = Vec::new();
+        plan_entry_write(
+            &owns,
+            stuffr_formats::ar::AR,
+            &m,
+            LinkCopy::Unavailable,
+            &mut w,
+        );
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(matches!(
+            &w[0],
+            Fidelity::MetadataIncomplete { fields, .. } if fields.uid_gid && fields.mode
         ));
     }
 
