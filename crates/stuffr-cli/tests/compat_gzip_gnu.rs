@@ -2004,6 +2004,68 @@ mod differential {
         }
     }
 
+    /// Ruling T8-5 for a later member refused at its header (method 7):
+    /// to an ordinary output name GNU keeps what was decoded and removes
+    /// the input, but here the output is the input, which GNU unlinked
+    /// before decoding, so both are lost (observed with 1.15: `unknown
+    /// method 7 -- not supported`, exit 1, nothing left). stuffr says and
+    /// exits the same and leaves the input untouched; publishing member
+    /// 1's bytes over it once lost every later member.
+    #[test]
+    fn a_later_refused_header_keeps_an_input_named_by_its_own_stored_name() {
+        let t = txt();
+        let mut bytes = gzm(&t, b"a.gz");
+        bytes.extend_from_slice(&[0x1f, 0x8b, 7, 0, 0, 0, 0, 0, 0, 3]);
+        for args in [&["-dNf", "a.gz"][..], &["-dNfv", "a.gz"]] {
+            let c = dz("gzip", args, vec![("a.gz", bytes.clone())]);
+            let s = stuffr_as(&c);
+            if let Some(r) = reference(gnu_gzip_dir(), &c) {
+                assert_eq!(
+                    (r.code, &r.stdout, &r.stderr),
+                    (s.code, &s.stdout, &s.stderr)
+                );
+                assert!(r.tree.is_empty(), "GNU kept {:?}", r.tree.keys());
+            }
+            assert_eq!(s.code, 1, "{}", s.stderr);
+            assert!(s.stderr.contains("unknown method 7"), "{}", s.stderr);
+            assert_eq!(s.tree.len(), 1, "{:?}", s.tree.keys());
+            assert_eq!(s.tree["a.gz"].0, bytes, "the input must survive unchanged");
+        }
+    }
+
+    /// Ruling T8-5 under `-k`: the decoded file that replaced the input is
+    /// the only copy of the data, so a later operand cut inside its header
+    /// (a failure that ends the run and removes the last `-k` output) must
+    /// not remove it. GNU does, leaving nothing of `a.gz` (observed with
+    /// 1.15: `\ngzip: b.gz: unexpected end of file`, exit 1, only `b.gz`
+    /// left). stuffr says and exits the same and keeps the decoded file.
+    #[test]
+    fn a_run_ending_failure_keeps_an_output_that_replaced_its_input() {
+        let t = txt();
+        let a = gzm(&t, b"a.gz");
+        let cut = vec![0x1f, 0x8b, 8, 0, 0];
+        for args in [&["-dNkf", "a.gz", "b.gz"][..], &["-dNkfv", "a.gz", "b.gz"]] {
+            let c = dz(
+                "gzip",
+                args,
+                vec![("a.gz", a.clone()), ("b.gz", cut.clone())],
+            );
+            let s = stuffr_as(&c);
+            if let Some(r) = reference(gnu_gzip_dir(), &c) {
+                assert_eq!(
+                    (r.code, &r.stdout, &r.stderr),
+                    (s.code, &s.stdout, &s.stderr)
+                );
+                let names: Vec<&String> = r.tree.keys().collect();
+                assert_eq!(names, ["b.gz"], "GNU's tree");
+            }
+            assert_eq!(s.code, 1, "{}", s.stderr);
+            let names: Vec<&String> = s.tree.keys().collect();
+            assert_eq!(names, ["a.gz", "b.gz"], "{args:?}");
+            assert_eq!(s.tree["a.gz"].0, t, "the decoded file must survive");
+        }
+    }
+
     /// Whether the directory the harness works in (`temp_dir()`) folds
     /// case: a file `a` is also found as `A`.
     fn scratch_folds_case() -> bool {

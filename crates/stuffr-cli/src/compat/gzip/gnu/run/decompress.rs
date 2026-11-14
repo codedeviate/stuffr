@@ -32,7 +32,7 @@ use super::super::args::Mode;
 use super::super::decode::{self, Counted, Fail, Note, Progress};
 use super::super::list::Entry;
 use super::super::messages::{self as m, PROGRAM, printf, quote};
-use super::{Gz, Step, Stop, open_input, parent_of};
+use super::{Gz, Step, Stop, is_the_input, open_input, parent_of};
 use crate::compat::gzip::member::{Header, Lookahead};
 use crate::compat::host::{self, Host, InFile, Input, stdin_file, strerror};
 
@@ -417,6 +417,10 @@ impl Gz<'_> {
         let Some(replace) = self.may_write(&out_path, &out_name, &qout, path, meta) else {
             return Ok(());
         };
+        // Ruling T8-5: the output is the input itself (`-dNf` storing the
+        // input's own name). Nothing may then replace or remove it but a
+        // complete decode, and that decoded file is the only copy left.
+        let own = replace && is_the_input(&out_path, path, meta);
         // A stored name that is empty or ends in `/` cannot be a file: GNU
         // fails creating it (observed: an empty FNAME under `-N` gives
         // `gzip: '': No such file or directory`). Ask the system for the
@@ -501,7 +505,10 @@ impl Gz<'_> {
                 // what was decoded is kept and the input removed, as on
                 // success but exit 1 and no ratio; under `-k` the output
                 // goes instead (observed: `gzip -d` and `gzip -dk` on a
-                // member followed by `1f 8b` and `junk`).
+                // member followed by `1f 8b` and `junk`). When the output
+                // is the input itself (T8-5) the input stays untouched:
+                // publishing would replace it with a part of its data
+                // (GNU, which unlinked it before decoding, loses both).
                 let later_header = matches!(
                     f,
                     Fail::UnknownMethod(_)
@@ -510,7 +517,7 @@ impl Gz<'_> {
                         | Fail::HeaderCrc(..)
                         | Fail::ZBits(_)
                 );
-                if later_header && !self.s.keep {
+                if later_header && !self.s.keep && !own {
                     let step = self.report(f, &qname, &qout);
                     self.commit(&tmp, &out_path, &qout, meta, mtime, replace, path, &qname);
                     return step;
@@ -520,7 +527,11 @@ impl Gz<'_> {
             }
         };
         if self.commit(&tmp, &out_path, &qout, meta, mtime, replace, path, &qname) {
-            if self.s.keep {
+            // Under T8-5 the published output replaced the input, so it is
+            // the only copy of the data: a later failure that ends the run
+            // must not remove it as a stale `-k` output (GNU does, losing
+            // both).
+            if self.s.keep && !own {
                 self.stale = Some(out_path);
             }
             let compressed = meta.len().saturating_sub(done.header_bytes);

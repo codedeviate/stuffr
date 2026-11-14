@@ -97,7 +97,12 @@
 //!   for `x.gz`): GNU removes the input before decoding and the output
 //!   after, losing both whether the body decodes or not; stuffr says and
 //!   exits the same but keeps the decoded file on success and the
-//!   untouched input on failure (Rulings T8-4, T8-5). "The same file" is
+//!   untouched input on failure (Rulings T8-4, T8-5). That holds where GNU
+//!   would keep a part or remove the output later: a later member refused
+//!   at its header (for another output name, the part decoded is kept and
+//!   the input removed) leaves the input untouched, and under `-dNkf` a
+//!   later operand whose header failure ends the run (which removes the
+//!   last `-k` output) leaves the decoded file in place. "The same file" is
 //!   judged by device and inode; off unix, by spelling only.
 //! - Read and write failures say `gzip: NAME: strerror`, exit 1, and end
 //!   the run: the shape every other file error has, not observed.

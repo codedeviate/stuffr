@@ -424,9 +424,9 @@ impl Gz<'_> {
             return Some(false);
         }
         if self.s.force {
-            let is_input = fs::metadata(out_path)
-                .is_ok_and(|o| same_file(&o, input_meta).unwrap_or(out_path == input));
-            if !is_input && let Err(e) = fs::remove_file(out_path) {
+            if !is_the_input(out_path, input, input_meta)
+                && let Err(e) = fs::remove_file(out_path)
+            {
                 // A name ending in `/` fails as a create, not an unlink: Debian
                 // 13's 1.13 prefixes the newline (see `OUTPUT_REFUSED`); macOS
                 // 1.15 does not (its unlink says "Operation not permitted").
@@ -641,6 +641,13 @@ fn parent_of(out_path: &Path) -> PathBuf {
         Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
         _ => PathBuf::from("."),
     }
+}
+
+/// Whether the output name `out_path` names the input `input` itself
+/// (`input_meta`, the opened input's): by identity, off unix by spelling.
+/// Ruling T8-5's test, which [`Gz::may_write`] and the `-dN` decode share.
+pub(super) fn is_the_input(out_path: &Path, input: &Path, input_meta: &Metadata) -> bool {
+    fs::metadata(out_path).is_ok_and(|o| same_file(&o, input_meta).unwrap_or(out_path == input))
 }
 
 /// Whether the input's name `path` should be removed after the output
