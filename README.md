@@ -656,6 +656,20 @@ read list.
 > tier — measured from this bump's own `make check FULL=1`, `GATE_EXIT=0`,
 > nothing skipped.
 >
+> `0.29.0`: **the lz4 links follow lz4 1.11.1**, and the `lz4-c` tier
+> vendors liblz4 1.11.1 (which fixes an out-of-bounds write in
+> `LZ4_resetStreamHC()` that stuffr never called). What changes under the
+> lz4 names, as in lz4 1.11.1: `-h`, `-H` and `--help` print to standard
+> output; refusing a terminal on standard input adds `For help, type: lz4
+> -h`; `--list` with no file operand lists standard input when it is
+> redirected from a file (a pipe is `stdin is not a regular file`, exit 1);
+> `--list` lists a legacy frame with no block and calls a legacy block that
+> runs past the end of the file corrupt. Compressed bytes are unchanged on
+> both tiers. A MINOR, as every compat personality change has been.
+> **3916** tests under `--all-features`, **3761** on the default tier —
+> measured from this bump's own `make check`, `GATE_EXIT=0`, nothing
+> skipped.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
