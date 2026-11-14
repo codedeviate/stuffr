@@ -3712,7 +3712,7 @@ impl ZipWrite {
             // option has not been set"; with it unconditionally, every small
             // entry would carry a zip64 extra field and 32-bit sentinels that
             // older readers handle worse.
-            .large_file(meta.size.is_some_and(|s| s > ZIP64_SIZE_THRESHOLD));
+            .large_file(needs_zip64(meta.size, self.method));
         if let Some(mtime) = meta.mtime {
             o = o.last_modified_time(dos_from_system_time(mtime));
         }
@@ -3726,6 +3726,39 @@ impl ZipWrite {
 /// The 32-bit size ceiling a zip local header can express. Past it an entry
 /// needs zip64 fields, which is what `FileOptions::large_file` adds.
 const ZIP64_SIZE_THRESHOLD: u64 = u32::MAX as u64 - 1;
+
+/// A codec's worst-case compressed size for `size` input bytes, with margin.
+///
+/// Incompressible data expands: deflate by 5 bytes per stored block (counted
+/// here per 16 KiB, well under zip's actual block size), bzip2 by about 1%
+/// plus a constant, xz and zstd by a fraction of a percent. Stored does not
+/// expand. Anything else is bounded by 2% plus 1 KiB.
+fn worst_case_compressed(size: u64, method: CompressionMethod) -> u64 {
+    if method == CompressionMethod::Stored {
+        return size;
+    }
+    if method == CompressionMethod::DEFLATE {
+        return size.saturating_add(size.div_ceil(16 * 1024).saturating_mul(5) + 64);
+    }
+    size.saturating_add(size / 50 + 1024)
+}
+
+/// Whether an entry must be written with zip64 fields.
+///
+/// Decided from the uncompressed size AND the codec's worst-case compressed
+/// size: an incompressible entry just under 4 GiB can compress to more than
+/// 0xFFFFFFFF, and zip refuses that late, from `finish_file`, unless
+/// `large_file(true)` was set when the entry started. An entry of unknown
+/// size can grow past 4 GiB while it is read, so it gets zip64 too; the
+/// alternative is a failure after gigabytes were written.
+fn needs_zip64(size: Option<u64>, method: CompressionMethod) -> bool {
+    match size {
+        None => true,
+        Some(s) => {
+            s > ZIP64_SIZE_THRESHOLD || worst_case_compressed(s, method) > ZIP64_SIZE_THRESHOLD
+        }
+    }
+}
 
 impl ArchiveWrite for ZipWrite {
     fn add(&mut self, meta: &EntryMeta, data: &mut dyn Read) -> Result<()> {
@@ -3848,6 +3881,35 @@ impl Read for CountingReader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zip64_is_chosen_from_the_compressed_bound_too() {
+        let d = CompressionMethod::DEFLATE;
+        // Far from the boundary: unchanged, no zip64.
+        assert!(!needs_zip64(Some(0), d));
+        assert!(!needs_zip64(Some(1 << 30), d));
+        assert!(!needs_zip64(Some(4_000_000_000), d));
+        // Under 4 GiB by size, but deflate's stored-block overhead crosses it.
+        let just_under = u64::from(u32::MAX) - 2;
+        assert!(just_under <= ZIP64_SIZE_THRESHOLD);
+        assert!(needs_zip64(Some(just_under), d));
+        assert!(needs_zip64(Some(4_294_900_000), d));
+        // Over by size, as before.
+        assert!(needs_zip64(Some(u64::from(u32::MAX) + 1), d));
+        // Stored never expands: only the size decides.
+        assert!(!needs_zip64(
+            Some(ZIP64_SIZE_THRESHOLD),
+            CompressionMethod::Stored
+        ));
+        assert!(needs_zip64(
+            Some(ZIP64_SIZE_THRESHOLD + 1),
+            CompressionMethod::Stored
+        ));
+        // Other codecs get a percentage margin.
+        assert!(needs_zip64(Some(4_294_000_000), CompressionMethod::BZIP2));
+        // Unknown size can grow past 4 GiB while read.
+        assert!(needs_zip64(None, d));
+    }
 
     /// One central record whose "version made by" host is `host` and whose
     /// external attributes hold the unix word for a 0644 regular file.
