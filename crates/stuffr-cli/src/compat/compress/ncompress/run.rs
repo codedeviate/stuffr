@@ -41,6 +41,9 @@ struct Run<'h, 'e> {
     /// `remove_ofname`: the output a failure removes, armed for the
     /// signal handler too.
     armed: Option<CleanupGuard>,
+    /// Deviation N5: the temporary the output is written under while the
+    /// output's name still holds the input's only copy.
+    tmp: Option<PathBuf>,
     /// `inbuf`, shared by both coders and the overwrite question.
     inbuf: Vec<u8>,
     enc: Option<EncTables>,
@@ -62,6 +65,7 @@ pub(super) fn execute(s: Settings, host: &mut Host, err: &mut dyn Write) -> u8 {
         ifname: Vec::new(),
         ofname: None,
         armed: None,
+        tmp: None,
         inbuf: vec![0; lzw::INBUF_ALLOC],
         enc: None,
         dec: None,
@@ -146,10 +150,13 @@ impl Run<'_, '_> {
 
     /// `abort_compress()`: the armed output removed, the run over.
     fn abort(&mut self) -> Abort {
-        if self.armed.take().is_some()
-            && let Some(o) = &self.ofname
-        {
-            let _ = fs::remove_file(self.path(o));
+        let tmp = self.tmp.take();
+        if self.armed.take().is_some() {
+            if let Some(t) = tmp {
+                let _ = fs::remove_file(t);
+            } else if let Some(o) = &self.ofname {
+                let _ = fs::remove_file(self.path(o));
+            }
         }
         Abort
     }
@@ -284,6 +291,7 @@ impl Run<'_, '_> {
             Ok(None) => {
                 self.ofname = None;
                 self.armed = None;
+                self.tmp = None;
                 self.exit_code = 1;
                 Ok(())
             }
@@ -398,13 +406,34 @@ impl Run<'_, '_> {
                         return Ok(None);
                     }
                 }
-                if let Err(e) = fs::remove_file(&out_path) {
+                if host::removing_output_loses_input(&in_path, &out_path) {
+                    // Deviation N5: the input is a symlink to the output's
+                    // name, that name's only link. ncompress removes it
+                    // here, so the input lives on only in `fdin` and any
+                    // failure loses it; stuffr leaves it and writes a
+                    // temporary, renamed over the name on success.
+                    let dir = match out_path.parent() {
+                        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+                        _ => PathBuf::from("."),
+                    };
+                    self.tmp = Some(dir);
+                } else if let Err(e) = fs::remove_file(&out_path) {
                     let _ = self.err.write_all(m::CANT_REMOVE.as_bytes());
                     self.perror(&ofname, &e);
                     return Ok(None);
                 }
             }
-            let file = match host::create_excl_armed(self.host, &out_path) {
+            let created = match self.tmp.take() {
+                Some(dir) => match host::create_temp_excl_armed(self.host, &dir, "compress") {
+                    Ok((tmp, f, guard)) => {
+                        self.tmp = Some(tmp);
+                        Ok((f, guard))
+                    }
+                    Err(e) => Err(e),
+                },
+                None => host::create_excl_armed(self.host, &out_path),
+            };
+            let file = match created {
                 Ok((f, guard)) => {
                     self.armed = Some(guard);
                     out_fd = Some(f.try_clone());
@@ -437,12 +466,15 @@ impl Run<'_, '_> {
         drop(out);
 
         let refused = matches!(end, End::NotCompressed | End::TooManyBits(_));
+        // What a removal of the new output removes: the temporary under
+        // deviation N5, else the output itself.
+        let written = self.tmp.clone().unwrap_or_else(|| out_path.clone());
         if bytes_in == 0 && !self.s.force {
             if self.armed.take().is_some() {
                 if !self.s.quiet {
                     self.say(m::NO_COMPRESSION, &[&tempname]);
                 }
-                if let Err(e) = fs::remove_file(&out_path) {
+                if let Err(e) = fs::remove_file(&written) {
                     let _ = self.err.write_all(m::UNLINK_ERROR_NL.as_bytes());
                     self.perror(&ofname, &e);
                 }
@@ -453,14 +485,14 @@ impl Run<'_, '_> {
             // success here, removing it and keeping the empty output.
             // stuffr removes its empty output and keeps the input.
             self.armed = None;
-            let _ = fs::remove_file(&out_path);
+            let _ = fs::remove_file(&written);
         } else if !self.s.zcat {
             if !self.s.decomp && bytes_out >= bytes_in && !self.s.force {
                 // No compression: remove file.Z.
                 if !self.s.quiet {
                     self.say(m::NO_COMPRESSION, &[&tempname]);
                 }
-                if let Err(e) = fs::remove_file(&out_path) {
+                if let Err(e) = fs::remove_file(&written) {
                     let _ = self.err.write_all(m::UNLINK_ERROR.as_bytes());
                     self.perror(&ofname, &e);
                 }
@@ -479,6 +511,15 @@ impl Run<'_, '_> {
                 if let Some(out_fd) = &out_fd {
                     self.copy_stat(&ofname, out_fd, &infstat);
                 }
+                if let Some(tmp) = self.tmp.take()
+                    && let Err(e) = fs::rename(&tmp, &out_path)
+                {
+                    // Deviation N5's temporary could not take the name:
+                    // nothing is published, the input stays.
+                    self.perror(&ofname, &e);
+                    let _ = fs::remove_file(&tmp);
+                    return Ok(None);
+                }
                 self.armed = None;
                 if !self.s.keep
                     && let Err(e) = fs::remove_file(&in_path)
@@ -492,6 +533,7 @@ impl Run<'_, '_> {
             self.exit_code = 0;
         }
         self.armed = None;
+        self.tmp = None;
         self.ofname = None;
         Ok(Some(()))
     }
@@ -694,6 +736,7 @@ mod tests {
             ifname: Vec::new(),
             ofname: None,
             armed: None,
+            tmp: None,
             inbuf: Vec::new(),
             enc: None,
             dec: None,

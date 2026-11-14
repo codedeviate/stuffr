@@ -696,6 +696,25 @@ pub(crate) fn create_excl_armed(host: &Host, path: &Path) -> io::Result<(File, C
     })
 }
 
+/// [`create_excl_armed`] under a temporary name in `dir`,
+/// `.stuffr-{family}-{pid}-{n}.tmp` (as [`create_temp`]): the file a
+/// failure or [`install_abort_exit`]'s handler removes is the temporary.
+pub(crate) fn create_temp_excl_armed(
+    host: &Host,
+    dir: &Path,
+    family: &str,
+) -> io::Result<(PathBuf, File, CleanupGuard)> {
+    for n in 0u32.. {
+        let tmp = temp_name(dir, family, n);
+        match create_excl_armed(host, &tmp) {
+            Ok((f, g)) => return Ok((tmp, f, g)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && n < 1000 => {}
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("the loop returns")
+}
+
 /// Info-ZIP Zip 3.0 (zip.c:main, measured 2026-10-25 on both references):
 /// INT, TERM, ABRT, BUS, ILL and SEGV run zip's `handler`, installed with
 /// `signal()` over an inherited ignore: `putc('\n', mesg)`, then
@@ -1607,13 +1626,18 @@ extern "C" fn on_stop_signal(_sig: libc::c_int) {
     STOPPED_MS.fetch_add(monotonic_ms().wrapping_sub(t), Ordering::Relaxed);
 }
 
+/// The `n`th candidate name of a temporary in `dir`.
+fn temp_name(dir: &Path, family: &str, n: u32) -> PathBuf {
+    dir.join(format!(".stuffr-{family}-{}-{n}.tmp", std::process::id()))
+}
+
 /// Create a temporary output file in `dir`, `create_new`, mode 0600, named
 /// `.stuffr-{family}-{pid}-{n}.tmp`; a name already taken moves on to the
 /// next `n`.
 pub(crate) fn create_temp(dir: &Path, family: &str) -> io::Result<(PathBuf, File)> {
     let opts = private_new_file();
     for n in 0u32.. {
-        let tmp = dir.join(format!(".stuffr-{family}-{}-{n}.tmp", std::process::id()));
+        let tmp = temp_name(dir, family, n);
         match opts.open(&tmp) {
             Ok(f) => return Ok((tmp, f)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists && n < 1000 => {}
@@ -2033,6 +2057,21 @@ pub(crate) fn same_file(a: &Metadata, b: &Metadata) -> Option<bool> {
     {
         let _ = (a, b);
         None
+    }
+}
+
+/// Whether removing `output` before writing it would delete `input`'s
+/// data: `input` resolves (through a symlink) to the very regular file
+/// that the name `output` holds (judged with `lstat`), and that name is
+/// the file's only link. A tool that removes an existing output first
+/// (bzip2 and ncompress under `-f`) would then hold the input's only copy
+/// in an open descriptor, and lose it on any failure.
+pub(crate) fn removing_output_loses_input(input: &Path, output: &Path) -> bool {
+    match (fs::metadata(input), fs::symlink_metadata(output)) {
+        (Ok(i), Ok(o)) => {
+            o.is_file() && same_file(&i, &o) == Some(true) && count_hard_links(output) == 0
+        }
+        _ => false,
     }
 }
 

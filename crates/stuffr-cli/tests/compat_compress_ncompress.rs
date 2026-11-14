@@ -1305,6 +1305,122 @@ mod deviations {
             assert!(s.tree["bad.Z"].0 == data, "{why}");
         }
     }
+
+    fn sym_l_to_lz(d: &std::path::Path) {
+        std::os::unix::fs::symlink("l.Z", d.join("l")).unwrap();
+    }
+    fn sym_xz_to_x(d: &std::path::Path) {
+        std::os::unix::fs::symlink("x", d.join("x.Z")).unwrap();
+    }
+    fn sym_l_to_lz_with_a_second_name(d: &std::path::Path) {
+        sym_l_to_lz(d);
+        std::fs::hard_link(d.join("l.Z"), d.join("z")).unwrap();
+    }
+
+    /// N5: `-f` with the input a symlink to its own output name, that
+    /// name's only link. ncompress removes the name first and loses the
+    /// data when the run then fails; stuffr writes a temporary, prints and
+    /// exits the same, and keeps the input. Homebrew's build refuses a
+    /// symlink operand (ruling E6), so the reference is compared on Linux
+    /// only; stuffr's side is asserted everywhere.
+    #[test]
+    fn n5_a_symlink_to_its_own_output_keeps_the_data() {
+        let Some(x) = fixtures() else { return };
+        let mut corrupt = x.fz[..40].to_vec();
+        corrupt.extend_from_slice(&[0xff; 16]);
+        // Failures: the input and its link stay as they were.
+        let failures = [
+            (
+                set(
+                    case("uncompress", &["-f", "x.Z"], vec![("x", x.f.clone())]),
+                    sym_xz_to_x,
+                ),
+                x.f.clone(),
+                1,
+                "x.Z: not in compressed format\n",
+            ),
+            (
+                set(
+                    case("uncompress", &["-fv", "x.Z"], vec![("x", x.f.clone())]),
+                    sym_xz_to_x,
+                ),
+                x.f.clone(),
+                1,
+                "x.Z: x.Z: not in compressed format\n",
+            ),
+            (
+                set(
+                    case("uncompress", &["-f", "x.Z"], vec![("x", corrupt.clone())]),
+                    sym_xz_to_x,
+                ),
+                corrupt.clone(),
+                1,
+                "uncompress: corrupt input\n",
+            ),
+        ];
+        for (c, data, code, tail) in failures {
+            let s = stuffr_as(&c);
+            let why = format!("{} {:?}", c.name, c.args);
+            assert_eq!(s.code, code, "{why}: {}", s.stderr);
+            assert!(s.stderr.ends_with(tail), "{why}: {:?}", s.stderr);
+            assert_eq!(names(&s), ["x", "x.Z"], "{why}");
+            assert!(s.tree["x"].0 == data, "{why}: the data is gone");
+            assert_eq!(s.tree["x.Z"].0, b"x", "{why}: the link");
+            if homebrew() {
+                continue;
+            }
+            let Some(r) = reference_run(&c) else { return };
+            // The reference loses the data; everything else is the same.
+            assert!(
+                r.tree.get("x").is_none_or(|n| n.0 != data),
+                "{why}: the reference kept the data: {:?}",
+                names(&r)
+            );
+            assert_eq!(s.code, r.code, "{why}");
+            assert_eq!(s.stdout, r.stdout, "{why}");
+            assert_eq!(s.stderr, r.stderr, "{why}");
+        }
+        // Successes leave what ncompress leaves.
+        let successes = [
+            (
+                set(
+                    case("compress", &["-f", "l"], vec![("l.Z", x.f.clone())]),
+                    sym_l_to_lz,
+                ),
+                "l.Z",
+                x.fz.clone(),
+            ),
+            (
+                set(
+                    case("uncompress", &["-fv", "x.Z"], vec![("x", x.fz.clone())]),
+                    sym_xz_to_x,
+                ),
+                "x",
+                x.f.clone(),
+            ),
+        ];
+        for (c, out, data) in successes {
+            let s = stuffr_as(&c);
+            let why = format!("{} {:?}", c.name, c.args);
+            assert_eq!(s.code, 0, "{why}: {}", s.stderr);
+            assert_eq!(names(&s), [out], "{why}");
+            assert!(s.tree[out].0 == data, "{why}");
+            if !homebrew() {
+                compare(&c);
+            }
+        }
+        // A second name keeps the data in ncompress too: no deviation.
+        let c = set(
+            case("compress", &["-f", "l"], vec![("l.Z", x.f.clone())]),
+            sym_l_to_lz_with_a_second_name,
+        );
+        let s = stuffr_as(&c);
+        assert_eq!(names(&s), ["l.Z", "z"]);
+        assert!(s.tree["z"].0 == x.f && s.tree["l.Z"].0 == x.fz);
+        if !homebrew() {
+            compare(&c);
+        }
+    }
 }
 
 /// Review Focus 5 (ruling E3): ncompress's `abort_compress` handles SIGINT

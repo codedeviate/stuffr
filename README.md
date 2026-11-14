@@ -1972,6 +1972,16 @@ the output.
   format` and then ` -- replaced with g` on the next line, which is false;
   stuffr leaves that line out. An empty `.Z` with `-f` still becomes an empty
   output, as ncompress makes it.
+- **N5.** `-f` (or a `y` at the question) when the input is a symbolic link
+  to its own output name (`l` -> `l.Z` compressing, `x.Z` -> `x`
+  decompressing) and that name is the file's only link: ncompress removes
+  the output name first, so the input's data lives on only in its open
+  descriptor and any failure loses it (a refused header, `corrupt input`, a
+  write error, an interrupt, or "no compression" after a `y`). stuffr leaves
+  the name alone, writes a temporary beside it (`.stuffr-compress-*.tmp`,
+  removed on failure and on INT, TERM or HUP) and renames it over the name
+  only on success. Messages and exit codes are the same; on success the files
+  left are the same; on failure the input and its link stay as they were.
 - **Debian 13's build everywhere.** On macOS this personality is still Debian 13's
   build, not Homebrew's: symbolic-link operands are followed, `-V` lists
   `FAST, ` and `IBUFSIZ=8192, OBUFSIZ=8192`, and the corrupt-input debug line

@@ -50,7 +50,7 @@
 //!   n)? ` and one line read with `read(2)` (only `y` first overwrites),
 //!   else `NAME not overwritten`, exit 1; `-f` (or `y`) removes the old
 //!   output first, so a link in its place is replaced, never written
-//!   through; `-c` never looks;
+//!   through (but see N5); `-c` never looks;
 //! - the output is created `O_EXCL`, mode 0600, and an open failure names
 //!   the input; `-v` prints `NAME: ` before the work and ` -- replaced
 //!   with NAME` (and ` Compression: x.xx%`) after; a success copies the
@@ -110,6 +110,19 @@
 //!   which is false (the input was refused, nothing replaced `g`): stuffr
 //!   leaves that line out. An empty `.Z` with `-f` still becomes an empty
 //!   output, as ncompress makes it (nothing is lost).
+//! - **N5.** `-f` (or a `y` at the question) when the input is a symbolic
+//!   link to its own output name (`l` -> `l.Z` compressing, `x.Z` -> `x`
+//!   decompressing) and that name is the file's only link: ncompress
+//!   `unlink`s the output name first, so the input's data lives on only in
+//!   `fdin` and any failure loses it (a header refusal under N4, `corrupt
+//!   input`, a write error, SIGINT/TERM/HUP, or "no compression" after a
+//!   `y`). stuffr leaves the name alone and writes a temporary beside it
+//!   (`.stuffr-compress-*.tmp`, armed for the signal handler like any
+//!   output), renamed over the name only on success (ruling E4: an input is
+//!   never lost). Messages and exit codes are ncompress's; a success leaves
+//!   the same files (the link removed unless `-k`); a failure leaves the
+//!   input and its link as they were. A second hard link keeps the data in
+//!   ncompress too: no deviation there.
 //! - **Debian 13's build everywhere (ruling E6).** On macOS this personality
 //!   is still Debian 13's build, not Homebrew's: symbolic-link operands are
 //!   followed (Homebrew's `-DLSTAT` refuses them, `NAME is not a directory
