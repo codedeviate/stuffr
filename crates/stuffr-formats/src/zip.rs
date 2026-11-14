@@ -3707,12 +3707,19 @@ impl ZipWrite {
             // from another container round-trips without the type bits
             // fighting the ones zip sets from `EntryKind` below.
             .unix_permissions(meta.mode.unwrap_or(default_mode))
-            // zip64 per entry, decided from the DECLARED size. Without it,
-            // `ZipWriter::write` aborts the entry past 4 GiB with "Large file
-            // option has not been set"; with it unconditionally, every small
-            // entry would carry a zip64 extra field and 32-bit sentinels that
-            // older readers handle worse.
-            .large_file(needs_zip64(meta.size, self.method));
+            // zip64 per entry. For a file (or `Other`, written as one) it is
+            // decided by `needs_zip64`: the declared size AND the codec's
+            // worst-case compressed size, because incompressible data just
+            // under 4 GiB expands past 0xFFFFFFFF, which zip refuses late;
+            // an undeclared size counts as possibly large. Directories and
+            // symlinks never are: they carry no sized payload (their `size`
+            // is `None` from `pack`), and zip64 on them would add a needless
+            // extra field and 32-bit sentinels to ordinary archives. Small
+            // files stay plain too, since older readers handle zip64 worse.
+            .large_file(match meta.kind {
+                EntryKind::Dir | EntryKind::Symlink { .. } => false,
+                _ => needs_zip64(meta.size, self.method),
+            });
         if let Some(mtime) = meta.mtime {
             o = o.last_modified_time(dos_from_system_time(mtime));
         }
@@ -3977,6 +3984,59 @@ mod tests {
         }
         w.finish().expect("finish").finish().expect("finish sink");
         buf.contents()
+    }
+
+    #[test]
+    fn dirs_symlinks_and_small_files_carry_no_zip64_extra() {
+        let dir = EntryMeta {
+            name: "d".into(),
+            kind: EntryKind::Dir,
+            ..Default::default()
+        };
+        let link = EntryMeta {
+            name: "l".into(),
+            kind: EntryKind::Symlink { target: "d".into() },
+            ..Default::default()
+        };
+        let file = EntryMeta {
+            name: "f".into(),
+            size: Some(3),
+            ..Default::default()
+        };
+        let bytes = build_with(
+            &CreateOpts::default(),
+            &[(dir, &b""[..]), (link, &b""[..]), (file, &b"abc"[..])],
+        );
+        // Every local (PK\3\4) and central (PK\1\2) header: its size fields
+        // are not the zip64 sentinel and its extra field holds no 0x0001.
+        let mut seen = 0;
+        for (sig, fixed, size_at) in [(b"PK\x03\x04", 30usize, 18usize), (b"PK\x01\x02", 46, 20)] {
+            let mut i = 0;
+            while i + fixed <= bytes.len() {
+                if &bytes[i..i + 4] != sig {
+                    i += 1;
+                    continue;
+                }
+                seen += 1;
+                let u32_at = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+                assert_ne!(u32_at(i + size_at), u32::MAX);
+                assert_ne!(u32_at(i + size_at + 4), u32::MAX);
+                let le16 = |o: usize| usize::from(u16::from_le_bytes([bytes[o], bytes[o + 1]]));
+                let (nlen, xlen) = if fixed == 30 {
+                    (le16(i + 26), le16(i + 28))
+                } else {
+                    (le16(i + 28), le16(i + 30))
+                };
+                let mut x = i + fixed + nlen;
+                let end = x + xlen;
+                while x + 4 <= end {
+                    assert_ne!(le16(x), 1, "zip64 extra field present");
+                    x += 4 + le16(x + 2);
+                }
+                i += fixed + nlen + xlen;
+            }
+        }
+        assert_eq!(seen, 6, "three local and three central headers");
     }
 
     fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
