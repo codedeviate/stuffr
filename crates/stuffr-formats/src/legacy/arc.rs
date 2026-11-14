@@ -1058,6 +1058,12 @@ impl LzwCodes<'_> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Prefix slots zeroed by CLEARs on this thread (test work counter).
+    static LZW_WIPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Decodes ARC's LZW layer, in whichever of its two dialects `variant`
 /// names.
 fn lzw_decode(input: &[u8], variant: LzwVariant, name: &str) -> Result<Vec<u8>> {
@@ -1108,12 +1114,23 @@ fn lzw_decode(input: &[u8], variant: LzwVariant, name: &str) -> Result<Vec<u8>> 
     out.push(finchar);
 
     let mut stack: Vec<u8> = Vec::new();
+    // One past the highest prefix slot written since the last wipe.
+    let mut hw = 256usize;
     while let Some(mut code) = codes.next() {
         if code == LZW_CLEAR {
-            // No table wipe: a slot below `free_ent` is always rewritten
-            // before it can be read, and a code at or above it takes the
-            // KwKwK path, so stale entries are unreachable. Wiping 8192
-            // slots per CLEAR made 18 input bits cost a 16 KiB memset.
+            // Zero only the slots written since the last wipe. A hostile
+            // stream can make the chain walk read a slot that was never
+            // (re)written after a CLEAR (a first code >= 256, or a code
+            // beyond `free_ent` accepted as KwKwK), and it must see 0 there,
+            // exactly as with a whole-table wipe. Slots at or above `hw`
+            // are still zero from the previous wipe, and slots below 256
+            // are never written, so the cost is amortised O(input).
+            if hw > 256 {
+                prefix[256..hw].fill(0);
+                #[cfg(test)]
+                LZW_WIPED.with(|c| c.set(c.get() + (hw - 256)));
+            }
+            hw = 256;
             codes.clear_pending = true;
             codes.free_ent = LZW_FIRST - 1;
             match codes.next() {
@@ -1157,6 +1174,7 @@ fn lzw_decode(input: &[u8], variant: LzwVariant, name: &str) -> Result<Vec<u8>> 
             prefix[usize::from(slot)] = oldcode;
             suffix[usize::from(slot)] = finchar;
             codes.free_ent = slot + 1;
+            hw = hw.max(usize::from(slot) + 1);
         }
         oldcode = incode;
     }
@@ -1906,11 +1924,170 @@ mod tests {
         );
     }
 
+    /// The pre-fix decoder, verbatim: the whole table wiped on every CLEAR.
+    /// The reference the optimised decoder must match bit for bit.
+    fn lzw_decode_full_wipe(input: &[u8], squashed: bool) -> Result<Vec<u8>> {
+        let (max_width, body) = if squashed {
+            (13u32, input)
+        } else {
+            (12u32, &input[1..])
+        };
+        let ceiling: u16 = 1u16 << max_width;
+        let table = usize::from(ceiling);
+        let mut prefix = vec![0u16; table];
+        let mut suffix = vec![0u8; table];
+        for (code, slot) in suffix.iter_mut().enumerate().take(256) {
+            *slot = code as u8;
+        }
+        let mut codes = LzwCodes {
+            bits: BitReader::new(body),
+            width: LZW_INIT_BITS,
+            max_width,
+            maxcode: (1u16 << LZW_INIT_BITS) - 1,
+            ceiling,
+            clear_pending: false,
+            free_ent: LZW_FIRST,
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let Some(mut oldcode) = codes.next() else {
+            return Ok(out);
+        };
+        let mut finchar = oldcode as u8;
+        out.push(finchar);
+        let mut stack: Vec<u8> = Vec::new();
+        while let Some(mut code) = codes.next() {
+            if code == LZW_CLEAR {
+                prefix.fill(0);
+                codes.clear_pending = true;
+                codes.free_ent = LZW_FIRST - 1;
+                match codes.next() {
+                    Some(c) => code = c,
+                    None => break,
+                }
+            }
+            let incode = code;
+            stack.clear();
+            if code >= codes.free_ent {
+                stack.push(finchar);
+                code = oldcode;
+            }
+            let mut steps = 0usize;
+            while code >= 256 {
+                steps += 1;
+                if steps > table {
+                    return Err(Error::Corrupt("cycle".into()));
+                }
+                stack.push(suffix[usize::from(code)]);
+                code = prefix[usize::from(code)];
+            }
+            finchar = suffix[usize::from(code)];
+            stack.push(finchar);
+            guard_output("t", out.len() + stack.len())?;
+            out.extend(stack.iter().rev());
+            let slot = codes.free_ent;
+            if slot < ceiling {
+                prefix[usize::from(slot)] = oldcode;
+                suffix[usize::from(slot)] = finchar;
+                codes.free_ent = slot + 1;
+            }
+            oldcode = incode;
+        }
+        Ok(out)
+    }
+
+    fn assert_same_as_full_wipe(codes: &[(u32, u16)]) {
+        let packed = pack_codes(codes);
+        let mut crunched = vec![12u8];
+        crunched.extend_from_slice(&packed);
+        // Error text differs only in the cycle message; compare the kind.
+        let shape = |r: Result<Vec<u8>>| match r {
+            Ok(v) => Ok(v),
+            Err(e) => Err(std::mem::discriminant(&e)),
+        };
+        assert_eq!(
+            shape(lzw_decode(&packed, LzwVariant::Squashed, "t")),
+            shape(lzw_decode_full_wipe(&packed, true)),
+            "squashed {codes:?}"
+        );
+        assert_eq!(
+            shape(lzw_decode(&crunched, LzwVariant::Crunched, "t")),
+            shape(lzw_decode_full_wipe(&crunched, false)),
+            "crunched {codes:?}"
+        );
+    }
+
+    /// CLEAR must leave a hostile stream seeing zeros where it always did:
+    /// a first code >= 256 after CLEAR chains through `oldcode`, and a code
+    /// beyond `free_ent` becomes `oldcode` over a never-written slot.
+    #[test]
+    fn clear_matches_a_full_table_wipe_on_hostile_streams() {
+        let a = b'A' as u16;
+        let b = b'B' as u16;
+        let streams: Vec<Vec<(u32, u16)>> = vec![
+            vec![(9, a), (9, b), (9, a), (9, 258), (9, 256), (9, 300), (9, a)],
+            vec![
+                (9, a),
+                (9, b),
+                (9, a),
+                (9, 258),
+                (9, 256),
+                (9, 300),
+                (9, 300),
+            ],
+            vec![(9, a), (9, b), (9, 400), (9, 256), (9, a), (9, 258), (9, b)],
+            vec![
+                (9, a),
+                (9, b),
+                (9, 400),
+                (9, 256),
+                (9, 300),
+                (9, 259),
+                (9, b),
+            ],
+            vec![
+                (9, a),
+                (9, 500),
+                (9, 501),
+                (9, 256),
+                (9, b),
+                (9, 258),
+                (9, 259),
+            ],
+        ];
+        for s in &streams {
+            assert_same_as_full_wipe(s);
+        }
+        // Deterministic LCG streams with small codes so CLEARs, KwKwK and
+        // beyond-free_ent codes all occur often.
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (x >> 33) as u32
+        };
+        for _ in 0..4000 {
+            let n = 2 + next() % 60;
+            let mut codes = Vec::new();
+            for _ in 0..n {
+                let r = next();
+                let code = match r % 8 {
+                    0 | 1 => LZW_CLEAR,
+                    2 | 3 => (r >> 8) as u16 % 256,
+                    4 => 257 + (r >> 8) as u16 % 8,
+                    5 => 257 + (r >> 8) as u16 % 40,
+                    _ => (r >> 8) as u16 % 511,
+                };
+                codes.push((9, code));
+            }
+            assert_same_as_full_wipe(&codes);
+        }
+    }
+
     /// Back-to-back CLEAR codes must cost input-proportional work: a CLEAR
-    /// plus a literal is 18 bits in and one byte out, so clearing the whole
-    /// 8192-entry table per CLEAR was a ~7000x CPU amplifier. The table
-    /// needs no clearing at all (every slot below `free_ent` is rewritten
-    /// before it can be read), so 400k pairs must decode near-instantly.
+    /// plus a literal is 18 bits in and one byte out, so wiping the whole
+    /// 8192-entry table per CLEAR was a ~7000x CPU amplifier. Counted, not
+    /// timed: slots zeroed stay within the number of codes decoded.
     #[test]
     fn many_clear_codes_do_not_cost_a_table_reset_each() {
         let pairs = 400_000usize;
@@ -1920,13 +2097,11 @@ mod tests {
             codes.push((9, b'A' as u16));
         }
         let packed = pack_codes(&codes);
-        let start = std::time::Instant::now();
+        LZW_WIPED.with(|c| c.set(0));
         let out = lzw_decode(&packed, LzwVariant::Squashed, "t").unwrap();
-        let took = start.elapsed();
         assert_eq!(out, vec![b'A'; pairs + 1]);
-        // Fixed code: milliseconds. The full-table clear: ~6.5 GB of
-        // memset, several seconds even in release.
-        assert!(took.as_millis() < 1500, "decode took {took:?}");
+        let wiped = LZW_WIPED.with(|c| c.get());
+        assert!(wiped <= codes.len() + 16, "wiped {wiped} slots");
     }
 
     #[test]
