@@ -20,29 +20,33 @@
   write in `c/dec/decode.c`, 1.0.3–1.2.0). Check upstream for newer security
   releases at every stuffr release.
 
-## liblz4 1.11.0 (`lz4-1.11.0/`)
+## liblz4 1.11.1 (`lz4-1.11.1/`)
 
-- **Upstream:** https://github.com/lz4/lz4, release `v1.11.0`
-- **Archive:** https://github.com/lz4/lz4/releases/download/v1.11.0/lz4-1.11.0.tar.gz
-- **Archive SHA-256:** `247e5fa64da5f7b75ee3dd3bed484076396c9ebe8254d9ccf693eb62800c5e26`
+- **Upstream:** https://github.com/lz4/lz4, release `v1.11.1`
+- **Archive:** https://github.com/lz4/lz4/releases/download/v1.11.1/lz4-1.11.1.tar.gz
+- **Archive SHA-256:** `683fed08a844ad012196381e40badf80c0bbe4962959761416d41c9e67d77ec7`
   (the release's `.sha256` asset; the same pin as `.github/actions/lz4-reference`)
 - **Copied, unmodified, from the archive's `lib/` (flattened into
-  `lz4-1.11.0/`):** `lz4.c`, `lz4.h`, `lz4hc.c`, `lz4hc.h`, `lz4frame.c`,
+  `lz4-1.11.1/`):** `lz4.c`, `lz4.h`, `lz4hc.c`, `lz4hc.h`, `lz4frame.c`,
   `lz4frame.h`, `lz4frame_static.h`, `xxhash.c`, `xxhash.h`, `LICENSE`
   (BSD-2-Clause). Not copied: `lz4file.c`/`lz4file.h` (stdio file API, not
   used), `Makefile`, `README.md`, `liblz4.pc.in`, `liblz4-dll.rc.in`,
   `.gitignore`. Nothing outside `lib/` was extracted (the CLI in
   `programs/` is GPL-2.0-or-later and never read).
-- **Ours, not upstream's:** `lz4-1.11.0/stuffr-prefix.h`, generated as for
-  libbrotli (137 symbols, the `XXH*` ones included; `XXH_NAMESPACE` is not
-  used, the prefix covers them).
+- **Ours, not upstream's:** `lz4-1.11.1/stuffr-prefix.h`, generated as for
+  libbrotli (137 symbols, the same set as 1.11.0's, the `XXH*` ones
+  included; `XXH_NAMESPACE` is not used, the prefix covers them).
 - **Built by:** `crates/stuffr-formats/build.rs`, only under the `lz4-c`
   feature: `lz4.c lz4hc.c lz4frame.c xxhash.c` at `-O3`, with
   `LZ4F_MULTITHREAD=1` and `-pthread` on unix targets (`-lpthread` on
   Linux), `LZ4F_MULTITHREAD=0` elsewhere (Windows would need the Vista API;
   the bytes are the same without threads).
-- **Security:** check upstream's releases and advisories for liblz4 at every
-  stuffr release.
+- **Security:** 1.11.1 fixes an out-of-bounds write in `LZ4_resetStreamHC()`
+  at levels >= 10 on a state holding garbage (since 1.11.0). stuffr never
+  called it (only `LZ4_resetStreamHC_fast`, inside `lz4frame.c`, on states
+  it initialised), so 1.11.0 was not exposed through stuffr; 1.11.1 is
+  vendored all the same. Check upstream's releases and advisories for
+  liblz4 at every stuffr release.
 
 `scripts/check-vendored.sh` downloads each archive, verifies its SHA-256 and
 compares every copied file with this tree (ignoring `stuffr-prefix.h`); CI's `supply-chain` job runs it.

@@ -4,7 +4,7 @@
 //!
 //! **Where both tiers are built.** The compatibility seams register one
 //! backend per build: under `c-backed`, `stuffr::brotli_opts` is libbrotli
-//! 1.2.1 and `stuffr::lz4_opts` is liblz4 1.11.0 (both vendored, every
+//! 1.2.1 and `stuffr::lz4_opts` is liblz4 1.11.1 (both vendored, every
 //! symbol prefixed `stuffr_`), and their pure halves are not compiled. The
 //! registry's `brotli` and `lz4` codecs, though, are pure in every build
 //! (the `brotli` crate's `BrotliDecompressStream`, `lz4_flex`'s frame
@@ -62,10 +62,10 @@ unsafe extern "C" {
 pub const OUTPUT_CAP: usize = 8 * 1024 * 1024;
 
 /// libbrotli 1.2.1 (`BROTLI_MAKE_HEX_VERSION`: major << 24 | minor << 12 |
-/// patch) and liblz4 1.11.0 (`LZ4_VERSION_NUMBER`: major * 10000 + minor *
+/// patch) and liblz4 1.11.1 (`LZ4_VERSION_NUMBER`: major * 10000 + minor *
 /// 100 + release), the vendored versions.
 const BROTLI_VERSION: u32 = (1 << 24) | (2 << 12) | 1;
-const LZ4_VERSION: i32 = 11_100;
+const LZ4_VERSION: i32 = 11_101;
 
 /// Fails the run at its first input unless the vendored libraries are the
 /// ones linked.
@@ -80,11 +80,11 @@ pub fn assert_c_tier() {
         );
         assert_eq!(
             lz, LZ4_VERSION,
-            "c-backed: liblz4 is not the vendored 1.11.0"
+            "c-backed: liblz4 is not the vendored 1.11.1"
         );
         assert_eq!(
             lz4_opts::liblz4_version(),
-            "1.11.0",
+            "1.11.1",
             "c-backed: lz4_opts is not on liblz4"
         );
     });

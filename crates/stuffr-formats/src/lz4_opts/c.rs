@@ -1,11 +1,11 @@
-//! The C tier: liblz4 1.11.0, vendored under `c/lz4-1.11.0/` and built by
+//! The C tier: liblz4 1.11.1, vendored under `c/lz4-1.11.1/` and built by
 //! this crate's `build.rs`, driven through its frame API the way the lz4
 //! CLI drives it (measured against the reference binary; the CLI's source
 //! was not read).
 //!
-//! Every function is declared below from 1.11.0's `lib/lz4frame.h`,
+//! Every function is declared below from 1.11.1's `lib/lz4frame.h`,
 //! `lib/lz4.h` and `lib/lz4hc.h`. The vendored library's exports all carry
-//! a `stuffr_` prefix (`c/lz4-1.11.0/stuffr-prefix.h`), so each declaration
+//! a `stuffr_` prefix (`c/lz4-1.11.1/stuffr-prefix.h`), so each declaration
 //! names its symbol with `#[link_name = "stuffr_…"]`: another liblz4 in the
 //! same binary (`lz4-sys`, say) cannot clash with this one.
 //!
@@ -205,13 +205,13 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// `LZ4_versionNumber()` rendered as liblz4 renders it: `"1.11.0"` for
-/// `11100` (R7).
+/// `LZ4_versionNumber()` rendered as liblz4 renders it: `"1.11.1"` for
+/// `11101` (R7).
 pub fn liblz4_version() -> &'static str {
     // SAFETY: LZ4_versionNumber takes no arguments and returns a constant.
     let n = unsafe { LZ4_versionNumber() };
     match n {
-        11100 => "1.11.0",
+        11101 => "1.11.1",
         _ => "unknown",
     }
 }
@@ -883,7 +883,7 @@ mod layout_tests {
     #[test]
     fn the_linked_liblz4_is_the_one_the_declarations_were_written_for() {
         // SAFETY: LZ4_versionNumber takes no arguments and returns a constant.
-        assert_eq!(unsafe { super::LZ4_versionNumber() }, 11100);
+        assert_eq!(unsafe { super::LZ4_versionNumber() }, 11101);
     }
 
     /// `LZ4F_MULTITHREAD` is on wherever `build.rs` turns it on (unix

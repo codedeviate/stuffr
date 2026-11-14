@@ -130,7 +130,7 @@ pub mod zlib_c {
 /// The `lz4` tool's options seam — levels, block sizes and modes,
 /// checksums, dictionaries, the legacy format — and the streaming coder over
 /// them, what the `stuffr` binary's lz4 compatibility family runs: liblz4
-/// 1.11.0 (vendored) under `lz4-c`, else its own frame writer and reader. Not part of
+/// 1.11.1 (vendored) under `lz4-c`, else its own frame writer and reader. Not part of
 /// the stable API.
 #[cfg(feature = "lz4")]
 #[doc(hidden)]

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Verify the vendored C sources under crates/stuffr-formats/c are
 # byte-identical to upstream's archives (pins in
-# crates/stuffr-formats/c/VENDORED.md): libbrotli 1.2.1 and liblz4 1.11.0.
+# crates/stuffr-formats/c/VENDORED.md): libbrotli 1.2.1 and liblz4 1.11.1.
 # Exit 0 when identical, 1 on any difference or a hash mismatch.
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -47,12 +47,12 @@ fi
 [ "$brotli" -eq 0 ] && echo "check-vendored: brotli-1.2.1 matches upstream v1.2.1"
 [ "$brotli" -eq 0 ] || status=1
 
-# liblz4 1.11.0: only lib/ is extracted (programs/ is GPL and never read).
-fetch https://github.com/lz4/lz4/releases/download/v1.11.0/lz4-1.11.0.tar.gz \
-    247e5fa64da5f7b75ee3dd3bed484076396c9ebe8254d9ccf693eb62800c5e26 lz4.tar.gz
-tar -xzf "$work/lz4.tar.gz" -C "$work" lz4-1.11.0/lib
-up="$work/lz4-1.11.0/lib"
-vendored="$c/lz4-1.11.0"
+# liblz4 1.11.1: only lib/ is extracted (programs/ is GPL and never read).
+fetch https://github.com/lz4/lz4/releases/download/v1.11.1/lz4-1.11.1.tar.gz \
+    683fed08a844ad012196381e40badf80c0bbe4962959761416d41c9e67d77ec7 lz4.tar.gz
+tar -xzf "$work/lz4.tar.gz" -C "$work" lz4-1.11.1/lib
+up="$work/lz4-1.11.1/lib"
+vendored="$c/lz4-1.11.1"
 lz4=0
 files="LICENSE lz4.c lz4.h lz4hc.c lz4hc.h lz4frame.c lz4frame.h lz4frame_static.h xxhash.c xxhash.h"
 for f in $files; do
@@ -64,7 +64,7 @@ if [ -n "$extra" ]; then
     echo "check-vendored: files not from upstream: $extra" >&2
     lz4=1
 fi
-[ "$lz4" -eq 0 ] && echo "check-vendored: lz4-1.11.0 matches upstream v1.11.0 lib/"
+[ "$lz4" -eq 0 ] && echo "check-vendored: lz4-1.11.1 matches upstream v1.11.1 lib/"
 [ "$lz4" -eq 0 ] || status=1
 
 exit "$status"

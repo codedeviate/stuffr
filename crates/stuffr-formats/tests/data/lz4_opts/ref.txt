@@ -1,8 +1,8 @@
 # lz4_opts fixture: `<input>|<source>|<flags>|<sha256>`. Source `file`:
-# the SHA-256 of `lz4 -q -c <flags> <input>` (lz4 1.11.0,
+# the SHA-256 of `lz4 -q -c <flags> <input>` (lz4 1.11.1,
 # multithread); `stdin`: of `lz4 -q -c <flags> < pipe`; `zstd`: of
 # `zstd -q --format=lz4 <level> -c <input>` (zstd 1.5.7 linked to liblz4
-# 1.11.0). Inputs are `src/lz4_opts/tests.rs`' `inputs()`;
+# 1.11.x). Inputs are `src/lz4_opts/tests.rs`' `inputs()`;
 # `-D d100`/`-D d10` name its `dictionary()` files. Regenerate with
 # `regenerate_fixtures` (see its doc and this directory's README).
 text|file|-1|3a99d2eb3925f801ec833375ae4f3f29d216aba0024ce2989a618a1b0e2ed90b

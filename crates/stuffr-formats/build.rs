@@ -3,7 +3,7 @@
 //! - libbrotli 1.2.1 (`c/brotli-1.2.1/`) for the `brotli-c` feature: every
 //!   `.c` file under `common`, `enc` and `dec`, with `include` on the path,
 //!   into `libbrotli_vendored.a` at `-O2`.
-//! - liblz4 1.11.0 (`c/lz4-1.11.0/`) for the `lz4-c` feature: `lz4.c`,
+//! - liblz4 1.11.1 (`c/lz4-1.11.1/`) for the `lz4-c` feature: `lz4.c`,
 //!   `lz4hc.c`, `lz4frame.c` and `xxhash.c` into `liblz4_vendored.a` at
 //!   `-O3` (upstream's default), with `LZ4F_MULTITHREAD=1` and `-pthread` on
 //!   unix targets and `LZ4F_MULTITHREAD=0` elsewhere.
@@ -101,7 +101,7 @@ mod brotli {
 mod lz4 {
     use std::path::{Path, PathBuf};
 
-    const ROOT: &str = "c/lz4-1.11.0";
+    const ROOT: &str = "c/lz4-1.11.1";
 
     /// Builds the archive and returns its path.
     ///

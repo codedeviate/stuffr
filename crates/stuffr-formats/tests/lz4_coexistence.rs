@@ -1,4 +1,4 @@
-//! The vendored liblz4 1.11.0 (`lz4-c`, every export prefixed `stuffr_`)
+//! The vendored liblz4 1.11.1 (`lz4-c`, every export prefixed `stuffr_`)
 //! linked into one binary beside another, unprefixed liblz4: `lz4-sys`
 //! (1.10.0, a dev-dependency only). Both must link, and each call must
 //! reach its own library — the situation of a downstream graph that holds
@@ -34,14 +34,14 @@ fn text(n: usize) -> Vec<u8> {
 fn both_libraries_link_and_answer_for_themselves() {
     // SAFETY: LZ4_versionNumber takes no arguments and returns a constant.
     assert_eq!(unsafe { lz4_sys::LZ4_versionNumber() }, 11000);
-    assert_eq!(liblz4_version(), "1.11.0");
+    assert_eq!(liblz4_version(), "1.11.1");
 }
 
 #[test]
 fn each_compresses_with_its_own_version_and_reads_the_other() {
     let data = text(300_000);
     // stuffr's legacy frame at level 1: one `LZ4_compress_fast` block
-    // (acceleration 1) from the vendored 1.11.0.
+    // (acceleration 1) from the vendored 1.11.1.
     let mut ours = Vec::new();
     let mut e = stuffr_formats::lz4_opts::Encoder::new(&EncodeOptions {
         legacy: true,
@@ -83,7 +83,7 @@ fn each_compresses_with_its_own_version_and_reads_the_other() {
     assert_eq!(m as usize, data.len());
     assert!(back == data);
 
-    // ...and 1.11.0 (stuffr's legacy reader) reads 1.10.0's.
+    // ...and 1.11.1 (stuffr's legacy reader) reads 1.10.0's.
     let mut frame = LEGACY_MAGIC.to_le_bytes().to_vec();
     frame.extend_from_slice(&(theirs.len() as u32).to_le_bytes());
     frame.extend_from_slice(&theirs);

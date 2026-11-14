@@ -32,7 +32,7 @@ use super::{
 
 /// The liblz4 version the C tier links, reported as-is on this tier (R7).
 pub fn liblz4_version() -> &'static str {
-    "1.11.0"
+    "1.11.1"
 }
 
 /// LZ4's window: how far back a match may reach.

@@ -1,5 +1,5 @@
 //! `lz4_opts`' unit tests. The C tier's bytes are pinned against the lz4
-//! 1.11.0 CLI (and zstd 1.5.7's `--format=lz4` over liblz4 1.11.0) through a vendored table of
+//! 1.11.1 CLI (and zstd 1.5.7's `--format=lz4` over liblz4 1.11.x) through a vendored table of
 //! digests, `tests/data/lz4_opts/ref.txt`; the binary fixtures beside it are
 //! the reference's own output, which the pure tier must read. The `README`
 //! there says how to regenerate both.
@@ -203,7 +203,7 @@ fn sha256(data: &[u8]) -> String {
     h.iter().map(|x| format!("{x:08x}")).collect()
 }
 
-/// The reference `lz4` 1.11.0, if this machine has it.
+/// The reference `lz4` 1.11.1, if this machine has it.
 #[cfg(unix)]
 fn reference() -> Option<std::path::PathBuf> {
     let path = std::env::var_os("STUFFR_LZ4_REFERENCE")
@@ -212,7 +212,7 @@ fn reference() -> Option<std::path::PathBuf> {
     let v = std::process::Command::new(&path).arg("-V").output().ok()?;
     let banner =
         String::from_utf8_lossy(&v.stdout).into_owned() + &String::from_utf8_lossy(&v.stderr);
-    banner.contains("lz4 v1.11.0").then_some(path)
+    banner.contains("lz4 v1.11.1").then_some(path)
 }
 
 /// `lz4 -q -c <args> FILE` (or `< pipe` when `file` is `None`, with
@@ -1168,8 +1168,8 @@ fn large_fixtures_decode_one_byte_at_a_time() {
     assert!(out == want);
 }
 
-/// Regenerates `tests/data/lz4_opts/` from the reference lz4 1.11.0 and
-/// zstd 1.5.7 linked to liblz4 1.11.0: `STUFFR_LZ4_OPTS_REGEN=<dir> cargo test -p stuffr-formats
+/// Regenerates `tests/data/lz4_opts/` from the reference lz4 1.11.1 and
+/// zstd 1.5.7 linked to liblz4 1.11.x: `STUFFR_LZ4_OPTS_REGEN=<dir> cargo test -p stuffr-formats
 /// --features lz4 lz4_opts::tests::regenerate_fixtures -- --ignored`, then
 /// copy `<dir>/*` into `tests/data/lz4_opts/`.
 #[cfg(unix)]
@@ -1180,7 +1180,7 @@ fn regenerate_fixtures() {
         std::env::var_os("STUFFR_LZ4_OPTS_REGEN").expect("STUFFR_LZ4_OPTS_REGEN"),
     );
     std::fs::create_dir_all(&out).unwrap();
-    let lz4 = reference().expect("the reference lz4 1.11.0");
+    let lz4 = reference().expect("the reference lz4 1.11.1");
     let zstd = std::env::var_os("STUFFR_ZSTD_REFERENCE")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| "/opt/homebrew/opt/zstd/bin/zstd".into());
@@ -1241,10 +1241,10 @@ fn regenerate_fixtures() {
 /// `ref.txt`'s header, written by [`regenerate_fixtures`].
 const REF_HEADER: &str = "\
 # lz4_opts fixture: `<input>|<source>|<flags>|<sha256>`. Source `file`:
-# the SHA-256 of `lz4 -q -c <flags> <input>` (lz4 1.11.0,
+# the SHA-256 of `lz4 -q -c <flags> <input>` (lz4 1.11.1,
 # multithread); `stdin`: of `lz4 -q -c <flags> < pipe`; `zstd`: of
 # `zstd -q --format=lz4 <level> -c <input>` (zstd 1.5.7 linked to liblz4
-# 1.11.0). Inputs are `src/lz4_opts/tests.rs`' `inputs()`;
+# 1.11.x). Inputs are `src/lz4_opts/tests.rs`' `inputs()`;
 # `-D d100`/`-D d10` name its `dictionary()` files. Regenerate with
 # `regenerate_fixtures` (see its doc and this directory's README).
 ";
@@ -1386,7 +1386,7 @@ mod c_tier {
 
     #[test]
     fn liblz4_is_1_11_0() {
-        assert_eq!(liblz4_version(), "1.11.0");
+        assert_eq!(liblz4_version(), "1.11.1");
     }
 
     #[test]
@@ -1569,7 +1569,7 @@ mod pure_tier {
 
     #[test]
     fn liblz4_version_is_the_c_tiers() {
-        assert_eq!(liblz4_version(), "1.11.0");
+        assert_eq!(liblz4_version(), "1.11.1");
     }
 
     /// Seeded cases over every option the pure tier accepts: each decodes

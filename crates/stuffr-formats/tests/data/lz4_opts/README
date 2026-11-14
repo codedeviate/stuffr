@@ -23,8 +23,8 @@ ref.txt      SHA-256 digests of the reference tools' output, one row per
   rand66, empty and rep9 (9 MiB + 37 of a 50,000-byte text repeated, so
   three 4 MiB jobs and two 8 MiB legacy blocks) are tests.rs' fixture_input(), d10 its dictionary().
 
-Reference tools: lz4 1.11.0 (/opt/homebrew/opt/lz4/bin/lz4, or
-$STUFFR_LZ4_REFERENCE) and zstd 1.5.7 linked statically to liblz4 1.11.0
+Reference tools: lz4 1.11.1 (/opt/homebrew/opt/lz4/bin/lz4, or
+$STUFFR_LZ4_REFERENCE) and zstd 1.5.7 linked statically to liblz4 1.11.x
 ($STUFFR_ZSTD_REFERENCE; .github/actions/zstd-reference builds it), on
 macOS. Regenerate everything with
 
