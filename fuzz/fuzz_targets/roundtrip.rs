@@ -211,7 +211,7 @@ fn container_round_trip(container: &dyn Container, content: &[u8]) {
     // the container would have to police) when the content length is a
     // multiple of four.
     let mut meta = EntryMeta::file(ENTRY_NAME);
-    if content.len() % 4 != 0 {
+    if !content.len().is_multiple_of(4) {
         meta.size = Some(content.len() as u64);
     }
     if let Err(e) = w.add(&meta, &mut std::io::Cursor::new(content)) {
