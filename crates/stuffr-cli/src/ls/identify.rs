@@ -70,8 +70,31 @@ pub fn is_dataless(md: &std::fs::Metadata) -> bool {
 /// Identifies `path` (following symlinks), reading at most [`PROBE_LEN`]
 /// bytes from its start and [`stuffr::probe::TAIL_LEN`] from its end.
 pub fn identify(reg: &Registry, path: &Path) -> io::Result<Identified> {
-    let mut src = FileSource::from_file(File::open(path)?).map_err(into_io)?;
+    let Some(file) = open_regular(path)? else {
+        return Ok(Identified::NotOpenable);
+    };
+    let mut src = FileSource::from_file(file).map_err(into_io)?;
     identify_with_reader(reg, path, &mut src)
+}
+
+/// Opens `path` for reading only if it is (still) a regular file.
+///
+/// The walk stats the entry first, but a FIFO renamed over it before this
+/// open would block `open(2)` until a writer appears. So on unix the open is
+/// `O_NONBLOCK` (a FIFO then opens at once) and the descriptor is `fstat`ed;
+/// anything but a regular file is `None`, skipped like any other non-file.
+fn open_regular(path: &Path) -> io::Result<Option<File>> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = File::open(path)?;
+    Ok(file.metadata()?.is_file().then_some(file))
 }
 
 /// An error from the library's read helpers, back as the `io::Error` the
@@ -110,6 +133,26 @@ pub(crate) fn identify_with_reader(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_not_opened_blockingly() {
+        let dir = std::env::temp_dir().join(format!("stuffr-ls-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("p.gz");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = fifo.clone();
+        std::thread::spawn(move || {
+            let r = identify(stuffr::registry(), &p);
+            let _ = tx.send(matches!(r, Ok(Identified::NotOpenable)));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, Ok(true), "a FIFO must be skipped, not block");
+    }
 
     #[test]
     fn the_dataless_flag_is_bit_0x40000000_alone() {
