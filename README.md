@@ -1326,6 +1326,11 @@ and mtimes.
   default setting both die of `SIGPIPE`.
 - **The `perror` line after a cut-short stream** reproduces the `errno`
   bzip2 leaves behind on macOS. Elsewhere stuffr prints `strerror(0)`.
+- **`-f` on a symlink to its own output name never loses the data.** With
+  `l` -> `l.bz2` (`bzip2 -f l`) or `x.bz2` -> `x` (`bunzip2 -f x.bz2`),
+  bzip2 removes the output name, which holds the input's only copy, then
+  fails: "I/O or other error ... No such file or directory", exit 1.
+  stuffr prints the same and exits the same, but removes nothing.
 - **bzip2recover at exactly 50000 blocks.** At 50000 magics with at least 40
   bits after the last, bzip2recover 1.0.8 writes past its arrays and, on
   macOS, silently drops block 1. stuffr writes it. Upstream's undefined

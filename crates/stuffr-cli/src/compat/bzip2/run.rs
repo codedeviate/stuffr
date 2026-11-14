@@ -22,7 +22,7 @@ use crate::compat::copy_metadata_from;
 use crate::compat::host::{BZIP2_SIGNALS, arm_interrupt_flag, take_interrupt};
 use crate::compat::host::{
     CHUNK, Counting, Host, Input, Kind, Published, count_hard_links, create_temp, errno_text,
-    not_a_standard_file, publish, set_times, strerror,
+    not_a_standard_file, publish, same_file, set_times, strerror,
 };
 
 /// C's `remove`: a file, or failing that an empty directory. The result is
@@ -289,6 +289,12 @@ impl Bz<'_> {
         }
         if src == SrcMode::F2F && File::open(self.host.path(&out)).is_ok() {
             if self.s.force {
+                if self.removing_output_loses_input() {
+                    // A deviation (mod.rs): bzip2 removes the output here, the
+                    // input's only copy, then fails to stat the input. Its
+                    // messages and exit are kept; the removal is not.
+                    return Err(self.fail(Failure::Io(io::Error::from_raw_os_error(2))));
+                }
                 c_remove(&self.host.path(&out));
             } else {
                 self.refuse(m::OUTPUT_EXISTS, &[p, &out]);
@@ -304,6 +310,23 @@ impl Bz<'_> {
             }
         }
         Ok(Some(()))
+    }
+
+    /// Whether `-f`'s removal of the output name would delete the input's
+    /// data: the input resolves (through a symlink) to the very file the
+    /// output name holds, and that name is its only link. bzip2 removes it
+    /// anyway, then its `stat` of the input fails with `ENOENT`.
+    fn removing_output_loses_input(&self) -> bool {
+        let out = self.host.path(&self.out_name);
+        match (
+            fs::metadata(self.host.path(&self.in_name)),
+            fs::symlink_metadata(&out),
+        ) {
+            (Ok(i), Ok(o)) => {
+                o.is_file() && same_file(&i, &o) == Some(true) && count_hard_links(&out) == 0
+            }
+            _ => false,
+        }
     }
 
     /// `saveInputFileMetaInfo` (stat, following symlinks).

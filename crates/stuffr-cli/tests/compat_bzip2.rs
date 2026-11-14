@@ -1233,6 +1233,73 @@ mod differential {
         check_all_with("verbosity", &cases, |r, s| s.stderr = r.stderr.clone());
     }
 
+    fn link_l_to_own_output(d: &Path) {
+        std::os::unix::fs::symlink("l.bz2", d.join("l")).unwrap();
+    }
+    fn link_x_bz2_to_own_output(d: &Path) {
+        std::os::unix::fs::symlink("x", d.join("x.bz2")).unwrap();
+    }
+    fn link_l_to_own_output_with_a_second_name(d: &Path) {
+        link_l_to_own_output(d);
+        std::fs::hard_link(d.join("l.bz2"), d.join("z")).unwrap();
+    }
+
+    /// `-f` with the input a symlink to its own output name: bzip2 removes
+    /// the output (the input's only copy) and then fails to stat the input.
+    /// stuffr prints and exits the same but removes nothing (deviation in
+    /// `compat/bzip2/mod.rs`). The kept data is checked without a reference.
+    #[test]
+    fn force_on_a_symlink_to_its_own_output_keeps_the_data() {
+        let t = kib_text();
+        let cases = [
+            (
+                case("bzip2", &["-f", "l"], vec![("l.bz2", t.clone())]),
+                link_l_to_own_output as fn(&Path),
+                ("l", "l.bz2"),
+            ),
+            (
+                case("bunzip2", &["-f", "x.bz2"], vec![("x", t.clone())]),
+                link_x_bz2_to_own_output,
+                ("x.bz2", "x"),
+            ),
+            (
+                case("bzip2", &["-fv", "l", "other"], vec![("l.bz2", t.clone())]),
+                link_l_to_own_output,
+                ("l", "l.bz2"),
+            ),
+        ];
+        for (mut c, setup, (link, data)) in cases {
+            c.setup = Some(setup);
+            let s = stuffr_as(&c);
+            assert_eq!(s.code, 1, "{:?}: {}", c.args, s.stderr);
+            assert!(
+                s.stderr.contains("No such file or directory"),
+                "{:?}: {}",
+                c.args,
+                s.stderr
+            );
+            assert_eq!(s.tree.len(), 2, "{:?}: {:?}", c.args, s.tree.keys());
+            assert_eq!(s.tree[data].0, t, "{:?}: the data is gone", c.args);
+            assert_eq!(s.tree[link].0, data.as_bytes(), "{:?}", c.args);
+            let Some(r) = reference(REFERENCE_DIR, &c) else {
+                continue;
+            };
+            // The reference loses the data; everything else is the same.
+            assert!(!r.tree.contains_key(data), "{:?}: {:?}", c.args, r.tree);
+            assert_eq!(s.code, r.code, "{:?}", c.args);
+            assert_eq!(s.stdout, r.stdout, "{:?}", c.args);
+            assert_eq!(s.stderr, r.stderr, "{:?}", c.args);
+        }
+        // A second name keeps the data in bzip2 too: no deviation there.
+        let mut c = case("bzip2", &["-f", "l"], vec![("l.bz2", t.clone())]);
+        c.setup = Some(link_l_to_own_output_with_a_second_name);
+        let s = stuffr_as(&c);
+        assert_eq!(s.tree["z"].0, t);
+        if let Some(r) = reference(REFERENCE_DIR, &c) {
+            assert_same(&c, &r, &s);
+        }
+    }
+
     /// Review focus 3: a corrupt input leaves no output behind and keeps the
     /// input, exactly as bzip2 does.
     #[test]

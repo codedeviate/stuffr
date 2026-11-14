@@ -27,6 +27,12 @@
 //! - The `perror` text after a cut-short stream reproduces the `errno` that
 //!   bzip2 happens to leave behind as measured on macOS; elsewhere it prints
 //!   `strerror(0)`.
+//! - With `-f`, when the input is a symlink to its own output name (`l` ->
+//!   `l.bz2` compressing, `x.bz2` -> `x` decompressing) and that name is
+//!   the file's only link, bzip2 removes the output, which deletes the
+//!   input's only copy, then fails to stat the input: "I/O or other error",
+//!   `No such file or directory`, exit 1. stuffr prints the same and exits
+//!   the same, but removes nothing: the data stays where it was.
 
 use std::ffi::OsString;
 use std::io::{self, Write};
