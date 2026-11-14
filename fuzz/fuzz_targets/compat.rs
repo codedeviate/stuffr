@@ -187,7 +187,7 @@
 //! Inputs past `COMPAT_FUZZ_MAX_INPUT` (64 KiB; see its doc) are skipped.
 //! Built with this crate's `c-backed` feature (the deep fuzz C-tier leg,
 //! 0.26.0), the brotli and lz4 families run on libbrotli 1.2.1 and liblz4
-//! 1.11.0, and each such case's payload also goes through both tiers'
+//! 1.11.1, and each such case's payload also goes through both tiers'
 //! decoders, which must agree (`cross_tier.rs`, ruling F-a of 0.20.0; it
 //! also asserts the C tier is the one built).
 //!
