@@ -1110,7 +1110,10 @@ fn lzw_decode(input: &[u8], variant: LzwVariant, name: &str) -> Result<Vec<u8>> 
     let mut stack: Vec<u8> = Vec::new();
     while let Some(mut code) = codes.next() {
         if code == LZW_CLEAR {
-            prefix.fill(0);
+            // No table wipe: a slot below `free_ent` is always rewritten
+            // before it can be read, and a code at or above it takes the
+            // KwKwK path, so stale entries are unreachable. Wiping 8192
+            // slots per CLEAR made 18 input bits cost a 16 KiB memset.
             codes.clear_pending = true;
             codes.free_ent = LZW_FIRST - 1;
             match codes.next() {
@@ -1901,6 +1904,29 @@ mod tests {
             lzw_decode(&packed, LzwVariant::Squashed, "t").unwrap(),
             want
         );
+    }
+
+    /// Back-to-back CLEAR codes must cost input-proportional work: a CLEAR
+    /// plus a literal is 18 bits in and one byte out, so clearing the whole
+    /// 8192-entry table per CLEAR was a ~7000x CPU amplifier. The table
+    /// needs no clearing at all (every slot below `free_ent` is rewritten
+    /// before it can be read), so 400k pairs must decode near-instantly.
+    #[test]
+    fn many_clear_codes_do_not_cost_a_table_reset_each() {
+        let pairs = 400_000usize;
+        let mut codes: Vec<(u32, u16)> = vec![(9, b'A' as u16)];
+        for _ in 0..pairs {
+            codes.push((9, LZW_CLEAR));
+            codes.push((9, b'A' as u16));
+        }
+        let packed = pack_codes(&codes);
+        let start = std::time::Instant::now();
+        let out = lzw_decode(&packed, LzwVariant::Squashed, "t").unwrap();
+        let took = start.elapsed();
+        assert_eq!(out, vec![b'A'; pairs + 1]);
+        // Fixed code: milliseconds. The full-table clear: ~6.5 GB of
+        // memset, several seconds even in release.
+        assert!(took.as_millis() < 1500, "decode took {took:?}");
     }
 
     #[test]
