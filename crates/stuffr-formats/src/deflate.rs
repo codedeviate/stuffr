@@ -4,13 +4,14 @@
 use std::io::Write;
 
 use flate2::Compression;
-use flate2::read::DeflateDecoder;
+use flate2::bufread::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 use stuffr_core::{
     Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, FormatMeta,
     Result, Sink, Source, StreamOnly,
 };
 
+use crate::member_tail::{PeekBuf, SingleStream};
 use crate::normalize::{MALFORMED_AS_INVALID_INPUT_EOF, NormalizeDecodeErrors};
 
 pub const DEFLATE: FormatId = FormatId::new("deflate");
@@ -49,6 +50,7 @@ impl Codec for Deflate {
             // never finished decoding at all.
             detects_corruption: CorruptionDetection::Never,
             memory_per_worker: Some(256 * 1024),
+            reports_trailing_data: true,
             ..CodecCaps::round_trip()
         }
     }
@@ -56,10 +58,15 @@ impl Codec for Deflate {
     fn decoder<'a>(
         &self,
         src: Box<dyn Source + 'a>,
-        _o: &DecodeOpts,
+        o: &DecodeOpts,
     ) -> Result<Box<dyn Source + 'a>> {
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
-            DeflateDecoder::new(src),
+            SingleStream::new(
+                DeflateDecoder::new(PeekBuf::new(src)),
+                DeflateDecoder::into_inner,
+                DEFLATE,
+                o.fidelity.clone(),
+            ),
             MALFORMED_AS_INVALID_INPUT_EOF,
         ))))
     }
@@ -135,6 +142,47 @@ mod tests {
             "deflate must actually compress this"
         );
         assert_eq!(decompress(packed), plain);
+    }
+
+    /// H3: bytes after the verified stream are reported, not dropped silently.
+    #[test]
+    fn trailing_bytes_are_reported_as_ignored() {
+        use stuffr_core::{Fidelity, FidelitySink};
+        let mut stream = encode_with(&Deflate, b"first", &EncodeOpts::default());
+        stream.extend_from_slice(&encode_with(&Deflate, b"second", &EncodeOpts::default()));
+        let sink = FidelitySink::new();
+        let opts = DecodeOpts {
+            fidelity: sink.clone(),
+            ..Default::default()
+        };
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(stream)));
+        let mut dec = Deflate.decoder(src, &opts).unwrap();
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"first");
+        let w = sink.warnings();
+        assert!(
+            matches!(w.as_slice(), [Fidelity::TrailingDataIgnored { bytes, .. }] if *bytes > 0),
+            "{w:?}"
+        );
+    }
+
+    #[test]
+    fn nul_padding_after_the_stream_is_silent() {
+        use stuffr_core::FidelitySink;
+        let mut stream = encode_with(&Deflate, b"first", &EncodeOpts::default());
+        stream.extend_from_slice(&[0u8; 16]);
+        let sink = FidelitySink::new();
+        let opts = DecodeOpts {
+            fidelity: sink.clone(),
+            ..Default::default()
+        };
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(stream)));
+        let mut dec = Deflate.decoder(src, &opts).unwrap();
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"first");
+        assert!(sink.warnings().is_empty());
     }
 
     #[test]

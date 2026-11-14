@@ -297,6 +297,72 @@ pub(crate) fn after_member<R: Read>(
     Ok(false)
 }
 
+/// A single-stream format's half of the rule (zlib, raw deflate): there is no
+/// next-member header, so whatever follows the verified stream is junk, except
+/// all-NUL / all-`'X'` padding, which stays silent.
+#[cfg(any(feature = "zlib", feature = "deflate"))]
+pub(crate) const SINGLE_STREAM_HEAD: usize = 1;
+
+/// Reads one stream through `dec` (built over a [`PeekBuf`]), then judges what
+/// follows with `after_member` and a rule that never accepts another member,
+/// recording [`Fidelity::TrailingDataIgnored`] for a real tail.
+#[cfg(any(feature = "zlib", feature = "deflate"))]
+pub(crate) struct SingleStream<D, R> {
+    dec: Option<D>,
+    into_inner: fn(D) -> PeekBuf<R>,
+    format: FormatId,
+    sink: FidelitySink,
+    failed: Option<(ErrorKind, String)>,
+}
+
+#[cfg(any(feature = "zlib", feature = "deflate"))]
+impl<D, R> SingleStream<D, R> {
+    pub(crate) fn new(
+        dec: D,
+        into_inner: fn(D) -> PeekBuf<R>,
+        format: FormatId,
+        sink: FidelitySink,
+    ) -> Self {
+        Self {
+            dec: Some(dec),
+            into_inner,
+            format,
+            sink,
+            failed: None,
+        }
+    }
+}
+
+#[cfg(any(feature = "zlib", feature = "deflate"))]
+impl<D: Read, R: Read> Read for SingleStream<D, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let Some(dec) = self.dec.as_mut() else {
+            return match &self.failed {
+                Some((k, m)) => Err(io::Error::new(*k, m.clone())),
+                None => Ok(0),
+            };
+        };
+        let n = dec.read(buf)?;
+        if n > 0 || buf.is_empty() {
+            return Ok(n);
+        }
+        let mut rest = (self.into_inner)(self.dec.take().unwrap());
+        let rule = Rule {
+            format: self.format,
+            magic: &[],
+            header_len: SINGLE_STREAM_HEAD,
+            judge: |_| Header::Junk,
+        };
+        match after_member(&mut rest, &rule, &self.sink) {
+            Ok(_) => Ok(0),
+            Err(e) => {
+                self.failed = Some((e.kind(), e.to_string()));
+                Err(e)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

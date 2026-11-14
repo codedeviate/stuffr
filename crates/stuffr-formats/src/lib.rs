@@ -218,7 +218,15 @@ static PROBE_ALLOCATOR: alloc_probe::Probe = alloc_probe::Probe;
 pub(crate) mod confirm_test;
 #[cfg(any(feature = "lzma-c", feature = "lzma-pure"))]
 mod lzma_shared;
-#[cfg(any(feature = "gzip", feature = "bzip2"))]
+#[cfg(any(
+    feature = "gzip",
+    feature = "bzip2",
+    feature = "zlib",
+    feature = "deflate"
+))]
+// zlib/deflate alone use only `SingleStream`; the multi-member items are dead
+// in that subset.
+#[cfg_attr(not(any(feature = "gzip", feature = "bzip2")), allow(dead_code))]
 mod member_tail;
 mod normalize;
 #[cfg(any(feature = "lz4", feature = "zstd-c", feature = "zstd-pure"))]
