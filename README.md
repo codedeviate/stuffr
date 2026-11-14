@@ -629,6 +629,33 @@ read list.
 > **3725** on the default tier — measured from this bump's own
 > `make check`, `GATE_EXIT=0`, nothing skipped.
 >
+> `0.28.0`: **fixes from a whole-project bug hunt.** `salvage` on a file
+> full of overlapping truncated headers no longer decodes (and under `-C`
+> writes) bytes quadratic in the file's size: past a budget of twice the
+> file, such headers are counted on stderr instead of listed, and the last
+> cut-short entry is always recovered. `convert` folds many per-entry
+> warnings in linear time. Limits now hold where they did not: the brotli
+> decoder refuses a window larger than `--memory-limit` (exit 6, judged by
+> the window the stream declares, as zstd and xz are), and a GNU sparse tar
+> entry's extension chain stops at 16 MiB (exit 6). Writers no longer
+> produce archives that cannot be read back: an ar member's uid, gid, mode
+> or mtime that does not fit its field is written as 0 (or masked) with a
+> metadata warning, and a member past ar's 10-digit size field is refused
+> (exit 3); a zip entry whose compressed size could pass 4 GiB is written
+> as zip64. zlib and raw deflate report bytes after the stream as
+> `TrailingDataIgnored`, as gzip does; an lz4 file of only skippable frames
+> decodes to nothing at exit 0; ARC's LZW decoder no longer wipes its whole
+> table on every clear code. `stuffr ls FILE` on an unreadable file exits 2
+> like `list`, `stuffr --examples | head` no longer panics, and `ls DIR`
+> no longer hangs on a file swapped for a FIFO. Three compatibility links
+> could lose the user's data where the real tool does too, and now keep it:
+> GNU `gzip -dNf` when the output is the input, `bzip2 -f` and ncompress
+> `compress -f` on a symlink to their own output name (new deviations,
+> listed below). A MINOR (`SalvageScan::format`, `Hash` on `Fidelity`, new
+> constants). **3916** tests under `--all-features`, **3761** on the default
+> tier — measured from this bump's own `make check FULL=1`, `GATE_EXIT=0`,
+> nothing skipped.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
