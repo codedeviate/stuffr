@@ -697,6 +697,18 @@ mod tests {
         ] {
             assert_eq!(decompress(bytes), b"");
         }
+        // A complete skippable frame, then 1-3 bytes of a next frame's magic.
+        for n in 1..=3 {
+            let mut bytes = skippable_frame(b"abcd");
+            bytes.extend_from_slice(&0x184D2204u32.to_le_bytes()[..n]);
+            let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(bytes)));
+            let mut dec = Lz4.decoder(src, &DecodeOpts::default()).unwrap();
+            let mut out = Vec::new();
+            assert!(
+                dec.read_to_end(&mut out).is_err(),
+                "{n} magic bytes must fail"
+            );
+        }
         let cut = skippable_frame(b"abcd");
         for n in 1..cut.len() {
             let src: Box<dyn Source> =
