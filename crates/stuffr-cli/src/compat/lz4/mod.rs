@@ -56,14 +56,14 @@
 //!    read and written by then; a legacy job's over the input before it; a
 //!    one-shot frame's over all of it; the pure tier's ratio is of its own
 //!    bytes, deviation 6), and so does a file of one job (1 MB, or a block
-//!    when larger) with independent blocks, which lz4 1.11.0 and stuffr
+//!    when larger) with independent blocks, which lz4 1.11.1 and stuffr
 //!    compress on the calling thread. Where liblz4's workers take the
 //!    frame (more than one job, or linked blocks over a block or more) the
 //!    figure is what they had handed back when it was drawn, which varies
-//!    from run to run in lz4 1.11.0 itself (probed: 18.93% or 28.39% at 8
+//!    from run to run in lz4 1.11.1 itself (probed: 18.93% or 28.39% at 8
 //!    MiB of the same `-B6` input, 0.00% or 27.71% at 2.5 MB `-T3 -B4`), so
 //!    it is timing too. While decoding, the refreshes are drawn at other
-//!    moments. lz4 1.11.0 draws one after each piece it has decoded
+//!    moments. lz4 1.11.1 draws one after each piece it has decoded
 //!    without error (3 to 4 MiB of output; probed with `-vvvv`), so
 //!    a decode that fails inside its first piece shows none (`Error 34 :
 //!    ... ERROR_decompressionFailed` alone) and one that fails at the end
@@ -81,7 +81,7 @@
 //!    lz4's own same-file message (`a: input and output are the same file;
 //!    not overwritten`, display level 1) and counts that input as failed
 //!    (exit 1), whatever `-f` says. Every other same-file case (`lz4 -f a
-//!    a`, `lz4 -df s.lz4 s.lz4`, a hard or symbolic link, `-m`) lz4 1.11.0
+//!    a`, `lz4 -df s.lz4 s.lz4`, a hard or symbolic link, `-m`) lz4 1.11.1
 //!    refuses itself, with that message, and stuffr does the same. A pipe
 //!    from the file, or standard output redirected onto it, loses the data
 //!    alike in both: the pipe or the shell has done it before either
@@ -108,12 +108,12 @@
 //!    strict prefix of lz4's. The summary's compressed size and ratio are
 //!    those of its own bytes. A legacy or mozlz4 block cut short may decode
 //!    on the pure tier, as far as it goes, where liblz4 refuses it with
-//!    `Error 64` (liblz4 1.11.0's end-of-block rules refuse some cuts
+//!    `Error 64` (liblz4 1.11's end-of-block rules refuse some cuts
 //!    `lz4_flex` takes: the `cut60` case of
 //!    `mozlz4_decodes_as_the_reference_decodes_it`; the C tier matches at
 //!    every cut).
 //! 7. A decode that fails keeps everything decoded before the fault in its
-//!    output (a file or standard output). lz4 1.11.0 hands its output on
+//!    output (a file or standard output). lz4 1.11.1 hands its output on
 //!    in 4 MiB pieces and writes the rest only at the end of a frame or of
 //!    the input, so a fault inside a frame loses what follows the last
 //!    whole piece (probed, 20 runs of 20: a 6.6 MiB frame corrupt in its
@@ -139,7 +139,7 @@
 //!     at an output name is never written through. lz4 checks for an
 //!     existing output with `stat` and opens it with `fopen(.., "wb")`, so a
 //!     dangling symlink looks absent and a live one is truncated, and the
-//!     data lands wherever the link points (lz4 1.11.0 also truncates a
+//!     data lands wherever the link points (lz4 1.11.1 also truncates a
 //!     link's target when the input is missing: `lz4 -d -f -m x.lz4` with
 //!     `x -> b.lz4`). stuffr checks with `lstat`: a symlink, dangling or
 //!     not, is an existing file (`already exists` / the overwrite

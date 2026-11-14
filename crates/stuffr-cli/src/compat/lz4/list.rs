@@ -682,8 +682,9 @@ fn list_one(run: &mut Run, name: &[u8], index: usize, total: usize) -> Result<()
     Ok(())
 }
 
-/// `--list` over every input of `cmd` (module doc): standard input lists
-/// nothing, and the first file that fails ends the run.
+/// `--list` over every input of `cmd` (module doc): with no list operand
+/// standard input is listed as the operand `stdin` is, and the first file
+/// that fails ends the run.
 pub(crate) fn list_files(
     cmd: &Command,
     host: &mut Host,

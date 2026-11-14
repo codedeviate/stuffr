@@ -1419,6 +1419,9 @@ mod unix {
                 "refusing to read from a console\n",
             )
             .tty(true, false),
+            // lz4 1.11.1's `For help, type: lz4 -h` goes with the refusal:
+            // silent at -qq too.
+            row(T3, "stdin a terminal, -qq", "lz4", &["-qq"], &[], 1, "").tty(true, true),
             row(
                 T3,
                 "stdin a terminal, -c",
@@ -2480,6 +2483,7 @@ mod unix {
             row(T5, "--list leg_block_one_short.lz4, -v (1.11.1)", "lz4", &["--list", "-v", "leg_block_one_short.lz4"], &["leg_block_one_short.lz4"], 1, "Corrupted legacy frame \nlz4: leg_block_one_short.lz4: File format not recognized \n"),
             row(T5, "--list leg_then_frame_magic.lz4 (1.11.1)", "lz4", &["--list", "leg_then_frame_magic.lz4"], &["leg_then_frame_magic.lz4"], 1, "lz4: leg_then_frame_magic.lz4: File format not recognized \n"),
             row(T5, "--list leg_then_frame_magic.lz4, -v (1.11.1)", "lz4", &["--list", "-v", "leg_then_frame_magic.lz4"], &["leg_then_frame_magic.lz4"], 1, "lz4: leg_then_frame_magic.lz4: File format not recognized \n"),
+            row(T5, "--list -r of a directory with no file (1.11.1 too)", "lz4", &["--list", "-r", "emptydir"], &[], 1, "lz4: emptydir is not a regular file \n").setup(|d| fs::create_dir(d.join("emptydir")).unwrap()),
             row(T5, "--list a legacy block cut short, -v (1.11.1: corrupt)", "lz4", &["--list", "-v", "leg_blk_trunc.lz4"], &["leg_blk_trunc.lz4"], 1, "Corrupted legacy frame \nlz4: leg_blk_trunc.lz4: File format not recognized \n"),
             row(T5, "--list a legacy frame then 3 bytes", "lz4", &["--list", "leg_garbage.lz4"], &["leg_garbage.lz4"], 1, "Corrupted legacy frame"),
             row(T5, "--list a legacy frame then 8 zeros", "lz4", &["--list", "-v", "leg_zeros.lz4"], &["leg_zeros.lz4"], 1, "Stream followed by undecodable data at position 107 \nlz4: leg_zeros.lz4: File format not recognized \n"),
@@ -2964,11 +2968,12 @@ mod unix {
         assert_eq!((o.status.code(), o.stderr.len()), (Some(1), 0));
     }
 
-    /// `--list stdin` (the operand, not `-`) lists standard input when it is
-    /// redirected from a regular file, named `stdin`, and refuses a pipe or
-    /// `/dev/null` (probed 2026-10-16; the differential harness feeds a
-    /// pipe, so this runs the two binaries by hand). `-` and no operand
-    /// never read it.
+    /// `--list stdin`, and since lz4 1.11.1 `--list` with no list operand
+    /// (none, `-`, operands only before `--list`), lists standard input when
+    /// it is redirected from a regular file, named `stdin`, from where its
+    /// offset stands, and refuses a pipe or `/dev/null` (probed 2026-10-16
+    /// and 2026-11-14; the differential harness feeds a pipe, so this runs
+    /// the two binaries by hand). A `-` among list operands is skipped.
     #[test]
     fn list_of_standard_input_redirected_from_a_file() {
         if lz4_dir().is_none() {
@@ -3044,6 +3049,41 @@ mod unix {
                     run(reference, args, input),
                     "{args:?} < {input:?}"
                 );
+            }
+        }
+        // Standard input already 3 bytes into the file (as after a reader
+        // took a prefix): the walk and its end-of-file checks count from
+        // there (lz4 1.11.1: a legacy block that ends at the end of the file
+        // lists, one cut short is corrupt; the compact row's size is the
+        // whole file's).
+        let at3 = |frame: &[u8]| [&b"xyz"[..], frame].concat();
+        let leg = fx("leg.lz4");
+        for (name, bytes) in [
+            ("off_leg.lz4", at3(&leg)),
+            ("off_b.lz4", at3(&fx("b.lz4"))),
+            ("off_legcut.lz4", at3(&leg[..leg.len() - 2])),
+        ] {
+            fs::write(dir.join(name), bytes).unwrap();
+            for args in [&["--list"][..], &["--list", "-v"], &["--list", "stdin"]] {
+                let run_at3 = |exe: &Path| {
+                    use std::io::{Seek, SeekFrom};
+                    let mut f = fs::File::open(dir.join(name)).unwrap();
+                    f.seek(SeekFrom::Start(3)).unwrap();
+                    let o = std::process::Command::new(exe)
+                        .args(args)
+                        .current_dir(&*dir)
+                        .stdin(std::process::Stdio::from(f))
+                        .env("LC_ALL", "C")
+                        .output()
+                        .unwrap();
+                    let err = String::from_utf8_lossy(&o.stderr).replacen(
+                        &format!("multithread (stuffr {})", env!("CARGO_PKG_VERSION")),
+                        "multithread",
+                        1,
+                    );
+                    (o.status.code(), o.stdout, err)
+                };
+                assert_eq!(run_at3(&link), run_at3(reference), "{args:?} < {name} at 3");
             }
         }
     }

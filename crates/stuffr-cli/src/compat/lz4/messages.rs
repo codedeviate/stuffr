@@ -19,11 +19,11 @@ pub(super) use crate::compat::host::printf;
 
 // ---- the banner and the help texts ----
 
-/// probe: `lz4 -V` (1.11.0) prints `*** lz4 v1.11.1 64-bit multithread, by
+/// probe: `lz4 -V` (1.11.1) prints `*** lz4 v1.11.1 64-bit multithread, by
 /// Yann Collet ***`; spec deviation 1 adds `(stuffr X.Y.Z)` (the argument)
 /// after `multithread`, so the prefix `*** lz4 v1.11.1 ` a script reads is
-/// unchanged. Printed by `-V` (standard output), first by `-h`/`-H`
-/// (standard error), and at `-v`.
+/// unchanged. Printed by `-V` and first by `-h`/`-H` (standard output, the
+/// help since 1.11.1), and at `-v` (standard error).
 pub(super) const BANNER: &str =
     "*** lz4 v1.11.1 64-bit multithread (stuffr %s), by Yann Collet ***\n";
 
