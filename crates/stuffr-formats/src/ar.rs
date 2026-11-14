@@ -1563,11 +1563,43 @@ impl ArchiveWrite for ArWrite {
         data.read_to_end(&mut buf)?;
 
         let identifier = write_safe_identifier(meta.name.clone().into_bytes());
+        // The size field holds ten decimal digits, and a BSD `#1/N` member
+        // counts its N name bytes (NUL-padded to a multiple of 4) inside it.
+        // There is no honest clamp for a length, so it is refused.
+        let name_in_size = if identifier.len() > 16 || identifier.contains(&b' ') {
+            (identifier.len() as u64).div_ceil(4) * 4
+        } else {
+            0
+        };
+        if (buf.len() as u64).saturating_add(name_in_size) > MAX_FIELD_SIZE {
+            return Err(Error::ResourceLimit(format!(
+                "ar cannot store `{}`: its size field holds ten decimal digits                  (at most {MAX_FIELD_SIZE} bytes, including a long name)",
+                meta.name
+            )));
+        }
+        // Every other number is clamped to what its fixed-width field holds
+        // rather than written wider, which would shift the rest of the header
+        // and the payload and corrupt the whole archive. The loss is reported
+        // by `pack`/`convert` through `unrepresentable_fields`.
+        let lost = unrepresentable_fields(meta);
+        let mode = meta.mode.unwrap_or(DEFAULT_MODE);
         let mut header = ar::Header::new(identifier, buf.len() as u64);
-        header.set_mode(meta.mode.unwrap_or(DEFAULT_MODE));
-        header.set_mtime(meta.mtime.map(unix_seconds).unwrap_or(0));
-        header.set_uid(meta.uid.unwrap_or(0));
-        header.set_gid(meta.gid.unwrap_or(0));
+        header.set_mode(if lost.mode { mode & MODE_KEEP } else { mode });
+        header.set_mtime(if lost.mtime {
+            0
+        } else {
+            meta.mtime.map(unix_seconds).unwrap_or(0)
+        });
+        header.set_uid(if lost.uid_gid && meta.uid.unwrap_or(0) > MAX_ID {
+            0
+        } else {
+            meta.uid.unwrap_or(0)
+        });
+        header.set_gid(if lost.uid_gid && meta.gid.unwrap_or(0) > MAX_ID {
+            0
+        } else {
+            meta.gid.unwrap_or(0)
+        });
 
         self.builder()?.append(&header, &mut &buf[..])?;
         self.wrote_any = true;
@@ -1667,6 +1699,31 @@ fn write_safe_identifier(mut identifier: Vec<u8>) -> Vec<u8> {
     identifier
 }
 
+/// Largest uid/gid the 6-digit decimal fields hold.
+const MAX_ID: u32 = 999_999;
+/// Largest mtime the 12-digit decimal field holds.
+const MAX_MTIME: u64 = 999_999_999_999;
+/// Largest mode the 8-digit octal field holds.
+const MAX_MODE: u32 = 0o77_777_777;
+/// What a mode that does not fit keeps: the type and permission bits.
+const MODE_KEEP: u32 = 0o177_777;
+/// Largest size the 10-digit decimal field holds.
+const MAX_FIELD_SIZE: u64 = 9_999_999_999;
+
+/// Which of `meta`'s header numbers an `ar` member header cannot hold, and
+/// so [`ArWrite::add`] clamps (uid/gid and mtime to 0, mode to its low 16
+/// bits). `uid_gid` covers either id. Doc-hidden: the facade turns it into a
+/// `Fidelity::MetadataIncomplete`.
+#[doc(hidden)]
+pub fn unrepresentable_fields(meta: &EntryMeta) -> stuffr_core::MetaFields {
+    stuffr_core::MetaFields {
+        uid_gid: meta.uid.is_some_and(|u| u > MAX_ID) || meta.gid.is_some_and(|g| g > MAX_ID),
+        mode: meta.mode.is_some_and(|m| m > MAX_MODE),
+        mtime: meta.mtime.is_some_and(|t| unix_seconds(t) > MAX_MTIME),
+        ..Default::default()
+    }
+}
+
 /// Seconds since the epoch, which is what `ar::Header::mtime` stores. A
 /// timestamp before 1970 clamps to zero rather than failing the write, the
 /// same choice `tar.rs`'s own `unix_seconds` makes and for the same reason.
@@ -1698,6 +1755,66 @@ mod tests {
         }
         w.finish().expect("finish").finish().expect("finish sink");
         buf.contents()
+    }
+
+    /// H6: a uid/gid of 7+ digits, a mode of 9+ octal digits or an mtime of
+    /// 13+ digits used to widen the 60-byte header and misframe every member
+    /// after it. The writer clamps them and `unrepresentable_fields` names
+    /// the loss; framing and payloads stay intact.
+    #[test]
+    fn fields_that_do_not_fit_are_clamped_and_never_misframe_the_archive() {
+        let buf = SharedBuf::new();
+        let mut w = Ar
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
+            .expect("create");
+        let mut big = EntryMeta::file("big");
+        big.uid = Some(1_234_567);
+        big.gid = Some(2_000_000);
+        big.mode = Some(0xFFFF_FFFF);
+        big.mtime = Some(UNIX_EPOCH + Duration::from_secs(10_u64.pow(12)));
+        assert!(unrepresentable_fields(&big).uid_gid);
+        assert!(unrepresentable_fields(&big).mode);
+        assert!(unrepresentable_fields(&big).mtime);
+        w.add(&big, &mut std::io::Cursor::new(&b"hello"[..]))
+            .expect("add big");
+        w.add(
+            &EntryMeta::file("next"),
+            &mut std::io::Cursor::new(&b"world"[..]),
+        )
+        .expect("add next");
+        w.finish().expect("finish").finish().expect("finish sink");
+        let bytes = buf.contents();
+        // Header terminator at its fixed position, for both members.
+        assert_eq!(&bytes[8 + 58..8 + 60], b"`\n");
+        let mut r = open_forward_only(&Ar, &bytes);
+        let mut seen = Vec::new();
+        while let Some(mut e) = r.next_entry().expect("next") {
+            let mut d = Vec::new();
+            e.reader().read_to_end(&mut d).expect("read");
+            seen.push((e.meta().name.clone(), d, e.meta().uid, e.meta().gid));
+        }
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].0, "big");
+        assert_eq!(seen[0].1, b"hello");
+        assert_eq!((seen[0].2, seen[0].3), (Some(0), Some(0)));
+        assert_eq!(seen[1].0, "next");
+        assert_eq!(seen[1].1, b"world");
+    }
+
+    #[test]
+    fn a_header_that_fits_reports_nothing_lost() {
+        let mut m = EntryMeta::file("ok");
+        m.uid = Some(999_999);
+        m.gid = Some(0);
+        m.mode = Some(0o100_644);
+        m.mtime = Some(UNIX_EPOCH + Duration::from_secs(999_999_999_999));
+        assert_eq!(
+            unrepresentable_fields(&m),
+            stuffr_core::MetaFields::default()
+        );
     }
 
     /// The writer's backstop (`plan_entry_write` keeps links away from it): a

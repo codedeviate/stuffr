@@ -5423,6 +5423,17 @@ fn plan_entry_write(
     {
         warnings.push(w);
     }
+    // `ar`'s fixed-width header fields clamp what does not fit; say so.
+    #[cfg(feature = "ar")]
+    if matches!(plan, WritePlan::Write) && container == stuffr_formats::ar::AR {
+        let lost = stuffr_formats::ar::unrepresentable_fields(meta);
+        if lost != MetaFields::default() {
+            warnings.push(Fidelity::MetadataIncomplete {
+                entry: meta.name.clone(),
+                fields: lost,
+            });
+        }
+    }
     plan
 }
 
@@ -7506,6 +7517,28 @@ mod tests {
             WritePlan::Write
         ));
         assert!(w.is_empty());
+    }
+
+    /// H6: an `ar` header field that cannot hold the value is clamped by the
+    /// writer, and the plan says so.
+    #[cfg(feature = "ar")]
+    #[test]
+    fn an_ar_entry_with_a_seven_digit_uid_warns_that_ownership_was_not_kept() {
+        let mut m = meta_with(Some(1_234_567), Some(20));
+        m.mode = Some(0o644);
+        let mut w = Vec::new();
+        let plan = plan_entry_write(
+            &ContainerCaps::default(),
+            stuffr_formats::ar::AR,
+            &m,
+            LinkCopy::Unavailable,
+            &mut w,
+        );
+        assert!(matches!(plan, WritePlan::Write));
+        assert!(matches!(
+            &w[..],
+            [Fidelity::MetadataIncomplete { fields, .. }] if fields.uid_gid && !fields.mode
+        ));
     }
 
     /// I1 (Phase 5a final review): an entry with no ids costs nothing in a
