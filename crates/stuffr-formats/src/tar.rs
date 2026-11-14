@@ -515,6 +515,17 @@ pub const MAX_PAX_EXTENSION: u64 = 16 * 1024 * 1024;
 /// narrower budget, `tar_salvage::MAX_LONG_NAME`. Fixed, not tunable.
 pub const MAX_GNU_LONG_NAME: u64 = 16 * 1024 * 1024;
 
+/// The most extension blocks one GNU sparse header may chain — 16 MiB of
+/// them, the same class as [`MAX_PAX_EXTENSION`]. The crate parses the whole
+/// chain eagerly inside `next()` into a `Vec` of regions (21 per block, about
+/// 500-670 heap bytes per 512-byte block), for `list` too, with no bound of
+/// its own. 32,768 blocks hold ~688k regions, far past any real file's map.
+/// [`Error::ResourceLimit`] (exit 6), refused before the block is read.
+/// `salvage` never parses the chain (it only recognises the entry), and the
+/// crate does not read pax `GNU.sparse.*` maps, so this is the only path.
+/// Fixed, not tunable.
+pub const MAX_GNU_SPARSE_EXT_BLOCKS: u64 = MAX_PAX_EXTENSION / BLOCK as u64;
+
 /// What `tar::Archive` reads from: [`TrailerWatch`] behind [`CrateNextGuard`].
 type TarSource = CrateNextGuard<TrailerWatch>;
 
@@ -818,6 +829,21 @@ fn pax_over_ceiling(len: u64) -> io::Error {
     )
 }
 
+/// The refusal: a GNU sparse header chaining more than
+/// [`MAX_GNU_SPARSE_EXT_BLOCKS`] extension blocks. `OutOfMemory`, so it
+/// classifies as [`Error::ResourceLimit`] (exit 6).
+fn sparse_chain_over_ceiling(run: &SparseRun) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::OutOfMemory,
+        format!(
+            "tar GNU sparse header at offset {} chains more than \
+             {MAX_GNU_SPARSE_EXT_BLOCKS} extension blocks, past the {MAX_PAX_EXTENSION}-byte \
+             ceiling this container reads eagerly; no real sparse file's map is this large",
+            run.header_at
+        ),
+    )
+}
+
 /// The refusal: a GNU `L`/`K` header declaring a payload past
 /// [`MAX_GNU_LONG_NAME`]. `OutOfMemory`, so [`Error::from_decode_io`]
 /// classifies it as [`Error::ResourceLimit`] (exit 6), like
@@ -860,6 +886,9 @@ impl<R: Read> Read for CrateNextGuard<R> {
                     // crate stops — `Done` stands.
                 }
                 GuardPhase::Extension(mut run) => {
+                    if run.blocks >= MAX_GNU_SPARSE_EXT_BLOCKS {
+                        return Err(sparse_chain_over_ceiling(&run));
+                    }
                     // Refused before a byte of the block is read: the
                     // crate's `try_read_all` fails where `:532` would have
                     // overflowed one line later.
@@ -2868,6 +2897,73 @@ mod tests {
                 .map_err(stuffr_core::Error::from_decode_io)?;
         }
         Ok(())
+    }
+
+    /// H5: a sparse extension chain past the ceiling is exit 6, refused
+    /// before the block past it is read (the crate would otherwise hold a
+    /// region list growing with the chain), on pipe and file alike.
+    #[test]
+    fn a_sparse_extension_chain_past_the_ceiling_is_a_resource_limit() {
+        let n = MAX_GNU_SPARSE_EXT_BLOCKS + 2;
+        let mut bytes = gnu_sparse_header("sparse.bin", 1, true).to_vec();
+        let ext = gnu_extension_block(true);
+        for _ in 0..n {
+            bytes.extend_from_slice(&ext);
+        }
+        bytes.extend_from_slice(&gnu_extension_block(false));
+        bytes.extend_from_slice(&[0u8; 2 * BLOCK]);
+        for (shape, ar) in [("pipe", open(&bytes)), ("file", open_seekable(&bytes))] {
+            let err = walk(ar).expect_err("a chain past the ceiling");
+            assert!(
+                matches!(err, stuffr_core::Error::ResourceLimit(_)),
+                "{shape}: {err:?}"
+            );
+            assert_eq!(err.exit_code(), 6, "{shape}: {err}");
+        }
+        // The read work is bounded: the guard stops at the ceiling, not at
+        // the end of the chain.
+        struct Counting<'a>(&'a [u8], usize);
+        impl Read for Counting<'_> {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                let n = self.0.len().saturating_sub(self.1).min(out.len());
+                out[..n].copy_from_slice(&self.0[self.1..self.1 + n]);
+                self.1 += n;
+                Ok(n)
+            }
+        }
+        let mut src = Counting(&bytes, 0);
+        {
+            let mut guard = CrateNextGuard::new(&mut src);
+            let mut sink = Vec::new();
+            let err = guard.read_to_end(&mut sink).expect_err("refused");
+            assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+        }
+        assert_eq!(
+            src.1 as u64,
+            BLOCK as u64 * (1 + MAX_GNU_SPARSE_EXT_BLOCKS),
+            "header plus exactly the ceiling's blocks"
+        );
+    }
+
+    /// Positive control: a chain exactly at the ceiling is not refused.
+    #[test]
+    fn a_sparse_extension_chain_at_the_ceiling_is_accepted() {
+        let mut header = tar::Header::new_gnu();
+        header.set_path("sparse.bin").unwrap();
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::GNUSparse);
+        header.set_size(0);
+        let gnu = header.as_gnu_mut().unwrap();
+        gnu.set_real_size(0);
+        gnu.set_is_extended(true);
+        header.set_cksum();
+        let mut bytes = header.as_bytes().to_vec();
+        for _ in 1..MAX_GNU_SPARSE_EXT_BLOCKS {
+            bytes.extend_from_slice(&gnu_extension_block(true));
+        }
+        bytes.extend_from_slice(&gnu_extension_block(false));
+        bytes.extend_from_slice(&[0u8; 2 * BLOCK]);
+        walk(open(&bytes)).expect("a chain of exactly the ceiling");
     }
 
     /// The phrase only [`CrateNextGuard`]'s refusal carries, so a test can
