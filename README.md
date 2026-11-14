@@ -1979,8 +1979,9 @@ the output.
   descriptor and any failure loses it (a refused header, `corrupt input`, a
   write error, an interrupt, or "no compression" after a `y`). stuffr leaves
   the name alone, writes a temporary beside it (`.stuffr-compress-*.tmp`,
-  removed on failure and on INT, TERM or HUP) and renames it over the name
-  only on success. Messages and exit codes are the same; on success the files
+  removed on failure and on INT, TERM or HUP; SIGQUIT leaves it behind,
+  mode 0600, with the input intact) and renames it over the name only on
+  success. Messages and exit codes are the same; on success the files
   left are the same; on failure the input and its link stay as they were.
 - **Debian 13's build everywhere.** On macOS this personality is still Debian 13's
   build, not Homebrew's: symbolic-link operands are followed, `-V` lists

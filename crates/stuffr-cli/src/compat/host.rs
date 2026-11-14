@@ -699,6 +699,9 @@ pub(crate) fn create_excl_armed(host: &Host, path: &Path) -> io::Result<(File, C
 /// [`create_excl_armed`] under a temporary name in `dir`,
 /// `.stuffr-{family}-{pid}-{n}.tmp` (as [`create_temp`]): the file a
 /// failure or [`install_abort_exit`]'s handler removes is the temporary.
+/// A temporary path the slot cannot hold (`SLOT_LEN` bytes or more) is left
+/// unarmed, as `create_excl_armed` leaves such a path: INT, TERM or HUP can
+/// then leave the temporary behind, while the input stays safe.
 pub(crate) fn create_temp_excl_armed(
     host: &Host,
     dir: &Path,

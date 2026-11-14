@@ -1378,7 +1378,20 @@ mod deviations {
             );
             assert_eq!(s.code, r.code, "{why}");
             assert_eq!(s.stdout, r.stdout, "{why}");
-            assert_eq!(s.stderr, r.stderr, "{why}");
+            if c.args.contains(&"-fv") {
+                // Deviation N4: ncompress goes on to print a false
+                // ` -- replaced with x` line, which stuffr leaves out; as
+                // `n4_a_refused_input_is_kept_under_f`, its stderr only
+                // starts with stuffr's.
+                assert!(
+                    r.stderr.starts_with(&s.stderr),
+                    "{why}: {:?} vs {:?}",
+                    r.stderr,
+                    s.stderr
+                );
+            } else {
+                assert_eq!(s.stderr, r.stderr, "{why}");
+            }
         }
         // Successes leave what ncompress leaves.
         let successes = [

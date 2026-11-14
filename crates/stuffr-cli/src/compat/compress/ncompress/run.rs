@@ -392,6 +392,8 @@ impl Run<'_, '_> {
         let mut out_fd: Option<io::Result<File>> = None;
         let mut out = if !self.s.zcat {
             // `access(ofname, F_OK)`: follows a link.
+            // Deviation N5: the directory of the temporary to write.
+            let mut temp_dir: Option<PathBuf> = None;
             if fs::metadata(&out_path).is_ok() {
                 if !self.s.force {
                     self.inbuf[0] = b'n';
@@ -416,14 +418,14 @@ impl Run<'_, '_> {
                         Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
                         _ => PathBuf::from("."),
                     };
-                    self.tmp = Some(dir);
+                    temp_dir = Some(dir);
                 } else if let Err(e) = fs::remove_file(&out_path) {
                     let _ = self.err.write_all(m::CANT_REMOVE.as_bytes());
                     self.perror(&ofname, &e);
                     return Ok(None);
                 }
             }
-            let created = match self.tmp.take() {
+            let created = match temp_dir {
                 Some(dir) => match host::create_temp_excl_armed(self.host, &dir, "compress") {
                     Ok((tmp, f, guard)) => {
                         self.tmp = Some(tmp);
