@@ -212,7 +212,7 @@ pub struct CodecCaps {
     /// [`crate::DecodeOpts::fidelity`]: the format is a concatenation of
     /// members, and bytes after the last verified one that are neither a
     /// member nor padding are read through and ignored with a warning (gzip,
-    /// bzip2).
+    /// bzip2; zlib and deflate, single-stream, for any tail).
     ///
     /// Such a stream's fidelity is only known once it has been read to the
     /// end, so `stuffr info`, which decodes nothing beyond its probe prefix,

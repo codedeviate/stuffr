@@ -1692,7 +1692,7 @@ pub struct Inspection {
     /// `false` only when a read could actually have lost something that
     /// `inspect` did not look at: a container declaring `trailing_index`
     /// that will NOT be read authoritatively, or a codec layer declaring
-    /// `CodecCaps::reports_trailing_data` (gzip, bzip2), whose trailing
+    /// `CodecCaps::reports_trailing_data` (gzip, bzip2, zlib, deflate), whose trailing
     /// bytes are judged only at the end of the stream. See
     /// `fidelity_is_knowable_without_opening` for the full rule and for
     /// which `ContainerCaps` flags count.
@@ -1913,7 +1913,7 @@ pub fn inspect_with_limit(
 /// # A codec layer can withhold it too
 ///
 /// A codec declaring [`stuffr_core::CodecCaps::reports_trailing_data`]
-/// (gzip, bzip2) judges what follows its last verified member only at the
+/// (gzip, bzip2, zlib, deflate) judges what follows its last verified member only at the
 /// end of the stream, and junk there is
 /// [`stuffr_core::Fidelity::TrailingDataIgnored`]. `inspect` reads a prefix,
 /// so for such a layer — bare, or with a container beneath it — it has not

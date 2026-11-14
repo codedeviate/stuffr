@@ -1,5 +1,7 @@
 //! What follows a verified member of a multi-member codec stream — the one
-//! rule gzip ([`crate::gzip`]) and bzip2 ([`crate::bzip2`]) share.
+//! rule gzip ([`crate::gzip`]) and bzip2 ([`crate::bzip2`]) share. zlib and
+//! raw deflate, which are single-stream, use it through [`SingleStream`] (no
+//! next-member header: any non-padding tail is `TrailingDataIgnored`).
 //!
 //! Both formats are legitimately concatenations, so after each member whose
 //! own check verified, the reader must decide what the remaining bytes are.
@@ -148,9 +150,12 @@ pub(crate) const FREE_MEMBERS: u64 = 4096;
 /// Low on purpose (controller ruling on the first value, 512): files of
 /// per-line appended gzip members move ~100-200 bytes a member and must
 /// decode, while an empty member (gzip 20 bytes, bzip2 14) can never pay 64.
-/// A member's set-up is tens of KiB of zeroing, so the set-up work stays
-/// within roughly a thousand times the bytes the stream moves — bounded,
-/// where it was unbounded per input byte before (a 20 MB file: tens of GB).
+/// A gzip member's set-up is tens of KiB of zeroing. A bzip2 `BZh9` member
+/// allocates up to ~3.6 MB (`tt`), freed per member, so peak memory does not
+/// accumulate; whether it is zeroed is allocator-dependent. Measured on macOS:
+/// ~21 us per tiny `BZh9` member (200,000 of them, 8 MB: 4.4 s, 11 MB RSS);
+/// Linux is unmeasured. The cost stays linear in the input, bounded where it
+/// was unbounded per input byte before (a 20 MB file: tens of GB).
 pub(crate) const BYTES_PER_MEMBER: u64 = 64;
 
 /// Counts the members a multi-member decoder starts against the bytes each
