@@ -1015,6 +1015,18 @@ impl ArchiveWrite for LhaWrite {
             _ => meta.name.clone(),
         };
         let name = stored_name.as_bytes();
+        // Every LHA reader — this module's (`lha_name_from_parts`) and
+        // lhasa — reads `\` as a path separator, so a unix name holding one
+        // would come back as a different path (`back\slash` as the file
+        // `slash` in a new directory `back`). There is no escape a reader
+        // would undo; refused (bug hunt 2026-11-15, finding 18).
+        if meta.name.contains('\\') {
+            return Err(Error::Unsupported(format!(
+                "LHA cannot store `{}`: its name contains a backslash, which every LHA \
+                 reader takes for a path separator",
+                meta.name
+            )));
+        }
         if name.len() > MAX_LEVEL1_NAME {
             return Err(Error::Unsupported(format!(
                 "LHA cannot store `{}`: its stored name is {} bytes (a directory gains a \
@@ -2051,6 +2063,31 @@ mod tests {
             .expect_err("one byte over must be refused");
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
         assert_eq!(err.exit_code(), 3, "{err}");
+    }
+
+    /// Bug hunt 2026-11-15, finding 18: the reader splits a name on `\`,
+    /// so a name holding one would read back as another path. Refused,
+    /// before a byte is written.
+    #[test]
+    fn a_name_containing_a_backslash_is_refused() {
+        for name in ["back\\slash", "dir\\", "x\\..\\..\\y"] {
+            let buf = stuffr_core::testing::SharedBuf::new();
+            let mut w = Lha
+                .create(
+                    PlainSink::new(Box::new(buf.clone())),
+                    &CreateOpts::default(),
+                )
+                .expect("create");
+            let err = w
+                .add(
+                    &EntryMeta::file(name),
+                    &mut io::Cursor::new(b"hi".as_slice()),
+                )
+                .expect_err("a backslash must be refused");
+            assert_eq!(err.exit_code(), 3, "{err}");
+            assert!(err.to_string().contains("LHA cannot store"), "{err}");
+            assert!(buf.contents().is_empty(), "nothing written");
+        }
     }
 
     /// `stores_symlinks` is false, so `entries.rs` warns and skips before

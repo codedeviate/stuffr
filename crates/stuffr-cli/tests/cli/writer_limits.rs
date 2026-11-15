@@ -133,3 +133,24 @@ fn the_cpio_writer_refuses_the_trailer_name() {
         stderr_text(&out)
     );
 }
+
+/// Finding 18: every LHA reader takes `\` for a path separator, so a file
+/// named `back\slash` came back as `back/slash` at "exact fidelity". The
+/// LHA writer refuses such a name at exit 3.
+#[cfg(unix)]
+#[test]
+fn the_lha_writer_refuses_a_backslash_in_a_name() {
+    let dir = tmp_dir();
+    let tree = dir.join("tree");
+    std::fs::create_dir(&tree).unwrap();
+    std::fs::write(tree.join("back\\slash"), b"bs").unwrap();
+    let dst = dir.join("out.lzh");
+    let out = run_output(&[
+        "pack",
+        tree.to_str().unwrap(),
+        "-o",
+        dst.to_str().unwrap(),
+        "--strict-fidelity",
+    ]);
+    assert_refused_with_nothing_left(&out, &dst, "LHA");
+}
