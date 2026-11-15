@@ -3419,23 +3419,48 @@ fn system_time_from_dos(dt: zip::DateTime) -> Option<SystemTime> {
         .map(|s| UNIX_EPOCH + Duration::from_secs(s))
 }
 
+/// A `SystemTime` as the MS-DOS civil date a zip header stores, or `None`
+/// outside the 1980-2107 the format covers (an instant before 1970 too).
+fn dos_datetime(t: SystemTime) -> Option<zip::DateTime> {
+    let secs = i64::try_from(t.duration_since(UNIX_EPOCH).ok()?.as_secs()).ok()?;
+    let odt = time::OffsetDateTime::from_unix_timestamp(secs).ok()?;
+    zip::DateTime::try_from(time::PrimitiveDateTime::new(odt.date(), odt.time())).ok()
+}
+
 /// A `SystemTime` as the MS-DOS civil date a zip header stores.
 ///
 /// Clamps rather than fails, the same choice `tar.rs`'s `unix_seconds` makes:
 /// MS-DOS dates cover only 1980-2107, and refusing to archive a file because
 /// of its mtime would be a worse answer than recording the nearest date the
-/// format has. `DateTime::DEFAULT` is 1980-01-01 00:00:00.
+/// format has — 1980-01-01 00:00:00 (`DateTime::DEFAULT`) for an earlier
+/// time, 2107-12-31 23:59:58 for a later one (it was 1980 both ways until the
+/// 2026-11-15 bug hunt, finding 22). Either clamp is reported through
+/// [`unrepresentable_fields`].
 fn dos_from_system_time(t: SystemTime) -> zip::DateTime {
-    let secs = t
-        .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0);
-    time::OffsetDateTime::from_unix_timestamp(secs)
-        .ok()
-        .and_then(|odt| {
-            zip::DateTime::try_from(time::PrimitiveDateTime::new(odt.date(), odt.time())).ok()
-        })
-        .unwrap_or(zip::DateTime::DEFAULT)
+    if let Some(dt) = dos_datetime(t) {
+        return dt;
+    }
+    if t > UNIX_EPOCH + Duration::from_secs(DOS_LAST_SECOND) {
+        zip::DateTime::from_date_and_time(2107, 12, 31, 23, 59, 58)
+            .unwrap_or(zip::DateTime::DEFAULT)
+    } else {
+        zip::DateTime::DEFAULT
+    }
+}
+
+/// 2107-12-31 23:59:59 UTC, the last second an MS-DOS date reaches.
+const DOS_LAST_SECOND: u64 = 4_354_819_199;
+
+/// Which of `meta`'s fields a zip header cannot hold, and so
+/// [`ZipWrite`] clamps: an mtime outside MS-DOS's 1980-2107 (see
+/// [`dos_from_system_time`]). Doc-hidden: the facade turns it into a
+/// `Fidelity::MetadataIncomplete` (bug hunt 2026-11-15, finding 22).
+#[doc(hidden)]
+pub fn unrepresentable_fields(meta: &EntryMeta) -> stuffr_core::MetaFields {
+    stuffr_core::MetaFields {
+        mtime: meta.mtime.is_some_and(|t| dos_datetime(t).is_none()),
+        ..Default::default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6812,6 +6837,39 @@ mod tests {
             UNIX_EPOCH + Duration::from_secs(315_532_800),
             "1980-01-01 00:00:00 UTC, the earliest date a zip can hold"
         );
+        let mut meta_in = EntryMeta::file("old.txt");
+        meta_in.mtime = Some(UNIX_EPOCH);
+        assert!(
+            unrepresentable_fields(&meta_in).mtime,
+            "and the clamp is reported"
+        );
+    }
+
+    /// Bug hunt 2026-11-15, finding 22: a time past 2107 clamps to the
+    /// NEAREST date the format has, 2107-12-31 23:59:58, not to 1980; and a
+    /// clamp either way is reported, while an in-range time is not.
+    #[test]
+    fn an_mtime_past_2107_clamps_to_the_last_dos_date_and_is_reported() {
+        let mut meta_in = EntryMeta::file("future.txt");
+        // 2111-01-02.
+        meta_in.mtime = Some(UNIX_EPOCH + Duration::from_secs(4_449_600_000));
+        assert!(unrepresentable_fields(&meta_in).mtime);
+        let bytes = build_with(&CreateOpts::default(), &[(meta_in, b"f")]);
+        let got = read_all_seekable(&bytes).unwrap();
+        assert_eq!(
+            got[0].0.mtime,
+            Some(UNIX_EPOCH + Duration::from_secs(DOS_LAST_SECOND - 1)),
+            "2107-12-31 23:59:58 UTC, the latest date a zip can hold"
+        );
+
+        let mut last = EntryMeta::file("last.txt");
+        last.mtime = Some(UNIX_EPOCH + Duration::from_secs(DOS_LAST_SECOND - 1));
+        assert!(!unrepresentable_fields(&last).mtime);
+        let mut first = EntryMeta::file("first.txt");
+        first.mtime = Some(UNIX_EPOCH + Duration::from_secs(315_532_800));
+        assert!(!unrepresentable_fields(&first).mtime);
+        first.mtime = Some(UNIX_EPOCH + Duration::from_secs(315_532_799));
+        assert!(unrepresentable_fields(&first).mtime);
     }
 
     #[test]

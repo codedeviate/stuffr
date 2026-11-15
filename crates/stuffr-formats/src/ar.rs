@@ -1749,14 +1749,17 @@ fn check_size_field(name: &str, size: u64, identifier: &[u8]) -> Result<()> {
 
 /// Which of `meta`'s header numbers an `ar` member header cannot hold, and
 /// so [`ArWrite::add`] clamps (uid/gid and mtime to 0, mode to its low 16
-/// bits). `uid_gid` covers either id. Doc-hidden: the facade turns it into a
+/// bits; an mtime before 1970 is written as 0 too). `uid_gid` covers either id. Doc-hidden: the facade turns it into a
 /// `Fidelity::MetadataIncomplete`.
 #[doc(hidden)]
 pub fn unrepresentable_fields(meta: &EntryMeta) -> stuffr_core::MetaFields {
     stuffr_core::MetaFields {
         uid_gid: meta.uid.is_some_and(|u| u > MAX_ID) || meta.gid.is_some_and(|g| g > MAX_ID),
         mode: meta.mode.is_some_and(|m| m > MAX_MODE),
-        mtime: meta.mtime.is_some_and(|t| unix_seconds(t) > MAX_MTIME),
+        // Before 1970 the unsigned field has nothing to say, and 0 is written.
+        mtime: meta
+            .mtime
+            .is_some_and(|t| t < UNIX_EPOCH || unix_seconds(t) > MAX_MTIME),
         ..Default::default()
     }
 }

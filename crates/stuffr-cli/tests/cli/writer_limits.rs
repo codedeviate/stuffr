@@ -183,3 +183,37 @@ fn arj_names_round_trip_as_latin_1() {
     let out = run_output(&["pack", tree.to_str().unwrap(), "-o", dst.to_str().unwrap()]);
     assert_refused_with_nothing_left(&out, &dst, "ARJ");
 }
+
+/// Finding 22: a file from 2111 packed into a format whose mtime field
+/// cannot hold it (zip, lha, arj: MS-DOS 1980-2107; cpio: 32-bit seconds)
+/// is reported as `missing metadata: mtime`, so `--strict-fidelity` exits
+/// 4 (with the archive written); it said "no fidelity loss" at exit 0.
+#[test]
+fn an_mtime_the_format_cannot_hold_is_a_fidelity_loss() {
+    use std::time::{Duration, UNIX_EPOCH};
+    let dir = tmp_dir();
+    let tree = dir.join("tree");
+    std::fs::create_dir(&tree).unwrap();
+    let f = tree.join("y2111");
+    std::fs::write(&f, b"f").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&f)
+        .unwrap()
+        .set_modified(UNIX_EPOCH + Duration::from_secs(4_449_600_000))
+        .unwrap();
+    for ext in ["zip", "lzh", "arj", "cpio"] {
+        let dst = dir.join(format!("out.{ext}"));
+        let out = run_output(&[
+            "pack",
+            f.to_str().unwrap(),
+            "-o",
+            dst.to_str().unwrap(),
+            "--strict-fidelity",
+        ]);
+        let err = stderr_text(&out);
+        assert_eq!(out.status.code(), Some(4), "{ext}: {err}");
+        assert!(err.contains("missing metadata: mtime"), "{ext}: {err}");
+        assert!(dst.exists(), "{ext}: the archive is still written");
+    }
+}

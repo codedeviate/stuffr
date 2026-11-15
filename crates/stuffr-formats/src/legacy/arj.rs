@@ -1322,6 +1322,18 @@ const CRC32_TABLE: [u32; 256] = {
     table
 };
 
+/// Which of `meta`'s fields an ARJ header cannot hold: an mtime outside
+/// MS-DOS's 1980-2107, which the writer stores as 0 ("no time"; the entry
+/// reads back with none). Doc-hidden: the facade turns it into a
+/// `Fidelity::MetadataIncomplete` (bug hunt 2026-11-15, finding 22).
+#[doc(hidden)]
+pub fn unrepresentable_fields(meta: &EntryMeta) -> stuffr_core::MetaFields {
+    stuffr_core::MetaFields {
+        mtime: meta.mtime.is_some_and(|t| dos_timestamp(t).is_none()),
+        ..Default::default()
+    }
+}
+
 /// Packs a `SystemTime` into the DOS `YYYYYYYM MMMDDDDD hhhhhmmm mmmsssss`
 /// word an ARJ header's `date time modified` field holds — the exact inverse
 /// of the unpacking [`dos_mtime`] performs through

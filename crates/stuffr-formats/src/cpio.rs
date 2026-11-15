@@ -1330,9 +1330,26 @@ impl ArchiveWrite for CpioWrite {
     }
 }
 
+/// Which of `meta`'s fields a `newc` header cannot hold, and so
+/// [`CpioWrite::add`] clamps: an mtime before 1970 (written as 0) or past
+/// the unsigned 32-bit field (2106-02-07, written as `u32::MAX`).
+/// Doc-hidden: the facade turns it into a `Fidelity::MetadataIncomplete`
+/// (bug hunt 2026-11-15, finding 22).
+#[doc(hidden)]
+pub fn unrepresentable_fields(meta: &EntryMeta) -> stuffr_core::MetaFields {
+    stuffr_core::MetaFields {
+        mtime: meta.mtime.is_some_and(|t| {
+            t.duration_since(UNIX_EPOCH)
+                .map_or(true, |d| d.as_secs() > u64::from(u32::MAX))
+        }),
+        ..Default::default()
+    }
+}
+
 /// Seconds since the epoch, which is what `cpio::newc`'s `mtime` field
 /// stores. A timestamp before 1970 clamps to zero rather than failing the
-/// write, the same choice `tar.rs`'s own `unix_seconds` makes.
+/// write, the same choice `tar.rs`'s own `unix_seconds` makes; either clamp
+/// is reported through [`unrepresentable_fields`].
 fn unix_seconds(t: SystemTime) -> u32 {
     t.duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

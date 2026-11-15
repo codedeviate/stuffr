@@ -826,6 +826,18 @@ fn check_u32_size(name: &str, size: u64) -> Result<u32> {
     })
 }
 
+/// Which of `meta`'s fields an LHA header cannot hold: an mtime outside
+/// MS-DOS's 1980-2107, which the writer stores as 0 ("no time"; the entry
+/// reads back with none). Doc-hidden: the facade turns it into a
+/// `Fidelity::MetadataIncomplete` (bug hunt 2026-11-15, finding 22).
+#[doc(hidden)]
+pub fn unrepresentable_fields(meta: &EntryMeta) -> stuffr_core::MetaFields {
+    stuffr_core::MetaFields {
+        mtime: meta.mtime.is_some_and(|t| dos_timestamp(t).is_none()),
+        ..Default::default()
+    }
+}
+
 /// Packs a `SystemTime` into the MS-DOS `YYYYYYYM MMMDDDDD hhhhhmmm mmmsssss`
 /// word a level-0/1 header's `last_modified` field holds.
 ///

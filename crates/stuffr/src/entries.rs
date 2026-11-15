@@ -5513,10 +5513,10 @@ fn plan_entry_write(
         ownership_at = Some(warnings.len());
         warnings.push(w);
     }
-    // `ar`'s fixed-width header fields clamp what does not fit; say so.
-    #[cfg(feature = "ar")]
-    if matches!(plan, WritePlan::Write) && container == stuffr_formats::ar::AR {
-        let lost = stuffr_formats::ar::unrepresentable_fields(meta);
+    // A writer's fixed-width header fields clamp or drop what does not fit
+    // (ar's ids, mode and mtime; an MS-DOS or 32-bit mtime); say so.
+    if matches!(plan, WritePlan::Write) {
+        let lost = unrepresentable_fields(container, meta);
         if lost != MetaFields::default() {
             // One warning per entry: fold into the ownership warning when
             // that one was already pushed.
@@ -5538,6 +5538,36 @@ fn plan_entry_write(
         }
     }
     plan
+}
+
+/// Which of `meta`'s fields `container`'s writer cannot hold and so clamps
+/// or drops — each format's own `unrepresentable_fields`, the one owner of
+/// its limits. Empty for a container with no such limit (tar's fields
+/// widen into pax records). Bug hunt 2026-11-15, finding 22 generalised
+/// what 0.28.0 did for `ar` alone.
+fn unrepresentable_fields(container: FormatId, meta: &EntryMeta) -> MetaFields {
+    #[cfg(feature = "ar")]
+    if container == stuffr_formats::ar::AR {
+        return stuffr_formats::ar::unrepresentable_fields(meta);
+    }
+    #[cfg(feature = "cpio")]
+    if container == stuffr_formats::cpio::CPIO {
+        return stuffr_formats::cpio::unrepresentable_fields(meta);
+    }
+    #[cfg(feature = "zip")]
+    if container == stuffr_formats::zip::ZIP {
+        return stuffr_formats::zip::unrepresentable_fields(meta);
+    }
+    #[cfg(feature = "lha")]
+    if container == stuffr_formats::legacy::lha::LHA {
+        return stuffr_formats::legacy::lha::unrepresentable_fields(meta);
+    }
+    #[cfg(feature = "arj")]
+    if container == stuffr_formats::legacy::arj::ARJ {
+        return stuffr_formats::legacy::arj::unrepresentable_fields(meta);
+    }
+    let _ = (container, meta);
+    MetaFields::default()
 }
 
 /// Why an `EntryKind::Other` entry is skipped — the ONE wording `unpack`
@@ -7695,6 +7725,65 @@ mod tests {
             &w[..],
             [Fidelity::MetadataIncomplete { fields, .. }] if fields.uid_gid && !fields.mode
         ));
+    }
+
+    /// Bug hunt 2026-11-15, finding 22: every writer whose mtime field
+    /// cannot hold an entry's mtime (zip, lha and arj: MS-DOS 1980-2107;
+    /// cpio: unsigned 32-bit seconds; ar: 12 decimal digits, and none before
+    /// 1970) clamps or drops it, and that is a `MetadataIncomplete { mtime }`
+    /// so `--strict-fidelity` exits 4, as ar's clamped ids already were.
+    /// A time each one holds earns nothing.
+    #[test]
+    fn an_mtime_the_target_cannot_hold_is_reported() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let y2111 = UNIX_EPOCH + Duration::from_secs(4_449_600_000);
+        let y1975 = UNIX_EPOCH + Duration::from_secs(157_680_000);
+        let y1969 = UNIX_EPOCH - Duration::from_secs(31_536_000);
+        let y2023 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut cases: Vec<(&str, Vec<std::time::SystemTime>)> = Vec::new();
+        #[cfg(feature = "zip")]
+        cases.push(("zip", vec![y2111, y1975, y1969]));
+        #[cfg(feature = "lha")]
+        cases.push(("lha", vec![y2111, y1975, y1969]));
+        #[cfg(feature = "arj")]
+        cases.push(("arj", vec![y2111, y1975, y1969]));
+        #[cfg(feature = "cpio")]
+        cases.push(("cpio", vec![y2111, y1969]));
+        #[cfg(feature = "ar")]
+        cases.push(("ar", vec![y1969]));
+        for (container, lost) in cases {
+            let caps = ContainerCaps::default();
+            for t in lost {
+                let mut m = meta_with(Some(1), Some(1));
+                m.mtime = Some(t);
+                let mut w = Vec::new();
+                plan_entry_write(
+                    &caps,
+                    FormatId::new(container),
+                    &m,
+                    LinkCopy::Unavailable,
+                    &mut w,
+                );
+                assert!(
+                    matches!(
+                        &w[..],
+                        [Fidelity::MetadataIncomplete { fields, .. }] if fields.mtime
+                    ),
+                    "{container} {t:?}: {w:?}"
+                );
+            }
+            let mut m = meta_with(Some(1), Some(1));
+            m.mtime = Some(y2023);
+            let mut w = Vec::new();
+            plan_entry_write(
+                &caps,
+                FormatId::new(container),
+                &m,
+                LinkCopy::Unavailable,
+                &mut w,
+            );
+            assert!(w.is_empty(), "{container}: {w:?}");
+        }
     }
 
     /// An `ar` entry with no ids AND a clamped mode earns ONE warning
