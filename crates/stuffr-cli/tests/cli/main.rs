@@ -29,3 +29,4 @@ mod salvage_cpio_ar;
 mod salvage_legacy_damage;
 mod salvage_zip_damage;
 mod verbs;
+mod writer_limits;

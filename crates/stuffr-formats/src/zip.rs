@@ -517,6 +517,54 @@ impl Container for Zip {
 /// when the error carries no OS error code: an `EINVAL` from the source is
 /// a real I/O failure and stays [`Error::Io`].
 fn classify_zip_error(e: ZipError) -> Error {
+    classify_zip_read_error(e)
+}
+
+/// The WRITE side's classifier, for the zip crate's errors while
+/// [`ZipWrite`] adds an entry or finishes the archive. Never
+/// [`Error::Corrupt`]: nothing is being read, so there is no input to call
+/// damaged. The crate raises `InvalidArchive` (and a crate-made `Io` error
+/// carrying no OS error code) on the write side for a limit of the FORMAT —
+/// "ZipLocalBlock + filename + extra fields must be less than 64KiB when
+/// combined" — which is something zip cannot store: exit 3, as the LHA and
+/// ARJ writers answer a name they cannot hold (bug hunt 2026-11-15, finding
+/// 1). An `Io` error with an OS code is the destination failing.
+fn classify_zip_write_error(e: ZipError, name: &str) -> Error {
+    let what = if name.is_empty() {
+        "this archive".to_string()
+    } else {
+        format!("`{name}`")
+    };
+    match e {
+        ZipError::InvalidArchive(msg) => {
+            Error::Unsupported(format!("zip cannot store {what}: {msg}"))
+        }
+        ZipError::UnsupportedArchive(msg) => {
+            Error::Unsupported(format!("zip cannot store {what}: {msg}"))
+        }
+        ZipError::Io(io_err)
+            if io_err.raw_os_error().is_none()
+                && matches!(
+                    io_err.kind(),
+                    ErrorKind::InvalidInput | ErrorKind::InvalidData | ErrorKind::Unsupported
+                ) =>
+        {
+            Error::Unsupported(format!("zip cannot store {what}: {io_err}"))
+        }
+        ZipError::Io(io_err) => Error::from(io_err),
+        other => match classify_zip_read_error(other) {
+            Error::Corrupt(msg) => Error::Unsupported(format!("zip cannot store {what}: {msg}")),
+            e => e,
+        },
+    }
+}
+
+/// The longest entry name a zip local header holds as this writer emits it
+/// (no extra fields of the caller's): the zip crate refuses a local block of
+/// `4 + 26 + name + extras` bytes at `u16::MAX` or more.
+const MAX_ZIP_NAME_LEN: usize = u16::MAX as usize - 30 - 1;
+
+fn classify_zip_read_error(e: ZipError) -> Error {
     match e {
         ZipError::Io(io_err) => {
             if io_err.kind() == ErrorKind::UnexpectedEof {
@@ -3772,6 +3820,21 @@ impl ArchiveWrite for ZipWrite {
         if matches!(meta.kind, EntryKind::Hardlink { .. }) {
             return Err(Error::hardlink_not_storable("zip", &meta.name));
         }
+        // The name as the local header stores it: `add_directory` appends a
+        // `/` (or keeps a trailing `\`). Checked before anything is written,
+        // with the format's own words — see `classify_zip_write_error`.
+        let stored_len = match meta.kind {
+            EntryKind::Dir if !meta.name.ends_with(['/', '\\']) => meta.name.len() + 1,
+            _ => meta.name.len(),
+        };
+        if stored_len > MAX_ZIP_NAME_LEN {
+            return Err(Error::Unsupported(format!(
+                "zip cannot store `{}`: its stored name is {stored_len} bytes (a directory \
+                 gains a trailing separator) and a zip local header holds at most \
+                 {MAX_ZIP_NAME_LEN}",
+                meta.name
+            )));
+        }
         let options = self.options(meta);
         // The offset this entry's local header will start at. Read BEFORE the
         // entry is started, because starting it is what finalizes the previous
@@ -3787,7 +3850,7 @@ impl ArchiveWrite for ZipWrite {
                 // consumed — the same convention `tar.rs` follows.
                 writer
                     .add_directory(meta.name.clone(), options)
-                    .map_err(classify_zip_error)?;
+                    .map_err(|e| classify_zip_write_error(e, &meta.name))?;
             }
             EntryKind::Symlink { target } => {
                 // The target is stored as the entry's payload and `S_IFLNK` is
@@ -3796,7 +3859,7 @@ impl ArchiveWrite for ZipWrite {
                 // entry itself.
                 writer
                     .add_symlink(meta.name.clone(), target.clone(), options)
-                    .map_err(classify_zip_error)?;
+                    .map_err(|e| classify_zip_write_error(e, &meta.name))?;
             }
             _ => {
                 // `EntryKind::Other` — a device node or fifo read out of some
@@ -3806,7 +3869,7 @@ impl ArchiveWrite for ZipWrite {
                 // (see `archive.rs`), not here.
                 writer
                     .start_file(meta.name.clone(), options)
-                    .map_err(classify_zip_error)?;
+                    .map_err(|e| classify_zip_write_error(e, &meta.name))?;
                 let mut counted = CountingReader {
                     inner: data,
                     read: 0,
@@ -3862,7 +3925,10 @@ impl ArchiveWrite for ZipWrite {
             .inner
             .take()
             .ok_or_else(|| Error::Usage("zip writer finished twice".into()))?;
-        writer.finish().map_err(classify_zip_error)?;
+        // An empty name: the refusal names the archive, not an entry.
+        writer
+            .finish()
+            .map_err(|e| classify_zip_write_error(e, ""))?;
         // Only now does the destination see anything it has not seen already.
         let mut spool = self.spool.borrow_mut();
         spool.commit_all()?;
@@ -7777,6 +7843,62 @@ z.close()\n";
             assert_eq!(meta.size, Some(10));
             assert_eq!(read, Err(5), "method {method}");
         }
+    }
+
+    fn add_one(meta: &EntryMeta) -> Result<()> {
+        let mut w = Zip
+            .create(
+                PlainSink::new(Box::new(SharedBuf::new())),
+                &CreateOpts::default(),
+            )
+            .expect("create");
+        w.add(meta, &mut io::Cursor::new(&b"hello\n"[..]))
+    }
+
+    /// Bug hunt 2026-11-15, finding 1: a name too long for a zip local
+    /// header is something zip cannot store (exit 3), never "archive is
+    /// corrupt" (exit 5) — the input being converted is valid.
+    #[test]
+    fn a_name_too_long_for_a_local_header_is_unsupported_not_corrupt() {
+        for kind in [
+            EntryKind::File,
+            EntryKind::Dir,
+            EntryKind::Symlink { target: "t".into() },
+        ] {
+            let mut meta = EntryMeta::file("d/".repeat(30_000) + &"n".repeat(10_000));
+            meta.kind = kind.clone();
+            let err = add_one(&meta).expect_err("a 70,000-byte name must be refused");
+            assert_eq!(err.exit_code(), 3, "{kind:?}: {err}");
+            assert!(
+                matches!(&err, Error::Unsupported(m) if m.starts_with("zip cannot store")),
+                "{kind:?}: {err:?}"
+            );
+        }
+        // The largest name the header holds is still written.
+        let fits = EntryMeta::file("n".repeat(MAX_ZIP_NAME_LEN));
+        add_one(&fits).expect("a name at the ceiling fits");
+        let over = EntryMeta::file("n".repeat(MAX_ZIP_NAME_LEN + 1));
+        assert_eq!(add_one(&over).unwrap_err().exit_code(), 3);
+        // A directory gains a `/`, which counts.
+        let mut dir = EntryMeta::file("n".repeat(MAX_ZIP_NAME_LEN));
+        dir.kind = EntryKind::Dir;
+        assert_eq!(add_one(&dir).unwrap_err().exit_code(), 3);
+    }
+
+    /// The writer's own classifier: a refusal the zip crate raises while
+    /// WRITING is a limit of the format, never a verdict on an input.
+    #[test]
+    fn a_writer_side_invalid_archive_is_unsupported() {
+        let err = classify_zip_write_error(ZipError::InvalidArchive("too long".into()), "n");
+        assert!(
+            matches!(&err, Error::Unsupported(m) if m.contains("`n`")),
+            "{err:?}"
+        );
+        let err = classify_zip_write_error(
+            ZipError::Io(io::Error::new(ErrorKind::InvalidInput, "x")),
+            "n",
+        );
+        assert_ne!(err.exit_code(), 5, "{err:?}");
     }
 }
 
