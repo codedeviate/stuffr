@@ -1166,6 +1166,30 @@ impl ArchiveWrite for CpioWrite {
                 meta.name
             )));
         }
+        // The reader refuses a `c_namesize` (the name plus its NUL) past
+        // `MAX_CPIO_NAME_LEN` and a symlink target past
+        // `MAX_SYMLINK_TARGET_LEN` (exit 6), so the writer refuses them
+        // first: an archive stuffr writes must be one stuffr reads (bug hunt
+        // 2026-11-15, finding 2).
+        let namesize = meta.name.len() as u64 + 1;
+        if namesize > MAX_CPIO_NAME_LEN {
+            return Err(Error::Unsupported(format!(
+                "cpio newc cannot store `{}`: its name is {} bytes, and a cpio entry name \
+                 (with its NUL) is read back only up to {MAX_CPIO_NAME_LEN}",
+                meta.name,
+                meta.name.len()
+            )));
+        }
+        if let EntryKind::Symlink { target } = &meta.kind
+            && target.len() as u64 > MAX_SYMLINK_TARGET_LEN
+        {
+            return Err(Error::Unsupported(format!(
+                "cpio newc cannot store `{}`: its symlink target is {} bytes, and a cpio \
+                 symlink target is read back only up to {MAX_SYMLINK_TARGET_LEN}",
+                meta.name,
+                target.len()
+            )));
+        }
         // A symlink's target IS its payload here — see the module doc's
         // "Symlinks" section — so `data` is not consumed for one, the same
         // "the caller's data reader is irrelevant for this kind" contract
@@ -1346,6 +1370,57 @@ mod tests {
         assert!(err.to_string().contains("hard link"), "{err}");
         assert!(buf.contents().is_empty(), "nothing was written");
         assert!(!CpioNewc.caps().stores_hardlinks);
+    }
+
+    /// Adds one entry to a fresh writer; returns the result and the bytes.
+    fn add_one(meta: &EntryMeta) -> (Result<()>, Vec<u8>) {
+        let buf = SharedBuf::new();
+        let mut w = CpioNewc
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
+            .expect("create");
+        let r = w.add(meta, &mut std::io::Cursor::new(&[][..]));
+        (r, buf.contents())
+    }
+
+    /// Bug hunt 2026-11-15, finding 2: what this module's reader refuses
+    /// (exit 6) its writer refuses first (exit 3), and the largest name and
+    /// target the reader takes are still written and read back.
+    #[test]
+    fn the_writer_refuses_what_the_reader_would_refuse() {
+        let ceiling = MAX_CPIO_NAME_LEN as usize;
+        let mut link = EntryMeta::file("l");
+        link.kind = EntryKind::Symlink {
+            target: "t".repeat(MAX_SYMLINK_TARGET_LEN as usize + 1),
+        };
+        for meta in [EntryMeta::file("n".repeat(ceiling)), link] {
+            let (r, bytes) = add_one(&meta);
+            let err = r.expect_err("past the reader's ceiling");
+            assert_eq!(err.exit_code(), 3, "{err}");
+            assert!(err.to_string().contains("cpio newc cannot store"), "{err}");
+            assert!(bytes.is_empty(), "refused before a byte was written");
+        }
+
+        let mut link = EntryMeta::file("l");
+        link.kind = EntryKind::Symlink {
+            target: "t".repeat(MAX_SYMLINK_TARGET_LEN as usize),
+        };
+        for meta in [EntryMeta::file("n".repeat(ceiling - 1)), link] {
+            let buf = SharedBuf::new();
+            let mut w = CpioNewc
+                .create(
+                    PlainSink::new(Box::new(buf.clone())),
+                    &CreateOpts::default(),
+                )
+                .unwrap();
+            w.add(&meta, &mut std::io::Cursor::new(&[][..])).unwrap();
+            w.finish().unwrap().finish().unwrap();
+            let mut ar = open(&buf.contents());
+            let entry = ar.next_entry().expect("read back").expect("an entry");
+            assert_eq!(entry.meta().name, meta.name);
+        }
     }
 
     /// newc stores the name NUL-terminated and its reader trims trailing
@@ -1813,27 +1888,20 @@ mod tests {
     }
 
     /// A symlink target past [`MAX_SYMLINK_TARGET_LEN`] is refused before a
-    /// single byte is read, not silently allocated. Written through this
-    /// container's own writer (which places no cap of its own on the WRITE
-    /// side — only the read-side eager buffer needs bounding) so the fixture
-    /// is a realistic, well-formed archive, not a hand-crafted one.
+    /// single byte is read, not silently allocated. Written through the
+    /// `cpio` crate's own builder, because this container's writer refuses
+    /// such a target since the 2026-11-15 bug hunt (finding 2), so the
+    /// fixture is still a well-formed archive, not a hand-crafted one.
     #[test]
     fn a_symlink_target_past_the_length_ceiling_is_refused() {
-        let buf = SharedBuf::new();
-        let mut w = CpioNewc
-            .create(
-                PlainSink::new(Box::new(buf.clone())),
-                &CreateOpts::default(),
-            )
-            .unwrap();
-        let mut link = EntryMeta::file("mylink");
-        link.kind = EntryKind::Symlink {
-            target: "x".repeat((MAX_SYMLINK_TARGET_LEN + 1) as usize),
-        };
-        w.add(&link, &mut std::io::Cursor::new(&[][..])).unwrap();
-        w.finish().unwrap().finish().unwrap();
+        let target = "x".repeat((MAX_SYMLINK_TARGET_LEN + 1) as usize);
+        let mut w = cpio::newc::Builder::new("mylink")
+            .mode(S_IFLNK | 0o777)
+            .write(Vec::new(), target.len() as u32);
+        w.write_all(target.as_bytes()).unwrap();
+        let bytes = cpio::newc::trailer(w.finish().unwrap()).unwrap();
 
-        let mut ar = open(&buf.contents());
+        let mut ar = open(&bytes);
         let err = ar
             .next_entry()
             .expect_err("an implausibly long symlink target must be refused");

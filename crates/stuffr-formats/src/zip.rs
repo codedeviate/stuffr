@@ -3835,6 +3835,19 @@ impl ArchiveWrite for ZipWrite {
                 meta.name
             )));
         }
+        // The reader refuses a symlink target past `MAX_SYMLINK_TARGET_LEN`
+        // (exit 6), so the writer refuses it first (bug hunt 2026-11-15,
+        // finding 2).
+        if let EntryKind::Symlink { target } = &meta.kind
+            && target.len() as u64 > MAX_SYMLINK_TARGET_LEN
+        {
+            return Err(Error::Unsupported(format!(
+                "zip cannot store `{}`: its symlink target is {} bytes, and a zip symlink \
+                 target is read back only up to {MAX_SYMLINK_TARGET_LEN}",
+                meta.name,
+                target.len()
+            )));
+        }
         let options = self.options(meta);
         // The offset this entry's local header will start at. Read BEFORE the
         // entry is started, because starting it is what finalizes the previous
@@ -6859,13 +6872,19 @@ mod tests {
     /// The target is genuinely written at 65,537 bytes, so the reader's own
     /// earlier checks (payload past EOF, size/offset sanity) have nothing to
     /// object to and the guard under test is the one that answers.
+    ///
+    /// Built with the zip crate's own writer: this module's refuses such a
+    /// target since the 2026-11-15 bug hunt (finding 2).
     #[test]
     fn a_symlink_target_past_the_length_ceiling_is_refused_as_a_resource_limit() {
-        let mut link = EntryMeta::file("biglink");
-        link.kind = EntryKind::Symlink {
-            target: "t".repeat(MAX_SYMLINK_TARGET_LEN as usize + 1),
-        };
-        let bytes = build_with(&CreateOpts::default(), &[(link, &[][..])]);
+        let mut w = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        w.add_symlink(
+            "biglink",
+            "t".repeat(MAX_SYMLINK_TARGET_LEN as usize + 1),
+            SimpleFileOptions::DEFAULT,
+        )
+        .unwrap();
+        let bytes = w.finish().unwrap().into_inner();
 
         let err = read_all_seekable(&bytes).expect_err("an oversized symlink target must refuse");
         assert_eq!(
@@ -7883,6 +7902,25 @@ z.close()\n";
         let mut dir = EntryMeta::file("n".repeat(MAX_ZIP_NAME_LEN));
         dir.kind = EntryKind::Dir;
         assert_eq!(add_one(&dir).unwrap_err().exit_code(), 3);
+    }
+
+    /// Bug hunt 2026-11-15, finding 2: a symlink target the reader refuses
+    /// (exit 6) the writer refuses first (exit 3); the largest one the
+    /// reader takes is still written.
+    #[test]
+    fn a_symlink_target_the_reader_would_refuse_is_not_written() {
+        let mut link = EntryMeta::file("l");
+        link.kind = EntryKind::Symlink {
+            target: "t".repeat(MAX_SYMLINK_TARGET_LEN as usize + 1),
+        };
+        let err = add_one(&link).expect_err("past the reader's ceiling");
+        assert_eq!(err.exit_code(), 3, "{err}");
+        assert!(err.to_string().contains("zip cannot store"), "{err}");
+        link.kind = EntryKind::Symlink {
+            target: "t".repeat(MAX_SYMLINK_TARGET_LEN as usize),
+        };
+        let bytes = build_with(&CreateOpts::default(), &[(link, &[][..])]);
+        read_all_seekable(&bytes).expect("the largest target reads back");
     }
 
     /// The writer's own classifier: a refusal the zip crate raises while
