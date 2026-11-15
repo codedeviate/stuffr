@@ -14,6 +14,7 @@ mod list_test;
 mod ls;
 mod max_ratio;
 mod missing_input;
+mod output_safety;
 mod pack_edges;
 mod pack_findings;
 mod pack_walk;

@@ -4025,6 +4025,10 @@ pub fn create_archive(
     // the parent, nothing more), so it costs nothing against the "every
     // input validated before the destination is touched" contract above.
     let dst_canonical = canonical_output_path(&dst);
+    // What a symlinked output would be written THROUGH. Excluding a walked
+    // file by name (above) cannot see it, and the direct write truncates it
+    // while the plan still lists it: refused instead (findings 6 and 12).
+    let dst_through_link = written_through_link(&dst);
 
     let mut plan: Vec<crate::walk::WalkItem> = Vec::with_capacity(paths.len());
     let mut names = HashSet::new();
@@ -4075,6 +4079,19 @@ pub fn create_archive(
             // stuffr correctly declining to put a file inside itself, which
             // is not a loss at all. The user is still told, on stderr, every
             // run — see `Outcome::notes`.
+            if let crate::walk::ItemSource::File(p) = &item.source
+                && let Some(through) = &dst_through_link
+                && through.is(p)
+            {
+                return Err(crate::ops::same_file_error(
+                    &p.display().to_string(),
+                    match &dst {
+                        Output::Path(o) => o,
+                        Output::Stdout => Path::new("-"),
+                    },
+                    "pack",
+                ));
+            }
             if let crate::walk::ItemSource::File(p) = &item.source
                 && is_output_file(p, dst_canonical.as_deref())
             {
@@ -5170,6 +5187,42 @@ fn canonical_output_path(dst: &Output) -> Option<PathBuf> {
     };
     let file_name = p.file_name()?;
     Some(parent.canonicalize().ok()?.join(file_name))
+}
+
+/// The file a symlinked output leads to: what `Output::create`'s
+/// direct-write branch would truncate and write in place. `None` unless the
+/// output name is a symlink that resolves to an existing regular file.
+struct ThroughLink {
+    canonical: PathBuf,
+    meta: std::fs::Metadata,
+}
+
+impl ThroughLink {
+    /// Whether the walked file at `candidate` is that file: by `(dev, ino)`
+    /// on unix (a hard link to it counts), by canonical path everywhere.
+    fn is(&self, candidate: &Path) -> bool {
+        std::fs::metadata(candidate).is_ok_and(|m| crate::ops::same_identity(&m, &self.meta))
+            || candidate
+                .canonicalize()
+                .is_ok_and(|c| c == self.canonical)
+    }
+}
+
+fn written_through_link(dst: &Output) -> Option<ThroughLink> {
+    let Output::Path(p) = dst else {
+        return None;
+    };
+    if !std::fs::symlink_metadata(p).ok()?.file_type().is_symlink() {
+        return None;
+    }
+    let meta = std::fs::metadata(p).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    Some(ThroughLink {
+        canonical: p.canonicalize().ok()?,
+        meta,
+    })
 }
 
 /// Whether the walked file at `candidate` IS the archive being written.

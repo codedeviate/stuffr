@@ -606,13 +606,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 NoCodecLayer::ConvertTarget(&target),
             )?;
             let src = input_of(&input);
-            if let (Input::Path(i), Output::Path(o)) = (&src, &dst) {
-                refuse_converting_onto_itself(i, o)?;
-            }
-            #[cfg(unix)]
-            if let (Input::Stdin, Output::Path(o)) = (&src, &dst) {
-                refuse_stdin_redirected_from(o)?;
-            }
+            ops::refuse_same_file(&src, &dst, "convert")?;
 
             let mut opts = RecompressOpts {
                 codec: target.outermost_codec(),
@@ -2507,74 +2501,6 @@ fn convert_target_chain(fmt: Option<FormatId>, output: Option<&str>) -> stuffr::
             output.unwrap_or_default(),
             chain.describe()
         ))),
-    }
-}
-
-/// Refuses (exit 2) a conversion whose output is its own input, before the
-/// output is opened.
-///
-/// With `--force` the temp-file-then-rename write would otherwise replace the
-/// input with its own conversion — harmless when it succeeds, but `convert`
-/// reads the input WHILE writing, and a symlink destination takes the
-/// direct-write branch (`Output::create`), truncating the very file being
-/// read. Two tests, because neither alone is enough: canonical paths catch
-/// `./a`, `a` and a symlink to `a`; only `(dev, ino)` catches a hard link,
-/// whose name canonicalises to itself.
-fn refuse_converting_onto_itself(input: &Path, output: &Path) -> stuffr::Result<()> {
-    let canonical_match = match (std::fs::canonicalize(input), std::fs::canonicalize(output)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    };
-    #[cfg(unix)]
-    let inode_match = {
-        use std::os::unix::fs::MetadataExt;
-        match (std::fs::metadata(input), std::fs::metadata(output)) {
-            (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
-            _ => false,
-        }
-    };
-    #[cfg(not(unix))]
-    let inode_match = false;
-    if canonical_match || inode_match {
-        return Err(same_file_error(&input.display().to_string(), output));
-    }
-    Ok(())
-}
-
-fn same_file_error(input: &str, output: &Path) -> stuffr::Error {
-    stuffr::Error::Usage(format!(
-        "`{input}` and `{}` are the same file; convert reads its input while writing its \
-         output, so it cannot convert a file onto itself. Name a different output.",
-        output.display()
-    ))
-}
-
-/// The stdin spelling of [`refuse_converting_onto_itself`]: `convert - -o l.xz
-/// < big.xz` with `l.xz` a symlink to `big.xz` would truncate the input the
-/// same way. When fd 0 is a regular file and OUT exists, compares `(dev, ino)`
-/// (OUT's following symlinks). A pipe, a tty or a missing OUT cannot clash.
-///
-/// fd 0 is only read through a `dup` (`BorrowedFd::try_clone_to_owned`), so
-/// dropping the handle closes the duplicate and never stdin itself; `fstat`
-/// reads no bytes, so the stream is untouched.
-#[cfg(unix)]
-fn refuse_stdin_redirected_from(output: &Path) -> stuffr::Result<()> {
-    use std::os::fd::AsFd;
-    use std::os::unix::fs::MetadataExt;
-    let Ok(fd) = std::io::stdin().as_fd().try_clone_to_owned() else {
-        return Ok(());
-    };
-    let Ok(stdin_meta) = std::fs::File::from(fd).metadata() else {
-        return Ok(());
-    };
-    if !stdin_meta.is_file() {
-        return Ok(());
-    }
-    match std::fs::metadata(output) {
-        Ok(o) if (o.dev(), o.ino()) == (stdin_meta.dev(), stdin_meta.ino()) => {
-            Err(same_file_error("-", output))
-        }
-        _ => Ok(()),
     }
 }
 

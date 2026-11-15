@@ -981,6 +981,78 @@ pub fn refuse_directory_for(src: &Input, verb: &str) -> Result<()> {
     })
 }
 
+/// Refuses ([`Error::Usage`], exit 2) an output that is the very file being
+/// read, before either is opened.
+///
+/// Every single-stream verb reads its input WHILE writing its output, and a
+/// symlink destination takes the direct-write branch of `Output::create`,
+/// truncating the file it leads to: through `l.gz -> a`, `pack --force a -o
+/// l.gz` compressed nothing over `a`, and `unpack --force a.gz` with `a ->
+/// a.gz` decoded its own output until the disk was full (bug hunt
+/// 2026-11-15, findings 5 and 11). A regular-file or hard-link destination
+/// would survive (temp + rename), but writing a file onto itself is never
+/// what was meant, so it is refused too, as `convert` always has.
+///
+/// Two tests, because neither alone is enough: canonical paths catch `./a`,
+/// `a` and a symlink to `a`; only `(dev, ino)` catches a hard link, whose
+/// name canonicalises to itself. For standard input (`- -o l.gz < a`) the
+/// descriptor redirected from a regular file is compared by `(dev, ino)`;
+/// a pipe, a terminal or a missing output cannot clash. `verb` names the
+/// operation in the message.
+pub fn refuse_same_file(src: &Input, dst: &Output, verb: &str) -> Result<()> {
+    let Output::Path(output) = dst else {
+        return Ok(());
+    };
+    match src {
+        Input::Path(input) => {
+            let canonical_match =
+                match (std::fs::canonicalize(input), std::fs::canonicalize(output)) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => false,
+                };
+            let inode_match = match (std::fs::metadata(input), std::fs::metadata(output)) {
+                (Ok(a), Ok(b)) => same_identity(&a, &b),
+                _ => false,
+            };
+            if canonical_match || inode_match {
+                return Err(same_file_error(&input.display().to_string(), output, verb));
+            }
+        }
+        Input::Stdin => {
+            if let Some(stdin) = stdin_file()
+                && let (Ok(a), Ok(b)) = (stdin.metadata(), std::fs::metadata(output))
+                && same_identity(&a, &b)
+            {
+                return Err(same_file_error("-", output, verb));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether two `stat` results name one file: `(dev, ino)` on unix, never
+/// elsewhere (no portable identity there; the canonical-path test stands).
+pub(crate) fn same_identity(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (a.dev(), a.ino()) == (b.dev(), b.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        false
+    }
+}
+
+pub(crate) fn same_file_error(input: &str, output: &Path, verb: &str) -> Error {
+    Error::Usage(format!(
+        "`{input}` and `{}` are the same file; {verb} reads its input while writing its \
+         output, so it cannot {verb} a file onto itself. Name a different output.",
+        output.display()
+    ))
+}
+
 /// Compresses `src` into `dst`, using the build's default registry.
 pub fn compress(src: Input, dst: Output, o: &CompressOpts) -> Result<Outcome> {
     compress_with(crate::registry(), src, dst, o)
@@ -1021,6 +1093,7 @@ pub fn compress_with(
     let format = choose_format(registry, &dst, o.format)?;
     // Before any filesystem work: a rejected option must cost nothing.
     let (codec, encode) = checked_encoder(registry, format, o)?;
+    refuse_same_file(&src, &dst, "pack")?;
 
     let from = FromInput::of(&src);
     let mut reader = src.open()?;
@@ -1157,6 +1230,7 @@ pub fn decompress_with(
     dst: Output,
     o: &DecompressOpts,
 ) -> Result<Outcome> {
+    refuse_same_file(&src, &dst, "unpack")?;
     let path = src.path().map(Path::to_path_buf);
     let from = FromInput::of(&src);
 
@@ -1505,6 +1579,7 @@ pub fn recompress_with(
     // Before the source is opened, as in `compress_with`: a rejected level or
     // an unconsented weak encoder must cost nothing.
     let encoder = target_encoder(registry, o)?;
+    refuse_same_file(&src, &dst, "convert")?;
     let source = ConvertSource::open_with(registry, src, o.memory_limit)?;
     write_recompressed(source, encoder, dst, o)
 }
