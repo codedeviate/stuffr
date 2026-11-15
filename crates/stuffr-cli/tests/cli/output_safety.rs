@@ -217,3 +217,30 @@ fn container_pack_still_writes_through_an_unrelated_symlink() {
     assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
     assert!(std::fs::metadata(&target).unwrap().len() > 3);
 }
+
+/// Finding 16: `-C` naming a regular file (or a path beneath one) was a bare
+/// `i/o error: File exists`, exit 1. It is a usage error naming the path.
+#[test]
+fn a_destination_that_is_not_a_directory_is_a_usage_error() {
+    let dir = tmp_dir();
+    let tar = write_fixture_tar(&dir, &[("a.txt", b"hello\n")]);
+    let reg = dir.join("reg");
+    std::fs::write(&reg, b"hi\n").unwrap();
+    let sub = reg.join("sub");
+    for (verb, dest) in [("unpack", &reg), ("salvage", &reg), ("unpack", &sub), ("salvage", &sub)] {
+        let out = run_output(&[verb, tar.to_str().unwrap(), "-C", dest.to_str().unwrap()]);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{verb} -C {}: {}",
+            dest.display(),
+            stderr_text(&out)
+        );
+        assert!(
+            stderr_text(&out).contains(reg.to_str().unwrap()),
+            "{verb}: the message must name the path: {}",
+            stderr_text(&out)
+        );
+        assert_eq!(std::fs::read(&reg).unwrap(), b"hi\n");
+    }
+}

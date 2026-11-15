@@ -1000,7 +1000,7 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
     // entry's path — it is the one the caller typed. Quarantined only when
     // this run made it.
     let dest_existed = std::fs::symlink_metadata(dest).is_ok();
-    std::fs::create_dir_all(dest)?;
+    create_destination_root(dest)?;
     if !dest_existed {
         stamp.quarantine_dir(dest);
     }
@@ -3026,7 +3026,7 @@ pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
     let quarantine = crate::ops::FromInput::of(&Input::Path(path.to_path_buf())).quarantine;
     if let Some(dest) = &opts.dest {
         let existed = std::fs::symlink_metadata(dest).is_ok();
-        std::fs::create_dir_all(dest)?;
+        create_destination_root(dest)?;
         if !existed {
             quarantine_dir(quarantine.as_ref(), dest);
         }
@@ -5187,6 +5187,32 @@ fn canonical_output_path(dst: &Output) -> Option<PathBuf> {
     };
     let file_name = p.file_name()?;
     Some(parent.canonicalize().ok()?.join(file_name))
+}
+
+/// Creates the destination root `-C` names (`unpack`, `salvage`).
+///
+/// A root that exists, or has an ancestor that exists, as something other
+/// than a directory (a regular file, a dangling symlink) is the caller's
+/// mistake, not stuffr failing: [`Error::Usage`] naming the path (exit 2),
+/// as a non-directory in the way of an entry's parent already is (bug hunt
+/// 2026-11-15, finding 16). It was a bare `i/o error: File exists`, exit 1.
+fn create_destination_root(dest: &Path) -> Result<()> {
+    match std::fs::create_dir_all(dest) {
+        Ok(()) => Ok(()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Err(Error::Usage(format!(
+                "cannot use `{}` as the destination: it, or a folder above it, exists and \
+                 is not a directory",
+                dest.display()
+            )))
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// The file a symlinked output leads to: what `Output::create`'s
