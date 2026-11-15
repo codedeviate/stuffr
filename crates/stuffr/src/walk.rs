@@ -10,7 +10,9 @@ use stuffr_core::{EntryKind, EntryMeta, Result};
 
 /// Where a walked entry's payload comes from, if it has one.
 pub(crate) enum ItemSource {
-    File(PathBuf),
+    /// A regular file, with what the walk saw of it: [`open_planned`] opens
+    /// it only if it is still that file.
+    File(PathBuf, Seen),
     Dir,
     Symlink,
     /// Met, named, and deliberately not stored. The reason is a warning for
@@ -20,6 +22,85 @@ pub(crate) enum ItemSource {
     Skipped {
         reason: String,
     },
+}
+
+/// What the walk saw of a regular file, so that the open made much later
+/// (after every earlier entry has been written) can tell whether it is still
+/// the same file.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Seen {
+    /// `(dev, ino)` from the walk's stat; `None` off unix.
+    pub id: Option<(u64, u64)>,
+    /// Whether the walk followed a symlink to reach it: only the path named
+    /// on the command line is followed, everything inside the walk is not.
+    pub follow: bool,
+}
+
+/// Opens a planned regular file only if it is still the file the walk saw.
+///
+/// Bug hunt 2026-11-15, finding 7. The walk stats every item long before
+/// `create_archive` opens it, and the window is the whole time spent writing
+/// the earlier entries. A plain `File::open` there followed a symlink that
+/// appeared meanwhile (storing the target's bytes under the innocent name)
+/// and blocked forever on a FIFO. So the open is `O_NONBLOCK` (a FIFO opens
+/// at once) and `O_NOFOLLOW` unless the walk itself followed this path (a
+/// path named on the command line), the descriptor is `fstat`ed and refused
+/// unless it is a regular file with the walk's `(dev, ino)`, and only then
+/// is `O_NONBLOCK` cleared. Any refusal is an `io::Error` whose text says
+/// why; the caller turns it into its ordinary skipped-entry warning.
+#[cfg(unix)]
+pub(crate) fn open_planned(path: &Path, seen: &Seen) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut flags = libc::O_NONBLOCK;
+    if !seen.follow {
+        flags |= libc::O_NOFOLLOW;
+    }
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)
+    {
+        Ok(f) => f,
+        // `O_NOFOLLOW` on a symlink answers ELOOP (FreeBSD: EMLINK), whose
+        // own text ("too many levels of symbolic links") would mislead.
+        Err(e)
+            if !seen.follow
+                && matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::EMLINK))
+                && std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) =>
+        {
+            return Err(std::io::Error::other(
+                "it was replaced by a symlink after the walk, which is not followed",
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    let md = file.metadata()?;
+    if !md.is_file() {
+        return Err(std::io::Error::other(
+            "it is no longer a regular file (replaced after the walk)",
+        ));
+    }
+    if let Some(id) = seen.id
+        && (md.dev(), md.ino()) != id
+    {
+        return Err(std::io::Error::other(
+            "it was replaced by another file after the walk",
+        ));
+    }
+    let fd = file.as_raw_fd();
+    // SAFETY: F_GETFL/F_SETFL on a descriptor this function owns.
+    let cur = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if cur < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, cur & !libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+/// Off unix there is no `O_NOFOLLOW`/`O_NONBLOCK` to ask for: a plain open.
+#[cfg(not(unix))]
+pub(crate) fn open_planned(path: &Path, _seen: &Seen) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
 }
 
 pub(crate) struct WalkItem {
@@ -74,7 +155,7 @@ pub(crate) fn walk(root: &Path, prefix: &str) -> Result<Vec<WalkItem>> {
     // the one stat in this function that follows a link, and it follows it
     // because the caller named this path.
     let root_md = std::fs::metadata(root)?;
-    out.push(item_for(prefix.to_string(), root, &root_md));
+    out.push(item_for(prefix.to_string(), root, &root_md, true));
 
     let mut stack: Vec<Child> = Vec::new();
     if root_md.is_dir() {
@@ -129,7 +210,7 @@ pub(crate) fn walk(root: &Path, prefix: &str) -> Result<Vec<WalkItem>> {
             continue;
         }
         let is_dir = md.is_dir();
-        out.push(item_for(child.name.text.clone(), &child.path, &md));
+        out.push(item_for(child.name.text.clone(), &child.path, &md, false));
         if is_dir {
             descend(&mut stack, &mut out, &child.path, &child.name.text, &md);
         }
@@ -267,7 +348,9 @@ fn ids_of(md: &std::fs::Metadata) -> (Option<u32>, Option<u32>) {
     }
 }
 
-fn item_for(name: String, path: &Path, md: &std::fs::Metadata) -> WalkItem {
+/// `follow`: whether `md` came from a stat that followed a symlink (the
+/// root named on the command line), recorded for [`open_planned`].
+fn item_for(name: String, path: &Path, md: &std::fs::Metadata, follow: bool) -> WalkItem {
     let base = base_meta(name, md);
     let ft = md.file_type();
     if ft.is_dir() {
@@ -326,7 +409,13 @@ fn item_for(name: String, path: &Path, md: &std::fs::Metadata) -> WalkItem {
                 kind: EntryKind::File,
                 ..base
             },
-            source: ItemSource::File(path.to_path_buf()),
+            source: ItemSource::File(
+                path.to_path_buf(),
+                Seen {
+                    id: file_id_of(md),
+                    follow,
+                },
+            ),
             link_id: link_id_of(md),
         }
     } else {
@@ -341,6 +430,20 @@ fn item_for(name: String, path: &Path, md: &std::fs::Metadata) -> WalkItem {
             },
             link_id: None,
         }
+    }
+}
+
+/// `(dev, ino)` of any file, `None` off unix.
+fn file_id_of(md: &std::fs::Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((md.dev(), md.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = md;
+        None
     }
 }
 
@@ -816,7 +919,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|i| i.meta.name == "proj/open.txt" && matches!(i.source, ItemSource::File(_))),
+                .any(|i| i.meta.name == "proj/open.txt" && matches!(i.source, ItemSource::File(..))),
             "the rest of the tree must still be packed: {:?}",
             names(&items)
         );
@@ -883,5 +986,114 @@ mod tests {
             ),
             _ => panic!("a child that cannot be stat'ed must not be stored"),
         }
+    }
+
+    /// The walk's stat of a planned file, as `item_for` records it.
+    #[cfg(unix)]
+    fn seen_now(path: &Path, follow: bool) -> Seen {
+        let md = if follow {
+            std::fs::metadata(path).unwrap()
+        } else {
+            std::fs::symlink_metadata(path).unwrap()
+        };
+        match item_for("x".into(), path, &md, follow).source {
+            ItemSource::File(_, seen) => seen,
+            _ => panic!("the premise: {} is a regular file", path.display()),
+        }
+    }
+
+    /// Bug hunt 2026-11-15, finding 7: a file the walk planned that is a
+    /// regular file still is opens, reads, and is left blocking.
+    #[cfg(unix)]
+    #[test]
+    fn a_planned_file_that_is_unchanged_opens_blocking() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("f.txt");
+        std::fs::write(&p, b"payload").unwrap();
+        let seen = seen_now(&p, false);
+        let mut f = open_planned(&p, &seen).expect("an unchanged file opens");
+        // SAFETY: F_GETFL on a descriptor this test owns.
+        let flags = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(flags & libc::O_NONBLOCK, 0, "O_NONBLOCK must be cleared");
+        let mut s = String::new();
+        f.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "payload");
+    }
+
+    /// A planned file swapped for a symlink after the walk is not followed:
+    /// the link target's bytes must never be stored under the file's name.
+    #[cfg(unix)]
+    #[test]
+    fn a_planned_file_replaced_by_a_symlink_is_not_followed() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("small");
+        let secret = d.path().join("secret");
+        std::fs::write(&p, b"harmless").unwrap();
+        std::fs::write(&secret, b"TOP-SECRET").unwrap();
+        let seen = seen_now(&p, false);
+        std::fs::remove_file(&p).unwrap();
+        std::os::unix::fs::symlink(&secret, &p).unwrap();
+        let e = open_planned(&p, &seen).expect_err("a swapped-in symlink must not be opened");
+        assert!(e.to_string().contains("symlink"), "{e}");
+    }
+
+    /// A planned file swapped for a FIFO after the walk answers at once
+    /// instead of blocking in `open` for a writer that never comes.
+    #[cfg(unix)]
+    #[test]
+    fn a_planned_file_replaced_by_a_fifo_is_refused_without_blocking() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("small");
+        std::fs::write(&p, b"harmless").unwrap();
+        let seen = seen_now(&p, false);
+        std::fs::remove_file(&p).unwrap();
+        let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path this test owns.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = p.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(open_planned(&path, &seen).map(|_| ()));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("open_planned blocked on a FIFO");
+        let e = got.expect_err("a FIFO is not the regular file the walk saw");
+        assert!(e.to_string().contains("no longer a regular file"), "{e}");
+    }
+
+    /// A planned file replaced by a different regular file (another inode)
+    /// is not the file the walk saw.
+    #[cfg(unix)]
+    #[test]
+    fn a_planned_file_replaced_by_another_file_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("small");
+        let other = d.path().join("other");
+        std::fs::write(&p, b"harmless").unwrap();
+        std::fs::write(&other, b"SOMETHING ELSE").unwrap();
+        let seen = seen_now(&p, false);
+        std::fs::rename(&other, &p).unwrap();
+        let e = open_planned(&p, &seen).expect_err("another inode must be refused");
+        assert!(e.to_string().contains("replaced"), "{e}");
+    }
+
+    /// A path NAMED on the command line is followed (the walk stats its root
+    /// with `metadata`), so a named symlink to a file still opens.
+    #[cfg(unix)]
+    #[test]
+    fn a_named_symlink_root_is_still_followed() {
+        let d = tempfile::tempdir().unwrap();
+        let target = d.path().join("notes.txt");
+        let link = d.path().join("link");
+        std::fs::write(&target, b"notes").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let items = walk(&link, "link").unwrap();
+        let ItemSource::File(p, seen) = &items[0].source else {
+            panic!("the root is a file");
+        };
+        open_planned(p, seen).expect("a named symlink root is followed");
     }
 }

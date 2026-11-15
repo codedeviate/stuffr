@@ -4079,7 +4079,7 @@ pub fn create_archive(
             // stuffr correctly declining to put a file inside itself, which
             // is not a loss at all. The user is still told, on stderr, every
             // run — see `Outcome::notes`.
-            if let crate::walk::ItemSource::File(p) = &item.source
+            if let crate::walk::ItemSource::File(p, _) = &item.source
                 && let Some(through) = &dst_through_link
                 && through.is(p)
             {
@@ -4092,7 +4092,7 @@ pub fn create_archive(
                     "pack",
                 ));
             }
-            if let crate::walk::ItemSource::File(p) = &item.source
+            if let crate::walk::ItemSource::File(p, _) = &item.source
                 && is_output_file(p, dst_canonical.as_deref())
             {
                 // Tracked separately from `notes` rather than inferred from
@@ -4177,7 +4177,7 @@ pub fn create_archive(
     let nothing_with_contents = !plan.iter().any(|i| {
         matches!(
             i.source,
-            crate::walk::ItemSource::File(_) | crate::walk::ItemSource::Symlink
+            crate::walk::ItemSource::File(..) | crate::walk::ItemSource::Symlink
         )
     });
     let nothing_storable = !plan
@@ -4298,45 +4298,47 @@ pub fn create_archive(
                 // half-written entry whose header declares a length the
                 // stream will not deliver, and there is no honest way to
                 // finish that archive.
-                crate::walk::ItemSource::File(p) => match std::fs::File::open(p) {
-                    Ok(file) => {
-                        // Never the bare `File`. The entry header carrying
-                        // this file's length was written from the walk's
-                        // `stat`, and a live filesystem may have changed the
-                        // file in between — so the payload is framed to the
-                        // length already promised rather than to whatever the
-                        // file now holds. See `ExactLength`, and
-                        // `Fidelity::EntrySizeChanged` for why this is a
-                        // warning and not a refusal.
-                        match item.meta.size {
-                            Some(declared) => {
-                                let mut sized = ExactLength::new(file, declared);
-                                archive.add(&item.meta, &mut sized)?;
-                                bytes_in += sized.real;
-                                if let Some(w) = sized.warning(&item.meta.name) {
-                                    warnings.push(w);
+                crate::walk::ItemSource::File(p, seen) => {
+                    match crate::walk::open_planned(p, seen) {
+                        Ok(file) => {
+                            // Never the bare `File`. The entry header carrying
+                            // this file's length was written from the walk's
+                            // `stat`, and a live filesystem may have changed the
+                            // file in between — so the payload is framed to the
+                            // length already promised rather than to whatever the
+                            // file now holds. See `ExactLength`, and
+                            // `Fidelity::EntrySizeChanged` for why this is a
+                            // warning and not a refusal.
+                            match item.meta.size {
+                                Some(declared) => {
+                                    let mut sized = ExactLength::new(file, declared);
+                                    archive.add(&item.meta, &mut sized)?;
+                                    bytes_in += sized.real;
+                                    if let Some(w) = sized.warning(&item.meta.name) {
+                                        warnings.push(w);
+                                    }
+                                }
+                                // No length was recorded, so nothing was promised
+                                // and there is nothing to hold the payload to:
+                                // the container measures it itself, and
+                                // `bytes_in` gains nothing because nothing here
+                                // knows what it read. The walk always records a
+                                // length for a regular file, so this is reachable
+                                // only through a caller that built a plan by hand
+                                // — and it is what the code did for every entry
+                                // before this.
+                                None => {
+                                    let mut file = file;
+                                    archive.add(&item.meta, &mut file)?;
                                 }
                             }
-                            // No length was recorded, so nothing was promised
-                            // and there is nothing to hold the payload to:
-                            // the container measures it itself, and
-                            // `bytes_in` gains nothing because nothing here
-                            // knows what it read. The walk always records a
-                            // length for a regular file, so this is reachable
-                            // only through a caller that built a plan by hand
-                            // — and it is what the code did for every entry
-                            // before this.
-                            None => {
-                                let mut file = file;
-                                archive.add(&item.meta, &mut file)?;
-                            }
                         }
+                        Err(e) => warnings.push(Fidelity::EntrySkipped {
+                            entry: item.meta.name.clone(),
+                            reason: format!("could not be opened ({e}); it is not stored"),
+                        }),
                     }
-                    Err(e) => warnings.push(Fidelity::EntrySkipped {
-                        entry: item.meta.name.clone(),
-                        reason: format!("could not be opened ({e}); it is not stored"),
-                    }),
-                },
+                }
                 // No payload: a directory has none, and a symlink's target
                 // lives in the container's own header (or, for cpio and zip,
                 // is written by the container from `EntryKind::Symlink`). The
@@ -8563,7 +8565,13 @@ mod tests {
 
         let file = crate::walk::WalkItem {
             meta: meta_with(None, None),
-            source: crate::walk::ItemSource::File("p".into()),
+            source: crate::walk::ItemSource::File(
+                "p".into(),
+                crate::walk::Seen {
+                    id: None,
+                    follow: false,
+                },
+            ),
             link_id: None,
         };
         assert!(matches!(
