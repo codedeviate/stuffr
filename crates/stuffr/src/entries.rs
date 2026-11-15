@@ -5228,9 +5228,7 @@ impl ThroughLink {
     /// on unix (a hard link to it counts), by canonical path everywhere.
     fn is(&self, candidate: &Path) -> bool {
         std::fs::metadata(candidate).is_ok_and(|m| crate::ops::same_identity(&m, &self.meta))
-            || candidate
-                .canonicalize()
-                .is_ok_and(|c| c == self.canonical)
+            || candidate.canonicalize().is_ok_and(|c| c == self.canonical)
     }
 }
 

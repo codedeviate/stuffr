@@ -23,7 +23,9 @@ fn assert_same_file_refusal(out: &std::process::Output) {
 fn pack_refuses_an_output_that_is_a_symlink_to_its_input() {
     let dir = tmp_dir();
     let a = dir.join("a");
-    let data: Vec<u8> = (0..5000u32).map(|i| b"abcdefgh\n"[(i % 9) as usize]).collect();
+    let data: Vec<u8> = (0..5000u32)
+        .map(|i| b"abcdefgh\n"[(i % 9) as usize])
+        .collect();
     std::fs::write(&a, &data).unwrap();
     let link = dir.join("link.gz");
     std::os::unix::fs::symlink("a", &link).unwrap();
@@ -157,7 +159,12 @@ fn pack_and_unpack_still_write_through_to_a_device() {
         link.to_str().unwrap(),
     ]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
-    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(std::fs::read(&target).unwrap(), b"payload\n".repeat(100));
 }
 
@@ -214,7 +221,12 @@ fn container_pack_still_writes_through_an_unrelated_symlink() {
         "--force",
     ]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
-    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert!(std::fs::metadata(&target).unwrap().len() > 3);
 }
 
@@ -227,7 +239,12 @@ fn a_destination_that_is_not_a_directory_is_a_usage_error() {
     let reg = dir.join("reg");
     std::fs::write(&reg, b"hi\n").unwrap();
     let sub = reg.join("sub");
-    for (verb, dest) in [("unpack", &reg), ("salvage", &reg), ("unpack", &sub), ("salvage", &sub)] {
+    for (verb, dest) in [
+        ("unpack", &reg),
+        ("salvage", &reg),
+        ("unpack", &sub),
+        ("salvage", &sub),
+    ] {
         let out = run_output(&[verb, tar.to_str().unwrap(), "-C", dest.to_str().unwrap()]);
         assert_eq!(
             out.status.code(),
