@@ -296,6 +296,10 @@ pub(crate) struct Finish {
     /// Whether `publish` should fsync at all. See `CompressOpts::sync` /
     /// `DecompressOpts::sync` for what turning it off costs.
     pub(crate) sync: bool,
+    /// Whether the publish may replace a file at `target` (`--force`).
+    /// Without it, one that appeared after `Output::create`'s check is kept
+    /// and the publish refused (see [`publish`]).
+    pub(crate) replace: bool,
 }
 
 impl Output {
@@ -448,6 +452,7 @@ impl Output {
                         target: p.clone(),
                         handle: Some(handle),
                         sync,
+                        replace: force,
                     }),
                     warnings,
                 })
@@ -621,6 +626,11 @@ pub(crate) fn discard(finish: Option<Finish>) {
 /// not a corrupted file. That is a durability gap, not a correctness one, so
 /// it is not worth failing an otherwise-successful publish over.
 ///
+/// **Without `--force` nothing is replaced** (`Finish::replace` false): a
+/// file that appeared at the destination after `Output::create` checked is
+/// kept, the temp removed, and the publish refused with the same "already
+/// exists" usage error the check gives ([`rename_no_replace`]).
+///
 /// When `Finish::sync` is `false` (`--no-sync`), neither fsync runs: the
 /// rename still happens, but a crash immediately after it can leave a
 /// zero-length or partial file under the real name. That trade is the whole
@@ -640,12 +650,23 @@ pub(crate) fn publish(finish: Option<Finish>) -> Result<()> {
         SYNC_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    if let Err(e) = std::fs::rename(&f.tmp, &f.target) {
+    let moved = if f.replace {
+        std::fs::rename(&f.tmp, &f.target)
+    } else {
+        rename_no_replace(&f.tmp, &f.target)
+    };
+    if let Err(e) = moved {
         // The rename itself failed, so nothing was published: remove the
         // temp file rather than leaving it to strand on disk forever —
         // the caller only ever branches on success (`publish`) vs.
         // failure (`discard`), never both.
         let _ = std::fs::remove_file(&f.tmp);
+        if e.kind() == std::io::ErrorKind::AlreadyExists && !f.replace {
+            return Err(Error::Usage(format!(
+                "{} already exists; pass --force to overwrite",
+                f.target.display()
+            )));
+        }
         return Err(Error::from(e));
     }
 
@@ -668,6 +689,75 @@ pub(crate) fn publish(finish: Option<Finish>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Moves `tmp` to `target` without replacing anything already there:
+/// `AlreadyExists` when a file appeared at `target` after `Output::create`'s
+/// check (bug hunt 2026-11-15, finding 9). A plain `rename` would silently
+/// replace it, so the publish without `--force` was check-then-rename.
+///
+/// In order: the system's exclusive rename (`renamex_np(RENAME_EXCL)` on
+/// Apple, `renameat2(RENAME_NOREPLACE)` on Linux); where the filesystem
+/// does not support it, a hard link to `target` (which fails `EEXIST`
+/// exactly where the rename must) and the temp's unlink, as the compat
+/// links' `host::publish` does; and only where hard links are unsupported
+/// too, a plain `rename`.
+pub(crate) fn rename_no_replace(tmp: &Path, target: &Path) -> std::io::Result<()> {
+    match exclusive_rename(tmp, target) {
+        Some(Ok(())) => return Ok(()),
+        Some(Err(e)) => return Err(e),
+        None => {}
+    }
+    match std::fs::hard_link(tmp, target) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(tmp);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
+        Err(_) => std::fs::rename(tmp, target),
+    }
+}
+
+/// The system's no-replace rename, or `None` where this platform or this
+/// filesystem has none (the caller falls back).
+#[cfg(any(
+    target_vendor = "apple",
+    all(target_os = "linux", any(target_env = "gnu", target_env = "musl"))
+))]
+fn exclusive_rename(tmp: &Path, target: &Path) -> Option<std::io::Result<()>> {
+    use std::os::unix::ffi::OsStrExt;
+    let from = std::ffi::CString::new(tmp.as_os_str().as_bytes()).ok()?;
+    let to = std::ffi::CString::new(target.as_os_str().as_bytes()).ok()?;
+    // SAFETY: both pointers are valid NUL-terminated strings for the call.
+    #[cfg(target_vendor = "apple")]
+    let rc = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+    // SAFETY: as above; `AT_FDCWD` resolves relative paths as `rename` does.
+    #[cfg(target_os = "linux")]
+    let rc = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        return Some(Ok(()));
+    }
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::EINVAL | libc::ENOSYS | libc::ENOTSUP) => None,
+        _ => Some(Err(e)),
+    }
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    all(target_os = "linux", any(target_env = "gnu", target_env = "musl"))
+)))]
+fn exclusive_rename(_tmp: &Path, _target: &Path) -> Option<std::io::Result<()>> {
+    None
 }
 
 #[derive(Clone, Debug)]
@@ -2112,6 +2202,51 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("stuffr-ops-unit-{}-{}", std::process::id(), name));
         p
+    }
+
+    /// Finding 9 (bug hunt 2026-11-15): without `--force`, a file that
+    /// appears at the output name during the run must not be replaced by the
+    /// publish — the open-time check alone was check-then-rename.
+    #[test]
+    fn publish_without_force_never_replaces_a_file_that_appeared_meanwhile() {
+        let dst = tmp("appeared-meanwhile");
+        let _ = std::fs::remove_file(&dst);
+        let mut opened = Output::Path(dst.clone())
+            .create(false, false, &FromInput::default())
+            .unwrap();
+        opened.writer.write_all(b"OUTPUT").unwrap();
+        opened.writer.flush().unwrap();
+        let tmp_path = opened.finish.as_ref().unwrap().tmp.clone();
+        std::fs::write(&dst, b"PRECIOUS").unwrap();
+
+        let err = publish(opened.finish).unwrap_err();
+        let _ = std::fs::remove_file(&tmp_path);
+        let kept = std::fs::read(&dst).unwrap();
+        let _ = std::fs::remove_file(&dst);
+        assert!(
+            matches!(&err, Error::Usage(m) if m.contains("already exists")),
+            "{err:?}"
+        );
+        assert_eq!(kept, b"PRECIOUS", "the file that appeared was replaced");
+        assert!(!tmp_path.exists(), "the temp file was left behind");
+    }
+
+    /// With `--force` the publish still replaces what is there.
+    #[test]
+    fn publish_with_force_replaces_the_destination() {
+        let dst = tmp("force-replaces");
+        std::fs::write(&dst, b"OLD").unwrap();
+        let mut opened = Output::Path(dst.clone())
+            .create(true, false, &FromInput::default())
+            .unwrap();
+        opened.writer.write_all(b"NEW").unwrap();
+        opened.writer.flush().unwrap();
+        let tmp_path = opened.finish.as_ref().unwrap().tmp.clone();
+        publish(opened.finish).unwrap();
+        let got = std::fs::read(&dst).unwrap();
+        let _ = std::fs::remove_file(&dst);
+        assert_eq!(got, b"NEW");
+        assert!(!tmp_path.exists());
     }
 
     #[test]
