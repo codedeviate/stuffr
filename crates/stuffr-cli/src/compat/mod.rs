@@ -25,12 +25,18 @@ pub mod zstd;
 pub(crate) use host::ARM_TEST_LOCK;
 #[doc(hidden)]
 pub use host::InputReads;
+/// Also `main`'s for salvage's cross-filesystem staging temp.
+#[doc(hidden)]
+pub use host::create_armed;
 /// The whole-run signal hook `stuffr bench` registers (kill its memory
 /// child, clear its bar) before the shared cleanup handler re-raises.
 #[cfg(unix)]
 pub(crate) use host::hook_run_signals;
+/// The native verbs' temporary-output cleanup (`main` registers it).
+#[doc(hidden)]
+pub use host::watch_native_temps;
 /// The armed-temporary entry point `stuffr bench` shares with the families.
-pub(crate) use host::{CleanupGuard, create_armed, with_run_signals_held};
+pub(crate) use host::{CleanupGuard, with_run_signals_held};
 #[cfg(all(test, unix))]
 pub(crate) use host::{armed_path, disarm_inherited};
 

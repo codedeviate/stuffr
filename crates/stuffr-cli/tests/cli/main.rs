@@ -9,6 +9,7 @@ mod hygiene;
 mod indentation_guard;
 mod index;
 mod infozip;
+mod interrupts;
 mod list_fidelity;
 mod list_test;
 mod ls;

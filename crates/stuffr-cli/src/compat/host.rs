@@ -310,7 +310,7 @@ fn unlink_armed() {
 /// What a run holds while its output is partial; dropping it disarms the
 /// handler, so a published output is never removed.
 #[must_use = "dropping the guard disarms the cleanup at once"]
-pub(crate) struct CleanupGuard {
+pub struct CleanupGuard {
     #[cfg(unix)]
     armed: bool,
     #[cfg(unix)]
@@ -1677,18 +1677,60 @@ const BENCH_SIGNALS: Signals = &[];
 
 /// Create `path` (read and write, `create_new`, mode 0600) and arm its removal
 /// on SIGINT, SIGTERM, SIGHUP and SIGQUIT, which then kill the process as
-/// [`arm_cleanup`] describes; the signals are held back between the create
-/// and the arm, as in [`create_temp_armed`]. For a stuffr temporary that is
+/// `arm_cleanup` describes; the signals are held back between the create
+/// and the arm, as in `create_temp_armed`. For a stuffr temporary that is
 /// no compatibility family's output, so it takes no host or signal set: the
 /// host is the process itself. The caller names the file and removes it;
 /// dropping the guard only disarms.
-pub(crate) fn create_armed(path: &Path) -> io::Result<(File, CleanupGuard)> {
+pub fn create_armed(path: &Path) -> io::Result<(File, CleanupGuard)> {
     held_back(BENCH_SIGNALS, || {
         private_new_file()
             .read(true)
             .open(path)
             .map(|f| (f, arm_cleanup(&Host::Real, path, BENCH_SIGNALS)))
     })
+}
+
+/// The native verbs' armed temporary (`stuffr pack`/`unpack`/`convert`
+/// writing to a path): its guard, held between `stuffr::ops`' arm and
+/// release. Ordinary code only; the handler reads `SLOT`, never this.
+static NATIVE_TEMP: Mutex<Option<CleanupGuard>> = Mutex::new(None);
+
+/// Registers [`stuffr::ops::TempWatch`] for the native verbs (bug hunt
+/// 2026-11-15, finding 10): every hidden `.PID.N.NAME.tmp` the library
+/// writes an output through is armed for removal on SIGINT, SIGTERM, SIGHUP
+/// and SIGQUIT ([`create_armed`]'s set), so an interrupted native run no
+/// longer strands a partial output beside its destination. The handler is
+/// `arm_cleanup`'s: it unlinks the armed path and re-raises at the
+/// default action, so the process still dies of the signal; one the parent
+/// left ignored stays ignored. Created and armed with the signals held back
+/// (`held_back`), so no signal finds the temp unarmed. Call once, before
+/// any native verb runs; never on a compatibility family's path (they arm
+/// their own outputs).
+#[doc(hidden)]
+pub fn watch_native_temps() {
+    stuffr::ops::watch_temps(stuffr::ops::TempWatch {
+        hold: native_hold,
+        arm: native_arm,
+        release: native_release,
+    });
+}
+
+fn native_hold(f: &mut dyn FnMut()) {
+    held_back(BENCH_SIGNALS, f);
+}
+
+fn native_arm(path: &Path) {
+    let mut slot = NATIVE_TEMP.lock().unwrap_or_else(|e| e.into_inner());
+    // One arm at a time: a temp still armed (never released) is let go
+    // first, so the new one is the one a signal removes.
+    *slot = None;
+    *slot = Some(arm_cleanup(&Host::Real, path, BENCH_SIGNALS));
+}
+
+fn native_release(_path: &Path) {
+    let mut slot = NATIVE_TEMP.lock().unwrap_or_else(|e| e.into_inner());
+    *slot = None;
 }
 
 /// The path the cleanup handler would remove now, if one is armed.

@@ -51,6 +51,46 @@ const MAX_TMP_ATTEMPTS: u32 = 100;
 /// function actually picked — the two would look identical to any test that
 /// only inspects `Output::create`'s result. Calling this directly, without
 /// the widening step, is what makes the choice observable at all.
+/// How the binary removes a native temporary on a signal (bug hunt
+/// 2026-11-15, finding 10). This crate installs no signal handler of its
+/// own; the CLI registers one of these ([`watch_temps`]) and every temp
+/// `create_temp_file` makes is armed through it, then released once it
+/// is published or removed. `#[doc(hidden)]`: a seam for `stuffr-cli`, not
+/// stable API.
+///
+/// - `hold` runs its argument with the watched signals held back, so the
+///   temp is never on disk unarmed (a signal that arrives meanwhile is
+///   delivered once it returns, with the temp armed).
+/// - `arm` registers the temp's path for removal on a signal; called inside
+///   `hold`, right after the temp was created. One temp at a time.
+/// - `release` forgets it again: after the publish renamed it away, or
+///   after it was removed. The temp's name is unique and no longer exists
+///   by then, so a signal in between unlinks nothing that matters.
+///
+/// The handler itself, and its async-signal-safety, are the CLI's.
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct TempWatch {
+    pub hold: fn(&mut dyn FnMut()),
+    pub arm: fn(&Path),
+    pub release: fn(&Path),
+}
+
+static TEMP_WATCH: std::sync::OnceLock<TempWatch> = std::sync::OnceLock::new();
+
+/// Registers the process's [`TempWatch`]; the first registration wins.
+#[doc(hidden)]
+pub fn watch_temps(watch: TempWatch) {
+    let _ = TEMP_WATCH.set(watch);
+}
+
+/// Tells the [`TempWatch`], if any, that `tmp` was published or removed.
+fn release_temp(tmp: &Path) {
+    if let Some(w) = TEMP_WATCH.get() {
+        (w.release)(tmp);
+    }
+}
+
 fn create_temp_file(
     parent: &Path,
     file_name: &str,
@@ -69,7 +109,21 @@ fn create_temp_file(
                 opts.mode(0o600);
             }
         }
-        match opts.open(&candidate) {
+        let opened = match TEMP_WATCH.get() {
+            Some(w) => {
+                let mut opened = None;
+                (w.hold)(&mut || {
+                    let made = opts.open(&candidate);
+                    if made.is_ok() {
+                        (w.arm)(&candidate);
+                    }
+                    opened = Some(made);
+                });
+                opened.expect("TempWatch::hold must run its argument")
+            }
+            None => opts.open(&candidate),
+        };
+        match opened {
             Ok(f) => return Ok((candidate, f)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 attempt += 1;
@@ -444,7 +498,14 @@ impl Output {
                 // A second handle on the same temp file, taken before `f` is
                 // boxed away as the writer, so `publish` can `sync_all()` it
                 // after the codec has finished writing through the writer.
-                let handle = f.try_clone()?;
+                let handle = match f.try_clone() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&tmp);
+                        release_temp(&tmp);
+                        return Err(e.into());
+                    }
+                };
                 Ok(Opened {
                     writer: Box::new(f),
                     finish: Some(Finish {
@@ -590,7 +651,8 @@ pub fn sync_call_count() -> u64 {
 /// exactly as it was — untouched if it existed, still absent if it did not.
 pub(crate) fn discard(finish: Option<Finish>) {
     if let Some(f) = finish {
-        let _ = std::fs::remove_file(f.tmp);
+        let _ = std::fs::remove_file(&f.tmp);
+        release_temp(&f.tmp);
     }
 }
 
@@ -645,7 +707,12 @@ pub(crate) fn publish(finish: Option<Finish>) -> Result<()> {
     if f.sync
         && let Some(h) = &f.handle
     {
-        h.sync_all()?;
+        if let Err(e) = h.sync_all() {
+            // Nothing was published: the temp goes, as on a failed rename.
+            let _ = std::fs::remove_file(&f.tmp);
+            release_temp(&f.tmp);
+            return Err(e.into());
+        }
         #[cfg(feature = "testing")]
         SYNC_CALLS.fetch_add(1, Ordering::Relaxed);
     }
@@ -655,12 +722,17 @@ pub(crate) fn publish(finish: Option<Finish>) -> Result<()> {
     } else {
         rename_no_replace(&f.tmp, &f.target)
     };
+    if moved.is_ok() {
+        // Renamed away: the temp's name is gone, so the watch lets it go.
+        release_temp(&f.tmp);
+    }
     if let Err(e) = moved {
         // The rename itself failed, so nothing was published: remove the
         // temp file rather than leaving it to strand on disk forever —
         // the caller only ever branches on success (`publish`) vs.
         // failure (`discard`), never both.
         let _ = std::fs::remove_file(&f.tmp);
+        release_temp(&f.tmp);
         if e.kind() == std::io::ErrorKind::AlreadyExists && !f.replace {
             return Err(Error::Usage(format!(
                 "{} already exists; pass --force to overwrite",

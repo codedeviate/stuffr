@@ -43,6 +43,9 @@ fn main() -> ExitCode {
     if let Some(code) = stuffr_cli::bench::memory::child_entry(&args) {
         return code;
     }
+    // Native outputs are written through a hidden temp beside the
+    // destination; a signal removes it (bug hunt 2026-11-15, finding 10).
+    stuffr_cli::compat::watch_native_temps();
     let cli = Cli::parse();
 
     if cli.examples {
@@ -1640,17 +1643,16 @@ fn copy_into_place(from: &Path, to: &Path) -> std::io::Result<Option<std::io::Er
     }
     let mut input = std::fs::File::open(from)?;
     let mut attempt = 0;
-    let (tmp, mut out) = loop {
+    // `create_new`, 0600, and armed for removal on SIGINT/SIGTERM/SIGHUP/
+    // SIGQUIT until this function returns (bug hunt 2026-11-15, finding
+    // 10: the native temps are armed, and this one is no different).
+    let (tmp, mut out, _armed) = loop {
         let tmp = parent.join(format!(
             ".{name}.{}-{attempt}.salvage-tmp",
             std::process::id()
         ));
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-        match opts.open(&tmp) {
-            Ok(f) => break (tmp, f),
+        match stuffr_cli::compat::create_armed(&tmp) {
+            Ok((f, guard)) => break (tmp, f, guard),
             Err(e)
                 if e.kind() == std::io::ErrorKind::AlreadyExists
                     && attempt + 1 < MAX_TEMP_DIR_ATTEMPTS =>
@@ -2777,6 +2779,14 @@ fn salvage_column(registry: &stuffr::Registry, id: FormatId) -> &'static str {
 mod tests {
     use super::*;
 
+    /// `copy_into_place` arms its temp in the process-wide cleanup slot,
+    /// which holds one arm at a time: the tests that call it take turns.
+    static ARMED_TEMP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn armed_temp_turn() -> std::sync::MutexGuard<'static, ()> {
+        ARMED_TEMP.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// HOST-7: `salvage -o` stages in a directory this call made, 0700.
     #[cfg(unix)]
     #[test]
@@ -2802,6 +2812,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn copying_into_place_reads_a_staged_file_its_mode_made_unreadable() {
+        let _turn = armed_temp_turn();
         use std::os::unix::fs::PermissionsExt;
         // SAFETY: `geteuid` cannot fail.
         if unsafe { libc::geteuid() } == 0 {
@@ -2834,6 +2845,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn copying_into_place_keeps_the_file_when_its_mode_is_refused() {
+        let _turn = armed_temp_turn();
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!("stuffr-copy-refused-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -2861,6 +2873,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn copying_into_place_replaces_a_planted_symlink() {
+        let _turn = armed_temp_turn();
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!("stuffr-copy-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
