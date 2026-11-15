@@ -1032,7 +1032,7 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
         ..MadeByRun::default()
     };
 
-    matched += visit_selected(ar.as_mut(), selection, |entry| {
+    let visited = visit_selected(ar.as_mut(), selection, |entry| {
         let meta = entry.meta().clone();
 
         // Containment BEFORE anything is created. Checking after opening the
@@ -1121,8 +1121,10 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
                     }
                     // `place_entry` created the parents; `create_dir` says
                     // whether THIS call made the directory or it was there.
-                    let created = match skip_if_name_refused(create_dir_once(&target), &meta.name)?
-                    {
+                    let created = match skip_if_name_refused(
+                        create_dir_once(&target, initial_dir_mode(meta.mode, stamp.mode_bits)),
+                        &meta.name,
+                    )? {
                         Ok(created) => created,
                         Err(w) => {
                             warnings.push(w);
@@ -1233,7 +1235,7 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
             }
         }
         Ok(())
-    })?;
+    });
 
     // Now that nothing more will be created inside them. Sorted deepest
     // path first: a parent chmod'd to something without the execute bit
@@ -1250,6 +1252,12 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
     // cost. Safe for mtime too, either way: chmod or utimes on a child does
     // not touch its parent's mtime, so applying children first cannot cause
     // the parent to observe a stale timestamp.
+    //
+    // Run on the ERROR path too, before the error is returned (bug hunt
+    // 2026-11-15, finding 8): a run that fails part-way (an unsafe path, a
+    // corrupt member, a budget) has still created directories, and leaving
+    // them at their creation mode would silently drop a narrower archived
+    // mode for good. The warnings are lost with the error; the modes are not.
     deferred_dirs.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.components().count()));
     for (path, meta, id) in &deferred_dirs {
         let missing = match open_created_dir(path, *id) {
@@ -1267,6 +1275,7 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
         };
         warn_metadata(&mut warnings, &meta.name, missing);
     }
+    matched += visited?;
 
     // A selection that selects nothing must not report success: a typo'd name
     // would otherwise look exactly like an archive that had nothing to give.
@@ -3142,7 +3151,7 @@ fn place_salvaged_entry(
                     Ok(()) => {}
                     Err(skipped) => return Ok(skipped),
                 }
-                match skip_if_name_refused(create_dir_once(&target), &entry.meta.name) {
+                match skip_if_name_refused(create_dir_once(&target, None), &entry.meta.name) {
                     Ok(Ok(created)) => {
                         if created {
                             quarantine_dir(made.quarantine.as_ref(), &target);
@@ -6168,13 +6177,36 @@ fn identity(path: &Path) -> Option<(u64, u64)> {
     }
 }
 
+/// The mode an extracted directory is CREATED with: its archived mode as
+/// it will finally be restored (`mode_bits`), plus owner `rwx` so the run
+/// can still write and traverse into it before the deferred metadata
+/// narrows it. Bug hunt 2026-11-15, finding 8: creating every directory at
+/// the umask default left a directory archived 0700 at 0755 for the whole
+/// extraction (and for good, when the run failed), exposing what was
+/// extracted into it. GNU tar and libarchive create it the same way.
+/// `None` (no archived mode) keeps the umask default.
+fn initial_dir_mode(archived: Option<u32>, mode_bits: u32) -> Option<u32> {
+    archived.map(|m| (m & mode_bits) | 0o700)
+}
+
 /// A `(st_dev, st_ino)` pair: what [`identity`] reads.
 type DevIno = (u64, u64);
 
 /// `mkdir path`: `Ok(true)` when this call created it, `Ok(false)` when a
 /// directory (not a symlink to one) was already there.
-fn create_dir_once(path: &Path) -> std::io::Result<bool> {
-    match std::fs::create_dir(path) {
+///
+/// `mode` is the creation mode (still masked by the umask, as `mkdir(2)`
+/// does); `None` is the umask default. See [`initial_dir_mode`].
+fn create_dir_once(path: &Path, mode: Option<u32>) -> std::io::Result<bool> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    match builder.create(path) {
         Ok(()) => Ok(true),
         Err(e)
             if e.kind() == std::io::ErrorKind::AlreadyExists
@@ -6931,6 +6963,36 @@ mod tests {
     use super::*;
     use stuffr_core::{DEFAULT_MAX_RATIO, ReaderSource};
 
+    /// Bug hunt 2026-11-15, finding 8: a directory is created no wider than
+    /// its archived mode plus owner rwx, not at the umask default, so it is
+    /// private for the whole extraction, not only once the run ends.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_is_created_no_wider_than_its_archived_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = ScratchDir::create(&format!("stuffr-entries-dirmode-{}", std::process::id()));
+        let umask = process_umask();
+        let mode_bits = RESTORED_MODE_BITS & !umask;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        let private = root.join("private");
+        assert!(create_dir_once(&private, initial_dir_mode(Some(0o40700), mode_bits)).unwrap());
+        assert_eq!(mode(&private), 0o700 & !umask);
+
+        // A read-only archived mode still lets the run write into it.
+        let ro = root.join("ro");
+        assert!(create_dir_once(&ro, initial_dir_mode(Some(0o500), mode_bits)).unwrap());
+        assert_eq!(mode(&ro), 0o700 & !umask);
+
+        let open = root.join("open");
+        assert!(create_dir_once(&open, initial_dir_mode(Some(0o755), mode_bits)).unwrap());
+        assert_eq!(mode(&open), 0o755 & !umask);
+
+        let unknown = root.join("unknown");
+        assert!(create_dir_once(&unknown, initial_dir_mode(None, mode_bits)).unwrap());
+        assert_eq!(mode(&unknown), 0o777 & !umask);
+    }
+
     /// EXTRACT-5: deferred directory metadata re-opens only the directory
     /// this run created. A symlink swapped in at its name is not followed,
     /// and another directory moved into its place is refused by identity.
@@ -6939,8 +7001,8 @@ mod tests {
     fn a_created_directory_is_reopened_only_while_it_is_the_one_created() {
         let root = ScratchDir::create(&format!("stuffr-entries-reopen-{}", std::process::id()));
         let d = root.join("d");
-        assert!(create_dir_once(&d).unwrap(), "created by this call");
-        assert!(!create_dir_once(&d).unwrap(), "already there");
+        assert!(create_dir_once(&d, None).unwrap(), "created by this call");
+        assert!(!create_dir_once(&d, None).unwrap(), "already there");
         let id = identity(&d);
         assert!(id.is_some());
         assert!(open_created_dir(&d, id).is_ok());

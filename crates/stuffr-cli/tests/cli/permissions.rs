@@ -246,3 +246,74 @@ fn salvage_gives_a_recovered_file_its_archived_mode_masked_by_the_umask() {
         assert_eq!(mode_of(&file), want, "{name}");
     }
 }
+
+/// A tar holding directory `priv/` (mode `dir_mode`), file `priv/secret.txt`
+/// (0644), then `../escape`, which aborts the extraction at exit 7.
+fn private_dir_then_escape_tar(path: &Path, dir_mode: u32) {
+    let mut builder = tar::Builder::new(std::fs::File::create(path).unwrap());
+    let dir = raw_header("priv/", tar::EntryType::Directory, None, 0, dir_mode);
+    builder.append(&dir, std::io::empty()).unwrap();
+    let file = raw_header("priv/secret.txt", tar::EntryType::Regular, None, 7, 0o644);
+    builder.append(&file, &b"secret\n"[..]).unwrap();
+    let escape = raw_header("../escape", tar::EntryType::Regular, None, 1, 0o644);
+    builder.append(&escape, &b"x"[..]).unwrap();
+    builder.finish().unwrap();
+}
+
+/// Bug hunt 2026-11-15, finding 8: an extraction that fails after creating
+/// a private directory still gives it its archived mode. It used to stay at
+/// the umask default (0755), so `priv/secret.txt` was readable by others.
+#[test]
+fn a_failed_extraction_still_applies_a_private_directorys_mode() {
+    let dir = tmp_dir();
+    let archive = dir.join("p.tar");
+    private_dir_then_escape_tar(&archive, 0o700);
+    let dest = dir.join("out");
+    let out = run_under_umask(
+        0o022,
+        &[
+            "unpack",
+            archive.to_str().unwrap(),
+            "-C",
+            dest.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(mode_of(&dest.join("priv")), 0o700);
+}
+
+/// The deferred metadata, not only the creation mode, runs on the error
+/// path: an archived 0500 is created 0700 (so the file can be written into
+/// it) and still narrowed to 0500 when the run fails.
+#[test]
+fn a_failed_extraction_still_applies_deferred_directory_metadata() {
+    let dir = tmp_dir();
+    let archive = dir.join("p.tar");
+    private_dir_then_escape_tar(&archive, 0o500);
+    let dest = dir.join("out");
+    let out = run_under_umask(
+        0o022,
+        &[
+            "unpack",
+            archive.to_str().unwrap(),
+            "-C",
+            dest.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(mode_of(&dest.join("priv")), 0o500);
+    assert_eq!(
+        std::fs::read(dest.join("priv/secret.txt")).unwrap(),
+        b"secret\n"
+    );
+}
