@@ -806,7 +806,11 @@ fn exclusive_rename(tmp: &Path, target: &Path) -> Option<std::io::Result<()>> {
     // SAFETY: as above; `AT_FDCWD` resolves relative paths as `rename` does.
     #[cfg(target_os = "linux")]
     let rc = unsafe {
-        libc::renameat2(
+        // The raw syscall, not libc's wrapper: glibc before 2.28 and older
+        // musl have no `renameat2` symbol, and a kernel without the call
+        // answers ENOSYS, which falls back below.
+        libc::syscall(
+            libc::SYS_renameat2,
             libc::AT_FDCWD,
             from.as_ptr(),
             libc::AT_FDCWD,
@@ -819,7 +823,8 @@ fn exclusive_rename(tmp: &Path, target: &Path) -> Option<std::io::Result<()>> {
     }
     let e = std::io::Error::last_os_error();
     match e.raw_os_error() {
-        Some(libc::EINVAL | libc::ENOSYS | libc::ENOTSUP) => None,
+        // EPERM: a seccomp filter that does not know the call.
+        Some(libc::EINVAL | libc::ENOSYS | libc::ENOTSUP | libc::EPERM) => None,
         _ => Some(Err(e)),
     }
 }
@@ -2292,6 +2297,7 @@ mod tests {
         std::fs::write(&dst, b"PRECIOUS").unwrap();
 
         let err = publish(opened.finish).unwrap_err();
+        let temp_left = tmp_path.exists();
         let _ = std::fs::remove_file(&tmp_path);
         let kept = std::fs::read(&dst).unwrap();
         let _ = std::fs::remove_file(&dst);
@@ -2300,7 +2306,7 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(kept, b"PRECIOUS", "the file that appeared was replaced");
-        assert!(!tmp_path.exists(), "the temp file was left behind");
+        assert!(!temp_left, "the temp file was left behind");
     }
 
     /// With `--force` the publish still replaces what is there.
