@@ -345,6 +345,35 @@ pub enum Fidelity {
          and the comparison's work budget ran out"
     )]
     LocalHeadersUnchecked { format: FormatId, entries: u64 },
+
+    /// An entry's name (or link target) in the archive is not valid UTF-8,
+    /// so it is read with U+FFFD in place of each byte that is not.
+    ///
+    /// The archive's own bytes cannot be carried through a `String`, so the
+    /// name delivered is not the name stored: written back out (`unpack`,
+    /// `convert`) it is a different name, and two stored names that differ
+    /// only in such bytes — Latin-1 `caf\xe9` and `caf\xe8` — are read as
+    /// the same one. `raw` spells the stored bytes, each byte that is not
+    /// UTF-8 as `\xNN`, so two such entries stay distinguishable in the
+    /// report even though their delivered names are not. `field` is `"name"`
+    /// or `"link target"`. `--strict-fidelity` turns this into exit 4.
+    /// `pack`'s walk refuses the same thing outright (it skips an
+    /// undecodable name with [`Self::EntrySkipped`]); a reader cannot skip,
+    /// because the entry's contents are still real.
+    #[error(
+        "`{format}` entry `{}`: its {field} `{}` is not valid UTF-8 and is read with \
+         U+FFFD in place of the bytes that are not",
+        fmt_name(.entry),
+        fmt_name(.raw)
+    )]
+    NameNotUtf8 {
+        format: FormatId,
+        /// The entry's name as delivered.
+        entry: String,
+        field: &'static str,
+        /// The stored bytes, `\xNN` for each byte that is not UTF-8.
+        raw: String,
+    },
 }
 
 /// Where a codec's decoder records what it approximated.

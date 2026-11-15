@@ -22,6 +22,7 @@ mod pack_findings;
 mod pack_walk;
 mod permissions;
 mod quarantine;
+mod readers;
 mod reference_tools;
 mod salvage;
 mod salvage_checksumless;

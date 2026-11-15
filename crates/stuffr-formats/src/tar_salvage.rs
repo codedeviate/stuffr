@@ -280,8 +280,10 @@
 //! record. Writing either payload verbatim would hand back bytes that are
 //! not the file. Both are therefore [`UnverifiedCause::UndecodableMethod`]
 //! — listed, not written, exit 3 — with [`SPARSE`] as their codec. That is
-//! stricter than `tar.rs` for pax sparse, which the `tar` crate does not
-//! recognise and reads back raw.
+//! stricter than the reader, which expands both (`tar.rs` through the
+//! crate for typeflag `S`, `tar_pax.rs` for pax 0.0, 0.1 and 1.0 since bug
+//! hunt 2026-11-15, finding 4): a scan of a damaged archive cannot trust a
+//! map whose payload it has not walked whole.
 //!
 //! # The whole-entry ceiling: none of this scanner's own
 //!

@@ -265,6 +265,7 @@ use stuffr_core::{
     Source,
 };
 
+use crate::names::not_utf8;
 use crate::normalize::{AR_MALFORMED_AS_INVALID_DATA_EOF, NormalizeDecodeErrors};
 
 pub const AR: FormatId = FormatId::new("ar");
@@ -1417,6 +1418,11 @@ impl ArchiveRead for ArRead {
         };
 
         let meta = entry_meta(raw.header(), self.mode_unknown.0.get());
+        // A name that is not UTF-8 is read lossily; say so (bug hunt
+        // 2026-11-15, finding 20).
+        if let Some(w) = not_utf8(AR, &meta.name, "name", raw.header().identifier()) {
+            self.report.warn(w);
+        }
         let remaining = raw.header().size();
         let name = meta.name.clone();
         self.current = Some(raw);
@@ -2524,6 +2530,45 @@ mod tests {
         id[0..3].copy_from_slice(b"#1/");
         id[3..16].copy_from_slice(&dec_field(padded_length, 13));
         id
+    }
+
+    /// Bug hunt 2026-11-15, finding 20: a member name that is not UTF-8 is
+    /// read lossily and reported per member, its stored bytes spelled out.
+    #[test]
+    fn a_member_name_that_is_not_utf8_is_reported() {
+        let mut bytes = b"!<arch>\n".to_vec();
+        for (name, data) in [
+            (&b"caf\xe9"[..], &b"ONE"[..]),
+            (b"caf\xe8", b"TWO!"),
+            (b"b", b"x"),
+        ] {
+            let mut id = [b' '; 16];
+            id[..name.len()].copy_from_slice(name);
+            bytes.extend(ar_header_raw(&id, data.len() as u64));
+            bytes.extend_from_slice(data);
+            if data.len() % 2 == 1 {
+                bytes.push(b'\n');
+            }
+        }
+        let mut ar = open(&bytes);
+        let mut names = Vec::new();
+        while let Some(entry) = ar.next_entry().unwrap() {
+            names.push(entry.meta().name.clone());
+        }
+        assert_eq!(names, ["caf\u{fffd}", "caf\u{fffd}", "b"]);
+        let raws: Vec<String> = ar
+            .fidelity()
+            .warnings
+            .iter()
+            .filter_map(|w| match w {
+                stuffr_core::Fidelity::NameNotUtf8 { raw, field, .. } => {
+                    assert_eq!(*field, "name");
+                    Some(raw.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(raws, ["caf\\xe9", "caf\\xe8"]);
     }
 
     /// One hand-built 60-byte `ar` entry header — every field but the

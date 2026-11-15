@@ -157,11 +157,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use stuffr_core::{
     ArchiveRead, ArchiveWrite, Container, ContainerCaps, CreateOpts, Entry, EntryKind, EntryMeta,
-    Error, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts, Resolved, Result, Sink,
-    Source,
+    Error, Fidelity, FidelityReport, FormatId, FormatMeta, MagicRule, MetaFields, OpenOpts,
+    Resolved, Result, Sink, Source,
 };
 
+use crate::names::not_utf8;
 use crate::normalize::{NormalizeDecodeErrors, TAR_MALFORMED_AS_OTHER};
+use crate::tar_pax::{PaxRecords, TimeField, header_time, pax_time};
 
 pub const TAR: FormatId = FormatId::new("tar");
 
@@ -521,8 +523,9 @@ pub const MAX_GNU_LONG_NAME: u64 = 16 * 1024 * 1024;
 /// 500-670 heap bytes per 512-byte block), for `list` too, with no bound of
 /// its own. 32,768 blocks hold ~688k regions, far past any real file's map.
 /// [`Error::ResourceLimit`] (exit 6), refused before the block is read.
-/// `salvage` never parses the chain (it only recognises the entry), and the
-/// crate does not read pax `GNU.sparse.*` maps, so this is the only path.
+/// `salvage` never parses the chain (it only recognises the entry). pax
+/// `GNU.sparse.*` maps are read by `tar_pax.rs`, under its own region
+/// ceiling of the same size (`MAX_SPARSE_REGIONS`).
 /// Fixed, not tunable.
 pub const MAX_GNU_SPARSE_EXT_BLOCKS: u64 = MAX_PAX_EXTENSION / BLOCK as u64;
 
@@ -1094,7 +1097,7 @@ impl ArchiveRead for TarRead {
             .entries
             .as_mut()
             .expect("TarRead::entries is only taken in Drop");
-        let (raw, mut meta) = loop {
+        let (raw, mut meta, mut pax) = loop {
             let Some(next) = iter.next() else {
                 self.ended = true;
                 // tar cannot tell "the archive ended" from "the stream ran
@@ -1102,18 +1105,67 @@ impl ArchiveRead for TarRead {
                 self.verify_end_of_archive()?;
                 return Ok(None);
             };
-            let raw = next.map_err(classify_tar_error)?;
+            let mut raw = next.map_err(classify_tar_error)?;
+            let pax = pax_records(&mut raw)?;
             let meta = entry_meta(&raw);
             refuse_corrupt_hard_link(&meta)?;
             // A link naming itself is the same file declared twice (GNU tar
             // writes one for `tar -cf x.tar a a`): it yields no entry, as
             // cpio's self-named member does. Dropped unread, so the iterator
-            // skips whatever its header declares.
-            if matches!(&meta.kind, EntryKind::Hardlink { target } if *target == meta.name) {
+            // skips whatever its header declares. Compared as the stored
+            // bytes: two names that are not UTF-8 can read alike and differ.
+            if matches!(meta.kind, EntryKind::Hardlink { .. })
+                && raw.link_name_bytes().as_deref() == Some(&*raw.path_bytes())
+            {
                 continue;
             }
-            break (raw, meta);
+            break (raw, meta, pax);
         };
+        // pax records the crate does not apply (bug hunt 2026-11-15,
+        // findings 4 and 25): a GNU sparse map, and the `mtime` record.
+        let sparse = pax.sparse_plan(&meta.name)?;
+        if let Some(plan) = &sparse {
+            if meta.kind != EntryKind::File || raw.header().entry_type().is_gnu_sparse() {
+                return Err(Error::Unsupported(format!(
+                    "tar entry `{}` carries a pax sparse map on an entry that is not a plain \
+                     regular file; this build expands a map only on a regular file",
+                    meta.name
+                )));
+            }
+            if let Some(name) = &plan.name {
+                meta.name = String::from_utf8_lossy(name).into_owned();
+            }
+            meta.size = Some(plan.realsize);
+        }
+        // Names the archive stores as bytes that are not UTF-8 (finding 20).
+        let stored_name = match sparse.as_ref().and_then(|plan| plan.name.as_deref()) {
+            Some(name) => std::borrow::Cow::Borrowed(name),
+            None => raw.path_bytes(),
+        };
+        let unreadable_name = not_utf8(TAR, &meta.name, "name", &stored_name);
+        let unreadable_target = match meta.kind {
+            EntryKind::Symlink { .. } | EntryKind::Hardlink { .. } => raw
+                .link_name_bytes()
+                .and_then(|target| not_utf8(TAR, &meta.name, "link target", &target)),
+            _ => None,
+        };
+        for w in [unreadable_name, unreadable_target].into_iter().flatten() {
+            self.report.warn(w);
+        }
+        let time = match pax.mtime.as_deref() {
+            Some(value) => pax_time(value),
+            None => header_time(raw.header()),
+        };
+        meta.mtime = time.time();
+        if time == TimeField::Unusable {
+            self.report.warn(Fidelity::MetadataIncomplete {
+                entry: meta.name.clone(),
+                fields: MetaFields {
+                    mtime: true,
+                    ..MetaFields::default()
+                },
+            });
+        }
         // A hard link carries no payload of its own: its content is the
         // target's. Whatever size its header declares, the reader yields no
         // bytes and `size` is unknown (`EntryKind::Hardlink`'s contract).
@@ -1124,15 +1176,20 @@ impl ArchiveRead for TarRead {
             drop(raw);
             return Ok(Some(Entry::new(meta, Box::new(io::empty()))));
         }
-        let payload = EntryPayload {
-            remaining: raw.size(),
-            entry: raw,
-            name: meta.name.clone(),
-        };
-        Ok(Some(Entry::new(
-            meta,
-            Box::new(NormalizeDecodeErrors::new(payload, TAR_MALFORMED_AS_OTHER)),
-        )))
+        let stored = raw.size();
+        let payload = NormalizeDecodeErrors::new(
+            EntryPayload {
+                remaining: stored,
+                entry: raw,
+                name: meta.name.clone(),
+            },
+            TAR_MALFORMED_AS_OTHER,
+        );
+        if let Some(plan) = sparse {
+            let reader = plan.reader(payload, stored, &meta.name)?;
+            return Ok(Some(Entry::new(meta, Box::new(reader))));
+        }
+        Ok(Some(Entry::new(meta, Box::new(payload))))
     }
 
     /// tar has no entry index, on any source.
@@ -1232,7 +1289,8 @@ pub(crate) fn is_regular_file(entry_type: tar::EntryType) -> bool {
 ///
 /// Names come from `path_bytes`, not `path()`: the latter fails on a
 /// non-UTF-8 name on Windows, and `EntryMeta::name` is a `String` either way,
-/// so a lossy conversion is the most this layer can carry. Names are NOT
+/// so a lossy conversion is the most this layer can carry — and
+/// `next_entry` reports it (`Fidelity::NameNotUtf8`) when it loses bytes. Names are NOT
 /// sanitised — see harness property 12; refusal is the ops layer's job and it
 /// can only refuse what it can still see.
 fn entry_meta(entry: &tar::Entry<'_, TarSource>) -> EntryMeta {
@@ -1249,6 +1307,20 @@ fn entry_meta(entry: &tar::Entry<'_, TarSource>) -> EntryMeta {
         }),
         ..Default::default()
     }
+}
+
+/// The pax records of `raw` this module applies itself ([`PaxRecords`]).
+/// A pax global (`g`) header is handed back as an entry of its own and is
+/// not asked: `pax_extensions` would read its payload as records.
+fn pax_records(raw: &mut tar::Entry<'_, TarSource>) -> Result<PaxRecords> {
+    if raw.header().entry_type().is_pax_global_extensions() {
+        return Ok(PaxRecords::default());
+    }
+    Ok(raw
+        .pax_extensions()
+        .map_err(classify_tar_error)?
+        .map(PaxRecords::collect)
+        .unwrap_or_default())
 }
 
 /// The [`EntryKind`] a header's typeflag names — the ONE table both this
@@ -3381,6 +3453,68 @@ mod tests {
         assert!(
             !err.to_string().contains(GUARD_PHRASE),
             "the guard refused a header the crate can advance over: {err}"
+        );
+    }
+
+    /// Bug hunt 2026-11-15, finding 20: a name or link target that is not
+    /// UTF-8 is read lossily, as before, and now says so per entry —
+    /// spelling the stored bytes, so `caf\xe9` and `caf\xe8` stay apart in
+    /// the report though both are delivered as `caf\u{fffd}`.
+    #[test]
+    fn a_name_or_link_target_that_is_not_utf8_is_reported() {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (name, data) in [
+            (&b"caf\xe9"[..], &b"ONE"[..]),
+            (b"caf\xe8", b"TWO!"),
+            (b"b", b"x"),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.as_old_mut().name[..name.len()].copy_from_slice(name);
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, data).unwrap();
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.as_old_mut().name[..1].copy_from_slice(b"l");
+        header.as_old_mut().linkname[..2].copy_from_slice(b"t\xff");
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_cksum();
+        builder.append(&header, &[][..]).unwrap();
+        let bytes = builder.into_inner().unwrap();
+
+        let mut ar = open(&bytes);
+        let mut names = Vec::new();
+        while let Some(entry) = ar.next_entry().unwrap() {
+            names.push(entry.meta().name.clone());
+        }
+        assert_eq!(names, ["caf\u{fffd}", "caf\u{fffd}", "b", "l"]);
+        let raws: Vec<(String, &str, String)> = ar
+            .fidelity()
+            .warnings
+            .iter()
+            .filter_map(|w| match w {
+                stuffr_core::Fidelity::NameNotUtf8 {
+                    format,
+                    entry,
+                    field,
+                    raw,
+                } => {
+                    assert_eq!(*format, TAR);
+                    Some((entry.clone(), *field, raw.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            raws,
+            [
+                ("caf\u{fffd}".to_owned(), "name", "caf\\xe9".to_owned()),
+                ("caf\u{fffd}".to_owned(), "name", "caf\\xe8".to_owned()),
+                ("l".to_owned(), "link target", "t\\xff".to_owned()),
+            ]
         );
     }
 
