@@ -216,6 +216,7 @@ use zip::write::SimpleFileOptions;
 use crate::normalize::{
     NormalizeDecodeErrors, ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_UNSUPPORTED_EOF,
 };
+use crate::zip_memory;
 
 pub const ZIP: FormatId = FormatId::new("zip");
 
@@ -392,8 +393,13 @@ impl Container for Zip {
         }
     }
 
-    fn open(&self, resolved: Resolved, _o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+    fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
         let Resolved { source, report, .. } = resolved;
+        // What one entry's decoder may allocate on the entry's say-so
+        // ([`crate::zip_memory`], bug hunt 2026-11-15, finding 3).
+        let memory_limit = o
+            .memory_limit
+            .unwrap_or_else(stuffr_core::default_memory_limit);
 
         if source.caps().seekable {
             // Authoritative: the central directory carries real metadata and
@@ -434,6 +440,7 @@ impl Container for Zip {
                 compared: HashSet::new(),
                 claims: LocalClaims::new(archive_len),
                 disagreements: DisagreementLog::default(),
+                memory_limit,
             }));
         }
 
@@ -469,6 +476,7 @@ impl Container for Zip {
             report,
             index: IndexCheck::default(),
             ended: false,
+            memory_limit,
         }))
     }
 
@@ -1575,6 +1583,8 @@ struct ZipIndexed {
     claims: LocalClaims,
     /// The disagreements reported so far, capped ([`DisagreementLog`]).
     disagreements: DisagreementLog,
+    /// What one entry's decoder may allocate ([`crate::zip_memory`]).
+    memory_limit: u64,
 }
 
 /// Entries an archive names in [`Fidelity::HeadersDisagree`] before the rest
@@ -1742,6 +1752,23 @@ thread_local! {
     /// Local-header bytes [`read_local_claim`] read on this thread: the
     /// PARSE-4 tests count work, not time.
     static LOCAL_CLAIM_BYTES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A compression method's number, as its local header spells it.
+fn method_id(method: CompressionMethod) -> u16 {
+    #[allow(deprecated)]
+    if let CompressionMethod::Unsupported(id) = method {
+        return id;
+    }
+    [
+        (CompressionMethod::LZMA, 14),
+        (CompressionMethod::ZSTD, 93),
+        (CompressionMethod::XZ, 95),
+        (CompressionMethod::PPMD, 98),
+    ]
+    .into_iter()
+    .find_map(|(m, id)| (m == method).then_some(id))
+    .unwrap_or(0)
 }
 
 impl ZipIndexed {
@@ -2146,13 +2173,29 @@ const MAX_LEGACY_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
 impl ZipIndexed {
     /// `Some` when entry `index` is stored with method 1 or 6 and is not
     /// encrypted (an encrypted one keeps `zip`'s own refusal).
+    ///
+    /// Also refuses (exit 6) an entry whose decoder would size itself past
+    /// the memory limit on the payload's own say-so ([`zip_memory`], bug
+    /// hunt 2026-11-15, finding 3): the declaration is read raw here, before
+    /// `zip` builds the decoder on the entry's first read. A method this
+    /// build cannot decode is left to [`refuse_undecodable_method`] (exit 3).
     fn legacy_method_at(&mut self, index: usize) -> Result<Option<LegacyMethod>> {
-        let raw = match self.archive.by_index_raw(index) {
+        let mut raw = match self.archive.by_index_raw(index) {
             Ok(raw) => raw,
             // Leave header trouble to the normal path's classification.
             Err(_) => return Ok(None),
         };
         if raw.encrypted() {
+            return Ok(None);
+        }
+        let method = method_id(raw.compression());
+        #[allow(deprecated)]
+        let decodable = !matches!(raw.compression(), CompressionMethod::Unsupported(_));
+        if decodable && zip_memory::METHODS.contains(&method) {
+            let (size, name) = (raw.size(), entry_meta(&raw, None).name);
+            let mut head = Vec::new();
+            let _ = (&mut raw).take(zip_memory::HEAD_LEN).read_to_end(&mut head);
+            zip_memory::check(method, Some(size), &head, self.memory_limit, &name)?;
             return Ok(None);
         }
         Ok(if raw.compression() == CompressionMethod::SHRINK {
@@ -2517,6 +2560,8 @@ struct ZipStreamed {
     /// the end gets `Ok(None)` rather than the same error repeatedly. The
     /// same shape `tar.rs`'s `ended` has.
     ended: bool,
+    /// What one entry's decoder may allocate ([`crate::zip_memory`]).
+    memory_limit: u64,
 }
 
 impl ArchiveRead for ZipStreamed {
@@ -2539,7 +2584,7 @@ impl ArchiveRead for ZipStreamed {
         }
         self.source.push_back(&signature);
         // Read and replayed, so zip reads the same bytes after.
-        let claim = peek_local_claim(&mut self.source);
+        let (claim, head) = peek_local_claim(&mut self.source);
 
         let file = match zip::read::read_zipfile_from_stream(&mut self.source) {
             Ok(Some(file)) => file,
@@ -2562,6 +2607,21 @@ impl ArchiveRead for ZipStreamed {
         // Ends the walk, as zip 9.1.3's own refusal inside
         // `read_zipfile_from_stream` did: the payload is not consumed.
         if let Err(e) = refuse_undecodable_method(&file) {
+            self.ended = true;
+            return Err(e);
+        }
+        // The decoder's declared memory, from the payload head the peek
+        // read (finding 3); zip builds the decoder on the first read.
+        if let Some(claim) = &claim
+            && claim.flags & FLAG_ENCRYPTED == 0
+            && let Err(e) = zip_memory::check(
+                claim.method,
+                Some(file.size()),
+                &head,
+                self.memory_limit,
+                &entry_meta(&file, None).name,
+            )
+        {
             self.ended = true;
             return Err(e);
         }
@@ -2973,15 +3033,32 @@ impl Read for Recording<'_> {
 /// what ruling B3 compares; zip's view has already applied an Info-ZIP
 /// Unicode Path field to the name. `None` if the header cannot be parsed:
 /// zip then reports it, and the comparison is not made.
-fn peek_local_claim(source: &mut Pushback) -> Option<HeaderClaim> {
+///
+/// For a method whose decoder sizes itself from the payload's head
+/// ([`zip_memory::METHODS`]), also reads up to [`zip_memory::HEAD_LEN`]
+/// payload bytes (no further than the declared compressed size) and returns
+/// them, replayed like the rest; otherwise the head is empty.
+fn peek_local_claim(source: &mut Pushback) -> (Option<HeaderClaim>, Vec<u8>) {
     let mut recording = Recording {
         inner: source,
         seen: Vec::new(),
     };
     let claim = parse_local_claim(&mut recording);
+    let header_len = recording.seen.len();
+    if let Some(c) = &claim
+        && c.flags & FLAG_ENCRYPTED == 0
+        && zip_memory::METHODS.contains(&c.method)
+    {
+        let want = c
+            .csize
+            .map_or(zip_memory::HEAD_LEN, |n| n.min(zip_memory::HEAD_LEN));
+        let mut sink = Vec::new();
+        let _ = (&mut recording).take(want).read_to_end(&mut sink);
+    }
     let seen = recording.seen;
+    let head = seen[header_len..].to_vec();
     source.push_back(&seen);
-    claim
+    (claim, head)
 }
 
 /// Compares the walked local headers with the central records (ruling B3's

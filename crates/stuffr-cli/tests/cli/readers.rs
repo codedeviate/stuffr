@@ -430,3 +430,123 @@ fn an_unreadable_pax_mtime_is_a_fidelity_loss() {
     assert_eq!(out.status.code(), Some(4), "{}", stderr_text(&out));
     assert!(stderr_text(&out).contains("mtime"), "{}", stderr_text(&out));
 }
+
+/// A one-entry zip whose entry `x` uses `method`, with `data` as its
+/// compressed payload and `usize_` as its declared uncompressed size; the
+/// CRC is 0, so an entry that does decode fails its check (exit 5).
+fn zip_with_method(method: u16, data: &[u8], usize_: u32) -> Vec<u8> {
+    let le16 = |v: u16| v.to_le_bytes();
+    let le32 = |v: u32| v.to_le_bytes();
+    let name = b"x";
+    let mut out = Vec::new();
+    out.extend(b"PK\x03\x04");
+    out.extend(le16(63));
+    out.extend(le16(0));
+    out.extend(le16(method));
+    out.extend(le32(0)); // time, date
+    out.extend(le32(0)); // crc
+    out.extend(le32(data.len() as u32));
+    out.extend(le32(usize_));
+    out.extend(le16(name.len() as u16));
+    out.extend(le16(0));
+    out.extend(name);
+    out.extend(data);
+    let cd_at = out.len() as u32;
+    out.extend(b"PK\x01\x02");
+    out.extend(le16(63));
+    out.extend(le16(63));
+    out.extend(le16(0));
+    out.extend(le16(method));
+    out.extend(le32(0));
+    out.extend(le32(0));
+    out.extend(le32(data.len() as u32));
+    out.extend(le32(usize_));
+    out.extend(le16(name.len() as u16));
+    out.extend([0u8; 12]); // extra, comment, disk, internal attrs
+    out.extend(le32(0)); // external attrs
+    out.extend(le32(0)); // local header offset
+    out.extend(name);
+    let cd_len = out.len() as u32 - cd_at;
+    out.extend(b"PK\x05\x06");
+    out.extend([0u8; 4]);
+    out.extend(le16(1));
+    out.extend(le16(1));
+    out.extend(le32(cd_len));
+    out.extend(le32(cd_at));
+    out.extend(le16(0));
+    out
+}
+
+/// `test --memory-limit LIMIT` over `zip`, from a file and from a pipe.
+fn assert_zip_test_exits(dir: &Path, zip: &[u8], limit: &str, code: i32, label: &str) {
+    let path = dir.join(format!("{label}.zip"));
+    std::fs::write(&path, zip).unwrap();
+    let out = run_output(&["test", "--memory-limit", limit, path.to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(code),
+        "{label} file: {}",
+        stderr_text(&out)
+    );
+    let out = run_with_stdin_output(&["test", "--memory-limit", limit, "-"], zip);
+    assert_eq!(
+        out.status.code(),
+        Some(code),
+        "{label} pipe: {}",
+        stderr_text(&out)
+    );
+    if code == 6 {
+        assert!(
+            stderr_text(&out).contains("--memory-limit"),
+            "{}",
+            stderr_text(&out)
+        );
+    }
+}
+
+/// Finding 3: a zip entry's PPMd model, LZMA dictionary, xz dictionary or
+/// zstd window over `--memory-limit` is refused by its declaration (exit
+/// 6), as a standalone `.lzma`/`.xz`/`.zst` is, on the indexed and the
+/// forward rung — before the decoder allocates it (a 1 KB PPMd zip cost
+/// 276 MB). A declaration within the limit is read as before.
+#[test]
+fn a_zip_entry_decoder_is_held_to_the_memory_limit() {
+    let dir = tmp_dir();
+    let junk = vec![0x5au8; 1024];
+    // PPMd: order 8, 256 MiB model; then 1 MiB.
+    let mut ppmd = (7u16 | (255 << 4)).to_le_bytes().to_vec();
+    ppmd.extend(&junk);
+    assert_zip_test_exits(
+        &dir,
+        &zip_with_method(98, &ppmd, 4096),
+        "1M",
+        6,
+        "ppmd-256m",
+    );
+    let mut ppmd = 7u16.to_le_bytes().to_vec();
+    ppmd.extend(&junk);
+    assert_zip_test_exits(&dir, &zip_with_method(98, &ppmd, 4096), "1M", 5, "ppmd-1m");
+
+    // LZMA: a 1 GiB dictionary for 1 GiB of output; then for 4 KiB of
+    // output, which the decoder cuts the dictionary to.
+    let mut lzma = vec![9, 20, 5, 0, 0x5d];
+    lzma.extend((1u32 << 30).to_le_bytes());
+    lzma.extend(&junk);
+    assert_zip_test_exits(
+        &dir,
+        &zip_with_method(14, &lzma, 1 << 30),
+        "1M",
+        6,
+        "lzma-1g",
+    );
+    assert_zip_test_exits(&dir, &zip_with_method(14, &lzma, 4096), "1M", 5, "lzma-4k");
+
+    // xz: a stream whose first block declares a 64 MiB LZMA2 dictionary.
+    let mut xz = vec![
+        0xfd, b'7', b'z', b'X', b'Z', 0, 0, 4, 0xe6, 0xd6, 0xb4, 0x46,
+    ];
+    xz.extend([0x02, 0x00, 0x21, 0x01, 0x1c, 0x00, 0x00, 0x00, 0, 0, 0, 0]);
+    xz.extend(&junk);
+    assert_zip_test_exits(&dir, &zip_with_method(95, &xz, 4096), "1M", 6, "xz-64m");
+    assert_zip_test_exits(&dir, &zip_with_method(95, &xz, 4096), "128M", 5, "xz-under");
+}

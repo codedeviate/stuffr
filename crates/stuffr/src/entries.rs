@@ -363,7 +363,7 @@ fn open_archive(
         registry,
         &chain,
         source,
-        &opts.fidelity,
+        &opts,
         &consumed,
         max_ratio,
         &read_verb_policy,
@@ -387,13 +387,16 @@ fn open_archive(
 /// `policy_for` picks the ladder policy from the container's caps: the read
 /// verbs pass [`read_verb_policy`], `convert` passes [`convert_read_policy`].
 ///
-/// `sink` is the [`DecodeOpts::fidelity`] the codec layers were built with;
-/// [`DrainAtEnd`] folds it into the archive's report once the walk is over.
+/// `opts` are the [`DecodeOpts`] the codec layers were built with: its
+/// `fidelity` sink is what [`DrainAtEnd`] folds into the archive's report
+/// once the walk is over, and its `memory_limit` bounds the container's own
+/// entry decoders too ([`OpenOpts::memory_limit`]; a zip entry's PPMd model
+/// or LZMA dictionary, bug hunt 2026-11-15, finding 3).
 fn open_resolved(
     registry: &Registry,
     chain: &Chain,
     source: Box<dyn Source>,
-    sink: &FidelitySink,
+    opts: &DecodeOpts,
     consumed: &Arc<AtomicU64>,
     max_ratio: u64,
     policy_for: &dyn Fn(&ContainerCaps) -> StreamPolicy,
@@ -439,12 +442,16 @@ fn open_resolved(
                 // format, the container's own caps, and the policy.
                 let caps = k.caps();
                 let resolved = ladder::resolve(source, *container, caps, &policy_for(&caps))?;
-                let archive = k.open(resolved, &OpenOpts::default())?;
+                let open = OpenOpts {
+                    memory_limit: opts.memory_limit,
+                    ..OpenOpts::default()
+                };
+                let archive = k.open(resolved, &open)?;
                 let archive = match rest {
                     Some(rest) => Box::new(DrainAtEnd {
                         inner: archive,
                         rest: Some(rest),
-                        sink: sink.clone(),
+                        sink: opts.fidelity.clone(),
                         merged: std::cell::OnceCell::new(),
                     }),
                     None => archive,
@@ -4648,11 +4655,16 @@ pub fn convert_archive_source_with(
         quarantine: src.input_traits().quarantine.clone(),
     };
     let (chain, decoded, consumed, _raw_rung, compressed_total) = src.into_parts();
+    let read_opts = DecodeOpts {
+        memory_limit: o.memory_limit,
+        fidelity: sink,
+        ..Default::default()
+    };
     let (mut ar, source_container) = open_resolved(
         registry,
         &chain,
         decoded,
-        &sink,
+        &read_opts,
         &consumed,
         o.max_ratio,
         &|caps| convert_read_policy(caps, &o.spill),

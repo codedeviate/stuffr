@@ -320,6 +320,8 @@ pub mod xz_opts;
 #[cfg(feature = "zip")]
 pub mod zip;
 #[cfg(feature = "zip")]
+mod zip_memory;
+#[cfg(feature = "zip")]
 pub mod zip_salvage;
 // The format-agnostic streaming verifier `zip_salvage.rs`,
 // `legacy::arc_salvage` and `legacy::zoo_salvage` delegate to. Gated on

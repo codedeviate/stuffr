@@ -89,6 +89,12 @@ pub struct OpenOpts {
     /// ambient global. Needed so a container with `per_entry_codec` can build
     /// a `DecodeOpts` per entry, carrying the same governor forward.
     pub governor: Option<std::sync::Arc<crate::Governor>>,
+    /// The memory a container may let one entry's decoder allocate on the
+    /// archive's own say-so, as [`DecodeOpts::memory_limit`] bounds a codec:
+    /// a zip entry's PPMd model, LZMA or xz dictionary, or zstd window
+    /// beyond it is [`crate::Error::ResourceLimit`] (exit 6). `None` means
+    /// the container's default (zip: [`crate::default_memory_limit`]).
+    pub memory_limit: Option<u64>,
 }
 
 impl std::fmt::Debug for OpenOpts {
@@ -96,6 +102,7 @@ impl std::fmt::Debug for OpenOpts {
         f.debug_struct("OpenOpts")
             .field("password", &self.password)
             .field("governor", &self.governor.as_ref().map(|_| "Governor"))
+            .field("memory_limit", &self.memory_limit)
             .finish()
     }
 }

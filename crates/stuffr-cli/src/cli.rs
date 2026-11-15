@@ -336,7 +336,9 @@ pub enum Command {
         /// Bounds the codec layer beneath the container, which `--max-ratio`
         /// cannot see: a pure xz/lzma/lzip decoder sizes its dictionary from
         /// a value the file declares in its own header, before producing any
-        /// output. Defaults to 25% of available RAM, honouring cgroup limits.
+        /// output. A zip entry's PPMd model, LZMA or xz dictionary and zstd
+        /// window are held to it the same way. Defaults to 25% of available
+        /// RAM, honouring cgroup limits.
         #[arg(long, value_name = "SIZE")]
         memory_limit: Option<String>,
         /// Fail (exit 4) if the read approximated or lost anything.
@@ -376,7 +378,9 @@ pub enum Command {
         /// Bounds the codec layer beneath the container, which `--max-ratio`
         /// cannot see: a pure xz/lzma/lzip decoder sizes its dictionary from
         /// a value the file declares in its own header, before producing any
-        /// output. Defaults to 25% of available RAM, honouring cgroup limits.
+        /// output. A zip entry's PPMd model, LZMA or xz dictionary and zstd
+        /// window are held to it the same way. Defaults to 25% of available
+        /// RAM, honouring cgroup limits.
         #[arg(long, value_name = "SIZE")]
         memory_limit: Option<String>,
         /// Fail (exit 4) if the read approximated or lost anything.
@@ -519,7 +523,9 @@ pub struct LsArgs {
     /// Bounds the codec layer beneath the container, which `--max-ratio`
     /// cannot see: a pure xz/lzma/lzip decoder sizes its dictionary from
     /// a value the file declares in its own header, before producing any
-    /// output. Defaults to 25% of available RAM, honouring cgroup limits.
+    /// output. A zip entry's PPMd model, LZMA or xz dictionary and zstd
+    /// window are held to it the same way. Defaults to 25% of available
+    /// RAM, honouring cgroup limits.
     #[arg(long, value_name = "SIZE")]
     pub memory_limit: Option<String>,
     /// Archive only: fail (exit 4) if the read approximated or lost
