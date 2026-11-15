@@ -1145,6 +1145,9 @@ fn check_u32_size(name: &str, size: u64) -> Result<u32> {
     })
 }
 
+/// The name of newc's end-of-archive entry.
+const TRAILER_NAME: &str = "TRAILER!!!";
+
 struct CpioWrite {
     /// `None` once `finish` has consumed it.
     dst: Option<Box<dyn Sink>>,
@@ -1163,6 +1166,17 @@ impl ArchiveWrite for CpioWrite {
             return Err(Error::Unsupported(format!(
                 "cpio newc cannot store `{}`: its name contains a NUL byte, and newc \
                  stores names NUL-terminated",
+                meta.name
+            )));
+        }
+        // In newc the name `TRAILER!!!` IS the end-of-archive marker: an
+        // entry of that name would end the archive there for every reader,
+        // hiding itself and everything written after it. Refused like a NUL
+        // (bug hunt 2026-11-15, finding 17).
+        if meta.name == TRAILER_NAME {
+            return Err(Error::Unsupported(format!(
+                "cpio newc cannot store `{}`: that name is newc's end-of-archive marker, \
+                 and every reader would stop there",
                 meta.name
             )));
         }
@@ -1421,6 +1435,24 @@ mod tests {
             let entry = ar.next_entry().expect("read back").expect("an entry");
             assert_eq!(entry.meta().name, meta.name);
         }
+    }
+
+    /// Bug hunt 2026-11-15, finding 17: `TRAILER!!!` ends a newc archive,
+    /// so an entry of that name is refused rather than hiding itself and
+    /// every later entry. A name that merely contains it is still stored.
+    #[test]
+    fn the_trailer_name_is_refused() {
+        for kind in [EntryKind::File, EntryKind::Dir] {
+            let mut meta = EntryMeta::file(TRAILER_NAME);
+            meta.kind = kind;
+            let (r, bytes) = add_one(&meta);
+            let err = r.expect_err("the end-of-archive name");
+            assert_eq!(err.exit_code(), 3, "{err}");
+            assert!(err.to_string().contains("end-of-archive"), "{err}");
+            assert!(bytes.is_empty());
+        }
+        let (r, _) = add_one(&EntryMeta::file("d/TRAILER!!!"));
+        r.expect("a path ending in the marker is an ordinary name");
     }
 
     /// newc stores the name NUL-terminated and its reader trims trailing

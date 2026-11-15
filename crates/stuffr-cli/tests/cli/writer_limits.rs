@@ -106,3 +106,30 @@ fn the_ar_writer_refuses_a_name_bsd_ar_cannot_read() {
         }
     }
 }
+
+/// Finding 17: in newc the name `TRAILER!!!` IS the end-of-archive marker,
+/// so an entry of that name hid itself and every entry after it from every
+/// reader while pack reported "no fidelity loss". Refused at exit 3.
+#[test]
+fn the_cpio_writer_refuses_the_trailer_name() {
+    let dir = tmp_dir();
+    for name in ["aaa", "TRAILER!!!", "zzz"] {
+        std::fs::write(dir.join(name), name).unwrap();
+    }
+    let dst = dir.join("out.cpio");
+    let out = run_output(&[
+        "pack",
+        dir.join("aaa").to_str().unwrap(),
+        dir.join("TRAILER!!!").to_str().unwrap(),
+        dir.join("zzz").to_str().unwrap(),
+        "-o",
+        dst.to_str().unwrap(),
+        "--strict-fidelity",
+    ]);
+    assert_refused_with_nothing_left(&out, &dst, "cpio newc");
+    assert!(
+        stderr_text(&out).contains("TRAILER!!!"),
+        "{}",
+        stderr_text(&out)
+    );
+}
