@@ -1555,6 +1555,20 @@ impl ArchiveWrite for ArWrite {
                 meta.name
             )));
         }
+        // Apple's `ar` refuses a `#1/N` name whose padded length N is over
+        // its MAXNAMLEN, 255, and can read nothing after it; the `ar` crate
+        // pads to a multiple of four, so 253 bytes is already N = 256. Far
+        // inside `MAX_BSD_IDENTIFIER_LEN`, so this also keeps the writer
+        // inside what its own reader takes (bug hunt 2026-11-15, findings 23
+        // and 2).
+        if meta.name.len() > MAX_AR_NAME_LEN {
+            return Err(Error::Unsupported(format!(
+                "ar cannot store `{}`: its name is {} bytes, and BSD ar reads a member \
+                 name of at most {MAX_AR_NAME_LEN}",
+                meta.name,
+                meta.name.len()
+            )));
+        }
         // `ar` needs the size up front and cannot stream an unknown length,
         // so an entry of unknown size is buffered. Stated rather than
         // hidden: this is the one container here that cannot stream its
@@ -1691,6 +1705,13 @@ fn write_safe_identifier(mut identifier: Vec<u8>) -> Vec<u8> {
     }
     identifier
 }
+
+/// Longest member name this writer stores: the largest whose BSD `#1/N`
+/// form, padded to a multiple of four as the `ar` crate pads it, keeps N
+/// within Apple `ar`'s MAXNAMLEN of 255. Measured: N = 240 lists, N = 256
+/// is "Inappropriate file type or format".
+const MAX_AR_NAME_LEN: usize = 252;
+const _: () = assert!(MAX_AR_NAME_LEN as u64 <= MAX_BSD_IDENTIFIER_LEN);
 
 /// Largest uid/gid the 6-digit decimal fields hold.
 const MAX_ID: u32 = 999_999;
@@ -1931,6 +1952,39 @@ mod tests {
         let m = err.to_string();
         assert!(m.contains("`a\\x1b\\0b`"), "{m}");
         assert!(!m.contains("\\\\"), "double escaped: {m}");
+    }
+
+    /// Bug hunt 2026-11-15, findings 23 and 2: Apple's `ar` refuses a BSD
+    /// `#1/N` name whose padded length N is over 255 ("Inappropriate file
+    /// type or format") and reads nothing after it, so the writer refuses
+    /// a name of 253 bytes or more (padded to 256) at exit 3, before a byte
+    /// is written. 252 bytes (N = 252) is still written and read back.
+    #[test]
+    fn a_name_past_what_bsd_ar_reads_is_refused() {
+        let add = |name: String| {
+            let buf = SharedBuf::new();
+            let mut w = Ar
+                .create(
+                    PlainSink::new(Box::new(buf.clone())),
+                    &CreateOpts::default(),
+                )
+                .unwrap();
+            let r = w.add(&EntryMeta::file(name), &mut std::io::Cursor::new(b"x"));
+            (r, w, buf)
+        };
+        for len in [MAX_AR_NAME_LEN + 1, 256, 70_000] {
+            let (r, _, buf) = add("n".repeat(len));
+            let err = r.expect_err("past what BSD ar reads");
+            assert_eq!(err.exit_code(), 3, "{len}: {err}");
+            assert!(err.to_string().contains("ar cannot store"), "{err}");
+            assert!(buf.contents().is_empty(), "nothing written");
+        }
+        let name = "n".repeat(MAX_AR_NAME_LEN);
+        let (r, w, buf) = add(name.clone());
+        r.expect("the largest name BSD ar reads");
+        w.finish().unwrap().finish().unwrap();
+        let mut ar = open(&buf.contents());
+        assert_eq!(ar.next_entry().unwrap().unwrap().meta().name, name);
     }
 
     /// A BSD `#1/N` name is NUL-padded and read back with every trailing

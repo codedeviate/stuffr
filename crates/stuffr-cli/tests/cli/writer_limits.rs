@@ -83,3 +83,26 @@ fn convert_refuses_what_the_target_reader_would_refuse() {
         assert_refused_with_nothing_left(&out, &dst, format);
     }
 }
+
+/// Findings 23 and 2: a member name of 253 bytes or more pads past Apple
+/// `ar`'s 255-byte limit (and a 70 KiB one past stuffr's own reader), so
+/// the ar writer refuses it at exit 3; 252 bytes is still written.
+#[test]
+fn the_ar_writer_refuses_a_name_bsd_ar_cannot_read() {
+    let dir = tmp_dir();
+    for (len, code) in [(252usize, 0), (253, 3), (70_000, 3)] {
+        let src = write_fixture_tar(&dir, &[(&"n".repeat(len), b"x"), ("zzz", b"z")]);
+        let dst = dir.join(format!("o{len}.ar"));
+        let out = run_output(&[
+            "convert",
+            src.to_str().unwrap(),
+            "-o",
+            dst.to_str().unwrap(),
+        ]);
+        if code == 0 {
+            assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+        } else {
+            assert_refused_with_nothing_left(&out, &dst, "ar");
+        }
+    }
+}
