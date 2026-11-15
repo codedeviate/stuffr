@@ -154,3 +154,32 @@ fn the_lha_writer_refuses_a_backslash_in_a_name() {
     ]);
     assert_refused_with_nothing_left(&out, &dst, "LHA");
 }
+
+/// Finding 19: an ARJ name is read back one byte per character (Latin-1),
+/// so the writer stores it that way: `åäö.txt` lists as itself (it came
+/// back as UTF-8 mojibake at "exact fidelity"), and a name with a
+/// character past U+00FF is refused at exit 3.
+#[test]
+fn arj_names_round_trip_as_latin_1() {
+    let dir = tmp_dir();
+    let tree = dir.join("tree");
+    std::fs::create_dir(&tree).unwrap();
+    std::fs::write(tree.join("åäö.txt"), b"utf").unwrap();
+    let dst = dir.join("out.arj");
+    let out = run_output(&[
+        "pack",
+        tree.to_str().unwrap(),
+        "-o",
+        dst.to_str().unwrap(),
+        "--strict-fidelity",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    let list = run_output(&["list", dst.to_str().unwrap()]);
+    let text = String::from_utf8_lossy(&list.stdout);
+    assert!(text.contains("tree/åäö.txt"), "{text}");
+
+    std::fs::write(tree.join("日本.txt"), b"x").unwrap();
+    let dst = dir.join("wide.arj");
+    let out = run_output(&["pack", tree.to_str().unwrap(), "-o", dst.to_str().unwrap()]);
+    assert_refused_with_nothing_left(&out, &dst, "ARJ");
+}

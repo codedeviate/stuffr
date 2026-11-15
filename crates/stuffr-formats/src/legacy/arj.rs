@@ -1498,6 +1498,22 @@ impl ArjWrite {
     }
 }
 
+/// `name` as the Latin-1 bytes the ARJ reader decodes back into it, or
+/// the refusal for a char past U+00FF. See [`ArjWrite::add`].
+fn latin_1_name(name: &str) -> Result<Vec<u8>> {
+    name.chars()
+        .map(|c| {
+            u8::try_from(u32::from(c)).map_err(|_| {
+                Error::Unsupported(format!(
+                    "ARJ cannot store `{name}`: its name holds `{c}` (U+{:04X}), and ARJ \
+                     names are read back one byte per character (Latin-1), up to U+00FF",
+                    u32::from(c)
+                ))
+            })
+        })
+        .collect()
+}
+
 impl ArchiveWrite for ArjWrite {
     fn add(&mut self, meta: &EntryMeta, data: &mut dyn Read) -> Result<()> {
         if matches!(meta.kind, EntryKind::Hardlink { .. }) {
@@ -1517,7 +1533,14 @@ impl ArchiveWrite for ArjWrite {
                 meta.name
             )));
         }
-        let name = meta.name.as_bytes();
+        // The reader (`unarj-rs`'s `convert_string!`, `push(byte as char)`)
+        // decodes a name as Latin-1, one char per byte, so the writer is its
+        // inverse: each char is stored as the byte of its code point. Raw
+        // UTF-8 came back as mojibake at "exact fidelity". A char past
+        // U+00FF has no such byte and is refused (bug hunt 2026-11-15,
+        // finding 19).
+        let name = latin_1_name(&meta.name)?;
+        let name = name.as_slice();
         if name.len() > MAX_ARJ_NAME_LEN {
             return Err(Error::Unsupported(format!(
                 "ARJ cannot store `{}`: its name is {} bytes, and the format's maximum basic \
@@ -2316,6 +2339,30 @@ mod tests {
             err.to_string().contains("NUL"),
             "the refusal must say what about the name it cannot store: {err}"
         );
+    }
+
+    /// Bug hunt 2026-11-15, finding 19: the reader (`unarj-rs`'s
+    /// `convert_string!`, `push(byte as char)`) decodes a name as Latin-1,
+    /// one char per byte, so the writer stores each char as that byte: a
+    /// name of chars up to U+00FF round-trips exactly (it came back as
+    /// UTF-8 mojibake at "exact fidelity"), and one past U+00FF has no byte
+    /// and is refused, exit 3. The byte on disk is pinned too.
+    #[test]
+    fn a_latin_1_name_round_trips_and_a_wider_one_is_refused() {
+        let name = "tree/åäö-ÿ.txt";
+        let bytes = write_arj(&[(EntryMeta::file(name), &b"x"[..])]);
+        assert!(
+            bytes.windows(4).any(|w| w == b"/\xe5\xe4\xf6"),
+            "stored as Latin-1 bytes"
+        );
+        let back = read_entries(&bytes);
+        assert_eq!(back[0].0, name);
+
+        for wide in ["€.txt", "日本.txt", "a\u{100}"] {
+            let err = write_one_expecting_error(&EntryMeta::file(wide), b"x");
+            assert_eq!(err.exit_code(), 3, "{wide}: {err}");
+            assert!(err.to_string().contains("ARJ cannot store"), "{err}");
+        }
     }
 
     /// An mtime survives to MS-DOS's own two-second resolution, and rounds
