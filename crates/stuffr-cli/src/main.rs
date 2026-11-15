@@ -11,6 +11,23 @@ use stuffr::{Chain, FormatId};
 use stuffr_cli::cli::{Cli, Command};
 use stuffr_cli::format_by_name;
 
+/// `eprintln!` that never panics, shadowing the standard one in this file
+/// and in `ls` (defined before `mod ls`, so it is in scope there too).
+///
+/// The standard macro panics when the write fails: the runtime ignores
+/// SIGPIPE, so a standard error whose reader has gone (`2>&1 | grep -q`,
+/// `| head -1`) gave EPIPE and every verb died with exit 101, its real
+/// verdict (0, 2, 5...) lost (bug hunt 2026-11-15, findings 13 and 35).
+/// A diagnostic nobody can read is dropped; the run goes on and exits with
+/// the code its outcome deserves. Each line is written whole, as one
+/// `write_all` on the locked handle.
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock(), $($arg)*);
+    }};
+}
+
 mod ls;
 
 /// The `--examples` page. A static asset rather than an inline literal so it
@@ -886,10 +903,23 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             } else {
                 names.iter().map(String::as_str).collect()
             };
-            for a in links::install_links(&dir, &chosen, force, remove, dry_run, &target)? {
-                println!("{}", a.describe(&target));
+            let actions = links::install_links(&dir, &chosen, force, remove, dry_run, &target)?;
+            // Not `println!`, which panics on a closed stdout (bug hunt
+            // 2026-11-15, finding 14): the links are already made, so a
+            // reader that went away ends the report quietly, as
+            // `--examples` does.
+            use std::io::Write as _;
+            let mut out = std::io::stdout().lock();
+            for a in actions {
+                match writeln!(out, "{}", a.describe(&target)) {
+                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+                    written => written?,
+                }
             }
-            Ok(())
+            match out.flush() {
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                flushed => Ok(flushed?),
+            }
         }
         Command::List {
             input,

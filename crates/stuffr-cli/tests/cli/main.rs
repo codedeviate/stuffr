@@ -1,4 +1,5 @@
 mod bench;
+mod closed_streams;
 mod common;
 mod convert;
 mod entries;
