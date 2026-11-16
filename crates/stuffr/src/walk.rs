@@ -99,7 +99,9 @@ pub(crate) fn open_planned(path: &Path, seen: &Seen) -> std::io::Result<std::fs:
 
 /// Off unix there is no `O_NOFOLLOW`/`O_NONBLOCK` to ask for: a plain open.
 #[cfg(not(unix))]
-pub(crate) fn open_planned(path: &Path, _seen: &Seen) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_planned(path: &Path, seen: &Seen) -> std::io::Result<std::fs::File> {
+    // No identity to check off unix; read so the fields are not dead here.
+    let _ = (seen.id, seen.follow);
     std::fs::File::open(path)
 }
 

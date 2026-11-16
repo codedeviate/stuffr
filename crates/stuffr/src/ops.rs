@@ -30,27 +30,6 @@ static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
 /// generous only ever bites on something more structurally wrong.
 const MAX_TMP_ATTEMPTS: u32 = 100;
 
-/// Creates a fresh, uniquely-named temp file beside `parent`/`file_name`, at
-/// the mode this destination's carry-over case demands.
-///
-/// `restrict` selects between the two modes this project cares about: 0600
-/// (`restrict: true`) when a mode is about to be set on this file — a
-/// pre-existing destination's, or the input file's (security audit HOST-1)
-/// — closing the window between creation and that later widening, during
-/// which another local user could otherwise open the file while it is still
-/// world/group-readable and keep reading from that descriptor even after
-/// permissions are narrowed; or the ordinary umask-derived default
-/// (`restrict: false`) when there is no mode to set (a stream input, or an
-/// archive written from many inputs).
-///
-/// Split out from `Output::create` specifically so this one decision is
-/// independently testable: inlined, the widening `set_permissions` call that
-/// always immediately follows whenever there is anything to carry over
-/// overwrites whatever mode creation chose, so the file's PERSISTED state by
-/// the time `Output::create` returns can never reveal which mode this
-/// function actually picked — the two would look identical to any test that
-/// only inspects `Output::create`'s result. Calling this directly, without
-/// the widening step, is what makes the choice observable at all.
 /// How the binary removes a native temporary on a signal (bug hunt
 /// 2026-11-15, finding 10). This crate installs no signal handler of its
 /// own; the CLI registers one of these ([`watch_temps`]) and every temp
@@ -91,6 +70,27 @@ fn release_temp(tmp: &Path) {
     }
 }
 
+/// Creates a fresh, uniquely-named temp file beside `parent`/`file_name`, at
+/// the mode this destination's carry-over case demands.
+///
+/// `restrict` selects between the two modes this project cares about: 0600
+/// (`restrict: true`) when a mode is about to be set on this file — a
+/// pre-existing destination's, or the input file's (security audit HOST-1)
+/// — closing the window between creation and that later widening, during
+/// which another local user could otherwise open the file while it is still
+/// world/group-readable and keep reading from that descriptor even after
+/// permissions are narrowed; or the ordinary umask-derived default
+/// (`restrict: false`) when there is no mode to set (a stream input, or an
+/// archive written from many inputs).
+///
+/// Split out from `Output::create` specifically so this one decision is
+/// independently testable: inlined, the widening `set_permissions` call that
+/// always immediately follows whenever there is anything to carry over
+/// overwrites whatever mode creation chose, so the file's PERSISTED state by
+/// the time `Output::create` returns can never reveal which mode this
+/// function actually picked — the two would look identical to any test that
+/// only inspects `Output::create`'s result. Calling this directly, without
+/// the widening step, is what makes the choice observable at all.
 fn create_temp_file(
     parent: &Path,
     file_name: &str,

@@ -104,6 +104,12 @@ fn interrupt_pack(dir: &Path, out_name: &str, sig: i32) -> Option<(ExitStatus, V
         // Finished between the check and the signal: a miss.
         return None;
     }
+    // Killed after the publish (directory fsync, summary line): the output
+    // is complete and in place, and the run still dies of the signal. Also
+    // a miss, to retry with more input (task 2 review, M1).
+    if dir.join(out_name).exists() {
+        return None;
+    }
     Some((status, entries(dir)))
 }
 

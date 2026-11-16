@@ -6247,6 +6247,7 @@ type DevIno = (u64, u64);
 /// `mode` is the creation mode (still masked by the umask, as `mkdir(2)`
 /// does); `None` is the umask default. See [`initial_dir_mode`].
 fn create_dir_once(path: &Path, mode: Option<u32>) -> std::io::Result<bool> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     if let Some(mode) = mode {
