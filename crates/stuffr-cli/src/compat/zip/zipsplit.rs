@@ -441,7 +441,10 @@ fn make_part(
             let n = format!("{:>5}", job.a[idx] + 1);
             printf(&mut buf, m::INDEX_LINE, &[n.as_bytes(), cstr(&zf.zname)]);
         }
-        let r = w.write_all(&buf).and_then(|()| w.flush());
+        // deviation 37: fclose checked (zipsplit does not look at it)
+        let r = w
+            .write_all(&buf)
+            .and_then(|()| zipfile::ZWrite::close(&mut w));
         if let Err(e) = r {
             return Err(part_error(z, job, ZE_WRITE, &path, &e));
         }
@@ -494,8 +497,9 @@ fn make_part(
         }
         Err(PutError::Write(err)) => return Err(Part::End(write_failed(z, &err))),
     }
-    let flushed = out.w.flush();
-    let failed = flushed.err().or_else(|| out.w.ferror());
+    // deviation 37: the part's fclose, close(2) included, checked
+    let closed = out.w.close();
+    let failed = closed.err().or_else(|| out.w.ferror());
     if let Some(e) = failed {
         return Err(part_error(z, job, ZE_WRITE, &path, &e));
     }

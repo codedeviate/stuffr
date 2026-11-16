@@ -516,3 +516,29 @@ fn a_failing_close_replaces_nothing_and_moves_nothing() {
     assert_eq!(code, 0);
     assert!(!s.0.join("b").exists());
 }
+
+/// Review M7 of finding 30 (deviation 37): the close of every split but
+/// the last (`close_split`) is checked too. Failing only the second close
+/// of the run (a split's; the last split's close is the run's final one)
+/// ends the run as a write failure: no archive published, `-m` deletes
+/// nothing. zip ignores that `fclose`; before the fix this close was
+/// never asked, so the archive was made and the file moved.
+#[cfg(unix)]
+#[test]
+fn a_failing_split_close_moves_nothing() {
+    let s = Scratch::new("splitclose");
+    std::fs::write(s.0.join("big"), big(300_000)).unwrap();
+    let args = ["-q", "-0", "-s", "64k", "-m", "t.zip", "big"];
+    host::fail_nth_close(1, libc::EIO);
+    let (code, out, err) = run(&s.0, &args, "big", InputReads::default());
+    host::fail_closes(None);
+    assert_eq!(code, 14, "{out} {err}");
+    assert!(out.contains("Could not write split"), "{out}");
+    assert!(s.0.join("big").exists());
+    assert!(!s.0.join("t.zip").exists());
+    // A working run splits and moves it.
+    let (code, out, err) = run(&s.0, &args, "big", InputReads::default());
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(!s.0.join("big").exists());
+    assert!(s.0.join("t.z01").exists() && s.0.join("t.zip").exists());
+}

@@ -423,6 +423,14 @@
 //!     `-v`), and its `trash()` deletes neither the archive written nor the
 //!     one read, whatever entry names them (`zip warning: not deleting the
 //!     archive: NAME`).
+//! 37. Every output's `close(2)` is checked (finding 30 of the second bug
+//!     hunt: a network file system may report a deferred write error only
+//!     there). zip ignores the `fclose` of a split it moves on from and of
+//!     zipsplit's parts and index. stuffr takes a failed one for a write
+//!     failure: a split is `zip I/O error: ...` then `zip error: Output file
+//!     write failure (Could not write split)`, exit 14, the split removed,
+//!     nothing published and `-m` deleting nothing; a zipsplit part or index
+//!     is its write error (exit 14).
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};

@@ -2349,6 +2349,11 @@ before the command line, as the reference does.
     name after updating it. stuffr leaves the `-O` target out of the scan, as
     zip does the archive it reads, and never deletes the archive written or
     read (`zip warning: not deleting the archive: NAME`).
+37. **A failed close of a split or a zipsplit part is a write failure.**
+    zip does not look at the `fclose` of a split it moves on from, nor of
+    zipsplit's parts and index, where a network file system may report a
+    deferred write error. stuffr ends the run there (exit 14): nothing is
+    published and `-m` deletes nothing.
 
 The full set is in the code's module docs
 (`crates/stuffr-cli/src/compat/zip/mod.rs`), which is the source of truth.

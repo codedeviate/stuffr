@@ -415,8 +415,19 @@ impl SplitW {
             l.extend_from_slice(&split_path);
             pending.push(Pend::Message(l));
         }
-        // fclose: a buffered write failing here is not looked at by zip
-        let _ = w.flush();
+        // fclose. zip does not look at its result; deviation 37 (finding 30
+        // of the second bug hunt): a split whose last write or close(2)
+        // fails is a write failure, removed, and the run ends before
+        // anything is replaced or `-m` deletes a file.
+        if let Err(e) = w.close() {
+            drop(w);
+            let _ = std::fs::remove_file(self.env.path(tempname));
+            return Err(split_fail(
+                ZE_WRITE,
+                m::COULD_NOT_WRITE_SPLIT.as_bytes(),
+                Some(e),
+            ));
+        }
         drop(w);
         // zip.c:rename_split
         let to = self.env.path(&split_path);
