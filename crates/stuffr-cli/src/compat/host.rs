@@ -2896,6 +2896,20 @@ impl Host {
         };
         BufWriter::with_capacity(64 * 1024, w)
     }
+
+    /// [`Host::out_writer`] over a writer of the caller's own for an
+    /// output file (one that keeps the file to close it checked): the
+    /// sandbox's budget applies to it as to a file.
+    pub(crate) fn file_writer(&self, w: Box<dyn Write + Send>) -> BufWriter<Box<dyn Write + Send>> {
+        let w: Box<dyn Write + Send> = match self {
+            Host::Real => w,
+            Host::Sandbox(s) => Box::new(Capped {
+                inner: w,
+                budget: s.budget.clone(),
+            }),
+        };
+        BufWriter::with_capacity(64 * 1024, w)
+    }
 }
 
 /// A sandboxed run's standard output.

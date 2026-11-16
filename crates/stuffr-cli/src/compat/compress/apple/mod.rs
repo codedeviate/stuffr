@@ -390,4 +390,53 @@ mod tests {
             assert!(matches!(code, 0 | 1), "round {round}: exit {code}");
         }
     }
+
+    /// Final review item 5 (bug hunt 2): the output has two descriptors,
+    /// the stream's and the duplicate `setfile` uses. On Linux NFS the
+    /// deferred write error comes back from whichever is closed first, so
+    /// both closes are checked: failing either is `cwarn(out)`, exit 1, the
+    /// output removed and the input kept, compressing and decompressing.
+    /// (Dropping either unchecked removed the input.)
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_close_of_either_descriptor_keeps_the_input() {
+        use crate::compat::host;
+        let d = scratch("close");
+        let data = text(10_000);
+        let attempt = |name: &'static str, operand: &str, nth: Option<u32>| {
+            if let Some(n) = nth {
+                host::fail_nth_close(n, libc::EIO);
+            }
+            let r = run(&d, name, &[operand], b"");
+            host::fail_closes(None);
+            r
+        };
+        std::fs::write(d.join("f"), &data).unwrap();
+        for nth in [0, 1] {
+            let (code, _, err) = attempt("compress", "f", Some(nth));
+            assert_eq!(
+                (code, err.as_str()),
+                (1, "compress: f.Z: Input/output error\n"),
+                "close {nth}"
+            );
+            assert_eq!(std::fs::read(d.join("f")).unwrap(), data, "close {nth}");
+            assert!(!d.join("f.Z").exists(), "close {nth}");
+        }
+        let (code, _, err) = attempt("compress", "f", None);
+        assert_eq!((code, err.as_str()), (0, ""));
+        let z = std::fs::read(d.join("f.Z")).unwrap();
+        for nth in [0, 1] {
+            let (code, _, err) = attempt("uncompress", "f.Z", Some(nth));
+            assert_eq!(
+                (code, err.as_str()),
+                (1, "uncompress: f: Input/output error\n"),
+                "close {nth}"
+            );
+            assert_eq!(std::fs::read(d.join("f.Z")).unwrap(), z, "close {nth}");
+            assert!(!d.join("f").exists(), "close {nth}");
+        }
+        let (code, _, err) = attempt("uncompress", "f.Z", None);
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert_eq!(std::fs::read(d.join("f")).unwrap(), data);
+    }
 }

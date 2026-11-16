@@ -118,6 +118,39 @@ impl<W: Write> Write for LineBuffered<W> {
     }
 }
 
+/// The output file, shared by its writer and the run, so that the run can
+/// close it checked (`if (fclose(ofp)) { cwarn(out); goto err; }`) once the
+/// writer is gone, instead of the writer dropping it unchecked.
+#[derive(Clone)]
+struct OutFile(std::sync::Arc<std::sync::Mutex<Option<File>>>);
+
+impl OutFile {
+    fn new(f: File) -> OutFile {
+        OutFile(std::sync::Arc::new(std::sync::Mutex::new(Some(f))))
+    }
+    /// `fclose(ofp)`: through [`host::close_file`], its result kept.
+    fn close(self) -> io::Result<()> {
+        let f = self.0.lock().unwrap_or_else(|p| p.into_inner()).take();
+        f.map_or(Ok(()), host::close_file)
+    }
+    fn with<T>(&self, op: impl FnOnce(&mut File) -> io::Result<T>) -> io::Result<T> {
+        let mut g = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        match g.as_mut() {
+            Some(f) => op(f),
+            None => Err(io::Error::other("the output is closed")),
+        }
+    }
+}
+
+impl Write for OutFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.with(|f| f.write(buf))
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.with(|f| f.flush())
+    }
+}
+
 /// The run's state: compress.c's globals and the process around them.
 struct Run<'h, 'e> {
     name: &'static str,
@@ -324,8 +357,13 @@ impl Run<'_, '_> {
     /// The writer for an output opened as `file`, or standard output: the
     /// host's, line-buffered when standard output is a terminal, as stdio
     /// buffers it.
-    fn writer(&self, file: Option<File>) -> Box<dyn Write> {
-        if file.is_none() && self.host.stdout_is_tty() {
+    fn writer(&self, file: Option<File>) -> (Box<dyn Write>, Option<OutFile>) {
+        if let Some(f) = file {
+            let shared = OutFile::new(f);
+            let w = self.host.file_writer(Box::new(shared.clone()));
+            return (Box::new(w), Some(shared));
+        }
+        if self.host.stdout_is_tty() {
             let inner = host::stdout_writer();
             #[cfg(unix)]
             let cap = {
@@ -340,13 +378,16 @@ impl Run<'_, '_> {
             };
             #[cfg(not(unix))]
             let cap = TTY_BUFSIZ;
-            return Box::new(LineBuffered {
-                inner,
-                buf: Vec::with_capacity(cap),
-                cap,
-            });
+            return (
+                Box::new(LineBuffered {
+                    inner,
+                    buf: Vec::with_capacity(cap),
+                    cap,
+                }),
+                None,
+            );
         }
-        Box::new(self.host.out_writer(file))
+        (Box::new(self.host.out_writer(None)), None)
     }
 
     /// Open where the output is written: the output itself, or for
@@ -410,6 +451,33 @@ impl Run<'_, '_> {
             }
             _ => {}
         }
+    }
+
+    /// Close the output's duplicate descriptor (kept for [`Run::setfile`]),
+    /// checked, before the input is removed. On Linux every `close(2)` of
+    /// a descriptor of the file flushes it and NFS reports a deferred write
+    /// error on whichever comes first, so dropping it unchecked could hide
+    /// the error that must keep the input (as 0d2422c did for lz4). A
+    /// failure is `cwarn(out)` and the `err:` path: the output removed,
+    /// the input kept.
+    fn close_dup(
+        &mut self,
+        fd: Option<host::OutFd>,
+        target: &Target,
+        oreg: bool,
+        shown: &[u8],
+    ) -> bool {
+        let Err(e) = fd.map_or(Ok(()), host::OutFd::close) else {
+            return true;
+        };
+        self.cwarn_io(shown, &e);
+        match target {
+            Target::Temp { out, .. } if !self.cat && oreg => {
+                let _ = fs::remove_file(out);
+            }
+            _ => self.discard(target, oreg),
+        }
+        false
     }
 
     /// A finished temporary takes the output's name (deviation A2).
@@ -484,7 +552,8 @@ impl Run<'_, '_> {
                 return;
             }
         };
-        let mut enc = Encoder::new(self.writer(file), self.bits);
+        let (w, shared) = self.writer(file);
+        let mut enc = Encoder::new(w, self.bits);
         let mut buf = [0u8; BUFSIZ];
         let failed = loop {
             let (n, rerr) = fread(&mut *input, &mut buf);
@@ -521,6 +590,13 @@ impl Run<'_, '_> {
             return;
         }
         drop(enc);
+        // `fclose(ofp)`, checked; the duplicate descriptor stays open for
+        // `setfile` and is closed, checked, before the input goes.
+        if let Err(e) = shared.map_or(Ok(()), OutFile::close) {
+            self.cwarn_io(out_shown, &e);
+            self.discard(&target, oreg);
+            return;
+        }
         let (Some(written), Some(isb)) = (target.written(), isb.as_ref()) else {
             return;
         };
@@ -552,6 +628,9 @@ impl Run<'_, '_> {
         let Name::File(i) = inp else { return };
         if let Some(fd) = fd.as_mut() {
             self.setfile(out_shown, fd, isb);
+        }
+        if !self.close_dup(fd, &target, oreg, out_shown) {
+            return;
         }
         if let Err(e) = fs::remove_file(self.path(i)) {
             self.cwarn_io(i, &e);
@@ -598,7 +677,7 @@ impl Run<'_, '_> {
                 return;
             }
         };
-        let mut w = self.writer(file);
+        let (mut w, shared) = self.writer(file);
         if let Err(e) = w.write_all(&buf[..nr]) {
             // Apple returns here without removing the output; only
             // stuffr's own temporary goes.
@@ -646,7 +725,15 @@ impl Run<'_, '_> {
             }
         };
         drop(w);
-        if !flushed {
+        let closed = flushed
+            && match shared.map_or(Ok(()), OutFile::close) {
+                Ok(()) => true,
+                Err(e) => {
+                    self.cwarn_io(out_shown, &e);
+                    false
+                }
+            };
+        if !closed {
             self.discard(&target, oreg);
             return;
         }
@@ -661,6 +748,9 @@ impl Run<'_, '_> {
         let out_path = self.path(out_shown);
         if let Some(fd) = fd.as_mut() {
             self.setfile(out_shown, fd, isb);
+        }
+        if !self.close_dup(fd, &target, oreg, out_shown) {
+            return;
         }
         if let Err(e) = fs::remove_file(self.path(i)) {
             self.cwarn_io(i, &e);
