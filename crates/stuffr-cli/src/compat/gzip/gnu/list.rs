@@ -115,6 +115,14 @@ impl Lister {
         }
     }
 
+    /// An input refused at its header (not gzip, an unknown method or
+    /// flags, encrypted, a zip it cannot read): no header bytes, so the
+    /// totals that follow subtract none (observed: `gzip -l a.gz plain`
+    /// totals 65.0% where `a.gz`'s own line says 65.6%).
+    pub(super) fn refused(&mut self) {
+        self.last_header_bytes = 0;
+    }
+
     /// After the last operand of a run that was not stopped: the totals,
     /// when there were several operands and not under `-q`.
     pub(super) fn finish(

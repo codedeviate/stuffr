@@ -1777,6 +1777,69 @@ mod differential {
         check_exact("list", &cases, none_skipped());
     }
 
+    /// Bug hunt 2, finding 38: the totals subtract the header bytes of the
+    /// last input looked at, and an input refused at its header (not in
+    /// gzip format, an unknown method, encrypted, unknown flags, an
+    /// encrypted zip or one of another method) has none, so after it the
+    /// totals' ratio is of the whole compressed size (GNU 1.15: `65.0%`
+    /// where the listed file's own line says `65.6%`).
+    #[test]
+    fn list_totals_after_a_refused_operand() {
+        let t = txt();
+        let good = gzm(&t, b"stored-name");
+        let zip = |flag: u16, method: u16| {
+            let mut v = b"PK\x03\x04".to_vec();
+            for h in [20u16, flag, method, 0, 0] {
+                v.extend_from_slice(&h.to_le_bytes());
+            }
+            for w in [0u32, 5, 5] {
+                v.extend_from_slice(&w.to_le_bytes());
+            }
+            v.extend_from_slice(&1u16.to_le_bytes());
+            v.extend_from_slice(&0u16.to_le_bytes());
+            v.extend_from_slice(b"xhello");
+            v
+        };
+        let files = || {
+            vec![
+                ("good.gz", good.clone()),
+                ("plain.gz", t.clone()),
+                (
+                    "meth.gz",
+                    b"\x1f\x8b\x09\x00\x00\x00\x00\x00\x00\x03xxxx".to_vec(),
+                ),
+                (
+                    "enc.gz",
+                    b"\x1f\x8b\x08\x20\x00\x00\x00\x00\x00\x03xxxxxxxxxx".to_vec(),
+                ),
+                (
+                    "flg.gz",
+                    b"\x1f\x8b\x08\xc0\x00\x00\x00\x00\x00\x03xxxxxxxx".to_vec(),
+                ),
+                ("zenc.gz", zip(1, 8)),
+                ("zmeth.gz", zip(0, 99)),
+            ]
+        };
+        let mut cases = Vec::new();
+        for flags in [&["-l"][..], &["-lv"], &["-lq"]] {
+            for ops in [
+                &["good.gz", "plain.gz"][..],
+                &["good.gz", "good.gz", "plain.gz"],
+                &["good.gz", "plain.gz", "good.gz"],
+                &["good.gz", "meth.gz"],
+                &["good.gz", "enc.gz"],
+                &["good.gz", "flg.gz"],
+                &["good.gz", "zenc.gz"],
+                &["good.gz", "zmeth.gz"],
+            ] {
+                let mut a = flags.to_vec();
+                a.extend_from_slice(ops);
+                cases.push(dz("gzip", &a, files()));
+            }
+        }
+        check_exact("list totals after a refusal", &cases, none_skipped());
+    }
+
     /// `-r` over a tree of plain files, `.gz` files, a symbolic link to a
     /// file and one to a directory: compressed (`gzip -r`, compared by
     /// round trip) and decompressed (`gunzip -r`, byte for byte), and

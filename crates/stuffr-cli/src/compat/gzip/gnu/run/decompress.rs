@@ -272,6 +272,12 @@ impl Gz<'_> {
         let opened = match opened {
             Ok(o) => o,
             Err(f) => {
+                // Observed (bug hunt 2, finding 38): under `-l` an input
+                // refused at its header has no header bytes, and the totals
+                // subtract none after it.
+                if mode == Mode::List && !f.fatal(false) {
+                    self.list.refused();
+                }
                 let step = self.refused(f, qname, m::STDOUT_NAME);
                 // Observed: standard input refused at its header (not gzip,
                 // an unknown method, an encrypted zip) ends the run in
