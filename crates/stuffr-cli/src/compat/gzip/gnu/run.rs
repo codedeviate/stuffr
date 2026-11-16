@@ -372,7 +372,11 @@ impl Gz<'_> {
         ) {
             Ok(t) => t,
             Err(e) => {
-                self.error(m::OPEN_FAILED, &[PROGRAM, &qout, &strerror(&e)]);
+                // Observed: `gzip plain` in a directory it cannot write to
+                // says `\ngzip: plain.gz: Permission denied` (the leading
+                // newline of every output-creation failure; bug hunt 2,
+                // finding 39).
+                self.error(m::CREATE_FAILED, &[PROGRAM, &qout, &strerror(&e)]);
                 return;
             }
         };

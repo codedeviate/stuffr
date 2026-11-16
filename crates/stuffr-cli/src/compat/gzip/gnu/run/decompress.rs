@@ -448,6 +448,24 @@ impl Gz<'_> {
             self.error(m::CREATE_FAILED, &[PROGRAM, shown, &strerror(&e)]);
             return Ok(());
         }
+        // A stored name the file system refuses (on APFS an invalid UTF-8
+        // name is EILSEQ): GNU fails creating it, before `-v` names the
+        // input; the temporary here would be created fine and the refusal
+        // met only at publish, after the `-v` prefix (bug hunt 2, finding
+        // 39). So the name itself is created and removed first, as the
+        // empty name above is; a name that exists already is left to the
+        // checks that follow.
+        if self.s.restore
+            && opened.header.as_ref().is_some_and(|h| h.name.is_some())
+            && let Err(e) = match File::options().write(true).create_new(true).open(&out_path) {
+                Ok(_) => fs::remove_file(&out_path),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+                Err(e) => Err(e),
+            }
+        {
+            self.error(m::CREATE_FAILED, &[PROGRAM, &qout, &strerror(&e)]);
+            return Ok(());
+        }
         let (tmp, tmp_file, _guard) = match host::create_temp_armed(
             self.host,
             &parent_of(&out_path),

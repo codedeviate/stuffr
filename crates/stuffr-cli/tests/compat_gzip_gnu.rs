@@ -1777,6 +1777,39 @@ mod differential {
         check_exact("list", &cases, none_skipped());
     }
 
+    /// Bug hunt 2, finding 39: GNU gzip prints a failure to create its
+    /// output with a leading newline, compressing too (`gzip plain` in a
+    /// directory it cannot write to: `\ngzip: plain.gz: Permission
+    /// denied`), and a stored name the file system refuses under `-dN` (on
+    /// APFS an invalid UTF-8 name is EILSEQ) fails as it is created, before
+    /// `-v` names the input. On a file system that takes any bytes the
+    /// `-dN` rows decompress alike on both sides.
+    #[test]
+    fn output_creation_failures_are_said_as_gnu_says_them() {
+        fn read_only(d: &Path) {
+            set_mode(d, "ro", 0o555);
+        }
+        let stored = member(Member {
+            name: Some(b"\xff\xfe.txt"),
+            ..plain_member(b"hello\n")
+        });
+        let mut cases = Vec::new();
+        for flags in [&[][..], &["-v"], &["-k"], &["-f"], &["-q"]] {
+            let mut a = flags.to_vec();
+            a.push("ro/plain");
+            cases.push(with_setup(
+                case("gzip", &a, vec![("ro/plain", b"hi\n".to_vec())]),
+                read_only,
+            ));
+        }
+        for flags in [&["-dN"][..], &["-dNv"], &["-dNk"], &["-dNf"], &["-dNq"]] {
+            let mut a = flags.to_vec();
+            a.push("hi.gz");
+            cases.push(dz("gzip", &a, vec![("hi.gz", stored.clone())]));
+        }
+        check_exact("output creation failures", &cases, none_skipped());
+    }
+
     /// Bug hunt 2, finding 38: the totals subtract the header bytes of the
     /// last input looked at, and an input refused at its header (not in
     /// gzip format, an unknown method, encrypted, unknown flags, an
