@@ -240,10 +240,12 @@ impl Run<'_, '_> {
         self.host.path(b)
     }
 
-    /// `cwarnx`: the message after the program name; exit 1.
+    /// `cwarnx`: the message after the program name; exit 1. err(3)'s
+    /// messages are escaped as macOS libc escapes them
+    /// ([`host::printf_err3`]; bug hunt 2, finding 36).
     fn cwarnx(&mut self, fmt: &str, args: &[&[u8]]) {
         m::printf(self.err, m::PREFIX, &[self.name.as_bytes()]);
-        m::printf(self.err, fmt, args);
+        host::printf_err3(self.err, fmt, args);
         let _ = self.err.write_all(m::NEWLINE.as_bytes());
         self.eval = 1;
     }
@@ -251,8 +253,8 @@ impl Run<'_, '_> {
     /// `cwarn`: the message, then `strerror(errno)` (`text`); exit 1.
     fn cwarn(&mut self, fmt: &str, args: &[&[u8]], text: &[u8]) {
         m::printf(self.err, m::PREFIX, &[self.name.as_bytes()]);
-        m::printf(self.err, fmt, args);
-        m::printf(self.err, m::ERRNO_SUFFIX, &[text]);
+        host::printf_err3(self.err, fmt, args);
+        host::printf_err3(self.err, m::ERRNO_SUFFIX, &[text]);
         self.eval = 1;
     }
 
@@ -264,7 +266,7 @@ impl Run<'_, '_> {
     /// `errx(1, msg)`: the caller returns 1.
     fn errx(&mut self, msg: &str) {
         m::printf(self.err, m::PREFIX, &[self.name.as_bytes()]);
-        let _ = self.err.write_all(msg.as_bytes());
+        let _ = self.err.write_all(&host::err3_escape(msg.as_bytes()));
         let _ = self.err.write_all(m::NEWLINE.as_bytes());
     }
 

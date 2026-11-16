@@ -22,6 +22,12 @@
 //!
 //! Behaviours reproduced (each pinned by `tests/compat_gzip_bsd.rs`):
 //!
+//! - the warn(3)/warnx(3)/errx(3) and getopt_long(3) messages escape each
+//!   byte 0x01-0x1f but TAB and LF of the text after the program name, as
+//!   macOS libc does (`\a \b \v \f \r`, else `\ooo`; `host::err3_escape`),
+//!   so a stored name under `-N` or an operand never sends an escape
+//!   sequence to the terminal raw; the prompt and the `-v` lines are
+//!   `fprintf` and stay raw;
 //! - output is written under a temporary name (`.stuffr-gzip-*.tmp`) and
 //!   linked into place when complete; on SIGINT, and only SIGINT, the
 //!   temporary is removed and the process dies of the signal, as gzip's

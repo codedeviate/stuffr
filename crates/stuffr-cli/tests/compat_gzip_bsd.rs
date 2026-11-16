@@ -2230,6 +2230,50 @@ mod differential {
         }
         check_exact("long_header_fields", &cases, Skipped::none());
     }
+    /// Bug hunt 2, finding 36: Apple's gzip reports through err(3) and
+    /// warn(3) (and getopt_long's own warnx), which on macOS write each
+    /// byte 0x01-0x1f of the formatted message but TAB and LF escaped
+    /// (`\a \b \v \f \r`, the rest `\ooo`) in every locale, and 0x7f and
+    /// bytes from 0x80 as they are. A stored name or an operand holding an
+    /// escape sequence therefore never reaches the terminal raw. The
+    /// prompt and the `-v` lines are `fprintf` and stay raw.
+    #[test]
+    fn control_bytes_in_messages_are_escaped_as_macos_libc_does() {
+        const ALL: &str = "n\u{1}\u{2}\u{3}\u{4}\u{5}\u{6}\u{7}\u{8}\t\n\u{b}\u{c}\r\
+                           \u{e}\u{f}\u{10}\u{11}\u{12}\u{13}\u{14}\u{15}\u{16}\u{17}\
+                           \u{18}\u{19}\u{1a}\u{1b}\u{1c}\u{1d}\u{1e}\u{1f}\u{7f}\u{e9}\\x";
+        let esc = "e\u{1b}[31mred\nnew";
+        let stored = member(Member {
+            name: Some(esc.as_bytes()),
+            ..plain_member(b"hello\n")
+        });
+        let all_gz = format!("{ALL}.gz");
+        let all_z = format!("{ALL}.zz");
+        let bad_s = format!("\u{1b}{}", "2".repeat(31));
+        let long_opt = "--\u{1b}x";
+        let cases = vec![
+            dz(
+                "gzip",
+                &["-dNk", "esc.gz"],
+                vec![("esc.gz", stored.clone()), (esc, b"x".to_vec())],
+            ),
+            dz(
+                "gzip",
+                &["-dNkv", "esc.gz"],
+                vec![("esc.gz", stored.clone()), (esc, b"x".to_vec())],
+            ),
+            gz(&[ALL], vec![]),
+            gz(&["-d", ALL], vec![]),
+            gz(&["-d", &all_z], vec![(&all_z, b"x".to_vec())]),
+            gz(&["-l", &all_gz], vec![(&all_gz, b"not gzip".to_vec())]),
+            gz(&["-t", &all_gz], vec![(&all_gz, b"not gzip".to_vec())]),
+            gz(&[ALL, "-v"], vec![(ALL, b"x".to_vec())]),
+            gz(&["-\u{1}"], vec![]),
+            gz(&[long_opt], vec![]),
+            gz(&["-S", &bad_s, "a"], vec![]),
+        ];
+        run_group("escaping", &cases, Skipped::none(), &apple_compare);
+    }
 }
 
 /// 0.13.1 Task 3: an interrupted run removes its partial output on SIGINT,

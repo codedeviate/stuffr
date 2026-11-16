@@ -2857,6 +2857,39 @@ pub(crate) fn printf(w: &mut dyn Write, fmt: &str, args: &[&[u8]]) {
     let _ = w.write_all(&out);
 }
 
+/// macOS libc's err(3)/warn(3) escaping of a formatted message (its
+/// `vis`-style pass, measured against `/usr/bin/compress` and
+/// `/usr/bin/gzip` under `LC_ALL=C` and `en_US.UTF-8` alike): each byte
+/// 0x01-0x1f but TAB and LF becomes `\a` (BEL), `\b`, `\v`, `\f`, `\r` or
+/// a three-digit octal `\ooo` (ESC is `\033`); 0x7f, bytes from 0x80 and
+/// the backslash itself are written as they are. Only the message is
+/// escaped, not the program name in front of it (bug hunt 2, finding 36).
+pub(crate) fn err3_escape(msg: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(msg.len());
+    for &b in msg {
+        match b {
+            0x07 => out.extend_from_slice(b"\\a"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x0b => out.extend_from_slice(b"\\v"),
+            0x0c => out.extend_from_slice(b"\\f"),
+            0x0d => out.extend_from_slice(b"\\r"),
+            0x01..=0x1f if b != b'\t' && b != b'\n' => {
+                out.extend_from_slice(format!("\\{b:03o}").as_bytes());
+            }
+            _ => out.push(b),
+        }
+    }
+    out
+}
+
+/// [`printf`] through [`err3_escape`]: the message part of an Apple
+/// personality's err(3), warn(3) or getopt_long(3) diagnostic.
+pub(crate) fn printf_err3(w: &mut dyn Write, fmt: &str, args: &[&[u8]]) {
+    let mut msg = Vec::new();
+    printf(&mut msg, fmt, args);
+    let _ = w.write_all(&err3_escape(&msg));
+}
+
 /// Set only the access and modification times (`utime`).
 pub(crate) fn set_times(meta: &Metadata, to: &Path) -> io::Result<()> {
     set_times_fd(meta, &open_nofollow_for_write(to)?)
@@ -3057,6 +3090,27 @@ pub(crate) fn apple_copy_attributes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bug hunt 2, finding 36: macOS libc's err(3) escaping, byte by byte,
+    /// as measured against `/usr/bin/compress -d` under `LC_ALL=C` and
+    /// `en_US.UTF-8`.
+    #[test]
+    fn err3_escape_matches_macos_libc() {
+        for b in 0u8..=255 {
+            let want: Vec<u8> = match b {
+                0x07 => b"\\a".to_vec(),
+                0x08 => b"\\b".to_vec(),
+                0x0b => b"\\v".to_vec(),
+                0x0c => b"\\f".to_vec(),
+                0x0d => b"\\r".to_vec(),
+                b'\t' | b'\n' | 0 => vec![b],
+                0x01..=0x1f => format!("\\{b:03o}").into_bytes(),
+                _ => vec![b],
+            };
+            assert_eq!(err3_escape(&[b]), want, "byte {b:#04x}");
+        }
+        assert_eq!(err3_escape(b"e\x1b[31m\\x"), b"e\\033[31m\\x");
+    }
 
     /// Ruling T5: `create_output` replaces a symlink (live or dangling) at
     /// the name with a fresh file created with the given mode, leaving the

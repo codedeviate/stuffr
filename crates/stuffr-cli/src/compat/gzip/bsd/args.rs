@@ -284,10 +284,12 @@ impl<'w> Getopt<'w> {
     }
 }
 
-/// `getopt`'s and `errx`'s messages: the program name, then the text.
+/// `getopt`'s and `errx`'s messages: the program name, then the text,
+/// escaped as macOS libc's warnx and errx escape it (getopt_long reports
+/// through warnx).
 fn say(err: &mut dyn Write, name: &str, fmt: &str, args: &[&[u8]]) {
     printf(err, m::PREFIX, &[name.as_bytes()]);
-    printf(err, fmt, args);
+    crate::compat::host::printf_err3(err, fmt, args);
 }
 
 /// `prepend_gzip`: `$GZIP` split on spaces and tabs, empty words dropped.

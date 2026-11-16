@@ -29,7 +29,7 @@ use super::messages::{self as m, printf};
 mod decompress;
 
 use crate::compat::gzip::member::{Engine, Header, compress_body, write_header, write_trailer};
-use crate::compat::host::{self, Host, Published, publish, stdin_file, strerror};
+use crate::compat::host::{self, Host, Published, printf_err3, publish, stdin_file, strerror};
 pub(super) use decompress::Fatal;
 
 /// `BUFLEN`: gzip's read and write size.
@@ -238,11 +238,12 @@ impl Gz<'_> {
         }
     }
 
-    /// `maybe_warnx`.
+    /// `maybe_warnx`. The message is escaped as macOS libc's warnx
+    /// escapes it ([`printf_err3`]).
     fn warnx(&mut self, fmt: &str, args: &[&[u8]]) {
         if !self.s.quiet {
             printf(self.err, m::PREFIX, &[self.name.as_bytes()]);
-            printf(self.err, fmt, args);
+            printf_err3(self.err, fmt, args);
             printf(self.err, m::NEWLINE, &[]);
         }
         self.mark();
@@ -252,8 +253,8 @@ impl Gz<'_> {
     fn warn(&mut self, fmt: &str, args: &[&[u8]], e: &io::Error) {
         if !self.s.quiet {
             printf(self.err, m::PREFIX, &[self.name.as_bytes()]);
-            printf(self.err, fmt, args);
-            printf(self.err, m::ERRNO_SUFFIX, &[&strerror(e)]);
+            printf_err3(self.err, fmt, args);
+            printf_err3(self.err, m::ERRNO_SUFFIX, &[&strerror(e)]);
         }
         self.mark();
     }

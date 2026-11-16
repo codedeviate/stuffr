@@ -782,6 +782,40 @@ mod differential {
         ));
         group("every bit count", &cases);
     }
+    /// Bug hunt 2, finding 36: Apple's compress reports through err(3)
+    /// (`cwarn`, `cwarnx`, `errx`), whose message macOS libc writes with
+    /// each byte 0x01-0x1f but TAB and LF escaped (`\a \b \v \f \r`, the
+    /// rest `\ooo`) and 0x7f and bytes from 0x80 as they are. getopt(3)'s
+    /// "illegal option" is `fprintf` and stays raw; so do the `-v` lines.
+    #[test]
+    fn control_bytes_in_messages_are_escaped_as_macos_libc_does() {
+        const ALL: &str = "n\u{1}\u{2}\u{3}\u{4}\u{5}\u{6}\u{7}\u{8}\t\n\u{b}\u{c}\r\
+                           \u{e}\u{f}\u{10}\u{11}\u{12}\u{13}\u{14}\u{15}\u{16}\u{17}\
+                           \u{18}\u{19}\u{1a}\u{1b}\u{1c}\u{1d}\u{1e}\u{1f}\u{7f}\u{e9}\\x";
+        let all_z = format!("{ALL}.Z");
+        let esc_z = "e\u{1b}[31mx.Z";
+        let bits = "1\u{1b}";
+        let cases = vec![
+            case("compress", &[ALL], vec![]),
+            case("compress", &["-d", ALL], vec![]),
+            case("uncompress", &[ALL], vec![]),
+            case("compress", &[&all_z], vec![(&all_z, b"x".to_vec())]),
+            case(
+                "uncompress",
+                &[&all_z],
+                vec![(&all_z, b"not compressed".to_vec())],
+            ),
+            case(
+                "compress",
+                &["-v", ALL],
+                vec![(ALL, b"aaaaaaaaaaaaaaaaaaaaaaaa".to_vec())],
+            ),
+            case("compress", &[esc_z], vec![(esc_z, b"x".to_vec())]),
+            case("compress", &["-b", bits, "f"], vec![("f", b"x".to_vec())]),
+            case("compress", &["-\u{1}"], vec![]),
+        ];
+        group("escaping", &cases);
+    }
 }
 
 /// The deviations of `compat/compress/apple/mod.rs`, each asserted in its

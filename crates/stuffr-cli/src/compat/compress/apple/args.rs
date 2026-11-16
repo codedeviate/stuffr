@@ -97,8 +97,9 @@ pub(super) fn parse(name: &str, argv0: &[u8], args: &[OsString], err: &mut dyn W
                 place = 0;
                 let (value, end) = strtol(optarg);
                 if end < optarg.len() {
+                    // `errx`: escaped as macOS libc escapes it.
                     m::printf(err, m::PREFIX, &[name.as_bytes()]);
-                    m::printf(err, m::ILLEGAL_BIT_COUNT, &[optarg]);
+                    crate::compat::host::printf_err3(err, m::ILLEGAL_BIT_COUNT, &[optarg]);
                     let _ = err.write_all(m::NEWLINE.as_bytes());
                     return Parsed::Exit(1);
                 }

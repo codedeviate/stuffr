@@ -20,6 +20,11 @@
 //!
 //! Behaviours reproduced (each pinned by `tests/compat_compress_apple.rs`):
 //!
+//! - the err(3) messages (`cwarn`, `cwarnx`, `errx`) escape each byte
+//!   0x01-0x1f but TAB and LF of the text after the program name, as macOS
+//!   libc does (`\a \b \v \f \r`, else `\ooo`; `host::err3_escape`);
+//!   getopt(3)'s "illegal option" and the `-v` lines are `fprintf` and
+//!   stay raw;
 //! - options before the first operand only (no permutation); `--`; a lone
 //!   `-` is standard input, and turns on `-c` for every later operand;
 //!   `-c` with more than one file is refused when compressing only;
