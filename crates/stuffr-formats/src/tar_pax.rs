@@ -1028,7 +1028,9 @@ mod tests {
     /// reported loss.
     #[test]
     fn an_empty_header_mtime_is_the_epoch_and_not_reported() {
-        for field in [[0u8; 12], *b"           \0", [b' '; 12]] {
+        let mut blanks_then_nul = [b' '; 12];
+        blanks_then_nul[11] = 0;
+        for field in [[0u8; 12], blanks_then_nul, [b' '; 12]] {
             let mut archive = pax_entry(&[], "f", b"data");
             set_header_mtime(&mut archive[..BLOCK], field);
             let (mtime, warnings) = one_entry_report(&archive);
