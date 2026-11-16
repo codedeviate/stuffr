@@ -294,6 +294,13 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Print the version of this build.
+    Version {
+        /// Print one JSON object describing this build: version, target,
+        /// features, per-codec tiers and the compatibility names.
+        #[arg(long)]
+        json: bool,
+    },
     /// Compare compression formats on your own files: size, ratio, and
     /// compress and decompress time for each one.
     ///

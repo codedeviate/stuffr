@@ -23,6 +23,7 @@ pub mod bench;
 pub mod cli;
 pub mod compat;
 pub mod size;
+pub mod version;
 
 /// Resolves a `--format` name against the registry. Shared by
 /// `main`'s verbs and `stuffr bench`.

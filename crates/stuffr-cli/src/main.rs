@@ -251,6 +251,7 @@ fn destination_is_stdout(cmd: &Command) -> bool {
         Command::Cat { .. }
         | Command::Info { .. }
         | Command::Formats { .. }
+        | Command::Version { .. }
         | Command::List { .. }
         | Command::Bench(_) => true,
         // Only the `--list` row-per-record report is the "big data to
@@ -879,6 +880,16 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             Ok(())
         }
         Command::Formats { json } => print_formats(json),
+        Command::Version { json } => {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            if json {
+                writeln!(out, "{}", stuffr_cli::version::json())?;
+            } else {
+                writeln!(out, "{}", stuffr_cli::version::plain())?;
+            }
+            Ok(())
+        }
         Command::Bench(args) => {
             use stuffr_cli::bench::{DEBUG_REFUSAL, Ran};
             match stuffr_cli::bench::run(args)? {

@@ -1379,6 +1379,17 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
 
 WHAT THIS BUILD CAN DO
 
+  stuffr version
+      Prints what `stuffr --version` prints.
+
+  stuffr version --json
+      One JSON object describing this build, for a program to read:
+      {"schema": 1, "version", "target" (the compile target triple),
+      "features" (the stuffr-cli features that are on), "tiers" (each codec's
+      "pure" or "c"), "personalities" (every compatibility name stuffr
+      answers to as argv[0]: gzip, unzip, zstdcat and so on) and
+      "host_fs_abi" (reserved, always null)}.
+
   stuffr formats --json
       The same rows as one JSON object, {"schema": 1, "formats": [...]},
       for a program to read. Each element has format, kind ("codec" or
