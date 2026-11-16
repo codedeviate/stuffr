@@ -1631,7 +1631,10 @@ extern "C" fn on_stop_signal(_sig: libc::c_int) {
 
 /// The `n`th candidate name of a temporary in `dir`.
 fn temp_name(dir: &Path, family: &str, n: u32) -> PathBuf {
-    dir.join(format!(".stuffr-{family}-{}-{n}.tmp", std::process::id()))
+    dir.join(format!(
+        ".stuffr-{family}-{}-{n}.tmp",
+        stuffr::process_tag()
+    ))
 }
 
 /// Create a temporary output file in `dir`, `create_new`, mode 0600, named

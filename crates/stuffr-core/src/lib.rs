@@ -19,6 +19,7 @@ pub mod governor;
 mod honesty;
 pub mod ladder;
 pub mod probe;
+mod process_tag;
 pub mod registry;
 pub mod salvage;
 pub mod size;
@@ -48,6 +49,8 @@ pub use probe::{
     foreign_from_tail, identify_strict, probe, read_tail, resolve_chain, resolve_chain_checked,
     resolve_chain_deep, resolve_chain_deep_with,
 };
+#[doc(hidden)]
+pub use process_tag::process_tag;
 pub use registry::{FormatRow, Registry};
 pub use size::format_size;
 pub use source::{

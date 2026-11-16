@@ -99,7 +99,12 @@ fn create_temp_file(
     let mut attempt = 0u32;
     loop {
         let n = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
-        let candidate = parent.join(format!(".{}.{}.{}.tmp", std::process::id(), n, file_name));
+        let candidate = parent.join(format!(
+            ".{}.{}.{}.tmp",
+            stuffr_core::process_tag(),
+            n,
+            file_name
+        ));
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
         #[cfg(unix)]

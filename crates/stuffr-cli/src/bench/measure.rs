@@ -795,7 +795,7 @@ impl TempOut {
         let mut tries = 0;
         loop {
             let n = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-            let path = dir.join(format!("stuffr-bench-{}-{n}", std::process::id()));
+            let path = dir.join(format!("stuffr-bench-{}-{n}", stuffr::process_tag()));
             match create_armed(&path) {
                 Ok((file, armed)) => {
                     return Ok(Self {

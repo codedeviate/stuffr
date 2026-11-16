@@ -422,7 +422,7 @@ pub(crate) fn mkstemp_with(
     let mut seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64)
-        ^ (u64::from(std::process::id()) << 32);
+        ^ (u64::from(stuffr::process_tag()) << 32);
     let mut name = Vec::new();
     for _ in 0..100 {
         name = dir.to_vec();

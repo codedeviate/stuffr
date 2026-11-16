@@ -1585,7 +1585,7 @@ fn fresh_temp_dir_in(root: &Path, label: &str) -> stuffr::Result<TempDirGuard> {
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = root.join(format!(
             "stuffr-salvage-{label}-{}-{nanos}-{n}",
-            std::process::id()
+            stuffr::process_tag()
         ));
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
@@ -1679,7 +1679,7 @@ fn copy_into_place(from: &Path, to: &Path) -> std::io::Result<Option<std::io::Er
     let (tmp, mut out, _armed) = loop {
         let tmp = parent.join(format!(
             ".{name}.{}-{attempt}.salvage-tmp",
-            std::process::id()
+            stuffr::process_tag()
         ));
         match stuffr_cli::compat::create_armed(&tmp) {
             Ok((f, guard)) => break (tmp, f, guard),

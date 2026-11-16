@@ -240,7 +240,8 @@ pub fn install_links(
                 // Atomic: build the new link beside the old entry, then
                 // rename over it, so a failure leaves the original intact.
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
-                let tmp = path.with_file_name(format!(".{name}.stuffr-tmp-{}", std::process::id()));
+                let tmp =
+                    path.with_file_name(format!(".{name}.stuffr-tmp-{}", stuffr::process_tag()));
                 let _ = std::fs::remove_file(&tmp);
                 std::os::unix::fs::symlink(target, &tmp).map_err(|e| at(&tmp, e))?;
                 if let Err(e) = std::fs::rename(&tmp, &path) {
