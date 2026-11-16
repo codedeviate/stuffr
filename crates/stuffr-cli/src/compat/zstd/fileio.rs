@@ -245,7 +245,17 @@ struct FileSink {
 /// NAME: File too large`, the output removed and the next operand
 /// processed; from 1 MiB on the first write fails, `error 70`, and 65536
 /// bytes are left).
+///
+/// That is Apple's libc honouring zstd's `setvbuf(file, NULL, _IOFBF, 1
+/// MiB)`. glibc ignores the size when no buffer is passed and keeps its
+/// block-sized one, so on Linux zstd's first large write goes straight to
+/// the file and fails there (CI, Debian 13, zstd 1.5.7: `error 70`, 65536
+/// bytes left, for the same 200 kB output that only fails at `fclose` on
+/// macOS).
+#[cfg(not(target_os = "linux"))]
 const WRITE_BUFFER: usize = 1 << 20;
+#[cfg(target_os = "linux")]
+const WRITE_BUFFER: usize = 4096;
 
 enum FileW {
     /// The real process's file, through zstd's stdio-sized buffer.

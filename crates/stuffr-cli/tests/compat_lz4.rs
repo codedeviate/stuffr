@@ -5177,7 +5177,20 @@ mod unix {
             &["-q", "-f", "--rm", "-m", "f"],
         ] {
             let ours = run(&link, args);
-            assert_eq!(ours, run(reference, args), "{args:?}");
+            let theirs = run(reference, args);
+            // A multi-megabyte input goes through lz4's worker threads,
+            // and which write lz4 sees fail first is a race there: CI's
+            // Linux runs gave 46 (a block) twice and 49 (the end of the
+            // frame) once for the same command. stuffr always says 46.
+            let late = (
+                Some(49),
+                "Error 49 : Write error : cannot write end of frame \n".to_string(),
+            );
+            if args.contains(&"big") && theirs == late {
+                assert_eq!(ours.0, Some(46), "{args:?}");
+            } else {
+                assert_eq!(ours, theirs, "{args:?}");
+            }
             assert!(
                 stuffr_cli::compat::lz4::EXIT_CODES.contains(&ours.0.unwrap()),
                 "{args:?}"

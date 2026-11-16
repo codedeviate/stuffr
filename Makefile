@@ -284,7 +284,7 @@ release:
 # so a newly added subprocess test shows up as a loud Miri failure and is
 # added here deliberately. Tests that only exercise multi-megabyte limits
 # (the 16 MiB pax ceiling) and the GNU long-name ceiling tests (16 MiB and a
-# 1 MiB long name, 0.10.3; the GNU sparse extension-chain ceiling) are skipped under Miri too: they don't touch the
+# 1 MiB long name, 0.10.3; the GNU sparse extension-chain ceiling; 0.30.0's warning-cap tests over thousands of entries and a 16 MiB name) are skipped under Miri too: they don't touch the
 # unsafe regions and Miri runs them for hours.
 MIRI_SKIP = --skip system_tar_ --skip we_accept_what_system_tar_ \
             --skip every_reference_writer_ --skip system_ar_ \
@@ -293,7 +293,10 @@ MIRI_SKIP = --skip system_tar_ --skip we_accept_what_system_tar_ \
             --skip a_pax_header_past_the_ceiling_ \
             --skip a_pax_header_inside_the_ceiling_ \
             --skip a_long_name_ --skip a_normal_long_name_ \
-            --skip bsd_ar_with_odd_names_ --skip a_sparse_extension_chain_
+            --skip bsd_ar_with_odd_names_ --skip a_sparse_extension_chain_ \
+            --skip name_warnings_are_capped_ \
+            --skip name_and_time_warnings_are_capped_ \
+            --skip a_huge_name_is_held_in_its_warning_
 # `-Zmiri-disable-isolation` because several of these tests write a real temp
 # file (tar's `by_index` test needs a genuinely seekable source, which a
 # Cursor is not, as far as `FileSource` is concerned). Isolation is Miri's
