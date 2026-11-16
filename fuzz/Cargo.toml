@@ -7,6 +7,13 @@ edition = "2024"
 [package.metadata]
 cargo-fuzz = true
 
+# Its own workspace root. The root workspace lists `fuzz` under `exclude`,
+# but cargo only honours that when this crate sits directly inside that
+# root: in a checkout nested inside another stuffr checkout it walks past
+# the inner root and finds the outer workspace, which refuses the crate.
+# An empty table here stops the upward search at this manifest.
+[workspace]
+
 # The deep fuzz C-tier leg (0.26.0): every C backend stuffr has, the two
 # vendored libraries (libbrotli 1.2.1, liblz4 1.11.1) among them, for
 # `compat` and `roundtrip` (`cargo fuzz run --features c-backed ...`).
