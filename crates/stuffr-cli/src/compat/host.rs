@@ -2092,7 +2092,18 @@ pub(crate) fn errno_text(n: i32) -> Vec<u8> {
 /// (after closing the descriptor), as no local file system can.
 pub(crate) fn close_file(f: File) -> io::Result<()> {
     #[cfg(test)]
-    let fault = CLOSE_FAULT.with(std::cell::Cell::get);
+    let fault = CLOSE_FAULT.with(|c| match c.get() {
+        Some((errno, None)) => Some(errno),
+        Some((errno, Some(0))) => {
+            c.set(None);
+            Some(errno)
+        }
+        Some((errno, Some(n))) => {
+            c.set(Some((errno, Some(n - 1))));
+            None
+        }
+        None => None,
+    });
     #[cfg(unix)]
     let r = {
         use std::os::fd::IntoRawFd;
@@ -2117,16 +2128,32 @@ pub(crate) fn close_file(f: File) -> io::Result<()> {
     r
 }
 
+/// Test builds: the injected close fault, `(errno, which)`: `which` `None`
+/// fails every close, `Some(n)` only the close `n` closes from now (0 is the
+/// next one), after which closes work again.
+#[cfg(test)]
+type CloseFault = Option<(i32, Option<u32>)>;
+
 #[cfg(test)]
 thread_local! {
-    static CLOSE_FAULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    static CLOSE_FAULT: std::cell::Cell<CloseFault> = const { std::cell::Cell::new(None) };
 }
 
 /// Test builds: from now on every [`close_file`] on this thread fails with
 /// `errno` (`None`: closes work again).
 #[cfg(test)]
 pub(crate) fn fail_closes(errno: Option<i32>) {
-    CLOSE_FAULT.with(|c| c.set(errno));
+    CLOSE_FAULT.with(|c| c.set(errno.map(|e| (e, None))));
+}
+
+/// Test builds: only the `nth` [`close_file`] on this thread from now (0 is
+/// the next one) fails with `errno`; the others work. With several
+/// descriptors of one output, a network file system reports a deferred
+/// write error on whichever is closed first, so each of them must be a
+/// checked close.
+#[cfg(test)]
+pub(crate) fn fail_nth_close(nth: u32, errno: i32) {
+    CLOSE_FAULT.with(|c| c.set(Some((errno, Some(nth)))));
 }
 
 /// `notAStandardFile`: anything but a regular file, judged without following
@@ -2947,7 +2974,8 @@ pub(crate) fn default_file_mode() -> u32 {
 /// reference leaves for an ordinary input, and a private input's partial
 /// output stays private.
 pub(crate) struct OutFd {
-    file: File,
+    /// `None` only once [`OutFd::close`] has taken it.
+    file: Option<File>,
     widen: bool,
     input_mode: u32,
 }
@@ -2958,33 +2986,51 @@ impl OutFd {
     /// `input_mode` is the input's mode, `None` for none (standard input).
     pub(crate) fn new(file: &File, fresh: bool, input_mode: Option<u32>) -> Option<OutFd> {
         Some(OutFd {
-            file: file.try_clone().ok()?,
+            file: Some(file.try_clone().ok()?),
             widen: fresh,
             input_mode: input_mode.unwrap_or(0o777) & 0o777,
         })
     }
     pub(crate) fn file(&self) -> &File {
-        &self.file
+        // Only `close` takes the file, and it consumes `self`.
+        self.file
+            .as_ref()
+            .expect("an OutFd holds its file until close consumes it")
     }
     /// The output's mode has been set: leave it alone on drop.
     pub(crate) fn settle(&mut self) {
         self.widen = false;
     }
+    /// Close this descriptor through [`close_file`], its result kept. On
+    /// Linux every `close(2)` of any descriptor of a file flushes it, and a
+    /// network file system (NFS) reports a deferred write error on the
+    /// FIRST of them only, so a family that removes its input once the
+    /// output is written must close the duplicate this way too, never drop
+    /// it (finding 30 of the second bug hunt, review I1).
+    pub(crate) fn close(mut self) -> io::Result<()> {
+        self.widen_now();
+        self.file.take().map_or(Ok(()), close_file)
+    }
+    fn widen_now(&mut self) {
+        if !std::mem::take(&mut self.widen) {
+            return;
+        }
+        let Some(file) = &self.file else { return };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::Permissions::from_mode(default_file_mode() & self.input_mode);
+            let _ = file.set_permissions(mode);
+        }
+        // Off unix there are no mode bits to widen.
+        #[cfg(not(unix))]
+        let _ = (file, self.input_mode);
+    }
 }
 
 impl Drop for OutFd {
     fn drop(&mut self) {
-        if self.widen {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = fs::Permissions::from_mode(default_file_mode() & self.input_mode);
-                let _ = self.file.set_permissions(mode);
-            }
-            // Off unix there are no mode bits to widen.
-            #[cfg(not(unix))]
-            let _ = self.input_mode;
-        }
+        self.widen_now();
     }
 }
 

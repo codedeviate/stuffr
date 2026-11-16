@@ -549,7 +549,13 @@ impl Sink {
     /// a deferred write error only there; a failure is the sink's write
     /// error (`Error N`, the run ends, the source kept). Anything else is
     /// flushed already ([`Sink::finish`]).
-    fn close(mut self, run: &mut Run) -> Result<(), Fail> {
+    /// Close the output, and `dup` (its second descriptor, taken out for
+    /// the metadata) with it. Both closes are checked: on Linux every
+    /// `close(2)` of a descriptor of the file flushes it, and NFS reports a
+    /// deferred write error on whichever comes first, so an unchecked drop
+    /// of either could swallow the error `--rm` must see. A failure of
+    /// either is the sink's write error.
+    fn close(mut self, run: &mut Run, dup: Option<host::OutFd>) -> Result<(), Fail> {
         let kind = std::mem::replace(&mut self.kind, SinkKind::Null);
         let r = match kind {
             SinkKind::RealFile(w) => match w.into_inner() {
@@ -559,7 +565,9 @@ impl Sink {
             SinkKind::SparseFile(f) => host::close_file(f),
             _ => Ok(()),
         };
-        r.map_err(|_| run.exm(self.write_error.1, self.write_error.0, &[]))
+        let d = dup.map_or(Ok(()), host::OutFd::close);
+        r.and(d)
+            .map_err(|_| run.exm(self.write_error.1, self.write_error.0, &[]))
     }
 }
 
@@ -1216,9 +1224,10 @@ impl Run<'_> {
         // probe (1.11.0): `lz4 -l a` gets `a`'s time and mode too (1.10.0
         // left the run's time and the default mode).
         Self::copy_metadata(target, meta.as_ref().filter(|_| named), fd.as_mut());
-        drop(fd);
+        // Every descriptor of the output is closed checked before `--rm`
+        // (`Sink::close`); with no sink the run failed above.
         if let Some(sink) = sink {
-            sink.close(self)?;
+            sink.close(self, fd)?;
         }
         self.total += stats.read;
         self.show_compress_summary(&stats);
@@ -1476,8 +1485,7 @@ impl Run<'_> {
         if !decoded.undecodable {
             Self::copy_metadata(target, meta.as_ref().filter(|_| named), fd.as_mut());
         }
-        drop(fd);
-        sink.close(self)?;
+        sink.close(self, fd)?;
         self.total += stats.written;
         self.show_decode_summary(name, &stats);
         if !decoded.undecodable {

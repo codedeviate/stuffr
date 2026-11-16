@@ -725,6 +725,45 @@ mod tests {
         assert!(!d.0.join("a.lz4").exists());
     }
 
+    /// Review I1 of finding 30: a file output has two descriptors (the sink
+    /// and the duplicate the metadata is set through). On Linux NFS the
+    /// deferred write error comes back from whichever is closed first, so
+    /// each close is checked: failing only the first, or only the second,
+    /// still keeps the source. (Dropping either unchecked fails one leg.)
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_close_of_either_descriptor_keeps_the_source() {
+        let plain = b"beta beta beta beta\n";
+        let d = Scratch::new(&[("a", plain)]);
+        let p = |n: &str| d.0.join(n).to_string_lossy().into_owned();
+        let run = |args: &[&str], nth: Option<u32>| -> (i32, String) {
+            let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+            let mut err = Vec::new();
+            if let Some(n) = nth {
+                host::fail_nth_close(n, libc::EIO);
+            }
+            let code = main(b"lz4", &args, &|_| None, &mut Host::Real, &mut err);
+            host::fail_closes(None);
+            (code, String::from_utf8(err).unwrap())
+        };
+        let single = "Error 42 : Write error : failed writing single-block compressed frame \n";
+        for nth in [0, 1] {
+            let args = ["-q", "-f", "--rm", &p("a"), &p("a.lz4")];
+            assert_eq!(run(&args, Some(nth)), (42, single.into()), "close {nth}");
+            assert_eq!(std::fs::read(p("a")).unwrap(), plain, "close {nth}");
+        }
+        assert_eq!(
+            run(&["-q", "-f", "--rm", &p("a"), &p("a.lz4")], None),
+            (0, String::new())
+        );
+        let sparse = "Error 73 : Write error : cannot write decoded block \n";
+        for nth in [0, 1] {
+            let args = ["-q", "-d", "-f", "--rm", &p("a.lz4"), &p("a")];
+            assert_eq!(run(&args, Some(nth)), (73, sparse.into()), "close {nth}");
+            assert!(d.0.join("a.lz4").exists(), "close {nth}");
+        }
+    }
+
     /// lz4 1.11.0's same-file refusal in the sandbox: an output that is the
     /// input is refused and the input kept.
     #[test]
