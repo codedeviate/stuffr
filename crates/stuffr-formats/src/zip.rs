@@ -552,6 +552,7 @@ fn classify_zip_write_error(e: ZipError, name: &str) -> Error {
         }
         ZipError::Io(io_err)
             if io_err.raw_os_error().is_none()
+                && !NotZips::is(&io_err)
                 && matches!(
                     io_err.kind(),
                     ErrorKind::InvalidInput | ErrorKind::InvalidData | ErrorKind::Unsupported
@@ -564,6 +565,47 @@ fn classify_zip_write_error(e: ZipError, name: &str) -> Error {
             Error::Corrupt(msg) => Error::Unsupported(format!("zip cannot store {what}: {msg}")),
             e => e,
         },
+    }
+}
+
+/// An I/O error that is not the zip crate's refusal of an entry: one of the
+/// spool's own (an invariant of this module broken), or the destination's
+/// without an OS errno. [`classify_zip_write_error`] reads the zip crate's
+/// errno-less `InvalidInput`/`InvalidData`/`Unsupported` as "zip cannot
+/// store" (exit 3); these keep their kind and text but stay I/O errors
+/// (task 3 review, minor 1).
+#[derive(Debug)]
+struct NotZips(io::Error);
+
+impl std::fmt::Display for NotZips {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for NotZips {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+impl NotZips {
+    /// `e` tagged, unless it carries an OS errno (which already routes it
+    /// to [`Error::from`]) or is tagged already.
+    fn tag(e: io::Error) -> io::Error {
+        if e.raw_os_error().is_some() || Self::is(&e) {
+            return e;
+        }
+        io::Error::new(e.kind(), NotZips(e))
+    }
+
+    /// One of the spool's own errors.
+    fn new(kind: ErrorKind, msg: impl Into<String>) -> io::Error {
+        Self::tag(io::Error::new(kind, msg.into()))
+    }
+
+    fn is(e: &io::Error) -> bool {
+        e.get_ref().is_some_and(|inner| inner.is::<NotZips>())
     }
 }
 
@@ -3692,7 +3734,7 @@ impl Spool {
         if n == 0 {
             return Ok(());
         }
-        self.dst.write_all(&self.buf[..n])?;
+        self.dst.write_all(&self.buf[..n]).map_err(NotZips::tag)?;
         self.buf.drain(..n);
         self.base += n as u64;
         Ok(())
@@ -3711,7 +3753,7 @@ impl Spool {
     }
 
     fn flush_destination(&mut self) -> io::Result<()> {
-        self.dst.flush()
+        self.dst.flush().map_err(NotZips::tag)
     }
 
     /// Hands the real destination back, leaving a placeholder behind.
@@ -3740,7 +3782,10 @@ impl Write for SpoolHandle {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         let mut spool = self.0.borrow_mut();
         let off = usize::try_from(spool.pos - spool.base).map_err(|_| {
-            io::Error::other("zip: spool window exceeds this platform's addressing")
+            NotZips::new(
+                ErrorKind::Other,
+                "zip: spool window exceeds this platform's addressing",
+            )
         })?;
         // A seek past the end followed by a write would leave a hole, and
         // zero-filling it is what a real file would do. `ZipWriter` never
@@ -3758,7 +3803,7 @@ impl Write for SpoolHandle {
         if off > spool.buf.len() {
             let hole = off - spool.buf.len();
             if hole > MAX_SPOOL_HOLE {
-                return Err(io::Error::new(
+                return Err(NotZips::new(
                     ErrorKind::InvalidInput,
                     format!(
                         "zip: refusing to zero-fill a {hole}-byte hole in the spool window; \
@@ -3795,7 +3840,7 @@ impl Seek for SpoolHandle {
             SeekFrom::Current(d) => offset(spool.pos, d)?,
         };
         if target < spool.base {
-            return Err(io::Error::new(
+            return Err(NotZips::new(
                 ErrorKind::Unsupported,
                 format!(
                     "zip: cannot rewrite offset {target}; bytes below {} have already been \
@@ -3813,7 +3858,7 @@ impl Seek for SpoolHandle {
 /// a real `Seek` does.
 fn offset(base: u64, delta: i64) -> io::Result<u64> {
     base.checked_add_signed(delta).ok_or_else(|| {
-        io::Error::new(
+        NotZips::new(
             ErrorKind::InvalidInput,
             "zip: seek would move before the start of the archive",
         )
@@ -8067,11 +8112,56 @@ z.close()\n";
             matches!(&err, Error::Unsupported(m) if m.contains("`n`")),
             "{err:?}"
         );
+        // The zip crate's own errno-less refusal: the entry cannot be stored.
         let err = classify_zip_write_error(
             ZipError::Io(io::Error::new(ErrorKind::InvalidInput, "x")),
             "n",
         );
-        assert_ne!(err.exit_code(), 5, "{err:?}");
+        assert!(
+            matches!(&err, Error::Unsupported(m) if m.contains("`n`")),
+            "{err:?}"
+        );
+        assert_eq!(err.exit_code(), 3);
+        // Task 3 review, minor 1: the spool's own errors and an errno-less
+        // destination error stay I/O errors (exit 1), with their text.
+        let mut spool = SpoolHandle(Rc::new(RefCell::new(Spool::new(PlainSink::new(Box::new(
+            Refusing,
+        ))))));
+        let seek = spool.seek(SeekFrom::Current(-1)).unwrap_err();
+        for (e, kind) in [
+            (seek, ErrorKind::InvalidInput),
+            (
+                NotZips::new(ErrorKind::Unsupported, "cannot rewrite"),
+                ErrorKind::Unsupported,
+            ),
+        ] {
+            let err = classify_zip_write_error(ZipError::Io(e), "n");
+            assert!(
+                matches!(&err, Error::Io(io) if io.kind() == kind),
+                "{err:?}"
+            );
+            assert_eq!(err.exit_code(), 1, "{err:?}");
+        }
+        spool.write_all(b"abc").unwrap();
+        let sink = spool.0.borrow_mut().commit_all().unwrap_err();
+        let err = classify_zip_write_error(ZipError::Io(sink), "n");
+        assert!(
+            matches!(&err, Error::Io(io) if io.kind() == ErrorKind::InvalidData),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("sink says no"), "{err}");
+    }
+
+    /// A destination whose writes fail without an OS errno.
+    struct Refusing;
+
+    impl Write for Refusing {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(ErrorKind::InvalidData, "sink says no"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 }
 

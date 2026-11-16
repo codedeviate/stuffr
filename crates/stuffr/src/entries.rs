@@ -5554,9 +5554,12 @@ fn plan_entry_write(
 
 /// Which of `meta`'s fields `container`'s writer cannot hold and so clamps
 /// or drops — each format's own `unrepresentable_fields`, the one owner of
-/// its limits. Empty for a container with no such limit (tar's fields
-/// widen into pax records). Bug hunt 2026-11-15, finding 22 generalised
-/// what 0.28.0 did for `ar` alone.
+/// its limits. Empty for a container with no such limit. tar has one: its
+/// writer stores GNU headers and no pax records, and its unsigned `mtime`
+/// field writes a time before 1970 as 0 (sizes, ids and long names widen
+/// into GNU base-256 fields and long-name records). Bug hunt 2026-11-15,
+/// finding 22 generalised what 0.28.0 did for `ar` alone; the task 3
+/// review added tar.
 fn unrepresentable_fields(container: FormatId, meta: &EntryMeta) -> MetaFields {
     #[cfg(feature = "ar")]
     if container == stuffr_formats::ar::AR {
@@ -5577,6 +5580,10 @@ fn unrepresentable_fields(container: FormatId, meta: &EntryMeta) -> MetaFields {
     #[cfg(feature = "arj")]
     if container == stuffr_formats::legacy::arj::ARJ {
         return stuffr_formats::legacy::arj::unrepresentable_fields(meta);
+    }
+    #[cfg(feature = "tar")]
+    if container == stuffr_formats::tar::TAR {
+        return stuffr_formats::tar::unrepresentable_fields(meta);
     }
     let _ = (container, meta);
     MetaFields::default()
@@ -7763,6 +7770,17 @@ mod tests {
         cases.push(("cpio", vec![y2111, y1969]));
         #[cfg(feature = "ar")]
         cases.push(("ar", vec![y1969]));
+        #[cfg(feature = "tar")]
+        cases.push(("tar", vec![y1969]));
+        #[cfg(any(
+            feature = "zip",
+            feature = "lha",
+            feature = "arj",
+            feature = "cpio",
+            feature = "ar",
+            feature = "tar"
+        ))]
+        assert!(!cases.is_empty());
         for (container, lost) in cases {
             let caps = ContainerCaps::default();
             for t in lost {

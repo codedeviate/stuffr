@@ -1654,10 +1654,26 @@ fn fill(slot: &mut [u8], value: &[u8]) {
     slot[n..].fill(0);
 }
 
+/// Which of `meta`'s fields this writer cannot hold, and so clamps: an
+/// mtime before 1970, written as 0 (the header field is unsigned and the
+/// writer emits no pax `mtime` record). Doc-hidden: the facade turns it
+/// into a `Fidelity::MetadataIncomplete`, as for the other writers (bug
+/// hunt 2026-11-15, finding 22; task 3 review).
+#[doc(hidden)]
+pub fn unrepresentable_fields(meta: &EntryMeta) -> stuffr_core::MetaFields {
+    stuffr_core::MetaFields {
+        mtime: meta
+            .mtime
+            .is_some_and(|t| t.duration_since(UNIX_EPOCH).is_err()),
+        ..Default::default()
+    }
+}
+
 /// Seconds since the epoch, which is what a tar header stores. A timestamp
 /// before 1970 clamps to zero rather than failing the write: tar's field is
 /// unsigned, and refusing to archive a file because of its mtime would be a
-/// worse answer than recording the epoch.
+/// worse answer than recording the epoch. The clamp is reported through
+/// [`unrepresentable_fields`].
 fn unix_seconds(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
