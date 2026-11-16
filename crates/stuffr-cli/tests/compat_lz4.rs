@@ -5030,10 +5030,6 @@ mod unix {
         check("deterministic_refresh_figures_match_the_reference", &cases);
     }
 
-    /// Standard input redirected from a regular file (review I1 of 0.26.0
-    /// Task 4): its size is known (the one-job rule, `--content-size`), it
-    /// is never checked for changes (probe, 1.11.0: no warning, whatever a
-    /// file named `stdin` beside it), and its figures are the reference's.
     /// Finding 28 (bug hunt 2): a read error is never the end of the input.
     /// Standard input is a socket reset after the data (`reset_after`); on
     /// macOS also a named input behind `src -> /dev/fd/0` (`--rm`), the
@@ -5238,6 +5234,10 @@ mod unix {
         assert_eq!(kept.unwrap(), b"PRECIOUS-ORIGINAL-DATA\n");
     }
 
+    /// Standard input redirected from a regular file (review I1 of 0.26.0
+    /// Task 4): its size is known (the one-job rule, `--content-size`), it
+    /// is never checked for changes (probe, 1.11.0: no warning, whatever a
+    /// file named `stdin` beside it), and its figures are the reference's.
     #[test]
     fn standard_input_redirected_from_a_file_matches_the_reference() {
         use std::process::{Command, Stdio};
