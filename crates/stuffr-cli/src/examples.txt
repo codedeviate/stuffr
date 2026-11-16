@@ -266,7 +266,9 @@ COLLECTING FILES INTO AN ARCHIVE
       per-entry size field is a hard 4 GiB (u32)
       ceiling — an entry larger than that is refused outright, naming the
       limit, never silently truncated to the wrong length. ar has no such
-      ceiling.
+      ceiling. Names are another matter: ar refuses (exit 3) a member name
+      over 252 bytes, the most BSD ar reads back, and cpio refuses the name
+      TRAILER!!!, its end-of-archive marker; either ends the whole pack.
 
   stuffr pack one.txt two.txt -o bundle.zip
       zip collects files the same way, and is the first container here whose
