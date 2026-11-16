@@ -1317,16 +1317,17 @@ impl Run<'_> {
         let mut streamed = false;
         loop {
             let n = src.read_full(&mut buf);
+            // probe (1.11.1): `lz4 -c < /tmp`, and a socket reset after
+            // 100000 bytes (finding 28): the chunk the error cut short is
+            // not compressed, and the run ends. Tested before
+            // `cut_short`: a read error is no truncation (review M3).
+            if src.reader.failed {
+                return Err(self.exm(40, m::E40_READ, &[name]));
+            }
             // Linux: a mapped file cut short meanwhile ends the run while it
             // is read, before the frame is finished ([`verdict`]).
             if LINUX_MAPPING && stable && src.cut_short() {
                 return Err(self.exm(53, m::E53_SOURCE_TRUNCATED, &[name]));
-            }
-            // probe (1.11.1): `lz4 -c < /tmp`, and a socket reset after
-            // 100000 bytes (finding 28): the chunk the error cut short is
-            // not compressed, and the run ends.
-            if src.reader.failed {
-                return Err(self.exm(40, m::E40_READ, &[name]));
             }
             if n == 0 {
                 break;
