@@ -670,6 +670,37 @@ read list.
 > measured from this bump's own `make check`, `GATE_EXIT=0`, nothing
 > skipped.
 >
+> `0.30.0`: **fixes from a second whole-project bug hunt**, organised by
+> kind of defect rather than by area, with the 0.29.0 binary used to
+> reproduce each finding. The ones that could lose data: `pack` and
+> `unpack` refuse (exit 2) an output that is the file being read, which
+> `--force` through a symlink used to truncate; without `--force` a file
+> that appears at the output name during the run is never replaced; the
+> lz4 links no longer take a read error for the end of input (and so no
+> longer `--rm` the source of a truncated frame); `zip -m` keeps a file a
+> read error cut short and never deletes the archive it has just written;
+> the zstd, lz4, zip and Apple `compress` links check the close of an
+> output before removing an input; zstd and lz4 refuse to write an output
+> over a later operand. Reading: tar entries written as pax sparse files
+> (what macOS `tar` writes) come back with their real name and content,
+> the pax `mtime` record is honoured, a name that is not UTF-8 is a
+> fidelity warning, and zip's PPMd, LZMA and xz entries are held to
+> `--memory-limit`. Writing: the cpio, ar, zip, LHA and ARJ writers refuse
+> (exit 3) a name they cannot store faithfully, ARJ names are written as
+> the Latin-1 its readers decode, and an mtime a format cannot hold is
+> reported instead of silently becoming 1980 or 0. Also: an interrupted run
+> removes its temporary file, a closed standard output or error never
+> panics, `pack` skips a file swapped for a symlink or FIFO after the walk,
+> private directories stay private while they are being extracted, the
+> pure-tier xz link refuses a dictionary it cannot hold instead of
+> panicking, the bzip2 links on macOS carry extended attributes as Apple's
+> do, and the Apple gzip and compress links escape control bytes in
+> messages as macOS does. A MINOR: `OpenOpts` gained `memory_limit`,
+> `Fidelity` gained `NameNotUtf8` and `Unlisted`, and exit codes change for
+> inputs 0.29.0 accepted. **4017** tests under `--all-features`,
+> **3862** on the default tier — measured from this bump's own
+> `make check`, `GATE_EXIT=0`, nothing skipped.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
