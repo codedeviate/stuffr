@@ -1336,9 +1336,10 @@ pub fn output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
 }
 
 /// An input whose reads fail part-way: one end of a loopback TCP
-/// connection, whose peer (a thread) sends `data`, waits a second for the
-/// reader to take it, then resets the connection (`SO_LINGER` 0), so the
-/// reader's next `read` fails with `ECONNRESET`. Give the descriptor to a
+/// connection, whose peer (a thread) sends `data`, waits until the reader
+/// has taken all of it ([`wait_until_drained`]), then resets the
+/// connection (`SO_LINGER` 0), so the reader's next `read` fails with
+/// `ECONNRESET`. Give the descriptor to a
 /// child as its standard input (`Stdio::from`; on macOS a symlink to
 /// `/dev/fd/0` makes it a named input too) and join the thread after the
 /// child has finished. The way a failing disk or network file system is
@@ -1350,9 +1351,13 @@ pub fn reset_after(data: Vec<u8>) -> (OwnedFd, std::thread::JoinHandle<()>) {
         std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap()
     };
     let (mut server, _) = listener.accept().unwrap();
+    // The peer's own view of the reader's end (close-on-exec), to see
+    // when the reader has emptied its receive queue.
+    let watch = client.try_clone().unwrap();
     let peer = std::thread::spawn(move || {
         let _ = server.write_all(&data);
-        std::thread::sleep(Duration::from_secs(1));
+        wait_until_drained(&server, &watch);
+        drop(watch);
         let linger = libc::linger {
             l_onoff: 1,
             l_linger: 0,
@@ -1371,6 +1376,57 @@ pub fn reset_after(data: Vec<u8>) -> (OwnedFd, std::thread::JoinHandle<()>) {
         drop(server);
     });
     (OwnedFd::from(client), peer)
+}
+
+/// Wait until nothing sent on `server` is still on its way to, or waiting
+/// in, `reader`'s socket: the sender's queue is empty (Linux `TIOCOUTQ`,
+/// macOS `SO_NWRITE`) and so is the reader's receive queue (`FIONREAD`),
+/// twice in a row 5 ms apart. A reader that never takes everything (it
+/// failed first) is given up on after 30 s; the reset then comes anyway.
+fn wait_until_drained(server: &std::net::TcpStream, reader: &std::net::TcpStream) {
+    fn queued(server: &std::net::TcpStream, reader: &std::net::TcpStream) -> Option<i64> {
+        let mut unread: libc::c_int = 0;
+        // SAFETY: a valid socket descriptor and a pointer to a `c_int`,
+        // which `FIONREAD` writes.
+        if unsafe { libc::ioctl(reader.as_raw_fd(), libc::FIONREAD as _, &raw mut unread) } != 0 {
+            return None;
+        }
+        let mut unsent: libc::c_int = 0;
+        #[cfg(target_os = "linux")]
+        // SAFETY: as above; `TIOCOUTQ` (`SIOCOUTQ`) writes a `c_int`.
+        let r = unsafe { libc::ioctl(server.as_raw_fd(), libc::TIOCOUTQ as _, &raw mut unsent) };
+        #[cfg(target_vendor = "apple")]
+        let r = {
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: a valid socket descriptor, a `c_int` and its size.
+            unsafe {
+                libc::getsockopt(
+                    server.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_NWRITE,
+                    (&raw mut unsent).cast(),
+                    &raw mut len,
+                )
+            }
+        };
+        #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+        let r = {
+            let _ = server;
+            0
+        };
+        (r == 0).then_some(i64::from(unread) + i64::from(unsent))
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut empty_once = false;
+    while std::time::Instant::now() < deadline {
+        match queued(server, reader) {
+            Some(0) if empty_once => return,
+            Some(0) => empty_once = true,
+            Some(_) => empty_once = false,
+            None => return,
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// A full disk for `cmd`'s process: no file it writes may grow past
