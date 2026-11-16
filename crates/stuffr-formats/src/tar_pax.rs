@@ -114,8 +114,14 @@ pub(crate) fn pax_time(value: &[u8]) -> TimeField {
 /// The header's own `mtime` field: octal, GNU base-256 positive (as the
 /// crate reads it), or GNU base-256 NEGATIVE (a leading `0xff`, two's
 /// complement), which the crate reads as a huge unsigned number.
+///
+/// An empty field (every byte NUL or a blank) is no time at all and reads
+/// as 0, as bsdtar reads it, with nothing to report.
 pub(crate) fn header_time(header: &tar::Header) -> TimeField {
     let field = &header.as_old().mtime;
+    if field.iter().all(|&b| b == 0 || b == b' ') {
+        return TimeField::Known(UNIX_EPOCH);
+    }
     if field[0] == 0xff {
         // Twelve bytes of two's complement; a value that fits an `i64` has
         // its top four bytes all set and the fifth's sign bit set.
@@ -981,17 +987,56 @@ mod tests {
             .any(|w| matches!(w, Fidelity::MetadataIncomplete { entry, fields } if entry == "f" && fields.mtime))
     }
 
-    /// A pax mtime that cannot be read, or one no `SystemTime` holds, is an
-    /// unknown mtime and a reported loss, never silently 1970 or "now".
+    /// A pax mtime that cannot be read, or one no `SystemTime` holds, is a
+    /// reported loss, never silently 1970 or "now". The header's own field,
+    /// when it holds a time, is the fallback (task 4 review, minor 2): the
+    /// pax record's precision is what is lost, not the time.
     #[test]
     fn an_unusable_mtime_is_reported() {
+        let header = Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
         let archive = pax_entry(&[("mtime", b"soon")], "f", b"data");
         let (mtime, warnings) = one_entry_report(&archive);
-        assert_eq!(mtime, None);
+        assert_eq!(mtime, header);
         assert!(mtime_lost(&warnings), "{warnings:?}");
 
         let huge = format!("{}", u64::MAX);
         let archive = pax_entry(&[("mtime", huge.as_bytes())], "f", b"data");
+        let (mtime, warnings) = one_entry_report(&archive);
+        assert_eq!(mtime, header);
+        assert!(mtime_lost(&warnings), "{warnings:?}");
+
+        // With the header's field unusable too, the mtime is unknown.
+        let mut archive = pax_entry(&[("mtime", b"soon")], "f", b"data");
+        let at = archive.len() - 3 * BLOCK - BLOCK;
+        set_header_mtime(&mut archive[at..at + BLOCK], *b"zzzzzzzzzzz\0");
+        let (mtime, warnings) = one_entry_report(&archive);
+        assert_eq!(mtime, None);
+        assert!(mtime_lost(&warnings), "{warnings:?}");
+    }
+
+    /// The header's `mtime` field set to `field`, its checksum re-summed.
+    fn set_header_mtime(header: &mut [u8], field: [u8; 12]) {
+        header[136..148].copy_from_slice(&field);
+        header[148..156].fill(b' ');
+        let sum: u32 = header.iter().map(|&b| u32::from(b)).sum();
+        header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    }
+
+    /// An empty header `mtime` field (all NUL, or blanks) is no time at all:
+    /// read as 0, as bsdtar reads it (`tar -tvf` shows 1970 and `-x` sets
+    /// it), and not reported (task 4 review, minor 1). Garbage is still a
+    /// reported loss.
+    #[test]
+    fn an_empty_header_mtime_is_the_epoch_and_not_reported() {
+        for field in [[0u8; 12], *b"           \0", [b' '; 12]] {
+            let mut archive = pax_entry(&[], "f", b"data");
+            set_header_mtime(&mut archive[..BLOCK], field);
+            let (mtime, warnings) = one_entry_report(&archive);
+            assert_eq!(mtime, Some(UNIX_EPOCH), "{field:?}");
+            assert!(warnings.is_empty(), "{field:?}: {warnings:?}");
+        }
+        let mut archive = pax_entry(&[], "f", b"data");
+        set_header_mtime(&mut archive[..BLOCK], *b"zzzzzzzzzzz\0");
         let (mtime, warnings) = one_entry_report(&archive);
         assert_eq!(mtime, None);
         assert!(mtime_lost(&warnings), "{warnings:?}");

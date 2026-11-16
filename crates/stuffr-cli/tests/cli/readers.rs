@@ -208,26 +208,96 @@ fn a_hostile_pax_sparse_map_is_refused() {
     tiny.resize(512, 0);
     tiny.push(b'x');
     let huge = build("huge.tar", "1099511627776", &tiny);
-    for (archive, verb_codes) in [
-        (&bad, [("list", 5), ("test", 5), ("unpack", 5)]),
-        (&huge, [("list", 0), ("test", 6), ("unpack", 6)]),
-    ] {
-        for (verb, code) in verb_codes {
-            let dest = dir.join(format!("out-{verb}"));
-            let p = archive.to_str().unwrap();
-            let out = match verb {
-                "unpack" => run_output(&["unpack", "-C", dest.to_str().unwrap(), p]),
-                _ => run_output(&[verb, p]),
-            };
-            assert_eq!(
-                out.status.code(),
-                Some(code),
-                "{verb} {}: {}",
-                archive.display(),
-                stderr_text(&out)
-            );
-            assert!(!dest.join("GNUSparseFile.0").exists());
+    // Each verb on the file and on a pipe (task 4 review, minor 5): the
+    // same verdict, and an unpack leaves no placeholder. A refused map
+    // writes no `big` at all; the 1 TiB one is refused by the ratio budget
+    // part-way, and entry-aware extraction is documented as not atomic
+    // (`stuffr::entries::extract`, README): the one partial file it leaves
+    // is bounded by that budget, never the declared size.
+    for (archive, codes) in [(&bad, [5, 5, 5, 5]), (&huge, [0, 6, 6, 6])] {
+        let bytes = std::fs::read(archive).unwrap();
+        for (i, verb) in ["list", "test", "unpack", "cat"].into_iter().enumerate() {
+            for pipe in [false, true] {
+                let dest = dir.join(format!("out-{verb}-{pipe}"));
+                let p = if pipe { "-" } else { archive.to_str().unwrap() };
+                let args: Vec<&str> = match verb {
+                    "unpack" => vec!["unpack", "-C", dest.to_str().unwrap(), p],
+                    "cat" => vec!["cat", p, "big"],
+                    _ => vec![verb, p],
+                };
+                let out = if pipe {
+                    piped(&args, &bytes)
+                } else {
+                    run_output(&args)
+                };
+                assert_eq!(
+                    out.status.code(),
+                    Some(codes[i]),
+                    "{verb} {} (pipe {pipe}): {}",
+                    archive.display(),
+                    stderr_text(&out)
+                );
+                assert!(!dest.join("GNUSparseFile.0").exists());
+                let big = std::fs::metadata(dest.join("big")).map(|m| m.len());
+                if codes[i] == 5 {
+                    assert!(big.is_err(), "{verb}: a refused map wrote `big`");
+                    assert!(out.stdout.is_empty(), "{verb}: a refused map wrote data");
+                } else if let Ok(len) = big {
+                    assert!(len <= 128 << 20, "{verb}: `big` grew to {len} bytes");
+                }
+                if verb == "cat" {
+                    assert!(
+                        out.stdout.len() <= 128 << 20,
+                        "{verb}: {} bytes",
+                        out.stdout.len()
+                    );
+                }
+            }
         }
+    }
+}
+
+/// `GNU.sparse.name` is the attacker's new way to name an entry: `../x`
+/// and `/x` are held to the same path safety as any name, exit 7 on unpack
+/// with nothing written outside the destination (task 4 review, minor 4).
+#[test]
+fn a_pax_sparse_name_is_held_to_path_safety() {
+    let dir = tmp_dir();
+    for (i, name) in ["../x", "/x", "a/../../x"].into_iter().enumerate() {
+        let path = dir.join(format!("evil-{i}.tar"));
+        let mut builder = tar::Builder::new(std::fs::File::create(&path).unwrap());
+        builder
+            .append_pax_extensions([
+                ("GNU.sparse.major", &b"1"[..]),
+                ("GNU.sparse.minor", b"0"),
+                ("GNU.sparse.name", name.as_bytes()),
+                ("GNU.sparse.realsize", b"4"),
+            ])
+            .unwrap();
+        let mut payload = b"1\n0\n4\n".to_vec();
+        payload.resize(512, 0);
+        payload.extend_from_slice(b"evil");
+        let mut header = tar::Header::new_ustar();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o644);
+        builder
+            .append_data(&mut header, "GNUSparseFile.0/x", &payload[..])
+            .unwrap();
+        builder.finish().unwrap();
+        let dest = dir.join(format!("dest-{i}"));
+        std::fs::create_dir_all(&dest).unwrap();
+        let out = run_output(&[
+            "unpack",
+            "-C",
+            dest.to_str().unwrap(),
+            path.to_str().unwrap(),
+        ]);
+        assert_eq!(out.status.code(), Some(7), "{name}: {}", stderr_text(&out));
+        assert!(
+            !dir.join("x").exists(),
+            "{name}: written outside the destination"
+        );
+        assert!(!dest.join("x").exists() && !dest.join("GNUSparseFile.0").exists());
     }
 }
 

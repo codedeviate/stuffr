@@ -1164,11 +1164,15 @@ impl ArchiveRead for TarRead {
         for w in [unreadable_name, unreadable_target].into_iter().flatten() {
             self.name_log.warn(&mut self.report, || w);
         }
+        let header = header_time(raw.header());
         let time = match pax.mtime.as_deref() {
             Some(value) => pax_time(value),
-            None => header_time(raw.header()),
+            None => header,
         };
-        meta.mtime = time.time();
+        // A pax time that cannot be used still loses its precision (and is
+        // reported below), but the header's own field, when it holds a
+        // time, is kept rather than discarded.
+        meta.mtime = time.time().or(header.time());
         if time == TimeField::Unusable {
             let entry = &meta.name;
             self.time_log
