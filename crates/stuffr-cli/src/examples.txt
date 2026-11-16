@@ -1681,6 +1681,25 @@ GUARDING AGAINST DECOMPRESSION BOMBS
       later phases add codecs and containers that CAN reach 10000:1.
 
 
+CHOOSING THE WORKING DIRECTORY
+
+  stuffr --cwd /data/archives list t.tar.gz
+      --cwd DIR enters DIR before anything else, so relative paths resolve
+      against it. DIR may itself be relative. There is no short form: -C
+      already means unpack's destination.
+
+  STUFFR_CWD=/data/archives stuffr list t.tar.gz
+      The same through the environment, for a host that cannot change
+      directory itself (a WebAssembly/WASI embedder has no working directory
+      of its own). The value must be ABSOLUTE; a relative one is refused,
+      exit 2. An empty value is ignored, and when --cwd is given
+      STUFFR_CWD is ignored entirely. A stuffr extension: gzip, zip and the
+      other reference tools have neither. It also applies when stuffr runs
+      under another tool's name (a compat link), where a directory that
+      cannot be entered ends the run with that tool's own failure code
+      (1; unzip's 2; zip's 16), after `NAME: cannot enter DIR: REASON`.
+
+
 SKIPPING THE DURABILITY FSYNC
 
   stuffr pack big.txt --no-sync

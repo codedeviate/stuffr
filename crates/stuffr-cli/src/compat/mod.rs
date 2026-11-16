@@ -132,6 +132,74 @@ pub fn family_for(argv0: &OsStr) -> Option<(Family, &'static str)> {
         .map(|&(n, fam)| (fam, n))
 }
 
+/// The exit code a failure to enter the `STUFFR_CWD` / `--cwd` directory ends
+/// the run with, per invoked family (`None` is the native `stuffr` command).
+///
+/// `1` for the gzip, bzip2, xz, zstd, lz4, brotli and compress families, `2`
+/// for unzip's (`unzip`, `zipinfo`, `funzip`), `16` for zip's (`zip`,
+/// `zipcloak`, `zipnote`, `zipsplit`), and `2`, the usage code, for native
+/// `stuffr`. unzip's manual lists 2 as a generic zipfile-format error and 10
+/// as invalid command-line options, so 10 may be the closer match; 2 is the
+/// table as specified.
+pub fn cwd_exit_code(family: Option<Family>) -> u8 {
+    match family {
+        None | Some(Family::Unzip) => 2,
+        Some(Family::Zip) => 16,
+        Some(
+            Family::Bzip2
+            | Family::Gzip
+            | Family::Xz
+            | Family::Zstd
+            | Family::Lz4
+            | Family::Brotli
+            | Family::Compress,
+        ) => 1,
+    }
+}
+
+/// Enter the directory a run asked for, before it dispatches, or fail it.
+///
+/// A WASI module has no working directory of its own, so an embedder says
+/// where it is standing with `STUFFR_CWD`; it is honoured here, ahead of
+/// every personality as well as the native verbs. A stuffr extension: the
+/// reference tools have neither it nor `--cwd`.
+///
+/// `flag` is `--cwd`'s value (native verbs only); when given, `STUFFR_CWD`
+/// is ignored entirely. Otherwise a set, non-empty `STUFFR_CWD` is entered,
+/// and it must be absolute: `stuffr bench` re-runs itself as a child that
+/// inherits the variable, so a relative value would be applied twice. `Err`
+/// carries the exit code, `<name>: cannot enter <DIR>: <error>` having been
+/// written to standard error already.
+pub fn enter_startup_cwd(
+    name: &str,
+    family: Option<Family>,
+    flag: Option<&OsStr>,
+) -> Result<(), ExitCode> {
+    let env = std::env::var_os("STUFFR_CWD");
+    let (dir, from_env) = match (flag, env.as_deref()) {
+        (Some(d), _) => (d, false),
+        (None, Some(d)) if !d.is_empty() => (d, true),
+        _ => return Ok(()),
+    };
+    let entered = if from_env && !Path::new(dir).is_absolute() {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "STUFFR_CWD must be an absolute path",
+        ))
+    } else {
+        std::env::set_current_dir(dir)
+    };
+    entered.map_err(|e| {
+        use std::io::Write as _;
+        let _ = writeln!(
+            io::stderr().lock(),
+            "{name}: cannot enter {}: {e}",
+            Path::new(dir).display()
+        );
+        ExitCode::from(cwd_exit_code(family))
+    })
+}
+
 /// Run the compatibility tool `args[0]` names, or return `None` when it names
 /// none (the caller then behaves as `stuffr`). The tool gets the arguments
 /// after `args[0]`; `bzip2recover`, which prints its `argv[0]` verbatim,
@@ -144,6 +212,10 @@ pub fn dispatch(args: Vec<OsString>) -> Option<ExitCode> {
         return Some(host::signal_test(&args[1..]));
     }
     let (family, name) = family_for(args.first()?)?;
+    // Honoured here, before any family sees its arguments.
+    if let Err(code) = enter_startup_cwd(name, Some(family), None) {
+        return Some(code);
+    }
     let mut args = args.into_iter();
     let argv0 = args.next().unwrap_or_default();
     let rest = args.collect();

@@ -2,6 +2,7 @@ mod bench;
 mod closed_streams;
 mod common;
 mod convert;
+mod cwd;
 mod entries;
 mod fidelity;
 mod foreign;

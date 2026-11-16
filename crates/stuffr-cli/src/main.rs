@@ -64,6 +64,11 @@ fn main() -> ExitCode {
     // destination; a signal removes it (bug hunt 2026-11-15, finding 10).
     stuffr_cli::compat::watch_native_temps();
     let cli = Cli::parse();
+    // After the parse, so `--cwd` can override `STUFFR_CWD`; the bench child
+    // (handled above, before clap) inherits the directory instead.
+    if let Err(code) = stuffr_cli::compat::enter_startup_cwd("stuffr", None, cli.cwd.as_deref()) {
+        return code;
+    }
 
     if cli.examples {
         // `print!` panics on EPIPE (SIGPIPE is ignored by the runtime), and

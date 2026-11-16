@@ -21,6 +21,12 @@ pub struct Cli {
     /// Print detailed usage examples covering every feature, then exit.
     #[arg(long)]
     pub examples: bool,
+    /// Enter DIR before doing anything else (may be relative).
+    ///
+    /// Overrides `STUFFR_CWD`, which is then ignored. `-C` is taken by
+    /// `unpack`, so this one has no short form.
+    #[arg(long, global = true, value_name = "DIR")]
+    pub cwd: Option<std::ffi::OsString>,
 }
 
 #[derive(Subcommand)]

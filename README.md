@@ -2730,6 +2730,17 @@ such a file (a damaged archive you name is reported corrupt, exit 5, and
 tar of a `.tar.gz` whose first header fails its checksum — and `--json`
 adds `unconfirmed_layer`; a file whose every layer checks out prints neither.
 
+**Where stuffr stands: `STUFFR_CWD` and `--cwd`.** `--cwd DIR` (native verbs,
+long form only: `-C` is `unpack`'s) enters `DIR` before anything else, and the
+environment variable `STUFFR_CWD=/abs/dir` does the same for a host that has no
+working directory of its own, such as a WebAssembly/WASI embedder. The variable
+is read at startup, before dispatch, so it reaches the compat personalities
+too; it must be absolute (a relative value is refused), an empty value is
+ignored, and `--cwd` given, `STUFFR_CWD` is ignored. **A stuffr extension:** the
+reference tools have neither. A directory that cannot be entered prints
+`NAME: cannot enter DIR: REASON` and exits 2 (`stuffr`, and `unzip` with its
+siblings), 16 (`zip` with its siblings) or 1 (every other family).
+
 ### Finding archives: `stuffr ls`
 
 `stuffr ls` on a folder (or with no argument, the current one) lists the
