@@ -5041,6 +5041,9 @@ mod unix {
     fn a_read_error_matches_the_reference() {
         use std::process::{Command, Stdio};
         let Some(_) = lz4_dir() else { return };
+        if !loopback_available() {
+            return;
+        }
         let dir = ScratchDir::unique("lz4-readerr");
         fs::create_dir_all(&*dir).unwrap();
         let data = mixed(100_000, 28);

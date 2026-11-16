@@ -1335,6 +1335,24 @@ pub fn output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
     spawn(cmd)?.wait_with_output()
 }
 
+/// Whether [`reset_after`] can work here: a loopback TCP listener can be
+/// bound. A build sandbox without loopback skips (with a note) instead of
+/// panicking inside the helper; under `CI` it must work (as
+/// [`require_reference`]).
+pub fn loopback_available() -> bool {
+    match std::net::TcpListener::bind("127.0.0.1:0") {
+        Ok(_) => true,
+        Err(e) => {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI is set but no loopback TCP listener can be bound: {e}"
+            );
+            eprintln!("skipped: no loopback TCP ({e})");
+            false
+        }
+    }
+}
+
 /// An input whose reads fail part-way: one end of a loopback TCP
 /// connection, whose peer (a thread) sends `data`, waits until the reader
 /// has taken all of it ([`wait_until_drained`]), then resets the
@@ -1344,6 +1362,7 @@ pub fn output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
 /// `/dev/fd/0` makes it a named input too) and join the thread after the
 /// child has finished. The way a failing disk or network file system is
 /// met: the second bug hunt's read-error findings were all reproduced so.
+/// Callers check [`loopback_available`] first.
 pub fn reset_after(data: Vec<u8>) -> (OwnedFd, std::thread::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let client = {

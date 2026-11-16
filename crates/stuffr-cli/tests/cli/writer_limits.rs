@@ -202,6 +202,13 @@ fn an_mtime_the_format_cannot_hold_is_a_fidelity_loss() {
         .unwrap()
         .set_modified(UNIX_EPOCH + Duration::from_secs(4_449_600_000))
         .unwrap();
+    // A file system that clamps times (XFS without bigtime, ext3) reads
+    // back 2038: then there is no 2111 file to pack (final review Minor 6).
+    let stuck = std::fs::metadata(&f).unwrap().modified().unwrap();
+    if stuck != UNIX_EPOCH + Duration::from_secs(4_449_600_000) {
+        eprintln!("skipped: the file system did not keep a 2111 mtime ({stuck:?})");
+        return;
+    }
     for ext in ["zip", "lzh", "arj", "cpio"] {
         let dst = dir.join(format!("out.{ext}"));
         let out = run_output(&[

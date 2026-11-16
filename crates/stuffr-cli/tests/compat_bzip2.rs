@@ -1753,14 +1753,30 @@ mod attributes {
         if !require_reference(&reference) {
             return;
         }
-        let root = std::env::temp_dir().join(format!("stuffr-bzip2-xattr-{}", std::process::id()));
-        let clean = |d: &std::path::Path| {
-            if d.exists() {
-                let _ = Command::new("chmod").arg("-RN").arg(d).status();
-                let _ = std::fs::remove_dir_all(d);
+        /// Removes the tree on drop, a failed assertion included (final
+        /// review Minor 6: a leftover failed the gate's tmp-leaks check
+        /// too), its ACLs stripped first (`chmod -RN`).
+        struct Root(std::path::PathBuf);
+        impl Root {
+            fn clean(&self) {
+                if self.0.exists() {
+                    let _ = std::process::Command::new("chmod")
+                        .arg("-RN")
+                        .arg(&self.0)
+                        .status();
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
             }
-        };
-        clean(&root);
+        }
+        impl Drop for Root {
+            fn drop(&mut self) {
+                self.clean();
+            }
+        }
+        let guard =
+            Root(std::env::temp_dir().join(format!("stuffr-bzip2-xattr-{}", std::process::id())));
+        guard.clean();
+        let root = guard.0.clone();
         std::fs::create_dir_all(root.join("bin")).unwrap();
         let ours = root.join("bin").join("bzip2");
         std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &ours).unwrap();
@@ -1834,6 +1850,5 @@ mod attributes {
                 "{what}: stuffr's outputs against the reference's"
             );
         }
-        clean(&root);
     }
 }
