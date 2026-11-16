@@ -24,15 +24,6 @@ XFAIL=(
   # Item 10: the xz personality's own worker handling, same cause (exit 1,
   # "Internal error (bug)").
   xz-personality-T8
-  # No item yet. std's `File::try_clone` is unsupported on wasm32 ("operation
-  # not supported on this platform", without asking the host), and
-  # `Output::create` (crates/stuffr/src/ops.rs) clones the temp file's handle
-  # for the `sync_all` before publishing: `pack`, and `unpack` of a plain
-  # codec stream, to a named file exit 1. Container extraction is unaffected.
-  roundtrip
-  # No item yet. The same `try_clone`, in the xz personality's own output
-  # (crates/stuffr-cli/src/compat/xz/file_io.rs).
-  xz-personality-file
 )
 
 WAZERO_VERSION=1.12.0

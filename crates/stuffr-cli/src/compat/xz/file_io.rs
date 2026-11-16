@@ -31,6 +31,7 @@
 use std::fs::{self, File, Metadata};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::args::{Args, OpMode};
@@ -63,17 +64,50 @@ impl Read for Src {
 enum Out {
     /// The real process: a file (standard output's descriptor, or the
     /// temporary), written unbuffered as `write(2)` writes.
-    Raw(File),
+    Raw(SharedFile),
     /// A sandbox: its capped standard output or file, flushed after each
     /// write so a full budget fails where a full disk would.
     Capped(BufWriter<Box<dyn Write + Send>>),
 }
 
+/// One open file held by both the writer and the [`DestFile`] that later
+/// syncs it and sets its attributes: the same descriptor, shared, where
+/// `File::try_clone` (unsupported on wasm32-wasip1) would have duplicated it.
+/// Never a reopen by path: the temporary's directory may be writable by
+/// others.
+#[derive(Clone)]
+struct SharedFile(Arc<File>);
+
+impl std::ops::Deref for SharedFile {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl Write for SharedFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        (&*self.0).write(buf)
+    }
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        (&*self.0).write_vectored(bufs)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        (&*self.0).flush()
+    }
+}
+
+impl Seek for SharedFile {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        (&*self.0).seek(pos)
+    }
+}
+
 /// The output file being written.
 struct DestFile {
-    /// The temporary, and a handle on it for attributes and syncing.
+    /// The temporary, and the shared file for attributes and syncing.
     tmp: PathBuf,
-    handle: File,
+    handle: SharedFile,
     /// `dest_st`, taken when it was created.
     meta: Option<Metadata>,
     /// Its name as given (`dest_name`) and as a path.
@@ -485,7 +519,7 @@ impl FilePair {
                 Host::Real => match stdout_file() {
                     Ok(f) => {
                         self.dest_try_sparse = sparse && stdout_can_be_sparse(&f);
-                        self.out = Some(Out::Raw(f));
+                        self.out = Some(Out::Raw(SharedFile(Arc::new(f))));
                     }
                     Err(_) => self.out = Some(Out::Capped(host.out_writer(None))),
                 },
@@ -548,20 +582,13 @@ impl FilePair {
                     return false;
                 }
             };
-        let handle = match file.try_clone() {
-            Ok(h) => h,
-            Err(e) => {
-                let _ = fs::remove_file(&tmp);
-                msg.error(err, m::NAME_COLON, &[&shown, &strerror(&e)]);
-                return false;
-            }
-        };
+        let handle = SharedFile(Arc::new(file));
         self.out = Some(match host {
             Host::Real => {
                 self.dest_try_sparse = sparse;
-                Out::Raw(file)
+                Out::Raw(handle.clone())
             }
-            Host::Sandbox(_) => Out::Capped(host.out_writer(Some(file))),
+            Host::Sandbox(_) => Out::Capped(host.file_writer(Box::new(handle.clone()))),
         });
         self.dest_name = dest;
         self.dest = Some(DestFile {
@@ -750,6 +777,11 @@ impl FilePair {
 fn close_out(out: Option<Out>) -> io::Result<()> {
     match out {
         Some(Out::Raw(f)) => {
+            // The destination's handle was dropped first, so this is the
+            // last holder; if not, the last drop closes it, unchecked.
+            let Ok(f) = Arc::try_unwrap(f.0) else {
+                return Ok(());
+            };
             #[cfg(unix)]
             {
                 use std::os::fd::IntoRawFd;

@@ -343,15 +343,32 @@ pub(crate) struct Opened {
     pub(crate) warnings: Vec<Fidelity>,
 }
 
+/// A writer over a file that something else also holds (`Finish::handle`),
+/// so the one descriptor is written and later synced without
+/// `File::try_clone`.
+struct SharedFile(std::sync::Arc<std::fs::File>);
+
+impl Write for SharedFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        (&*self.0).write(buf)
+    }
+    fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+        (&*self.0).write_vectored(bufs)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&*self.0).flush()
+    }
+}
+
 /// What `Opened::writer` is actually writing to, and where it must end up.
 pub(crate) struct Finish {
     /// The temp path currently being written. Removed on failure.
     pub(crate) tmp: PathBuf,
     /// The real destination. Renamed onto only after a successful write.
     pub(crate) target: PathBuf,
-    /// A second handle on the temp file, kept so `publish` can `sync_all()`
-    /// after the codec has consumed the writer it was handed.
-    pub(crate) handle: Option<std::fs::File>,
+    /// The temp file itself, shared with the writer, kept so `publish` can
+    /// `sync_all()` after the codec has consumed the writer it was handed.
+    pub(crate) handle: Option<std::sync::Arc<std::fs::File>>,
     /// Whether `publish` should fsync at all. See `CompressOpts::sync` /
     /// `DecompressOpts::sync` for what turning it off costs.
     pub(crate) sync: bool,
@@ -500,19 +517,14 @@ impl Output {
                     #[cfg(unix)]
                     warnings.extend(set_mode_best_effort(&f, _mode, p));
                 }
-                // A second handle on the same temp file, taken before `f` is
-                // boxed away as the writer, so `publish` can `sync_all()` it
-                // after the codec has finished writing through the writer.
-                let handle = match f.try_clone() {
-                    Ok(h) => h,
-                    Err(e) => {
-                        let _ = std::fs::remove_file(&tmp);
-                        release_temp(&tmp);
-                        return Err(e.into());
-                    }
-                };
+                // One open file, shared: the codec writes through `writer` and
+                // `publish` later `sync_all()`s the very same descriptor. Not
+                // `try_clone` (unsupported on wasm32-wasip1), and never a
+                // reopen by path: the name is a temp in a directory others
+                // may write to.
+                let handle = std::sync::Arc::new(f);
                 Ok(Opened {
-                    writer: Box::new(f),
+                    writer: Box::new(SharedFile(std::sync::Arc::clone(&handle))),
                     finish: Some(Finish {
                         tmp,
                         target: p.clone(),
@@ -2337,6 +2349,28 @@ mod tests {
         let got = std::fs::read(&dst).unwrap();
         let _ = std::fs::remove_file(&dst);
         assert_eq!(got, b"NEW");
+        assert!(!tmp_path.exists());
+    }
+
+    /// create -> write -> drop the writer (as a codec does) -> publish with
+    /// sync on: the shared file is still open for the `sync_all`, and the
+    /// destination ends up with exactly the written bytes.
+    #[test]
+    fn create_write_publish_with_sync_leaves_the_written_bytes() {
+        let dst = tmp("shared-handle-sync");
+        let _ = std::fs::remove_file(&dst);
+        let mut opened = Output::Path(dst.clone())
+            .create(false, true, &FromInput::default())
+            .unwrap();
+        opened.writer.write_all(b"shared ").unwrap();
+        opened.writer.write_all(b"handle").unwrap();
+        opened.writer.flush().unwrap();
+        let tmp_path = opened.finish.as_ref().unwrap().tmp.clone();
+        drop(opened.writer);
+        publish(opened.finish).unwrap();
+        let got = std::fs::read(&dst).unwrap();
+        let _ = std::fs::remove_file(&dst);
+        assert_eq!(got, b"shared handle");
         assert!(!tmp_path.exists());
     }
 
