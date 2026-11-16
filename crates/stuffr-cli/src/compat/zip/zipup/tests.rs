@@ -178,7 +178,9 @@ fn a_file_that_changes_while_zipping_warns_as_zip_does() {
 /// the second bug hunt): a deflated or bzip2 one says so too (zipup's
 /// `zerr()` looks at the stored loop's count only, so zip says nothing),
 /// and `-m` never deletes a file that could not be read whole (zip does,
-/// though its entry holds only part of it).
+/// though its entry holds only part of it). Ruling M8: the run ends as
+/// one with a file zip could not open (`Not all files were readable`,
+/// exit 18), where zip exits 0.
 #[test]
 fn a_read_error_is_the_end_of_the_input() {
     let data = big(200_000);
@@ -197,15 +199,20 @@ fn a_read_error_is_the_end_of_the_input() {
             };
             let (code, out, err) = run(&s.0, &args, "big", reads);
             let ctx = format!("{level} -m={mv}: {out} {err}");
-            assert_eq!(code, 0, "{ctx}");
+            assert_eq!(code, 18, "{ctx}");
             let changed = "\tzip warning:  file size changed while zipping big\n";
             assert_eq!(err, "\nzip warning: Input/output error\n", "{ctx}");
             let unread =
                 format!("  adding: big\n\tzip warning: could not read input file: big\n{changed}");
+            // Ruling M8: zip's ending for a file it could not read (probe:
+            // `/usr/bin/zip t.zip a u`, `u` mode 000), the file counted as
+            // skipped with its unread bytes.
+            let summary = "\nzip warning: Not all files were readable\n  \
+                files/entries read:  0 (48K bytes)  skipped:  1 (146K bytes)\n";
             if stored {
-                assert_eq!(out, format!("{unread} (stored 0%)\n"), "{ctx}");
+                assert_eq!(out, format!("{unread} (stored 0%)\n{summary}"), "{ctx}");
             } else {
-                assert!(out.starts_with(&unread), "{ctx}");
+                assert!(out.starts_with(&unread) && out.ends_with(summary), "{ctx}");
             }
             assert_eq!(std::fs::read(s.0.join("big")).unwrap(), data, "{ctx}");
             let zip = std::fs::read(s.0.join("t.zip")).unwrap();

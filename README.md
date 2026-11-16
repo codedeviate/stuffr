@@ -2340,9 +2340,10 @@ before the command line, as the reference does.
 35. **A read error part-way through a file is said, and `-m` keeps the
     file.** zip takes a failing read for the end of the file and says so only
     for a stored entry; `-m` then deletes the file though its entry holds
-    only part of it. stuffr says `could not read input file` for every
-    method and leaves that file where it is; the entry and the exit code are
-    zip's.
+    only part of it, and exits 0. stuffr says `could not read input file`
+    for every method, leaves that file where it is, and ends the run as zip
+    ends one with a file it could not open (`Not all files were readable`,
+    exit 18); the entry is zip's.
 36. **`-m` never deletes an archive.** zip adds an existing `-O` target the
     operands match and then deletes it (the archive just written, with every
     moved file gone), and deletes an archive that holds an entry of its own

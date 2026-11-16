@@ -411,7 +411,10 @@
 //!     count). stuffr keeps the entry and zip's lines, says `could not read
 //!     input file: NAME` (after the `perror` line) for a deflated or bzip2
 //!     entry too, and `-m` leaves that file where it is (zip deletes it
-//!     though its entry is incomplete). The exit code stays zip's.
+//!     though its entry is incomplete). The run then ends as one with a
+//!     file zip could not open (where zip exits 0): `zip warning: Not all
+//!     files were readable` and the `files/entries read: ... skipped: ...`
+//!     line (the file counted as skipped with its unread bytes), exit 18.
 //! 36. `-m` never deletes an archive (finding 29 of the second bug hunt).
 //!     zip's `trash()` unlinks every name it moved: an existing `-O` target
 //!     the operands match is added as an entry and then deleted, the

@@ -395,7 +395,12 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
                         let disk = z.host.path(stripped);
                         match add_entry(z, &mut w, zf.e.clone(), &disk) {
                             Err(x) => return x,
-                            Ok(Zipped::Entry(e)) => zf.e = *e,
+                            Ok(Zipped::Entry(e)) => {
+                                // deviation 35 (ruling M8): a read error ends
+                                // the run ZE_OPEN, as an unopenable file does
+                                o |= e.read_failed;
+                                zf.e = *e;
+                            }
                             Ok(other) => r = Some(other),
                         }
                     } else {
@@ -611,6 +616,16 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
                 w.files_so_far += 1;
                 w.good_bytes_so_far = w.good_bytes_so_far.wrapping_add(e.len);
                 w.bytes_so_far = w.bytes_so_far.wrapping_add(len);
+                if e.read_failed {
+                    // deviation 35 (ruling M8): a file a read error cut
+                    // short is one zip could not read: it counts as
+                    // skipped (its unread bytes), "Not all files were
+                    // readable", and the run ends ZE_OPEN (18). Its entry
+                    // keeps what was read.
+                    o = true;
+                    w.bad_files_so_far += 1;
+                    w.bad_bytes_so_far = w.bad_bytes_so_far.wrapping_add(len.saturating_sub(e.len));
+                }
                 zfiles.push(ZFile {
                     e: *e,
                     zname: f.zname.clone(),

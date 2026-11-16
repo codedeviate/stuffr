@@ -13,7 +13,8 @@
 //! entry warns "could not read input file" (deviation 35 for a deflated or
 //! bzip2 one: zipup's `zerr()` looks at the stored loop's `k` only, so zip
 //! says nothing there), and the size changed; `-m` then leaves the file
-//! (deviation 35, `ZEntry::read_failed`). **A write that fails** ends the run as
+//! (deviation 35, `ZEntry::read_failed`) and the run ends 18, "Not all
+//! files were readable" (ruling M8). **A write that fails** ends the run as
 //! `bfwrite` ends it: `ZE_WRITE`, "write error on zip file", exit 14.
 
 use std::fs::File;
