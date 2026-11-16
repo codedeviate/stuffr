@@ -76,6 +76,7 @@ pub(super) fn execute(prog: &'static str, s: Settings, host: &mut Host, err: &mu
         in_name: b"(none)".to_vec(),
         out_name: b"(none)".to_vec(),
         pending: None,
+        attrs: None,
         unz_fails: false,
         test_fails: false,
         host,
@@ -110,6 +111,9 @@ struct Bz<'a> {
     /// The temporary output while bzip2 would delete its output on a fatal
     /// error (`deleteOutputOnInterrupt`).
     pending: Option<PathBuf>,
+    /// macOS, file-to-file: the input and the temporary output, for the
+    /// attribute copy made once the output is published ([`Bz::commit`]).
+    attrs: Option<(File, File)>,
     unz_fails: bool,
     test_fails: bool,
     /// Where operands resolve and standard input and output come from.
@@ -359,6 +363,36 @@ impl Bz<'_> {
         }
     }
 
+    /// macOS: keep the file-to-file input and output for the attribute copy
+    /// [`Bz::commit`] makes (bug hunt 2, finding 24). Elsewhere a no-op.
+    fn keep_for_attributes(&mut self, input: &File, out: &File) {
+        #[cfg(target_os = "macos")]
+        if let (Ok(i), Ok(o)) = (input.try_clone(), out.try_clone()) {
+            self.attrs = Some((i, o));
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (input, out);
+    }
+
+    /// macOS, standard output: Apple's bzip2 copies the input's ACL and
+    /// extended attributes onto standard output (`-c`, and standard input
+    /// to standard output) as it starts on each input, which takes where
+    /// standard output is a regular file and is ignored elsewhere.
+    /// `input` `None` is standard input. Only a real run's standard
+    /// streams are descriptors; a sandboxed run has none.
+    fn copy_attributes_to_stdout(&mut self, input: Option<&File>) {
+        #[cfg(target_os = "macos")]
+        if matches!(self.host, Host::Real) {
+            let stdout = io::stdout();
+            match input {
+                Some(f) => crate::compat::host::apple_copy_attributes(f, &stdout),
+                None => crate::compat::host::apple_copy_attributes(&io::stdin(), &stdout),
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = input;
+    }
+
     /// Publish the finished temporary output under its name, then remove the
     /// input unless it is kept (the tail of `compress` and `uncompress`).
     /// `Ok(false)`: the output appeared meanwhile and was refused.
@@ -374,7 +408,18 @@ impl Bz<'_> {
         if let Some(tmp) = self.pending.clone() {
             let out = self.host.path(&self.out_name);
             match publish(&tmp, &out, self.s.force) {
-                Ok(Published::Done) => {}
+                Ok(Published::Done) => {
+                    // Apple's bzip2 gives the output the input's ACL and
+                    // extended attributes as it opens it; here the copy
+                    // waits until the output is published, so an ACL that
+                    // denies deletion never reaches the temporary (whose
+                    // name `publish` unlinks). The descriptors are the same
+                    // files, so the result is Apple's.
+                    #[cfg(target_os = "macos")]
+                    if let Some((i, o)) = self.attrs.take() {
+                        crate::compat::host::apple_copy_attributes(&i, &o);
+                    }
+                }
                 Ok(Published::Exists) => {
                     self.pending = None;
                     let (p, o) = (self.p(), self.out_name.clone());
@@ -397,6 +442,7 @@ impl Bz<'_> {
 
     fn compress(&mut self, name: Option<&[u8]>) -> Step {
         self.pending = None;
+        self.attrs = None;
         match (self.s.src, name) {
             (SrcMode::F2F, Some(n)) => {
                 self.check_name(n)?;
@@ -424,6 +470,7 @@ impl Bz<'_> {
                     self.refuse_tty(m::NO_TTY_OUTPUT);
                     return Ok(());
                 }
+                self.copy_attributes_to_stdout(None);
                 (Box::new(self.host.stdin()), None)
             }
             SrcMode::F2O => {
@@ -433,7 +480,10 @@ impl Bz<'_> {
                     return Ok(());
                 }
                 match inp {
-                    Ok(f) => (Box::new(f), None),
+                    Ok(f) => {
+                        self.copy_attributes_to_stdout(Some(&f));
+                        (Box::new(f), None)
+                    }
                     Err(e) => {
                         let (p, n) = (self.p(), self.in_name.clone());
                         self.refuse(m::CANT_OPEN_INPUT, &[p, &n, &strerror(&e)]);
@@ -446,6 +496,7 @@ impl Bz<'_> {
                     return Ok(());
                 };
                 self.pending = Some(tmp);
+                self.keep_for_attributes(&inp, &out);
                 (Box::new(inp), Some(out))
             }
         };
@@ -528,6 +579,7 @@ impl Bz<'_> {
 
     fn uncompress(&mut self, name: Option<&[u8]>) -> Step {
         self.pending = None;
+        self.attrs = None;
         let mut cant_guess = false;
         match (self.s.src, name) {
             (SrcMode::F2F, Some(n)) => {
@@ -562,10 +614,14 @@ impl Bz<'_> {
                     self.refuse_tty(m::NO_TTY_INPUT);
                     return Ok(());
                 }
+                self.copy_attributes_to_stdout(None);
                 (self.host.stdin(), None)
             }
             SrcMode::F2O => match File::open(self.host.path(&self.in_name)) {
-                Ok(f) => (Input::file(f), None),
+                Ok(f) => {
+                    self.copy_attributes_to_stdout(Some(&f));
+                    (Input::file(f), None)
+                }
                 Err(e) => {
                     let (p, n) = (self.p(), self.in_name.clone());
                     self.refuse(m::CANT_OPEN_INPUT_NOSPACE, &[p, &n, &strerror(&e)]);
@@ -577,6 +633,7 @@ impl Bz<'_> {
                     return Ok(());
                 };
                 self.pending = Some(tmp);
+                self.keep_for_attributes(&inp, &out);
                 (Input::file(inp), Some(out))
             }
         };
@@ -982,6 +1039,7 @@ mod tests {
                 in_name: b"a".to_vec(),
                 out_name: out.as_os_str().as_encoded_bytes().to_vec(),
                 pending: Some(tmp.clone()),
+                attrs: None,
                 unz_fails: false,
                 test_fails: false,
                 host: &mut host,
@@ -1037,6 +1095,7 @@ mod tests {
                 in_name: gone.as_os_str().as_encoded_bytes().to_vec(),
                 out_name: out.as_os_str().as_encoded_bytes().to_vec(),
                 pending: Some(tmp.clone()),
+                attrs: None,
                 unz_fails: false,
                 test_fails: false,
                 host: &mut host,
@@ -1072,6 +1131,7 @@ mod tests {
                 in_name: b"a".to_vec(),
                 out_name: b"a.bz2".to_vec(),
                 pending: None,
+                attrs: None,
                 unz_fails: false,
                 test_fails: false,
                 host: &mut host,
@@ -1107,6 +1167,7 @@ mod tests {
             in_name: b"a".to_vec(),
             out_name: b"a.bz2".to_vec(),
             pending: None,
+            attrs: None,
             unz_fails: false,
             test_fails: false,
             host: &mut host,

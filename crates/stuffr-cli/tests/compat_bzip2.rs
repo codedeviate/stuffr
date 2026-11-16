@@ -1732,3 +1732,108 @@ mod interrupts {
         unit.repeat(mib)
     }
 }
+
+/// The macOS attribute copy (bug hunt 2, finding 24).
+#[cfg(target_os = "macos")]
+mod attributes {
+    use super::compat_harness::*;
+
+    /// Bug hunt 2, finding 24: on macOS `/usr/bin/bzip2` gives its output
+    /// the input's ACL and extended attributes (`fcopyfile` with
+    /// `COPYFILE_ACL | COPYFILE_XATTR`, quarantine included) and clears the
+    /// Finder type and creator, in every mode: compressing, decompressing,
+    /// `-k`, `-c` and standard input to a regular-file standard output,
+    /// even when the decode then fails (the copy is made as the output is
+    /// opened). Each scenario runs in twin directories, one per side, and
+    /// the outputs' `xattr -l` and ACL listings must agree.
+    #[test]
+    fn extended_attributes_and_acls_follow_the_reference() {
+        use std::process::Command;
+        let reference = std::path::Path::new(REFERENCE_DIR).join("bzip2");
+        if !require_reference(&reference) {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("stuffr-bzip2-xattr-{}", std::process::id()));
+        let clean = |d: &std::path::Path| {
+            if d.exists() {
+                let _ = Command::new("chmod").arg("-RN").arg(d).status();
+                let _ = std::fs::remove_dir_all(d);
+            }
+        };
+        clean(&root);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        let ours = root.join("bin").join("bzip2");
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &ours).unwrap();
+        // Each scenario: a script run with `$B` the program, in an empty
+        // directory, then the files whose attributes are compared.
+        let tag = "t(){ xattr -w com.apple.quarantine '0083;5f000000;Safari;ABCD-1234' \"$1\"; \
+                   xattr -w user.foo bar \"$1\"; \
+                   xattr -wx com.apple.FinderInfo 54455854424f424f000c00000000000000000000000000000000000000000000 \"$1\"; \
+                   chmod +a 'everyone deny write' \"$1\"; }; ";
+        let scenarios: &[(&str, &str, &[&str])] = &[
+            ("compress", "echo hello > a; t a; $B a", &["a.bz2"]),
+            ("keep", "echo hello > a; t a; $B -k a", &["a.bz2"]),
+            (
+                "decompress",
+                "echo hello | /usr/bin/bzip2 > a.bz2; t a.bz2; $B -d a.bz2",
+                &["a"],
+            ),
+            ("to stdout", "echo hello > a; t a; $B -c a > o", &["o"]),
+            ("stdin", "echo hello > a; t a; $B < a > o", &["o"]),
+            (
+                "-dc not bzip2",
+                "echo plain > a; t a; $B -dc a > o 2>/dev/null; true",
+                &["o"],
+            ),
+            (
+                "trailing garbage",
+                "echo hi | /usr/bin/bzip2 > g.bz2; echo junk >> g.bz2; t g.bz2; $B -d g.bz2 2>/dev/null",
+                &["g"],
+            ),
+            (
+                "two inputs",
+                "echo a > a; t a; echo b > b; xattr -w user.two 2 b; $B -c a b > o",
+                &["o"],
+            ),
+        ];
+        let describe = |dir: &std::path::Path, f: &str| -> String {
+            let p = dir.join(f);
+            let x = Command::new("xattr").arg("-l").arg(&p).output().unwrap();
+            let l = Command::new("ls").arg("-le").arg(&p).output().unwrap();
+            let acl: Vec<String> = String::from_utf8_lossy(&l.stdout)
+                .lines()
+                .skip(1)
+                .map(str::to_string)
+                .collect();
+            format!("{}acl {:?}", String::from_utf8_lossy(&x.stdout), acl)
+        };
+        for (what, script, outputs) in scenarios {
+            let mut seen = Vec::new();
+            for (side, exe) in [("ref", reference.as_path()), ("ours", ours.as_path())] {
+                let dir = root.join(format!("{}-{side}", what.replace(' ', "_")));
+                std::fs::create_dir_all(&dir).unwrap();
+                let st = output(
+                    Command::new("/bin/sh")
+                        .arg("-c")
+                        .arg(format!("{tag}{script}"))
+                        .env("B", exe)
+                        .current_dir(&dir),
+                )
+                .unwrap();
+                assert!(st.status.success(), "{what} ({side}): {st:?}");
+                let d: Vec<String> = outputs.iter().map(|f| describe(&dir, f)).collect();
+                seen.push(d);
+            }
+            assert!(
+                seen[0][0].contains("user."),
+                "{what}: the reference carried nothing: {:?}",
+                seen[0]
+            );
+            assert_eq!(
+                seen[1], seen[0],
+                "{what}: stuffr's outputs against the reference's"
+            );
+        }
+        clean(&root);
+    }
+}

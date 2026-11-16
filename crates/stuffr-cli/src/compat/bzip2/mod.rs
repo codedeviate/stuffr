@@ -8,6 +8,16 @@
 //! are caught (even if inherited as ignored, as bzip2's `signal()` does) and
 //! answered at the next chunk with bzip2's message and `cleanUpAndFail(1)`.
 //!
+//! On macOS the reference is Apple's build, which also gives each output the
+//! input's ACL and extended attributes (`fcopyfile`, `COPYFILE_ACL |
+//! COPYFILE_XATTR`, quarantine included) and clears the Finder type and
+//! creator, in every mode where the output is a file: file to file (either
+//! direction, `-k` too) and standard output (`-c`, standard input) when it
+//! is a regular file, even if the decode then fails. stuffr does the same
+//! (`host::apple_copy_attributes`); file to file the copy is made once the
+//! output is published rather than as it is opened, so an ACL that denies
+//! deletion cannot stop the temporary's removal. Bug hunt 2, finding 24.
+//!
 //! Known deviations from bzip2 1.0.8:
 //!
 //! - `--version`/`-V`/`-L`/`--license` name stuffr and its version on the

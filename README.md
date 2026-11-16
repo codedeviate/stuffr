@@ -1341,6 +1341,13 @@ stuffr install-links --dir ~/.local/bin --remove         # remove stuffr's links
   and `--help`. Where `bzip2.c` surprises, stuffr follows it: `-V` and `-L`
   print and carry on, a terminal is refused even under `-f`, and `-s` caps
   the compression block size at 200k.
+- **On macOS, extended attributes and ACLs follow the input,** as with
+  Apple's build of bzip2 (`/usr/bin/bzip2`): compressing and decompressing,
+  with `-k`, and with `-c` or standard input when standard output is a
+  regular file, the output gets the input's ACL and extended attributes,
+  `com.apple.quarantine` included, and the Finder type and creator are
+  cleared. A downloaded `.bz2` decompresses to a quarantined file. Elsewhere
+  nothing but the mode, owner and times is copied, as upstream bzip2 does.
 - **Compressed output is byte-identical** to bzip2 1.0.8 at every level, on
   both build tiers. The default level is 9, not stuffr's own 6.
   `bzip2recover`'s `rec*` files are byte-identical too.

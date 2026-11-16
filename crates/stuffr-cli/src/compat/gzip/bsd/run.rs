@@ -563,7 +563,7 @@ impl Gz<'_> {
             }
         }
         #[cfg(target_os = "macos")]
-        apple_copy_attributes(&input, &fd);
+        crate::compat::host::apple_copy_attributes(&*input, &fd);
         self.copymodes(&fd, &isb, None, &outfile);
         drop(input);
         self.unlink_input(&path, &isb, &out_path);
@@ -1066,61 +1066,6 @@ fn enametoolong() -> i32 {
     #[cfg(not(unix))]
     {
         38
-    }
-}
-
-/// `fcopyfile(in, out, 0, COPYFILE_ACL | COPYFILE_XATTR)` then
-/// `clear_type_and_creator(out)`: the input's ACL and extended attributes,
-/// then the Finder type and creator cleared if the output has Finder info.
-/// Failures are ignored, as gzip ignores them.
-#[cfg(target_os = "macos")]
-fn apple_copy_attributes(input: &File, out: &File) {
-    use std::os::fd::AsRawFd;
-    let (i, o) = (input.as_raw_fd(), out.as_raw_fd());
-    // SAFETY: both descriptors are open; a null state is allowed.
-    unsafe {
-        libc::fcopyfile(
-            i,
-            o,
-            std::ptr::null_mut(),
-            libc::COPYFILE_ACL | libc::COPYFILE_XATTR,
-        );
-    }
-    #[repr(C)]
-    struct FinderBuf {
-        length: u32,
-        info: [u8; 32],
-    }
-    let mut alist = libc::attrlist {
-        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
-        reserved: 0,
-        commonattr: libc::ATTR_CMN_FNDRINFO,
-        volattr: 0,
-        dirattr: 0,
-        fileattr: 0,
-        forkattr: 0,
-    };
-    let mut abuf = FinderBuf {
-        length: 0,
-        info: [0; 32],
-    };
-    let size = std::mem::size_of::<FinderBuf>();
-    // SAFETY: `alist` and `abuf` are valid for the sizes passed; the
-    // kernel writes at most `size` bytes into `abuf`.
-    let got =
-        unsafe { libc::fgetattrlist(o, (&raw mut alist).cast(), (&raw mut abuf).cast(), size, 0) };
-    if got == 0 && abuf.length as usize == size {
-        abuf.info[..8].fill(0);
-        // SAFETY: as above; `info` is 32 bytes.
-        unsafe {
-            libc::fsetattrlist(
-                o,
-                (&raw mut alist).cast(),
-                abuf.info.as_mut_ptr().cast(),
-                abuf.info.len(),
-                0,
-            );
-        }
     }
 }
 
