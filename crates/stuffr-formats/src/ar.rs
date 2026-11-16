@@ -265,7 +265,7 @@ use stuffr_core::{
     Source,
 };
 
-use crate::names::not_utf8;
+use crate::names::{WarningLog, not_utf8};
 use crate::normalize::{AR_MALFORMED_AS_INVALID_DATA_EOF, NormalizeDecodeErrors};
 
 pub const AR: FormatId = FormatId::new("ar");
@@ -381,6 +381,7 @@ impl Container for Ar {
             mode_unknown,
             report,
             seekable,
+            name_log: WarningLog::new(AR, crate::tar::NAME_NOT_UTF8),
         }))
     }
 
@@ -1377,6 +1378,9 @@ struct ArRead {
     mode_unknown: ModeUnknown,
     report: FidelityReport,
     seekable: bool,
+    /// The names that are not UTF-8: listed for 64 members, counted after
+    /// that (task 4 review, I1).
+    name_log: WarningLog,
 }
 
 impl Drop for ArRead {
@@ -1421,7 +1425,7 @@ impl ArchiveRead for ArRead {
         // A name that is not UTF-8 is read lossily; say so (bug hunt
         // 2026-11-15, finding 20).
         if let Some(w) = not_utf8(AR, &meta.name, "name", raw.header().identifier()) {
-            self.report.warn(w);
+            self.name_log.warn(&mut self.report, || w);
         }
         let remaining = raw.header().size();
         let name = meta.name.clone();
@@ -2569,6 +2573,33 @@ mod tests {
             })
             .collect();
         assert_eq!(raws, ["caf\\xe9", "caf\\xe8"]);
+    }
+
+    /// Task 4 review, I1: the name warnings are capped at 64 plus one count.
+    #[test]
+    fn name_warnings_are_capped_with_a_count() {
+        let mut bytes = b"!<arch>\n".to_vec();
+        for i in 0..100 {
+            let mut id = [b' '; 16];
+            let name = format!("m{i}");
+            id[..name.len()].copy_from_slice(name.as_bytes());
+            id[name.len()] = 0xe9;
+            bytes.extend(ar_header_raw(&id, 2));
+            bytes.extend_from_slice(b"ab");
+        }
+        let mut ar = open(&bytes);
+        while ar.next_entry().unwrap().is_some() {}
+        let w = &ar.fidelity().warnings;
+        let listed = w
+            .iter()
+            .filter(|w| matches!(w, stuffr_core::Fidelity::NameNotUtf8 { .. }))
+            .count();
+        assert_eq!(listed, 64);
+        assert!(
+            w.iter()
+                .any(|w| matches!(w, stuffr_core::Fidelity::Unlisted { entries: 36, .. }))
+        );
+        assert_eq!(w.len(), 65);
     }
 
     /// One hand-built 60-byte `ar` entry header — every field but the

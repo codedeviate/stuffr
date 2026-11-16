@@ -161,7 +161,7 @@ use stuffr_core::{
     Resolved, Result, Sink, Source,
 };
 
-use crate::names::not_utf8;
+use crate::names::{WarningLog, clip, not_utf8};
 use crate::normalize::{NormalizeDecodeErrors, TAR_MALFORMED_AS_OTHER};
 use crate::tar_pax::{PaxRecords, TimeField, header_time, pax_time};
 
@@ -396,6 +396,8 @@ impl Container for Tar {
             source: shared,
             trailer,
             ended: false,
+            name_log: WarningLog::new(TAR, NAME_NOT_UTF8),
+            time_log: WarningLog::new(TAR, TIME_UNUSABLE),
         }))
     }
 
@@ -990,7 +992,17 @@ struct TarRead {
     /// exactly once and a caller polling past the end gets `Ok(None)` rather
     /// than the same error repeatedly.
     ended: bool,
+    /// The names that are not UTF-8 and the unusable times, each listed for
+    /// 64 entries and counted after that (task 4 review, I1).
+    name_log: WarningLog,
+    time_log: WarningLog,
 }
+
+/// [`Fidelity::Unlisted`]'s `what` for the names [`not_utf8`] reports.
+pub(crate) const NAME_NOT_UTF8: &str = "have a name that is not valid UTF-8";
+
+/// [`Fidelity::Unlisted`]'s `what` for an unusable modification time.
+const TIME_UNUSABLE: &str = "have a modification time that cannot be used";
 
 impl Drop for TarRead {
     fn drop(&mut self) {
@@ -1150,7 +1162,7 @@ impl ArchiveRead for TarRead {
             _ => None,
         };
         for w in [unreadable_name, unreadable_target].into_iter().flatten() {
-            self.report.warn(w);
+            self.name_log.warn(&mut self.report, || w);
         }
         let time = match pax.mtime.as_deref() {
             Some(value) => pax_time(value),
@@ -1158,13 +1170,15 @@ impl ArchiveRead for TarRead {
         };
         meta.mtime = time.time();
         if time == TimeField::Unusable {
-            self.report.warn(Fidelity::MetadataIncomplete {
-                entry: meta.name.clone(),
-                fields: MetaFields {
-                    mtime: true,
-                    ..MetaFields::default()
-                },
-            });
+            let entry = &meta.name;
+            self.time_log
+                .warn(&mut self.report, || Fidelity::MetadataIncomplete {
+                    entry: clip(entry),
+                    fields: MetaFields {
+                        mtime: true,
+                        ..MetaFields::default()
+                    },
+                });
         }
         // A hard link carries no payload of its own: its content is the
         // target's. Whatever size its header declares, the reader yields no
@@ -3516,6 +3530,114 @@ mod tests {
                 ("l".to_owned(), "link target", "t\\xff".to_owned()),
             ]
         );
+    }
+
+    /// Task 4 review, I1: the per-entry name and time warnings are capped
+    /// at 64 each plus one count, so a 50,000-entry Latin-1 tarball does
+    /// not print 50,000 lines (nor hold 50,000 names).
+    #[test]
+    fn name_and_time_warnings_are_capped_with_a_count() {
+        const N: usize = 50_000;
+        let mut bytes = Vec::with_capacity((N + 2) * 512);
+        for i in 0..N {
+            let name = format!("f{i}\u{0}");
+            let mut header = tar::Header::new_gnu();
+            let raw = name.as_bytes();
+            header.as_old_mut().name[..raw.len()].copy_from_slice(raw);
+            // Not UTF-8: replace the NUL with 0xe9 (Latin-1 `é`).
+            header.as_old_mut().name[raw.len() - 1] = 0xe9;
+            header.as_old_mut().mtime = *b"zzzzzzzzzzz\0";
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_cksum();
+            bytes.extend_from_slice(header.as_bytes());
+        }
+        bytes.extend_from_slice(&[0; 1024]);
+        let mut ar = open(&bytes);
+        let mut n = 0;
+        while ar.next_entry().unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, N);
+        let w = &ar.fidelity().warnings;
+        let names = w
+            .iter()
+            .filter(|w| matches!(w, Fidelity::NameNotUtf8 { .. }))
+            .count();
+        let times = w
+            .iter()
+            .filter(|w| matches!(w, Fidelity::MetadataIncomplete { .. }))
+            .count();
+        assert_eq!((names, times), (64, 64));
+        let mut counts: Vec<(&str, u64)> = w
+            .iter()
+            .filter_map(|w| match w {
+                Fidelity::Unlisted {
+                    format,
+                    what,
+                    entries,
+                } => {
+                    assert_eq!(*format, TAR);
+                    Some((*what, *entries))
+                }
+                _ => None,
+            })
+            .collect();
+        counts.sort();
+        assert_eq!(
+            counts,
+            [
+                (
+                    "have a modification time that cannot be used",
+                    (N - 64) as u64
+                ),
+                ("have a name that is not valid UTF-8", (N - 64) as u64),
+            ]
+        );
+        assert_eq!(w.len(), 130);
+    }
+
+    /// Task 4 review, I1: a name of 4 MiB that is not UTF-8 is held in
+    /// its warning as a prefix of about 256 bytes, not copied whole (twice,
+    /// and spelled at four bytes a byte).
+    #[test]
+    fn a_huge_name_is_held_in_its_warning_as_a_prefix() {
+        let name = vec![0xffu8; 4 << 20];
+        // A GNU long-name (`L`) record, then the entry it names.
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut long = tar::Header::new_gnu();
+        long.as_old_mut().name[..13].copy_from_slice(b"././@LongLink");
+        long.set_entry_type(tar::EntryType::GNULongName);
+        long.set_size(name.len() as u64 + 1);
+        long.set_mode(0o644);
+        long.set_cksum();
+        builder
+            .append(&long, &[name.as_slice(), b"\0"].concat()[..])
+            .unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.as_old_mut().name[..1].copy_from_slice(b"x");
+        header.set_size(1);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, &b"x"[..]).unwrap();
+        let bytes = builder.into_inner().unwrap();
+        let mut ar = open(&bytes);
+        let entry = ar.next_entry().unwrap().unwrap();
+        assert_eq!(entry.meta().name.chars().count(), 4 << 20);
+        drop(entry);
+        while ar.next_entry().unwrap().is_some() {}
+        let w = &ar.fidelity().warnings;
+        assert_eq!(w.len(), 1);
+        let Fidelity::NameNotUtf8 { entry, raw, .. } = &w[0] else {
+            panic!("{w:?}")
+        };
+        assert!(
+            entry.len() <= 260 && entry.ends_with('…'),
+            "{}",
+            entry.len()
+        );
+        assert!(raw.len() <= 260 && raw.ends_with('…'), "{}", raw.len());
+        assert!(w[0].to_string().len() < 1024);
     }
 
     /// Opens `bytes` from a real file, which is the only source shape that

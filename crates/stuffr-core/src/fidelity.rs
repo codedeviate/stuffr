@@ -374,6 +374,20 @@ pub enum Fidelity {
         /// The stored bytes, `\xNN` for each byte that is not UTF-8.
         raw: String,
     },
+
+    /// More entries that earned one kind of per-entry warning than a reader
+    /// lists one by one: past the first 64, `entries` counts them and
+    /// `what` says what they have ("have a name that is not valid UTF-8").
+    /// As [`Fidelity::HeadersDisagreeUnlisted`] does for zip, this keeps a
+    /// tarball of fifty thousand Latin-1 names from printing (and holding)
+    /// fifty thousand warnings, and keeps the verdict: `--strict-fidelity`
+    /// exits 4 on either.
+    #[error("`{format}`: {entries} more entr(y/ies) {what}, not listed")]
+    Unlisted {
+        format: FormatId,
+        what: &'static str,
+        entries: u64,
+    },
 }
 
 /// Where a codec's decoder records what it approximated.
