@@ -1335,6 +1335,44 @@ pub fn output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
     spawn(cmd)?.wait_with_output()
 }
 
+/// An input whose reads fail part-way: one end of a loopback TCP
+/// connection, whose peer (a thread) sends `data`, waits a second for the
+/// reader to take it, then resets the connection (`SO_LINGER` 0), so the
+/// reader's next `read` fails with `ECONNRESET`. Give the descriptor to a
+/// child as its standard input (`Stdio::from`; on macOS a symlink to
+/// `/dev/fd/0` makes it a named input too) and join the thread after the
+/// child has finished. The way a failing disk or network file system is
+/// met: the second bug hunt's read-error findings were all reproduced so.
+pub fn reset_after(data: Vec<u8>) -> (OwnedFd, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = {
+        let _guard = spawn_lock();
+        std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap()
+    };
+    let (mut server, _) = listener.accept().unwrap();
+    let peer = std::thread::spawn(move || {
+        let _ = server.write_all(&data);
+        std::thread::sleep(Duration::from_secs(1));
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        // SAFETY: a valid descriptor of a socket this thread owns, and a
+        // pointer to a `linger` of the size given.
+        unsafe {
+            libc::setsockopt(
+                server.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                (&raw const linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            );
+        }
+        drop(server);
+    });
+    (OwnedFd::from(client), peer)
+}
+
 /// The program each run in flight is running, by the run's work directory
 /// (`execute` registers it after the spawn and removes it once it ends).
 static CHILDREN: Mutex<Vec<(PathBuf, u32)>> = Mutex::new(Vec::new());

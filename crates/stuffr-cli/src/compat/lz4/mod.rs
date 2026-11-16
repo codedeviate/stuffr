@@ -148,6 +148,18 @@
 //!     opened `O_NOFOLLOW`. An output's mode, owner and time are set
 //!     through its own descriptor, where lz4 sets them by name. Why: a
 //!     planted link must not redirect a write.
+//! 11. A read error on the input is never its end (finding 28 of the
+//!     second bug hunt). Where lz4 1.11.1 fails, stuffr fails alike
+//!     (`Error 40 : Error reading NAME` compressing a frame, `Error 26 :
+//!     Read error` decoding one, `Error 65` for a legacy or mozlz4 one,
+//!     `Error 51` copying; `--rm` keeps the source). Where lz4 takes the
+//!     error for the end of the input, exits 0 and lets `--rm` remove the
+//!     source, stuffr fails too: `-l` compression is `Error 40` (lz4 writes
+//!     a frame of what it read), and a read that fails where a magic number
+//!     is read, at the start or after a skippable frame, is `Error 26 :
+//!     Read error`. Probed with a socket reset after the data (standard
+//!     input, and `src -> /dev/fd/3`). Why: the source must never be
+//!     removed after a read that did not reach its end.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -224,9 +236,15 @@ pub fn run(name: &'static str, argv0: &OsStr, args: Vec<OsString>) -> ExitCode {
 /// source truncated while it is compressed as `Error 53 : NAME : file
 /// truncated or unreadable during compression (memory-mapped) ; retry with
 /// --no-mmap` (CI run 42458938478; macOS says `Error 54` there).
+///
+/// The second bug hunt (finding 28) added 51 and 65: a read error while a
+/// non-lz4 input is copied (`lz4 -dcf`: `Error 51 : Read Error`) and where a
+/// legacy frame's next size word or a mozlz4 block is read (`Error 65 :
+/// Read error : ferror`; probed 2026-11-16 with a socket reset after the
+/// data).
 #[doc(hidden)]
-pub const EXIT_CODES: [i32; 21] = [
-    0, 1, 26, 27, 34, 40, 42, 43, 44, 46, 50, 53, 54, 61, 62, 63, 64, 69, 70, 72, 74,
+pub const EXIT_CODES: [i32; 23] = [
+    0, 1, 26, 27, 34, 40, 42, 43, 44, 46, 50, 51, 53, 54, 61, 62, 63, 64, 65, 69, 70, 72, 74,
 ];
 
 /// [`run`] without the process: operands resolve against `dir`, standard
@@ -532,6 +550,111 @@ mod tests {
                 "cut at {k}: {code}"
             );
         }
+    }
+
+    /// A sandboxed run whose reads of `file` fail with `EIO` once
+    /// `fail_after` bytes were read from it.
+    fn run_failing(
+        d: &Scratch,
+        args: &[&str],
+        file: &str,
+        fail_after: u64,
+    ) -> (i32, Vec<u8>, String) {
+        let reads = Arc::new(Mutex::new(BTreeMap::new()));
+        reads.lock().unwrap().insert(
+            d.0.join(file),
+            host::InputReads {
+                fail_after: Some(fail_after),
+                ..Default::default()
+            },
+        );
+        let stdout = Arc::new(Mutex::new(Vec::new()));
+        let mut host = Host::Sandbox(Sandbox {
+            dir: d.0.clone(),
+            stdin: Some(Vec::new()),
+            stdout: stdout.clone(),
+            budget: Arc::new(AtomicU64::new(SANDBOX_OUTPUT_CAP)),
+            reads,
+        });
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let mut err = Vec::new();
+        let code = main(b"lz4", &args, &|_| None, &mut host, &mut err);
+        drop(host);
+        let out = std::mem::take(&mut *stdout.lock().unwrap());
+        (code, out, String::from_utf8(err).unwrap())
+    }
+
+    /// Finding 28 (bug hunt 2): a read error is never the end of the
+    /// input. lz4 1.11.1 (probed with a socket reset after the data, as
+    /// standard input and behind `src -> /dev/fd/3`): compressing is
+    /// `Error 40 : Error reading NAME  ` with the source kept under `--rm`;
+    /// decoding a frame is `Error 26 : Read error `, a legacy frame's next
+    /// size word `Error 65 : Read error : ferror `, the source kept.
+    /// Deviation 11: `-l`, and a read error where a magic number is read,
+    /// which lz4 takes for the end of the input (exit 0, and `--rm` removes
+    /// the source), fail too.
+    #[test]
+    fn a_read_error_is_never_the_end_of_the_input() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let plain: Vec<u8> = (0..300_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                b"abcdefgh"[(x >> 40) as usize % 8]
+            })
+            .collect();
+        let d = Scratch::new(&[("a", &plain)]);
+        assert_eq!(d.run("lz4", &["-q", "a", "a.lz4"], b"").0, 0);
+        assert_eq!(d.run("lz4", &["-q", "-l", "a", "l.lz4"], b"").0, 0);
+        let frame = std::fs::read(d.0.join("a.lz4")).unwrap();
+        let legacy = std::fs::read(d.0.join("l.lz4")).unwrap();
+        // Compressing: a frame and a legacy frame.
+        for (opt, at) in [("-1", 100_000), ("-1", 0), ("-l", 100_000), ("-l", 0)] {
+            let (code, _, err) = run_failing(&d, &[opt, "-q", "--rm", "-f", "a", "o.lz4"], "a", at);
+            assert_eq!(
+                (code, err.as_str()),
+                (40, "Error 40 : Error reading a  \n"),
+                "{opt} {at}"
+            );
+            assert_eq!(std::fs::read(d.0.join("a")).unwrap(), plain, "{opt} {at}");
+        }
+        // Decoding and testing, at a frame's end and inside it.
+        for (name, bytes, at, want) in [
+            (
+                "f.lz4",
+                &frame,
+                frame.len() as u64,
+                "Error 26 : Read error \n",
+            ),
+            ("f.lz4", &frame, 70_000, "Error 26 : Read error \n"),
+            ("f.lz4", &frame, 0, "Error 26 : Read error \n"),
+            (
+                "g.lz4",
+                &legacy,
+                legacy.len() as u64,
+                "Error 65 : Read error : ferror \n",
+            ),
+        ] {
+            std::fs::write(d.0.join(name), bytes).unwrap();
+            for op in ["-d", "-t"] {
+                let (code, _, err) =
+                    run_failing(&d, &[op, "-q", "--rm", "-f", name, "o"], name, at);
+                let code_want: i32 = want[6..8].parse().unwrap();
+                assert_eq!((code, err.as_str()), (code_want, want), "{op} {name} {at}");
+                assert_eq!(
+                    &std::fs::read(d.0.join(name)).unwrap(),
+                    bytes,
+                    "{op} {name}"
+                );
+                assert!(EXIT_CODES.contains(&code));
+            }
+        }
+        // Copied as it is (`-dcf`): lz4's `Error 51 : Read Error `.
+        let (code, out, err) = run_failing(&d, &["-dcf", "a"], "a", 70_000);
+        assert_eq!((code, err.as_str()), (51, "Error 51 : Read Error \n"));
+        assert!(out.len() <= 70_000);
+        assert!(EXIT_CODES.contains(&51) && EXIT_CODES.contains(&65));
     }
 
     /// lz4 1.11.0's same-file refusal in the sandbox: an output that is the

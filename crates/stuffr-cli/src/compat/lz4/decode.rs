@@ -36,6 +36,14 @@
 //!   whole input is copied as it is. After a legacy or skippable frame it
 //!   is "Stream followed by undecodable data" at display level 2: the
 //!   input is finished (summary, `--rm`) and counts as failed.
+//! - **A read error** (finding 28 of the second bug hunt) is never the end
+//!   of the input: inside or right after a modern frame it is `Error 26 :
+//!   Read error`, where a legacy frame's next size word or a mozlz4 block
+//!   is read `Error 65`, in a copy `Error 51` (probe, 1.11.1: a socket
+//!   reset after the data as standard input). Where a magic number is read
+//!   (at the start, after a skippable frame) lz4 takes it for the end of
+//!   the input (exit 0, and `--rm` removes the source); stuffr says `Error
+//!   26` there too (deviation 11).
 //!
 //! **Memory** (Review Focus 1 and 4): the decoder is fed small slices
 //! ([`FEED`]) and what each call decodes goes to the output before the
@@ -90,6 +98,10 @@ pub(super) fn stream(
     loop {
         let head = src.fill(4);
         if head.is_empty() {
+            // Deviation 11: lz4 1.11.1 ends the input here.
+            if src.failed() {
+                return Err(run.exm(26, m::E26_READ, &[]));
+            }
             break;
         }
         if head.len() < 4 {
@@ -149,6 +161,11 @@ pub(super) fn stream(
             loop {
                 let rest = src.fill(1);
                 if rest.is_empty() {
+                    // probe (1.11.1): `lz4 -dcf` from a socket reset after
+                    // 100000 bytes.
+                    if src.failed() {
+                        return Err(run.exm(51, m::E51_READ, &[]));
+                    }
                     break;
                 }
                 let n = rest.len();
@@ -199,6 +216,11 @@ fn modern(
     loop {
         let avail = src.fill(1);
         if avail.is_empty() {
+            // probe (1.11.1): a socket reset after a whole frame, or inside
+            // one: `Error 26 : Read error`, whatever the frame decoder had.
+            if src.failed() {
+                return Err(run.exm(26, m::E26_READ, &[]));
+            }
             break;
         }
         let take = avail.len().min(FEED);
@@ -261,6 +283,10 @@ fn mozlz4(run: &mut Run, src: &mut Src, sink: &mut Sink, d: &mut Decoded) -> Res
             break;
         }
     }
+    // probe (1.11.1): a whole mozlz4 file, then a socket reset.
+    if block.len() <= bound && src.failed() {
+        return Err(run.exm(65, m::E65_READ, &[]));
+    }
     // probe (1.11.0): `small.mozlz4` (4999 declared, 5000 decoded),
     // `cut100.mozlz4`, `two.mozlz4`, `junk.mozlz4`: nothing written.
     let Ok(out) = mozlz4_block_decode(&block, declared) else {
@@ -297,6 +323,11 @@ fn legacy(run: &mut Run, src: &mut Src, sink: &mut Sink, d: &mut Decoded) -> Res
         let avail = src.fill(4);
         if avail.is_empty() {
             if dec.at_block_boundary() {
+                // probe (1.11.1): a whole legacy frame, then a socket
+                // reset (a block cut short by one is `Error 63`, below).
+                if src.failed() {
+                    return Err(run.exm(65, m::E65_READ, &[]));
+                }
                 return Ok(());
             }
             // probe: `lz4 -t leg_blk_trunc.lz4`, `leg_8m.lz4`.

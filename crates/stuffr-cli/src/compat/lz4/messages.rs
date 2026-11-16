@@ -380,6 +380,13 @@ pub(super) const NEWLINE: &str = "\n";
 pub(super) const E26_INCOMPLETE: &str =
     "Error 26 : LZ4F frame decoding could not complete: invalid frame \n";
 
+/// probe (1.11.1): a socket reset after a whole frame (or inside one) as
+/// standard input, or behind `ln -s /dev/fd/3 src.lz4; lz4 -d --rm src.lz4
+/// o`: a read of a modern frame's input failed (`-t` too); the source
+/// stays. stuffr also says it where a magic number cannot be read
+/// (deviation 11).
+pub(super) const E26_READ: &str = "Error 26 : Read error \n";
+
 /// probe: `lz4 -D nosuch a`, `lz4 -D d a` (after the open's own line).
 pub(super) const E27_DICTIONARY: &str =
     "Error 27 : Dictionary error : could not open dictionary file \n";
@@ -420,10 +427,14 @@ pub(super) const SOURCE_REPLACED: &str = "\rWarning : %s : file renamed or repla
 /// [`SOURCE_MODIFIED`] or [`SOURCE_REPLACED`], and `f` is kept.
 pub(super) const SOURCE_KEPT: &str = "; source kept ";
 
-/// probe: `lz4 -c <&-` (closed standard input): the first read of a frame's
-/// input failed. Two blanks before the newline.
-pub(super) const E40_FIRST_CHUNK: &str =
-    "Error 40 : Error reading first chunk (%d bytes) of '%s'  \n";
+/// probe (1.11.1): `lz4 -c < /tmp` (a directory as standard input), `lz4
+/// -c <&-`, and a socket reset after 100000 bytes as standard input or
+/// behind `ln -s /dev/fd/3 src; lz4 --rm src o.lz4`: a read of a frame's
+/// input failed, on the first chunk or a later one (1.10.0 said `Error
+/// reading first chunk (%d bytes) of '%s'` for the first). Two blanks
+/// before the newline. The output keeps what was written before; the source
+/// stays. stuffr says it for `-l` too (deviation 11).
+pub(super) const E40_READ: &str = "Error 40 : Error reading %s  \n";
 
 /// probe: `lz4 -t t_magic.lz4`, a skippable frame then two bytes.
 pub(super) const E40_MAGIC_UNREADABLE: &str =
@@ -471,6 +482,15 @@ pub(super) const E62_MOZLZ4_SIZE: &str =
 /// past `0x7E000000`, as `%u`.
 pub(super) const E62_MOZLZ4_TOO_LARGE: &str =
     "Error 62 : Error: mozlz4 decompressed size too large (%d) \n";
+
+/// probe (1.11.1): `lz4 -dcf` (an input that is no lz4 stream, copied as
+/// it is) from a socket reset after 100000 bytes: the copy fails.
+pub(super) const E51_READ: &str = "Error 51 : Read Error \n";
+
+/// probe (1.11.1): a socket reset after a whole legacy frame (the next
+/// size word cannot be read), or after a whole mozlz4 file, as standard
+/// input (`lz4 -dc`, `-t`).
+pub(super) const E65_READ: &str = "Error 65 : Read error : ferror \n";
 
 /// probe: `lz4 --sparse -dc z.lz4 | cat` (all zeros, so only the final
 /// skip, which a pipe refuses). The blank line is lz4's.

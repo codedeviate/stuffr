@@ -5011,6 +5011,98 @@ mod unix {
     /// Task 4): its size is known (the one-job rule, `--content-size`), it
     /// is never checked for changes (probe, 1.11.0: no warning, whatever a
     /// file named `stdin` beside it), and its figures are the reference's.
+    /// Finding 28 (bug hunt 2): a read error is never the end of the input.
+    /// Standard input is a socket reset after the data (`reset_after`); on
+    /// macOS also a named input behind `src -> /dev/fd/0` (`--rm`), the
+    /// source kept. The exit, standard error and (compressing) standard
+    /// output are lz4 1.11.1's; a failed decode's output is deviation 7's.
+    /// Deviation 11 is pinned last: `-l`, and a read error where a magic
+    /// number is read, which lz4 takes for the end of the input.
+    #[test]
+    fn a_read_error_matches_the_reference() {
+        use std::process::{Command, Stdio};
+        let Some(_) = lz4_dir() else { return };
+        let dir = ScratchDir::unique("lz4-readerr");
+        fs::create_dir_all(&*dir).unwrap();
+        let data = mixed(100_000, 28);
+        let frame = made(&["-c"], &data);
+        let legacy = made(&["-l", "-c"], &data);
+        let link = dir.join("lz4");
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
+        let run = |exe: &Path, args: &[&str], input: &[u8]| {
+            let (fd, peer) = reset_after(input.to_vec());
+            let o = output(
+                Command::new(exe)
+                    .args(args)
+                    .current_dir(&*dir)
+                    .stdin(Stdio::from(fd))
+                    .env("LC_ALL", "C"),
+            )
+            .unwrap();
+            peer.join().unwrap();
+            let err = String::from_utf8_lossy(&o.stderr).into_owned();
+            (o.status.code(), o.stdout, err)
+        };
+        let reference = Path::new(ref_lz4());
+        let half_legacy = legacy[..legacy.len() / 2].to_vec();
+        let two_frames = [&frame[..], &frame[..]].concat();
+        let cases: Vec<(&[&str], &[u8], bool)> = vec![
+            (&["-c"], &data, true),
+            (&["-c", "--no-mmap"], &data, true),
+            (&["-B4", "-c"], &data, true),
+            (&["-dc"], &frame, false),
+            (&["-dc"], &two_frames, false),
+            (&["-dc"], &frame[..frame.len() / 2], false),
+            (&["-q", "-t"], &frame, false),
+            (&["-dc"], &legacy, false),
+            (&["-dc"], &half_legacy, false),
+            (&["-dcf"], &data, false),
+        ];
+        for (args, input, same_stdout) in cases {
+            let ours = run(&link, args, input);
+            let theirs = run(reference, args, input);
+            assert_eq!((ours.0, &ours.2), (theirs.0, &theirs.2), "{args:?}");
+            assert_ne!(ours.0, Some(0), "{args:?}");
+            if same_stdout {
+                assert_eq!(ours.1, theirs.1, "{args:?}");
+            }
+        }
+        // A named input with `--rm` (macOS: `/dev/fd/0` opens the socket
+        // again; Linux refuses to open a socket through `/proc`).
+        if cfg!(target_os = "macos") {
+            std::os::unix::fs::symlink("/dev/fd/0", dir.join("src")).unwrap();
+            std::os::unix::fs::symlink("/dev/fd/0", dir.join("src.lz4")).unwrap();
+            for (args, input) in [
+                (&["--rm", "-f", "src", "o.lz4"][..], &data),
+                (&["-q", "-d", "--rm", "-f", "src.lz4", "o"], &frame),
+            ] {
+                let ours = run(&link, args, input);
+                let theirs = run(reference, args, input);
+                assert_eq!((ours.0, &ours.2), (theirs.0, &theirs.2), "{args:?}");
+                for name in ["src", "src.lz4"] {
+                    assert!(fs::symlink_metadata(dir.join(name)).is_ok(), "{args:?}");
+                }
+            }
+        }
+        // Deviation 11: lz4 1.11.1 exits 0 here (and `--rm` would remove
+        // the source); stuffr fails.
+        let skippable = [&0x184D_2A50u32.to_le_bytes()[..], &[4, 0, 0, 0], b"abcd"].concat();
+        for (args, input, code, text) in [
+            (
+                &["-l", "-c"][..],
+                &data[..],
+                40,
+                "Error 40 : Error reading stdin  \n",
+            ),
+            (&["-dc"], &[], 26, "Error 26 : Read error \n"),
+            (&["-dc"], &skippable, 26, "Error 26 : Read error \n"),
+        ] {
+            let ours = run(&link, args, input);
+            assert_eq!((ours.0, ours.2.as_str()), (Some(code), text), "{args:?}");
+            assert_eq!(run(reference, args, input).0, Some(0), "{args:?}");
+        }
+    }
+
     #[test]
     fn standard_input_redirected_from_a_file_matches_the_reference() {
         use std::process::{Command, Stdio};

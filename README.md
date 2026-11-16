@@ -1809,6 +1809,14 @@ benchmark lines included.
   `y`) replaces the link with a fresh file and leaves its target alone. An
   output's mode, owner and time are set through its descriptor, where lz4
   sets them by name.
+- **A read error on the input is never its end.** As lz4 does, a frame's
+  compression stops with `Error 40 : Error reading NAME`, a frame's decode
+  with `Error 26 : Read error`, a legacy or mozlz4 one with `Error 65`, a
+  copy with `Error 51`, and `--rm` keeps the source. Where lz4 takes the
+  error for the end of the input and exits 0 (and `--rm` removes the
+  source), stuffr fails too: `-l` compression (`Error 40`), and a read that
+  fails where a magic number is read, at the start or after a skippable
+  frame (`Error 26 : Read error`).
 
 **Known differences, pure tier only** (without `lz4-c`):
 

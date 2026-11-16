@@ -125,8 +125,11 @@ struct Reader {
 }
 
 impl Reader {
-    /// One read; an error ends the input, as a short read does (probe: `lz4
-    /// -dc <&-` decodes nothing, exit 0), and is remembered in `failed`.
+    /// One read; an error ends the input, as a short read does, and is
+    /// remembered in `failed`, which every reader of the input looks at
+    /// once the bytes read are used up (finding 28 of the second bug hunt:
+    /// a read error is never the end of the input; [`m::E40_READ`],
+    /// [`m::E26_READ`]).
     fn read(&mut self, buf: &mut [u8]) -> usize {
         let buf = match self.left {
             Some(0) => {
@@ -288,6 +291,11 @@ impl Src {
             Origin::Stdin(f) => f.metadata().ok(),
             Origin::Stream(_) => None,
         }
+    }
+
+    /// A read of the input failed (it ended there): never a true end.
+    pub(super) fn failed(&self) -> bool {
+        self.reader.failed
     }
 
     /// The bytes taken so far (`ftell`).
@@ -1223,7 +1231,7 @@ impl Run<'_> {
             return Err(self.exm(46, m::E46_WRITE_COMPRESSED, &[]));
         };
         if legacy {
-            return self.compress_legacy(src, sink, &mut enc);
+            return self.compress_legacy(name, src, sink, &mut enc);
         }
         // lz4_opts: a frame's input is read one update at a time, 4 MiB or
         // a custom `-B#`'s size.
@@ -1231,7 +1239,6 @@ impl Run<'_> {
         let mut buf = vec![0u8; chunk];
         let mut packed = Vec::new();
         let mut stats = Stats::default();
-        let mut first = true;
         // The progress figures (probe, 1.11.0: `lz4 -vvvv` over 1 MiB and 9
         // MiB + 123 bytes of text, threaded and `--single-thread`, `-B4`,
         // `-B6`, `-B7`, `-BD`; a custom `-B32` and `-B1024` over 4000 and
@@ -1251,15 +1258,12 @@ impl Run<'_> {
             if LINUX_MAPPING && stable && src.cut_short() {
                 return Err(self.exm(53, m::E53_SOURCE_TRUNCATED, &[name]));
             }
-            // probe: `lz4 -c <&-` (a frame).
-            if n == 0 && first && src.reader.failed {
-                return Err(self.exm(
-                    40,
-                    m::E40_FIRST_CHUNK,
-                    &[chunk.to_string().as_bytes(), name],
-                ));
+            // probe (1.11.1): `lz4 -c < /tmp`, and a socket reset after
+            // 100000 bytes (finding 28): the chunk the error cut short is
+            // not compressed, and the run ends.
+            if src.reader.failed {
+                return Err(self.exm(40, m::E40_READ, &[name]));
             }
-            first = false;
             if n == 0 {
                 break;
             }
@@ -1306,8 +1310,14 @@ impl Run<'_> {
     /// block is written, over the input read before that job; the figure
     /// counts everything written, the magic too; a last, partial job is
     /// drawn after `finish`, and an empty input draws none (`lz4 -l e`).
+    ///
+    /// Deviation 11: a read error ends the run with [`m::E40_READ`], as a
+    /// frame's does; lz4 1.11.1 takes it for the end of the input (probe: a
+    /// socket reset after 100000 bytes, `lz4 -l --rm src o.lz4`: exit 0, the
+    /// source removed).
     fn compress_legacy(
         &mut self,
+        name: &[u8],
         src: &mut Src,
         sink: &mut Sink,
         enc: &mut Encoder,
@@ -1319,8 +1329,12 @@ impl Run<'_> {
         let mut before = 0u64;
         let mut last_job = None;
         loop {
-            // probe: `lz4 -l -c <&-` writes an empty legacy frame.
+            // probe: `lz4 -l -c <&-` writes an empty legacy frame (deviation
+            // 11: stuffr says `Error 40`).
             let n = src.read_full(&mut buf);
+            if src.reader.failed {
+                return Err(self.exm(40, m::E40_READ, &[name]));
+            }
             if n == 0 {
                 break;
             }
