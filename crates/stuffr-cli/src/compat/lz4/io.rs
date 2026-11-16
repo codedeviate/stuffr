@@ -735,8 +735,12 @@ pub(super) struct Run<'a> {
     /// decoded when decoding (probe: `lz4 -v -d -m` over 2000 bytes at
     /// 0.00 s says several MiB/s, which only the decoded size gives).
     pub(super) total: u64,
-    /// The inputs after the current one (`-m`, `-r`): deviation 12.
-    later: Vec<Vec<u8>>,
+    /// The inputs of a `-m`/`-r` run, held once, and the one being
+    /// handled: deviation 12 looks at those after it.
+    operands: Vec<Vec<u8>>,
+    current: usize,
+    /// Deviation 12's check, linear over the run.
+    later: host::LaterInputs,
 }
 
 impl<'a> Run<'a> {
@@ -760,7 +764,9 @@ impl<'a> Run<'a> {
             display: Display::new(level),
             timer,
             total: 0,
-            later: Vec::new(),
+            operands: Vec::new(),
+            current: 0,
+            later: host::LaterInputs::default(),
         }
     }
 }
@@ -888,12 +894,13 @@ impl Run<'_> {
             // Deviation 12 (finding 31 of the second bug hunt): never over
             // an input still to be read (`lz4 -f -m f f.lz4`); lz4 1.11.1
             // overwrites it.
+            let host = &*self.host;
             if let Ok(existing) = fs::metadata(&path)
-                && self.later.iter().any(|l| {
-                    l.as_slice() != STDINMARK
-                        && fs::metadata(self.host.path(l))
-                            .is_ok_and(|m| host::same_file(&m, &existing) == Some(true))
-                })
+                && self
+                    .later
+                    .holds(&self.operands, self.current, STDINMARK, &existing, |l| {
+                        fs::metadata(host.path(l)).ok()
+                    })
             {
                 return Err(self.fail(m::LATER_INPUT, &[name]));
             }
@@ -909,8 +916,14 @@ impl Run<'_> {
                 }
             }
         }
-        host::create_output(&path, mode)
-            .map_err(|e| self.fail(m::OPEN_OUTPUT_FAILED, &[name, &host::strerror(&e)]))
+        let made = host::create_output(&path, mode)
+            .map_err(|e| self.fail(m::OPEN_OUTPUT_FAILED, &[name, &host::strerror(&e)]))?;
+        if made.1
+            && let Ok(m) = made.0.metadata()
+        {
+            self.later.created(&m);
+        }
+        Ok(made)
     }
 
     /// Display level 4: standard output is the output, and sparse writing
@@ -1633,9 +1646,10 @@ fn files(run: &mut Run, plan: &Plan) -> Result<usize, i32> {
     if let Err(Fail::Exit(code)) = run.load_dictionary() {
         return Err(code);
     }
-    for (i, name) in names.iter().enumerate() {
-        run.later = names[i + 1..].to_vec();
-        let name = name.clone();
+    run.operands = names;
+    for i in 0..run.operands.len() {
+        run.current = i;
+        let name = run.operands[i].clone();
         // probe: `lz4 -m stdin e` writes both to standard output, `lz4 -m e
         // stdin` writes `e.lz4` and `stdin.lz4`: the plan made from the first
         // input says standard output for all.

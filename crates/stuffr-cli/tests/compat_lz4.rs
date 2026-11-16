@@ -5234,6 +5234,44 @@ mod unix {
         assert_eq!(kept.unwrap(), b"PRECIOUS-ORIGINAL-DATA\n");
     }
 
+    /// Final review I2 and Minor 1 (bug hunt 2): `-f -m` over a few
+    /// thousand inputs whose outputs exist. Deviation 12's check used to
+    /// copy the remaining operand list for every input and `stat` every
+    /// remaining operand for every existing output (about 4.5 million
+    /// `stat`s here); it is linear now. Every output is still written.
+    #[test]
+    fn many_inputs_over_existing_outputs_stay_linear() {
+        use std::process::{Command, Stdio};
+        let dir = ScratchDir::unique("lz4-many");
+        fs::create_dir_all(&*dir).unwrap();
+        let n = 3000;
+        let mut args = vec!["-q".to_string(), "-f".into(), "-m".into()];
+        for i in 0..n {
+            fs::write(dir.join(format!("f{i}")), format!("{i}\n")).unwrap();
+            fs::write(dir.join(format!("f{i}.lz4")), b"old").unwrap();
+            args.push(format!("f{i}"));
+        }
+        let link = dir.join("lz4");
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
+        let o = output(
+            Command::new(&link)
+                .args(&args)
+                .current_dir(&*dir)
+                .stdin(Stdio::null()),
+        )
+        .unwrap();
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        for i in [0, n / 2, n - 1] {
+            let lz = fs::read(dir.join(format!("f{i}.lz4"))).unwrap();
+            assert_eq!(&lz[..4], b"\x04\x22\x4d\x18", "f{i}.lz4");
+        }
+    }
+
     /// Standard input redirected from a regular file (review I1 of 0.26.0
     /// Task 4): its size is known (the one-job rule, `--content-size`), it
     /// is never checked for changes (probe, 1.11.0: no warning, whatever a

@@ -2180,6 +2180,112 @@ pub(crate) fn same_file(a: &Metadata, b: &Metadata) -> Option<bool> {
     }
 }
 
+/// A file's identity, the pair [`same_file`] compares; `None` off unix.
+fn identity(m: &Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((m.dev(), m.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = m;
+        None
+    }
+}
+
+/// Whether an existing destination is the same file as an operand still to
+/// be read (zstd deviation 9, lz4 deviation 12), answered without
+/// re-`stat`ing every later operand for every destination: a run of `-f`
+/// over n existing outputs asked that n²/2 times (final review of the
+/// second bug hunt, Minor 1).
+///
+/// The operands' identities are taken once, at the first question, and
+/// kept by identity. Two things keep the answer the same as a fresh `stat`
+/// of every later operand. A hit is re-`stat`ed before it counts, so an
+/// operand removed or replaced since says no. And a destination this run
+/// created after the snapshot ([`LaterInputs::created`]) rebuilds it: the
+/// only way this run makes an operand name a different file is to create a
+/// new file there, so an operand can resolve to a destination it did not
+/// resolve to at the snapshot only when that destination is new. Changes
+/// made by another process race the check either way, as they did before.
+#[derive(Default)]
+pub(crate) struct LaterInputs {
+    snapshot: Option<LaterSnapshot>,
+}
+
+/// [`LaterInputs`]' identities, taken after operand `from`.
+struct LaterSnapshot {
+    /// Each identity with the operand indices that resolved to it.
+    by_id: std::collections::HashMap<(u64, u64), Vec<usize>>,
+    /// Files this run created since the snapshot was taken.
+    created: std::collections::HashSet<(u64, u64)>,
+}
+
+impl LaterInputs {
+    /// Whether `dest` is the same file as one of `names[current + 1..]`,
+    /// other than `stdin` (the name standing for standard input). `stat`
+    /// follows a symlink, as `fs::metadata` does.
+    pub(crate) fn holds(
+        &mut self,
+        names: &[Vec<u8>],
+        current: usize,
+        stdin: &[u8],
+        dest: &Metadata,
+        stat: impl Fn(&[u8]) -> Option<Metadata>,
+    ) -> bool {
+        let Some(id) = identity(dest) else {
+            return false;
+        };
+        let stale = self
+            .snapshot
+            .as_ref()
+            .is_none_or(|s| s.created.contains(&id));
+        if stale {
+            let mut by_id = std::collections::HashMap::<_, Vec<usize>>::new();
+            for (i, name) in names.iter().enumerate().skip(current + 1) {
+                if name.as_slice() != stdin
+                    && let Some(k) = stat(name).as_ref().and_then(identity)
+                {
+                    by_id.entry(k).or_default().push(i);
+                }
+            }
+            self.snapshot = Some(LaterSnapshot {
+                by_id,
+                created: std::collections::HashSet::new(),
+            });
+        }
+        let Some(snapshot) = self.snapshot.as_mut() else {
+            return false;
+        };
+        let Some(indices) = snapshot.by_id.get_mut(&id) else {
+            return false;
+        };
+        indices.retain(|&i| i > current);
+        // A hit counts only if the operand still names that file; one that
+        // no longer does is dropped (it can name a new file only through a
+        // creation, which `created` catches).
+        let mut found = false;
+        indices.retain(|&i| {
+            if found {
+                return true;
+            }
+            let same = stat(&names[i]).is_some_and(|m| same_file(&m, dest) == Some(true));
+            found = same;
+            same
+        });
+        found
+    }
+
+    /// This run created `file` (a new output, or a temporary it will
+    /// publish under an output's name).
+    pub(crate) fn created(&mut self, file: &Metadata) {
+        if let (Some(s), Some(id)) = (self.snapshot.as_mut(), identity(file)) {
+            s.created.insert(id);
+        }
+    }
+}
+
 /// Whether removing `output` before writing it would delete `input`'s
 /// data: `input` resolves (through a symlink) to the very regular file
 /// that the name `output` holds (judged with `lstat`), and that name is
@@ -4353,5 +4459,66 @@ mod tests {
             stop.store(true, Ordering::Relaxed);
         });
         assert!(reads.load(Ordering::Relaxed) > 0, "nothing was read");
+    }
+
+    /// Final review Minor 1: the later-operand answer equals a fresh `stat`
+    /// of every later operand (stdin skipped, hard links seen, a removed
+    /// operand forgotten, a file created at an operand's name noticed), and
+    /// a run of n destinations costs O(n) `stat`s, not n²/2.
+    #[cfg(unix)]
+    #[test]
+    fn later_inputs_match_a_fresh_scan_in_linear_stats() {
+        use std::cell::Cell;
+        let dir = scratch("later");
+        let n = 3000;
+        let names: Vec<Vec<u8>> = (0..n)
+            .map(|i| format!("{}/f{i}", dir.display()).into_bytes())
+            .chain([b"-".to_vec()])
+            .collect();
+        for name in &names[..n] {
+            fs::write(Path::new(std::str::from_utf8(name).unwrap()), b"x").unwrap();
+        }
+        let p = |i: usize| PathBuf::from(std::str::from_utf8(&names[i]).unwrap());
+        let stats = Cell::new(0usize);
+        let stat = |name: &[u8]| {
+            stats.set(stats.get() + 1);
+            fs::metadata(std::str::from_utf8(name).unwrap()).ok()
+        };
+        let mut later = LaterInputs::default();
+        // A destination that is no operand, asked once per operand: the
+        // shape of `-f` over existing outputs.
+        let other = dir.join("other");
+        fs::write(&other, b"o").unwrap();
+        let o = fs::metadata(&other).unwrap();
+        for i in 0..n {
+            assert!(!later.holds(&names, i, b"-", &o, stat));
+        }
+        assert!(
+            stats.get() <= 2 * n,
+            "{} stats for {n} operands",
+            stats.get()
+        );
+        // A later operand is found, an earlier one is not, and so is a
+        // hard link to a later one.
+        let mut later = LaterInputs::default();
+        let f10 = fs::metadata(p(10)).unwrap();
+        assert!(later.holds(&names, 5, b"-", &f10, stat));
+        assert!(!later.holds(&names, 10, b"-", &f10, stat));
+        fs::hard_link(p(20), dir.join("link")).unwrap();
+        let link = fs::metadata(dir.join("link")).unwrap();
+        assert!(later.holds(&names, 10, b"-", &link, stat));
+        // A removed operand is forgotten.
+        fs::remove_file(p(30)).unwrap();
+        let f40 = fs::metadata(p(40)).unwrap();
+        assert!(later.holds(&names, 10, b"-", &f40, stat));
+        fs::remove_file(p(40)).unwrap();
+        assert!(!later.holds(&names, 10, b"-", &f40, stat));
+        // A file this run creates at a later operand's name is that
+        // operand from then on.
+        fs::write(p(30), b"new").unwrap();
+        let new30 = fs::metadata(p(30)).unwrap();
+        later.created(&new30);
+        assert!(later.holds(&names, 11, b"-", &new30, stat));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

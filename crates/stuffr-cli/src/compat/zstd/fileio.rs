@@ -361,6 +361,8 @@ pub(crate) struct Io<'a> {
     codec: Option<Box<dyn FrameCodec>>,
     /// The operands, for deviation 9's later-operand check.
     inputs: Vec<Vec<u8>>,
+    /// Deviation 9's check, linear over the run.
+    later: host::LaterInputs,
     /// Under `--rm`, the outputs this run published (deviation 9).
     published: Vec<Metadata>,
 }
@@ -457,6 +459,7 @@ impl<'a> Io<'a> {
             answers: None,
             codec: Some(frame_codec()),
             inputs: cmd.files.clone(),
+            later: host::LaterInputs::default(),
             published: Vec::new(),
         }
     }
@@ -865,10 +868,12 @@ impl<'a> Io<'a> {
         if src.is_some()
             && let Ok(o) = util::stat(self.host, dst)
         {
-            let later = self.inputs.iter().skip(self.curr_file_idx + 1).any(|i| {
-                i != STDINMARK
-                    && util::stat(self.host, i).is_ok_and(|s| host::same_file(&s, &o) == Some(true))
-            });
+            let host = &*self.host;
+            let later = self
+                .later
+                .holds(&self.inputs, self.curr_file_idx, STDINMARK, &o, |i| {
+                    util::stat(host, i).ok()
+                });
             if later {
                 self.say(1, m::REFUSING_OVERWRITE_INPUT, &[]);
                 return Ok(false);
@@ -964,6 +969,9 @@ impl<'a> Io<'a> {
                 }
             }
         };
+        if let Ok(m) = file.metadata() {
+            self.later.created(&m);
+        }
         let w = if sandboxed {
             FileW::Capped(self.host.out_writer(Some(file)))
         } else {
