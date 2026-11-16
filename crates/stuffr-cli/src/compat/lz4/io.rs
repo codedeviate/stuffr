@@ -376,8 +376,12 @@ enum SinkKind {
     Stdout(Option<File>),
     /// Discarded (`-t`, `null`); a sandbox counts it against its budget.
     Null,
-    /// A file, through the host's writer (a sandbox's budget applies).
+    /// A sandboxed run's file, through the host's writer (its budget
+    /// applies).
     File(io::BufWriter<Box<dyn Write + Send>>),
+    /// A file of the real process, kept typed so that its `close(2)` is
+    /// made and checked ([`Sink::close`]).
+    RealFile(io::BufWriter<File>),
     /// A file of the real process written sparsely: seeked and written
     /// directly.
     SparseFile(File),
@@ -419,6 +423,7 @@ impl Sink {
             SinkKind::Stdout(None) => out.write_all(data),
             SinkKind::Stdout(Some(f)) | SinkKind::SparseFile(f) => f.write_all(data),
             SinkKind::File(w) => w.write_all(data),
+            SinkKind::RealFile(w) => w.write_all(data),
             SinkKind::Null => Ok(()),
         }
     }
@@ -438,6 +443,10 @@ impl Sink {
             }
             // A sandbox's file: the zeros are written (the bytes are the
             // same; a sandbox has no holes).
+            SinkKind::RealFile(w) => {
+                w.flush()?;
+                w.get_mut().seek(SeekFrom::Current(off)).map(drop)
+            }
             SinkKind::File(w) => {
                 let zeros = [0u8; 4096];
                 let mut left = n;
@@ -529,8 +538,28 @@ impl Sink {
             SinkKind::Stdout(None) => out.flush(),
             SinkKind::Stdout(Some(f)) | SinkKind::SparseFile(f) => f.flush(),
             SinkKind::File(w) => w.flush(),
+            SinkKind::RealFile(w) => w.flush(),
             SinkKind::Null => Ok(()),
         }
+    }
+
+    /// The output's end once its input succeeded (finding 30 of the second
+    /// bug hunt): a file of the real process is closed and its `close(2)`
+    /// checked ([`host::close_file`]), as a network file system may report
+    /// a deferred write error only there; a failure is the sink's write
+    /// error (`Error N`, the run ends, the source kept). Anything else is
+    /// flushed already ([`Sink::finish`]).
+    fn close(mut self, run: &mut Run) -> Result<(), Fail> {
+        let kind = std::mem::replace(&mut self.kind, SinkKind::Null);
+        let r = match kind {
+            SinkKind::RealFile(w) => match w.into_inner() {
+                Ok(f) => host::close_file(f),
+                Err(e) => Err(e.into_error()),
+            },
+            SinkKind::SparseFile(f) => host::close_file(f),
+            _ => Ok(()),
+        };
+        r.map_err(|_| run.exm(self.write_error.1, self.write_error.0, &[]))
     }
 }
 
@@ -915,6 +944,10 @@ impl Run<'_> {
                 fd = host::OutFd::new(&f, false, None);
                 match self.host {
                     Host::Real if sparse_asked => (SinkKind::SparseFile(f), true),
+                    Host::Real => (
+                        SinkKind::RealFile(io::BufWriter::with_capacity(64 << 10, f)),
+                        false,
+                    ),
                     _ => (SinkKind::File(self.host.out_writer(Some(f))), sparse_asked),
                 }
             }
@@ -1097,7 +1130,7 @@ impl Run<'_> {
         if let (Some(s), Some(m), true) = (src.as_mut(), regular, mapped) {
             s.limit_to(m.len());
         }
-        let (r, mut fd, change, rewritten) =
+        let (r, mut fd, change, rewritten, sink) =
             match self.open_sink(target, meta.as_ref(), named, false) {
                 Ok(mut sink) => {
                     // Standard input is taken only now: the overwrite question
@@ -1132,9 +1165,9 @@ impl Run<'_> {
                         _ => false,
                     };
                     self.put_back(name, src);
-                    (r, sink.fd.take(), change, rewritten)
+                    (r, sink.fd.take(), change, rewritten, Some(sink))
                 }
-                Err(f) => (Err(f), None, Change::default(), false),
+                Err(f) => (Err(f), None, Change::default(), false, None),
             };
         let stats = r?;
         let checksum = self.cmd.opts.content_checksum;
@@ -1151,6 +1184,7 @@ impl Run<'_> {
             }
             Verdict::Fail => {
                 drop(fd);
+                drop(sink);
                 if let Target::File(out) = target {
                     let _ = fs::remove_file(self.host.path(out));
                 }
@@ -1160,6 +1194,7 @@ impl Run<'_> {
             // 794624 bytes, no frame end), and so does the source.
             Verdict::Truncated => {
                 drop(fd);
+                drop(sink);
                 return Err(self.exm(53, m::E53_SOURCE_TRUNCATED, &[name]));
             }
         };
@@ -1167,6 +1202,9 @@ impl Run<'_> {
         // left the run's time and the default mode).
         Self::copy_metadata(target, meta.as_ref().filter(|_| named), fd.as_mut());
         drop(fd);
+        if let Some(sink) = sink {
+            sink.close(self)?;
+        }
         self.total += stats.read;
         self.show_compress_summary(&stats);
         if !kept {
@@ -1415,7 +1453,6 @@ impl Run<'_> {
         };
         sink.finish(self)?;
         let mut fd = sink.fd.take();
-        drop(sink);
         let stats = Stats {
             read: decoded.read,
             written: decoded.written,
@@ -1425,6 +1462,7 @@ impl Run<'_> {
             Self::copy_metadata(target, meta.as_ref().filter(|_| named), fd.as_mut());
         }
         drop(fd);
+        sink.close(self)?;
         self.total += stats.written;
         self.show_decode_summary(name, &stats);
         if !decoded.undecodable {

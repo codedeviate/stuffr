@@ -662,6 +662,60 @@ mod tests {
         assert!(EXIT_CODES.contains(&51) && EXIT_CODES.contains(&65));
     }
 
+    /// Finding 30 (bug hunt 2): the output's `close(2)` is checked before
+    /// `--rm` removes the source. A close that fails (a network file
+    /// system's deferred write error; injected here, as no local file
+    /// system can) is the output's write error (`Error N`, as lz4's failed
+    /// writes), the run ends and the source stays. A real process (absolute
+    /// paths, `-q`, file outputs only).
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_close_keeps_the_source() {
+        let d = Scratch::new(&[("a", b"alpha alpha alpha alpha\n")]);
+        let p = |n: &str| d.0.join(n).to_string_lossy().into_owned();
+        let run = |args: &[&str], fault: bool| -> (i32, String) {
+            let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+            let mut err = Vec::new();
+            host::fail_closes(fault.then_some(libc::EIO));
+            let code = main(b"lz4", &args, &|_| None, &mut Host::Real, &mut err);
+            host::fail_closes(None);
+            (code, String::from_utf8(err).unwrap())
+        };
+        let single = "Error 42 : Write error : failed writing single-block compressed frame \n";
+        assert_eq!(
+            run(&["-q", "--rm", &p("a"), &p("a.lz4")], true),
+            (42, single.into())
+        );
+        assert!(d.0.join("a").exists());
+        assert_eq!(
+            run(&["-q", "-f", "--rm", &p("a"), &p("a.lz4")], false),
+            (0, String::new())
+        );
+        assert!(!d.0.join("a").exists());
+        for (sparse, code, text) in [
+            (
+                "--sparse",
+                73,
+                "Error 73 : Write error : cannot write decoded block \n",
+            ),
+            (
+                "--no-sparse",
+                70,
+                "Error 70 : Write error : cannot write decoded block \n",
+            ),
+        ] {
+            let args = ["-q", "-d", "-f", sparse, "--rm", &p("a.lz4"), &p("a")];
+            assert_eq!(run(&args, true), (code, text.into()), "{sparse}");
+            assert!(d.0.join("a.lz4").exists(), "{sparse}");
+        }
+        assert_eq!(
+            run(&["-q", "-d", "-f", "--rm", &p("a.lz4"), &p("a")], false),
+            (0, String::new())
+        );
+        assert_eq!(std::fs::read(p("a")).unwrap(), b"alpha alpha alpha alpha\n");
+        assert!(!d.0.join("a.lz4").exists());
+    }
+
     /// lz4 1.11.0's same-file refusal in the sandbox: an output that is the
     /// input is refused and the input kept.
     #[test]
