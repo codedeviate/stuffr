@@ -1802,12 +1802,15 @@ mod differential {
                 read_only,
             ));
         }
+        // The stored name is printed, and only 1.15 quotes it.
+        let mut quoted = Vec::new();
         for flags in [&["-dN"][..], &["-dNv"], &["-dNk"], &["-dNf"], &["-dNq"]] {
             let mut a = flags.to_vec();
             a.push("hi.gz");
-            cases.push(dz("gzip", &a, vec![("hi.gz", stored.clone())]));
+            quoted.push(dz("gzip", &a, vec![("hi.gz", stored.clone())]));
         }
-        check_exact("output creation failures", &cases, none_skipped());
+        let (cases, skipped) = gated(cases, quoted, Since::QuotedNames);
+        check_exact("output creation failures", &cases, skipped);
     }
 
     /// Bug hunt 2, finding 38: the totals subtract the header bytes of the

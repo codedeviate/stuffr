@@ -113,6 +113,8 @@ struct Bz<'a> {
     pending: Option<PathBuf>,
     /// macOS, file-to-file: the input and the temporary output, for the
     /// attribute copy made once the output is published ([`Bz::commit`]).
+    /// Never set, and so never read, anywhere else.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     attrs: Option<(File, File)>,
     unz_fails: bool,
     test_fails: bool,
