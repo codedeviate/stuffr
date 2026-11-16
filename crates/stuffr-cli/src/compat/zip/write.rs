@@ -301,11 +301,33 @@ pub(crate) fn dos2unixtime(host: &Host, d: u32) -> i64 {
 /// as there.
 // port: zipfile.c:trash
 pub(crate) fn trash(z: &mut Zr, zfiles: &mut [ZFile]) {
+    // Deviation 36 (finding 29 of the second bug hunt): the archive just
+    // written (`-O`'s, or the one updated) and the one read are never
+    // deleted, whichever entry names them; zip deletes them.
+    let archives: Vec<std::fs::Metadata> = [z.o.out_path.clone(), z.o.zipfile.clone()]
+        .into_iter()
+        .flatten()
+        .filter(|p| !p.is_empty() && p.as_slice() != b"-")
+        .filter_map(|p| std::fs::metadata(z.host.path(&p)).ok())
+        .collect();
     for zf in zfiles.iter_mut() {
+        // Deviation 35: a file that could not be read whole stays.
+        if zf.e.read_failed {
+            continue;
+        }
         if zf.mark == 1 || zf.trash {
             zf.mark = 1;
             if zf.e.iname.last() != Some(&b'/') {
                 let name = zf.e.name.clone();
+                let is_archive = std::fs::metadata(z.host.path(&name)).is_ok_and(|n| {
+                    archives
+                        .iter()
+                        .any(|a| crate::compat::host::same_file(a, &n) == Some(true))
+                });
+                if is_archive {
+                    z.zipwarn(m::NOT_DELETING_ARCHIVE.as_bytes(), &name);
+                    continue;
+                }
                 if z.o.verbose > 0 {
                     let mut l = Vec::new();
                     printf(&mut l, m::DELETING_FILE, &[&name]);

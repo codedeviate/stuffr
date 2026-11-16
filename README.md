@@ -2324,6 +2324,18 @@ before the command line, as the reference does.
     sends; its own `abort()` (and, on Linux, a real memory fault) removes
     the temporary and dies of the signal, with no message. macOS cannot
     tell a `kill -SEGV` from a fault, so a fault there still answers as zip.
+35. **A read error part-way through a file is said, and `-m` keeps the
+    file.** zip takes a failing read for the end of the file and says so only
+    for a stored entry; `-m` then deletes the file though its entry holds
+    only part of it. stuffr says `could not read input file` for every
+    method and leaves that file where it is; the entry and the exit code are
+    zip's.
+36. **`-m` never deletes an archive.** zip adds an existing `-O` target the
+    operands match and then deletes it (the archive just written, with every
+    moved file gone), and deletes an archive that holds an entry of its own
+    name after updating it. stuffr leaves the `-O` target out of the scan, as
+    zip does the archive it reads, and never deletes the archive written or
+    read (`zip warning: not deleting the archive: NAME`).
 
 The full set is in the code's module docs
 (`crates/stuffr-cli/src/compat/zip/mod.rs`), which is the source of truth.

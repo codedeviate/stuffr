@@ -9,10 +9,11 @@
 //! every byte it reads. Reads are zipup's: one `read` per request
 //! (`zread`), so a pipe's short reads reach deflate as they reach the C's,
 //! and `-l`/`-ll` translate each request as `file_read` does. A read error
-//! is the end of the input, as there (`file_read` returns `EOF`): a stored
-//! entry then warns "could not read input file", a deflated one does not
-//! (zipup's `zerr()` looks at the stored loop's `k` only), and both warn
-//! that the size changed. **A write that fails** ends the run as
+//! is the end of the input, as there (`file_read` returns `EOF`): the
+//! entry warns "could not read input file" (deviation 35 for a deflated or
+//! bzip2 one: zipup's `zerr()` looks at the stored loop's `k` only, so zip
+//! says nothing there), and the size changed; `-m` then leaves the file
+//! (deviation 35, `ZEntry::read_failed`). **A write that fails** ends the run as
 //! `bfwrite` ends it: `ZE_WRITE`, "write error on zip file", exit 14.
 
 use std::fs::File;
@@ -707,6 +708,9 @@ pub(crate) fn add_entry(
             s = b.s;
             e.crc = b.crc;
             translate_warning(z, b.file_binary, e.att);
+            if let Some(err) = b.read_error {
+                unread(z, &mut e, &err);
+            }
         }
         Data::Read(mut src) if m_ != STORE => {
             let level = z.o.level;
@@ -747,6 +751,9 @@ pub(crate) fn add_entry(
             s = sum.out_bytes;
             e.crc = sum.crc32;
             translate_warning(z, fr.file_binary, e.att);
+            if let Some(err) = fr.err.take() {
+                unread(z, &mut e, &err);
+            }
         }
         Data::Link => {
             // deviation 11: a link gone between the stat and here (the C's
@@ -792,8 +799,7 @@ pub(crate) fn add_entry(
             }
             if let Some(err) = fr.err.take() {
                 // zerr(ifile): the stored loop's k was EOF
-                perror(z, m::PERROR_WARNING_NL, &err);
-                z.zipwarn(m::COULD_NOT_READ.as_bytes(), &e.oname.clone());
+                unread(z, &mut e, &err);
             }
             s = isize;
             e.crc = crc.sum();
@@ -942,6 +948,15 @@ fn translate_warning(z: &mut Zr, file_binary: i8, att: u16) {
     }
 }
 
+/// A read of the entry's file failed part-way: zerr(ifile)'s warnings
+/// (the stored loop's, given by every method under deviation 35), and the
+/// file is marked to stay where it is under `-m`.
+fn unread(z: &mut Zr, e: &mut ZEntry, err: &io::Error) {
+    perror(z, m::PERROR_WARNING_NL, err);
+    z.zipwarn(m::COULD_NOT_READ.as_bytes(), &e.oname.clone());
+    e.read_failed = true;
+}
+
 /// What [`bzfilecompress`] made of an entry.
 struct Bzipped {
     isize: u64,
@@ -950,6 +965,8 @@ struct Bzipped {
     text: bool,
     stored: bool,
     file_binary: i8,
+    /// The read error that ended the input, if one did.
+    read_error: Option<io::Error>,
 }
 
 /// The compressed bytes the bzip2 encoder has written, shared with it.
@@ -1087,6 +1104,7 @@ fn bzfilecompress(
         text,
         stored,
         file_binary: fr.file_binary,
+        read_error: fr.err.take(),
     })
 }
 

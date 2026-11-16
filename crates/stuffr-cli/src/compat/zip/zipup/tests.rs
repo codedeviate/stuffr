@@ -172,43 +172,54 @@ fn a_file_that_changes_while_zipping_warns_as_zip_does() {
 }
 
 /// Ruling Z9: a read error is the end of the input, as zipup's
-/// `file_read` takes it. A stored entry then also says why (`perror` on
-/// standard error) and that the file could not be read; a deflated one does
-/// not (zipup's `zerr()` looks at the stored loop's count only). Both warn
-/// that the size changed, and the entry holds what was read.
+/// `file_read` takes it, and the entry holds what was read; both warn that
+/// the size changed. A stored entry also says why (`perror` on standard
+/// error) and that the file could not be read. Deviation 35 (finding 34 of
+/// the second bug hunt): a deflated or bzip2 one says so too (zipup's
+/// `zerr()` looks at the stored loop's count only, so zip says nothing),
+/// and `-m` never deletes a file that could not be read whole (zip does,
+/// though its entry holds only part of it).
 #[test]
 fn a_read_error_is_the_end_of_the_input() {
     let data = big(200_000);
     for (level, stored) in [("-0", true), ("-6", false)] {
-        let s = Scratch::new("eio");
-        std::fs::write(s.0.join("big"), &data).unwrap();
-        let reads = InputReads {
-            fail_after: Some(50_000),
-            ..Default::default()
-        };
-        let (code, out, err) = run(&s.0, &[level, "t.zip", "big"], "big", reads);
-        assert_eq!(code, 0, "{out} {err}");
-        let changed = "\tzip warning:  file size changed while zipping big\n";
-        if stored {
-            assert_eq!(err, "\nzip warning: Input/output error\n");
-            assert_eq!(
-                out,
-                format!(
-                    "  adding: big\n\tzip warning: could not read input file: big\n{changed} (stored 0%)\n"
-                )
-            );
-        } else {
-            assert_eq!(err, "");
-            assert!(
-                out.starts_with(&format!("  adding: big\n{changed}")),
-                "{out:?}"
-            );
+        for mv in [false, true] {
+            let s = Scratch::new("eio");
+            std::fs::write(s.0.join("big"), &data).unwrap();
+            let reads = InputReads {
+                fail_after: Some(50_000),
+                ..Default::default()
+            };
+            let args: Vec<&str> = if mv {
+                vec![level, "-m", "t.zip", "big"]
+            } else {
+                vec![level, "t.zip", "big"]
+            };
+            let (code, out, err) = run(&s.0, &args, "big", reads);
+            let ctx = format!("{level} -m={mv}: {out} {err}");
+            assert_eq!(code, 0, "{ctx}");
+            let changed = "\tzip warning:  file size changed while zipping big\n";
+            assert_eq!(err, "\nzip warning: Input/output error\n", "{ctx}");
+            let unread =
+                format!("  adding: big\n\tzip warning: could not read input file: big\n{changed}");
+            if stored {
+                assert_eq!(out, format!("{unread} (stored 0%)\n"), "{ctx}");
+            } else {
+                assert!(out.starts_with(&unread), "{ctx}");
+            }
+            assert_eq!(std::fs::read(s.0.join("big")).unwrap(), data, "{ctx}");
+            let zip = std::fs::read(s.0.join("t.zip")).unwrap();
+            let (local, _) = sizes(&zip);
+            assert_eq!(local[3], 50_000, "{ctx}");
+            assert_eq!(local[1], crc(&data[..50_000]), "{ctx}");
         }
-        let zip = std::fs::read(s.0.join("t.zip")).unwrap();
-        let (local, _) = sizes(&zip);
-        assert_eq!(local[3], 50_000);
-        assert_eq!(local[1], crc(&data[..50_000]));
     }
+    // A file read whole is still moved.
+    let s = Scratch::new("eio");
+    std::fs::write(s.0.join("big"), &data).unwrap();
+    let (code, _, _) = run(&s.0, &["-m", "t.zip", "big"], "big", InputReads::default());
+    assert_eq!(code, 0);
+    assert!(!s.0.join("big").exists());
 }
 
 /// Task 2 review (c): `ZipDeflater::new` takes levels 1 to 9 only; `-0`
@@ -467,4 +478,41 @@ fn a_link_gone_before_readlink_is_stored_empty() {
     let zip = std::fs::read(s.0.join("t.zip")).unwrap();
     let (local, _) = sizes(&zip);
     assert_eq!(local, [0, 0, 0, 0]);
+}
+
+/// Finding 30 (bug hunt 2): `fclose(y)` is the archive's `close(2)`,
+/// checked. A close that fails (a network file system's deferred write
+/// error; injected here, as no local file system can) is zip's failed
+/// fclose of the temporary (`ZE_TEMP`, exit 10): the old archive is not
+/// replaced and `-m` deletes nothing.
+#[cfg(unix)]
+#[test]
+fn a_failing_close_replaces_nothing_and_moves_nothing() {
+    let s = Scratch::new("close");
+    std::fs::write(s.0.join("a"), b"alpha\n").unwrap();
+    std::fs::write(s.0.join("b"), b"beta\n").unwrap();
+    let (code, _, _) = run(&s.0, &["-q", "t.zip", "a"], "a", InputReads::default());
+    assert_eq!(code, 0);
+    let before = std::fs::read(s.0.join("t.zip")).unwrap();
+    host::fail_closes(Some(libc::EIO));
+    let (code, out, err) = run(
+        &s.0,
+        &["-q", "-m", "t.zip", "b"],
+        "b",
+        InputReads::default(),
+    );
+    host::fail_closes(None);
+    assert_eq!(code, 10, "{out} {err}");
+    assert!(out.contains("zip error: Temporary file failure"), "{out}");
+    assert_eq!(std::fs::read(s.0.join("t.zip")).unwrap(), before);
+    assert!(s.0.join("a").exists() && s.0.join("b").exists());
+    // A working close moves it.
+    let (code, _, _) = run(
+        &s.0,
+        &["-q", "-m", "t.zip", "b"],
+        "b",
+        InputReads::default(),
+    );
+    assert_eq!(code, 0);
+    assert!(!s.0.join("b").exists());
 }

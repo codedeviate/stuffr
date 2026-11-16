@@ -404,6 +404,25 @@
 //!     `kill -SEGV`/`-BUS`/`-ILL` exactly as a fault, a real fault still
 //!     answers as zip does. A stack overflow dies of the signal with no
 //!     message (the handler has no stack to run on).
+//! 35. A read error part-way through a file (a failing disk, a network file
+//!     system; finding 34 of the second bug hunt). zip takes it for the end
+//!     of the file (zipup.c's `file_read`), the entry holds what was read,
+//!     and only a stored entry says so (`zerr()` looks at the stored loop's
+//!     count). stuffr keeps the entry and zip's lines, says `could not read
+//!     input file: NAME` (after the `perror` line) for a deflated or bzip2
+//!     entry too, and `-m` leaves that file where it is (zip deletes it
+//!     though its entry is incomplete). The exit code stays zip's.
+//! 36. `-m` never deletes an archive (finding 29 of the second bug hunt).
+//!     zip's `trash()` unlinks every name it moved: an existing `-O` target
+//!     the operands match is added as an entry and then deleted, the
+//!     archive just written, so every moved file is gone (`zip -rm in.zip .
+//!     -O out.zip` run twice); an archive that holds an entry of its own
+//!     name is updated and then deleted (`zip -rm t.zip .`, `zip -fm
+//!     t.zip`). stuffr leaves the `-O` target out of the scan, as zip leaves
+//!     out the archive it reads (`file matches zip file -- skipping` under
+//!     `-v`), and its `trash()` deletes neither the archive written nor the
+//!     one read, whatever entry names them (`zip warning: not deleting the
+//!     archive: NAME`).
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};

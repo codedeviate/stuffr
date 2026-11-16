@@ -88,6 +88,9 @@ pub(crate) struct ZEntry {
     /// length of a bit-11 name after the name was converted (the central
     /// directory's size counts it, not the name written).
     pub(crate) nam: Option<usize>,
+    /// Deviation 35: a read of the file failed part-way, so the entry holds
+    /// only what was read, and `-m` leaves the file where it is.
+    pub(crate) read_failed: bool,
 }
 
 /// Where an archive is written: a file (the temporary archive, or standard
@@ -118,6 +121,14 @@ pub(crate) trait ZWrite: Write {
     /// an entry they drop and write the next over it.
     fn seek_raw(&mut self, _at: u64) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(29))
+    }
+    /// `fclose(y)`: what is buffered written out, then (a file) its
+    /// `close(2)`, checked (finding 30 of the second bug hunt: a network
+    /// file system may report a deferred write error only there, and the
+    /// archive must not replace the old one, nor `-m` delete a file, after
+    /// that). The stream is not written again.
+    fn close(&mut self) -> io::Result<()> {
+        self.flush()
     }
     /// `zftello(y)`: where the stream really is.
     fn tell_raw(&mut self) -> io::Result<u64> {

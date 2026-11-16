@@ -774,7 +774,7 @@ pub(crate) fn run(z: &mut Zr, c: Collected) -> Exit {
         tempzip = sp.tempzip.clone();
     }
     // fclose(y)
-    if let Err(err) = w.out.w.flush() {
+    if let Err(err) = w.out.w.close() {
         let shown = if split.is_some() {
             tempzip.clone()
         } else {

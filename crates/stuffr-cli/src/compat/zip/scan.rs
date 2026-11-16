@@ -103,6 +103,9 @@ struct Scan {
     /// archive's `stat` (`Some(None)`: it does not exist, or goes to
     /// standard output).
     zip_stat: Option<Option<std::fs::Metadata>>,
+    /// Deviation 36: the `-O` target's stat, when it exists and is not the
+    /// archive read, taken once as `zip_stat` is.
+    out_stat: Option<Option<std::fs::Metadata>>,
     /// The error of the last failed `stat` (the C's stale `errno`, which
     /// `ziperr(ZE_OPEN, ...)` shows for `-MM`).
     last_err: Option<io::Error>,
@@ -474,6 +477,7 @@ impl Scan {
         Scan {
             listed: Vec::new(),
             zip_stat: None,
+            out_stat: None,
             last_err: None,
             ar,
         }
@@ -690,16 +694,26 @@ impl Scan {
                 std::fs::metadata(z.host.path(&zipfile)).ok()
             });
         }
-        let Some(Some(zm)) = &self.zip_stat else {
-            return false;
-        };
+        if self.out_stat.is_none() {
+            // Deviation 36 (finding 29 of the second bug hunt): the `-O`
+            // target is no input either; zip adds an existing one and then
+            // `-m` deletes it, the archive just written.
+            self.out_stat = Some(match &z.o.out_path {
+                Some(out) if !out.is_empty() && out != b"-" => {
+                    std::fs::metadata(z.host.path(out)).ok()
+                }
+                _ => None,
+            });
+        }
         if name.is_empty() {
             return false;
         }
-        match std::fs::metadata(z.host.path(name)) {
-            Ok(nm) => same_stat(zm, &nm),
-            Err(_) => false,
-        }
+        let Ok(nm) = std::fs::metadata(z.host.path(name)) else {
+            return false;
+        };
+        [&self.zip_stat, &self.out_stat]
+            .into_iter()
+            .any(|st| matches!(st, Some(Some(m)) if same_stat(m, &nm)))
     }
 }
 

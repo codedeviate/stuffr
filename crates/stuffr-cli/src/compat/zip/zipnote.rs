@@ -289,7 +289,7 @@ pub(crate) fn run(z: &mut Zr, o: NoteOptions) -> Exit {
         Err(PutError::Write(err)) => return write_failed(z, &err),
     }
     // fclose(y)
-    if let Err(err) = out.w.flush() {
+    if let Err(err) = out.w.close() {
         return z.ziperr_os(ZE_TEMP, &tempzip, &err);
     }
     drop(out);

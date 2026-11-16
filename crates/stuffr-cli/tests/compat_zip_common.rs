@@ -1101,4 +1101,101 @@ mod unix {
             }
         }
     }
+
+    /// Finding 29 (bug hunt 2), deviation 36: `-m` never deletes the
+    /// archive it has just written, nor the one it updates. Info-ZIP's
+    /// trash() unlinks every marked name: (a) an existing `-O` target the
+    /// operands match is added and then deleted (the moved files gone with
+    /// it); (b) an archive holding an entry of its own name is updated and
+    /// then deleted. The reference's loss is checked first; stuffr excludes
+    /// the `-O` target from the scan, as zip excludes the archive it reads,
+    /// and trash() leaves either archive (a warning).
+    #[test]
+    fn moving_never_deletes_an_archive() {
+        use std::process::{Command, Stdio};
+        let Some(zdir) = zip_dir() else { return };
+        let flavour = platform_zip_flavour();
+        let names = |zip: &std::path::Path| -> Vec<String> {
+            let o = output(Command::new("/usr/bin/unzip").arg("-Z1").arg(zip)).unwrap();
+            let mut v: Vec<String> = String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            v.sort();
+            v
+        };
+        let run = |exe: Option<&str>, args: &[&str], shape: u8| {
+            let base = ScratchDir::unique("zip-trash");
+            let w = base.join("w");
+            std::fs::create_dir_all(w.join("src")).unwrap();
+            std::fs::write(w.join("src/a"), b"one\n").unwrap();
+            std::fs::write(w.join("src/b"), b"two\n").unwrap();
+            if shape == b'a' {
+                std::fs::write(w.join("out.zip"), b"prev\n").unwrap();
+                let z = zip_with(&[ZipEntrySpec::new(b"src/a", b"old\n")], b"", b"");
+                std::fs::write(w.join("t.zip"), z).unwrap();
+            } else {
+                let z = zip_with(
+                    &[
+                        ZipEntrySpec::new(b"t.zip", b"older"),
+                        ZipEntrySpec::new(b"x", b"1"),
+                    ],
+                    b"",
+                    b"",
+                );
+                std::fs::write(w.join("t.zip"), z).unwrap();
+            }
+            let exe = match exe {
+                Some(e) => std::path::PathBuf::from(e),
+                None => {
+                    std::fs::create_dir_all(base.join("bin")).unwrap();
+                    let link = base.join("bin/zip");
+                    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
+                    link
+                }
+            };
+            let o = output(
+                Command::new(&exe)
+                    .args(args)
+                    .current_dir(&w)
+                    .env("STUFFR_ZIP_FLAVOR", flavour)
+                    .stdin(Stdio::null()),
+            )
+            .unwrap();
+            let out = String::from_utf8_lossy(&o.stdout).into_owned();
+            (o.status.code(), out, base)
+        };
+        let reference = format!("{zdir}/zip");
+        // (a) the `-O` target among the moved names.
+        let a = ["-rm", "t.zip", ".", "-O", "out.zip"];
+        let (code, _, base) = run(Some(&reference), &a, b'a');
+        assert_eq!(code, Some(0));
+        assert!(!base.join("w/out.zip").exists() && !base.join("w/src/b").exists());
+        let (code, out, base) = run(None, &a, b'a');
+        assert_eq!(code, Some(0), "{out}");
+        assert!(!out.contains("adding: out.zip"), "{out}");
+        assert_eq!(
+            names(&base.join("w/out.zip")),
+            ["src/", "src/a", "src/b"],
+            "{out}"
+        );
+        assert!(!base.join("w/src/a").exists() && !base.join("w/src/b").exists());
+        // (b) an entry named as the archive.
+        let b = ["-rm", "t.zip", "."];
+        let (code, _, base) = run(Some(&reference), &b, b'b');
+        assert_eq!(code, Some(0));
+        assert!(!base.join("w/t.zip").exists());
+        let (code, out, base) = run(None, &b, b'b');
+        assert_eq!(code, Some(0), "{out}");
+        assert!(
+            out.contains("zip warning: not deleting the archive: t.zip"),
+            "{out}"
+        );
+        assert_eq!(
+            names(&base.join("w/t.zip")),
+            ["src/", "src/a", "src/b", "t.zip", "x"],
+            "{out}"
+        );
+        assert!(!base.join("w/src/a").exists());
+    }
 }

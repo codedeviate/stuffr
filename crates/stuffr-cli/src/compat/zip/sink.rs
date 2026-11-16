@@ -48,7 +48,7 @@ impl FileSink {
             f: BufWriter::with_capacity(
                 cap,
                 Charged {
-                    f,
+                    f: Some(f),
                     budget,
                     #[cfg(test)]
                     limit: FILE_SIZE_LIMIT.with(|l| l.get()),
@@ -114,6 +114,11 @@ impl FileSink {
         Ok(())
     }
 
+    /// The open file under the buffer (`EBADF` once closed).
+    fn file(&mut self) -> io::Result<&mut File> {
+        self.f.get_mut().f.as_mut().ok_or_else(closed)
+    }
+
     /// Remember a failed write as stdio's error flag does.
     fn failed(&mut self, e: io::Error) -> io::Error {
         if self.err.is_none() {
@@ -127,7 +132,8 @@ impl FileSink {
 /// it: as a file size limit, a write takes what is left of the budget,
 /// and once it is spent a write fails as a full disk does.
 pub(crate) struct Charged {
-    f: File,
+    /// `None` once closed ([`FileSink`]'s `close`).
+    f: Option<File>,
     budget: Option<Arc<AtomicU64>>,
     /// Test builds: `ulimit -f` for the archive (bytes), `EFBIG` past it.
     #[cfg(test)]
@@ -159,8 +165,11 @@ impl Write for Charged {
             }
             None => buf,
         };
+        let Some(f) = self.f.as_mut() else {
+            return Err(closed());
+        };
         let Some(b) = &self.budget else {
-            return self.f.write(buf);
+            return f.write(buf);
         };
         // as a file size limit: what fits is written, then nothing
         let left = b.load(std::sync::atomic::Ordering::Relaxed);
@@ -169,7 +178,7 @@ impl Write for Charged {
             host::take(b, 1)?;
         }
         host::take(b, want)?;
-        let n = self.f.write(&buf[..want as usize]);
+        let n = f.write(&buf[..want as usize]);
         if let Ok(n) = &n {
             // give back what a short write did not use
             b.fetch_add(want - *n as u64, std::sync::atomic::Ordering::Relaxed);
@@ -177,7 +186,22 @@ impl Write for Charged {
         n
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.f.flush()
+        match self.f.as_mut() {
+            Some(f) => f.flush(),
+            None => Ok(()),
+        }
+    }
+}
+
+/// A write to a sink already closed (`EBADF`).
+fn closed() -> io::Error {
+    #[cfg(unix)]
+    {
+        io::Error::from_raw_os_error(libc::EBADF)
+    }
+    #[cfg(not(unix))]
+    {
+        io::Error::from(io::ErrorKind::BrokenPipe)
     }
 }
 
@@ -207,7 +231,7 @@ impl ZWrite for FileSink {
     }
     fn seek_to(&mut self, at: u64) -> io::Result<()> {
         self.flush()?;
-        self.f.get_mut().f.seek(SeekFrom::Start(at)).map(|_| ())
+        self.file()?.seek(SeekFrom::Start(at)).map(|_| ())
     }
     fn write_here(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.f.write_all(bytes).map_err(|e| self.failed(e))
@@ -215,11 +239,11 @@ impl ZWrite for FileSink {
     fn seek_end(&mut self) -> io::Result<()> {
         self.flush()?;
         let pos = self.pos;
-        self.f.get_mut().f.seek(SeekFrom::Start(pos)).map(|_| ())
+        self.file()?.seek(SeekFrom::Start(pos)).map(|_| ())
     }
     fn seek_here(&mut self) -> io::Result<()> {
         self.flush()?;
-        let f = &mut self.f.get_mut().f;
+        let f = self.file()?;
         let here = f.stream_position()?;
         f.seek(SeekFrom::Start(here)).map(|_| ())
     }
@@ -231,14 +255,21 @@ impl ZWrite for FileSink {
     }
     fn seek_raw(&mut self, at: u64) -> io::Result<()> {
         self.flush()?;
-        self.f.get_mut().f.seek(SeekFrom::Start(at)).map(|_| ())
+        self.file()?.seek(SeekFrom::Start(at)).map(|_| ())
     }
     fn tell_raw(&mut self) -> io::Result<u64> {
         self.flush()?;
-        self.f.get_mut().f.stream_position()
+        self.file()?.stream_position()
     }
     fn set_offset(&mut self, at: u64) {
         self.pos = at;
+    }
+    fn close(&mut self) -> io::Result<()> {
+        self.flush()?;
+        match self.f.get_mut().f.take() {
+            Some(f) => host::close_file(f).map_err(|e| self.failed(e)),
+            None => Ok(()),
+        }
     }
 }
 

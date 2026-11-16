@@ -1157,6 +1157,9 @@ pub(super) const LARGE_DISABLED_USING: &str = "Large entry support disabled usin
 pub(super) const DELETING_FILE: &str = "zip diagnostic: deleting file %s\n";
 /// zipfile.c:trash, a failed `unlink`.
 pub(super) const ERROR_DELETING: &str = "error deleting ";
+/// stuffr's own (deviation 36): `-m` met the archive written or read among
+/// the names to delete, and leaves it.
+pub(super) const NOT_DELETING_ARCHIVE: &str = "not deleting the archive: ";
 /// zipfile.c:trash, `-m` with `-v`, a directory.
 pub(super) const DELETING_DIR: &str = "deleting directory %s (if empty)                \n";
 /// zip.c:finish, `-o` over directories only.
