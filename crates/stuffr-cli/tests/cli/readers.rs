@@ -208,21 +208,38 @@ fn a_hostile_pax_sparse_map_is_refused() {
     tiny.resize(512, 0);
     tiny.push(b'x');
     let huge = build("huge.tar", "1099511627776", &tiny);
+    // No region at all: the whole 1 TiB is one hole (final review I3).
+    let mut empty_map = b"0\n".to_vec();
+    empty_map.resize(512, 0);
+    let hole = build("hole.tar", "1099511627776", &empty_map);
     // Each verb on the file and on a pipe (task 4 review, minor 5): the
     // same verdict, and an unpack leaves no placeholder. A refused map
     // writes no `big` at all; the 1 TiB one is refused by the ratio budget
     // part-way, and entry-aware extraction is documented as not atomic
     // (`stuffr::entries::extract`, README): the one partial file it leaves
     // is bounded by that budget, never the declared size.
-    for (archive, codes) in [(&bad, [5, 5, 5, 5]), (&huge, [0, 6, 6, 6])] {
+    // `convert` too (final review I3): every verb that reads the content
+    // stops at the ratio budget.
+    for (archive, codes) in [
+        (&bad, [5, 5, 5, 5, 5]),
+        (&huge, [0, 6, 6, 6, 6]),
+        (&hole, [0, 6, 6, 6, 6]),
+    ] {
         let bytes = std::fs::read(archive).unwrap();
-        for (i, verb) in ["list", "test", "unpack", "cat"].into_iter().enumerate() {
+        for (i, verb) in ["list", "test", "unpack", "cat", "convert"]
+            .into_iter()
+            .enumerate()
+        {
             for pipe in [false, true] {
-                let dest = dir.join(format!("out-{verb}-{pipe}"));
+                let stem = archive.file_stem().unwrap().to_str().unwrap();
+                let dest = dir.join(format!("out-{stem}-{verb}-{pipe}"));
+                let converted = dir.join(format!("conv-{pipe}.zip"));
+                let _ = std::fs::remove_file(&converted);
                 let p = if pipe { "-" } else { archive.to_str().unwrap() };
                 let args: Vec<&str> = match verb {
                     "unpack" => vec!["unpack", "-C", dest.to_str().unwrap(), p],
                     "cat" => vec!["cat", p, "big"],
+                    "convert" => vec!["convert", p, "-o", converted.to_str().unwrap()],
                     _ => vec![verb, p],
                 };
                 let out = if pipe {
@@ -244,6 +261,9 @@ fn a_hostile_pax_sparse_map_is_refused() {
                     assert!(out.stdout.is_empty(), "{verb}: a refused map wrote data");
                 } else if let Ok(len) = big {
                     assert!(len <= 128 << 20, "{verb}: `big` grew to {len} bytes");
+                }
+                if let Ok(m) = std::fs::metadata(&converted) {
+                    assert!(m.len() <= 128 << 20, "convert wrote {} bytes", m.len());
                 }
                 if verb == "cat" {
                     assert!(

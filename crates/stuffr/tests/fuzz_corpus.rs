@@ -3792,6 +3792,73 @@ fn symlink_chain_tar_seeds() -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
+/// GNU's three pax sparse layouts (1.0, 0.1, 0.0), each a 100000-byte
+/// `sparse.bin` holding `hello` at 0 and `0123456789` at 99990, and a 1.0
+/// map with no region over a real size of `u64::MAX` (final review of bug
+/// hunt 2, I3): the reader expands holes as zeros, so that one entry is
+/// 2^64 - 1 bytes from a tar of 3 KiB, which the `container` target's drain
+/// budget, not the reader, must stop.
+fn pax_sparse_tar_seeds() -> Vec<(&'static str, Vec<u8>)> {
+    let data = b"hello0123456789";
+    let pax = |records: &[(&str, &[u8])]| -> Vec<u8> {
+        let body: Vec<u8> = records
+            .iter()
+            .flat_map(|(k, v)| seed_pax_record(k, v))
+            .collect();
+        seed_tar_member(b"PaxHeader", b'x', b"", &body)
+    };
+    let one_zero = |realsize: &[u8], map: &[u8], data: &[u8]| {
+        let mut tar = pax(&[
+            ("GNU.sparse.major", b"1"),
+            ("GNU.sparse.minor", b"0"),
+            ("GNU.sparse.name", b"sparse.bin"),
+            ("GNU.sparse.realsize", realsize),
+        ]);
+        let mut payload = map.to_vec();
+        payload.resize(512, 0);
+        payload.extend_from_slice(data);
+        tar.extend(seed_tar_member(
+            b"GNUSparseFile.0/sparse.bin",
+            b'0',
+            b"",
+            &payload,
+        ));
+        seed_tar_end(tar)
+    };
+    let mut zero_one = pax(&[
+        ("GNU.sparse.size", b"100000"),
+        ("GNU.sparse.name", b"sparse.bin"),
+        ("GNU.sparse.map", b"0,5,99990,10"),
+    ]);
+    zero_one.extend(seed_tar_member(
+        b"GNUSparseFile.0/sparse.bin",
+        b'0',
+        b"",
+        data,
+    ));
+    let mut zero_zero = pax(&[
+        ("GNU.sparse.size", b"100000"),
+        ("GNU.sparse.numblocks", b"2"),
+        ("GNU.sparse.offset", b"0"),
+        ("GNU.sparse.numbytes", b"5"),
+        ("GNU.sparse.offset", b"99990"),
+        ("GNU.sparse.numbytes", b"10"),
+    ]);
+    zero_zero.extend(seed_tar_member(b"sparse.bin", b'0', b"", data));
+    vec![
+        (
+            "tar-pax-sparse-1.0",
+            one_zero(b"100000", b"2\n0\n5\n99990\n10\n", data),
+        ),
+        ("tar-pax-sparse-0.1", seed_tar_end(zero_one)),
+        ("tar-pax-sparse-0.0", seed_tar_end(zero_zero)),
+        (
+            "tar-pax-sparse-huge-hole",
+            one_zero(u64::MAX.to_string().as_bytes(), b"0\n", b""),
+        ),
+    ]
+}
+
 /// Extra `container/` seeds beyond the per-slot pair: `(file stem, slot, bytes)`.
 fn extra_container_seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     vec![
@@ -3819,6 +3886,7 @@ fn extra_container_seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
         conflict_tar_seeds()
             .into_iter()
             .chain(symlink_chain_tar_seeds())
+            .chain(pax_sparse_tar_seeds())
             .map(|(stem, bytes)| (stem, "tar", bytes)),
     )
     .collect()
@@ -4421,6 +4489,43 @@ fn the_link_and_escape_seeds_read_as_what_they_claim() {
         "{esc:?}"
     );
     assert!(esc.iter().any(|m| m.name.contains('\0')), "{esc:?}");
+}
+
+/// The pax sparse seeds read as the file they describe: `sparse.bin`, 100000
+/// bytes, its two data runs where the map puts them and zeros between; the
+/// huge-hole seed lists at its declared size and is refused by `test`'s
+/// ratio budget (exit 6), never expanded.
+#[test]
+fn the_pax_sparse_seeds_read_as_what_they_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    for (stem, bytes) in pax_sparse_tar_seeds() {
+        let p = dir.path().join(format!("{stem}.tar"));
+        std::fs::write(&p, bytes).unwrap();
+        let metas = entries::list(Input::Path(p.clone()), 0, None).unwrap().0;
+        assert_eq!(metas.len(), 1, "{stem}: {metas:?}");
+        assert_eq!(metas[0].name, "sparse.bin", "{stem}");
+        if stem.ends_with("huge-hole") {
+            assert_eq!(metas[0].size, Some(u64::MAX), "{stem}");
+            let e = entries::test(Input::Path(p), stuffr_core::DEFAULT_MAX_RATIO, None)
+                .expect_err("a 2^64-byte hole must hit the ratio budget");
+            assert_eq!(e.exit_code(), 6, "{stem}: {e}");
+            continue;
+        }
+        assert_eq!(metas[0].size, Some(100_000), "{stem}");
+        let mut out = Vec::new();
+        entries::cat(
+            Input::Path(p),
+            &entries::Selection::All,
+            stuffr_core::DEFAULT_MAX_RATIO,
+            None,
+            &mut out,
+        )
+        .unwrap();
+        let mut want = vec![0u8; 100_000];
+        want[..5].copy_from_slice(b"hello");
+        want[99_990..].copy_from_slice(b"0123456789");
+        assert!(out == want, "{stem}: contents differ");
+    }
 }
 
 /// The legacy-directory seeds (0.16.0 deep fuzz) list their directory as a

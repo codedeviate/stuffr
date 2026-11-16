@@ -99,6 +99,16 @@ fn declared_zip_index(path: &Path) -> Option<usize> {
     Some(usize::from(entries))
 }
 
+/// How many entry bytes one walk drains before it stops, summed over its
+/// entries (final review of bug hunt 2, I3). `ArchiveRead` has no ratio
+/// guard of its own (the `ops`/`entries` layer owns `--max-ratio`), and a pax
+/// sparse map with no regions delivers its declared real size in zeros, up
+/// to 2^64 bytes from a tar of under 2 KiB. Hitting the budget is a normal
+/// end, as in `codec.rs`: the walk stops, and every check that needs the
+/// whole walk (the entry's size, the count, the fidelity claim) is skipped
+/// for that input. 64 MiB is `codec.rs`'s `MAX_OUTPUT`.
+const DRAIN_BUDGET: u64 = 64 << 20;
+
 /// Walks `payload` through `container` a SECOND time, forward-only, counting
 /// entries — Ruling B's independent observation for `check_fidelity_claim`.
 ///
@@ -165,6 +175,7 @@ fn forward_entry_count(container: &dyn Container, payload: &[u8]) -> Option<usiz
     };
 
     let mut count = 0usize;
+    let mut drained = 0u64;
     let mut buf = [0u8; 4096];
     loop {
         let mut entry = match ar.next_entry() {
@@ -181,10 +192,16 @@ fn forward_entry_count(container: &dyn Container, payload: &[u8]) -> Option<usiz
         // depends on having consumed entry N's bytes, since there is no seek
         // to skip ahead with. Leaving this unread would make the count an
         // artefact of OUR walk, not a fact about the archive.
+        // Past [`DRAIN_BUDGET`] the count says nothing: inconclusive.
         loop {
             match entry.reader().read(&mut buf) {
                 Ok(0) => break,
-                Ok(_) => {}
+                Ok(n) => {
+                    drained += n as u64;
+                    if drained >= DRAIN_BUDGET {
+                        return None;
+                    }
+                }
                 Err(e) => {
                     let e = Error::from_decode_io(e);
                     check_error_is_classified(&e)
@@ -617,8 +634,11 @@ fuzz_target!(|data: &[u8]| {
     // Every name the walk reached, for `convert_oracle`; seekable path only,
     // the only one the oracle runs on.
     let mut names: Vec<String> = Vec::new();
+    // Bytes drained so far, and whether [`DRAIN_BUDGET`] ended the walk.
+    let mut drained = 0u64;
+    let mut capped = false;
 
-    loop {
+    'walk: loop {
         let mut entry = match ar.next_entry() {
             Ok(Some(e)) => e,
             Ok(None) => break,
@@ -644,7 +664,13 @@ fuzz_target!(|data: &[u8]| {
         loop {
             match entry.reader().read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => produced += n as u64,
+                Ok(n) => {
+                    produced += n as u64;
+                    if drained + produced >= DRAIN_BUDGET {
+                        capped = true;
+                        break 'walk;
+                    }
+                }
                 Err(e) => {
                     // `from_decode_io`, NOT the bare `Error::Io` `Error::from`
                     // would give: an `io::Error` here can be malformed-input
@@ -665,6 +691,7 @@ fuzz_target!(|data: &[u8]| {
         }
         // `entry` is dropped at the end of this loop body, releasing its
         // borrow on `ar` before the next `ar.next_entry()` call.
+        drained += produced;
 
         check_entry_size(declared_size, produced, &entry_name, &entry_kind).expect("entry size");
         if seekable {
@@ -687,7 +714,10 @@ fuzz_target!(|data: &[u8]| {
         None
     };
 
-    check_entry_count(declared, enumerated, report).expect("entry count");
+    // A walk [`DRAIN_BUDGET`] ended enumerated a prefix: nothing to count.
+    if !capped {
+        check_entry_count(declared, enumerated, report).expect("entry count");
+    }
 
     // Ruling B: `approximated` must be an independent observation — one that
     // can be TRUE in a state where every other oracle call in this target
@@ -744,7 +774,8 @@ fuzz_target!(|data: &[u8]| {
     //   and narrowing these three to the zero case as well would throw away a
     //   sound observation on three of the four slots to fix a problem only
     //   the fourth has.
-    let approximated = seekable
+    let approximated = !capped
+        && seekable
         && forward_entry_count(container.as_ref(), payload).is_some_and(|forward| {
             if name == "zip" {
                 enumerated == 0 && forward > 0
@@ -753,7 +784,9 @@ fuzz_target!(|data: &[u8]| {
             }
         });
 
-    check_fidelity_claim(report, approximated).expect("fidelity claim");
+    if !capped {
+        check_fidelity_claim(report, approximated).expect("fidelity claim");
+    }
 
     // Phase 5a: convert what this walk read into a tar, seekable path only
     // (the cheap one: the input is already a file). Last, so every check
