@@ -316,3 +316,75 @@ fn peak_rss_bytes() -> u64 {
         ru.ru_maxrss as u64
     }
 }
+
+/// Finding 30 (bug hunt 2): the output's `close(2)` is checked, as
+/// fileio.c checks `fclose(dstFile)`. A close that fails (the deferred write
+/// error of a network file system; injected here, as no local file system
+/// can) fails that file: `zstd: NAME: strerror`, result 1, the output
+/// removed and the source kept under `--rm`; the next operand goes on. For
+/// the one output of several inputs (`-o`), the close is `error 29`, and no
+/// source is removed (zstd never removes inputs it concatenates). A real
+/// process (absolute paths), its standard
+/// output untouched (`-q`, file outputs only).
+#[cfg(unix)]
+#[test]
+fn a_failing_close_fails_the_file_and_keeps_the_source() {
+    let d = Dir::new("close");
+    let p = |n: &str| d.0.join(n).to_string_lossy().into_owned();
+    let eio = String::from_utf8(host::errno_text(libc::EIO)).unwrap();
+    let run = |args: &[&str], fault: bool| -> (i32, String) {
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let mut err = Vec::new();
+        host::fail_closes(fault.then_some(libc::EIO));
+        let code = main(
+            b"zstd",
+            &args,
+            &|_| None,
+            &mut Host::Real,
+            Cores::SANDBOX,
+            None,
+            &mut err,
+        );
+        host::fail_closes(None);
+        (code, String::from_utf8(err).unwrap())
+    };
+    std::fs::write(p("a"), b"alpha alpha alpha\n").unwrap();
+    std::fs::write(p("b"), b"beta beta beta\n").unwrap();
+    // Compressing, two operands: both fail, both kept.
+    let (code, err) = run(&["-q", "--rm", &p("a"), &p("b")], true);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(
+        err,
+        format!(
+            "zstd: {}.zst: {eio} \nzstd: {}.zst: {eio} \n",
+            p("a"),
+            p("b")
+        )
+    );
+    for n in ["a", "b"] {
+        assert!(
+            d.0.join(n).exists() && !d.0.join(format!("{n}.zst")).exists(),
+            "{n}"
+        );
+    }
+    // `-o` over both: error 29, nothing removed, nothing left.
+    let (code, err) = run(
+        &["-q", "--rm", "-f", "-o", &p("ab.zst"), &p("a"), &p("b")],
+        true,
+    );
+    assert_eq!(code, 29, "{err}");
+    assert!(err.contains("cannot properly close"), "{err}");
+    assert!(d.0.join("a").exists() && d.0.join("b").exists());
+    // A working close: published, sources removed.
+    assert_eq!(run(&["-q", "--rm", &p("a")], false), (0, String::new()));
+    assert!(!d.0.join("a").exists() && d.0.join("a.zst").exists());
+    // Decompressing: the same.
+    let (code, err) = run(&["-q", "-d", "--rm", &p("a.zst")], true);
+    assert_eq!((code, err), (1, format!("zstd: {}: {eio} \n", p("a"))));
+    assert!(d.0.join("a.zst").exists() && !d.0.join("a").exists());
+    assert_eq!(
+        run(&["-q", "-d", "--rm", &p("a.zst")], false),
+        (0, String::new())
+    );
+    assert_eq!(std::fs::read(p("a")).unwrap(), b"alpha alpha alpha\n");
+}

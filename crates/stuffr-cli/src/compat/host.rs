@@ -2081,6 +2081,54 @@ pub(crate) fn errno_text(n: i32) -> Vec<u8> {
     s.strip_suffix(&suffix).unwrap_or(&s).as_bytes().to_vec()
 }
 
+/// `close(2)` of an output file, its result kept: C's checked `fclose`. A
+/// network file system (NFS, SMB, FUSE) may report a write it deferred
+/// (`EDQUOT`, `ENOSPC`, `EIO`) only there, and Rust's `drop` of a `File`
+/// throws that away. Every family that removes an input once its output is
+/// written closes the output through this first (finding 30 of the second
+/// bug hunt; brotli has its own, injectable, `files::close_file`).
+///
+/// Test builds: [`fail_closes`] makes the calling thread's closes fail
+/// (after closing the descriptor), as no local file system can.
+pub(crate) fn close_file(f: File) -> io::Result<()> {
+    #[cfg(test)]
+    let fault = CLOSE_FAULT.with(std::cell::Cell::get);
+    #[cfg(unix)]
+    let r = {
+        use std::os::fd::IntoRawFd;
+        let fd = f.into_raw_fd();
+        // SAFETY: `fd` was just taken out of its `File`, so it is open,
+        // owned here alone, and closed exactly once.
+        if unsafe { libc::close(fd) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    };
+    #[cfg(not(unix))]
+    let r = {
+        drop(f);
+        Ok(())
+    };
+    #[cfg(test)]
+    if let Some(errno) = fault {
+        return Err(io::Error::from_raw_os_error(errno));
+    }
+    r
+}
+
+#[cfg(test)]
+thread_local! {
+    static CLOSE_FAULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test builds: from now on every [`close_file`] on this thread fails with
+/// `errno` (`None`: closes work again).
+#[cfg(test)]
+pub(crate) fn fail_closes(errno: Option<i32>) {
+    CLOSE_FAULT.with(|c| c.set(errno));
+}
+
 /// `notAStandardFile`: anything but a regular file, judged without following
 /// a final symlink; "if in doubt, return True".
 pub(crate) fn not_a_standard_file(p: &Path) -> bool {

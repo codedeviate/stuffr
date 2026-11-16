@@ -4380,4 +4380,117 @@ mod unix {
         assert_eq!(s.code, 0, "{}", s.stderr);
         assert!(s.tree["o"].0.starts_with(&[0x37, 0xa4, 0x30, 0xec]));
     }
+
+    /// The files of a scratch directory with their sizes, the links
+    /// leading to the binaries left out.
+    fn listing(dir: &std::path::Path) -> Vec<(String, u64)> {
+        let mut v: Vec<(String, u64)> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| !e.file_type().unwrap().is_symlink())
+            .map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                (name, e.metadata().unwrap().len())
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// One run in `dir` of `exe` with `args`, standard input empty, no file
+    /// it writes past `limit` bytes (`SIGXFSZ` ignored), or unlimited.
+    fn run_in(
+        dir: &std::path::Path,
+        exe: &std::path::Path,
+        args: &[&str],
+        limit: Option<u64>,
+    ) -> (Option<i32>, String) {
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(args)
+            .current_dir(dir)
+            .stdin(std::process::Stdio::null())
+            .env("LC_ALL", "C");
+        if let Some(l) = limit {
+            file_size_limit(&mut cmd, l);
+        }
+        let o = output(&mut cmd).unwrap();
+        (
+            o.status.code(),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+        )
+    }
+
+    /// Finding 32 (bug hunt 2): zstd 1.5.7 writes a file through a 1 MiB
+    /// stdio buffer, so under a full disk (a 64 KiB file-size limit,
+    /// `SIGXFSZ` ignored) an output that fits in it fails only at `fclose`:
+    /// `zstd: NAME: File too large`, that output removed, the next operand
+    /// processed, exit 1; a larger one fails at its first write, `error 70`,
+    /// 65536 bytes left. Exit, standard error and the files left (with the
+    /// failed outputs' sizes) are the reference's, both directions.
+    #[test]
+    fn a_full_disk_matches_the_reference() {
+        let Some(_) = zstd_dir() else { return };
+        let reference = std::path::Path::new(ref_zstd());
+        let small = random(200_000, 32);
+        let large = random(1_100_000, 33);
+        let mut zeros = vec![0u8; 600_000];
+        zeros[300_000] = 1;
+        let half = [vec![0u8; 50_000], random(50_000, 34)].concat();
+        let inputs: Vec<(&str, Vec<u8>)> = vec![
+            ("f", small.clone()),
+            ("g", random(3000, 35)),
+            ("h", large.clone()),
+            (
+                "big.zst",
+                filter_through(ref_zstd(), &["-q", "-c"], &random(100_000, 36)).unwrap(),
+            ),
+            (
+                "zeros.zst",
+                filter_through(ref_zstd(), &["-q", "-c"], &zeros).unwrap(),
+            ),
+            (
+                "half.zst",
+                filter_through(ref_zstd(), &["-q", "-c"], &half).unwrap(),
+            ),
+        ];
+        for args in [
+            &["-q", "--rm", "f", "g"][..],
+            &["-q", "-f", "f", "g"],
+            &["-q", "-f", "h"],
+            &["-q", "-f", "-d", "big.zst"],
+            &["-q", "-f", "-d", "--no-sparse", "big.zst"],
+            &["-q", "-f", "-d", "zeros.zst"],
+            &["-q", "-f", "-d", "half.zst"],
+            &["-q", "-f", "-o", "out.zst", "f", "g"],
+            &["-q", "-f", "--rm", "-o", "out.zst", "f", "g"],
+        ] {
+            let mut seen = Vec::new();
+            for exe in [reference.to_path_buf(), std::path::PathBuf::new()] {
+                let dir = ScratchDir::unique("zstd-fulldisk");
+                std::fs::create_dir_all(&*dir).unwrap();
+                for (name, bytes) in &inputs {
+                    std::fs::write(dir.join(name), bytes).unwrap();
+                }
+                let exe = if exe.as_os_str().is_empty() {
+                    let link = dir.join("zstd");
+                    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
+                    link
+                } else {
+                    exe
+                };
+                let (code, err) = run_in(&dir, &exe, args, Some(64 << 10));
+                // A compressed output written whole may differ in size on
+                // the pure tier: only a failed one's size is compared.
+                let files: Vec<(String, u64)> = listing(&dir)
+                    .into_iter()
+                    .map(|(n, l)| {
+                        let whole = inputs.iter().any(|(i, _)| *i == n) || l < (64 << 10);
+                        (n, if whole && !EXACT { 0 } else { l })
+                    })
+                    .collect();
+                seen.push((code, err, files));
+            }
+            assert_eq!(seen[1], seen[0], "{args:?}");
+        }
+    }
 }

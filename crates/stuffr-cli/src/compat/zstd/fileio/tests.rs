@@ -96,7 +96,7 @@ fn sparse_write(dir: &Dir, blocks: &[Vec<u8>]) -> (Vec<u8>, u64) {
     assert_eq!(io.prefs.sparse, 2);
     let path = dir.0.join("sparse");
     io.sink = Sink::File(Box::new(FileSink {
-        w: FileW::Raw(File::create(&path).unwrap()),
+        w: FileW::Raw(BufWriter::new(File::create(&path).unwrap())),
         tmp: None,
         path: path.clone(),
         name: b"sparse".to_vec(),

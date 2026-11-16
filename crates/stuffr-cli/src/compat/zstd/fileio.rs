@@ -239,11 +239,21 @@ struct FileSink {
     guard: Option<CleanupGuard>,
 }
 
+/// The real process's output buffer, as zstd's stdio buffer: 1 MiB (probe,
+/// 1.5.7, finding 32 of the second bug hunt: under a 64 KiB file-size limit
+/// a compressed output up to 1048575 bytes fails only at `fclose`, `zstd:
+/// NAME: File too large`, the output removed and the next operand
+/// processed; from 1 MiB on the first write fails, `error 70`, and 65536
+/// bytes are left).
+const WRITE_BUFFER: usize = 1 << 20;
+
 enum FileW {
-    /// The real process's file.
-    Raw(File),
+    /// The real process's file, through zstd's stdio-sized buffer.
+    Raw(BufWriter<File>),
     /// A sandboxed run's, charged to its output budget.
     Capped(BufWriter<Box<dyn Write + Send>>),
+    /// Closed ([`FileW::close`]).
+    Closed,
 }
 
 impl FileW {
@@ -251,17 +261,23 @@ impl FileW {
         match self {
             FileW::Raw(f) => f.write_all(b),
             FileW::Capped(w) => w.write_all(b),
+            FileW::Closed => Err(io::Error::from(io::ErrorKind::BrokenPipe)),
         }
     }
 
     /// `LONG_SEEK(file, n, SEEK_CUR)`; a sandboxed file writes the zeros.
     fn skip(&mut self, n: u64) -> io::Result<()> {
         match self {
+            // An empty skip seeks nothing, and so does not flush (probe,
+            // 1.5.7: decoding random data to a file under a file-size limit
+            // fails only at the close).
+            FileW::Raw(_) if n == 0 => Ok(()),
             FileW::Raw(f) => {
                 let n =
                     i64::try_from(n).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
                 f.seek(SeekFrom::Current(n)).map(drop)
             }
+            FileW::Closed => Err(io::Error::from(io::ErrorKind::BrokenPipe)),
             FileW::Capped(w) => {
                 let zeros = [0u8; 8192];
                 let mut left = n;
@@ -277,8 +293,35 @@ impl FileW {
 
     fn flush(&mut self) -> io::Result<()> {
         match self {
-            FileW::Raw(_) => Ok(()),
+            FileW::Raw(f) => f.flush(),
             FileW::Capped(w) => w.flush(),
+            FileW::Closed => Ok(()),
+        }
+    }
+
+    /// `fclose`: what is buffered written out, then the real file's
+    /// `close(2)`, checked ([`host::close_file`]; finding 30 of the second
+    /// bug hunt). A sandboxed file is only flushed.
+    fn close(&mut self) -> io::Result<()> {
+        match std::mem::replace(self, FileW::Closed) {
+            FileW::Raw(w) => match w.into_inner() {
+                Ok(f) => host::close_file(f),
+                Err(e) => Err(e.into_error()),
+            },
+            FileW::Capped(mut w) => {
+                let r = w.flush();
+                *self = FileW::Capped(w);
+                r
+            }
+            FileW::Closed => Ok(()),
+        }
+    }
+
+    /// The real file, for its metadata.
+    fn file(&self) -> Option<&File> {
+        match self {
+            FileW::Raw(w) => Some(w.get_ref()),
+            _ => None,
         }
     }
 }
@@ -701,7 +744,7 @@ impl<'a> Io<'a> {
         Ok(match sink {
             Sink::Unset => (Ok(()), None),
             Sink::Stdout => (self.out.flush(), None),
-            Sink::File(mut f) => (f.w.flush(), Some(f)),
+            Sink::File(mut f) => (f.w.close(), Some(f)),
         })
     }
 
@@ -893,7 +936,7 @@ impl<'a> Io<'a> {
         let w = if sandboxed {
             FileW::Capped(self.host.out_writer(Some(file)))
         } else {
-            FileW::Raw(file)
+            FileW::Raw(BufWriter::with_capacity(WRITE_BUFFER, file))
         };
         self.sink = Sink::File(Box::new(FileSink {
             w,
@@ -935,7 +978,7 @@ impl<'a> Io<'a> {
             if f.tmp.is_none() {
                 drop(guard.take());
             }
-            if let (Some(meta), FileW::Raw(file)) = (transfer, &f.w) {
+            if let (Some(meta), Some(file)) = (transfer, f.w.file()) {
                 set_fd_stat(file, meta);
             }
         }
