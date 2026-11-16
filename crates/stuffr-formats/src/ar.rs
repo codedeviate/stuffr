@@ -381,7 +381,7 @@ impl Container for Ar {
             mode_unknown,
             report,
             seekable,
-            name_log: WarningLog::new(AR, crate::tar::NAME_NOT_UTF8),
+            name_log: WarningLog::new(AR, crate::names::NAME_NOT_UTF8),
         }))
     }
 

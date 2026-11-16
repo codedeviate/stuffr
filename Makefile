@@ -239,6 +239,9 @@ lint-latest:
 #   the zip-only test build: 0.25.0 parked a break there (`crc16_arc` was
 #   reached by tests the feature subset does not provide) because no gate
 #   command ever compiled that subset.
+# - The same for `--features ar`: the ar reader leaned on `tar`'s module for a
+#   shared constant (bug hunt 2, final review I1), and the ar-without-tar
+#   selection `crates/stuffr/Cargo.toml` promises failed to compile unseen.
 release:
 	$(CARGO) build --release --workspace
 	$(CARGO) build -p stuffr-core --no-default-features
@@ -246,6 +249,7 @@ release:
 	$(CARGO) check -p stuffr --features pure --no-default-features
 	$(CARGO) check -p stuffr --features legacy --no-default-features
 	$(CARGO) check -p stuffr-formats --lib --tests --no-default-features --features zip
+	$(CARGO) check -p stuffr-formats --lib --tests --no-default-features --features ar
 
 # NOT part of `check`, deliberately: Miri is 10-50x slower than a native run
 # and the gate is already 35-60s. Run it when you touch the self-referential

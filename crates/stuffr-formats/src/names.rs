@@ -6,6 +6,10 @@ use stuffr_core::{Fidelity, FidelityReport, FormatId};
 /// warning lives until the walk ends (task 4 review, I1).
 const CLIP: usize = 256;
 
+/// [`Fidelity::Unlisted`]'s `what` for the names [`not_utf8`] reports, shared
+/// by the tar and ar readers (here so that either compiles without the other).
+pub(crate) const NAME_NOT_UTF8: &str = "have a name that is not valid UTF-8";
+
 /// `s` cut to [`CLIP`] bytes at a character boundary, `…` marking a cut.
 pub(crate) fn clip(s: &str) -> String {
     if s.len() <= CLIP {

@@ -161,7 +161,7 @@ use stuffr_core::{
     Resolved, Result, Sink, Source,
 };
 
-use crate::names::{WarningLog, clip, not_utf8};
+use crate::names::{NAME_NOT_UTF8, WarningLog, clip, not_utf8};
 use crate::normalize::{NormalizeDecodeErrors, TAR_MALFORMED_AS_OTHER};
 use crate::tar_pax::{PaxRecords, TimeField, header_time, pax_time};
 
@@ -997,9 +997,6 @@ struct TarRead {
     name_log: WarningLog,
     time_log: WarningLog,
 }
-
-/// [`Fidelity::Unlisted`]'s `what` for the names [`not_utf8`] reports.
-pub(crate) const NAME_NOT_UTF8: &str = "have a name that is not valid UTF-8";
 
 /// [`Fidelity::Unlisted`]'s `what` for an unusable modification time.
 const TIME_UNUSABLE: &str = "have a modification time that cannot be used";
