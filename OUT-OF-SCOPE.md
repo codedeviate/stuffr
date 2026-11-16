@@ -296,9 +296,66 @@ question rather than an omission:
 ## Platform and packaging
 
 - WASM target for the `pure` feature set — a browser-side archive reader is a
-  genuinely useful thing to have from this codebase
+  genuinely useful thing to have from this codebase. See "WASM integration"
+  below for what a host in another language would need.
 - `no_std` support for the simpler codecs
 - Static musl builds and Homebrew / distro packaging
+
+## WASM integration
+
+A Go project is embedding stuffr through WebAssembly (2026-11-16). Measured
+that day at 0.30.0: `cargo check` of `stuffr` and of `stuffr-cli` with default
+features passes for `wasm32-wasip1` and `wasm32-unknown-unknown`. Nothing was
+run, and nothing in CI builds either target, so that can regress silently.
+Ideas, roughly in the order a host would hit them:
+
+- **A CI job that builds and runs on wasm.** `cargo build --target
+  wasm32-wasip1` for the `pure` bundle plus a run of the CLI's round-trip
+  tests under wasmtime. Without it "works on wasm" is a one-day measurement.
+- **A C-ABI crate (`stuffr-wasm` or `stuffr-capi`), `cdylib`.** A Go host
+  (wazero, wasmtime-go) calls exported functions and reads linear memory; it
+  cannot use Rust traits. Export `stuffr_alloc`/`stuffr_free`, a streaming
+  codec handle (`open(format, level, limit)`, `write(ptr, len)`,
+  `read(ptr, cap)`, `finish`, `close`), one-shot `compress`/`decompress` for
+  small buffers, `probe(ptr, len)` returning the detected chain, and a
+  last-error accessor returning the exit-code class (2-7) and the message.
+  The same header would serve cgo and any other language.
+- **Host-supplied I/O.** Imported `read`/`write`/`seek` callbacks behind a
+  `Source`/`Sink`, so the host streams from a Go `io.Reader` without copying
+  whole files into linear memory. Matters most on `wasm32-unknown-unknown`,
+  where there is no file system at all.
+- **A WASI component (WIT interface).** `wit-bindgen` types for codecs,
+  archive entries and fidelity warnings give a typed binding per language
+  instead of hand-written pointer code. Worth it once the C ABI has settled.
+- **A `wasm` feature bundle with honest capabilities.** No threads (the
+  governor must report and use 1), no signals, no `umask`, no symlinks or
+  ownership on most hosts, no `--memory-limit` probing of the machine. Each
+  should be a stated refusal or a fidelity warning rather than a silent
+  no-op; `stuffr formats` should say what this build can do.
+- **Memory inside a 4 GiB (often far smaller) linear memory.** A documented
+  default `memory_limit` for wasm, a check that every decoder honours it
+  there (xz and zstd windows, brotli, zip's PPMd/LZMA/xz entries, bench), and
+  a note on which encoder levels cannot fit.
+- **An in-memory container API.** Archive entries in and out as
+  name + metadata + byte stream, with no extraction to a file system: the
+  path-safety walk (`beneath`), quarantine and permissions are all host
+  concerns on wasm. `unpack` to a host callback per entry.
+- **The CLI as a WASI command module.** Ship `stuffr.wasm` as a release
+  asset so a host can run it with preopened directories and argv, as it
+  would a subprocess. The compat links need `argv[0]` dispatch to work when
+  the host sets the program name, and the Unix-only families (zip, unzip,
+  the signal handling) need a clear "not on this platform".
+- **Size.** A feature set per codec already exists; add a documented
+  small-build recipe (`opt-level = "z"`, LTO, `panic = "abort"`, wasm-opt)
+  and measure the module size per codec so an embedder can choose.
+- **Panics.** With `panic = "abort"` a panic traps the whole module. The
+  "hostile input never panics" contract matters more there; consider running
+  the fuzz corpus through the wasm build as a regression leg.
+- **A published binding.** A small Go module wrapping the wasm build (wazero,
+  no cgo) with `io.Reader`/`io.Writer` adapters, versioned with the crates.
+  Possibly the same for npm (`wasm-bindgen` or the component) later.
+- **`no_std` + `alloc` for the simple codecs** would shrink the module and
+  drop the WASI dependency for hosts that only want buffers in and out.
 
 ## Architecture
 
