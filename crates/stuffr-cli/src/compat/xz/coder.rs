@@ -41,7 +41,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use stuffr::xz_opts::memusage::{MEMUSAGE_BASE, lzma_decoder_memusage_nocheck, mt_block_size};
 use stuffr::xz_opts::{
     self, Check, DecodeOptions, Decoder, EncodeOptions, Encoder, Filter, Format, Lzma, Profile,
-    XzError, decoder_memusage_with, encoder_memusage_with,
+    XzError, decoder_memusage_with, encoder_chain_supported, encoder_memusage_with,
 };
 
 use super::args::{Args, CoderSettings, FormatChoice, OpMode};
@@ -144,11 +144,26 @@ fn memlimit_too_small(limits_memlimit: u64, usage: u64, msg: &Messages, err: &mu
 /// `--flush-timeout`'s, and the memory usage against the limit (fewer
 /// threads, then single-threaded, then smaller dictionaries, or a
 /// refusal). `Err` is the exit code once the refusal is said.
+///
+/// Last, when compressing, a chain this build's encoder cannot run is
+/// refused as liblzma's `LZMA_OPTIONS_ERROR` is here: on the pure tier a
+/// dictionary lzma-rust2 cannot hold (bug hunt 2, finding 0; a pure-tier
+/// deviation, xz compresses with it), before any output is opened.
 pub(crate) fn set_compression_settings(
     a: &mut Args,
     msg: &Messages,
     err: &mut dyn Write,
 ) -> Result<(), u8> {
+    compression_settings(a, msg, err)?;
+    if a.op == OpMode::Compress
+        && !used(&a.coder).all(|i| encoder_chain_supported(chain_of(&a.coder, i)))
+    {
+        return Err(msg.fatal(err, m::UNSUPPORTED_CHAIN, &[]));
+    }
+    Ok(())
+}
+
+fn compression_settings(a: &mut Args, msg: &Messages, err: &mut dyn Write) -> Result<(), u8> {
     let (op, format) = (a.op, a.format);
     let c = &mut a.coder;
     // CRC64 is the default; this build always supports it.

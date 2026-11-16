@@ -497,8 +497,17 @@ impl Encoder {
     /// Initialises the encoder, refusing what liblzma refuses:
     /// [`XzError::Options`] for an unsupported chain or [`Format::Lzip`],
     /// [`XzError::MemLimit`] for an [`super::encoder_memusage`] over
-    /// [`EncodeOptions::memlimit`].
+    /// [`EncodeOptions::memlimit`]. A chain whose dictionary lzma-rust2
+    /// cannot hold ([`super::encoder_chain_supported`]) is
+    /// [`XzError::Options`] here, before anything is written, though
+    /// liblzma takes it.
     pub fn new(o: &EncodeOptions) -> Result<Encoder, XzError> {
+        if !memusage::used_chains(o)
+            .into_iter()
+            .all(super::encoder_chain_supported)
+        {
+            return Err(XzError::Options);
+        }
         let needed = memusage::encoder_memusage(o).ok_or(XzError::Options)?;
         let limit = limit_of(o.memlimit);
         if needed > limit {

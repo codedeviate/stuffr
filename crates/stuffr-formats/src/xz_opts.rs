@@ -35,11 +35,14 @@ pub mod memusage;
 pub mod pure;
 #[cfg(feature = "xz-c")]
 pub use c::{
-    Decoder, Encoder, cputhreads, decoder_memusage, encoder_memusage, liblzma_version, physmem,
+    Decoder, Encoder, cputhreads, decoder_memusage, encoder_chain_supported, encoder_memusage,
+    liblzma_version, physmem,
 };
 pub use memusage::{Profile, decoder_memusage_with, encoder_memusage_with};
 #[cfg(all(feature = "xz-pure", not(feature = "xz-c")))]
-pub use pure::{Decoder, Encoder, decoder_memusage, encoder_memusage, liblzma_version};
+pub use pure::{
+    Decoder, Encoder, decoder_memusage, encoder_chain_supported, encoder_memusage, liblzma_version,
+};
 
 /// The container (`--format`). [`Format::Lzip`] decodes only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1537,6 +1537,12 @@ and `XZ_OPT` are read before the command line, as xz reads them.
   xz encoder writes one). With threads and a `--block-size` smaller than the
   dictionary (a lone LZMA2 filter, no `--block-list`), the Block
   boundaries differ from xz's.
+- **Pure tier, the largest dictionaries.** A dictionary from about
+  1535.99 MiB up to xz's 1536 MiB maximum (`--lzma2=dict=`,
+  `--lzma1=dict=`, `--filters=`, a preset with a `dict` override) is
+  refused before anything is written: "Unsupported filter chain or filter
+  options", exit 1. xz compresses with it; the pure encoder
+  (`lzma-rust2`) cannot hold its window. The `c-backed` tier compresses.
 - **The memory figures** xz prints (`-vv`, `--list`, the memory-limit
   messages) come from liblzma's formulas modelled on a configure-built
   xz 5.8.4 for the host, on both tiers.

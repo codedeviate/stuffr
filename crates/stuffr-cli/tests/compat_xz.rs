@@ -1919,6 +1919,74 @@ mod unix {
         }
     }
 
+    /// A dictionary in the top of xz's range (bug hunt 2, findings 0 and
+    /// 37). xz 5.8.4 compresses with it; lzma-rust2 0.24.0 keeps its
+    /// window in a buffer indexed by `i32`, which a dictionary over about
+    /// 1535.99 MiB overflows (it panicked, on a worker thread under
+    /// threads, after the 12-byte Stream Header had reached stdout). The
+    /// pure tier refuses such a chain while parsing the options, as xz
+    /// refuses a chain it cannot use: "Unsupported filter chain or filter
+    /// options", exit 1, nothing written and no output file. Every way to
+    /// name the dictionary is covered: `--lzma2`, `--lzma1`, `--filters`,
+    /// a preset with a `dict` override, a raw stream, a file operand, and
+    /// the threaded and single-threaded paths. The C tier compresses, as
+    /// xz does.
+    #[test]
+    fn a_dictionary_lzma_rust2_cannot_hold_is_refused_on_the_pure_tier() {
+        let cases: &[(&str, &[&str])] = &[
+            ("xz", &["-T1", "-c", "--lzma2=dict=1536MiB", "a"]),
+            ("xz", &["-c", "--lzma2=dict=1536MiB", "a"]),
+            ("xz", &["-T2", "-c", "--lzma2=dict=1610612735", "a"]),
+            ("xz", &["-k", "--lzma2=dict=1536MiB", "a"]),
+            (
+                "xz",
+                &["-T1", "-c", "--lzma2=preset=9e,dict=1610612736", "a"],
+            ),
+            ("xz", &["-T1", "-c", "--filters=lzma2:dict=1536MiB", "a"]),
+            (
+                "xz",
+                &["-c", "--filters=delta:dist=2 lzma2:dict=1536MiB", "a"],
+            ),
+            (
+                "xz",
+                &["-T1", "-c", "-F", "lzma", "--lzma1=dict=1536MiB", "a"],
+            ),
+            (
+                "xz",
+                &["-T1", "-c", "-F", "raw", "--lzma2=dict=1536MiB", "a"],
+            ),
+            ("lzma", &["-c", "--lzma1=dict=1536MiB", "a"]),
+            ("lzma", &["-c", "--lzma1=dict=1610604271,mode=normal", "a"]),
+        ];
+        for (name, args) in cases {
+            let c = case(name, args);
+            let s = stuffr_as(&c);
+            let what = format!("{name} {args:?}");
+            assert!(!s.stderr.contains("panicked"), "{what}: {}", s.stderr);
+            if PURE {
+                assert_eq!(
+                    s.stderr,
+                    format!("{name}: Unsupported filter chain or filter options\n"),
+                    "{what}"
+                );
+                assert_eq!(s.code, 1, "{what}");
+                assert!(s.stdout.is_empty(), "{what}: {} bytes", s.stdout.len());
+                assert_eq!(
+                    s.tree.keys().collect::<Vec<_>>(),
+                    ["a"],
+                    "{what}: no output file"
+                );
+            } else {
+                assert_eq!(s.code, 0, "{what}: {}", s.stderr);
+            }
+        }
+        // Just under the bound the pure tier compresses (normal mode).
+        let c = case("xz", &["-T1", "-c", "--lzma2=dict=1610604270", "a"]);
+        let s = stuffr_as(&c);
+        assert_eq!((s.code, s.stderr.as_str()), (0, ""));
+        assert!(!s.stdout.is_empty());
+    }
+
     // ==== Part 3 (Task 7): --list ====
 
     /// An `.xz` variable-length integer.

@@ -77,6 +77,13 @@
 //!   dictionary, the Block boundaries differ from xz's (for a lone LZMA2
 //!   chain and no `--block-list`, the threaded encoder's Blocks are at
 //!   least the dictionary size).
+//! - Pure tier: a compression dictionary whose `lzma-rust2` window buffer
+//!   would pass `i32::MAX` bytes (from about 1535.99 MiB up to xz's
+//!   1536 MiB maximum; `--lzma2=dict=`, `--lzma1=dict=`, `--filters=`, a
+//!   preset with a `dict` override) is refused while the options are
+//!   parsed, before any output is opened: "Unsupported filter chain or
+//!   filter options", exit 1 (bug hunt 2, finding 0). xz compresses with
+//!   it.
 //! - Pure tier: the `-v` line's compressed size and ratio are those of
 //!   the pure encoder's output, which is compatible with xz's, not equal
 //!   to it.

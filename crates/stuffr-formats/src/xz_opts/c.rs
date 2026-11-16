@@ -511,6 +511,12 @@ fn mt_options() -> ffi::lzma_mt {
     }
 }
 
+/// Whether this tier's encoder can run `chain`: always, liblzma takes every
+/// dictionary `xz` accepts (the pure tier's answer is narrower).
+pub fn encoder_chain_supported(_chain: &[Filter]) -> bool {
+    true
+}
+
 /// The encoder's memory usage for `o` (`lzma_raw_encoder_memusage`, or
 /// `lzma_stream_encoder_mt_memusage` threaded), the largest over the chains
 /// in use; `None` for an unsupported chain or options, or [`Format::Lzip`].

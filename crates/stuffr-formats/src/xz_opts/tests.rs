@@ -1205,6 +1205,63 @@ mod pure_tier {
         assert_eq!(crate::xz_opts::pure::liblzma_version(), "5.8.4");
     }
 
+    /// Bug hunt 2, finding 0: a dictionary whose lzma-rust2 window buffer
+    /// passes `i32::MAX` is refused before any byte is written, in every
+    /// format and on the threaded path, instead of panicking on the first
+    /// write. The bound is exact for both modes.
+    #[test]
+    fn pure_encoder_refuses_a_dictionary_lzma_rust2_cannot_hold() {
+        use crate::xz_opts::pure::{Encoder, encoder_chain_supported};
+        let lzma = |dict: u32, mode: Mode| {
+            let mut l = Lzma::preset(6, false).unwrap();
+            l.dict_size = dict;
+            l.mode = mode;
+            l
+        };
+        // Normal: dict + 4096 + 4096 + 273 + 512 MiB <= i32::MAX.
+        assert!(encoder_chain_supported(&[Filter::Lzma2(lzma(
+            1_610_604_270,
+            Mode::Normal
+        ))]));
+        assert!(!encoder_chain_supported(&[Filter::Lzma2(lzma(
+            1_610_604_271,
+            Mode::Normal
+        ))]));
+        // Fast: dict + 1 + 272 + 273 + 512 MiB <= i32::MAX.
+        assert!(encoder_chain_supported(&[Filter::Lzma1(lzma(
+            1_610_612_189,
+            Mode::Fast
+        ))]));
+        assert!(!encoder_chain_supported(&[Filter::Lzma1(lzma(
+            1_610_612_190,
+            Mode::Fast
+        ))]));
+        let big = lzma(1536 << 20, Mode::Normal);
+        let cases = [
+            (Format::Xz, vec![Filter::Lzma2(big.clone())], 0),
+            (Format::Xz, vec![Filter::Lzma2(big.clone())], 2),
+            (
+                Format::Xz,
+                vec![Filter::Delta { dist: 2 }, Filter::Lzma2(big.clone())],
+                2,
+            ),
+            (Format::Lzma, vec![Filter::Lzma1(big.clone())], 0),
+            (Format::Raw, vec![Filter::Lzma2(big.clone())], 0),
+        ];
+        for (format, filters, threads) in cases {
+            let o = EncodeOptions {
+                format,
+                filters,
+                threads,
+                ..EncodeOptions::default()
+            };
+            assert!(
+                matches!(Encoder::new(&o), Err(XzError::Options)),
+                "{format:?} {threads}"
+            );
+        }
+    }
+
     #[test]
     fn pure_encoder_and_decoder_are_send() {
         fn send<T: Send>() {}

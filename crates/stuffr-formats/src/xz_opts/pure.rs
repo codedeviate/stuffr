@@ -85,6 +85,17 @@
 //! - **`.lzma` with a known size and an end marker:** liblzma accepts the
 //!   marker (`LZMA_LZMA1EXT_ALLOW_EOPM`); `LzmaStream` does not, so the
 //!   pure tier calls it corrupt. No encoder `xz` knows writes it.
+//! ## Encoding: a dictionary `lzma-rust2` cannot hold
+//!
+//! `lzma-rust2` 0.24's LZ encoder keeps its window in one buffer of
+//! `dict_size + extras + min(dict_size / 2 + 256 KiB, 512 MiB)` bytes
+//! (`lz_encoder.rs`, `get_buf_size`) and indexes it with `i32`: a buffer
+//! over `i32::MAX` bytes, which a dictionary from about 1535.99 MiB up to
+//! xz's 1536 MiB maximum makes, sends its first write out of bounds (a
+//! panic). [`encoder_chain_supported`] says so beforehand and
+//! [`Encoder::new`] refuses such a chain with [`XzError::Options`]; liblzma
+//! encodes it.
+//!
 //! - **A dictionary above 4 GiB - 16:** `LzmaStream` caps the window at
 //!   `0xFFFF_FFF0`, which changes nothing for any stream shorter than that.
 //!
@@ -97,13 +108,41 @@ pub use super::memusage::{decoder_memusage, encoder_memusage};
 pub use dec::Decoder;
 pub use enc::Encoder;
 
-use super::{Bcj, Lzma, MatchFinder, Mode, XzError};
+use super::{Bcj, Filter, Lzma, MatchFinder, Mode, XzError};
 use lzma_rust2::{EncodeMode, LzmaOptions, MfType};
 
 /// The liblzma this tier answers for: `"5.8.4"`, the version whose
 /// formulas, verdicts and container bytes it ports.
 pub fn liblzma_version() -> &'static str {
     "5.8.4"
+}
+
+/// lzma-rust2 0.24's `MATCH_LEN_MAX`.
+const MATCH_LEN_MAX: u64 = 273;
+
+/// The size of the window buffer lzma-rust2 0.24's LZ encoder allocates for
+/// `l` (`lz_encoder.rs` `get_buf_size`, with the extra sizes
+/// `encoder.rs` passes for the mode: `encoder_normal.rs` 4096 before and
+/// after, `encoder_fast.rs` 1 before and `MATCH_LEN_MAX - 1` after).
+fn lz_buf_size(l: &Lzma) -> u64 {
+    let dict = u64::from(l.dict_size);
+    let (before, after) = match l.mode {
+        Mode::Normal => (4096, 4096),
+        Mode::Fast => (1, MATCH_LEN_MAX - 1),
+    };
+    dict + before + after + MATCH_LEN_MAX + (dict / 2 + (256 << 10)).min(512 << 20)
+}
+
+/// Whether this tier's encoder can run `chain`: every LZMA1 or LZMA2
+/// filter's window buffer fits lzma-rust2's `i32` positions (see the module
+/// doc). The C tier's answer is always yes.
+pub fn encoder_chain_supported(chain: &[Filter]) -> bool {
+    chain.iter().all(|f| match f {
+        Filter::Lzma1(l) | Filter::Lzma1Ext(l) | Filter::Lzma2(l) => {
+            lz_buf_size(l) <= i32::MAX as u64
+        }
+        _ => true,
+    })
 }
 
 /// `xz`'s limit as liblzma holds it: `0` and `u64::MAX` are no limit.
