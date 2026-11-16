@@ -17,13 +17,6 @@ set -euo pipefail
 
 # Checks expected to fail, each with its cause and the item that fixes it.
 XFAIL=(
-  # Item 10: wasm32-wasip1 cannot spawn a thread, so a pack asked for
-  # workers exits 1 ("Not supported (os error 58)") instead of falling back
-  # to one.
-  pack-threads
-  # Item 10: the xz personality's own worker handling, same cause (exit 1,
-  # "Internal error (bug)").
-  xz-personality-T8
 )
 
 WAZERO_VERSION=1.12.0
@@ -212,6 +205,20 @@ printf '%b' '\xfd\x37\x7a\x58\x5a\x00\x00\x01\x69\x22\xde\x36' \
 
 # --- checks ----------------------------------------------------------------
 
+# Threads do not exist on wasm, so no format may claim to be parallel.
+c_formats_parallel() {
+  stuffr formats --json
+  expect_exit 0 || return 1
+  grep -q '"parallel":false' "$out" || {
+    detail="formats --json lists no format"
+    return 1
+  }
+  if grep -q '"parallel":true' "$out"; then
+    detail="formats --json reports a parallel format"
+    return 1
+  fi
+}
+
 c_formats() {
   stuffr formats
   expect_exit 0 || return 1
@@ -328,8 +335,14 @@ xz_roundtrip() {
 }
 # To stdout, so a failure here is about the threads alone.
 c_xz_personality_t8() { xz_roundtrip -T8 -c; }
+# No -T: the personality defaults to every thread (xz >= 5.6), which on
+# wasm must still run, single-threaded.
+c_xz_personality_default() { xz_roundtrip -c; }
 # One thread, to a named file: the personality's own output path.
-c_xz_personality_file() { xz_roundtrip -T1 -k; }
+c_xz_personality_file() {
+  rm -f "$w/x.txt.xz" # the -c checks kept one here
+  xz_roundtrip -T1 -k
+}
 
 # A relative path, resolved against STUFFR_CWD=/w (the archive
 # roundtrip-stdout kept).
@@ -402,6 +415,7 @@ c_trap_detector() {
 
 check trap-detector c_trap_detector
 check formats c_formats
+check formats-parallel c_formats_parallel
 check roundtrip c_roundtrip
 check roundtrip-stdout c_roundtrip_stdout
 check pack-threads c_pack_threads
@@ -418,6 +432,7 @@ check hostile-zoo c_hostile_zoo
 check limit-zstd c_limit_zstd
 check limit-xz c_limit_xz
 check xz-personality-T8 c_xz_personality_t8
+check xz-personality-default c_xz_personality_default
 check xz-personality-file c_xz_personality_file
 
 echo "$passes ok, $xfails xfail, $fails fail, $xpasses xpass"

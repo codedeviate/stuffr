@@ -4,7 +4,9 @@
 pub mod budget;
 pub mod cgroup;
 
-pub use budget::{BudgetInputs, DEFAULT_CAP, detect_cpu_budget, resolve_workers};
+pub use budget::{
+    BudgetInputs, DEFAULT_CAP, detect_cpu_budget, resolve_workers, resolve_workers_with,
+};
 
 /// Whether this build can spawn threads at all. `false` on WASI
 /// (`wasm32-wasip1` has no thread spawn), `true` everywhere else. The one

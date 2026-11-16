@@ -197,7 +197,21 @@ impl Limits {
     /// hardware.c: hardware_threads_set. `u32::MAX` is `-T+1`: one thread
     /// in multi-threaded mode.
     pub(crate) fn threads_set(&mut self, n: u32) {
+        self.threads_set_with(n, stuffr::governor::threads_available());
+    }
+
+    /// [`Limits::threads_set`] with the thread capability passed in. Where
+    /// threads cannot be spawned (WASI) every request, the `-T0` default
+    /// included, is one thread in single-threaded mode: the encoder is
+    /// never asked for a worker it cannot start.
+    pub(crate) fn threads_set_with(&mut self, n: u32, threads_available: bool) {
         self.threads_are_automatic = false;
+        if !threads_available {
+            self.threads_are_automatic = n == 0;
+            self.use_mt_mode_with_one_thread = false;
+            self.threads_max = 1;
+            return;
+        }
         self.use_mt_mode_with_one_thread = false;
         if n == 0 {
             self.threads_are_automatic = true;
@@ -422,6 +436,17 @@ mod tests {
         assert_eq!((l.threads_get(), l.threads_is_mt()), (1, true));
         l.threads_set(4);
         assert!(l.threads_is_mt() && !l.memlimit_mtenc_is_default());
+    }
+
+    #[test]
+    fn without_threads_every_request_is_one_single_threaded() {
+        let mut l = limits();
+        for n in [0, 1, 8, u32::MAX] {
+            l.threads_set_with(n, false);
+            assert_eq!((l.threads_get(), l.threads_is_mt()), (1, false), "-T{n}");
+        }
+        l.threads_set_with(8, true);
+        assert_eq!((l.threads_get(), l.threads_is_mt()), (8, true));
     }
 
     #[test]

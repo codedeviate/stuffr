@@ -92,8 +92,20 @@ pub struct BudgetInputs {
     pub turbo: bool,
 }
 
-/// Resolves the worker count. Never returns zero.
+/// Resolves the worker count. Never returns zero. Where this build cannot
+/// spawn a thread ([`super::threads_available`]) the answer is always 1,
+/// whatever was asked for: an explicit `--threads 8` runs single-threaded
+/// rather than failing.
 pub fn resolve_workers(i: &BudgetInputs) -> usize {
+    resolve_workers_with(i, super::threads_available())
+}
+
+/// [`resolve_workers`] with the thread capability passed in, so the clamp is
+/// testable on a host that has threads.
+pub fn resolve_workers_with(i: &BudgetInputs, threads_available: bool) -> usize {
+    if !threads_available {
+        return 1;
+    }
     // The first source that expresses an opinion wins, and `Some(0)` IS an
     // opinion: it means "use the auto budget". A lower-precedence source must
     // not override it — otherwise a stale STUFFR_THREADS silently beats an
@@ -127,6 +139,30 @@ mod tests {
             detected,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn without_threads_every_request_resolves_to_one() {
+        let explicit = |cli, env, turbo| BudgetInputs {
+            cli,
+            env,
+            turbo,
+            ..inputs(16)
+        };
+        for i in [
+            explicit(Some(8), None, false),
+            explicit(None, Some(8), false),
+            explicit(Some(0), None, false),
+            explicit(None, None, true),
+            inputs(16),
+        ] {
+            assert_eq!(resolve_workers_with(&i, false), 1);
+        }
+        // With threads the explicit request is honoured, as before.
+        assert_eq!(
+            resolve_workers_with(&explicit(Some(8), None, false), true),
+            8
+        );
     }
 
     #[test]
