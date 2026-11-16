@@ -1379,6 +1379,14 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
 
 WHAT THIS BUILD CAN DO
 
+  stuffr formats --json
+      The same rows as one JSON object, {"schema": 1, "formats": [...]},
+      for a program to read. Each element has format, kind ("codec" or
+      "container"), read, write, parallel, salvage ("yes", "weak" or "no"),
+      extensions and tier ("pure" or "c"). It describes the running build:
+      `parallel` is false where threads cannot be spawned (a WASI build),
+      and `write` is true for a weak encoder too (the table's `weak`).
+
   stuffr formats
       Lists the formats compiled into THIS binary, not everything stuffr will
       ever support. A default build has twenty rows: twelve

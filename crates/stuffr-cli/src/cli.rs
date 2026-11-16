@@ -288,7 +288,12 @@ pub enum Command {
         memory_limit: Option<String>,
     },
     /// List the formats this build contains.
-    Formats,
+    Formats {
+        /// Print the table as one JSON object, `{"schema": 1, "formats":
+        /// [...]}`, describing this build.
+        #[arg(long)]
+        json: bool,
+    },
     /// Compare compression formats on your own files: size, ratio, and
     /// compress and decompress time for each one.
     ///

@@ -6,6 +6,7 @@ mod cwd;
 mod entries;
 mod fidelity;
 mod foreign;
+mod formats_json;
 mod hard_links;
 mod hygiene;
 mod indentation_guard;

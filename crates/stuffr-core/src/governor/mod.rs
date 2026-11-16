@@ -6,6 +6,14 @@ pub mod cgroup;
 
 pub use budget::{BudgetInputs, DEFAULT_CAP, detect_cpu_budget, resolve_workers};
 
+/// Whether this build can spawn threads at all. `false` on WASI
+/// (`wasm32-wasip1` has no thread spawn), `true` everywhere else. The one
+/// place that predicate is defined: anything that reports or chooses
+/// parallelism asks here rather than repeating the `target_os` test.
+pub const fn threads_available() -> bool {
+    !cfg!(target_os = "wasi")
+}
+
 use std::sync::{Arc, Condvar, Mutex};
 
 /// Floor for the memory budget: below this, even single-threaded work struggles.
@@ -495,5 +503,13 @@ mod tests {
             }
         });
         assert_eq!(g.outstanding(), 0);
+    }
+}
+
+#[cfg(test)]
+mod threads_available_tests {
+    #[test]
+    fn threads_are_unavailable_only_on_wasi() {
+        assert_eq!(super::threads_available(), !cfg!(target_os = "wasi"));
     }
 }

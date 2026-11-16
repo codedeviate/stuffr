@@ -250,7 +250,7 @@ fn destination_is_stdout(cmd: &Command) -> bool {
     match cmd {
         Command::Cat { .. }
         | Command::Info { .. }
-        | Command::Formats
+        | Command::Formats { .. }
         | Command::List { .. }
         | Command::Bench(_) => true,
         // Only the `--list` row-per-record report is the "big data to
@@ -878,7 +878,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             }
             Ok(())
         }
-        Command::Formats => print_formats(),
+        Command::Formats { json } => print_formats(json),
         Command::Bench(args) => {
             use stuffr_cli::bench::{DEBUG_REFUSAL, Ran};
             match stuffr_cli::bench::run(args)? {
@@ -2714,10 +2714,13 @@ fn salvage_format_by_name(name: &str) -> stuffr::Result<FormatId> {
 /// (which `destination_is_stdout` already lists as stdout destinations) used
 /// to exit 101 with "failed printing to stdout: Broken pipe" instead of
 /// exiting cleanly like every other early-closed-reader case.
-fn print_formats() -> stuffr::Result<()> {
+fn print_formats(json: bool) -> stuffr::Result<()> {
     use std::io::Write;
     let mut out = std::io::stdout();
     let rows = stuffr::registry().matrix();
+    if json {
+        return print_formats_json(&mut out);
+    }
     if rows.is_empty() {
         writeln!(out, "This build contains 0 formats.")?;
         writeln!(
@@ -2775,6 +2778,42 @@ fn print_formats() -> stuffr::Result<()> {
          checksum the archive carries, and writes; `weak` where it scans and writes but the \
          format checksums nothing an entry's content can be verified against.)"
     )?;
+    Ok(())
+}
+
+/// `stuffr formats --json`: one object, `{"schema": 1, "formats": [...]}`,
+/// the same rows as the table but read from the running build. `parallel`
+/// is the table's PARALLEL column AND [`stuffr::governor::threads_available`]
+/// (a WASI build can list a parallel codec and still never spawn a thread);
+/// `tier` is the label `stuffr bench` puts on its rows; `salvage` is `no`
+/// where the table prints `-`; `write` is true for a `weak` encoder too.
+fn print_formats_json(out: &mut impl std::io::Write) -> stuffr::Result<()> {
+    let registry = stuffr::registry();
+    let threads = stuffr::governor::threads_available();
+    let formats: Vec<serde_json::Value> = registry
+        .matrix()
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "format": r.id.as_str(),
+                "kind": match r.kind {
+                    stuffr::FormatKind::Codec => "codec",
+                    stuffr::FormatKind::Container => "container",
+                },
+                "read": r.read,
+                "write": r.write,
+                "parallel": r.parallel && threads,
+                "salvage": match salvage_column(registry, r.id) {
+                    "-" => "no",
+                    other => other,
+                },
+                "extensions": r.extensions,
+                "tier": stuffr_cli::bench::levels::backend_of(r.id.as_str()),
+            })
+        })
+        .collect();
+    let doc = serde_json::json!({ "schema": 1, "formats": formats });
+    writeln!(out, "{doc}")?;
     Ok(())
 }
 
