@@ -7754,6 +7754,8 @@ mod tests {
     /// so `--strict-fidelity` exits 4, as ar's clamped ids already were.
     /// A time each one holds earns nothing.
     #[test]
+    // The pushes are feature-gated one by one; a `vec![]` cannot be.
+    #[allow(clippy::vec_init_then_push)]
     fn an_mtime_the_target_cannot_hold_is_reported() {
         use std::time::{Duration, UNIX_EPOCH};
         let y2111 = UNIX_EPOCH + Duration::from_secs(4_449_600_000);

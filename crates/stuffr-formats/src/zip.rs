@@ -600,7 +600,7 @@ impl NotZips {
     }
 
     /// One of the spool's own errors.
-    fn new(kind: ErrorKind, msg: impl Into<String>) -> io::Error {
+    fn internal(kind: ErrorKind, msg: impl Into<String>) -> io::Error {
         Self::tag(io::Error::new(kind, msg.into()))
     }
 
@@ -3782,7 +3782,7 @@ impl Write for SpoolHandle {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         let mut spool = self.0.borrow_mut();
         let off = usize::try_from(spool.pos - spool.base).map_err(|_| {
-            NotZips::new(
+            NotZips::internal(
                 ErrorKind::Other,
                 "zip: spool window exceeds this platform's addressing",
             )
@@ -3803,7 +3803,7 @@ impl Write for SpoolHandle {
         if off > spool.buf.len() {
             let hole = off - spool.buf.len();
             if hole > MAX_SPOOL_HOLE {
-                return Err(NotZips::new(
+                return Err(NotZips::internal(
                     ErrorKind::InvalidInput,
                     format!(
                         "zip: refusing to zero-fill a {hole}-byte hole in the spool window; \
@@ -3840,7 +3840,7 @@ impl Seek for SpoolHandle {
             SeekFrom::Current(d) => offset(spool.pos, d)?,
         };
         if target < spool.base {
-            return Err(NotZips::new(
+            return Err(NotZips::internal(
                 ErrorKind::Unsupported,
                 format!(
                     "zip: cannot rewrite offset {target}; bytes below {} have already been \
@@ -3858,7 +3858,7 @@ impl Seek for SpoolHandle {
 /// a real `Seek` does.
 fn offset(base: u64, delta: i64) -> io::Result<u64> {
     base.checked_add_signed(delta).ok_or_else(|| {
-        NotZips::new(
+        NotZips::internal(
             ErrorKind::InvalidInput,
             "zip: seek would move before the start of the archive",
         )
@@ -8131,7 +8131,7 @@ z.close()\n";
         for (e, kind) in [
             (seek, ErrorKind::InvalidInput),
             (
-                NotZips::new(ErrorKind::Unsupported, "cannot rewrite"),
+                NotZips::internal(ErrorKind::Unsupported, "cannot rewrite"),
                 ErrorKind::Unsupported,
             ),
         ] {
