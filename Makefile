@@ -25,7 +25,7 @@ TEST_THREAD_ARGS =
 FUZZ_RSS_ARGS =
 endif
 
-.PHONY: help check check-legs lint-latest deps-guard fmt fmt-check lint doc test test-pure release miri hooks clean fuzz-corpus fuzz compat-debian deny sweep-tmp leak-snapshot leak-check tmp-leaks-selftest
+.PHONY: help check check-legs lint-latest deps-guard fmt fmt-check lint doc test test-pure release miri hooks clean fuzz-corpus fuzz compat-debian deny wasm wasi-smoke sweep-tmp leak-snapshot leak-check tmp-leaks-selftest
 
 help:
 	@echo 'stuffr development targets:'
@@ -51,6 +51,9 @@ help:
 	@echo '  make fuzz-corpus  (re)generate fuzz/corpus/{codec,container,chain,roundtrip,salvage,compat,infozip}'
 	@echo '  make fuzz     short, seeded smoke pass over the seven targets (mirrors CI)'
 	@echo '  make deny     cargo-deny (advisories, licences, bans, sources) and the vendored-C check'
+	@echo '  make wasm     $(WASM_FILE), pure,legacy (needs `rustup target add wasm32-wasip1`)'
+	@echo '  make wasi-smoke  scripts/wasi-smoke.sh on that module under the pinned wazero release'
+	@echo '                binary (downloaded, SHA-256 checked, cached in target/wasi-smoke/)'
 	@echo '  make compat-debian  the unzip, compress, zip, bzip2 and gzip suites against Debian 13, in Docker'
 	@echo '                (not in check; COMPAT_DEBIAN_ARGS=... is passed to the tests)'
 
@@ -582,3 +585,17 @@ deny:
 	cargo deny --manifest-path Cargo.toml check
 	cargo deny --manifest-path fuzz/Cargo.toml --config deny.toml check advisories
 	scripts/check-vendored.sh
+
+# The WebAssembly build of the CLI for wasm32-wasip1: the `pure,legacy` tier
+# (no C toolchain), the build a WASI host embeds. Prerequisite, not
+# run here and not in rust-toolchain.toml: `rustup target add wasm32-wasip1`.
+WASM_FILE = target/wasm32-wasip1/release/stuffr.wasm
+
+wasm:
+	$(CARGO) build --release --target wasm32-wasip1 --no-default-features --features pure,legacy --locked -p stuffr-cli
+
+# Runs the module `make wasm` built (not rebuilt here) under wazero; the
+# version and its SHA-256 pins live in the script. Needs curl and tar; the
+# first run downloads the runtime.
+wasi-smoke:
+	scripts/wasi-smoke.sh $(WASM_FILE)
