@@ -390,9 +390,11 @@ pub(super) struct Sink {
     sparse: bool,
     /// Zero bytes passed over and not yet seeked.
     skips: u64,
-    /// The error a failed write ends the run with (`Error 46` compressing,
-    /// `Error 70` decoding).
-    write_error: (&'static str, i32),
+    /// The error a failed write ends the run with (probe, 1.11.1, under a
+    /// file-size limit: `Error 46` compressing a streamed frame, `Error 42`
+    /// one written in one piece, `Error 38` a legacy one; `Error 73`
+    /// decoding sparsely, `Error 70` otherwise).
+    pub(super) write_error: (&'static str, i32),
     /// A second descriptor of a file output, for its metadata (HOST-8: set
     /// by descriptor, never by name; deviation 10).
     fd: Option<host::OutFd>,
@@ -885,11 +887,6 @@ impl Run<'_> {
         // --sparse -c zeros | cat` succeeds).
         let sparse_asked = decoding && self.cmd.sparse != Some(false);
         let mut fd = None;
-        let write_error = if decoding {
-            (m::E70_WRITE_DECODED, 70)
-        } else {
-            (m::E46_WRITE_COMPRESSED, 46)
-        };
         let (kind, sparse) = match target {
             Target::Null => (SinkKind::Null, false),
             Target::Stdout => {
@@ -921,6 +918,11 @@ impl Run<'_> {
                     _ => (SinkKind::File(self.host.out_writer(Some(f))), sparse_asked),
                 }
             }
+        };
+        let write_error = match (decoding, sparse) {
+            (true, true) => (m::E73_WRITE_SPARSE, 73),
+            (true, false) => (m::E70_WRITE_DECODED, 70),
+            (false, _) => (m::E46_WRITE_COMPRESSED, 46),
         };
         Ok(Sink {
             kind,
@@ -1288,6 +1290,10 @@ impl Run<'_> {
         if enc.finish(&mut packed).is_err() {
             return Err(self.exm(46, m::E46_WRITE_COMPRESSED, &[]));
         }
+        // probe (1.11.1): a frame written in one piece fails as such.
+        if !streamed {
+            sink.write_error = (m::E42_WRITE_SINGLE_BLOCK, 42);
+        }
         sink.write(self, &packed)?;
         stats.written += packed.len() as u64;
         // The frame ends with its content checksum, written by `finish`
@@ -1323,6 +1329,8 @@ impl Run<'_> {
         enc: &mut Encoder,
     ) -> Result<Stats, Fail> {
         let chunk = LEGACY_BLOCK_SIZE;
+        // probe (1.11.1): `lz4 -l f o` under a file-size limit.
+        sink.write_error = (m::E38_WRITE_LEGACY, 38);
         let mut buf = vec![0u8; chunk];
         let mut packed = Vec::new();
         let mut stats = Stats::default();

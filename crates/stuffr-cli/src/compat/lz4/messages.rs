@@ -399,6 +399,18 @@ pub(super) const E34_DECOMPRESSION: &str = "Error 34 : Decompression error : %s 
 pub(super) const E46_WRITE_COMPRESSED: &str =
     "Error 46 : Write error : cannot write compressed block \n";
 
+/// probe (1.11.1): `lz4 f o` with `f` shorter than a block (a frame
+/// written in one piece; `-BD`, `-12`, `--no-frame-crc` too) and a
+/// file-size limit below the output (`SIGXFSZ` ignored).
+pub(super) const E42_WRITE_SINGLE_BLOCK: &str =
+    "Error 42 : Write error : failed writing single-block compressed frame \n";
+
+/// probe (1.11.1): `lz4 -l f o` under a file-size limit below the output
+/// (1.11.0 moved a frame's write error to [`E46_WRITE_COMPRESSED`]; the
+/// legacy format kept 38).
+pub(super) const E38_WRITE_LEGACY: &str =
+    "Error 38 : Write error : cannot write compressed block \n";
+
 /// probe (1.11.0, Linux, CI run 42458938478 and the 0.26.0 Linux probe):
 /// `lz4 -12 -T1 f` with `f` truncated while it is compressed from its
 /// mapping (default, `--no-frame-crc`, `--rm`, `--single-thread`; not
@@ -499,6 +511,11 @@ pub(super) const E69_FINAL_SKIP: &str = "Error 69 : Final skip error (sparse fil
 /// probe: `lz4cat big.lz4 | head -c1` with SIGPIPE ignored.
 pub(super) const E70_WRITE_DECODED: &str = "Error 70 : Write error : cannot write decoded block \n";
 
+/// probe (1.11.1): `lz4 -d f.lz4 o` (a file, written sparsely by default;
+/// legacy frames too) under a file-size limit below the output; `lz4 -d
+/// --no-sparse` says [`E70_WRITE_DECODED`] there.
+pub(super) const E73_WRITE_SPARSE: &str = "Error 73 : Write error : cannot write decoded block \n";
+
 /// probe: `lz4 --sparse -dc a8.lz4 | cat` (data in whole words: the skip
 /// before it is tried, even an empty one, and a pipe refuses): `errno`, then
 /// `strerror`.
@@ -585,6 +602,11 @@ pub(super) const LIST_NOT_REGULAR: &str = "lz4: %s is not a regular file \n";
 /// probe: `lz4 --list leg_huge.lz4` (a legacy block size above 8 MiB, or a
 /// size word cut short): printed before [`LIST_NOT_RECOGNIZED`].
 pub(super) const LIST_CORRUPTED_LEGACY: &str = "Corrupted legacy frame \n";
+
+/// probe (1.11.1): `lz4 -vv --list` of a legacy frame whose block-size word
+/// is over LZ4_compressBound(8 MiB) (8421521 and up; `02 21 4c 18 ff ff ff
+/// ff 1b 58`): display level 4, before [`LIST_CORRUPTED_LEGACY`].
+pub(super) const LIST_LEGACY_TOO_LARGE: &str = "Error : block in legacy frame is too large \n";
 
 /// probe: `lz4 -vv --list b.lz4` (display level 4, after the banner):
 /// `_POSIX_VERSION` as the system reports it (`sysconf(_SC_VERSION)`: on

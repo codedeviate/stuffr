@@ -233,6 +233,8 @@ mod unix {
             "leg_blk_trunc.lz4" => cat(&[&LEGACY, &le32(50), b"abc"]),
             "leg_huge.lz4" => cat(&[&LEGACY, &le32(0xffff_fff0), b"abc"]),
             "leg_8m.lz4" => cat(&[&LEGACY, &le32(0x80_0100), b"abc"]),
+            "leg_bound.lz4" => cat(&[&LEGACY, &le32(8_421_520), b"abc"]),
+            "leg_bound1.lz4" => cat(&[&LEGACY, &le32(8_421_521), b"abc"]),
             "leg_bad.lz4" => cat(&[&LEGACY, &le32(8), &[0xff; 8]]),
             "leg_garbage.lz4" => cat(&[&legacy(), b"AAA"]),
             "leg_garbage100.lz4" => cat(&[&legacy(), &[b'A'; 100]]),
@@ -2477,6 +2479,15 @@ mod unix {
             row(T5, "--list leg_magic_then_leg.lz4, -v (1.11.1)", "lz4", &["--list", "-v", "leg_magic_then_leg.lz4"], &["leg_magic_then_leg.lz4"], 0, ""),
             row(T5, "--list leg_then_magic.lz4 (1.11.1)", "lz4", &["--list", "leg_then_magic.lz4"], &["leg_then_magic.lz4"], 0, ""),
             row(T5, "--list leg_then_magic.lz4, -v (1.11.1)", "lz4", &["--list", "-v", "leg_then_magic.lz4"], &["leg_then_magic.lz4"], 0, ""),
+            // Finding 27 (bug hunt 2): at display level 4 a word over
+            // LZ4_compressBound(8 MiB) (8421520) says why first; one between
+            // 8 MiB and that bound does not.
+            row(T5, "--list -vv, a legacy size above 4 GiB - 16 (1.11.1)", "lz4", &["-vv", "--list", "leg_huge.lz4"], &["leg_huge.lz4"], 1, "Error : block in legacy frame is too large \nCorrupted legacy frame \nlz4: leg_huge.lz4: File format not recognized \n"),
+            row(T5, "--list -vvv, a legacy size above 4 GiB - 16 (1.11.1)", "lz4", &["-vvv", "--list", "leg_huge.lz4"], &["leg_huge.lz4"], 1, "Error : block in legacy frame is too large \nCorrupted legacy frame \n"),
+            row(T5, "--list -v, a legacy size above 4 GiB - 16 (1.11.1)", "lz4", &["-v", "--list", "leg_huge.lz4"], &["leg_huge.lz4"], 1, "Corrupted legacy frame \nlz4: leg_huge.lz4"),
+            row(T5, "--list -vv, a legacy size just above 8 MiB (1.11.1)", "lz4", &["-vv", "--list", "leg_8m.lz4"], &["leg_8m.lz4"], 1, "L\nCorrupted legacy frame \n"),
+            row(T5, "--list -vv, a legacy size just above the bound (1.11.1)", "lz4", &["-vv", "--list", "leg_bound1.lz4"], &["leg_bound1.lz4"], 1, "Error : block in legacy frame is too large \nCorrupted legacy frame \n"),
+            row(T5, "--list -vv, a legacy size at the bound (1.11.1)", "lz4", &["-vv", "--list", "leg_bound.lz4"], &["leg_bound.lz4"], 1, "L\nCorrupted legacy frame \n"),
             row(T5, "--list leg_block_exact.lz4 (1.11.1)", "lz4", &["--list", "leg_block_exact.lz4"], &["leg_block_exact.lz4"], 0, ""),
             row(T5, "--list leg_block_exact.lz4, -v (1.11.1)", "lz4", &["--list", "-v", "leg_block_exact.lz4"], &["leg_block_exact.lz4"], 0, ""),
             row(T5, "--list leg_block_one_short.lz4 (1.11.1)", "lz4", &["--list", "leg_block_one_short.lz4"], &["leg_block_one_short.lz4"], 1, "Corrupted legacy frame \nlz4: leg_block_one_short.lz4: File format not recognized \n"),
@@ -3062,6 +3073,18 @@ mod unix {
             ("off_leg.lz4", at3(&leg)),
             ("off_b.lz4", at3(&fx("b.lz4"))),
             ("off_legcut.lz4", at3(&leg[..leg.len() - 2])),
+            // Finding 26 (bug hunt 2): undecodable data's position is the
+            // file's (`ftell`), not counted from where standard input
+            // started (lz4 1.11.1: 3 + the frames + 4).
+            (
+                "off_junk.lz4",
+                at3(&[&fx("b.lz4")[..], &fx("b.lz4"), b"JUNKJUNKJUNK"].concat()),
+            ),
+            (
+                "off_legjunk.lz4",
+                at3(&[&leg[..], b"JUNKJUNKJUNK"].concat()),
+            ),
+            ("off_notlz4.lz4", at3(b"JUNKJUNKJUNK")),
         ] {
             fs::write(dir.join(name), bytes).unwrap();
             for args in [&["--list"][..], &["--list", "-v"], &["--list", "stdin"]] {
@@ -5100,6 +5123,67 @@ mod unix {
             let ours = run(&link, args, input);
             assert_eq!((ours.0, ours.2.as_str()), (Some(code), text), "{args:?}");
             assert_eq!(run(reference, args, input).0, Some(0), "{args:?}");
+        }
+    }
+
+    /// Finding 33 (bug hunt 2): a failed write is lz4 1.11.1's `Error N`:
+    /// 42 for a frame written in one piece (shorter than a block), 46 for
+    /// a streamed one, 38 for `-l`, 73 decoding to a sparse file (the
+    /// default for a file), 70 otherwise. A file-size limit of 32 KiB
+    /// (`SIGXFSZ` ignored) is the full disk; both keep the source.
+    #[test]
+    fn a_failed_write_matches_the_reference() {
+        use std::process::{Command, Stdio};
+        let Some(_) = lz4_dir() else { return };
+        let dir = ScratchDir::unique("lz4-wrerr");
+        fs::create_dir_all(&*dir).unwrap();
+        let f = random(200_000, 33);
+        let big = random(6_000_000, 34);
+        for (name, bytes) in [
+            ("f", f.clone()),
+            ("big", big.clone()),
+            ("f.lz4", made(&["-c"], &f)),
+            ("big.lz4", made(&["-c"], &big)),
+            ("l.lz4", made(&["-l", "-c"], &f)),
+        ] {
+            fs::write(dir.join(name), bytes).unwrap();
+        }
+        let link = dir.join("lz4");
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
+        let run = |exe: &Path, args: &[&str]| {
+            let _ = fs::remove_file(dir.join("o"));
+            let mut cmd = Command::new(exe);
+            cmd.args(args)
+                .current_dir(&*dir)
+                .stdin(Stdio::null())
+                .env("LC_ALL", "C");
+            file_size_limit(&mut cmd, 32 << 10);
+            let o = output(&mut cmd).unwrap();
+            let err = String::from_utf8_lossy(&o.stderr).into_owned();
+            (o.status.code(), err)
+        };
+        let reference = Path::new(ref_lz4());
+        for args in [
+            &["-q", "-f", "f", "o"][..],
+            &["-q", "-f", "-BD", "f", "o"],
+            &["-q", "-f", "-12", "f", "o"],
+            &["-q", "-f", "--no-frame-crc", "f", "o"],
+            &["-q", "-f", "-B4", "f", "o"],
+            &["-q", "-f", "big", "o"],
+            &["-q", "-f", "-l", "f", "o"],
+            &["-q", "-f", "-d", "f.lz4", "o"],
+            &["-q", "-f", "-d", "l.lz4", "o"],
+            &["-q", "-f", "-d", "big.lz4", "o"],
+            &["-q", "-f", "-d", "--no-sparse", "f.lz4", "o"],
+            &["-q", "-f", "--rm", "-m", "f"],
+        ] {
+            let ours = run(&link, args);
+            assert_eq!(ours, run(reference, args), "{args:?}");
+            assert!(
+                stuffr_cli::compat::lz4::EXIT_CODES.contains(&ours.0.unwrap()),
+                "{args:?}"
+            );
+            assert_eq!(fs::read(dir.join("f")).unwrap(), f, "{args:?}");
         }
     }
 

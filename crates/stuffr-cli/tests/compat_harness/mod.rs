@@ -1373,6 +1373,30 @@ pub fn reset_after(data: Vec<u8>) -> (OwnedFd, std::thread::JoinHandle<()>) {
     (OwnedFd::from(client), peer)
 }
 
+/// A full disk for `cmd`'s process: no file it writes may grow past
+/// `bytes` (`RLIMIT_FSIZE`), and `SIGXFSZ` is ignored, so the write that
+/// would cross the limit fails with `EFBIG` instead of killing it (the
+/// second bug hunt's write-error findings were reproduced so; macOS has no
+/// `/dev/full`). Standard output to a pipe is not limited.
+pub fn file_size_limit(cmd: &mut Command, bytes: u64) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: between fork and exec only async-signal-safe calls, `signal`
+    // and `setrlimit`, on plain values.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let lim = libc::rlimit {
+                rlim_cur: bytes as libc::rlim_t,
+                rlim_max: bytes as libc::rlim_t,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &lim) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 /// The program each run in flight is running, by the run's work directory
 /// (`execute` registers it after the spawn and removes it once it ends).
 static CHILDREN: Mutex<Vec<(PathBuf, u32)>> = Mutex::new(Vec::new());

@@ -592,7 +592,17 @@ fn legacy_frames() {
     assert_eq!(stop_of(&f), Some(Stop::CorruptLegacy));
     let mut f = legacy(&[3]);
     f.extend_from_slice(&u32::MAX.to_le_bytes());
-    assert_eq!(stop_of(&f), Some(Stop::CorruptLegacy));
+    assert_eq!(stop_of(&f), Some(Stop::LegacyTooLarge));
+    // Finding 27: over LZ4_compressBound(8 MiB) it is too large.
+    for (v, stop) in [
+        (8_421_520u32, Stop::CorruptLegacy),
+        (8_421_521, Stop::LegacyTooLarge),
+    ] {
+        let mut f = magic.to_vec();
+        f.extend_from_slice(&v.to_le_bytes());
+        f.extend_from_slice(b"ab");
+        assert_eq!(stop_of(&f), Some(stop), "{v}");
+    }
 }
 
 /// probe: bytes that are no frame, after the first or first in the file:

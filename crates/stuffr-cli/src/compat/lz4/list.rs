@@ -79,7 +79,8 @@ use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 
 use stuffr::lz4_opts::{
-    LEGACY_BLOCK_SIZE, LEGACY_MAGIC, MAGIC, is_skippable_magic, parse_frame_header,
+    LEGACY_BLOCK_BOUND, LEGACY_BLOCK_SIZE, LEGACY_MAGIC, MAGIC, is_skippable_magic,
+    parse_frame_header,
 };
 
 use super::cli::{Command, STDINMARK};
@@ -134,6 +135,9 @@ impl FrameInfo {
 enum Stop {
     NotRecognized,
     CorruptLegacy,
+    /// [`Stop::CorruptLegacy`] for a block-size word over
+    /// `LZ4_compressBound(8 MiB)`, which says why at display level 4 first.
+    LegacyTooLarge,
     /// Bytes that are no frame; the position past the magic number's four
     /// bytes.
     Trailing(u64),
@@ -271,8 +275,11 @@ impl<R: Read + Seek> Walker<R> {
             self.skippable(start)?
         } else {
             // probe: `lz4 --list -v notlz4` says it at position 4, as it
-            // does after a frame.
-            return Err(Stop::Trailing(start + 4));
+            // does after a frame. The position is the file's (`ftell`):
+            // standard input may start further in (finding 26 of the second
+            // bug hunt; probe, 1.11.1: `{ dd bs=1 count=25 of=/dev/null;
+            // lz4 --list -v; } < m.bin` says 54, not 29).
+            return Err(Stop::Trailing(self.win.base + start + 4));
         };
         self.frames += 1;
         Ok(Some(info))
@@ -365,6 +372,12 @@ impl<R: Read + Seek> Walker<R> {
             }
             if v == MAGIC || v == LEGACY_MAGIC || is_skippable_magic(v) {
                 break;
+            }
+            // probe (1.11.1, finding 27 of the second bug hunt): a word
+            // over LZ4_compressBound(8 MiB) (8421521 and up) is said to be
+            // too large at `-vv`; one up to that bound is not.
+            if v as usize > LEGACY_BLOCK_BOUND {
+                return Err(Stop::LegacyTooLarge);
             }
             if v as usize > LEGACY_BLOCK_SIZE {
                 return Err(Stop::CorruptLegacy);
@@ -590,6 +603,10 @@ fn report(run: &mut Run, name: &[u8], stop: Stop) -> Fail {
     match stop {
         Stop::NotRecognized => {}
         Stop::CorruptLegacy => run.say(1, m::LIST_CORRUPTED_LEGACY, &[]),
+        Stop::LegacyTooLarge => {
+            run.say(4, m::LIST_LEGACY_TOO_LARGE, &[]);
+            run.say(1, m::LIST_CORRUPTED_LEGACY, &[]);
+        }
         Stop::Trailing(at) => {
             run.say(3, m::UNDECODABLE, &[]);
             run.say(3, m::AT_POSITION, &[at.to_string().as_bytes()]);

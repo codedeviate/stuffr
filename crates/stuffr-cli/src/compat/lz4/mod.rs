@@ -242,9 +242,14 @@ pub fn run(name: &'static str, argv0: &OsStr, args: Vec<OsString>) -> ExitCode {
 /// legacy frame's next size word or a mozlz4 block is read (`Error 65 :
 /// Read error : ferror`; probed 2026-11-16 with a socket reset after the
 /// data).
+///
+/// Finding 33 added 38 (back: a legacy frame's write error) and 73 (a write
+/// error decoding sparsely); 42 is also a frame written in one piece that
+/// could not be written (probed 2026-11-16 under a file-size limit).
 #[doc(hidden)]
-pub const EXIT_CODES: [i32; 23] = [
-    0, 1, 26, 27, 34, 40, 42, 43, 44, 46, 50, 51, 53, 54, 61, 62, 63, 64, 65, 69, 70, 72, 74,
+pub const EXIT_CODES: [i32; 25] = [
+    0, 1, 26, 27, 34, 38, 40, 42, 43, 44, 46, 50, 51, 53, 54, 61, 62, 63, 64, 65, 69, 70, 72, 73,
+    74,
 ];
 
 /// [`run`] without the process: operands resolve against `dir`, standard
