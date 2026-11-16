@@ -168,6 +168,30 @@ fn pack_and_unpack_still_write_through_to_a_device() {
     assert_eq!(std::fs::read(&target).unwrap(), b"payload\n".repeat(100));
 }
 
+/// Final review Minor 2: a device is never "the same file" as its input.
+/// `/dev/null` as both input and output (and standard input redirected from
+/// it) wrote straight through in 0.29.0; the identity check refused it.
+#[cfg(unix)]
+#[test]
+fn a_device_given_as_input_and_output_is_not_refused() {
+    let out = run_output(&["pack", "--force", "/dev/null", "-o", "/dev/null"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    let out = Command::new(STUFFR)
+        .args([
+            "pack",
+            "--force",
+            "--format",
+            "gzip",
+            "-",
+            "-o",
+            "/dev/null",
+        ])
+        .stdin(std::fs::File::open("/dev/null").unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+}
+
 /// Findings 6 and 12: a container output that is a symlink to a file inside
 /// the tree being packed overwrote that file with the archive and stored the
 /// archive's own head as its entry, at exit 0.

@@ -1163,13 +1163,21 @@ pub fn refuse_directory_for(src: &Input, verb: &str) -> Result<()> {
 /// Two tests, because neither alone is enough: canonical paths catch `./a`,
 /// `a` and a symlink to `a`; only `(dev, ino)` catches a hard link, whose
 /// name canonicalises to itself. For standard input (`- -o l.gz < a`) the
-/// descriptor redirected from a regular file is compared by `(dev, ino)`;
-/// a pipe, a terminal or a missing output cannot clash. `verb` names the
-/// operation in the message.
+/// descriptor redirected from a regular file is compared by `(dev, ino)`.
+///
+/// Only an output that resolves to a REGULAR file is compared (final review
+/// of bug hunt 2, Minor 2): a device or FIFO destination takes the
+/// direct-write branch and destroys nothing, so `/dev/null` given as both,
+/// or `/dev/stdin` and `/dev/stdout` on one terminal (macOS `/dev/fd/N`
+/// stats the descriptor), write straight through as before; a missing
+/// output cannot clash either. `verb` names the operation in the message.
 pub fn refuse_same_file(src: &Input, dst: &Output, verb: &str) -> Result<()> {
     let Output::Path(output) = dst else {
         return Ok(());
     };
+    if !std::fs::metadata(output).is_ok_and(|m| m.is_file()) {
+        return Ok(());
+    }
     match src {
         Input::Path(input) => {
             let canonical_match =
