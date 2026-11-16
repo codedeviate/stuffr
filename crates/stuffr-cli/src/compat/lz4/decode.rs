@@ -125,6 +125,12 @@ pub(super) fn stream(
                 break;
             }
         }
+        // A mozlz4 magic cut short by a read error is that read error
+        // (deviation 11, review M2 of finding 28): never "undecodable
+        // data", after which `--rm` would remove the source.
+        if src.failed() {
+            return Err(run.exm(26, m::E26_READ, &[]));
+        }
         // A mozlz4 magic that went wrong is an unknown one (below).
         let known = unknown.len() == 4
             && (is_skippable_magic(magic) || magic == LEGACY_MAGIC || magic == MAGIC);

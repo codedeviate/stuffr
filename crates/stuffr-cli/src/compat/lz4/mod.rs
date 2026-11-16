@@ -623,6 +623,8 @@ mod tests {
         assert_eq!(d.run("lz4", &["-q", "-l", "a", "l.lz4"], b"").0, 0);
         let frame = std::fs::read(d.0.join("a.lz4")).unwrap();
         let legacy = std::fs::read(d.0.join("l.lz4")).unwrap();
+        let mut skippable_then_moz = vec![0x50, 0x2a, 0x4d, 0x18, 3, 0, 0, 0, 1, 2, 3];
+        skippable_then_moz.extend_from_slice(b"mozLz40\0");
         // Compressing: a frame and a legacy frame.
         for (opt, at) in [("-1", 100_000), ("-1", 0), ("-l", 100_000), ("-l", 0)] {
             let (code, _, err) = run_failing(&d, &[opt, "-q", "--rm", "-f", "a", "o.lz4"], "a", at);
@@ -648,6 +650,15 @@ mod tests {
                 &legacy,
                 legacy.len() as u64,
                 "Error 65 : Read error : ferror \n",
+            ),
+            // Review M2: a mozlz4 magic cut by the error after a skippable
+            // frame is the read error, not "undecodable data" (which
+            // would let `--rm` remove the source).
+            (
+                "m.lz4",
+                &skippable_then_moz,
+                skippable_then_moz.len() as u64 - 2,
+                "Error 26 : Read error \n",
             ),
         ] {
             std::fs::write(d.0.join(name), bytes).unwrap();
