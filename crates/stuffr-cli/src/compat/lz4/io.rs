@@ -727,6 +727,8 @@ pub(super) struct Run<'a> {
     /// decoded when decoding (probe: `lz4 -v -d -m` over 2000 bytes at
     /// 0.00 s says several MiB/s, which only the decoded size gives).
     pub(super) total: u64,
+    /// The inputs after the current one (`-m`, `-r`): deviation 12.
+    later: Vec<Vec<u8>>,
 }
 
 impl<'a> Run<'a> {
@@ -750,6 +752,7 @@ impl<'a> Run<'a> {
             display: Display::new(level),
             timer,
             total: 0,
+            later: Vec::new(),
         }
     }
 }
@@ -873,6 +876,18 @@ impl Run<'_> {
                 && host::same_file(i, &existing) == Some(true)
             {
                 return Err(self.fail(m::SAME_FILE, &[name]));
+            }
+            // Deviation 12 (finding 31 of the second bug hunt): never over
+            // an input still to be read (`lz4 -f -m f f.lz4`); lz4 1.11.1
+            // overwrites it.
+            if let Ok(existing) = fs::metadata(&path)
+                && self.later.iter().any(|l| {
+                    l.as_slice() != STDINMARK
+                        && fs::metadata(self.host.path(l))
+                            .is_ok_and(|m| host::same_file(&m, &existing) == Some(true))
+                })
+            {
+                return Err(self.fail(m::LATER_INPUT, &[name]));
             }
             if !self.cmd.force {
                 if self.level <= 1 {
@@ -1609,7 +1624,9 @@ fn files(run: &mut Run, plan: &Plan) -> Result<usize, i32> {
     if let Err(Fail::Exit(code)) = run.load_dictionary() {
         return Err(code);
     }
-    for name in names {
+    for (i, name) in names.iter().enumerate() {
+        run.later = names[i + 1..].to_vec();
+        let name = name.clone();
         // probe: `lz4 -m stdin e` writes both to standard output, `lz4 -m e
         // stdin` writes `e.lz4` and `stdin.lz4`: the plan made from the first
         // input says standard output for all.

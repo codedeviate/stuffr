@@ -4493,4 +4493,82 @@ mod unix {
             assert_eq!(seen[1], seen[0], "{args:?}");
         }
     }
+
+    /// Finding 31 (bug hunt 2), deviation 9: an output that is a later
+    /// operand, or (`--rm`) an output this run already wrote for an input
+    /// it removed, is refused before it is opened. zstd 1.5.7 overwrites
+    /// it, and with `--rm` both originals are gone (checked here too).
+    #[test]
+    fn an_output_never_destroys_a_later_input() {
+        let Some(_) = zstd_dir() else { return };
+        let reference = std::path::Path::new(ref_zstd());
+        let setup = |dir: &std::path::Path| {
+            std::fs::write(dir.join("f"), b"top\n").unwrap();
+            std::fs::write(dir.join("f.zst"), b"PRECIOUS-ORIGINAL-DATA\n").unwrap();
+            for sub in ["a", "b", "out"] {
+                std::fs::create_dir_all(dir.join(sub)).unwrap();
+            }
+            std::fs::write(dir.join("a/f"), b"from a\n").unwrap();
+            std::fs::write(dir.join("b/f"), b"from b\n").unwrap();
+        };
+        let in_dir = |exe: Option<&std::path::Path>, args: &[&str]| {
+            let dir = ScratchDir::unique("zstd-later");
+            std::fs::create_dir_all(&*dir).unwrap();
+            setup(&dir);
+            let exe = match exe {
+                Some(e) => e.to_path_buf(),
+                None => {
+                    let link = dir.join("zstd");
+                    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
+                    link
+                }
+            };
+            let (code, err) = run_in(&dir, &exe, args, None);
+            (code, err, dir)
+        };
+        let decoded =
+            |p: &std::path::Path| filter_through(ref_zstd(), &["-dcq"], &std::fs::read(p).unwrap());
+        // The reference loses the later operand.
+        let (code, _, dir) = in_dir(Some(reference), &["-q", "-f", "--rm", "f", "f.zst"]);
+        assert_eq!(code, Some(0));
+        assert!(!dir.join("f").exists() && !dir.join("f.zst").exists());
+        // stuffr refuses the first output and keeps both.
+        let (code, err, dir) = in_dir(None, &["-q", "-f", "--rm", "f", "f.zst"]);
+        assert_eq!(
+            (code, err.as_str()),
+            (
+                Some(1),
+                "zstd: Refusing to open an output file which will overwrite the input file \n"
+            )
+        );
+        assert_eq!(std::fs::read(dir.join("f")).unwrap(), b"top\n");
+        assert_eq!(
+            decoded(&dir.join("f.zst.zst")).unwrap(),
+            b"PRECIOUS-ORIGINAL-DATA\n"
+        );
+        // `--output-dir-flat`: the second `f` would replace the first's
+        // output, whose input `--rm` removed.
+        let flat = ["-q", "-f", "--rm", "a/f", "b/f", "--output-dir-flat", "out"];
+        let (code, _, dir) = in_dir(Some(reference), &flat);
+        assert_eq!(code, Some(0));
+        assert!(!dir.join("a/f").exists() && !dir.join("b/f").exists());
+        let (code, err, dir) = in_dir(None, &flat);
+        assert_eq!(
+            (code, err.as_str()),
+            (
+                Some(1),
+                "zstd: out/f.zst: holds the output of an input this run removed; not overwritten \n"
+            )
+        );
+        assert!(!dir.join("a/f").exists());
+        assert_eq!(std::fs::read(dir.join("b/f")).unwrap(), b"from b\n");
+        assert_eq!(decoded(&dir.join("out/f.zst")).unwrap(), b"from a\n");
+        // Without `--rm` nothing is lost and nothing changes (zstd 1.5.7
+        // replaces the first output, as before).
+        let keep = ["-q", "-f", "a/f", "b/f", "--output-dir-flat", "out"];
+        let ours = in_dir(None, &keep);
+        let theirs = in_dir(Some(reference), &keep);
+        assert_eq!((ours.0, &ours.1), (theirs.0, &theirs.1));
+        assert_eq!(decoded(&ours.2.join("out/f.zst")).unwrap(), b"from b\n");
+    }
 }

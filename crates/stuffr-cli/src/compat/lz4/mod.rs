@@ -160,6 +160,15 @@
 //!     Read error`. Probed with a socket reset after the data (standard
 //!     input, and `src -> /dev/fd/3`). Why: the source must never be
 //!     removed after a read that did not reach its end.
+//! 12. An output never destroys an input still to be read (finding 31 of
+//!     the second bug hunt). lz4 1.11.1 compares an output only with its
+//!     own input: `lz4 -f -m --rm f f.lz4` writes `f`'s frame over the
+//!     operand `f.lz4` before reading it, then compresses that into
+//!     `f.lz4.lz4`, and both originals are gone. stuffr refuses an output
+//!     that is the same file as a later input, before opening it
+//!     (`f.lz4: is also an input still to be read; not overwritten`, at
+//!     display level 1, whatever `-f` says); that input counts as failed and
+//!     is kept.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};

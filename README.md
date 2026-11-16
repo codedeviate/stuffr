@@ -1646,6 +1646,14 @@ input through, at display level 1) and `zstdmt` compresses with `-T0`.
   `O_NOFOLLOW` and their times set without following a link. `--train`
   still overwrites a regular file without `-f`, as zstd does, but refuses
   a symlink there (`cannot open`, exit 3) unless `-f`.
+- **An output never destroys an input still to be read.** zstd opens an
+  output over a later operand (`zstd -f --rm f f.zst` writes `f`'s frame
+  over `f.zst` before reading it, and both originals are gone) and, with
+  `--rm` and `--output-dir-flat`, over the output of an earlier input of the
+  same name it has removed. stuffr refuses both, before the output is
+  opened: `Refusing to open an output file which will overwrite the input
+  file`, or `NAME: holds the output of an input this run removed; not
+  overwritten`; that input fails (exit 1) and is kept.
 
 **Known differences, pure tier only** (`zstd-pure` without `zstd-c`):
 
@@ -1817,6 +1825,11 @@ benchmark lines included.
   source), stuffr fails too: `-l` compression (`Error 40`), and a read that
   fails where a magic number is read, at the start or after a skippable
   frame (`Error 26 : Read error`).
+- **An output never destroys an input still to be read.** lz4 opens an
+  output over a later operand (`lz4 -f -m --rm f f.lz4` writes `f`'s frame
+  over `f.lz4` before reading it, and both originals are gone). stuffr
+  refuses such an output (`f.lz4: is also an input still to be read; not
+  overwritten`), whatever `-f` says; that input fails and is kept.
 
 **Known differences, pure tier only** (without `lz4-c`):
 

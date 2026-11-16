@@ -134,6 +134,17 @@
 //!    file without `-f`, as zstd does, but refuses a symlink at the
 //!    dictionary's name (`cannot open`, exit 3) unless `-f`, which replaces
 //!    the link. Why: a planted link must not redirect a write.
+//! 9. An output never destroys an input still to be read (finding 31 of
+//!    the second bug hunt). zstd 1.5.7 compares an output only with its own
+//!    input: `zstd -f --rm f f.zst` writes `f`'s frame over the operand
+//!    `f.zst` before reading it, then compresses that into `f.zst.zst`, and
+//!    both originals are gone; `zstd -f --rm a/f b/f --output-dir-flat out`
+//!    replaces `out/f.zst` (a/f's, a/f removed) with b/f's. stuffr refuses,
+//!    before the output is opened, an output that is the same file as a
+//!    later operand (zstd's own `Refusing to open an output file which will
+//!    overwrite the input file`) and, under `--rm`, one this run published
+//!    for an input it removed (`NAME: holds the output of an input this run
+//!    removed; not overwritten`); that input fails (exit 1) and is kept.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};

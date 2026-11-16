@@ -528,6 +528,12 @@ pub(super) const SPARSE_OFF_STDOUT: &str =
 pub(super) const REFUSING_OVERWRITE_INPUT: &str =
     "zstd: Refusing to open an output file which will overwrite the input file \n";
 
+/// stuffr's own (deviation 9): with `--rm`, an output this run already
+/// wrote for an input it then removed (`--output-dir-flat` and two inputs
+/// of one name) is never overwritten.
+pub(super) const WRITTEN_FOR_A_REMOVED_INPUT: &str =
+    "zstd: %s: holds the output of an input this run removed; not overwritten \n";
+
 /// fileio.c: FIO_openDstFile (display level 4).
 pub(super) const SPARSE_OFF_NOT_FILE: &str =
     "Sparse File Support is disabled when output is not a file \n";

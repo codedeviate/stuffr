@@ -439,6 +439,10 @@ pub(super) const SOURCE_REPLACED: &str = "\rWarning : %s : file renamed or repla
 /// [`SOURCE_MODIFIED`] or [`SOURCE_REPLACED`], and `f` is kept.
 pub(super) const SOURCE_KEPT: &str = "; source kept ";
 
+/// stuffr's own (deviation 12): an output that is an input still to be
+/// read (`lz4 -f -m f f.lz4` with `f.lz4` there) is never opened over.
+pub(super) const LATER_INPUT: &str = "%s: is also an input still to be read; not overwritten \n";
+
 /// probe (1.11.1): `lz4 -c < /tmp` (a directory as standard input), `lz4
 /// -c <&-`, and a socket reset after 100000 bytes as standard input or
 /// behind `ln -s /dev/fd/3 src; lz4 --rm src o.lz4`: a read of a frame's

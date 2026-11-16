@@ -359,6 +359,10 @@ pub(crate) struct Io<'a> {
     clock: Instant,
     answers: Option<Answers>,
     codec: Option<Box<dyn FrameCodec>>,
+    /// The operands, for deviation 9's later-operand check.
+    inputs: Vec<Vec<u8>>,
+    /// Under `--rm`, the outputs this run published (deviation 9).
+    published: Vec<Metadata>,
 }
 
 /// The C `printf` of `fmt` into bytes.
@@ -452,6 +456,8 @@ impl<'a> Io<'a> {
             clock: Instant::now(),
             answers: None,
             codec: Some(frame_codec()),
+            inputs: cmd.files.clone(),
+            published: Vec::new(),
         }
     }
 
@@ -851,6 +857,31 @@ impl<'a> Io<'a> {
             self.say(1, m::REFUSING_OVERWRITE_INPUT, &[]);
             return Ok(false);
         }
+        // Deviation 11 (finding 31 of the second bug hunt): never over an
+        // operand still to be read (`zstd -f f f.zst` writes f's frame over
+        // `f.zst` before reading it), nor, under `--rm`, over an output this
+        // run wrote for an input it removed (`--output-dir-flat` and two
+        // inputs of one name). zstd 1.5.7 overwrites both.
+        if src.is_some()
+            && let Ok(o) = util::stat(self.host, dst)
+        {
+            let later = self.inputs.iter().skip(self.curr_file_idx + 1).any(|i| {
+                i != STDINMARK
+                    && util::stat(self.host, i).is_ok_and(|s| host::same_file(&s, &o) == Some(true))
+            });
+            if later {
+                self.say(1, m::REFUSING_OVERWRITE_INPUT, &[]);
+                return Ok(false);
+            }
+            if self
+                .published
+                .iter()
+                .any(|p| host::same_file(p, &o) == Some(true))
+            {
+                self.say(1, m::WRITTEN_FOR_A_REMOVED_INPUT, &[dst]);
+                return Ok(false);
+            }
+        }
         let is_reg = util::is_regular_file(self.host, dst);
         // Deviation 8 (hardening): a symlink at the name, live or
         // dangling, is an existing file, and is replaced, never followed.
@@ -1021,6 +1052,11 @@ impl<'a> Io<'a> {
             return Ok(1);
         }
         drop(guard);
+        if self.prefs.remove_src
+            && let Ok(meta) = fs::metadata(&f.path)
+        {
+            self.published.push(meta);
+        }
         Ok(result)
     }
 

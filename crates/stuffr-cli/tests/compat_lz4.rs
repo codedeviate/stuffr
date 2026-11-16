@@ -5187,6 +5187,57 @@ mod unix {
         }
     }
 
+    /// Finding 31 (bug hunt 2), deviation 12: an output that is an input
+    /// still to be read is refused before it is opened. lz4 1.11.1 writes
+    /// `f`'s frame over the operand `f.lz4`, then compresses that, and with
+    /// `--rm` both originals are gone (checked here too).
+    #[test]
+    fn an_output_never_destroys_a_later_input() {
+        use std::process::{Command, Stdio};
+        let Some(_) = lz4_dir() else { return };
+        let run = |exe: Option<&Path>| {
+            let dir = ScratchDir::unique("lz4-later");
+            fs::create_dir_all(&*dir).unwrap();
+            fs::write(dir.join("f"), b"top\n").unwrap();
+            fs::write(dir.join("f.lz4"), b"PRECIOUS-ORIGINAL-DATA\n").unwrap();
+            let exe = match exe {
+                Some(e) => e.to_path_buf(),
+                None => {
+                    let link = dir.join("lz4");
+                    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
+                    link
+                }
+            };
+            let o = output(
+                Command::new(&exe)
+                    .args(["-f", "-m", "--rm", "f", "f.lz4"])
+                    .current_dir(&*dir)
+                    .stdin(Stdio::null()),
+            )
+            .unwrap();
+            let err = String::from_utf8_lossy(&o.stderr).into_owned();
+            (o.status.code(), err, dir)
+        };
+        let (code, _, dir) = run(Some(Path::new(ref_lz4())));
+        assert_eq!(code, Some(0));
+        assert!(!dir.join("f").exists() && !dir.join("f.lz4").exists());
+        let (code, err, dir) = run(None);
+        assert_eq!(
+            (code, err.as_str()),
+            (
+                Some(1),
+                "f.lz4: is also an input still to be read; not overwritten \n"
+            )
+        );
+        assert_eq!(fs::read(dir.join("f")).unwrap(), b"top\n");
+        let kept = filter_through(
+            ref_lz4(),
+            &["-dc"],
+            &fs::read(dir.join("f.lz4.lz4")).unwrap(),
+        );
+        assert_eq!(kept.unwrap(), b"PRECIOUS-ORIGINAL-DATA\n");
+    }
+
     #[test]
     fn standard_input_redirected_from_a_file_matches_the_reference() {
         use std::process::{Command, Stdio};
