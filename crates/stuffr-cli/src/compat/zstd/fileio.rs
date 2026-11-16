@@ -857,7 +857,7 @@ impl<'a> Io<'a> {
             self.say(1, m::REFUSING_OVERWRITE_INPUT, &[]);
             return Ok(false);
         }
-        // Deviation 11 (finding 31 of the second bug hunt): never over an
+        // Deviation 9 (finding 31 of the second bug hunt): never over an
         // operand still to be read (`zstd -f f f.zst` writes f's frame over
         // `f.zst` before reading it), nor, under `--rm`, over an output this
         // run wrote for an input it removed (`--output-dir-flat` and two
