@@ -701,6 +701,26 @@ read list.
 > **3862** on the default tier — measured from this bump's own
 > `make check`, `GATE_EXIT=0`, nothing skipped.
 >
+> `0.31.0`: **stuffr builds and runs as a WebAssembly module**
+> (`wasm32-wasip1`, the pure tier), for hosts that embed it; most of the
+> work came from the sercon project, which does. `make wasm` builds the
+> module and `make wasi-smoke` runs it under a pinned wazero, as a CI job
+> does. New for every build: `STUFFR_CWD=/abs/dir` and `--cwd DIR` say
+> where stuffr stands (the variable reaches the compat links too),
+> `formats --json` and `version --json` describe the running build, and
+> `fuzz/` is its own cargo workspace. On a target without threads every
+> thread request runs single-threaded instead of failing, `xz`'s default
+> included. Where a build can neither read nor set file modes (WASI),
+> `pack`, single-stream outputs and `salvage` now say that a mode was not
+> carried (exit 4 under `--strict-fidelity`) instead of archiving a 0600
+> file as 0644 under "no fidelity loss". Not yet on WASI: modes, owners
+> and symlink creation, and most compat links are untested there. Unix
+> and Windows behave as in 0.30.0 apart from the new flags. The C tier's
+> zlib moves to libz-sys 1.1.33 (RUSTSEC-2026-0544, a `gzwrite` overflow
+> stuffr never reached). A MINOR: additive. **4039** tests under `--all-features`, **3884** on the
+> default tier — measured from this bump's own `make check`,
+> `GATE_EXIT=0`, nothing skipped.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own

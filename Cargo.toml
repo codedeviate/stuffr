@@ -4,15 +4,15 @@ exclude = ["fuzz"]
 resolver = "3"
 
 [workspace.package]
-version = "0.30.0"
+version = "0.31.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/codedeviate/stuffr"
 
 [workspace.dependencies]
-stuffr-core = { path = "crates/stuffr-core", version = "0.30.0" }
-stuffr-formats = { path = "crates/stuffr-formats", version = "0.30.0" }
+stuffr-core = { path = "crates/stuffr-core", version = "0.31.0" }
+stuffr-formats = { path = "crates/stuffr-formats", version = "0.31.0" }
 thiserror = "2"
 tempfile = "3"
 serde = { version = "1", features = ["derive"] }
@@ -101,9 +101,11 @@ liblzma-sys = { version = "0.4.9", default-features = false }
 # above; `default-features = false` drops `libc` and `stock-zlib`. This is a
 # separate crate from flate2's backend, which stays miniz_oxide everywhere:
 # no `zlib`/`zlib-rs`/`zlib-ng` feature on flate2.
-# Floor 1.1.31: 1.1.29's build script can print the environment
-# (RUSTSEC-2026-0418; not reachable with `static`, but audit tools flag it).
-libz-sys = { version = "1.1.31", default-features = false, features = ["static"] }
+# Floor 1.1.33: its vendored zlib fixes a heap overflow in `gzwrite`
+# (RUSTSEC-2026-0544; stuffr calls only the deflate/inflate stream API, never
+# `gz*`, so it was not reachable, but audit tools flag it). Before that,
+# 1.1.31: 1.1.29's build script can print the environment (RUSTSEC-2026-0418).
+libz-sys = { version = "1.1.33", default-features = false, features = ["static"] }
 # The pure-Rust xz backend (Task 5 of Phase 1e): a port of Tukaani's "XZ for
 # Java" that both encodes and decodes, unlike zstd's decode-only pure
 # fallback. Pure Rust (`sha2` + `digest`, no `-sys` crate), `rust-version =
