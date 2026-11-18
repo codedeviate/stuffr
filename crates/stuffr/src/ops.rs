@@ -2682,3 +2682,37 @@ mod tests {
         let _ = std::fs::remove_file(&link);
     }
 }
+
+#[cfg(test)]
+mod unreadable_mode_tests {
+    use super::*;
+
+    /// An input whose mode this build could not read: the output says its
+    /// mode was not carried, once, whether or not it replaces a file.
+    #[test]
+    fn an_unreadable_input_mode_is_one_warning_on_the_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("out.gz");
+        let from = FromInput {
+            mode_unreadable: true,
+            ..FromInput::default()
+        };
+        for force in [false, true] {
+            let opened = Output::Path(dst.clone())
+                .create(force, false, &from)
+                .unwrap();
+            let modes = opened
+                .warnings
+                .iter()
+                .filter(|w| matches!(w, Fidelity::MetadataIncomplete { fields, .. } if fields.mode))
+                .count();
+            assert_eq!(modes, 1, "force={force}: {:?}", opened.warnings);
+            drop(opened.writer);
+            publish(opened.finish).unwrap();
+        }
+        let quiet = Output::Path(dir.path().join("quiet.gz"))
+            .create(false, false, &FromInput::default())
+            .unwrap();
+        assert!(quiet.warnings.is_empty(), "{:?}", quiet.warnings);
+    }
+}

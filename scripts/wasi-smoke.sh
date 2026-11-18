@@ -401,7 +401,7 @@ c_limit_xz() {
 # one must say so (`missing metadata: mode`, exit 4 under --strict-fidelity)
 # and never report "no fidelity loss" for a 0600 file archived as 0644.
 mode_named() {
-  grep -q 'mode' "$err" || {
+  grep -q 'missing metadata:.*mode' "$err" || {
     detail="stderr does not name the mode: $(tail -n 1 "$err" | cut -c1-200)"
     return 1
   }
@@ -425,10 +425,7 @@ c_honest_pack_stream() {
 # std::env::temp_dir() (it panics on wasm).
 c_honest_salvage() {
   stuffr salvage -C /w/sal /w/h.tar
-  trapped && {
-    detail="salvage -C: $(why)"
-    return 1
-  }
+  expect_exit 0 || return 1
   grep -q 'mode could not be applied' "$err" || {
     detail="salvage -C printed no mode note: $(tail -n 1 "$err" | cut -c1-200)"
     return 1
@@ -436,10 +433,7 @@ c_honest_salvage() {
 }
 c_salvage_one() {
   stuffr salvage --index 0 -o /w/one.out /w/h.tar
-  trapped && {
-    detail="$(why)"
-    return 1
-  }
+  expect_exit 0 || return 1
   cmp -s "$w/one.out" "$w/priv.txt" || {
     detail="salvage --index 0 -o did not write the entry: $(why)"
     return 1

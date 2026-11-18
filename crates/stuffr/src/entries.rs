@@ -3565,8 +3565,9 @@ fn open_salvage_target(
     let mode = salvaged_file_mode(meta.mode, made.umask);
     #[cfg(unix)]
     let mode_refused = crate::ops::set_mode_by_descriptor(&out, mode).err();
-    // Where a mode exists but cannot be set (WASI), the same note a refused
-    // `fchmod` gets; on Windows there is no mode to apply and nothing to say.
+    // Where files have modes this build cannot set (WASI), the same note a
+    // refused `fchmod` gets, for every file: neither an archived mode nor the
+    // umask default was applied. On Windows there is no mode and nothing to say.
     #[cfg(not(unix))]
     let mode_refused: Option<std::io::Error> = crate::ops::MODES_OUT_OF_REACH.then(|| {
         std::io::Error::new(
@@ -6117,16 +6118,29 @@ struct MadeByRun {
 const MAX_SALVAGE_NOTES: usize = 64;
 
 impl MadeByRun {
+    /// What a file whose mode was not applied is left at, for one file and
+    /// for several. On unix the file was created 0600. Elsewhere the open
+    /// asked for no mode, so the host chose it and the note must not name one.
+    const KEPT_MODE: (&'static str, &'static str) = if cfg!(unix) {
+        ("it stays 0600", "they stay 0600")
+    } else {
+        (
+            "it keeps the mode it was created with",
+            "they keep the mode they were created with",
+        )
+    };
+
     /// Records that the file written at `shown` (relative to the destination)
-    /// kept mode 0600 because `err` refused the `fchmod`.
+    /// kept its creation mode because `err` refused the `fchmod`.
     fn note_mode_refused(&mut self, shown: &Path, err: &std::io::Error) {
         if self.notes.len() >= MAX_SALVAGE_NOTES {
             self.notes_dropped += 1;
             return;
         }
         self.notes.push(format!(
-            "`{}`: written, but its mode could not be applied ({err}); it stays 0600",
-            stuffr_core::fmt_name(&shown.to_string_lossy())
+            "`{}`: written, but its mode could not be applied ({err}); {}",
+            stuffr_core::fmt_name(&shown.to_string_lossy()),
+            Self::KEPT_MODE.0
         ));
     }
 
@@ -6135,8 +6149,9 @@ impl MadeByRun {
         let mut notes = std::mem::take(&mut self.notes);
         if self.notes_dropped > 0 {
             notes.push(format!(
-                "… and {} more salvaged files whose mode could not be applied (they stay 0600)",
-                std::mem::take(&mut self.notes_dropped)
+                "… and {} more salvaged files whose mode could not be applied ({})",
+                std::mem::take(&mut self.notes_dropped),
+                Self::KEPT_MODE.1
             ));
         }
         notes

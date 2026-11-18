@@ -168,8 +168,9 @@ pub fn cwd_exit_code(family: Option<Family>) -> u8 {
 ///
 /// `flag` is `--cwd`'s value (native verbs only); when given, `STUFFR_CWD`
 /// is ignored entirely. Otherwise a set, non-empty `STUFFR_CWD` is entered,
-/// and it must be absolute: `stuffr bench` re-runs itself as a child that
-/// inherits the variable, so a relative value would be applied twice. `Err`
+/// and it must be absolute: the variable is inherited by anything
+/// this process starts, so a relative value would mean a different place to
+/// each of them. `Err`
 /// carries the exit code, `<name>: cannot enter <DIR>: <error>` having been
 /// written to standard error already.
 pub fn enter_startup_cwd(

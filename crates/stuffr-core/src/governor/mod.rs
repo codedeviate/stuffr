@@ -108,6 +108,9 @@ pub struct Governor {
 
 impl Governor {
     pub fn new(workers: usize, memory_limit: u64) -> Arc<Self> {
+        // One worker where no thread can be spawned, whoever built the
+        // count: a codec handed more would try to start one.
+        let workers = if threads_available() { workers } else { 1 };
         Arc::new(Self {
             workers: workers.max(1),
             memory_limit,
