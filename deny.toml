@@ -9,7 +9,13 @@ all-features = true
 [advisories]
 # Every RustSec advisory fails the check, unmaintained and unsound notices
 # included, except one we have read and recorded below with the reason.
-ignore = []
+ignore = [
+    # chrono is flagged unmaintained (2026-11; all versions, no fixed one).
+    # It reaches us only through `delharc` and `unarj-rs`, the LHA and ARJ
+    # readers, which use it to convert header timestamps. Not a vulnerability.
+    # Remove this when those crates move off chrono, or replace the readers.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained notice; reached only via delharc and unarj-rs for timestamp conversion" },
+]
 
 [licenses]
 # The licences in the graph today, by name. A new one fails the check, so it
