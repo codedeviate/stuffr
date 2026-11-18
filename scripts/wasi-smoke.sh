@@ -396,6 +396,58 @@ c_limit_xz() {
   expect_exit 6
 }
 
+# Modes. wasi-libc reports a file's type and no permission bits, so this
+# build can neither read nor set a mode. Every place that would have carried
+# one must say so (`missing metadata: mode`, exit 4 under --strict-fidelity)
+# and never report "no fidelity loss" for a 0600 file archived as 0644.
+mode_named() {
+  grep -q 'mode' "$err" || {
+    detail="stderr does not name the mode: $(tail -n 1 "$err" | cut -c1-200)"
+    return 1
+  }
+}
+c_honest_pack_tar() {
+  stuffr pack -o /w/h.tar /w/priv.txt
+  expect_exit 0 && mode_named || return 1
+  stuffr pack --strict-fidelity -o /w/h2.tar /w/priv.txt
+  expect_exit 4
+}
+c_honest_pack_zip() {
+  stuffr pack --strict-fidelity -o /w/h.zip /w/priv.txt
+  expect_exit 4 && mode_named
+}
+c_honest_pack_stream() {
+  stuffr pack --strict-fidelity -o /w/h.gz /w/priv.txt
+  expect_exit 4 && mode_named
+}
+# salvage writes each file without its archived mode and says so in a note;
+# `--index N -o FILE` stages in a temp directory, which must not need
+# std::env::temp_dir() (it panics on wasm).
+c_honest_salvage() {
+  stuffr salvage -C /w/sal /w/h.tar
+  trapped && {
+    detail="salvage -C: $(why)"
+    return 1
+  }
+  grep -q 'mode could not be applied' "$err" || {
+    detail="salvage -C printed no mode note: $(tail -n 1 "$err" | cut -c1-200)"
+    return 1
+  }
+}
+c_salvage_one() {
+  stuffr salvage --index 0 -o /w/one.out /w/h.tar
+  trapped && {
+    detail="$(why)"
+    return 1
+  }
+  cmp -s "$w/one.out" "$w/priv.txt" || {
+    detail="salvage --index 0 -o did not write the entry: $(why)"
+    return 1
+  }
+}
+printf 'private\n' >"$w/priv.txt"
+chmod 600 "$w/priv.txt"
+
 mkdir -p "$w/hostile"
 legacy=$root/crates/stuffr-formats/fixtures/legacy
 cp "$legacy/arc/wrongcrc16.arc" "$legacy/zoo/wrongcrc16.zoo" "$w/hostile/"
@@ -434,6 +486,11 @@ check limit-xz c_limit_xz
 check xz-personality-T8 c_xz_personality_t8
 check xz-personality-default c_xz_personality_default
 check xz-personality-file c_xz_personality_file
+check honest-pack-tar c_honest_pack_tar
+check honest-pack-zip c_honest_pack_zip
+check honest-pack-stream c_honest_pack_stream
+check honest-salvage c_honest_salvage
+check salvage-one c_salvage_one
 
 echo "$passes ok, $xfails xfail, $fails fail, $xpasses xpass"
 [ "$fails" -eq 0 ] && [ "$xpasses" -eq 0 ]

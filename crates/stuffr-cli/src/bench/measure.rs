@@ -791,7 +791,7 @@ pub(super) struct TempOut {
 
 impl TempOut {
     pub(super) fn create() -> io::Result<Self> {
-        let dir = std::env::temp_dir();
+        let dir = crate::temp_root()?;
         let mut tries = 0;
         loop {
             let n = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);

@@ -176,6 +176,18 @@ pub(crate) fn set_mode_by_descriptor(f: &std::fs::File, mode: u32) -> std::io::R
     f.set_permissions(std::fs::Permissions::from_mode(mode))
 }
 
+/// Whether files here carry permission bits this build can neither read nor
+/// set. True on WASI (wasi-libc reports a file's type and nothing else, and
+/// has no `chmod`); false on unix, where both work, and on Windows, where a
+/// file has no such bits to lose.
+///
+/// Where it is true, every place that would have carried a mode says it did
+/// not ([`Fidelity::MetadataIncomplete`] naming `mode`, exit 4 under
+/// `--strict-fidelity`): `pack` for each walked entry, a single-stream
+/// output for its input's mode, salvage for each file it writes. Silence
+/// there would be a 0600 file archived as 0644 under "no fidelity loss".
+pub(crate) const MODES_OUT_OF_REACH: bool = cfg!(not(any(unix, windows)));
+
 /// The warning [`set_mode_best_effort`] raises: the output, named as
 /// `unpack` names an entry whose mode it could not restore.
 fn mode_not_applied(target: &Path) -> Fidelity {
@@ -245,6 +257,10 @@ impl Input {
 pub(crate) struct FromInput {
     /// `st_mode & 0o777` of a regular-file input (unix only).
     pub(crate) mode: Option<u32>,
+    /// The input is a regular file whose mode this build cannot read
+    /// ([`MODES_OUT_OF_REACH`]): the output keeps what it was created with,
+    /// and says so.
+    pub(crate) mode_unreadable: bool,
     /// The quarantine value what is made from the input gets (macOS only).
     pub(crate) quarantine: Option<crate::quarantine::Quarantine>,
 }
@@ -266,6 +282,7 @@ impl FromInput {
         let Some(path) = src.path() else {
             return Self {
                 mode: None,
+                mode_unreadable: false,
                 quarantine: stdin_file().as_ref().and_then(crate::quarantine::read),
             };
         };
@@ -294,6 +311,7 @@ impl FromInput {
         let mode = None;
         Self {
             mode,
+            mode_unreadable: MODES_OUT_OF_REACH,
             quarantine: crate::quarantine::read(&file),
         }
     }
@@ -517,6 +535,9 @@ impl Output {
                     #[cfg(unix)]
                     warnings.extend(set_mode_best_effort(&f, _mode, p));
                 }
+                if from.mode_unreadable && warnings.is_empty() {
+                    warnings.push(mode_not_applied(p));
+                }
                 // One open file, shared: the codec writes through `writer` and
                 // `publish` later `sync_all()`s the very same descriptor. Not
                 // `try_clone` (unsupported on wasm32-wasip1), and never a
@@ -613,6 +634,9 @@ impl Output {
             }
             #[cfg(not(unix))]
             let _ = (md, created);
+            if from.mode_unreadable && warnings.is_empty() {
+                warnings.push(mode_not_applied(p));
+            }
         }
         Ok(Opened {
             writer: Box::new(f),

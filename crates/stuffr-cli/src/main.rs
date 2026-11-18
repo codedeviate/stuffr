@@ -1585,8 +1585,15 @@ const MAX_TEMP_DIR_ATTEMPTS: u32 = 100;
 /// predictable name is never adopted — a taken name is stepped over, a
 /// bounded number of times — and mode 0700, so nothing staged in it (a
 /// recovered member, at the umask default) is readable by anyone else.
-fn fresh_temp_dir(label: &str) -> stuffr::Result<TempDirGuard> {
-    fresh_temp_dir_in(&std::env::temp_dir(), label)
+///
+/// Where there is no temp root at all (WASI without `TMPDIR`), the directory
+/// is made beside `beside`, the output it stages for.
+fn fresh_temp_dir(label: &str, beside: &Path) -> stuffr::Result<TempDirGuard> {
+    let root = stuffr_cli::temp_root().unwrap_or_else(|_| match beside.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    });
+    fresh_temp_dir_in(&root, label)
 }
 
 /// [`fresh_temp_dir`] under `root` (the seam its tests use).
@@ -2028,10 +2035,9 @@ fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
     // of this function, including an early `?`, by `TempDirGuard`'s `Drop`)
     // and moves the one result out afterward; `-C` recovers directly into
     // the caller's own directory; `--list` alone recovers nowhere.
-    let temp_guard = if output.is_some() {
-        Some(fresh_temp_dir("one")?)
-    } else {
-        None
+    let temp_guard = match &output {
+        Some(out) => Some(fresh_temp_dir("one", Path::new(out))?),
+        None => None,
     };
     let dest = match (&directory, &temp_guard) {
         (Some(dir), _) => Some(PathBuf::from(dir)),

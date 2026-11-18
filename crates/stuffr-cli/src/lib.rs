@@ -25,6 +25,28 @@ pub mod compat;
 pub mod size;
 pub mod version;
 
+/// The directory throwaway files go in: `std::env::temp_dir()` wherever
+/// there is one. On WASI that call panics ("no filesystem on wasm"), even
+/// with `TMPDIR` set, so there the answer is `TMPDIR` when it is set and an
+/// `Unsupported` error otherwise; a caller with a better place (beside its
+/// output) falls back to that.
+pub fn temp_root() -> std::io::Result<std::path::PathBuf> {
+    #[cfg(not(target_os = "wasi"))]
+    {
+        Ok(std::env::temp_dir())
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        match std::env::var_os("TMPDIR") {
+            Some(d) if !d.is_empty() => Ok(d.into()),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "this platform has no temporary directory; set TMPDIR to a writable one",
+            )),
+        }
+    }
+}
+
 /// Resolves a `--format` name against the registry. Shared by
 /// `main`'s verbs and `stuffr bench`.
 ///

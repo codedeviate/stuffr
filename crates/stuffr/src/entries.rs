@@ -3565,8 +3565,15 @@ fn open_salvage_target(
     let mode = salvaged_file_mode(meta.mode, made.umask);
     #[cfg(unix)]
     let mode_refused = crate::ops::set_mode_by_descriptor(&out, mode).err();
+    // Where a mode exists but cannot be set (WASI), the same note a refused
+    // `fchmod` gets; on Windows there is no mode to apply and nothing to say.
     #[cfg(not(unix))]
-    let mode_refused: Option<std::io::Error> = None;
+    let mode_refused: Option<std::io::Error> = crate::ops::MODES_OUT_OF_REACH.then(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this build cannot set file modes",
+        )
+    });
     #[cfg(not(unix))]
     let _ = mode;
     if let Some(v) = &made.quarantine {
@@ -4652,6 +4659,7 @@ pub fn convert_archive_source_with(
     // any archive written from many entries.
     let from = crate::ops::FromInput {
         mode: None,
+        mode_unreadable: false,
         quarantine: src.input_traits().quarantine.clone(),
     };
     let (chain, decoded, consumed, _raw_rung, compressed_total) = src.into_parts();
@@ -5730,14 +5738,42 @@ fn plan_item(
 ) -> Option<WritePlan> {
     match &item.source {
         crate::walk::ItemSource::Skipped { .. } => None,
-        _ => Some(plan_entry_write(
-            caps,
-            container,
-            &item.meta,
-            LinkCopy::Unavailable,
-            warnings,
-        )),
+        _ => {
+            let before = warnings.len();
+            let plan =
+                plan_entry_write(caps, container, &item.meta, LinkCopy::Unavailable, warnings);
+            if crate::ops::MODES_OUT_OF_REACH && matches!(plan, WritePlan::Write) {
+                note_unread_mode(&item.meta, warnings, before);
+            }
+            Some(plan)
+        }
     }
+}
+
+/// Says that a walked entry is written without its mode, on a build that
+/// cannot read one ([`crate::ops::MODES_OUT_OF_REACH`]). The writers store
+/// their default (0644) for a `None` mode, so without this a 0600 file is
+/// archived wider under "no fidelity loss". A symlink has no mode worth
+/// keeping and is left alone. Folded into the entry's own
+/// [`Fidelity::MetadataIncomplete`] when [`plan_entry_write`] pushed one
+/// (`warnings[from..]` are this entry's), so an entry still has one warning.
+fn note_unread_mode(meta: &EntryMeta, warnings: &mut Vec<Fidelity>, from: usize) {
+    if meta.mode.is_some() || matches!(meta.kind, EntryKind::Symlink { .. }) {
+        return;
+    }
+    for w in &mut warnings[from..] {
+        if let Fidelity::MetadataIncomplete { fields, .. } = w {
+            fields.mode = true;
+            return;
+        }
+    }
+    warnings.push(Fidelity::MetadataIncomplete {
+        entry: meta.name.clone(),
+        fields: MetaFields {
+            mode: true,
+            ..Default::default()
+        },
+    });
 }
 
 /// The entry name a command-line path is stored under: its final component.
@@ -11217,5 +11253,66 @@ mod convert_tests {
         let mut big = std::io::Cursor::new(vec![0u8; 2 * 1024 * 1024]);
         let err = copy_charging(&mut big, &mut std::io::sink(), "y", &mut tight).unwrap_err();
         assert!(matches!(err, Error::ResourceLimit(_)), "{err:?}");
+    }
+}
+
+#[cfg(test)]
+mod unread_mode_tests {
+    use super::*;
+
+    fn file(name: &str, mode: Option<u32>) -> EntryMeta {
+        EntryMeta {
+            name: name.to_string(),
+            mode,
+            ..Default::default()
+        }
+    }
+
+    fn mode_flags(warnings: &[Fidelity]) -> Vec<(String, bool, bool)> {
+        warnings
+            .iter()
+            .map(|w| match w {
+                Fidelity::MetadataIncomplete { entry, fields } => {
+                    (entry.clone(), fields.mode, fields.uid_gid)
+                }
+                other => panic!("unexpected warning {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_entry_with_no_mode_gets_its_own_warning() {
+        let mut warnings = Vec::new();
+        note_unread_mode(&file("a", None), &mut warnings, 0);
+        assert_eq!(mode_flags(&warnings), [("a".to_string(), true, false)]);
+    }
+
+    #[test]
+    fn the_mode_folds_into_the_entrys_ownership_warning() {
+        let earlier = ownership_warning(&file("earlier", None)).unwrap();
+        let own = ownership_warning(&file("a", None)).unwrap();
+        let mut warnings = vec![earlier, own];
+        note_unread_mode(&file("a", None), &mut warnings, 1);
+        assert_eq!(
+            mode_flags(&warnings),
+            [
+                ("earlier".to_string(), false, true),
+                ("a".to_string(), true, true)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_known_mode_and_a_symlink_say_nothing() {
+        let mut warnings = Vec::new();
+        note_unread_mode(&file("a", Some(0o600)), &mut warnings, 0);
+        let link = EntryMeta {
+            kind: EntryKind::Symlink {
+                target: "a".to_string(),
+            },
+            ..file("l", None)
+        };
+        note_unread_mode(&link, &mut warnings, 0);
+        assert!(warnings.is_empty());
     }
 }
