@@ -102,7 +102,7 @@ pub fn resolve_workers(i: &BudgetInputs) -> usize {
 
 /// [`resolve_workers`] with the thread capability passed in, so the clamp is
 /// testable on a host that has threads.
-pub fn resolve_workers_with(i: &BudgetInputs, threads_available: bool) -> usize {
+pub(crate) fn resolve_workers_with(i: &BudgetInputs, threads_available: bool) -> usize {
     if !threads_available {
         return 1;
     }

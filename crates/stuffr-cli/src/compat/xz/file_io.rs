@@ -780,6 +780,7 @@ fn close_out(out: Option<Out>) -> io::Result<()> {
             // The destination's handle was dropped first, so this is the
             // last holder; if not, the last drop closes it, unchecked.
             let Ok(f) = Arc::try_unwrap(f.0) else {
+                debug_assert!(false, "close_out is not the file's last holder");
                 return Ok(());
             };
             #[cfg(unix)]

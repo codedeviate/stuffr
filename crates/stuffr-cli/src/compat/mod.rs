@@ -135,15 +135,17 @@ pub fn family_for(argv0: &OsStr) -> Option<(Family, &'static str)> {
 /// The exit code a failure to enter the `STUFFR_CWD` / `--cwd` directory ends
 /// the run with, per invoked family (`None` is the native `stuffr` command).
 ///
-/// `1` for the gzip, bzip2, xz, zstd, lz4, brotli and compress families, `2`
+/// `1` for the gzip, bzip2, xz, zstd, lz4, brotli and compress families, `10`
 /// for unzip's (`unzip`, `zipinfo`, `funzip`), `16` for zip's (`zip`,
 /// `zipcloak`, `zipnote`, `zipsplit`), and `2`, the usage code, for native
-/// `stuffr`. unzip's manual lists 2 as a generic zipfile-format error and 10
-/// as invalid command-line options, so 10 may be the closer match; 2 is the
-/// table as specified.
+/// `stuffr`. Each is its tool's "bad invocation" code: unzip documents 10 as
+/// invalid command-line options (2 there is a zipfile-format error), zip
+/// documents 16 as invalid command arguments, and for the others 1 is the
+/// plain error (2 is only a warning for gzip and xz).
 pub fn cwd_exit_code(family: Option<Family>) -> u8 {
     match family {
-        None | Some(Family::Unzip) => 2,
+        None => 2,
+        Some(Family::Unzip) => 10,
         Some(Family::Zip) => 16,
         Some(
             Family::Bzip2

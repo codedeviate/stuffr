@@ -2738,7 +2738,7 @@ is read at startup, before dispatch, so it reaches the compat personalities
 too; it must be absolute (a relative value is refused), an empty value is
 ignored, and `--cwd` given, `STUFFR_CWD` is ignored. **A stuffr extension:** the
 reference tools have neither. A directory that cannot be entered prints
-`NAME: cannot enter DIR: REASON` and exits 2 (`stuffr`, and `unzip` with its
+`NAME: cannot enter DIR: REASON` and exits 2 (`stuffr`), 10 (`unzip` with its
 siblings), 16 (`zip` with its siblings) or 1 (every other family).
 
 ### Finding archives: `stuffr ls`

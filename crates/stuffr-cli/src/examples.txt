@@ -1716,7 +1716,7 @@ CHOOSING THE WORKING DIRECTORY
       other reference tools have neither. It also applies when stuffr runs
       under another tool's name (a compat link), where a directory that
       cannot be entered ends the run with that tool's own failure code
-      (1; unzip's 2; zip's 16), after `NAME: cannot enter DIR: REASON`.
+      (1; unzip's 10; zip's 16), after `NAME: cannot enter DIR: REASON`.
 
 
 SKIPPING THE DURABILITY FSYNC

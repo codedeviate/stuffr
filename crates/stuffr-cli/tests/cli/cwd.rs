@@ -123,7 +123,7 @@ fn stuffr_cwd_reaches_personality() {
 #[cfg(unix)]
 fn expected_code(name: &str) -> i32 {
     match name {
-        "unzip" | "zipinfo" | "funzip" => 2,
+        "unzip" | "zipinfo" | "funzip" => 10,
         "zip" | "zipcloak" | "zipnote" | "zipsplit" => 16,
         _ => 1,
     }
